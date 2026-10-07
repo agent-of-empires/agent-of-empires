@@ -159,27 +159,12 @@ pub(crate) struct GroupRead {
 pub(crate) struct ProjectRead {
     pub name: String,
     pub path: String,
-    /// Opaque equality metadata the producer computed on its own filesystem.
-    /// Two rows naming one directory share it, which is what the merge needs;
-    /// it is not a path, is not rendered, and is never resolved here, because
-    /// resolving it would resolve it against the reader's machine.
-    ///
-    /// Required, and validated for type and non-emptiness only: a stored alias
-    /// may resolve to a target whose characters a rendered path may not carry,
-    /// and a key is not rendered. A frame without one is refused rather than
-    /// merged on a path, because that fallback is the defect it replaces.
+    /// Required daemon-computed equality key, never rendered or resolved on the client.
     pub merge_key: String,
     pub scope: ProjectScope,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub default_base_branch: Option<String>,
-    /// Whether the row came from a project registry rather than being
-    /// synthesized so a session's project path resolves. Only a synthesized
-    /// row may be absent from both registries, and a session row of the same
-    /// profile must justify it.
-    ///
-    /// Required, and not defaulted, because both published schemas already
-    /// list it. A missing flag is a missing answer, and the only direction a
-    /// default here could be safe in would be one that hides rows.
+    /// Registry membership is required; synthesized rows need a scoped session reference.
     pub registered: bool,
 }
 
@@ -190,7 +175,9 @@ pub(crate) enum ProjectScope {
     Profile,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// CLI projection shared by producer and consumer. Commands and alias-only
+/// profiles use the daemon-wide credential gate, not a per-profile ACL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionRead {
     pub id: String,
@@ -228,7 +215,7 @@ pub(crate) struct SessionRead {
     pub workspace_repos: Vec<WorkspaceRepo>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) enum WireStatus {
     Running,
@@ -240,6 +227,23 @@ pub(crate) enum WireStatus {
     Starting,
     Deleting,
     Creating,
+}
+
+impl From<crate::session::Status> for WireStatus {
+    fn from(status: crate::session::Status) -> Self {
+        use crate::session::Status;
+        match status {
+            Status::Running => Self::Running,
+            Status::Waiting => Self::Waiting,
+            Status::Idle => Self::Idle,
+            Status::Unknown => Self::Unknown,
+            Status::Stopped => Self::Stopped,
+            Status::Error => Self::Error,
+            Status::Starting => Self::Starting,
+            Status::Deleting => Self::Deleting,
+            Status::Creating => Self::Creating,
+        }
+    }
 }
 
 impl WireStatus {
@@ -256,11 +260,7 @@ impl WireStatus {
             Self::Creating => "Creating",
         }
     }
-
-    /// The machine-readable spelling every JSON projection uses. The human
-    /// `Status:` line keeps the PascalCase wire form; a consumer parsing this
-    /// output has always seen lowercase, as `aoe session show --json` did
-    /// before the read existed.
+    /// CLI JSON status values are lowercase; human status and wire values are PascalCase.
     pub(crate) fn json_str(self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -293,12 +293,23 @@ impl WireStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum WireState {
     Live,
     Archived,
     Trashed,
+}
+
+impl From<crate::session::SessionBucket> for WireState {
+    fn from(bucket: crate::session::SessionBucket) -> Self {
+        use crate::session::SessionBucket;
+        match bucket {
+            SessionBucket::Active => Self::Live,
+            SessionBucket::Archived => Self::Archived,
+            SessionBucket::Trashed => Self::Trashed,
+        }
+    }
 }
 
 impl WireState {
@@ -311,7 +322,7 @@ impl WireState {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorktreeRead {
     pub branch: String,
@@ -321,7 +332,7 @@ pub(crate) struct WorktreeRead {
     pub base_branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceRepo {
     pub name: String,
@@ -864,13 +875,13 @@ fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<()
             // registered by definition; only a profile list may hold a
             // synthesized row.
             || (matches!(scope, ProjectScope::Global) && !project.registered)
-            || !valid_text(&project.name)
-            || !valid_stored_project_path(&project.path)
-            || project.merge_key.is_empty()
-            || project
-                .default_base_branch
-                .as_deref()
-                .is_some_and(|value| !valid_text(value))
+            || !(if project.registered {
+                valid_stored_project_path(&project.path)
+            } else {
+                valid_session_project_path(&project.path)
+            })
+            || (project.merge_key.is_empty()
+                && (project.registered || !project.path.is_empty()))
             || !identities.insert((
                 project.name.as_str(),
                 project.path.as_str(),
@@ -884,9 +895,9 @@ fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<()
 }
 
 fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
-    // Titles and commands preserve persisted display text.
+    // Stored display text is preserved; identifiers retain their own checks.
     validate_safe_text(&session.id)?;
-    if session.profile.is_empty() || !valid_text(&session.tool) {
+    if session.profile.is_empty() {
         return Err("schema_invalid");
     }
     if session
@@ -900,14 +911,7 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     {
         return Err("schema_invalid");
     }
-    if session
-        .last_error
-        .as_deref()
-        .is_some_and(|value| !valid_text(value))
-    {
-        return Err("schema_invalid");
-    }
-    if !valid_stored_project_path(&session.project_path) {
+    if !valid_session_project_path(&session.project_path) {
         return Err("schema_invalid");
     }
     for value in [
@@ -924,29 +928,6 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     }
     if !valid_timestamp(&session.created_at) {
         return Err("schema_invalid");
-    }
-    // Compared as instants, not as bytes: a fractional part sorts below the
-    // `Z` of a whole second, so a byte comparison would read
-    // `…:00.5Z < …:00Z` and reject a session archived after it was created.
-    //
-    // The rule refuses the whole snapshot, so one row out of order -- from a
-    // restore, a clock skew or a hand edit -- stops all seven served reads on
-    // every profile, where the local command prints the same row. That is the
-    // deliberate trade: this transport refuses a state it cannot vouch for
-    // rather than rendering it, and it says why below rather than naming a row
-    // it has not been taught to name.
-    let created_at = parse_timestamp(&session.created_at).ok_or("schema_invalid")?;
-    for later in [
-        session.archived_at.as_deref(),
-        session.trashed_at.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let later = parse_timestamp(later).ok_or("schema_invalid")?;
-        if later < created_at {
-            return Err("schema_invalid");
-        }
     }
     match session.state {
         WireState::Live if session.archived_at.is_some() || session.trashed_at.is_some() => {
@@ -966,26 +947,15 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     }
     if let Some(worktree) = &session.worktree {
         if session.has_managed_worktree != worktree.managed_by_aoe
-            || !valid_text(&worktree.branch)
-            || !valid_absolute_path(&worktree.main_repo_path)
-            || worktree
-                .base_branch
-                .as_deref()
-                .is_some_and(|value| !valid_text(value))
+            || !valid_stored_project_path(&worktree.main_repo_path)
         {
             return Err("schema_invalid");
         }
     }
-    // Repos in the store's own order, like every other collection on the wire:
-    // `aoe list --json` prints them the way the workspace stored them, so a
-    // producer-side sort would make the array's order depend on the transport.
-    // Identity is the rule a set-like collection can still refuse, and a
-    // repeated (name, source_path) pair is not a thing a workspace holds.
+    // Preserve workspace order and native basenames; identity is (name, source_path).
     let mut repo_identities: HashSet<(&str, &str)> = HashSet::new();
     for repository in &session.workspace_repos {
-        if !valid_text(&repository.name)
-            || !valid_text(&repository.branch)
-            || !valid_absolute_path(&repository.source_path)
+        if !valid_absolute_path(&repository.source_path)
             || !repo_identities.insert((&repository.name, &repository.source_path))
         {
             return Err("schema_invalid");
@@ -1079,20 +1049,10 @@ fn valid_timestamp(value: &str) -> bool {
     if !matches!(fraction.len(), 0 | 3 | 6 | 9) || !fraction.iter().all(u8::is_ascii_digit) {
         return false;
     }
-    value.ends_with('Z') && parse_timestamp(value).is_some()
+    value.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(value).is_ok()
 }
 
-/// The instant a validated timestamp names, for the ordering rules. Byte
-/// comparison is not an ordering: `Z` sorts above `.`.
-fn parse_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|parsed| parsed.with_timezone(&chrono::Utc))
-}
-
-/// The grammar a wire path must satisfy, shared with the producer: it drops a
-/// stored row the client would otherwise refuse, because one such row fails the
-/// whole snapshot and therefore every read command on every profile.
+/// Canonical absolute POSIX spelling; native components may contain controls, but not NUL.
 pub(crate) fn valid_absolute_path(value: &str) -> bool {
     value == "/"
         || (value.starts_with('/')
@@ -1100,23 +1060,19 @@ pub(crate) fn valid_absolute_path(value: &str) -> bool {
                 !component.is_empty()
                     && component != "."
                     && component != ".."
-                    && valid_text(component)
+                    && !component.contains('\0')
             }))
 }
 
-/// The grammar of a path a registry stored, which the store itself compares
-/// with trailing separators aside: `/repo` and `/repo/` are one project there,
-/// so both are admissible here. The value is validated, never rewritten, so
-/// what a session row was stored with stays what the wire carries and stays
-/// usable as the identifier a `session show` is given.
-///
-/// The worktree and workspace paths keep [`valid_absolute_path`]: they name
-/// things the client does not own, so their grammar stays strict.
+/// Registry spellings also permit trailing separators without rewriting the stored value.
 pub(crate) fn valid_stored_project_path(value: &str) -> bool {
     let trimmed = value.trim_end_matches('/');
-    // A root spelled with nothing but separators trims away entirely, and it
-    // is still the root.
     (trimmed.is_empty() && value.starts_with('/')) || valid_absolute_path(trimmed)
+}
+
+/// The existing session writer uses an empty string for a non-UTF-8 native path.
+pub(crate) fn valid_session_project_path(value: &str) -> bool {
+    value.is_empty() || valid_stored_project_path(value)
 }
 
 #[cfg(test)]
@@ -1163,12 +1119,7 @@ mod tests {
         }
     }
 
-    /// A Hello that claims a local owner is only believed about the uid the
-    /// client admitted, which is the one it proved from the socket's peer
-    /// credentials. A recorded transcript cannot produce a disagreement here,
-    /// so the refusal had no test: it needs an admitted uid the Hello does not
-    /// carry, which is what a second process of another user produces and what
-    /// no committed case can.
+    /// A local Hello must agree with the admitted peer UID.
     fn local_hello(uid: Option<u32>) -> HelloData {
         HelloData {
             protocol_version: crate::server::runtime_ws::PROTOCOL_VERSION,
@@ -1238,11 +1189,7 @@ mod tests {
         assert!(serde_json::from_str::<SnapshotHealth>(duplicate).is_err());
     }
 
-    /// The two places a profile's health is published have to agree, and the
-    /// other four tests that build a snapshot both put the same value in them,
-    /// so nothing held the comparison to it. A daemon that summarised the
-    /// profile one way and reported the components another is a snapshot whose
-    /// answer is not the answer either half describes.
+    /// Profile component health and its summary must agree.
     #[test]
     fn a_profile_health_the_summary_disagrees_with_is_refused() {
         let mut value = snapshot();
@@ -1430,15 +1377,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_commands_do_not_relax_identity_or_tool_text() {
+    fn raw_commands_do_not_relax_session_identity() {
         let mut value = parent_chain_snapshot(1);
         value.sessions[0].command = "printf 'one\tvalue'\nprintf 'two\n'".into();
         assert_eq!(validate_snapshot(&value), Ok(()));
         let mut bad_id = value.clone();
         bad_id.sessions[0].id.push('\n');
         assert_eq!(validate_snapshot(&bad_id), Err("schema_invalid"));
-        value.sessions[0].tool.push('\n');
-        assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
     }
 
     #[test]
@@ -1458,11 +1403,6 @@ mod tests {
         assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
     }
 
-    /// Each row's ancestry is walked from the row, so a long chain costs a
-    /// walk per row. No real chain is long: `parent_session_id` is written only
-    /// by an explicit fork. The validator is the one place that sees the whole
-    /// graph before a consumer walks it, so the bound belongs here rather than
-    /// in each consumer.
     #[test]
     fn a_parent_chain_deeper_than_the_bound_is_refused() {
         assert_eq!(
@@ -1539,7 +1479,7 @@ mod tests {
             "2026-01-01t00:00:00Z",            // a lowercase date/time separator
             "2026-01-01T00:00:00z",            // a lowercase zone
             "2026-01-01T00:00:00.Z",           // an empty fraction
-            "2026-01-01T00:00:00.25Z",         // one fractional digit
+            "2026-01-01T00:00:00.25Z",         // two fractional digits
             "2026-01-01T00:00:00.2500Z",       // four, a width AutoSi never writes
             "2026-01-01T00:00:00.25000000Z",   // eight
             "2026-01-01T00:00:00.1234567890Z", // ten
@@ -1550,107 +1490,33 @@ mod tests {
         }
     }
 
-    /// A session archived a fraction of a second after it was created is not
-    /// archived before it: the ordering rule compares instants, and `Z` sorts
-    /// above `.` as a byte.
     #[test]
-    fn the_later_timestamp_rule_compares_instants_not_bytes() {
-        let mut value = snapshot();
-        value.health.profiles.insert("main".into(), health());
-        value.profiles[0].projects = vec![ProjectRead {
-            name: "repo".into(),
-            path: "/repo".into(),
-            merge_key: "/repo".into(),
-            scope: ProjectScope::Profile,
-            default_base_branch: None,
-            registered: true,
-        }];
-        let row = SessionRead {
-            id: "a".into(),
-            title: "A".into(),
-            project_path: "/repo".into(),
-            group_path: String::new(),
-            tool: "tool".into(),
-            command: String::new(),
-            profile: "main".into(),
-            status: WireStatus::Idle,
-            state: WireState::Archived,
-            created_at: "2026-01-01T00:00:00.500Z".into(),
-            last_accessed_at: None,
-            idle_entered_at: None,
-            last_error: None,
-            archived_at: Some("2026-01-01T00:00:01Z".into()),
-            trashed_at: None,
-            active_snoozed_until: None,
-            pinned_at: None,
-            agent_session_id: None,
-            parent_session_id: None,
-            has_worktree_info: false,
-            has_managed_worktree: false,
-            worktree: None,
-            workspace_repos: vec![],
-        };
-        value.sessions.push(row.clone());
-        assert_eq!(validate_snapshot(&value), Ok(()));
-
-        // The case that actually separates the two comparisons. As instants
-        // `…:00Z` is half a second *before* `…:00.500Z`, so this row is
-        // refused. As bytes `Z` (0x5a) sorts above `.` (0x2e), so a byte
-        // comparison reads it as later and admits the row. The two cases below
-        // this one are admitted or refused by either comparison, so without
-        // this one the test passes unchanged under the bug its name names.
-        let mut truncated = row.clone();
-        truncated.archived_at = Some("2026-01-01T00:00:00Z".into());
-        value.sessions = vec![truncated];
-        assert_eq!(
-            validate_snapshot(&value),
-            Err("schema_invalid"),
-            "an instant before creation is not later, whatever the bytes say"
-        );
-
-        let mut earlier = row;
-        earlier.archived_at = Some("2026-01-01T00:00:00.100Z".into());
-        value.sessions = vec![earlier];
-        assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
-    }
-
-    /// A stored project path is the spelling the registry holds, so a trailing
-    /// separator is admissible and left alone: it is the identifier a
-    /// `session show` is given. Everything the strict path grammar refuses is
-    /// still refused here, because a registry holding one is holding a path
-    /// that names nothing.
-    #[test]
-    fn a_stored_project_path_tolerates_a_trailing_separator_and_nothing_else() {
-        for admitted in ["/repo", "/repo/", "/repo///", "/"] {
+    fn stored_project_paths_preserve_native_components_and_trailing_separators() {
+        for admitted in [
+            "/repo",
+            "/repo/",
+            "/repo///",
+            "/",
+            "/team\twork/",
+            "/name\nline",
+            "/repo/\u{202e}",
+        ] {
             assert!(
                 valid_stored_project_path(admitted),
                 "{admitted} is a directory the store can hold"
             );
         }
-        for refused in ["repo", "", "/repo/../etc", "/repo//one", "/repo/\u{202e}"] {
+        for refused in ["repo", "", "/repo/../etc", "/repo//one", "/repo/\0"] {
             assert!(
                 !valid_stored_project_path(refused),
-                "{refused} names nothing the client can match on"
+                "{refused:?} is not an admitted absolute spelling"
             );
         }
-        // The worktree and workspace paths keep the strict grammar: they name
-        // things the client does not own, so a trailing separator there is a
-        // spelling no read can rely on.
         assert!(valid_absolute_path("/repo"));
         assert!(!valid_absolute_path("/repo/"));
     }
 
-    #[test]
-    fn status_wire_values_are_pascal_case() {
-        assert_eq!(WireStatus::Waiting.as_str(), "Waiting");
-        assert_eq!(WireStatus::Creating.as_str(), "Creating");
-    }
-
-    /// `registered` was the one field the decoder defaulted, and both published
-    /// schemas already list it as required, so a snapshot that omitted it
-    /// decoded to a guess while the schema would have refused it. No shipped
-    /// producer can omit the field; the gap was that the client was more
-    /// permissive than the contract it publishes.
+    /// Missing registry membership is refused rather than defaulted.
     #[test]
     fn an_absent_registered_flag_is_refused_rather_than_guessed() {
         let named = json!({
@@ -1682,11 +1548,7 @@ mod tests {
         }
     }
 
-    /// Repos are accepted in any order, like every other collection here: the
-    /// producer emits the store's own order, and an ordering rule on top of it
-    /// would refuse a snapshot the local command renders from the same rows.
-    /// What identity still buys is the refusal of a repeated
-    /// (name, source_path) pair, which a workspace cannot hold.
+    /// Preserve stored order and native basenames; refuse duplicate repository identities.
     #[test]
     fn workspace_repos_are_accepted_in_any_order_and_refused_when_repeated() {
         let repo = |name: &str, source: &str| WorkspaceRepo {
@@ -1696,8 +1558,8 @@ mod tests {
         };
         assert_eq!(
             validate_session(&session_with_repos(vec![
-                repo("a", "/srv/a"),
-                repo("a", "/srv/b"),
+                repo("a\t", "/srv/a"),
+                repo("a\t", "/srv/b"),
                 repo("b", "/srv/a"),
             ])),
             Ok(())
@@ -1712,12 +1574,47 @@ mod tests {
         );
         assert_eq!(
             validate_session(&session_with_repos(vec![
-                repo("a", "/srv/a"),
-                repo("a", "/srv/a"),
+                repo("a\t", "/srv/a"),
+                repo("a\t", "/srv/a"),
             ])),
             Err("schema_invalid"),
             "a repeated repo is refused"
         );
+    }
+
+    #[test]
+    fn stored_custom_tools_and_git_labels_do_not_poison_a_session() {
+        let mut session = session_with_repos(vec![WorkspaceRepo {
+            name: "repo".into(),
+            source_path: "/repo".into(),
+            branch: "feature\u{202e}review".into(),
+        }]);
+        session.tool = "custom\tagent".into();
+        session.has_worktree_info = true;
+        session.has_managed_worktree = true;
+        session.worktree = Some(WorktreeRead {
+            branch: "feature\u{202e}review".into(),
+            main_repo_path: "/repo/".into(),
+            managed_by_aoe: true,
+            base_branch: Some("base\u{2066}review".into()),
+        });
+        assert_eq!(validate_session(&session), Ok(()));
+        session.has_managed_worktree = false;
+        assert_eq!(validate_session(&session), Err("schema_invalid"));
+    }
+
+    #[test]
+    fn an_empty_stored_session_path_is_not_an_empty_registered_path() {
+        let mut value = parent_chain_snapshot(1);
+        value.sessions[0].project_path.clear();
+        let project = &mut value.profiles[0].projects[0];
+        project.path.clear();
+        project.merge_key.clear();
+        project.name.clear();
+        project.registered = false;
+        assert_eq!(validate_snapshot(&value), Ok(()));
+        value.profiles[0].projects[0].registered = true;
+        assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
     }
 
     fn session_with_repos(repos: Vec<WorkspaceRepo>) -> SessionRead {

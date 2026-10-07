@@ -89,10 +89,8 @@ async fn main() -> Result<()> {
     };
 
     let read_source = cli::runtime_read::read_request_source(&cli);
-    // A scoped read is served by a daemon when one is reachable: the default
-    // transport is the daemon's own UNIX socket, and an explicit endpoint
-    // replaces it. With no daemon publishing, the command runs locally as it
-    // always has.
+    // Linux defaults to local UDS discovery; other platforms default to the store.
+    // An explicitly selected endpoint replaces either default.
     //
     // A served read is still a CLI invocation, so its answer is carried into
     // `run` rather than printed here. The preflight below, the namespace

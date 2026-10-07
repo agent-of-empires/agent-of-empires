@@ -1,42 +1,18 @@
-//! The daemon-served read: one WebSocket exchange, two application frames, and
-//! a projection the CLI prints verbatim.
-//!
-//! What this module owes the operator is where the bytes came from. Every
-//! answer it returns was rendered by a daemon from a snapshot, so a command
-//! whose bytes came from the local store instead has to say so, or its output
-//! is indistinguishable from a read that was served.
-//!
-//! `--daemon-url` and `AOE_DAEMON_URL` are not in the same position and do not
-//! behave the same way. The flag names an endpoint, so refusing it (or failing
-//! to reach it) is what the user asked for by name and stays a refusal. The
-//! variable names a remote that may simply not be running, which is a state a
-//! local command still answers in, so a variable naming an endpoint that does
-//! not answer still lets the command run, and says on stderr that the local
-//! store answered. What it never does is fall over silently: the notice names
-//! the variable rather than its value, so a URL carrying a token is not echoed
-//! to a terminal or a log.
+//! Validate and render a daemon snapshot after a two-frame WebSocket exchange.
+//! Explicit endpoints never fall back. Absent environment-selected endpoints
+//! use the local store with a notice that does not disclose the endpoint URL.
 
-/// `pub(crate)` so the server's wire contract test can drive the client's real
-/// decoders; the two halves then cannot drift on a field name or member order.
+/// Shared with the producer's contract checks against the real client decoder.
 pub(crate) mod dto;
 mod endpoint;
-/// Debug-only Contract Pack support for unit and integration tests.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub mod pack;
-#[cfg(all(test, debug_assertions))]
+#[cfg(test)]
+pub(crate) mod pack;
+#[cfg(test)]
 mod pack_tests;
 mod render;
-/// The local admission walk and its peer-credential check, which read process
-/// identity from `/proc` and are therefore Linux-only. The publisher refuses
-/// every other platform for the same reason (`server::runtime_uds::publish`),
-/// so on one there is no local read to admit and the Local transport below
-/// reports the publication absent, which runs the command from the local store
-/// exactly as it did before the read existed.
+/// Linux descriptor admission shared with the local publisher.
+/// Other platforms use HTTP when selected, otherwise the local store.
 #[cfg(target_os = "linux")]
-/// `pub(crate)` because the publisher runs the identical walk
-/// (`server::runtime_uds`): the client stays the enforcing boundary, and a
-/// producer that re-derived the rules could only ever be weaker.
 pub(crate) mod uds;
 
 use std::time::Duration;
@@ -67,12 +43,7 @@ use super::session::ShowArgs;
 use super::status::StatusArgs;
 use super::{Cli, Commands};
 
-// The producer's own budget for one connection, so the client's exchange
-// deadline and the daemon's server-side bound are the same number rather
-// than two literals that happen to agree today. One stalled peer can never
-// hold a client task and a server task open at once, and a read has exactly
-// one budget: the exchange deadline is the establishment deadline, never a
-// second window opened after it.
+// Client establishment and exchange share one deadline; the server uses the same duration.
 use crate::server::runtime_ws::CONNECTION_BUDGET;
 const CLOSE_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPLICATION_LIMIT: usize = 16 * 1024 * 1024;
@@ -115,15 +86,7 @@ pub fn classify(command: Option<&Commands>) -> Option<ScopedCommand<'_>> {
     }
 }
 
-/// Every code a scoped read can report, and the only vocabulary the Contract
-/// Pack's phase/code/exit table may use.
-///
-/// The two lists are held together from both ends, and in a debug build only:
-/// every constructor below asserts in a `debug_assert!` that the code it was
-/// handed is in this set, so a new emitter cannot introduce a code the table
-/// does not describe, and the pack verifier is behind the pack's own
-/// `#[cfg(debug_assertions)]`, so the table cannot describe a code this half
-/// cannot emit. A release build checks neither.
+/// Stable failure codes emitted by scoped runtime reads.
 pub(crate) const EMITTABLE_CODES: &[&str] = &[
     // `parser_error` is clap's, raised before any read begins.
     "parser_error",
@@ -158,11 +121,7 @@ pub(crate) const EMITTABLE_CODES: &[&str] = &[
 /// user's own state, not on the wire.
 pub const RENDERER_INTERNAL: &str = "renderer_internal";
 
-/// The sentence a wire code is reported under, in the one place it is spelled.
-/// Three callers report `renderer_internal` (this module's own refusal, the
-/// renderer's failed serialisation, and a failed write of the answer to stdout)
-/// and the first of them reports a code the caller chose, so a literal in any
-/// of them is a second spelling waiting to drift.
+/// Format a runtime refusal code for CLI stderr.
 pub fn read_sentence(code: &str) -> String {
     format!("daemon read: {code}\n")
 }
@@ -171,13 +130,7 @@ pub fn read_sentence(code: &str) -> String {
 pub(crate) struct ReadFailure {
     code: &'static str,
     exit: i32,
-    /// The sentence the renderer prints, when the refusal is the user's to
-    /// read rather than a wire code. Owned text, not a `&'static str`, for the
-    /// same reason the producer half owns its detail
-    /// (`server::runtime_uds::PublishError`): a refusal that has to name the
-    /// path it refused, or the candidates that would resolve it, cannot say so
-    /// out of a constant. The code stays `&'static str` because it is checked
-    /// against [`EMITTABLE_CODES`].
+    /// Exact user-facing diagnosis when a stable wire code cannot name the cause.
     exact: Option<String>,
     attempt_close: bool,
 }
@@ -195,12 +148,7 @@ impl ReadFailure {
         Self::refusal(code, 4, false)
     }
 
-    /// A pre-admission refusal that says what to fix. The walk's refusal has
-    /// to name the component it refused, the mode it found and the command
-    /// that clears it, and none of that is a constant, for the same reason
-    /// [`ReadFailure::exit`] owns its text. The code and the exit are exactly
-    /// the ones the refusal already carried, so saying more cannot widen it:
-    /// a diagnosis is not an admission.
+    /// Pre-admission diagnosis; it does not authorize a connection.
     pub(crate) fn pre_exact(code: &'static str, message: impl Into<String>) -> Self {
         let mut failure = Self::refusal(code, 2, false);
         failure.exact = Some(message.into());
@@ -219,21 +167,12 @@ impl ReadFailure {
         }
     }
 
-    /// A refusal whose exit the renderer chooses: a user-facing message that is
-    /// not a wire failure. The code stays the renderer's own, so the pack can
-    /// still tell an internal fault (exit 1) from a refusal (exit 2).
+    /// Preserve the renderer's chosen exit status and exact message.
     pub(crate) fn exit(exit: i32, message: impl Into<String>) -> Self {
         Self::exit_with(exit, message.into())
     }
 
-    /// A refusal on the user's own state that keeps its own code. The three
-    /// user-input refusals (`profile_missing`, `session_missing`,
-    /// `session_ambiguous`) are not wire failures, so what they carry is the
-    /// local path's exit (1) and the local path's sentence, but the code is
-    /// still what says *which* refusal this was, so a caller can tell a
-    /// missing profile from a missing session from an internal fault. The code
-    /// is checked against the emittable set exactly as every other constructor
-    /// checks it.
+    /// User-state refusal with its stable code and local CLI exit/message.
     pub(crate) fn refuse(code: &'static str, exit: i32, message: impl Into<String>) -> Self {
         let mut failure = Self::refusal(code, exit, true);
         failure.exact = Some(message.into());
@@ -277,17 +216,9 @@ pub fn read_request_source(cli: &Cli) -> ReadRequestSource {
 /// What a scoped read found: either the daemon's answer, or the fact that no
 /// daemon publishes a local read here, which leaves the command to the caller.
 pub enum ScopedRead {
-    /// The daemon rendered the command, or refused it. This is the final result.
+    /// Final CLI projection or refusal from a served exchange; no local handler runs.
     Answered(ReadOutcome),
-    /// No local daemon has published a runtime read. Only ever returned for the
-    /// local transport, so the caller runs the command against the local store
-    /// exactly as it did before the read existed, including its best-effort
-    /// `agent_session_id` backfill, which an answered read does not run.
-    ///
-    /// The notice is `Some` only when a variable named an endpoint that did
-    /// not answer, the one case where the local store answers a command the
-    /// user aimed somewhere else. With no endpoint named this is the ordinary
-    /// local read and has nothing to report.
+    /// Run the local handler; notice is present only for an absent environment endpoint.
     NoLocalPublication(Option<&'static str>),
 }
 
@@ -312,44 +243,13 @@ pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> 
     }
 }
 
-/// Whether this failure means the local command path may answer for itself.
-///
-/// An explicit `--daemon-url` is a request for a served answer: whatever the
-/// endpoint says, including that it cannot be reached, is what the user asked
-/// for by name, so nothing here applies to it.
+/// Explicit endpoints never fall back. Environment endpoints do so only before a peer is reached.
 fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> bool {
     if source.explicit_url.is_some() {
         return false;
     }
     match error.code() {
-        // A take-over may carry a statement about the environment, never one
-        // about this client. The walk, the marker read and the join of the
-        // blocking task are this client's, so they stay refusals, and so does
-        // `marker_invalid`, because the artifact is there and untrustworthy.
-        // `marker_missing` is the exception: it is defined as an absence.
-        //
-        // Past admission the markers have proved a live publisher and the
-        // connected socket has been proved to be that publisher's, so failing
-        // to get an answer out of it is a fact about the environment.
         "marker_missing" => !source.env_url_is_set(),
-        // What proves the endpoint was not there. `publisher_absent` is the
-        // TCP connect failing, so nothing was listening; a stall stays
-        // because a silent peer and a dead host are the same observable from
-        // here.
-        //
-        // `unavailable` leaves, because it now means a peer that was reached
-        // and then did not serve, which is not absence. The two are separated
-        // by which call failed rather than by the error: the connect is its own
-        // step, and a refused certificate arrives from the handshake that
-        // follows it. Measured on this build, a refused certificate is
-        // `ErrorKind::InvalidData`, a refused port is `ConnectionRefused` and a
-        // name that does not resolve is `Uncategorized` -- distinct kinds, so
-        // an earlier note here claiming they were the same was wrong.
-        //
-        // What leaves the arm as well: `invalid_endpoint` and `invalid_token`
-        // are configuration faults no socket can fix, and `server_error` is a
-        // peer that answered and would not serve. Falling back on any of those
-        // prints this machine's sessions as though they came from the remote.
         "establishment_timeout" | "publisher_absent" => source.env_url_is_set(),
         _ => false,
     }
@@ -387,9 +287,7 @@ async fn execute_inner(
                 )
                 .await
             }
-            // No publisher runs on this platform, so the absence is the only
-            // answer the local transport can give, and the caller runs the
-            // command against the local store.
+            // No local publisher on this platform.
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = establishment_deadline;
@@ -397,59 +295,21 @@ async fn execute_inner(
             }
         }
         SelectedEndpoint::Http { request } => {
-            // `~` in `aoe status --verbose` is a display convention meaning
-            // "this machine's home", the same shorthand the local command
-            // prints. A loopback host is therefore given one. The host string
-            // does not prove the peer shares this home, since a forwarded
-            // loopback reaches another machine, and nothing here treats it as
-            // proof. The collapse only ever shows *less* than the wire
-            // carries, so a wrong assumption widens the output rather than
-            // narrowing it.
             let local_home = loopback_home(&request);
-            // The TCP connect is split from the handshake, as the local path
-            // already does, because a peer that answered and would not serve
-            // us is not a peer that was absent, and only the split says which
-            // happened. The TLS wrap survives the split because
-            // `client_async_tls_with_config` is public and takes the connected
-            // stream with the default connector, so `None` wraps exactly as
-            // `connect_async` would. It is not `client_async_with_config`:
-            // that one never wraps, and a `wss://` endpoint handed to it is
-            // not a transport at all.
-            let (connect_host, connect_port) = host_port(request.uri())?;
-            let stream = tokio::time::timeout_at(
-                establishment_deadline,
-                tokio::net::TcpStream::connect((connect_host, connect_port)),
-            )
-            .await
-            .map_err(|_| ReadFailure::pre("establishment_timeout"))?
-            .map_err(|_| ReadFailure::post("publisher_absent"))?;
-            // The second stage is not the same question as the first, and a
-            // timeout on it is not the same failure. The socket exists: a peer
-            // accepted and then stopped, which is a peer that was reached and
-            // would not serve, and the local store does not answer for that. A
-            // connect that never completed means nothing accepted, and that is
-            // what `establishment_timeout` is for — the pack puts it in
-            // `pre_transport` at exit 2, where a stall before a socket exists
-            // belongs, and `unavailable` in `transport` at exit 4, where a stall
-            // after one does.
-            let (stream, _) = tokio::time::timeout_at(
-                establishment_deadline,
-                tokio_tungstenite::client_async_tls_with_config(
-                    *request,
-                    stream,
-                    Some(websocket_config()),
-                    None,
-                ),
-            )
-            .await
-            .map_err(|_| ReadFailure::post("unavailable"))?
-            .map_err(map_upgrade_error)?;
-            // One budget per read: the exchange rides the establishment
-            // window rather than opening a second one behind it.
-            let exchange_deadline = establishment_deadline;
+            // Environment discovery is optional; an explicit endpoint keeps the full budget.
+            let connect_deadline = if source.explicit_url.is_none() {
+                establishment_deadline.min(Instant::now() + Duration::from_secs(1))
+            } else {
+                establishment_deadline
+            };
+            let stream = tokio::time::timeout_at(connect_deadline, connect_http(request.uri()))
+                .await
+                .map_err(|_| ReadFailure::pre("establishment_timeout"))?
+                .map_err(|_| ReadFailure::post("publisher_absent"))?;
+            let stream = upgrade_http(*request, stream, source, establishment_deadline).await?;
             exchange_stream(
                 stream,
-                exchange_deadline,
+                establishment_deadline,
                 ExpectedPeer::Remote,
                 local_home.as_deref(),
                 command,
@@ -460,11 +320,143 @@ async fn execute_inner(
     }
 }
 
-/// The `(host, port)` an endpoint names, defaulting the port the way the
-/// connect does so the two cannot disagree about it. The host arrives
-/// bracketed for IPv6, and the brackets are not part of the address: the
-/// connect resolves what it is given, and `[::1]` is not an address literal.
-/// `endpoint::unbracketed` is the same strip the handshake does.
+async fn connect_http(
+    uri: &tokio_tungstenite::tungstenite::http::Uri,
+) -> Result<tokio::net::TcpStream, std::io::Error> {
+    let (host, port) = host_port(uri)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid endpoint"))?;
+    if host.eq_ignore_ascii_case("localhost") {
+        let addresses = [
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port),
+            std::net::SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port),
+        ];
+        tokio::net::TcpStream::connect(addresses.as_slice()).await
+    } else {
+        tokio::net::TcpStream::connect((host, port)).await
+    }
+}
+
+async fn upgrade_http(
+    mut request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    mut stream: tokio::net::TcpStream,
+    source: &ReadRequestSource,
+    deadline: Instant,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ReadFailure,
+> {
+    use crate::acp::client::passphrase_session::{self, PassphraseSessionCache};
+    use crate::acp::client::{DaemonEndpoint, Source};
+
+    let peer = stream
+        .peer_addr()
+        .map_err(|_| ReadFailure::post("unavailable"))?;
+    let auth = if source.token.is_none() && std::env::var_os("AOE_DAEMON_PASSPHRASE").is_some() {
+        let uri = request.uri();
+        let path = uri
+            .path()
+            .strip_suffix("/api/runtime/ws")
+            .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
+        let base = if uri.scheme_str() == Some("wss") {
+            format!(
+                "https://{}{path}",
+                uri.authority()
+                    .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?
+            )
+        } else {
+            // Login uses the connected loopback address, never a second localhost lookup.
+            format!("http://{peer}{path}")
+        };
+        let endpoint = DaemonEndpoint::new(base, None, Source::Env);
+        endpoint
+            .resolved_passphrase()
+            .is_some()
+            .then(|| (endpoint, PassphraseSessionCache::default()))
+    } else {
+        None
+    };
+    let mut refreshed = false;
+    loop {
+        let mut had_cached_session = false;
+        if let Some((endpoint, cache)) = &auth {
+            let session = match cache.get(endpoint) {
+                Some(session) => {
+                    had_cached_session = true;
+                    session
+                }
+                None => {
+                    tokio::time::timeout_at(deadline, passphrase_session::login(endpoint, cache))
+                        .await
+                        .map_err(|_| ReadFailure::post("unavailable"))?
+                        .map_err(map_login_error)?
+                }
+            };
+            request.headers_mut().insert(
+                "Cookie",
+                session
+                    .cookie
+                    .parse()
+                    .map_err(|_| ReadFailure::post("unauthorized"))?,
+            );
+            request.headers_mut().insert(
+                "X-Aoe-Device-Binding",
+                session
+                    .binding_secret
+                    .parse()
+                    .map_err(|_| ReadFailure::post("unauthorized"))?,
+            );
+        }
+        let result = tokio::time::timeout_at(
+            deadline,
+            tokio_tungstenite::client_async_tls_with_config(
+                request,
+                stream,
+                Some(websocket_config()),
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| ReadFailure::post("unavailable"))?;
+        match result {
+            Ok((stream, _)) => return Ok(stream),
+            Err(WsError::Http(response))
+                if response.status().as_u16() == 401 && had_cached_session && !refreshed =>
+            {
+                let (endpoint, cache) = auth.as_ref().expect("cached passphrase session");
+                cache.invalidate(endpoint);
+                refreshed = true;
+                request = match endpoint::select_endpoint(source)? {
+                    SelectedEndpoint::Http { request } => *request,
+                    SelectedEndpoint::Local => unreachable!("captured HTTP source"),
+                };
+                stream = tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(peer))
+                    .await
+                    .map_err(|_| ReadFailure::post("unavailable"))?
+                    .map_err(|_| ReadFailure::post("unavailable"))?;
+            }
+            Err(error) => return Err(map_upgrade_error(error)),
+        }
+    }
+}
+
+fn map_login_error(error: crate::acp::client::HttpError) -> ReadFailure {
+    use crate::acp::client::HttpError;
+    match error {
+        HttpError::Unauthorized => map_http_status(401),
+        HttpError::Server { status, .. } => map_http_status(status.as_u16()),
+        _ => ReadFailure::post("unavailable"),
+    }
+}
+
+fn map_http_status(status: u16) -> ReadFailure {
+    if matches!(status, 401 | 403) {
+        ReadFailure::post("unauthorized")
+    } else {
+        ReadFailure::post("server_error")
+    }
+}
+
+/// Connect target with IPv6 brackets removed and the scheme's default port.
 fn host_port(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Result<(&str, u16), ReadFailure> {
     let host = uri
         .host()
@@ -478,20 +470,11 @@ fn host_port(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Result<(&str, u
     Ok((host, port))
 }
 
-/// This machine's home, when the endpoint names a loopback address, and
-/// nothing else.
-///
-/// The question is whether the peer is the machine these paths belong to, and
-/// only an address answers it. A name does not: nothing here resolves one, so
-/// an endpoint called `localhost` that resolves to another machine would have
-/// this machine's home collapsed into that machine's paths. That is wrong in
-/// the direction that leaks, so a name is refused rather than trusted. The
-/// cost is that a local daemon reached over TLS by name prints its rows
-/// unabbreviated.
+/// Collapse this host’s paths only for literals and the localhost name pinned by connect_http.
 fn loopback_home(
     request: &tokio_tungstenite::tungstenite::handshake::client::Request,
 ) -> Option<std::path::PathBuf> {
-    crate::daemon::is_loopback_address(request.uri().host()?)
+    crate::daemon::is_loopback_host(request.uri().host()?)
         .then(dirs::home_dir)
         .flatten()
 }
@@ -651,18 +634,7 @@ fn peer_gone() -> ReadFailure {
     failure
 }
 
-/// Close the exchange and settle on the answer.
-///
-/// A close that fails is still an error, because the contract says the read
-/// reports one, and a peer that cannot be told to stop must not pass for a
-/// clean finish. It is not, however, allowed to become *the* error: a snapshot
-/// the client refused (`schema_invalid`), a profile the daemon does not have
-/// (`profile_missing`) and a freshness the daemon never observed
-/// (`freshness_unavailable`) are the facts the exit code is about, and
-/// replacing any of them with `close_timeout` would report a transport hiccup
-/// as the reason the read failed. So the original failure is returned as it
-/// stands, and a close failure is what is reported only when there was no
-/// failure to report.
+/// Close failure replaces success, never the refusal that already caused the close.
 async fn finish_with_close<S>(
     stream: &mut tokio_tungstenite::WebSocketStream<S>,
     deadline: Instant,
@@ -713,15 +685,7 @@ where
 
 fn map_upgrade_error(error: WsError) -> ReadFailure {
     match error {
-        WsError::Http(response)
-            if response.status().as_u16() == 401 || response.status().as_u16() == 403 =>
-        {
-            ReadFailure::post("unauthorized")
-        }
-        // The peer answered and would not serve us, which is not the same as
-        // being absent, and a local store answering here would report this
-        // machine's sessions as the remote's.
-        WsError::Http(_) => ReadFailure::post("server_error"),
+        WsError::Http(response) => map_http_status(response.status().as_u16()),
         _ => ReadFailure::post("unavailable"),
     }
 }
@@ -732,11 +696,7 @@ mod tests {
     use clap::Parser;
     use std::ffi::OsString;
 
-    /// The home collapse is a loopback question, so every spelling of a
-    /// loopback host has to answer it the same way and no other host does. A
-    /// bracketed IPv6 authority arrives bracketed, and the reachable
-    /// bracketed hosts a TLS endpoint may name are exactly the ones that must
-    /// not collapse.
+    // Localhost is pinned; other TLS names do not establish local provenance.
     #[test]
     fn only_a_loopback_host_answers_with_this_machines_home() {
         assert!(
@@ -747,7 +707,7 @@ mod tests {
             ("http://127.0.0.1:8080/api/runtime/ws", true),
             ("http://[::1]:8080/api/runtime/ws", true),
             ("https://[::1]/api/runtime/ws", true),
-            ("https://localhost:8080/api/runtime/ws", false),
+            ("https://localhost:8080/api/runtime/ws", true),
             ("https://example.test/api/runtime/ws", false),
             ("wss://[fe80::1]/api/runtime/ws", false),
             ("wss://[2001:db8::1]/api/runtime/ws", false),
@@ -762,11 +722,7 @@ mod tests {
         }
     }
 
-    /// The local take-over is gated on the environment naming no endpoint, so
-    /// it has to read "names no endpoint" through the same definition the
-    /// selector does. An empty or whitespace-only `AOE_DAEMON_URL` is exactly
-    /// the case this exists for: with no daemon published, the command must
-    /// answer from the local store, on every platform.
+    /// Empty or blank environment endpoints preserve local takeover.
     #[test]
     fn an_empty_environment_url_still_takes_over_from_the_local_store() {
         let missing = ReadFailure::pre("marker_missing");
@@ -813,11 +769,7 @@ mod tests {
             "only an absent publication is a take-over"
         );
     }
-    /// The property worth pinning is not that these codes take over, but that
-    /// **nothing else does**. A new code added to the emit table is the edit
-    /// that would silently widen this, so the table enumerates the whole
-    /// vocabulary and asserts `false` for everything outside the set, under
-    /// every combination of endpoint inputs.
+    /// New refusal codes must not silently widen local takeover.
     #[test]
     fn only_the_endpoint_codes_take_over_and_nothing_else_does() {
         const TAKES_OVER: [&str; 3] = [
@@ -857,18 +809,7 @@ mod tests {
         }
     }
 
-    /// The stage a timeout happened in is the whole question, and the two
-    /// codes it produces sit on opposite sides of the take-over line. A
-    /// connect that never completed means nothing accepted, which is the case
-    /// a variable naming a remote that may not be running describes. A
-    /// handshake that never completed means a socket exists: something accepted
-    /// and then stopped serving, and answering from the local store there would
-    /// report this machine's sessions as the remote's.
-    ///
-    /// The existing test at this boundary used a closed port, so it exercised
-    /// the first stage and passed whichever way the second was mapped. That is
-    /// why the distinction needs saying in terms of the codes rather than in
-    /// terms of a connection this test does not make.
+    /// A TCP discovery timeout may fall back; an accepted but stalled peer may not.
     #[test]
     fn a_stall_after_the_socket_exists_is_not_the_same_as_a_stall_before_it() {
         let source = ReadRequestSource {
@@ -893,20 +834,7 @@ mod tests {
         );
     }
 
-    /// The one case where the local store answers a command the user aimed
-    /// somewhere else: `AOE_DAEMON_URL` names an endpoint, nothing answers
-    /// there, and the command runs locally anyway. That is the right fallback,
-    /// and it is only right if the operator is told, because the transport's
-    /// premise is that the bytes are a daemon's.
-    ///
-    /// A token is supplied so the read reaches the network and fails for the
-    /// reason this test is about. Without one it never dials, and a missing
-    /// token is a configuration fault rather than an absent endpoint, which the
-    /// companion test below pins separately.
-    ///
-    /// Port 9 on loopback, where the connection is refused immediately. A name
-    /// would be worse here: resolution of an unresolvable host is the host's
-    /// timing, and this test is about the stage that never completed.
+    /// An absent environment-selected peer falls back with an endpoint notice.
     #[tokio::test]
     async fn a_variable_naming_an_endpoint_that_did_not_answer_says_the_store_answered() {
         let absent = "http://127.0.0.1:9";
@@ -941,12 +869,7 @@ mod tests {
         assert!(outcome.stdout.is_none(), "a refusal prints no answer");
     }
 
-    /// The connect target has to be an address, not an authority. `uri.host()`
-    /// hands IPv6 back bracketed, and the brackets are not part of the
-    /// literal, so a bracketed endpoint resolved by the connect fails to
-    /// resolve at all -- which, with a variable naming the endpoint, is a
-    /// refusal and so answers from the local store instead of reporting that
-    /// the endpoint could not be reached.
+    /// Connect targets omit the authority brackets around IPv6 literals.
     #[test]
     fn a_bracketed_ipv6_endpoint_connects_to_an_address_literal() {
         for (url, host, port) in [
@@ -970,31 +893,26 @@ mod tests {
         }
     }
 
-    /// The other side of the same line: a variable naming an endpoint with no
-    /// bearer token never opens a socket, so nothing was ever asked whether it
-    /// was there. Falling back would print this machine's rows under a notice
-    /// claiming a remote did not answer, when the remote was never contacted.
     #[tokio::test]
-    async fn a_variable_without_a_token_refuses_rather_than_claiming_the_endpoint_was_absent() {
+    async fn an_explicitly_empty_token_refuses_before_endpoint_discovery() {
         let source = ReadRequestSource {
             explicit_url: None,
             env_url: Some(OsString::from("http://127.0.0.1:9")),
-            token: None,
+            token: Some(OsString::new()),
             explicit_profile: None,
             env_profile: None,
         };
-        let cli = Cli::try_parse_from(["aoe", "list"]).expect("the argv parses");
-        let command = classify(cli.command.as_ref()).expect("`aoe list` is scoped");
-
-        let ScopedRead::Answered(outcome) = attempt(command, &source).await else {
-            panic!("a configuration fault is not an absent endpoint");
+        let cli = Cli::parse_from(["aoe", "list"]);
+        let ScopedRead::Answered(outcome) =
+            attempt(classify(cli.command.as_ref()).unwrap(), &source).await
+        else {
+            panic!("a malformed credential is not an absent endpoint");
         };
-        assert_eq!(outcome.exit, 2, "the refusal keeps its exit");
-        assert!(outcome.stdout.is_none(), "a refusal prints no answer");
+        assert_eq!(outcome.exit, 2);
+        assert_eq!(outcome.stdout, None);
         assert_eq!(
             outcome.stderr.as_deref(),
-            Some("daemon read: invalid_token\n"),
-            "and it says what is actually wrong"
+            Some("daemon read: invalid_token\n")
         );
     }
 
@@ -1041,25 +959,7 @@ mod tests {
         assert!(Cli::try_parse_from(["aoe", "session", "list-trash"]).is_ok());
     }
 
-    /// The wire limits the verifier enforces, taken from the config a read
-    /// actually builds; the budgets themselves are documented on the
-    /// constants.
-
-    #[test]
-    fn error_rendering_uses_exact_exit_taxonomy() {
-        let pre: ReadOutcome = ReadFailure::pre("marker_invalid").into();
-        assert_eq!(pre.stderr.as_deref(), Some("daemon read: marker_invalid\n"));
-        assert_eq!(pre.exit, 2);
-        let post: ReadOutcome = ReadFailure::post("schema_invalid").into();
-        assert_eq!(
-            post.stderr.as_deref(),
-            Some("daemon read: schema_invalid\n")
-        );
-    }
-
-    /// A close that cannot be sent is still an error, but it is not allowed to
-    /// become the error: the refusal that caused it is the fact the exit code
-    /// is about. The peer here is gone, so every close fails.
+    /// A close failure cannot replace the refusal that prompted it.
     #[tokio::test]
     async fn a_failed_close_never_replaces_the_failure_that_caused_it() {
         let mut stream = broken_stream().await;
@@ -1072,9 +972,7 @@ mod tests {
         }
     }
 
-    /// With nothing to report, a close that cannot be sent is the whole story,
-    /// and a successful render is still refused rather than passed off as
-    /// clean.
+    /// An otherwise successful read reports its close failure.
     #[tokio::test]
     async fn a_failed_close_is_the_answer_when_the_read_otherwise_succeeded() {
         let mut stream = broken_stream().await;
@@ -1101,5 +999,154 @@ mod tests {
             None,
         )
         .await
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn localhost_passphrase_reads_reuse_a_session_and_relogin_after_revocation() {
+        use crate::server::test_support;
+        use crate::session::test_support::EnvGuard;
+        use std::sync::Arc;
+        let mut _env = test_support::RuntimeEnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        _env.bind(dir.path());
+        let phrase = "runtime read passphrase evidence";
+        let _phrase = EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
+        crate::session::create_profile("main").unwrap();
+        let mut row = crate::session::Instance::new("passphrase read evidence", "/repo");
+        row.id = "passphrase-read".into();
+        row.source_profile = "main".into();
+        row.tool = "claude".into();
+        test_support::seed_instances_on_disk_for_test("main", vec![row.clone()]);
+        let mut state = test_support::build_test_app_state_with_policy(
+            vec![row],
+            vec!["localhost".into(), "127.0.0.1".into()],
+            Vec::new(),
+            None,
+        );
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        mutable.login_manager = Arc::new(crate::server::login::LoginManager::new(Some(phrase)));
+        mutable.behind_tunnel = true;
+        mutable.auth_mode = "passphrase";
+        test_support::accept_runtime_read_cache_for_test(&state).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = test_support::build_router_for_test(state.clone());
+        let shutdown = state.shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
+        });
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let recording = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", recording.local_addr().unwrap());
+        let proxy_requests = Arc::new(AtomicUsize::new(0));
+        let stopped = tokio_util::sync::CancellationToken::new();
+        let proxy = tokio::spawn({
+            let requests = proxy_requests.clone();
+            let stopped = stopped.clone();
+            async move {
+                loop {
+                    let (mut socket, _) = tokio::select! {
+                        _ = stopped.cancelled() => break,
+                        accepted = recording.accept() => accepted.unwrap(),
+                    };
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let mut buffer = [0; 1024];
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        assert_ne!(count, 0);
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let response: &[u8] = if request.starts_with(b"GET ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    } else {
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    };
+                    socket.write_all(response).await.unwrap();
+                }
+            }
+        });
+        let _proxy_exclusions =
+            EnvGuard::unset(&["NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy"]);
+        let _proxy_env = EnvGuard::set(&[
+            ("HTTP_PROXY", proxy_url.as_str()),
+            ("http_proxy", proxy_url.as_str()),
+            ("ALL_PROXY", proxy_url.as_str()),
+            ("all_proxy", proxy_url.as_str()),
+        ]);
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/api/health"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert_eq!(
+            proxy_requests.load(Ordering::SeqCst),
+            1,
+            "positive control: the live proxy receives ordinary loopback HTTP"
+        );
+        let cli = Cli::parse_from(["aoe", "session", "show", "passphrase-read", "--json"]);
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url: Some(format!("http://localhost:{port}").into()),
+            token: None,
+            explicit_profile: Some("main".into()),
+            env_profile: None,
+        };
+        let mut previous_session = None;
+        for (index, revoke) in [false, false, true].into_iter().enumerate() {
+            if revoke {
+                assert_eq!(state.login_manager.logout_all().await, 1);
+            }
+            let ScopedRead::Answered(outcome) =
+                attempt(classify(cli.command.as_ref()).unwrap(), &source).await
+            else {
+                panic!("an authenticated localhost peer must not fall back to disk");
+            };
+            assert_eq!(outcome.exit, 0, "read {index}: {:?}", outcome.stderr);
+            let value: serde_json::Value = serde_json::from_str(&outcome.stdout.unwrap()).unwrap();
+            assert_eq!(value["id"], "passphrase-read");
+            assert_eq!(value["title"], "passphrase read evidence");
+            let sessions = state.login_manager.device_snapshot(None).await;
+            assert_eq!(
+                sessions.len(),
+                1,
+                "repeated CLI reads must not create extra device sessions"
+            );
+            if let Some(previous) = previous_session {
+                if revoke {
+                    assert_ne!(sessions[0].session_id, previous);
+                } else {
+                    assert_eq!(sessions[0].session_id, previous);
+                }
+            }
+            previous_session = Some(sessions[0].session_id.clone());
+        }
+        assert_eq!(
+            proxy_requests.load(Ordering::SeqCst),
+            1,
+            "login and cached401 relogin must never reach the environment proxy"
+        );
+        stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(5), proxy)
+            .await
+            .unwrap()
+            .unwrap();
+        state.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

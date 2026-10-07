@@ -1431,10 +1431,7 @@ mod tests {
         );
     }
 
-    /// A missing `profiles` directory is an empty inventory; a `profiles` that
-    /// is a regular file is a broken app dir. Both used to enumerate as zero
-    /// profiles with healthy health, so a read that depends on the inventory
-    /// reported a clean answer about a state that is not clean.
+    /// Missing profile inventories are empty; non-directory inventories are errors.
     #[test]
     #[serial_test::serial]
     fn readonly_enumeration_separates_a_missing_directory_from_a_broken_one() {

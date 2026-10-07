@@ -34,6 +34,16 @@ mod platform {
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn effective_uid() -> u32 {
+    platform::effective_uid()
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    platform::metadata_identity(metadata)
+}
+#[cfg(target_os = "linux")]
+pub(crate) use linux::runtime_io;
 
 /// Lower the child's scheduling and I/O priority where the OS supports it.
 pub(crate) fn throttle_child(cmd: &mut std::process::Command) {

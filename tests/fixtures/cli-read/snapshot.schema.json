@@ -56,12 +56,17 @@
     },
     "absolute_path": {
       "type": "string",
-      "pattern": "^/([^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*)?$"
+      "pattern": "^/([^/\\u0000]+(/[^/\\u0000]+)*)?$",
+      "not": { "pattern": "(^|/)\\.{1,2}(/|$)" }
     },
     "stored_project_path": {
-      "description": "An absolute_path as a registry stores it. The store compares project paths with trailing separators aside, so `/repo` and `/repo/` are one project there and both are admissible here; the value is validated, never rewritten, so the spelling a session row is identified by survives the wire. The worktree and workspace paths keep absolute_path: they name things the client does not own.",
+      "description": "Native absolute spelling, preserved verbatim; trailing separators also preserve legacy registry identity.",
       "type": "string",
-      "pattern": "^/([^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*)?/*$"
+      "pattern": "^/([^/\\u0000]+(/[^/\\u0000]+)*)?/*$",
+      "not": { "pattern": "(^|/)\\.{1,2}(/|$)" }
+    },
+    "session_project_path": {
+      "oneOf": [{ "$ref": "#/$defs/stored_project_path" }, { "const": "" }]
     },
     "group_path": {
       "type": "string",
@@ -173,13 +178,9 @@
       "additionalProperties": false,
       "required": ["name", "path", "merge_key", "scope", "default_base_branch", "registered"],
       "properties": {
-        "name": { "$ref": "#/$defs/safe_text" },
-        "path": { "$ref": "#/$defs/stored_project_path" },
-        "merge_key": {
-          "description": "Opaque equality metadata the producer computed with the store's own rule on the producer's filesystem. Two rows naming one directory share it. It is not a path and is never rendered, so it is only held to being a non-empty string: a stored alias may resolve to a target whose characters a rendered path may not carry. Uniqueness is deliberately not part of this contract, because legitimate aliases share an identity.",
-          "type": "string",
-          "minLength": 1
-        },
+        "name": { "type": "string" },
+        "path": { "$ref": "#/$defs/session_project_path" },
+        "merge_key": { "type": "string", "description": "Canonical registry equality key, or the synthesized stored session path." },
         "scope": {
           "type": "object",
           "additionalProperties": false,
@@ -187,13 +188,23 @@
           "properties": { "kind": { "type": "string", "enum": ["global", "profile"] } }
         },
         "default_base_branch": {
-          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+          "type": ["string", "null"]
         },
         "registered": {
-          "description": "Carried on every row the producer emits, so it is required, not optional. `ProjectRead::registered` in src/server/runtime_ws.rs serialises it unconditionally; the client decoder requires it too (`ProjectRead::registered` in src/cli/runtime_read/dto.rs), so an absent flag is refused rather than guessed. It is part of the row's identity, not a filter: `validate_projects` in src/cli/runtime_read/dto.rs keys uniqueness on name, path and this flag together, so a synthesized row that stands in for a session's project path and the registry row it stands in for are two identities. `registered: false` is legal only in a profile list, never in the global registry.",
+          "description": "Required identity flag; synthesized rows exist only in their sessions' profile.",
           "type": "boolean"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "registered": { "const": true } } },
+          "then": { "properties": { "path": { "$ref": "#/$defs/stored_project_path" } } }
+        },
+        {
+          "if": { "properties": { "merge_key": { "const": "" } } },
+          "then": { "properties": { "registered": { "const": false }, "path": { "const": "" } } }
+        }
+      ]
     },
     "profile_read": {
       "type": "object",
@@ -217,12 +228,10 @@
       "additionalProperties": false,
       "required": ["branch", "main_repo_path", "managed_by_aoe", "base_branch"],
       "properties": {
-        "branch": { "$ref": "#/$defs/safe_text" },
-        "main_repo_path": { "$ref": "#/$defs/absolute_path" },
+        "branch": { "type": "string" },
+        "main_repo_path": { "$ref": "#/$defs/stored_project_path" },
         "managed_by_aoe": { "type": "boolean" },
-        "base_branch": {
-          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
-        }
+        "base_branch": { "type": ["string", "null"] }
       }
     },
     "workspace_repo": {
@@ -230,9 +239,9 @@
       "additionalProperties": false,
       "required": ["name", "source_path", "branch"],
       "properties": {
-        "name": { "$ref": "#/$defs/safe_text" },
+        "name": { "type": "string" },
         "source_path": { "$ref": "#/$defs/absolute_path" },
-        "branch": { "$ref": "#/$defs/safe_text" }
+        "branch": { "type": "string" }
       }
     },
     "session_read": {
@@ -266,9 +275,9 @@
       "properties": {
         "id": { "$ref": "#/$defs/safe_text" },
         "title": { "type": "string", "description": "Persisted display text, including empty titles and controls, is preserved as on local reads." },
-        "project_path": { "$ref": "#/$defs/stored_project_path" },
+        "project_path": { "$ref": "#/$defs/session_project_path" },
         "group_path": { "$ref": "#/$defs/group_path" },
-        "tool": { "$ref": "#/$defs/safe_text" },
+        "tool": { "type": "string" },
         "command": { "type": "string" },
         "profile": { "$ref": "#/$defs/profile_label" },
         "status": {
@@ -294,7 +303,7 @@
           "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
         },
         "last_error": {
-          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+          "type": ["string", "null"]
         },
         "archived_at": {
           "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]

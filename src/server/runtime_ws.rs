@@ -13,35 +13,28 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
+#[cfg(any(target_os = "linux", test))]
 use tokio::net::UnixStream;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 
 use serde::Serialize;
+#[cfg(any(target_os = "linux", test))]
 use tokio_tungstenite::tungstenite;
 
 use super::AppState;
+use crate::cli::runtime_read::dto::{SessionRead, WorkspaceRepo, WorktreeRead};
 use crate::session::{GroupTree, Instance, Storage};
 
-/// Wire generation 4 adds physical profile aliases and listed membership.
+/// Wire version with physical profile aliases and listed membership.
 pub(crate) const PROTOCOL_VERSION: u16 = 4;
-/// A stalled reader must not hold a connection slot, or a full disk rescan's
-/// worth of work, open indefinitely. Both transports spend this one budget,
-/// each for the whole connection from accept to close rather than per stage,
-/// and it matches the client's single read budget, so a peer that
-/// authenticates and then says nothing is bounded identically either way.
+/// Whole-connection budget shared by both transports and the read client.
 pub(crate) const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
-/// The message ceiling both transports hand tungstenite, and the ceiling this
-/// module refuses to send past. tungstenite's message limit is larger than the
-/// frame limit it was already accepting here, so the frame ceiling already
-/// matched `APPLICATION_LIMIT` on both routes while the WS route was accepting
-/// more than the UDS route did. One constant, so the two routes cannot drift
-/// apart again.
+/// Shared incoming and outgoing frame/message ceiling for both transports.
 pub(crate) const MESSAGE_LIMIT: usize = crate::cli::runtime_read::APPLICATION_LIMIT;
 /// The trusted namespace this build publishes for itself, and the name the
 /// UDS marker files carry.
@@ -51,31 +44,15 @@ pub(crate) const NAMESPACE: &str = if cfg!(debug_assertions) {
     "release:agent-of-empires"
 };
 
-/// How many runtime-read connections are admitted at once. The sample itself
-/// is single-flight, so this does not raise throughput; it bounds how many
-/// connections can be alive holding a slot and a cloned row set while they
-/// wait for that one sample.
+/// Bound admitted connections independently of the single-flight snapshot worker.
 pub(crate) const RUNTIME_READ_CONCURRENCY: usize = 8;
 
-pub async fn runtime_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
-    // The daemon-wide middleware also accepts browser cookies and query tokens.
-    // The runtime read contract accepts exactly one Authorization: Bearer header.
-    if !has_bearer_header(&headers) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
+pub async fn runtime_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
     // CityHall lockdown must not be bypassable by opening this route directly.
     if let Some(response) = super::api::cityhall_block(&state) {
         return response;
     }
-    // The whole read is one budget, as on the local socket: the two frames and
-    // the close. The response that admits the upgrade is written by the
-    // extractor, so the bound has to wrap the upgraded task itself: a peer
-    // that authenticates, upgrades and then stops reading must not hold this
-    // task, its connection slot and its sample for the life of the daemon.
+    // Bound the upgraded task, including a peer that stops reading.
     ws.max_message_size(MESSAGE_LIMIT)
         .max_frame_size(crate::cli::runtime_read::APPLICATION_LIMIT)
         .on_upgrade(move |socket| async move {
@@ -89,27 +66,6 @@ pub async fn runtime_ws(
         .into_response()
 }
 
-fn has_bearer_header(headers: &HeaderMap) -> bool {
-    let mut values = headers.get_all(header::AUTHORIZATION).iter();
-    let Some(value) = values.next() else {
-        return false;
-    };
-    if values.next().is_some() {
-        return false;
-    }
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return false;
-    };
-    let bytes = token.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 4096
-        && bytes
-            .iter()
-            .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b'"' && *byte != b'\\')
-}
 async fn serve_runtime_read(socket: WebSocket, state: Arc<AppState>) {
     run_read(ReadSocket::Web(socket), state, Owner::remote(), true).await;
 }
@@ -117,6 +73,7 @@ async fn serve_runtime_read(socket: WebSocket, state: Arc<AppState>) {
 /// The same two frames over the daemon's own UNIX socket. The peer is admitted
 /// by [`super::runtime_uds`], which checks the connecting uid before the
 /// upgrade, so the declared owner is this process's own uid.
+#[cfg(target_os = "linux")]
 pub(crate) async fn serve_runtime_read_uds(
     socket: tokio_tungstenite::WebSocketStream<UnixStream>,
     state: Arc<AppState>,
@@ -128,7 +85,7 @@ pub(crate) async fn serve_runtime_read_uds(
         );
         return;
     }
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::process::effective_uid();
     run_read(ReadSocket::Unix(socket), state, Owner::local(uid), false).await;
 }
 
@@ -136,6 +93,7 @@ pub(crate) async fn serve_runtime_read_uds(
 /// frames, same close. Only the socket and the declared owner differ.
 enum ReadSocket {
     Web(WebSocket),
+    #[cfg(any(target_os = "linux", test))]
     Unix(tokio_tungstenite::WebSocketStream<UnixStream>),
 }
 
@@ -146,6 +104,7 @@ impl ReadSocket {
                 .send(Message::Text(text.into()))
                 .await
                 .map_err(|_| ()),
+            #[cfg(any(target_os = "linux", test))]
             ReadSocket::Unix(socket) => socket
                 .send(tungstenite::Message::Text(text.into()))
                 .await
@@ -162,6 +121,7 @@ impl ReadSocket {
                     }
                 }
             }
+            #[cfg(any(target_os = "linux", test))]
             ReadSocket::Unix(socket) => {
                 while let Some(Ok(message)) = socket.next().await {
                     if matches!(message, tungstenite::Message::Close(_)) {
@@ -176,6 +136,7 @@ impl ReadSocket {
             ReadSocket::Web(socket) => {
                 let _ = socket.send(Message::Close(None)).await;
             }
+            #[cfg(any(target_os = "linux", test))]
             ReadSocket::Unix(socket) => {
                 let _ = socket.send(tungstenite::Message::Close(None)).await;
                 let _ = socket.close(None).await;
@@ -270,11 +231,9 @@ async fn run_read(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Contract Pack recording
-// ---------------------------------------------------------------------------
+// Recorded wire fixtures.
 
-/// A recorded exchange, with everything the recorder had to pin spelled out.
+/// Wire frames and identities for the fixture recorder.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub struct RecordedExchange {
@@ -284,9 +243,7 @@ pub struct RecordedExchange {
     pub snapshot: Vec<u8>,
 }
 
-/// Which transport the recorded exchange pretends to have arrived over. The
-/// local one declares the uid the peer would have; the remote one declares no
-/// uid at all, which is the whole difference between the two Hello frames.
+/// Recorded local transport declares the peer UID; remote transport does not.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
@@ -295,11 +252,7 @@ pub enum RecordedOwner {
     Remote,
 }
 
-/// Everything a recording pins so the same store always yields the same bytes.
-///
-/// A transcript is a frozen artefact, so the two things the daemon mints per
-/// process or per instant, the three identity UUIDs and the freshness clock,
-/// are the only inputs a recorder may not take from the environment.
+/// Pin minted identities and observation time for deterministic recorded bytes.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub struct RecordingPins {
@@ -353,10 +306,6 @@ pub fn record_exchange(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Runtime identity and the status-freshness sampler
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeIdentity {
     pub(crate) runtime_epoch: String,
@@ -364,10 +313,7 @@ pub(crate) struct RuntimeIdentity {
     pub(crate) runtime_instance_id: String,
 }
 
-/// Publication state of the freshness sampler. `successes` counts published
-/// samples: the public observed revision is that count and the snapshot cursor is
-/// that count plus one. `latched` is the overflow latch: once set no counter
-/// moves again and the public projection stays unavailable.
+/// Published revisions count successful samples; overflow latches unavailable freshness.
 #[derive(Default)]
 struct Sampler {
     successes: u64,
@@ -377,13 +323,9 @@ struct Sampler {
 struct RuntimeState {
     identity: RuntimeIdentity,
     sampler: Mutex<Sampler>,
-    /// The single sample in flight. A `std` mutex because the guard belongs to
-    /// the blocking sample rather than to the connection awaiting it, so a
-    /// cancelled read cannot release it while its work still runs.
+    /// The blocking worker owns sample exclusion, even if its caller is cancelled.
     flight: Mutex<()>,
-    /// The clock a read observes at. A seam and nothing more: `None` is the
-    /// wall clock, and a recording harness pins an instant so a transcript
-    /// is reproducible. The daemon itself never pins one.
+    /// Recordings may pin time; production uses the wall clock.
     pinned_now: Option<DateTime<Utc>>,
 }
 
@@ -407,19 +349,12 @@ impl RuntimeState {
 /// minted once and reused by every Hello this process emits.
 static RUNTIME: LazyLock<RuntimeState> = LazyLock::new(RuntimeState::new);
 
-/// The identities every Hello this process emits carries. The UDS publisher
-/// writes the same three values into its marker files, so a client can prove
-/// the daemon it reached is the one that published the socket.
+/// Handshake identities shared with the local publisher's marker pair.
 pub(crate) fn identity() -> &'static RuntimeIdentity {
     &RUNTIME.identity
 }
 
-/// The cursor a latched sampler publishes. Both counters are saturated, so
-/// there is no next value and the cursor freezes at the last one it could
-/// name. It cannot freeze at zero, which is the value the client refuses,
-/// because that would turn a freshness the daemon cannot report into a
-/// snapshot the client rejects outright, and `freshness_unavailable` into
-/// `schema_invalid`.
+/// Keep the latched cursor nonzero so unavailable freshness is not a malformed snapshot.
 const LATCHED_CURSOR: u64 = u64::MAX;
 
 fn publish_freshness(runtime: &RuntimeState, observed_at: DateTime<Utc>) -> (StatusFreshness, u64) {
@@ -454,10 +389,6 @@ fn unavailable() -> StatusFreshness {
         observed_at: None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Snapshot assembly (blocking: every source is a filesystem read)
-// ---------------------------------------------------------------------------
 
 struct Sampled {
     hello: HelloData,
@@ -674,8 +605,7 @@ fn build_snapshot(
         let scoped: Vec<&SessionRead> = sessions.iter().filter(|row| row.profile == name).collect();
         let mut projects = entry.projects.unwrap_or_default();
         drop_unusable_projects(&mut projects);
-        // Referential integrity: every session's project path is a member of its
-        // own profile's project list.
+        // Session project paths resolve through a profile or global registry.
         add_session_projects(&mut projects, &scoped, &global_projects);
         // Registry order, not a canonical sort: that is the order a local
         // `aoe project list` prints, and the wire carries the presentation.
@@ -783,14 +713,7 @@ fn build_snapshot(
     }
 }
 
-/// Drop a project row the client could not admit.
-///
-/// The client's contract requires an absolute path, because a relative one is
-/// not a path any session row can reference. A hand-edited `projects.json` is
-/// the one way a row gets one, and refusing a whole snapshot over a single row
-/// would fail every read command on every profile: so the row goes, in the
-/// same spirit as [`reconcile_legacy_rows`], and the client's own
-/// `valid_stored_project_path` stays fail-closed.
+/// Omit stored paths that cannot represent an absolute native directory.
 fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
     projects
         .retain(|project| crate::cli::runtime_read::dto::valid_stored_project_path(&project.path));
@@ -917,7 +840,7 @@ fn add_session_projects(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for session in sessions {
         let path = session.project_path.clone();
-        if !crate::cli::runtime_read::dto::valid_stored_project_path(&path)
+        if !crate::cli::runtime_read::dto::valid_session_project_path(&path)
             || known.contains(&path)
             || !seen.insert(path.clone())
         {
@@ -935,10 +858,6 @@ fn add_session_projects(
         });
     }
 }
-
-// ---------------------------------------------------------------------------
-// Wire DTOs
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
 struct HelloFrame<'a> {
@@ -972,10 +891,7 @@ struct SnapshotData {
     cursor: Cursor,
     health: SnapshotHealth,
     default_profile: Option<String>,
-    /// The name the daemon resolved as the default, published whatever
-    /// `default_profile` says and absent only when resolving would have
-    /// bootstrapped a profile, so a client can name the profile a stale
-    /// default points at.
+    /// Resolved default name, including a stale configuration, unless resolution would create it.
     resolved_default_profile: Option<String>,
     profiles: Vec<ProfileRead>,
     sessions: Vec<SessionRead>,
@@ -983,10 +899,7 @@ struct SnapshotData {
     status_freshness: StatusFreshness,
 }
 
-/// What the Hello says about one profile: its name, and whether this daemon
-/// could read it at all. The inventory is not repeated, because the Snapshot
-/// that follows carries every group and project of every profile and the
-/// client validates each of them there.
+/// Profile name and cached-data readiness; full inventory follows in Snapshot.
 #[derive(Serialize, Clone)]
 struct ProfileHello {
     name: String,
@@ -1096,15 +1009,11 @@ struct GroupRead {
 struct ProjectRead {
     name: String,
     path: String,
-    /// Opaque equality metadata: the project's identity as the *daemon's*
-    /// filesystem resolves it. The client merges on this and never on a path,
-    /// because a path it resolved would be a path on the wrong machine.
+    /// Daemon-resolved equality key; the client must not resolve remote paths locally.
     merge_key: String,
     scope: ProjectScope,
     default_base_branch: Option<String>,
-    /// True for a row the registry holds, false for one synthesized so a
-    /// session's project path resolves. A `aoe project list` prints only the
-    /// registered ones.
+    /// Registry rows are visible; session-path referential rows are not listings.
     registered: bool,
 }
 
@@ -1115,53 +1024,9 @@ enum ProjectScope {
     Profile,
 }
 
-#[derive(Serialize, Clone)]
-struct WorktreeRead {
-    branch: String,
-    main_repo_path: String,
-    managed_by_aoe: bool,
-    base_branch: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct WorkspaceRepo {
-    name: String,
-    source_path: String,
-    branch: String,
-}
-
-#[derive(Serialize, Clone)]
-struct SessionRead {
-    id: String,
-    title: String,
-    project_path: String,
-    group_path: String,
-    tool: String,
-    command: String,
-    profile: String,
-    status: &'static str,
-    state: &'static str,
-    created_at: String,
-    last_accessed_at: Option<String>,
-    idle_entered_at: Option<String>,
-    last_error: Option<String>,
-    archived_at: Option<String>,
-    trashed_at: Option<String>,
-    active_snoozed_until: Option<String>,
-    pinned_at: Option<String>,
-    agent_session_id: Option<String>,
-    parent_session_id: Option<String>,
-    has_worktree_info: bool,
-    has_managed_worktree: bool,
-    worktree: Option<WorktreeRead>,
-    workspace_repos: Vec<WorkspaceRepo>,
-}
-
 impl SessionRead {
     fn from_instance(inst: &Instance) -> Self {
-        // Stored order, the way the local projection emits it: sorting here
-        // would make `aoe list --json` order the array by the transport. The
-        // client's rule is identity, which the store already holds.
+        // Preserve stored workspace order, as the CLI JSON projection does.
         let workspace_repos: Vec<WorkspaceRepo> = inst
             .workspace_info
             .as_ref()
@@ -1184,8 +1049,8 @@ impl SessionRead {
             tool: inst.tool.clone(),
             command: inst.command.clone(),
             profile: inst.source_profile.clone(),
-            status: inst.status.wire_str(),
-            state: wire_state(inst),
+            status: inst.status.into(),
+            state: inst.effective_bucket().into(),
             created_at: crate::cli::list::display_timestamp(inst.created_at),
             last_accessed_at: timestamp(inst.last_accessed_at),
             idle_entered_at: timestamp(inst.idle_entered_at),
@@ -1217,16 +1082,6 @@ impl SessionRead {
     }
 }
 
-fn wire_state(inst: &Instance) -> &'static str {
-    if inst.trashed_at.is_some() {
-        "trashed"
-    } else if inst.archived_at.is_some() {
-        "archived"
-    } else {
-        "live"
-    }
-}
-
 fn timestamp(value: Option<DateTime<Utc>>) -> Option<String> {
     value.map(crate::cli::list::display_timestamp)
 }
@@ -1239,288 +1094,49 @@ mod tests {
     };
     use crate::session::{Group, Status, WorkspaceInfo, WorkspaceRepo as StoredRepo, WorktreeInfo};
 
-    /// One row's `required` list from the published document beside the
-    /// fixtures rather than from anything this module knows. `definition` of
-    /// `None` is the frame's own list, which is the one the top-level row
-    /// answers to.
-    #[cfg(debug_assertions)]
-    fn schema_required(document: &str, definition: Option<&str>) -> BTreeSet<String> {
-        let parsed = published_schema(document);
-        let node = match definition {
-            Some(definition) => &parsed["$defs"][definition],
-            None => &parsed,
-        };
-        node["required"]
-            .as_array()
-            .expect("every wire row requires its fields")
-            .iter()
-            .map(|name| name.as_str().expect("a field name").to_string())
-            .collect()
-    }
-
-    /// Every field a `$defs` entry declares, required or not. A row that is a
-    /// discriminated union requires only its discriminant.
-    #[cfg(debug_assertions)]
-    fn schema_properties(document: &str, definition: Option<&str>) -> BTreeSet<String> {
-        let parsed = published_schema(document);
-        let node = match definition {
-            Some(definition) => &parsed["$defs"][definition],
-            None => &parsed,
-        };
-        node["properties"]
-            .as_object()
-            .expect("every wire row declares its fields")
-            .keys()
-            .map(|name| name.to_string())
-            .collect()
-    }
-
-    /// Every `$defs` entry that names an object row the frame reaches.
-    ///
-    /// Found by following `$ref`s out of the document rather than by matching
-    /// a name suffix. A suffix filter silently drops every object row whose
-    /// name does not end in `_read` or `_repo`, and the dropped ones are not
-    /// incidental: the cursor, the freshness row and the health rows are
-    /// required on every frame, so a field added inside one of them was emitted
-    /// by the producer, absent from the schema, and let past by a gate whose
-    /// own comment says that is the shape it exists to catch.
-    #[cfg(debug_assertions)]
-    fn row_definitions(document: &str) -> BTreeSet<String> {
-        use crate::cli::runtime_read::pack::{HELLO_SCHEMA, SNAPSHOT_SCHEMA};
-        let published = published_schema(document);
-        let defs = published["$defs"]
-            .as_object()
-            .expect("$defs is an object")
-            .clone();
-        let mut reached: BTreeSet<String> = BTreeSet::new();
-        let mut pending = vec![published.clone()];
-        while let Some(node) = pending.pop() {
-            let Some(reference) = node.get("$ref").and_then(|reference| reference.as_str()) else {
-                match node {
-                    // `$defs` is the dictionary rows are pulled out of, so
-                    // walking into it would reach every definition the schema
-                    // defines rather than every one this frame uses.
-                    serde_json::Value::Object(fields) => pending.extend(
-                        fields
-                            .into_iter()
-                            .filter(|(key, _)| key != "$defs")
-                            .map(|(_, value)| value),
-                    ),
-                    serde_json::Value::Array(items) => pending.extend(items),
-                    _ => {}
-                }
-                continue;
-            };
-            let name = reference
-                .rsplit('/')
-                .next()
-                .expect("a $ref names a definition")
-                .to_string();
-            if !reached.insert(name.clone()) {
-                continue;
-            }
-            pending.push(
-                defs.get(&name)
-                    .unwrap_or_else(|| panic!("{document} references an undefined {name}"))
-                    .clone(),
-            );
-        }
-        // A row is a shape. A scalar format and an enum have no fields of their
-        // own to hold the producer to, and their parents require them by name.
-        let rows: BTreeSet<String> = reached
-            .into_iter()
-            .filter(|name| defs[name]["type"] == "object")
-            .collect();
-        assert_eq!(
-            document == SNAPSHOT_SCHEMA,
-            rows.contains("session_read"),
-            "the documents are not the ones this gate reads"
-        );
-        assert_eq!(
-            document == HELLO_SCHEMA,
-            rows.contains("profile_hello"),
-            "the documents are not the ones this gate reads"
-        );
-        rows
-    }
-
-    #[cfg(debug_assertions)]
-    fn published_schema(document: &str) -> serde_json::Value {
-        let text =
-            std::fs::read_to_string(crate::cli::runtime_read::pack::pack_root().join(document))
-                .expect("the published schema");
-        serde_json::from_str(&text).expect("it is JSON")
-    }
-
-    /// Every field the producer serialises is one the published schema
-    /// requires, in both frames and in every row either one names.
-    ///
-    /// The pack holds recorded transcripts to the schemas, which proves the
-    /// two agree with each other and says nothing about either against the
-    /// producer. A field the producer grew and the schema and every recorded
-    /// frame left out is the shape that passes: the one this gate is for, and
-    /// the one no version number would catch. Checking three of the rows left
-    /// the rest unchecked, and a field added inside a worktree or a workspace
-    /// repo passed while the same field added to a session row did not.
-    ///
-    /// The last assertion is what makes this a gate rather than a list: a
-    /// definition the schemas gain and this table does not account for is a
-    /// row nothing holds the producer to, so adding one fails here until the
-    /// sample grows a row of that shape.
     #[test]
     #[serial_test::serial]
-    // The published schemas it reads live behind the pack module's debug gate,
-    // so this gate is where a release test build would otherwise name a module
-    // that is not compiled.
-    #[cfg(debug_assertions)]
-    fn every_field_the_producer_emits_is_required_by_the_published_schema() {
-        use crate::cli::runtime_read::pack::{HELLO_SCHEMA, SNAPSHOT_SCHEMA};
+    fn emitted_nested_rows_satisfy_the_published_wire_schemas() {
+        use crate::cli::runtime_read::pack::{validate_data, HELLO_SCHEMA, SNAPSHOT_SCHEMA};
         let _home = TempHome::new();
         let mut session = named("a", "main");
         session.group_path = "team/sub".into();
-        // A row the gate cannot see is a row nothing holds the producer to,
-        // so the sample carries one of every shape the two schemas name.
+        session.tool = "custom\tagent".into();
+        let mut repository = repo("beta\t", "/srv/beta\t");
+        repository.branch = "feature\u{202e}review".into();
         session.worktree_info = Some(WorktreeInfo {
-            branch: "feature".into(),
-            main_repo_path: "/repo".into(),
+            branch: "feature\u{202e}review".into(),
+            main_repo_path: "/repo/".into(),
             managed_by_aoe: true,
             created_at: Utc::now(),
-            base_branch: Some("main".into()),
+            base_branch: Some("base\u{2066}review".into()),
         });
         session.workspace_info = Some(WorkspaceInfo {
             branch: "feature".into(),
             workspace_dir: "/repo/.aoe/workspace".into(),
             created_at: Utc::now(),
             cleanup_on_delete: true,
-            repos: vec![repo("beta", "/srv/beta")],
+            repos: vec![repository],
         });
+        let mut empty_path = named("empty-path", "main");
+        empty_path.project_path.clear();
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &[session],
+            &[session, empty_path],
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
-        let hello: serde_json::Value =
-            serde_json::from_slice(&hello_frame(&sampled)).expect("the Hello is JSON");
-        let snapshot: serde_json::Value =
-            serde_json::from_slice(&snapshot_frame(&sampled)).expect("the Snapshot is JSON");
-        let hello = &hello["data"];
-        let snapshot = &snapshot["data"];
-        let profile = &snapshot["profiles"][0];
-        let row = &snapshot["sessions"][0];
-        let emitted: [(&str, Option<&str>, &serde_json::Value); 19] = [
-            (HELLO_SCHEMA, None, hello),
-            (HELLO_SCHEMA, Some("owner"), &hello["owner"]),
-            (HELLO_SCHEMA, Some("profile_hello"), &hello["profiles"][0]),
-            (SNAPSHOT_SCHEMA, None, snapshot),
-            (SNAPSHOT_SCHEMA, Some("session_read"), row),
-            (SNAPSHOT_SCHEMA, Some("profile_read"), profile),
-            (
-                SNAPSHOT_SCHEMA,
-                Some("project_read"),
-                &profile["projects"][0],
-            ),
-            (SNAPSHOT_SCHEMA, Some("group_read"), &profile["groups"][0]),
-            (SNAPSHOT_SCHEMA, Some("worktree_read"), &row["worktree"]),
-            (
-                SNAPSHOT_SCHEMA,
-                Some("workspace_repo"),
-                &row["workspace_repos"][0],
-            ),
-            // The rows the frame reaches that no `_read` or `_repo` name marks:
-            // the cursor and the freshness row are required on every frame, and
-            // the health shapes carry the components the answer rests on.
-            (SNAPSHOT_SCHEMA, Some("cursor"), &snapshot["cursor"]),
-            (
-                SNAPSHOT_SCHEMA,
-                Some("snapshot_health"),
-                &snapshot["health"],
-            ),
-            (
-                SNAPSHOT_SCHEMA,
-                Some("component_health"),
-                &snapshot["health"]["global_enumeration"],
-            ),
-            (SNAPSHOT_SCHEMA, Some("profile_health"), &profile["health"]),
-            (
-                SNAPSHOT_SCHEMA,
-                Some("status_freshness"),
-                &snapshot["status_freshness"],
-            ),
-            (HELLO_SCHEMA, Some("aggregate_health"), &hello["health"]),
-            (
-                HELLO_SCHEMA,
-                Some("profile_health"),
-                &hello["profiles"][0]["health"],
-            ),
-            (
-                HELLO_SCHEMA,
-                Some("component_health"),
-                &hello["profiles"][0]["health"]["profile_enumeration"],
-            ),
-            (
-                HELLO_SCHEMA,
-                Some("status_freshness"),
-                &hello["status_freshness"],
-            ),
-        ];
-        let mut checked: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
-        for (document, definition, value) in emitted {
-            let label = definition.unwrap_or("the frame itself");
-            let object = value
-                .as_object()
-                .unwrap_or_else(|| panic!("{label} is an object"));
-            let required = schema_required(document, definition);
-            let declared = schema_properties(document, definition);
-            // Both directions, and neither is the other's. A field the producer
-            // grew that the schema left out is the shape this gate exists for,
-            // and `additionalProperties: false` agrees with it. A field the
-            // schema demands that the producer does not send would reach a
-            // client as `schema_invalid` instead.
-            //
-            // The test is against `properties` rather than `required` because a
-            // health row is a discriminated union: `kind` alone is required and
-            // `code` belongs to the degraded arm only, so demanding that every
-            // emitted field be required rejects the shape rather than a
-            // regression. Every row in the pack but those has no optional
-            // field at all, so on those the two tests are the same test.
-            let unknown: Vec<&String> = object
-                .keys()
-                .filter(|key| !declared.contains(*key))
-                .collect();
-            assert!(
-                unknown.is_empty(),
-                "{label} emits fields the published schema does not declare: {unknown:?}"
-            );
-            let unsent: Vec<&String> = required
-                .iter()
-                .filter(|key| !object.contains_key(*key))
-                .collect();
-            assert!(
-                unsent.is_empty(),
-                "{label} leaves fields the published schema requires unsent: {unsent:?}"
-            );
-            if let Some(definition) = definition {
-                checked
-                    .entry(document)
-                    .or_default()
-                    .insert(definition.to_string());
-            }
-        }
-        for document in [HELLO_SCHEMA, SNAPSHOT_SCHEMA] {
-            assert_eq!(
-                row_definitions(document),
-                checked.get(document).cloned().unwrap_or_default(),
-                "{document} names a row this gate does not check"
-            );
+        for (schema, bytes) in [
+            (HELLO_SCHEMA, hello_frame(&sampled)),
+            (SNAPSHOT_SCHEMA, snapshot_frame(&sampled)),
+        ] {
+            let frame: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            validate_data(schema, &frame["data"]).unwrap();
         }
     }
 
-    /// The wire carries a session's repos in the order the workspace stored
-    /// them, because that is the order the local projection emits them in and
-    /// `aoe list --json` prints the array. Sorting here would make the array's
-    /// order depend on whether a daemon is publishing.
+    /// Preserve workspace repo order for local CLI parity.
     #[test]
     fn the_producer_keeps_workspace_repos_in_stored_order() {
         let mut instance = Instance::new("s1", "/srv/repo");
@@ -1833,9 +1449,7 @@ mod tests {
         );
     }
 
-    /// A read must not write. The projection path may read a registry with a
-    /// row that cannot deserialise, but it must not materialise a quarantine
-    /// sidecar beside a store it only reads.
+    /// Read-only projection must not create quarantine sidecars.
     #[test]
     #[serial_test::serial]
     fn a_served_read_leaves_the_profile_directory_untouched() {
@@ -1897,10 +1511,7 @@ mod tests {
         contents
     }
 
-    /// Deleting the configured default leaves the config naming a profile that
-    /// is gone. The local path refuses (`resolve_existing_profile`), so the
-    /// served path publishes no default at all rather than marking some other
-    /// profile `(default)` and serving its sessions.
+    /// A missing configured default must not silently select another profile.
     #[test]
     #[serial_test::serial]
     fn a_deleted_configured_default_publishes_no_default() {
@@ -1930,22 +1541,20 @@ mod tests {
         );
     }
 
-    /// Points the app dir at an empty temporary XDG base for the duration of one
-    /// test, so a snapshot is assembled from fixtures rather than the developer's
-    /// real profiles and project registries. The environment guard holds the
-    /// process-wide lock, and drops before the directory it points at.
+    /// Owned XDG fixture with process-global environment exclusion.
     struct TempHome {
-        _env: crate::server::test_support::RuntimeEnvGuard,
         _dir: tempfile::TempDir,
+        _env: crate::server::test_support::RuntimeEnvGuard,
     }
 
     impl TempHome {
         fn new() -> Self {
+            let mut env = crate::server::test_support::RuntimeEnvGuard::read_lock();
             let dir = tempfile::tempdir().expect("temp home");
-            let env = crate::server::test_support::RuntimeEnvGuard::set(dir.path());
+            env.bind(dir.path());
             Self {
-                _env: env,
                 _dir: dir,
+                _env: env,
             }
         }
 
@@ -1988,8 +1597,7 @@ mod tests {
         }
     }
 
-    /// The two frames the server emits, decoded by the client's real decoders and
-    /// validators: any field-name, member-order or invariant drift fails here.
+    /// The emitted frames satisfy the real client decoder and cross-message invariants.
     #[test]
     #[serial_test::serial]
     fn emitted_frames_satisfy_the_client_wire_contract() {
@@ -2074,12 +1682,7 @@ mod tests {
         assert_eq!(first.data.cursor.epoch, second.data.cursor.epoch);
     }
 
-    /// Once the counter would wrap, the projection latches to unavailable and no
-    /// counter moves again. What matters is the consequence on the client: the
-    /// sample it produces has to survive the real decoder, or the read is
-    /// refused as `schema_invalid` and `freshness_unavailable`, which is in
-    /// the Contract Pack's code set and in `EMITTABLE_CODES`, can never be
-    /// emitted at all.
+    /// Counter exhaustion is unavailable freshness, not a malformed snapshot.
     #[test]
     #[serial_test::serial]
     fn a_latched_sampler_still_produces_a_snapshot_the_client_accepts() {
@@ -2286,15 +1889,6 @@ mod tests {
         validate_snapshot(&snapshot).expect("the snapshot is projectable");
     }
 
-    #[test]
-    fn runtime_ws_requires_one_bearer_header() {
-        let mut headers = HeaderMap::new();
-        assert!(!has_bearer_header(&headers));
-        headers.append(header::AUTHORIZATION, "Bearer token".parse().unwrap());
-        assert!(has_bearer_header(&headers));
-        headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
-        assert!(!has_bearer_header(&headers));
-    }
     #[test]
     #[serial_test::serial]
     fn recording_an_empty_store_does_not_create_app_directories() {
@@ -2883,6 +2477,25 @@ mod tests {
             }
             let state = super::super::test_support::build_test_app_state(Vec::new());
             super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+            std::fs::remove_file(root.join("outside-a")).unwrap();
+            std::os::unix::fs::symlink(b.path(), root.join("outside-a")).unwrap();
+            assert!(!cached_data_healthy(
+                &cached_snapshot(&state).await,
+                "outside-a"
+            ));
+            std::fs::remove_file(root.join("outside-a")).unwrap();
+            std::os::unix::fs::symlink(a.path(), root.join("outside-a")).unwrap();
+            let restored = cached_snapshot(&state).await;
+            assert!(cached_data_healthy(&restored, "outside-a"));
+            assert_eq!(
+                restored
+                    .sessions
+                    .iter()
+                    .find(|row| row.profile == "outside-a")
+                    .unwrap()
+                    .title,
+                "store-a"
+            );
             std::fs::remove_file(root.join("outside-a")).unwrap();
             std::os::unix::fs::symlink(b.path(), root.join("outside-a")).unwrap();
             if !surviving_alias {

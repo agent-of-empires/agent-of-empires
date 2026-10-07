@@ -1,10 +1,8 @@
 use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::Read;
-use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,36 +12,30 @@ use tokio::time::Instant;
 
 use super::dto::{valid_namespace, valid_uuid};
 use super::ReadFailure;
+use crate::process::runtime_io::{self as os, validate_posix_acl, AclError};
+#[cfg(test)]
+use crate::process::runtime_io::{
+    validate_acl_value, ACL_GROUP, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER, ACL_USER, ACL_USER_OBJ,
+    ACL_VERSION,
+};
 use crate::server::runtime_uds::{
-    is_temporary_of, LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, SCHEMA, SOCKET_FILE,
-    TEMPORARY_SEPARATOR,
+    is_temporary_of, LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, PUBLISHER_LOCK_FILE, SCHEMA,
+    SOCKET_FILE, TEMPORARY_SEPARATOR,
 };
 
 const MARKER_LIMIT: u64 = 64 * 1024;
-/// How long the client waits before re-admitting after a republication it
-/// caught mid-flight. Short enough that a read which raced a publication is
-/// indistinguishable from one that did not, long enough not to spin on a
-/// namespace that is genuinely being rewritten.
+/// Backoff avoids spinning within the bounded publication-establishment budget.
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TrustedPathError {
     Missing,
     Invalid,
-    /// A component of the walk that resolved and was still refused, with
-    /// everything the refusal has to say about it. The variant exists so the
-    /// operator is told *which* directory and *what* to do about it: the
-    /// refusal itself is unchanged, it only stops being silent.
+    /// An inadmissible directory with an actionable diagnostic.
     Refused(RefusedComponent),
 }
 
-/// One refused directory of the walk, and the sentence the operator gets.
-///
-/// The path is the component as the walk reached it, the mode is the one read
-/// off the descriptor, and the remedy is the command that clears this
-/// particular cause. Both are static because they are the walk's own rules:
-/// there is a closed set of reasons a component can be refused for, and each
-/// one has one fix.
+/// Refused path component, descriptor mode and actionable cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RefusedComponent {
     path: PathBuf,
@@ -62,13 +54,11 @@ impl RefusedComponent {
         }
     }
 
-    /// The refusal as the operator reads it: what was refused, what is wrong
-    /// with it, and the one command that fixes it. The mode is printed as
-    /// octal because that is the only spelling `chmod` accepts.
+    /// Identify the refused directory, its mode, cause and safe remedy.
     fn message(&self) -> String {
         format!(
             "refused to read the daemon's runtime state: {} is {} (mode {}).\n\
-             Fix it with: {}\n",
+             Resolve this by: {}\n",
             self.path.display(),
             self.cause,
             self.mode,
@@ -176,20 +166,8 @@ pub(crate) struct Admission {
     _lock: File,
 }
 
-/// Admit the local read, retrying for as long as the establishment budget
-/// lasts.
-///
-/// A single attempt turns a publication race into a refusal: a daemon that
-/// republishes between the client's walk and its marker read leaves the
-/// markers describing a process that is no longer the one holding the socket,
-/// which is `marker_identity`: a true statement about a state that lasts
-/// microseconds. So that code alone is re-admitted rather than returned, and
-/// only an exhausted budget turns the last refusal into the answer. Every
-/// other code is final, including the `marker_invalid` that says the artifacts
-/// are present but not trustworthy, and including `marker_missing`, which is
-/// the one refusal the local command path is allowed to take over: it now
-/// covers a provably dead publisher as well as an empty namespace, so "no
-/// daemon is publishing here".
+/// Retry publication identity races within the establishment budget.
+/// Untrusted artifacts refuse; absent or provably dead publication permits disk fallback.
 pub(crate) fn connect(
     establishment_deadline: Instant,
 ) -> impl std::future::Future<Output = Result<UdsConnection, ReadFailure>> {
@@ -250,9 +228,6 @@ fn trusted_path_failure(error: TrustedPathError) -> ReadFailure {
     match error {
         TrustedPathError::Missing => ReadFailure::pre("marker_missing"),
         TrustedPathError::Invalid => ReadFailure::pre("marker_invalid"),
-        // The same code and the same exit, with the operator's own sentence
-        // under them: the walk is not admitting anything it refused before, it
-        // is only saying which directory and which fix.
         TrustedPathError::Refused(component) => {
             ReadFailure::pre_exact("marker_invalid", component.message())
         }
@@ -273,25 +248,63 @@ fn app_path_and_home() -> Result<(PathBuf, PathBuf), TrustedPathError> {
 
 pub(crate) fn existing_app_namespace() -> Result<OwnedNamespace, TrustedPathError> {
     let (path, home) = app_path_and_home()?;
-    let euid = unsafe { libc::geteuid() };
-    let dir = open_trusted_directory(&path, euid)?;
-    // The producer's own constant, not a second spelling of it: a divergence
-    // would send this client to a directory nobody published into, which
-    // arrives as `marker_missing` and silently answers from the local store.
-    let name = crate::server::runtime_ws::NAMESPACE;
+    let euid = crate::process::effective_uid();
+    let dir = match open_trusted_directory(&path, euid) {
+        Ok(dir) => dir,
+        Err(TrustedPathError::Refused(_)) if namespace_is_unpublished(&path, euid) => {
+            return Err(TrustedPathError::Missing);
+        }
+        Err(error) => return Err(error),
+    };
     Ok(OwnedNamespace {
-        name: name.to_string(),
+        name: crate::server::runtime_ws::NAMESPACE.to_string(),
         home,
         dir,
     })
 }
 
+// Observes absence only; this descriptor can never authorize a daemon connection.
+fn namespace_is_unpublished(path: &Path, euid: u32) -> bool {
+    let dir = match walk_directory(path, euid, false) {
+        Ok(dir) => dir,
+        Err(TrustedPathError::Missing) => return true,
+        Err(_) => return false,
+    };
+    let Ok(path) = anchored_child_path(dir.as_raw_fd(), ".") else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let bytes = name.as_encoded_bytes();
+        if bytes.starts_with(b"runtime.")
+            || bytes.starts_with(b".runtime.")
+            || bytes.starts_with(b"lifetime.lock")
+            || bytes.starts_with(b"publisher.lock")
+        {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, TrustedPathError> {
+    walk_directory(path, euid, true)
+}
+
+fn walk_directory(path: &Path, euid: u32, admission: bool) -> Result<OwnedFd, TrustedPathError> {
     if !path.is_absolute() {
         return Err(TrustedPathError::Invalid);
     }
     let root = open_dir(Path::new("/"))?;
-    validate_directory_stat(&root, euid, false, true, Path::new("/"))?;
+    if admission {
+        validate_directory_stat(&root, euid, false, true, Path::new("/"))?;
+    }
     let components: Vec<CString> = path
         .components()
         .skip(1)
@@ -306,115 +319,108 @@ pub(crate) fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, 
 
     let mut current = root;
     let count = components.len();
-    // The path of the component the cursor is on, rebuilt as the walk
-    // descends, so a refusal names the directory that was refused rather than
-    // the walk it was refused in.
+    // Keep the encountered spelling for actionable refusals.
     let mut walked = PathBuf::from("/");
     for (index, component) in components.into_iter().enumerate() {
         let final_component = index + 1 == count;
         walked.push(Path::new(OsStr::from_bytes(component.as_bytes())));
-        // A component that does not exist means the app directory does not
-        // exist, wherever in the chain it is: a fresh home has no
-        // `~/.local` to hold one. Every other errno keeps its own class, so
-        // an unreadable or non-directory component is still a refusal rather
-        // than an absence.
+        // A missing ancestor is namespace absence; other open failures remain refusals.
         let next =
             open_dir_at(current.as_raw_fd(), &component, final_component).map_err(|error| {
-                if error.raw_os_error() == Some(libc::ENOENT) {
+                if error.kind() == std::io::ErrorKind::NotFound {
                     TrustedPathError::Missing
                 } else {
                     unopenable_component(&walked, &error)
                 }
             })?;
-        // Every component that resolves is verified by descriptor, whichever
-        // component of the path it was reached through: ownership, the
-        // group/other-write allowance, the sticky-root ancestor rule and the
-        // POSIX ACL are all read off the opened directory, never off the
-        // path.
-        validate_directory_stat(&next, euid, final_component, true, &walked)?;
+        // Connection trust is checked on opened objects, never on their pathnames.
+        if admission {
+            validate_directory_stat(&next, euid, final_component, true, &walked)?;
+        }
         current = next;
     }
     Ok(current)
 }
 
-/// A component that exists but could not be opened is a refusal, and the
-/// errno says which one: each of these has its own fix, and the operator is
-/// the one who has to apply it.
+/// Refuse an existing path component with an actionable repair.
 fn unopenable_component(path: &Path, error: &std::io::Error) -> TrustedPathError {
-    let (cause, remedy) = match error.raw_os_error() {
-        Some(libc::ELOOP) => (
+    let (cause, remedy) = match os::directory_open_failure(error) {
+        os::DirectoryOpenFailure::Symlink => (
             "a symlink, and the app directory may not be one",
             "rm {path} && mkdir -p {path}",
         ),
-        Some(libc::ENOTDIR) => (
+        os::DirectoryOpenFailure::NotDirectory => (
             "not a directory, where the walk needs one",
             "rm {path} && mkdir -p {path}",
         ),
-        Some(libc::EACCES) | Some(libc::EPERM) => (
+        os::DirectoryOpenFailure::Permission => (
             "not readable or searchable by this user",
             "chmod u+rwx {path}",
         ),
-        _ => (
+        os::DirectoryOpenFailure::Other => (
             "not a directory this user may open",
-            "chown $(id -u) {path} && chmod u+rwx {path}",
+            "Run as the directory's owner, or select HOME/XDG_CONFIG_HOME for the intended user.",
         ),
     };
-    // The mode is read from the name itself, which is what the operator sees
-    // when they run `ls -ld`; a name that resolves to nothing usable has no
-    // better spelling than that.
+    // Report the mode of the path the operator can inspect.
     let mode = std::fs::symlink_metadata(path)
-        .map(|meta| meta.permissions().mode() & 0o7777)
+        .map(|meta| os::metadata_mode(&meta) & 0o7777)
         .unwrap_or(0);
     TrustedPathError::Refused(RefusedComponent::new(path, mode, cause, remedy))
 }
 
 fn open_dir(path: &Path) -> Result<OwnedFd, TrustedPathError> {
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| TrustedPathError::Invalid)?;
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    fd_to_owned(fd).map_err(|_| TrustedPathError::Invalid)
+    os::open_directory(path).map_err(|_| TrustedPathError::Invalid)
 }
 
-/// Open one component of the walk.
-///
-/// `O_NOFOLLOW` guards the final component only, the same convention the hook
-/// guard uses (`src/hooks/dir_guard.rs`). A prefix symlink, a home reached
-/// through one or macOS `/tmp` → `/private/tmp`, is followed and the
-/// directory it resolves to is verified by descriptor, which is where the
-/// ownership, mode, sticky-root and ACL checks are read from. A symlinked
-/// *final* component stays a refusal, because that would let the app directory
-/// itself be swapped for an attacker-chosen inode.
 fn open_dir_at(
     parent: RawFd,
     component: &CString,
     final_component: bool,
 ) -> std::io::Result<OwnedFd> {
-    let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    if final_component {
-        flags |= libc::O_NOFOLLOW;
-    }
-    let fd = unsafe { libc::openat(parent, component.as_ptr(), flags) };
-    fd_to_owned(fd)
+    os::open_directory_at(parent, component, final_component)
 }
 
-fn fd_to_owned(fd: RawFd) -> std::io::Result<OwnedFd> {
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
+fn validate_directory_owner(
+    stat: &os::Stat,
+    euid: u32,
+    final_component: bool,
+    path: &Path,
+) -> Result<(), TrustedPathError> {
+    let mode = stat.st_mode & 0o7777;
+    if !directory_stat(stat) {
+        return Err(TrustedPathError::Refused(RefusedComponent::new(
+            path,
+            mode,
+            "not a directory",
+            "Select a real directory at {path}; inspect the existing path before replacing it.",
+        )));
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    if stat.st_mode & 0o111 == 0 {
+        return Err(TrustedPathError::Refused(RefusedComponent::new(
+            path,
+            mode,
+            "not searchable by its own owner",
+            "chmod u+x {path}",
+        )));
+    }
+    let owned = if final_component {
+        stat.st_uid == euid
+    } else {
+        stat.st_uid == 0 || stat.st_uid == euid
+    };
+    if !owned {
+        return Err(TrustedPathError::Refused(RefusedComponent::new(
+            path,
+            mode,
+            "owned by another user",
+            "Run as the directory's owner, or select HOME/XDG_CONFIG_HOME for the intended user.",
+        )));
+    }
+    Ok(())
 }
 
-/// Verify one component of the walk by descriptor, naming the component and
-/// the fix in every refusal it raises.
-///
-/// `path` is the component as the walk reached it, which is what the operator
-/// can act on: the same directory reached through a symlinked prefix is
-/// reported at the path the walk took, because that is the one they can
-/// `chmod`.
+/// Verify the opened directory; retain the encountered spelling for diagnostics.
 fn validate_directory_stat(
     file: &OwnedFd,
     euid: u32,
@@ -441,32 +447,9 @@ fn validate_directory_stat(
         )));
     }
     if root_check {
-        let searchable = stat.st_mode & 0o111 != 0;
-        if !searchable {
-            return Err(TrustedPathError::Refused(RefusedComponent::new(
-                path,
-                mode,
-                "not searchable by its own owner",
-                "chmod u+x {path}",
-            )));
-        }
-        let owned = if final_component {
-            stat.st_uid == euid
-        } else {
-            stat.st_uid == 0 || stat.st_uid == euid
-        };
-        if !owned {
-            return Err(TrustedPathError::Refused(RefusedComponent::new(
-                path,
-                mode,
-                "owned by another user",
-                "chown $(id -u) {path}",
-            )));
-        }
+        validate_directory_owner(&stat, euid, final_component, path)?;
     }
-    // A named write is a fact read off the ACL; an ACL this walk cannot parse
-    // is a component it cannot admit, and the two sentences are different
-    // because the operator can only act on the first by reading it.
+    // Distinguish a named write from an ACL that cannot be verified.
     validate_posix_acl(file.as_raw_fd()).map_err(|cause| {
         let message = match cause {
             AclError::NamedWrite => {
@@ -484,140 +467,20 @@ fn validate_directory_stat(
     Ok(())
 }
 
-/// Whether group or other write bits are tolerable on this component of the
-/// walk. A non-final ancestor is tolerable when it is root-owned and sticky:
-/// a stranger may create entries but may not rename or replace one that
-/// belongs to somebody else, which is what `/tmp` offers and what a test
-/// namespace lives under. The final component has no such protection, and a
-/// sticky one would let its own owner be replaced, so it stays private.
-fn group_other_writes_allowed(stat: &libc::stat, final_component: bool) -> bool {
+/// Only root-owned sticky ancestors may be writable; the app directory stays private.
+fn group_other_writes_allowed(stat: &os::Stat, final_component: bool) -> bool {
     stat.st_mode & 0o022 == 0
-        || (!final_component && stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0)
+        || (!final_component
+            && stat.st_uid == 0
+            && stat.st_mode & crate::process::runtime_io::STICKY != 0)
 }
-
-fn validate_posix_acl(fd: RawFd) -> Result<(), AclError> {
-    let names = xattr_names(fd).map_err(|_| AclError::Unverifiable)?;
-    let Some(name) = names
-        .into_iter()
-        .find(|name| name.as_slice() == b"system.posix_acl_access")
-    else {
-        return Ok(());
-    };
-    validate_acl_value(&xattr_value(fd, &name).map_err(|_| AclError::Unverifiable)?)
-}
-
-fn xattr_names(fd: RawFd) -> Result<Vec<Vec<u8>>, TrustedPathError> {
-    let needed = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
-    if needed < 0 {
-        let error = std::io::Error::last_os_error();
-        return if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::ENOENT)) {
-            Ok(Vec::new())
-        } else {
-            Err(TrustedPathError::Invalid)
-        };
-    }
-    if needed == 0 {
-        return Ok(Vec::new());
-    }
-    let mut bytes = vec![0u8; needed as usize];
-    let actual = unsafe { libc::flistxattr(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
-    if actual < 0 {
-        return Err(TrustedPathError::Invalid);
-    }
-    bytes.truncate(actual as usize);
-    Ok(bytes
-        .split(|byte| *byte == 0)
-        .filter(|name| !name.is_empty())
-        .map(|name| name.to_vec())
-        .collect())
-}
-
-fn xattr_value(fd: RawFd, name: &[u8]) -> Result<Vec<u8>, TrustedPathError> {
-    let c_name = CString::new(name).map_err(|_| TrustedPathError::Invalid)?;
-    let needed = unsafe { libc::fgetxattr(fd, c_name.as_ptr(), std::ptr::null_mut(), 0) };
-    if needed < 0 {
-        return Err(TrustedPathError::Invalid);
-    }
-    let mut value = vec![0u8; needed as usize];
-    let actual =
-        unsafe { libc::fgetxattr(fd, c_name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
-    if actual < 0 {
-        return Err(TrustedPathError::Invalid);
-    }
-    value.truncate(actual as usize);
-    Ok(value)
-}
-
-/// The kernel serves `system.posix_acl_access` in its binary form: a 4-byte
-/// little-endian version, then 8-byte entries of a little-endian `u16` tag, a
-/// little-endian `u16` of permission bits and a little-endian `u32` id. Only a
-/// *named* user or group holding `w` is refused here: the base owner, group
-/// and other entries are already reflected in the directory mode, and the
-/// mask entry applies to them. Anything this code cannot read is a refusal
-/// too, so a value it cannot interpret is never treated as a chain it may
-/// trust.
-fn validate_acl_value(value: &[u8]) -> Result<(), AclError> {
-    let header = value.get(..4).ok_or(AclError::Unverifiable)?;
-    if u32::from_le_bytes([header[0], header[1], header[2], header[3]]) != ACL_VERSION {
-        // A version this code does not know carries entries of an unknown
-        // width, so nothing in it can be read as a named write or as safe.
-        return Err(AclError::Unverifiable);
-    }
-    let entries = value[4..].chunks_exact(ACL_ENTRY_LEN);
-    if value[4..].len() % ACL_ENTRY_LEN != 0 {
-        return Err(AclError::Unverifiable);
-    }
-    for entry in entries {
-        let tag = u16::from_le_bytes([entry[0], entry[1]]);
-        let permissions = u16::from_le_bytes([entry[2], entry[3]]);
-        let Ok(tag) = u8::try_from(tag) else {
-            return Err(AclError::Unverifiable);
-        };
-        if !matches!(
-            tag,
-            ACL_USER_OBJ | ACL_USER | ACL_GROUP_OBJ | ACL_GROUP | ACL_MASK | ACL_OTHER
-        ) {
-            return Err(AclError::Unverifiable);
-        }
-        if permissions & !u16::from(ACL_PERMISSION_MASK) != 0 {
-            return Err(AclError::Unverifiable);
-        }
-        // A base entry is the directory mode; only a named user or group is a
-        // grant the mode cannot show.
-        if matches!(tag, ACL_USER | ACL_GROUP) && permissions & u16::from(ACL_WRITE) != 0 {
-            return Err(AclError::NamedWrite);
-        }
-    }
-    Ok(())
-}
-
-/// The two ways a chain can fail to be admissible, told apart because the
-/// operator's sentence differs: a named write is a fact this walk read off the
-/// ACL, and anything else is an admission this walk could not complete.
-#[derive(Debug, PartialEq, Eq)]
-enum AclError {
-    NamedWrite,
-    Unverifiable,
-}
-
-/// The version the kernel writes: little-endian 2, the only layout there is.
-const ACL_VERSION: u32 = 2;
-const ACL_ENTRY_LEN: usize = 8;
-const ACL_USER_OBJ: u8 = 0x01;
-const ACL_USER: u8 = 0x02;
-const ACL_GROUP_OBJ: u8 = 0x04;
-const ACL_GROUP: u8 = 0x08;
-const ACL_MASK: u8 = 0x10;
-const ACL_OTHER: u8 = 0x20;
-const ACL_WRITE: u8 = 0x02;
-const ACL_PERMISSION_MASK: u8 = 0x07;
 
 async fn connect_admission(
     namespace: OwnedNamespace,
     exchange_deadline: Instant,
 ) -> Result<UdsConnection, ReadFailure> {
     let dir = namespace.dir.as_raw_fd();
-    let euid = unsafe { libc::geteuid() };
+    let euid = crate::process::effective_uid();
     // Structural and process-start validation precedes the lock and the
     // marker_missing shortcut, so retained crash state is never hidden.
     inspect_temporary_markers(dir)?;
@@ -626,14 +489,12 @@ async fn connect_admission(
         Err(EntryError::Missing) if runtime_entry_present(dir) => {
             return Err(ReadFailure::pre("marker_identity"));
         }
-        Err(EntryError::Missing) => return Err(ReadFailure::pre("marker_missing")),
+        Err(EntryError::Missing) => return Err(absent_publication(dir, euid)),
         Err(EntryError::Invalid) => return Err(ReadFailure::pre("marker_invalid")),
     };
     validate_regular_file(&lock, euid, &lock_identity)
         .map_err(|_| ReadFailure::pre("marker_invalid"))?;
-
-    let lock_fd = lock.as_raw_fd();
-    if unsafe { libc::flock(lock_fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+    if fs2::FileExt::try_lock_shared(&lock).is_err() {
         return Err(ReadFailure::pre("marker_identity"));
     }
     let after = fstatat(dir, LOCK_FILE).map_err(|_| ReadFailure::pre("marker_identity"))?;
@@ -662,25 +523,18 @@ async fn connect_admission(
         Err(error) => return Err(error),
     };
     let Some(postbind) = postbind else {
-        // A publication killed part-way leaves the prebind and the socket with
-        // no postbind, and only a daemon that starts again reaps that shape.
-        // The prebind already carries the pid and its start identity, so the
-        // same liveness proof that makes a complete dead pair an absence is
-        // available here: a provably dead publisher is absent and the local
-        // store answers, while a live one is mid-publication and keeps its
-        // retry, and an unreadable `/proc` stays `marker_identity` because
-        // that is a statement about liveness this client cannot make.
+        // A pending owner is not absence, including while it waits for old readers.
         if let Some(prebind) = &prebind {
             if let ProcessState::Dead = process_state(prebind.pid, &prebind.process_start_identity)?
             {
-                return Err(ReadFailure::pre("marker_missing"));
+                return Err(absent_publication(dir, euid));
             }
             return Err(ReadFailure::pre("marker_identity"));
         }
         if runtime_entry_present(dir) {
             return Err(ReadFailure::pre("marker_identity"));
         }
-        return Err(ReadFailure::pre("marker_missing"));
+        return Err(absent_publication(dir, euid));
     };
     if let Some(prebind) = &prebind {
         if prebind.prebind_instance_id != postbind.prebind_instance_id
@@ -690,16 +544,10 @@ async fn connect_admission(
             return Err(ReadFailure::pre("marker_identity"));
         }
     }
-    // A publisher that is provably gone is an absence, not a race, and retrying
-    // it would spend the whole establishment budget to report the same thing
-    // twice. A *live* publisher mid-republication cannot reach this branch: it
-    // holds `LOCK_EX` while it writes, so the client's own `flock` above failed
-    // first with `marker_identity`. An unprovable state, an unreadable
-    // `/proc` or a malformed identity, stays `marker_identity` and keeps its
-    // retry, because that is a statement about liveness this client cannot make.
+    // Dead markers are absence only when no successor owns publication.
     match process_state(postbind.pid, &postbind.process_start_identity)? {
         ProcessState::Live => {}
-        ProcessState::Dead => return Err(ReadFailure::pre("marker_missing")),
+        ProcessState::Dead => return Err(absent_publication(dir, euid)),
     }
     validate_socket_entry(dir, &postbind, euid)?;
 
@@ -719,10 +567,36 @@ async fn connect_admission(
         },
         home: admission._namespace.home.clone(),
         admission,
-        // One budget per read: the exchange rides the window the caller opened
-        // for establishment rather than a second one behind it.
+        // Establishment and exchange share one deadline.
         exchange_deadline,
     })
+}
+fn absent_publication(dir: RawFd, euid: u32) -> ReadFailure {
+    match publisher_is_active(dir, euid) {
+        Ok(false) => ReadFailure::pre("marker_missing"),
+        Ok(true) => ReadFailure::pre("marker_identity"),
+        Err(error) => error,
+    }
+}
+
+fn publisher_is_active(dir: RawFd, euid: u32) -> Result<bool, ReadFailure> {
+    let (file, entry) = match open_entry(dir, PUBLISHER_LOCK_FILE) {
+        Ok(value) => value,
+        Err(EntryError::Missing) => return Ok(false),
+        Err(EntryError::Invalid) => return Err(ReadFailure::pre("marker_invalid")),
+    };
+    validate_regular_file(&file, euid, &entry).map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    let active = match fs2::FileExt::try_lock_shared(&file) {
+        Ok(()) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => return Err(ReadFailure::pre("marker_identity")),
+    };
+    let after =
+        fstatat(dir, PUBLISHER_LOCK_FILE).map_err(|_| ReadFailure::pre("marker_identity"))?;
+    if identity(&after) != entry {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    Ok(active)
 }
 
 fn runtime_entry_present(dir: RawFd) -> bool {
@@ -731,12 +605,7 @@ fn runtime_entry_present(dir: RawFd) -> bool {
         .any(|name| fstatat(dir, name).is_ok())
 }
 
-/// A marker the producer spells with a schema this client does not speak is
-/// no publication this client can read, which is exactly what
-/// `marker_missing` means here, and it returns at once because only
-/// `marker_identity` buys a retry. Everything else about the body is judged
-/// on its own: an id or a namespace that is not well formed is
-/// `marker_invalid`, an artifact that is present and untrustworthy.
+/// Unsupported schemas are absent; invalid identities or namespaces remain refusals.
 fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadFailure> {
     if marker.schema != SCHEMA {
         return Err(ReadFailure::pre("marker_missing"));
@@ -763,7 +632,7 @@ fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), Rea
     }
     if marker.namespace != namespace
         || marker.socket_path != SOCKET_FILE
-        || marker.owner_uid != unsafe { libc::geteuid() }
+        || marker.owner_uid != crate::process::effective_uid()
         || !valid_process_identity(&marker.process_start_identity)
     {
         return Err(ReadFailure::pre("marker_identity"));
@@ -776,7 +645,7 @@ fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T
         EntryError::Missing => ReadFailure::pre("marker_missing"),
         EntryError::Invalid => ReadFailure::pre("marker_invalid"),
     })?;
-    validate_regular_file(&file, unsafe { libc::geteuid() }, &entry_identity)
+    validate_regular_file(&file, crate::process::effective_uid(), &entry_identity)
         .map_err(|_| ReadFailure::pre("marker_invalid"))?;
     let mut bytes = Vec::new();
     file.take(MARKER_LIMIT + 1)
@@ -794,33 +663,10 @@ fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T
 
 /// Validate all temporaries; dead and incomplete writes do not establish a publisher.
 fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
-    let duplicate = unsafe { libc::dup(dir) };
-    let scan = fd_to_owned(duplicate).map_err(|_| ReadFailure::pre("marker_identity"))?;
-    let raw = scan.into_raw_fd();
-    let entries = unsafe { libc::fdopendir(raw) };
-    if entries.is_null() {
-        unsafe { libc::close(raw) };
-        return Err(ReadFailure::pre("marker_identity"));
-    }
-    let result = scan_temporary_markers(entries);
-    unsafe { libc::closedir(entries) };
-    result
-}
-
-fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
-    loop {
-        errno_reset();
-        let entry = unsafe { libc::readdir(entries) };
-        if entry.is_null() {
-            return if errno() == 0 {
-                Ok(())
-            } else {
-                Err(ReadFailure::pre("marker_identity"))
-            };
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
+    let entries = os::read_directory(dir).map_err(|_| ReadFailure::pre("marker_identity"))?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ReadFailure::pre("marker_identity"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
         let Some(kind) = temporary_kind(&name) else {
             if name == PREBIND_FILE || name == POSTBIND_FILE || name == SOCKET_FILE {
                 continue;
@@ -840,7 +686,7 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
         if !valid_uuid(suffix) {
             return Err(ReadFailure::pre("marker_invalid"));
         }
-        let bytes = read_named_file(unsafe { libc::dirfd(entries) }, &name)?;
+        let bytes = read_named_file(dir, &name)?;
         let (content_uuid, pid, process_identity) = match kind {
             TempKind::Prebind => match serde_json::from_slice::<PrebindMarker>(&bytes) {
                 Ok(value)
@@ -884,6 +730,7 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
             return Err(ReadFailure::pre("marker_identity"));
         }
     }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -907,7 +754,7 @@ fn read_named_file(dir: RawFd, name: &str) -> Result<Vec<u8>, ReadFailure> {
         EntryError::Missing => ReadFailure::pre("marker_identity"),
         EntryError::Invalid => ReadFailure::pre("marker_invalid"),
     })?;
-    validate_regular_file(&file, unsafe { libc::geteuid() }, &entry)
+    validate_regular_file(&file, crate::process::effective_uid(), &entry)
         .map_err(|_| ReadFailure::pre("marker_invalid"))?;
     let mut bytes = Vec::new();
     file.take(MARKER_LIMIT + 1)
@@ -917,7 +764,7 @@ fn read_named_file(dir: RawFd, name: &str) -> Result<Vec<u8>, ReadFailure> {
         return Err(ReadFailure::pre("marker_invalid"));
     }
     let after = fstatat(dir, name).map_err(|error| {
-        ReadFailure::pre(if error.raw_os_error() == Some(libc::ENOENT) {
+        ReadFailure::pre(if error.kind() == std::io::ErrorKind::NotFound {
             "marker_identity"
         } else {
             "marker_invalid"
@@ -965,21 +812,8 @@ fn validate_connected_socket(
 }
 
 fn peer_credentials(stream: RawFd, marker: &PostbindMarker, euid: u32) -> Result<(), ReadFailure> {
-    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    };
-    if result != 0 || length != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
-        return Err(ReadFailure::post("peer_identity"));
-    }
-    let credentials = unsafe { credentials.assume_init() };
+    let credentials =
+        os::peer_credentials(stream).map_err(|_| ReadFailure::post("peer_identity"))?;
     if credentials.uid != marker.owner_uid
         || credentials.uid != euid
         || credentials.pid as u32 != marker.pid
@@ -991,17 +825,13 @@ fn peer_credentials(stream: RawFd, marker: &PostbindMarker, euid: u32) -> Result
 }
 
 fn anchored_child_path(dir: RawFd, child: &str) -> Result<PathBuf, ReadFailure> {
-    let base = PathBuf::from(format!("/proc/self/fd/{dir}"));
-    if !base.exists() {
-        return Err(ReadFailure::pre("anchored_alias_unavailable"));
-    }
-    Ok(base.join(child))
+    os::anchored_path(dir, child).map_err(|_| ReadFailure::pre("anchored_alias_unavailable"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
-    device: libc::dev_t,
-    inode: libc::ino_t,
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1012,7 +842,7 @@ enum EntryError {
 
 fn open_entry(dir: RawFd, name: &str) -> Result<(File, FileIdentity), EntryError> {
     let before = fstatat(dir, name).map_err(|error| {
-        if error.raw_os_error() == Some(libc::ENOENT) {
+        if error.kind() == std::io::ErrorKind::NotFound {
             EntryError::Missing
         } else {
             EntryError::Invalid
@@ -1022,22 +852,13 @@ fn open_entry(dir: RawFd, name: &str) -> Result<(File, FileIdentity), EntryError
         return Err(EntryError::Invalid);
     }
     let c_name = CString::new(name).map_err(|_| EntryError::Invalid)?;
-    let fd = unsafe {
-        libc::openat(
-            dir,
-            c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(if error.raw_os_error() == Some(libc::ENOENT) {
+    let file = os::open_readonly_at(dir, &c_name).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
             EntryError::Missing
         } else {
             EntryError::Invalid
-        });
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+        }
+    })?;
     let opened = fstat(file.as_raw_fd()).map_err(|_| EntryError::Invalid)?;
     let before_identity = identity(&before);
     let opened_identity = identity(&opened);
@@ -1064,61 +885,37 @@ fn validate_regular_file(
     Ok(())
 }
 
-fn identity(stat: &libc::stat) -> FileIdentity {
+fn identity(stat: &os::Stat) -> FileIdentity {
     FileIdentity {
         device: stat.st_dev,
         inode: stat.st_ino,
     }
 }
 
-fn fstat(fd: RawFd) -> Result<libc::stat, TrustedPathError> {
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-        return Err(TrustedPathError::Invalid);
-    }
-    Ok(unsafe { stat.assume_init() })
+fn fstat(fd: RawFd) -> Result<os::Stat, TrustedPathError> {
+    os::stat_file(fd).map_err(|_| TrustedPathError::Invalid)
+}
+fn fstatat(dir: RawFd, name: &str) -> std::io::Result<os::Stat> {
+    os::stat_entry(dir, name)
 }
 
-fn fstatat(dir: RawFd, name: &str) -> std::io::Result<libc::stat> {
-    let name =
-        CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            dir,
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { stat.assume_init() })
+fn regular_stat(stat: &os::Stat) -> bool {
+    stat.st_mode & crate::process::runtime_io::KIND_MASK == crate::process::runtime_io::REGULAR
 }
 
-fn regular_stat(stat: &libc::stat) -> bool {
-    stat.st_mode & libc::S_IFMT == libc::S_IFREG
+fn directory_stat(stat: &os::Stat) -> bool {
+    stat.st_mode & crate::process::runtime_io::KIND_MASK == crate::process::runtime_io::DIRECTORY
 }
 
-fn directory_stat(stat: &libc::stat) -> bool {
-    stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+fn socket_stat(stat: &os::Stat) -> bool {
+    stat.st_mode & crate::process::runtime_io::KIND_MASK == crate::process::runtime_io::SOCKET
 }
 
-fn socket_stat(stat: &libc::stat) -> bool {
-    stat.st_mode & libc::S_IFMT == libc::S_IFSOCK
-}
-
-fn socket_mode_allowed(stat: &libc::stat, euid: u32) -> bool {
+fn socket_mode_allowed(stat: &os::Stat, euid: u32) -> bool {
     stat.st_uid == euid && stat.st_mode & 0o777 == 0o600
 }
 
-/// The one definition of a well-formed process identity: `linux:v1:` and a
-/// boot UUID and a start tick count, nothing else. An identity that fails this
-/// is unprovable, never an absence. The client turns that into
-/// `marker_identity` and refuses to read; the publisher turns it into its own
-/// `ProcessLiveness::Unprovable` and refuses to reap. Only a process proven
-/// gone is ever reaped.
+/// Invalid process identities are unprovable, never proof of an absent publisher.
 pub(crate) fn valid_process_identity(value: &str) -> bool {
     let Some((platform, version, boot, start)) = parse_process_identity(value) else {
         return false;
@@ -1162,36 +959,15 @@ fn process_state(pid: u32, recorded: &str) -> Result<ProcessState, ReadFailure> 
 }
 
 fn current_boot_id() -> Option<String> {
-    let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    let value = value.trim().to_string();
+    let value = os::boot_id()?;
     valid_uuid(&value).then_some(value)
 }
-
 fn process_start(pid: u32) -> Result<Option<String>, ReadFailure> {
-    let path = format!("/proc/{pid}/stat");
-    let stat = match std::fs::read_to_string(path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(ReadFailure::pre("marker_identity")),
-    };
-    let close = stat
-        .rfind(')')
-        .ok_or_else(|| ReadFailure::pre("marker_identity"))?;
-    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-    fields
-        .get(19)
-        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
-        .map(|value| (*value).to_string())
-        .map(Some)
-        .ok_or_else(|| ReadFailure::pre("marker_identity"))
-}
-
-fn errno_reset() {
-    unsafe { *libc::__errno_location() = 0 }
-}
-
-fn errno() -> i32 {
-    unsafe { *libc::__errno_location() }
+    match os::process_start_ticks(pid) {
+        os::ProcessStart::Ticks(ticks) => Ok(Some(ticks)),
+        os::ProcessStart::Absent => Ok(None),
+        os::ProcessStart::Unprovable => Err(ReadFailure::pre("marker_identity")),
+    }
 }
 
 #[cfg(test)]
@@ -1225,10 +1001,7 @@ mod tests {
             .mode(0o600)
             .open(app.join(LOCK_FILE))
             .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(publishing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        fs2::FileExt::try_lock_exclusive(&publishing).unwrap();
         for artifact in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
             assert!(!app.join(artifact).exists());
         }
@@ -1238,11 +1011,8 @@ mod tests {
             assert_eq!(error.code(), "marker_identity");
             observed += 1;
             assert_eq!(observed, 1);
-            assert_eq!(
-                unsafe { libc::flock(publishing.as_raw_fd(), libc::LOCK_UN) },
-                0
-            );
-            let published = crate::server::runtime_uds::publish().unwrap();
+            fs2::FileExt::unlock(&publishing).unwrap();
+            let published = crate::server::runtime_uds::try_publish().unwrap();
             server = Some(tokio::spawn(crate::server::runtime_uds::serve(
                 state.clone(),
                 published,
@@ -1309,7 +1079,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn a_remembered_temporary_that_disappears_is_retryable_but_bad_mode_is_not() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let dir = File::open(directory.path()).unwrap();
@@ -1332,11 +1104,7 @@ mod tests {
         );
     }
 
-    /// The kernel serves `system.posix_acl_access` as a version word followed
-    /// by 8-byte entries, so the parser is exercised on bytes laid out that
-    /// way. Building them here rather than reading them back keeps the case
-    /// deterministic on a filesystem with no POSIX ACL support, and laying
-    /// them out by hand means a wrong ABI shows up as a failing test.
+    /// Exercise the Linux ACL byte layout without requiring filesystem ACL support.
     #[test]
     fn a_posix_acl_is_read_in_the_bytes_the_kernel_writes() {
         for admitted in [
@@ -1382,9 +1150,7 @@ mod tests {
                 ]),
                 AclError::NamedWrite,
             ),
-            // An unknown version, an unknown tag, a permission bit outside
-            // `rwx` and a trailing partial entry are all unreadable, and an
-            // unreadable value is refused without claiming a named write.
+            // Malformed ACLs remain unverifiable rather than claiming a named write.
             (acl_version(3), AclError::Unverifiable),
             (
                 acl_value(&[(ACL_USER_OBJ, 6), (0x40, 6), (ACL_OTHER, 4)]),
@@ -1433,15 +1199,13 @@ mod tests {
         assert!(!valid_process_identity(&format!("linux:v2:{boot}:123")));
     }
 
-    /// A fresh home has no `~/.local` to hold the app directory, so the walk
-    /// ends on an absent intermediate component. That is an absence, not a
-    /// refusal, and it is what lets the caller run the command locally. A
-    /// component that exists but is untrustworthy still refuses.
     #[test]
+    #[serial_test::parallel]
     fn an_absent_ancestor_is_an_absence_and_an_untrustworthy_one_is_not() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
 
-        let euid = unsafe { libc::geteuid() };
+        let euid = crate::process::effective_uid();
         let base = tempfile::tempdir().expect("temp base");
         let absent = base.path().join("never-created").join("app-dir");
         assert!(matches!(
@@ -1451,34 +1215,55 @@ mod tests {
 
         let present = base.path().join("app-dir");
         std::fs::create_dir(&present).expect("create");
+        std::fs::set_permissions(&present, std::fs::Permissions::from_mode(0o700))
+            .expect("private app");
         assert!(open_trusted_directory(&present, euid).is_ok());
 
-        // Sticky and world-writable is what /tmp looks like, but the allowance
-        // is for a root-owned ancestor only, so this one still refuses.
         let world = base.path().join("world");
         std::fs::create_dir(&world).expect("create");
-        let mut permissions = std::fs::metadata(&world).expect("stat").permissions();
-        permissions.set_mode(0o777 | libc::S_ISVTX);
-        std::fs::set_permissions(&world, permissions).expect("chmod");
+        std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o777)).expect("chmod");
         let world_child = world.join("app-dir");
         std::fs::create_dir(&world_child).expect("create");
+        std::fs::set_permissions(&world_child, std::fs::Permissions::from_mode(0o700))
+            .expect("private app");
         assert!(matches!(
             open_trusted_directory(&world_child, euid),
             Err(TrustedPathError::Refused(_))
         ));
     }
-
-    /// A home reached through a symlink is not a tampered home, and macOS
-    /// `/tmp` is a symlink on every machine, so a prefix component is followed
-    /// and the directory it resolves to is verified by descriptor. What must
-    /// not change is the verification: a symlinked prefix whose target is
-    /// world-writable is still refused, and a symlinked *final* component is
-    /// still a refusal, because that would swap the app directory itself.
     #[test]
+    #[serial_test::parallel]
+    fn a_foreign_owned_unpublished_namespace_is_absent_but_never_admitted() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let home = tempfile::tempdir().unwrap();
+        let app = home.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+        let caller_uid = if crate::process::effective_uid() == 0 {
+            1
+        } else {
+            0
+        };
+        assert!(matches!(
+            open_trusted_directory(&app, caller_uid),
+            Err(TrustedPathError::Refused(_))
+        ));
+        assert!(namespace_is_unpublished(&app, caller_uid));
+        std::fs::write(app.join("runtime.prebind.json"), b"{}").unwrap();
+        assert!(!namespace_is_unpublished(&app, caller_uid));
+        assert!(matches!(
+            open_trusted_directory(&app, caller_uid),
+            Err(TrustedPathError::Refused(_))
+        ));
+    }
+
+    /// Follow prefix symlinks without relaxing descriptor checks or final no-follow.
+    #[test]
+    #[serial_test::parallel]
     fn a_symlinked_prefix_is_followed_but_every_check_still_applies() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
 
-        let euid = unsafe { libc::geteuid() };
+        let euid = crate::process::effective_uid();
         let base = tempfile::tempdir().expect("temp base");
         let real = base.path().join("real");
         std::fs::create_dir(&real).expect("real dir");
@@ -1526,68 +1311,37 @@ mod tests {
         ));
     }
 
-    /// A refused path has to say which directory it refused, what is wrong
-    /// with it and what clears it. The refusal itself is unchanged: same
-    /// code, same exit, still no admission. But `daemon read: marker_invalid`
-    /// names nothing an operator can act on, and the walk already knows the
-    /// component, its mode and the rule it broke.
-    #[test]
-    fn a_refused_component_names_its_path_its_mode_and_its_remedy() {
-        let euid = unsafe { libc::geteuid() };
-        let base = tempfile::tempdir().expect("temp base");
-        let app = base.path().join("app-dir");
-        std::fs::create_dir(&app).expect("create");
-        let mut permissions = std::fs::metadata(&app).expect("stat").permissions();
-        permissions.set_mode(0o770);
-        std::fs::set_permissions(&app, permissions).expect("chmod");
-
-        let failure =
-            trusted_path_failure(open_trusted_directory(&app, euid).expect_err("0770 refuses"));
-        assert_eq!(
-            failure.code(),
-            "marker_invalid",
-            "the refusal keeps its code; a diagnosis is not a different answer"
-        );
-        let outcome = super::super::ReadOutcome::from(failure);
-        let stderr = outcome.stderr.expect("a refusal always says something");
-        assert!(
-            stderr.contains(&app.display().to_string()),
-            "the refusal must name the path the operator has to fix: {stderr}"
-        );
-        assert!(
-            stderr.contains("0770"),
-            "the refusal must name the mode it found: {stderr}"
-        );
-        assert!(
-            stderr.contains(&format!("chmod go-w '{}'", app.display())),
-            "the refusal must name the command that clears this cause: {stderr}"
-        );
-        assert_eq!(outcome.exit, 2, "the refusal keeps its exit");
-    }
-
-    /// `/tmp` is world-writable and sticky, and the walk must still pass
-    /// through it: a test namespace and a crash artifact both live there. A
-    /// sticky directory that is not root-owned, and the final component in any
-    /// case, stay refused.
+    /// Only root-owned sticky ancestors get the writable-directory allowance.
     #[test]
     fn a_sticky_root_ancestor_is_walkable_and_nothing_else_is() {
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        stat.st_mode = libc::S_IFDIR | 0o777;
+        let mut stat = os::Stat {
+            st_mode: os::DIRECTORY | 0o777,
+            st_uid: 0,
+            st_dev: 0,
+            st_ino: 0,
+            st_nlink: 1,
+        };
 
         stat.st_uid = 0;
         assert!(!group_other_writes_allowed(&stat, true));
-        stat.st_mode |= libc::S_ISVTX;
+        stat.st_mode |= crate::process::runtime_io::STICKY;
         assert!(group_other_writes_allowed(&stat, false));
         assert!(!group_other_writes_allowed(&stat, true));
 
-        stat.st_uid = unsafe { libc::geteuid() };
+        stat.st_uid = 1;
         assert!(!group_other_writes_allowed(&stat, false));
 
         stat.st_uid = 0;
-        stat.st_mode = libc::S_IFDIR | 0o755;
+        stat.st_mode = crate::process::runtime_io::DIRECTORY | 0o755;
         assert!(group_other_writes_allowed(&stat, false));
-        stat.st_mode = libc::S_IFDIR | 0o757;
+        stat.st_mode = crate::process::runtime_io::DIRECTORY | 0o757;
         assert!(!group_other_writes_allowed(&stat, false));
+        stat.st_uid = 1;
+        stat.st_mode = os::DIRECTORY | 0o700;
+        assert!(matches!(
+            validate_directory_owner(&stat, 0, true, Path::new("/preserved-home")),
+            Err(TrustedPathError::Refused(_))
+        ));
     }
 
     #[test]
@@ -1599,7 +1353,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::parallel]
     async fn abandoned_temporaries_do_not_establish_a_publication() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
         let instance = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let prebind = serde_json::json!({
@@ -1612,7 +1368,10 @@ mod tests {
             ("runtime_instance_id", serde_json::json!(instance)),
             ("runtime_epoch", serde_json::json!(instance)),
             ("socket_path", serde_json::json!(SOCKET_FILE)),
-            ("owner_uid", serde_json::json!(unsafe { libc::geteuid() })),
+            (
+                "owner_uid",
+                serde_json::json!(crate::process::effective_uid()),
+            ),
             ("socket_device", serde_json::json!(1)),
             ("socket_inode", serde_json::json!(1)),
             ("socket_creator_pid", serde_json::json!(u32::MAX)),
@@ -1656,13 +1415,11 @@ mod tests {
         }
     }
 
-    /// A namespace whose markers are all present, all consistent and all
-    /// perfectly valid, naming a pid that is provably not running: that is an
-    /// absence, and it must answer as one. Reporting it as an identity fault
-    /// would send the read back through the retry loop and spend the whole
-    /// establishment budget before saying the same thing twice.
+    /// Proven-dead markers permit absence without spending the retry budget.
     #[tokio::test]
+    #[serial_test::parallel]
     async fn a_dead_publisher_is_an_absence_rather_than_a_retryable_identity() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("namespace");
@@ -1670,8 +1427,6 @@ mod tests {
         std::fs::write(&lock, b"").expect("lock");
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 
-        // A pid no process can hold, recorded against this boot, so the walk
-        // proves it dead rather than failing to prove anything.
         let dead_pid = 4_194_302u32;
         let identity = format!(
             "linux:v1:{}:1",
@@ -1697,14 +1452,11 @@ mod tests {
             "runtime_epoch": "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e",
             "namespace": namespace_name,
             "socket_path": SOCKET_FILE,
-            "owner_uid": unsafe { libc::geteuid() },
+            "owner_uid": crate::process::effective_uid(),
             "socket_device": 1,
             "socket_inode": 1,
             "socket_creator_pid": dead_pid,
         });
-        // The admission requires exactly 0600 on both markers, so the mode the
-        // umask would give a plain write is corrected here rather than tested
-        // as a separate refusal.
         for (name, marker) in [(PREBIND_FILE, &prebind), (POSTBIND_FILE, &postbind)] {
             let path = dir.path().join(name);
             std::fs::write(&path, marker.to_string()).expect("marker");
@@ -1733,21 +1485,16 @@ mod tests {
         );
     }
 
-    /// Past admission the markers have proved a live publisher and
-    /// `validate_connected_socket` has proved this socket is that publisher's.
-    /// A publisher that then takes the connection and never completes the
-    /// exchange, whether the client's budget runs out or the peer drops, has
-    /// said something about the environment and nothing about this client, so
-    /// it has to say so with the code the take-over set already understands.
     #[tokio::test]
+    #[serial_test::parallel]
     async fn an_admitted_publisher_that_never_completes_the_exchange_is_an_absence() {
-        use std::os::unix::net::UnixListener;
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        use tokio::net::UnixListener;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
         let dir = tempfile::tempdir().expect("namespace");
         let socket_path = dir.path().join(SOCKET_FILE);
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
-        listener.set_nonblocking(true).expect("nonblocking accept");
         let lock = dir.path().join(LOCK_FILE);
         std::fs::write(&lock, b"").expect("lock");
         let request = || {
@@ -1756,8 +1503,6 @@ mod tests {
                 .expect("the local request")
         };
 
-        // The budget already spent: the client-budget scenario, where the
-        // publisher answered the connect and then said nothing.
         let Err(error) = admitted_connection(dir.path(), &socket_path, &lock, Instant::now())
             .await
             .upgrade(request())
@@ -1771,10 +1516,8 @@ mod tests {
             "a spent budget against a silent publisher is a statement about the environment"
         );
 
-        // The other half of the same statement: the peer drops the admitted
-        // connection instead of finishing the handshake. The connection is in
-        // the backlog the moment `connect` returns, so the accept below only
-        // has to collect it.
+        // Drain the expired attempt before connecting the peer-drop case.
+        drop(listener.accept().await.expect("expired attempt queued").0);
         let connection = admitted_connection(
             dir.path(),
             &socket_path,
@@ -1782,15 +1525,13 @@ mod tests {
             Instant::now() + crate::server::runtime_ws::CONNECTION_BUDGET,
         )
         .await;
-        let publisher = loop {
-            match listener.accept() {
-                Ok((publisher, _)) => break publisher,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(error) => panic!("accept socket: {error}"),
-            }
-        };
+        let (publisher, _) = listener.accept().await.expect("peer-drop attempt queued");
         drop(publisher);
-        let Err(error) = connection.upgrade(request()).await else {
+        let Err(error) =
+            tokio::time::timeout(Duration::from_secs(2), connection.upgrade(request()))
+                .await
+                .expect("the dropped peer must finish before the exchange deadline")
+        else {
             panic!("a publisher that drops the exchange admits none");
         };
         assert_eq!(
@@ -1800,9 +1541,7 @@ mod tests {
         );
     }
 
-    /// A connection admitted to `socket_path`, built by hand because
-    /// `upgrade` is otherwise only reachable behind a publisher that completes
-    /// an exchange, which is exactly what these cases are about.
+    /// Bypass marker admission to exercise peers that stop before handshake.
     async fn admitted_connection(
         dir: &std::path::Path,
         socket_path: &std::path::Path,
@@ -1819,7 +1558,7 @@ mod tests {
                 prebind_instance_id: String::new(),
                 runtime_instance_id: String::new(),
                 runtime_epoch: String::new(),
-                owner_uid: unsafe { libc::geteuid() },
+                owner_uid: crate::process::effective_uid(),
             },
             home: dir.to_path_buf(),
             admission: Admission {
@@ -1834,12 +1573,7 @@ mod tests {
         }
     }
 
-    /// A daemon killed between the prebind write and the postbind write leaves
-    /// the pair half-published, and only a daemon that starts again reaps that
-    /// shape. The prebind alone already carries the pid and its start identity,
-    /// so the same proof that makes a complete dead pair an absence applies
-    /// here: the read must be handed to the local store rather than retried
-    /// until the establishment budget runs out.
+    /// A dead prebind-only publication also permits local takeover.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_half_published_dead_publisher_is_an_absence_too() {
@@ -1869,7 +1603,6 @@ mod tests {
         let path = dir.path().join(PREBIND_FILE);
         std::fs::write(&path, prebind.to_string()).expect("prebind");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        // The socket the publisher binds before it writes the postbind.
         std::fs::write(dir.path().join(SOCKET_FILE), b"").expect("socket");
 
         let opened = std::fs::File::open(dir.path()).expect("open namespace");
@@ -1894,7 +1627,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn connected_socket_identity_does_not_require_path_inode_equality() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::net::{UnixListener, UnixStream};
 
         let dir = tempfile::tempdir().expect("temp namespace");
@@ -1913,7 +1648,7 @@ mod tests {
             runtime_epoch: String::new(),
             namespace: String::new(),
             socket_path: SOCKET_FILE.into(),
-            owner_uid: unsafe { libc::geteuid() },
+            owner_uid: crate::process::effective_uid(),
             socket_device: path_stat.st_dev as u64,
             socket_inode: path_stat.st_ino as u64,
             socket_creator_pid: std::process::id(),
@@ -1923,18 +1658,13 @@ mod tests {
             server.as_raw_fd(),
             dir_file.as_raw_fd(),
             &marker,
-            unsafe { libc::geteuid() },
+            crate::process::effective_uid(),
         )
         .is_ok());
         drop(client);
     }
 
-    /// A marker this client cannot speak the schema of is no publication it
-    /// can read, which is `marker_missing` and returns at once; a marker that
-    /// *is* one of ours but carries an id or a namespace that is not well
-    /// formed is `marker_invalid`, because the artifact is there and cannot be
-    /// trusted. Both refusals are compared, because swapping them would send a
-    /// stale namespace through the retry loop instead of answering from it.
+    /// Unsupported schemas and malformed bodies have distinct refusal codes.
     #[test]
     fn a_marker_schema_and_a_marker_body_are_two_different_refusals() {
         let namespace = crate::server::runtime_ws::NAMESPACE;
@@ -1956,7 +1686,7 @@ mod tests {
             runtime_epoch: "33333333-2222-3333-4444-555555555555".to_string(),
             namespace: namespace.to_string(),
             socket_path: SOCKET_FILE.to_string(),
-            owner_uid: unsafe { libc::geteuid() },
+            owner_uid: crate::process::effective_uid(),
             socket_device: 1,
             socket_inode: 1,
             socket_creator_pid: std::process::id(),

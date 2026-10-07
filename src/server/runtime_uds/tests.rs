@@ -1,21 +1,14 @@
-//! Publisher behavior against a real namespace directory.
-//!
-//! Every test publishes into its own temporary app dir under a base whose whole
-//! ancestor chain satisfies the client's trusted walk, so nothing here touches
-//! the developer's real app directory.
+//! Publisher and admission behavior against owned temporary namespace directories.
 
+use crate::process::runtime_io::{open_directory, open_lock_at, read_acl, set_acl, Umask};
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::*;
 
-/// A private temporary XDG base plus the environment binding that points the
-/// app dir, and therefore both the publisher and the client, at it. The
-/// binding is the environment rather than a test-only override inside
-/// `get_app_dir`, which every other unit test in this process also reads.
+/// Own the temporary XDG base and its environment binding.
 struct Namespace {
     base: tempfile::TempDir,
     _guard: crate::server::test_support::RuntimeEnvGuard,
@@ -27,16 +20,12 @@ impl Namespace {
     }
 }
 
-/// Whether the client itself would admit this chain. The tests below ask the
-/// client's walk rather than a second opinion of it: the publisher adopting a
-/// chain the client refuses is exactly the bug they exist to catch.
+/// Client admission defines the producer/client compatibility boundary.
 fn client_admits(path: &Path) -> bool {
-    crate::cli::runtime_read::uds::open_trusted_directory(path, unsafe { libc::geteuid() }).is_ok()
+    crate::cli::runtime_read::uds::open_trusted_directory(path, crate::process::effective_uid())
+        .is_ok()
 }
 
-/// The first base whose whole ancestor chain is private enough for the client's
-/// walk. `None` means this host has no such directory, which every caller
-/// treats as a failure.
 fn namespace() -> Option<Namespace> {
     let (base, _guard) = crate::server::test_support::trusted_namespace()?;
     Some(Namespace { base, _guard })
@@ -72,6 +61,46 @@ fn retained_marker(dir: &Path, name: &str) {
     std::fs::write(dir.join(name), marker.to_string()).expect("write retained marker");
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn namespace_discovery_waits_before_selecting_a_peers_temporary_parent() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut held = crate::server::test_support::RuntimeEnvGuard::read_lock();
+    let parent = tempfile::tempdir().expect("peer parent");
+    let parent_path = parent.path().to_path_buf();
+    held.bind(parent.path());
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let reactor = tokio::runtime::Handle::current();
+    let reader = std::thread::spawn(move || {
+        let _entered = reactor.enter();
+        crate::test_env_lock::observe_env_lock_contention(waiting_tx);
+        let (base, _env) = crate::server::test_support::trusted_namespace()
+            .expect("a private ancestor chain exists");
+        assert!(
+            !base.path().starts_with(&parent_path),
+            "discovery must not retain another fixture's temporary parent"
+        );
+        let _published = try_publish().expect("the owned namespace publishes");
+        let socket = base
+            .path()
+            .join(crate::session::APP_DIR_NAME_XDG)
+            .join(SOCKET_FILE);
+        assert!(std::fs::metadata(&socket).unwrap().file_type().is_socket());
+        let _connected = std::os::unix::net::UnixStream::connect(socket)
+            .expect("the actual published endpoint accepts a connection");
+    });
+    let contended = waiting_rx.recv_timeout(Duration::from_secs(30));
+    parent
+        .close()
+        .expect("remove the peer parent before releasing its environment");
+    drop(held);
+    reader.join().expect("namespace reader completes");
+    contended.expect("discovery must encounter the held process environment lock");
+}
+
 /// A live publication carries exactly the pair the client parses, at exactly
 /// the modes and identities it checks.
 #[tokio::test]
@@ -79,7 +108,7 @@ fn retained_marker(dir: &Path, name: &str) {
 async fn publication_writes_the_pair_the_client_parses() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
-    let published = publish().expect("the namespace is free");
+    let published = try_publish().expect("the namespace is free");
 
     let identity = runtime_ws::identity();
     let prebind = read_json(&dir, PREBIND_FILE);
@@ -98,7 +127,7 @@ async fn publication_writes_the_pair_the_client_parses() {
     );
     assert_eq!(postbind["runtime_epoch"], identity.runtime_epoch);
     assert_eq!(postbind["socket_path"], SOCKET_FILE);
-    assert_eq!(postbind["owner_uid"], unsafe { libc::geteuid() });
+    assert_eq!(postbind["owner_uid"], crate::process::effective_uid());
 
     // The recorded socket identity is the real one, not a placeholder.
     use std::os::unix::fs::MetadataExt;
@@ -114,7 +143,8 @@ async fn publication_writes_the_pair_the_client_parses() {
     assert!(mode_of(&dir) & 0o022 == 0, "the app dir must stay private");
 
     // A create-then-rename write leaves no temporary name behind.
-    let leftovers: Vec<String> = directory_entries(test_dir_fd(&dir))
+    let directory = open_directory(&dir).expect("namespace directory");
+    let leftovers: Vec<String> = directory_entries(directory.as_raw_fd())
         .expect("scan")
         .into_iter()
         .filter(|name| name.contains(".tmp."))
@@ -130,10 +160,10 @@ async fn publication_writes_the_pair_the_client_parses() {
 async fn a_live_publication_is_never_replaced() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
-    let first = publish().expect("the namespace is free");
+    let first = try_publish().expect("the namespace is free");
     let before = std::fs::read(dir.join(POSTBIND_FILE)).expect("postbind");
 
-    let error = match publish() {
+    let error = match try_publish() {
         Err(error) => error,
         Ok(_) => panic!("a live namespace cannot be republished"),
     };
@@ -146,11 +176,6 @@ async fn a_live_publication_is_never_replaced() {
     drop(first);
 }
 
-/// Retained crash state from a dead process is reaped, so the new publication
-/// lands where the client would otherwise fail closed. A crash between the
-/// exclusive create and the rename leaves a body that does not parse, and that
-/// body must not decide whether this publication may happen: the client refuses
-/// the very file, so the publisher has to remove it first.
 #[tokio::test]
 #[serial_test::serial]
 async fn retained_dead_artifacts_are_reaped_before_publishing() {
@@ -169,7 +194,7 @@ async fn retained_dead_artifacts_are_reaped_before_publishing() {
     let partial = format!("{PREBIND_FILE}.tmp.88888888-7777-6666-5555-444444444444");
     std::fs::write(dir.join(&partial), br#"{"schema":1,"pid":1"#).expect("partial temporary");
 
-    let published = publish().expect("retained state is reapable");
+    let published = try_publish().expect("retained state is reapable");
     assert!(!dir.join(&stale).exists());
     assert!(!dir.join(&torn).exists(), "the torn temporary is reaped");
     assert!(
@@ -201,14 +226,14 @@ async fn a_live_temporary_marker_stops_publication() {
         "runtime_epoch": identity.runtime_epoch,
         "namespace": runtime_ws::NAMESPACE,
         "socket_path": SOCKET_FILE,
-        "owner_uid": unsafe { libc::geteuid() },
+        "owner_uid": crate::process::effective_uid(),
         "socket_device": 0,
         "socket_inode": 0,
         "socket_creator_pid": std::process::id(),
     });
     std::fs::write(dir.join(&temporary), marker.to_string()).expect("live temporary");
 
-    let error = match publish() {
+    let error = match try_publish() {
         Err(error) => error,
         Ok(_) => panic!("a live writer owns the namespace"),
     };
@@ -220,11 +245,6 @@ async fn a_live_temporary_marker_stops_publication() {
     assert!(!dir.join(PREBIND_FILE).exists(), "nothing was published");
 }
 
-/// A `/proc` this process cannot read proves nothing about the process that
-/// wrote a retained marker. The publisher must refuse rather than reap: a
-/// daemon that is still serving would keep its listener while its markers
-/// were unlinked and its socket published over, and every client would fall
-/// back silently.
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unreadable_proc_entry_refuses_publication_and_keeps_the_artifacts() {
@@ -240,7 +260,7 @@ async fn an_unreadable_proc_entry_refuses_publication_and_keeps_the_artifacts() 
         "runtime_epoch": identity.runtime_epoch,
         "namespace": runtime_ws::NAMESPACE,
         "socket_path": SOCKET_FILE,
-        "owner_uid": unsafe { libc::geteuid() },
+        "owner_uid": crate::process::effective_uid(),
         "socket_device": 0,
         "socket_inode": 0,
         "socket_creator_pid": std::process::id(),
@@ -249,7 +269,7 @@ async fn an_unreadable_proc_entry_refuses_publication_and_keeps_the_artifacts() 
     std::fs::write(dir.join(POSTBIND_FILE), &before).expect("retained postbind");
 
     fail_next_proc_read();
-    let error = match publish() {
+    let error = match try_publish() {
         Err(error) => error,
         Ok(_) => panic!("an unprovable process must not be reaped"),
     };
@@ -262,13 +282,7 @@ async fn an_unreadable_proc_entry_refuses_publication_and_keeps_the_artifacts() 
     assert!(!dir.join(PREBIND_FILE).exists(), "nothing was published");
 }
 
-/// The twin of the test above, on the temporary name. The two halves of the
-/// retained-state scan answer the same question and used to answer it
-/// differently: the final name was reaped only on a writer proven gone, while a
-/// temporary was reaped on anything that was not provably alive, so an
-/// unplaceable process lost its artifact instead of owning the namespace. A
-/// shared regression cannot be caught by comparing the two paths against each
-/// other, because both would agree; only writing the temporary name says it.
+/// Unreadable process identity preserves retained temporary artifacts.
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unreadable_proc_entry_keeps_a_retained_temporary_marker_too() {
@@ -283,7 +297,7 @@ async fn an_unreadable_proc_entry_keeps_a_retained_temporary_marker_too() {
         "runtime_epoch": runtime_ws::identity().runtime_epoch,
         "namespace": runtime_ws::NAMESPACE,
         "socket_path": SOCKET_FILE,
-        "owner_uid": unsafe { libc::geteuid() },
+        "owner_uid": crate::process::effective_uid(),
         "socket_device": 0,
         "socket_inode": 0,
         "socket_creator_pid": std::process::id(),
@@ -294,7 +308,7 @@ async fn an_unreadable_proc_entry_keeps_a_retained_temporary_marker_too() {
     std::fs::write(&temporary, &before).expect("retained temporary");
 
     fail_next_proc_read();
-    let error = match publish() {
+    let error = match try_publish() {
         Err(error) => error,
         Ok(_) => panic!("an unprovable process must not have its temporary reaped"),
     };
@@ -307,10 +321,6 @@ async fn an_unreadable_proc_entry_keeps_a_retained_temporary_marker_too() {
     assert!(!dir.join(PREBIND_FILE).exists(), "nothing was published");
 }
 
-/// A temporary whose body never landed is the torn write a crash leaves between
-/// the exclusive create and the rename. No writer is left to honour, so keeping
-/// it would refuse publication forever, and it is reaped. This is the one
-/// exception to the rule its twin pins, and it is why the exception exists.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_torn_temporary_is_reaped_because_no_writer_is_left_to_honour() {
@@ -320,14 +330,10 @@ async fn a_torn_temporary_is_reaped_because_no_writer_is_left_to_honour() {
     let temporary = dir.join(&name);
     std::fs::write(&temporary, b"{\"schema\":1,\"pid\":").expect("retained temporary");
 
-    publish().expect("a torn temporary must not refuse publication forever");
+    try_publish().expect("a torn temporary must not refuse publication forever");
     assert!(!temporary.exists(), "the torn temporary is reaped");
 }
 
-/// A marker this half cannot read the schema of is still retained state, and
-/// the schema says nothing about who wrote it. Only a writer proven gone makes
-/// it reapable; a live one, or one this half cannot place, still owns the
-/// namespace and is refused, with the schema named as the reason.
 #[test]
 #[serial_test::serial]
 fn a_foreign_schema_marker_is_reaped_only_from_a_writer_proven_dead() {
@@ -399,7 +405,7 @@ fn a_foreign_schema_marker_is_reaped_only_from_a_writer_proven_dead() {
 async fn shutdown_retracts_only_its_own_publication() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
-    drop(publish().expect("the namespace is free"));
+    drop(try_publish().expect("the namespace is free"));
     for name in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
         assert!(!dir.join(name).exists(), "{name} survived shutdown");
     }
@@ -416,7 +422,7 @@ async fn shutdown_retracts_only_its_own_publication() {
 async fn shutdown_leaves_a_foreign_publication_in_place() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
-    let mut published = publish().expect("the namespace is free");
+    let mut published = try_publish().expect("the namespace is free");
     let foreign = serde_json::json!({
         "schema": SCHEMA,
         "pid": 1,
@@ -426,7 +432,7 @@ async fn shutdown_leaves_a_foreign_publication_in_place() {
         "runtime_epoch": "99999999-8888-7777-6666-555555555555",
         "namespace": runtime_ws::NAMESPACE,
         "socket_path": SOCKET_FILE,
-        "owner_uid": unsafe { libc::geteuid() },
+        "owner_uid": crate::process::effective_uid(),
         "socket_device": 0,
         "socket_inode": 0,
         "socket_creator_pid": 1,
@@ -438,6 +444,66 @@ async fn shutdown_leaves_a_foreign_publication_in_place() {
     assert!(dir.join(SOCKET_FILE).exists());
 }
 
+/// An absence observer delays a successor; only an exclusive publisher refuses it.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_shared_absence_probe_cannot_disable_successor_publication() {
+    let namespace = namespace().expect("a private ancestor chain exists on this host");
+    let dir = app_dir(&namespace);
+    let directory = open_directory(&dir).expect("namespace directory");
+    let probe = open_lock(directory.as_raw_fd(), PUBLISHER_LOCK_FILE).unwrap();
+    assert!(lock_shared(&probe));
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    let publishing = publish_when_available(&cancelled);
+    tokio::pin!(publishing);
+    assert!(matches!(
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(publishing.as_mut(), context))
+        })
+        .await,
+        std::task::Poll::Pending
+    ));
+    cancelled.cancel();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), publishing)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert!(!dir.join(SOCKET_FILE).exists());
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let publishing = publish_when_available(&shutdown);
+    tokio::pin!(publishing);
+    assert!(matches!(
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(publishing.as_mut(), context))
+        })
+        .await,
+        std::task::Poll::Pending
+    ));
+    fs2::FileExt::unlock(&probe).unwrap();
+    let _published = tokio::time::timeout(std::time::Duration::from_secs(5), publishing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(dir.join(SOCKET_FILE).exists());
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            publish_when_available(&shutdown)
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap()
+        .code(),
+        "namespace_busy"
+    );
+}
+
 /// The daemon holds the namespace lock shared, so a client still takes it while
 /// a second publisher's exclusive request is refused.
 #[tokio::test]
@@ -445,17 +511,18 @@ async fn shutdown_leaves_a_foreign_publication_in_place() {
 async fn the_held_lock_admits_a_client_and_refuses_a_publisher() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
-    let _published = publish().expect("the namespace is free");
-    let client = open_client_lock(&dir);
+    let _published = try_publish().expect("the namespace is free");
+    let parent = open_directory(&dir).expect("namespace directory");
+    let client = open_lock_at(parent.as_raw_fd(), &CString::new(LOCK_FILE).unwrap())
+        .expect("client lock descriptor");
     assert!(lock_shared(&client), "a client must be able to lock");
-    assert!(!lock_exclusive(&client), "no second publisher may lock");
+    assert!(
+        !lock_exclusive(&client).unwrap(),
+        "no second publisher may lock"
+    );
     unlock(&client);
 }
 
-/// A marker written by this process is live; one recorded against another boot
-/// or another start time is retained state. An identity this half cannot parse
-/// is unprovable rather than an absence, and the consumer consequence of that
-/// is asserted too, since reaping a marker is what would actually harm.
 #[test]
 #[serial_test::serial]
 fn process_identity_distinguishes_live_from_retained() {
@@ -526,11 +593,6 @@ fn process_identity_distinguishes_live_from_retained() {
     );
 }
 
-/// The consequence the unprovable rows exist to prevent: `reap_retained_state`
-/// unlinks a marker it proves dead and leaves every other one in place. A
-/// predicate that answered `Dead` for an identity it cannot parse would
-/// unlink a possibly-live daemon's state, and publication would go ahead over
-/// its socket.
 #[test]
 #[serial_test::serial]
 fn a_marker_this_half_cannot_prove_dead_is_never_reaped() {
@@ -596,12 +658,6 @@ fn the_publisher_only_publishes_into_a_trusted_chain() {
     );
 }
 
-/// A home reached through a symlink is the ordinary case on macOS and a real
-/// one on Linux, and it is the case the walk is written for: the prefix symlink
-/// is followed, the directory it resolves to is verified by descriptor, and the
-/// descriptor the publisher keeps is that directory, not a second resolution
-/// of the path by name, which is the only way a swapped directory could be
-/// published into after the chain was validated.
 #[test]
 #[serial_test::serial]
 fn a_symlinked_prefix_resolves_to_the_directory_it_verified() {
@@ -623,15 +679,6 @@ fn a_symlinked_prefix_resolves_to_the_directory_it_verified() {
     );
 }
 
-/// The producer applies the client's POSIX-ACL rule, so it cannot publish into a
-/// namespace the client would refuse. An ACL naming a user who may write is
-/// refused wherever in the chain it is found.
-///
-/// The named entry holds `rw` while the mask holds only `r`, so the mode the
-/// kernel derives is `0740` and the walk's own mode gate admits it: the
-/// refusal this lane asserts can only come from reading the ACL. Every step
-/// before the refusal is asserted, because a lane that quietly returns
-/// leaves a green test over a path nothing ran.
 #[test]
 #[serial_test::serial]
 fn a_named_user_write_acl_is_refused_on_an_intermediate_component() {
@@ -644,7 +691,7 @@ fn a_named_user_write_acl_is_refused_on_an_intermediate_component() {
         "the chain is admitted before the ACL lands"
     );
 
-    let other = unsafe { libc::geteuid() }.wrapping_add(1);
+    let other = crate::process::effective_uid().wrapping_add(1);
     let value = acl_v2(0o6, other);
     set_acl(&intermediate, &value);
     assert_eq!(
@@ -678,10 +725,6 @@ fn a_named_user_write_acl_is_refused_on_an_intermediate_component() {
     );
 }
 
-/// The counterpart of the lane above: the same directory, the same `0740` mode
-/// and the same mask, with a named entry that holds no write. Both walks admit
-/// it, so the refusal above is about the named write and not about the ACL
-/// being there at all.
 #[test]
 #[serial_test::serial]
 fn a_named_user_readonly_acl_is_admitted_by_both_walks() {
@@ -694,7 +737,7 @@ fn a_named_user_readonly_acl_is_admitted_by_both_walks() {
         "the chain is admitted before the ACL lands"
     );
 
-    let other = unsafe { libc::geteuid() }.wrapping_add(1);
+    let other = crate::process::effective_uid().wrapping_add(1);
     let value = acl_v2(0o4, other);
     set_acl(&intermediate, &value);
     assert_eq!(
@@ -715,9 +758,7 @@ fn a_named_user_readonly_acl_is_admitted_by_both_walks() {
     );
 }
 
-/// The POSIX-ACL layout the kernel writes: a 4-byte little-endian version,
-/// then 8-byte entries of a little-endian `u16` tag, a little-endian `u16` of
-/// permissions and a little-endian `u32` id.
+/// Linux access ACLs encode a little-endian version followed by eight-byte entries.
 const ACL_VERSION: u32 = 2;
 const ACL_ENTRY_LEN: usize = 8;
 const ACL_USER_OBJ: u8 = 0x01;
@@ -729,11 +770,7 @@ const ACL_OTHER: u8 = 0x20;
 /// The id a base entry carries, and the only one the kernel accepts for them.
 const ACL_UNDEFINED_ID: u32 = u32::MAX;
 
-/// One access ACL in the bytes the kernel serves, in the order it requires:
-/// the owner, the named users, the group, the named groups, the mask, other.
-/// The mask holds read only, so the mode the kernel derives is `0740` whatever
-/// the named entry says, and the walk's own mode gate cannot refuse it before
-/// the ACL is read.
+/// Encode an access ACL in kernel-required entry order.
 fn acl_v2(named_permissions: u8, uid: u32) -> Vec<u8> {
     let mut value = ACL_VERSION.to_le_bytes().to_vec();
     for (tag, permissions) in [
@@ -756,89 +793,64 @@ fn acl_v2(named_permissions: u8, uid: u32) -> Vec<u8> {
     value
 }
 
-/// Set `system.posix_acl_access`, panicking unless the filesystem took it: the
-/// lanes above assert a refusal, so a host that cannot be given the ACL is a
-/// failure to report rather than a reason to pass quietly.
-fn set_acl(dir: &Path, value: &[u8]) {
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("path");
-    let name = std::ffi::CString::new("system.posix_acl_access").expect("name");
-    let set = unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    assert_eq!(
-        set,
-        0,
-        "the filesystem must take the access ACL: {}",
-        std::io::Error::last_os_error()
-    );
-}
-
-/// Read the ACL back through a descriptor on the directory, so what is
-/// asserted is the bytes the walk will see rather than the bytes that were sent.
-fn read_acl(dir: &Path) -> Vec<u8> {
-    use std::os::unix::io::AsRawFd;
-    let file = std::fs::File::open(dir).expect("open the directory");
-    let name = std::ffi::CString::new("system.posix_acl_access").expect("name");
-    let needed =
-        unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
-    assert!(needed > 0, "the directory must carry the access ACL");
-    let mut value = vec![0u8; needed as usize];
-    let read = unsafe {
-        libc::fgetxattr(
-            file.as_raw_fd(),
-            name.as_ptr(),
-            value.as_mut_ptr().cast(),
-            value.len(),
-        )
-    };
-    assert!(read > 0, "read the access ACL back");
-    value.truncate(read as usize);
-    value
-}
-
 /// The mode bits the walk judges, as `fstat` reports them.
 fn stat_mode(dir: &Path) -> u32 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(dir).expect("stat").mode() & 0o7777
 }
 
-/// The client's own refusal, printed, so a lane can name the component and the
-/// cause rather than only the code the producer collapses it to.
+/// Preserve the client admission cause for the boundary assertion.
 fn client_refusal(path: &Path) -> String {
-    let walked =
-        crate::cli::runtime_read::uds::open_trusted_directory(path, unsafe { libc::geteuid() });
+    let walked = crate::cli::runtime_read::uds::open_trusted_directory(
+        path,
+        crate::process::effective_uid(),
+    );
     format!("{walked:?}")
 }
 
-/// A marker is created with `0o600` as a *mode argument*, so a umask that
-/// masks an owner bit lands it at less than the client admits, and a marker the
-/// publisher then cannot read back wedges the namespace for good. The two
-/// neighbouring artifacts pin their own mode; the marker did not.
-///
-/// The umask is process-global rather than a key in the environment map, so
-/// `#[serial_test::serial]` excludes only other `serial` tests and says nothing
-/// about a test that creates a directory and reads its mode. [`Umask`] takes
-/// `crate::test_env_lock` for the length of the window, and a test that touches
-/// a mode has to take that lock too or the two windows overlap silently.
-///
-/// The assertions are behaviour, not codes. A `namespace_busy` or a
-/// `marker_foreign` expectation would pin a label that has already changed
-/// once, and a mode assertion alone would pass just as happily against a
-/// "fix" that hardens the mode by refusing to publish at all.
+/// Restrictive umasks must not prevent marker reads or owned retraction.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_marker_keeps_its_mode_under_a_umask_that_would_clear_it() {
+    const CHILD: &str = "AOE_UDS_UMASK_TEST_CHILD";
+    const ENTERED: &str = "AOE_UDS_UMASK_TEST_ENTERED";
+    let _env = crate::session::test_support::EnvGuard::read_lock();
+    let thread = std::thread::current();
+    let test = thread.name().expect("named test thread");
+    if std::env::var(CHILD).as_deref() != Ok(test) {
+        let home = tempfile::tempdir().expect("private child home");
+        let entered = home.path().join("entered");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
+            .env(ENTERED, &entered)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("TMPDIR", home.path())
+            .stdin(std::process::Stdio::null());
+        let output = crate::process::run_with_timeout_process_group(
+            &mut command,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("spawn isolated umask test")
+        .expect("isolated umask test timed out");
+        assert!(
+            output.status.success(),
+            "isolated umask test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(entered).unwrap(), test);
+        return;
+    }
+    std::fs::write(std::env::var_os(ENTERED).expect("child entry path"), test)
+        .expect("acknowledge selected test");
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     {
         let _umask = Umask::set(0o777);
-        let published = publish().expect("the namespace is free under the mask");
+        let published = try_publish().expect("the namespace is free under the mask");
         assert_eq!(
             mode_of(&dir.join(PREBIND_FILE)),
             0o600,
@@ -849,23 +861,19 @@ async fn a_marker_keeps_its_mode_under_a_umask_that_would_clear_it() {
             0o600,
             "the postbind marker is owner read and write whatever the umask says"
         );
-        // Retraction proves it owns what it wrote by reading the postbind
-        // marker back. A marker it cannot read fails that check before any
-        // unlink, so the artifacts survive the process that created them.
+        // Retraction must still read owned markers under the restrictive mask.
         drop(published);
-        // The lock is the one artifact retraction keeps, by design: a
-        // publisher must find it to take the lock again.
+        // Lock files remain for future publishers.
         for name in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
             assert!(
                 !dir.join(name).exists(),
                 "{name} must be gone after retraction, or the namespace is wedged"
             );
         }
-        // And a namespace nothing was stranded in is publishable again.
-        let republished = publish().expect("a retracted namespace is publishable");
+        let republished = try_publish().expect("a retracted namespace is publishable");
         drop(republished);
     }
-    // With the mask gone, a client read answers from what is published.
+    // Directory admission remains valid after publication is retracted.
     assert!(
         client_admits(&dir),
         "the client admits the published directory: {}",
@@ -873,63 +881,6 @@ async fn a_marker_keeps_its_mode_under_a_umask_that_would_clear_it() {
     );
 }
 
-/// A process-global umask held for one scope. It is a global rather than a key
-/// in the environment map, so it takes [`crate::test_env_lock`] for as long as
-/// it is set: that lock is the crate's one answer to process-wide state, and a
-/// mutex only excludes the holders who take it, so a test that creates a file
-/// and then reads its mode has to be holding it too.
-struct Umask {
-    previous: libc::mode_t,
-    env_lock: Option<std::sync::MutexGuard<'static, ()>>,
-}
-
-impl Umask {
-    fn set(mask: libc::mode_t) -> Self {
-        let env_lock = crate::test_env_lock::acquire_env_lock(|| {
-            eprintln!("waiting for the environment lock: another test holds a process-wide state")
-        });
-        Self {
-            previous: unsafe { libc::umask(mask) },
-            env_lock,
-        }
-    }
-}
-
-impl Drop for Umask {
-    fn drop(&mut self) {
-        unsafe { libc::umask(self.previous) };
-        crate::test_env_lock::release_env_lock(self.env_lock.is_some());
-    }
-}
-
-/// Whether this host's filesystem takes an access ACL at all, printed. It
-/// exists so a failing lane can be read against the platform's answer rather
-/// than guessed at, and it neither returns nor skips: the lanes that depend on
-/// ACL support are strict.
-#[test]
-fn the_hosts_posix_acl_capability_is_reported() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let value = acl_v2(0o4, 1);
-    let path = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).expect("path");
-    let name = std::ffi::CString::new("system.posix_acl_access").expect("name");
-    let set = unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    eprintln!(
-        "posix acl capability: setxattr={set} ({})",
-        std::io::Error::last_os_error()
-    );
-}
-
-/// A symlinked *final* component would let the app directory itself be swapped
-/// for an attacker-chosen inode, so it stays a refusal even though a symlinked
-/// prefix is followed.
 #[test]
 #[serial_test::serial]
 fn a_symlinked_final_component_is_still_refused() {
@@ -945,39 +896,43 @@ fn a_symlinked_final_component_is_still_refused() {
     );
 }
 
-/// Following a prefix symlink does not relax the checks on what it resolves to:
-/// a link into a world-writable directory is refused on the resolved directory's
-/// own attributes.
 #[test]
 #[serial_test::serial]
 fn a_symlinked_prefix_to_a_world_writable_directory_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let open_dir = namespace.base.path().join("open");
     std::fs::create_dir_all(&open_dir).expect("open dir");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).expect("widen");
+    std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("private prefix");
+    let app = open_dir.join(crate::session::APP_DIR_NAME_XDG);
+    std::fs::create_dir(&app).expect("app dir");
+    std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).expect("private app");
     let link = namespace.base.path().join("elsewhere");
     std::os::unix::fs::symlink(&open_dir, &link).expect("prefix symlink");
+    let aliased_app = link.join(crate::session::APP_DIR_NAME_XDG);
+    assert!(open_trusted_app_dir(&aliased_app).is_ok());
 
+    std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).expect("widen");
     assert_eq!(
-        open_trusted_app_dir(&link).err().map(|error| error.code()),
+        open_trusted_app_dir(&aliased_app)
+            .err()
+            .map(|error| error.code()),
         Some("app_dir_untrusted"),
-        "the resolved directory is judged on its own attributes"
     );
 }
 
-/// A shutdown that happens while a client holds the namespace shared for its
-/// whole exchange still retracts. Asking for an exclusive lock to do it, which
-/// is what the old code did, could only ever fail while that client was
-/// reading, so the three artifacts were stranded for as long as the daemon took
-/// to notice.
+/// Retained readers do not prevent retraction of the owned publication.
 #[tokio::test]
 #[serial_test::serial]
 async fn retraction_succeeds_while_a_client_holds_the_namespace() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
-    let mut published = publish().expect("the namespace is free");
-    let client = open_client_lock(&dir);
+    let mut published = try_publish().expect("the namespace is free");
+    let parent = open_directory(&dir).expect("namespace directory");
+    let client = open_lock_at(parent.as_raw_fd(), &CString::new(LOCK_FILE).unwrap())
+        .expect("client lock descriptor");
     assert!(lock_shared(&client), "a client must be able to lock");
 
     published
@@ -991,41 +946,4 @@ async fn retraction_succeeds_while_a_client_holds_the_namespace() {
         );
     }
     unlock(&client);
-}
-
-/// A directory descriptor for a test that wants to scan a namespace, opened the
-/// way any other code would now: by descriptor, not by a name the walk rejects.
-fn test_dir_fd(dir: &Path) -> RawFd {
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("path");
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    assert!(fd >= 0, "the directory opens");
-    fd
-}
-
-/// How a client opens the lock file: a second descriptor on the same inode.
-fn open_client_lock(dir: &Path) -> File {
-    let name = CString::new(LOCK_FILE).expect("constant");
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("app dir path");
-    // A client resolves the namespace by name and opens the lock inside it.
-    let parent = unsafe {
-        OwnedFd::from_raw_fd(libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        ))
-    };
-    assert!(parent.as_raw_fd() >= 0, "the app dir opens");
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    assert!(fd >= 0, "the client opens the lock file directly");
-    unsafe { File::from_raw_fd(fd) }
 }

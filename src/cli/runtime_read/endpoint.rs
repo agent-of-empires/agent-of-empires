@@ -85,52 +85,27 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
         (None, None) => return Ok(SelectedEndpoint::Local),
     };
     let raw = selected.ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
-    if raw.is_empty() {
-        return Err(ReadFailure::pre("invalid_endpoint"));
-    }
     let (request_url, secure) = parse_endpoint(raw)?;
-    let token = source
-        .token
-        .as_deref()
-        .ok_or_else(|| ReadFailure::pre("invalid_token"))?;
-    validate_token(token)?;
-
     let mut request = request_url
         .into_client_request()
         .map_err(|_| ReadFailure::pre("invalid_endpoint"))?;
-    let value = valid_token_bytes(token).ok_or_else(|| ReadFailure::pre("invalid_token"))?;
-    let header = format!(
-        "Bearer {}",
-        String::from_utf8(value.to_vec()).expect("validated ASCII")
-    );
-    request.headers_mut().insert(
-        "Authorization",
-        header
-            .parse()
-            .map_err(|_| ReadFailure::pre("invalid_token"))?,
-    );
+    if let Some(token) = source.token.as_deref() {
+        let value = valid_token_bytes(token).ok_or_else(|| ReadFailure::pre("invalid_token"))?;
+        let value = std::str::from_utf8(value).expect("validated ASCII");
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {value}")
+                .parse()
+                .map_err(|_| ReadFailure::pre("invalid_token"))?,
+        );
+    }
     debug_assert_eq!(secure, request.uri().scheme_str() == Some("wss"));
     Ok(SelectedEndpoint::Http {
         request: Box::new(request),
     })
 }
 
-/// Which profile a read is aimed at. An explicit flag stops the search even
-/// when it is empty, and an explicit `-p` wins over the variable whatever its
-/// value.
-///
-/// The two inputs have two different local rules, and unifying them is what
-/// broke parity once already:
-///
-/// - the flag mirrors `resolve_existing_profile` (`src/session/mod.rs:349`),
-///   which branches on emptiness alone and never trims, so `-p '   '` is a
-///   profile *name* and must be refused exactly as the local command refuses
-///   it;
-/// - the variable goes through the same emptiness test the local caller uses:
-///   `main` hands the raw value over and `resolve_existing_profile` branches on
-///   `is_empty()` alone. Trimming here made `AGENT_OF_EMPIRES_PROFILE='   '`
-///   select the default profile when served and be refused as a profile *name*
-///   when local, which is the opposite of the parity this transport exists for.
+/// An explicit flag wins even when empty. Empty inputs select the default; whitespace remains a name.
 pub(crate) fn selected_profile_source(source: &ReadRequestSource) -> ProfileSource<'_> {
     if let Some(value) = source.explicit_profile.as_deref() {
         return if value.is_empty() {
@@ -156,21 +131,8 @@ pub(crate) enum ProfileSource<'a> {
     Default,
 }
 
-fn validate_token(token: &OsStr) -> Result<(), ReadFailure> {
-    valid_token_bytes(token)
-        .is_some()
-        .then_some(())
-        .ok_or_else(|| ReadFailure::pre("invalid_token"))
-}
-
 fn valid_token_bytes(token: &OsStr) -> Option<&[u8]> {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        token.as_bytes()
-    };
-    #[cfg(not(unix))]
-    let bytes = token.to_str().map(str::as_bytes)?;
+    let bytes = token.as_encoded_bytes();
 
     (!bytes.is_empty()
         && bytes.len() <= 4096
@@ -211,25 +173,8 @@ fn parse_endpoint(raw: &str) -> Result<(String, bool), ReadFailure> {
         return Err(invalid());
     }
     let (host, port): (&str, Option<u16>) = split_authority(authority).ok_or_else(invalid)?;
-    // A bearer goes over plaintext only to a loopback address, and a name is
-    // not an address: nothing here resolves one, so `localhost` would send the
-    // token to whatever the name was redirected to. HTTPS is unaffected, so a
-    // remote named `localhost` over TLS still works and the token is
-    // encrypted.
-    //
-    // The obvious repair is to resolve the name and re-check the address, and
-    // it is wrong here: `parse_endpoint` is synchronous and `execute_inner`
-    // calls it on a tokio worker, so a blocking resolve there blocks the
-    // runtime.
-    //
-    // This is narrower than the rest of the tool on purpose. `aoe acp attach`
-    // and `DaemonClient::new` still take `http://localhost`, because they are
-    // this PR's merge-base callers and narrowing them reaches the TUI
-    // dashboard. So `aoe ps --daemon-url http://localhost:8080` is refused
-    // where `aoe acp attach` accepts the identical host. The cost is paid
-    // here rather than widening this PR's blast radius; closing it everywhere
-    // is its own change.
-    if !secure && !crate::daemon::is_loopback_address(host) {
+    // The connector pins localhost to loopback IPs before sending plaintext credentials.
+    if !secure && !crate::daemon::is_loopback_host(host) {
         return Err(invalid());
     }
     if secure && !valid_https_host(host) {
@@ -366,14 +311,14 @@ mod tests {
             "HTTP://127.0.0.1:8080",
             "HtTpS://example.test",
             "http://127.0.0.2",
+            "http://localhost:8080",
+            "http://LocalHost:8080",
             "https://example.test/base/",
         ] {
             assert!(parse_endpoint(raw).is_ok(), "{raw}");
         }
         for raw in [
             "",
-            "http://localhost:8080",
-            "http://LocalHost:8080",
             "http://[::2]",
             "https://[fe80::1%25eth0]",
             "https://user@example.test",
@@ -475,12 +420,7 @@ mod tests {
         assert!(select_endpoint(&source_with(None, Some("not a url"), None, None)).is_err());
     }
 
-    /// The flag mirrors `resolve_existing_profile`, which branches on emptiness
-    /// and never trims: `-p ''` is the default profile, and `-p '   '` is a
-    /// profile *name* the local command refuses by name. The variable mirrors
-    /// the caller that resolves one, which trims first, so a blank variable is
-    /// the default profile on both sides. The two rules are different, and
-    /// unifying them is what broke parity for a round.
+    /// Both selectors distinguish an empty default from a whitespace-only name.
     #[test]
     fn an_empty_profile_selection_is_the_default_and_a_blank_one_is_a_name() {
         for env_profile in [None, Some("")] {
@@ -498,12 +438,7 @@ mod tests {
             ),
             "a blank flag is a profile name, which the local path refuses"
         );
-        // A blank *variable* is a profile name here, exactly as a blank flag
-        // is. `main` hands `cli.profile` the raw value and
-        // `resolve_existing_profile` branches on `is_empty()` alone -- nothing
-        // in the local path trims it -- so treating it as the default profile
-        // made a served read answer a question the local command answers the
-        // other way.
+        // The local profile resolver tests emptiness without trimming.
         for env_profile in [Some("   "), Some("\t\n")] {
             let source = source_with(None, None, None, env_profile);
             assert!(
@@ -535,16 +470,10 @@ mod tests {
         ));
     }
 
-    /// The capture keeps the raw value whatever it holds, because `main` reads
-    /// the same field to learn whether a profile was named at all and derives
-    /// the write scope from it. What the *selection* does with the value is the
-    /// local rule: only a genuinely empty variable is unset, and a blank one
-    /// is a profile name the local command refuses.
+    /// Empty environment selection remains captured but selects the default profile.
     #[test]
     fn an_empty_profile_variable_is_captured_and_still_reads_as_the_default() {
         let cli = {
-            // Parsed with the variable absent: `-p` is a flag, so nothing but
-            // the environment can put a value in `cli.profile`.
             let _env = crate::session::test_support::EnvGuard::unset(&[PROFILE_ENV]);
             super::super::Cli::parse_from(["aoe", "ps"])
         };

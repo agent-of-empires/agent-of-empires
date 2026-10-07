@@ -4,11 +4,15 @@
 
 ## Authentication
 
-Every endpoint requires the token `aoe serve` printed (also visible in the TUI's Serve panel), unless the server runs with `--no-auth`. Send it as `Authorization: Bearer <token>`, as a `?token=` query parameter, or as the `aoe_token` cookie. Read-only mode (`--read-only`) answers every write endpoint with `403 read_only`.
+Protected routes follow the configured authentication mode. Token authentication accepts `Authorization: Bearer <token>`, a `?token=` query parameter, or the `aoe_token` cookie. Passphrase authentication uses `/api/login` and a device-bound `aoe_session` cookie. A daemon running `--auth none` needs no credential. Read-only mode (`--read-only`) answers write endpoints with `403 read_only`.
 
 ## Runtime CLI reads
 
-The read-only CLI commands use `/api/runtime/ws` when `--daemon-url` or `AOE_DAEMON_URL` names an endpoint. Set `AOE_DAEMON_TOKEN` for the required bearer header. The route uses the shared authentication middleware; requiring a bearer header does not exclude cookie or query-token authentication. See the [CLI transport options](cli/reference.md#aoe) for endpoint selection and fallback behavior.
+The read-only CLI commands use `/api/runtime/ws` when `--daemon-url` or `AOE_DAEMON_URL` names an endpoint. The route uses the same credential policy as the daemon API, including bearer tokens, query tokens and login cookies; an unauthenticated daemon needs no credential. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`, with the existing device-bound session cache for passphrase login. See the [CLI transport options](cli/reference.md#aoe) for endpoint selection and fallback behavior.
+
+When descriptor-based inspection finds no runtime artifacts, local reads remain available even if ownership or permissions prohibit a UDS connection. Observed runtime artifacts still require trusted admission.
+
+Local publication waits for shared absence probes and readers retaining a prior namespace. An existing publisher's exclusive claim still refuses a second publisher.
 
 The runtime wire protocol is **version 4**. Each exchange sends a `Hello` followed by a `Snapshot`; both frames require each profile's `name`, `listed` boolean and `aliases` array. `name` identifies the representative of a physical directory on the daemon's filesystem. `aliases` contains its other selectable names. Scoped reads and configured defaults retain the requested alias spelling.
 
@@ -20,11 +24,15 @@ For alias-only structured sessions, accepted disk rows determine status. These s
 
 A failed pane probe keeps a newer disk generation's terminal status and idle-entered time rather than an older cached pair. For canonical and alias-only terminal sessions, an observed transition into `Idle` uses that generation's disk status as its baseline and stamps a new idle-entered time. Canonical reachability and detector tracking are not reset solely by a generation advance.
 
-Profile inventory, cached session data, group registries and project registries have independent health. A newly observed physical store is not ready until an accepted daemon reload; accepted empty stores are ready too. A session load failure makes affected session reads exit 1 instead of returning incomplete counts or an empty successful result. Repairing the file does not clear that failure until an accepted reload. Transient selector conflicts with retained cached stores also produce a refusal until an accepted reload rather than serving another store's rows. Other healthy profiles and inventory-only reads remain available.
+Profile inventory, cached session data, group registries and project registries have independent health. A newly observed physical store is not ready until an accepted daemon reload; accepted empty stores are ready too. A session load failure makes affected session reads exit 1 instead of returning incomplete counts or an empty successful result. Repairing the file does not clear that failure until an accepted reload. Selector conflicts with retained cached ownership refuse session reads while the binding differs. Restoring the accepted binding clears that conflict immediately; using a new binding requires an accepted reload. Other healthy profiles and inventory-only reads remain available.
 
 Project listing does not require session or group data. The `global` and `profile` scopes require their respective project registry; `all` retains entries from readable registries, matching the local merged listing. Missing or blank registry files represent an empty registry; other read errors mark it unreadable rather than returning a successful empty result. Global project registry reads and explicitly named profile project registry reads do not create app/profile directories. Local empty-profile bootstrap behavior is unchanged.
 
-Profile labels and persisted session titles, commands and group keys retain their original strings, including controls. Group keys are opaque equality keys, not filesystem paths; empty segments and leading or trailing separators are preserved. Alias names and scoped selections still follow the local profile-name grammar; a legacy directory label printed by the picker can remain unreadable for session reads. JSON preserves the values; human output follows local formatting without sanitizing their controls.
+Project names, configured agent names and stored Git branch labels are display text. Workspace repository names retain their native basenames. Native paths preserve legal controls but reject NUL; stored project and main-repository spellings, including trailing separators, are never rewritten. A session writer that cannot represent a native path as UTF-8 stores an empty string. Runtime reads preserve that existing representation without rejecting unrelated profiles; they do not recover the original native path. Empty paths cannot identify registered projects.
+
+Session timestamps reflect independent UTC wall-clock reads. After a clock correction, archive and trash timestamps may precede creation. Runtime reads preserve those values without requiring timestamp order.
+
+Profile labels and persisted session titles, commands and group keys retain their original strings, including controls. Runtime `last_error` is nullable display text and preserves multiline hook diagnostics. Group keys are opaque equality keys, not filesystem paths; empty segments and leading or trailing separators are preserved. Alias names and scoped selections still follow the local profile-name grammar; a legacy directory label printed by the picker can remain unreadable for session reads. JSON preserves the values; human output follows local formatting without sanitizing their controls.
 
 ### Transport parity fixture
 

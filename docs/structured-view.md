@@ -138,9 +138,9 @@ AOE_DAEMON_URL=https://aoe.example.com AOE_DAEMON_TOKEN=… aoe   # remote sessi
 aoe acp attach <session_id> --daemon-url https://aoe.example.com
 ```
 
-With `AOE_DAEMON_URL` set, the TUI swaps its home view for a remote session picker and `aoe serve --status` and the `aoe acp *` verbs retarget to the remote. Local-only operations (tmux attach, `aoe stop`, file edit) are not available against a remote; use the dashboard or SSH. The session list is read with a bearer token only over HTTPS or a loopback URL, so a token plus a plaintext remote URL is refused; the other daemon requests do not apply that check yet, so use HTTPS or a tunnel.
+With `AOE_DAEMON_URL` set, the TUI opens a remote session picker, and `aoe serve --status`, `aoe acp *`, and the read-only CLI commands select that daemon. Local-only operations such as tmux attach, `aoe stop`, and file editing still require the local machine or SSH. Runtime reads require HTTPS except for loopback literals and `localhost`, which the read client pins to loopback without DNS. The explicit flag and environment discovery have different fallback rules; see [`--daemon-url`](cli/reference.md#aoe).
 
-A remote daemon running `--auth=passphrase` never mints a bearer token, so `AOE_DAEMON_TOKEN` has nothing to carry. Set `AOE_DAEMON_PASSPHRASE` instead; the CLI logs in via the same `/api/login` handshake the web dashboard uses and caches the resulting session for the process. A local daemon needs neither: the CLI already reads its own `serve.passphrase` file (the same one `aoe serve --restart` recalls from) to log in automatically.
+For runtime reads and ACP requests to a daemon running `--auth=passphrase`, use `AOE_DAEMON_PASSPHRASE` instead of a bearer token. These clients share the `/api/login` handshake, device binding, and persisted session cache. Login secrets never follow redirects; loopback login bypasses environment proxies. ACP local discovery can also read the saved `serve.passphrase` file. A revoked cached session triggers a fresh login; a failed authentication never substitutes local rows. TUI session-list authentication supports bearer tokens only; an unauthenticated daemon needs no credential. Ancillary plugin UI requests can use passphrase authentication through the ACP client.
 
 ## Headless CLI verbs
 

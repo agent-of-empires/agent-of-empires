@@ -4,13 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use tempfile::TempDir;
 
-// The one lock for the whole process lives in `crate::test_env_lock`, because
-// `server::test_support` is compiled into the integration test binaries, where
-// this module is not. A per-module mutex for the same key would be two locks.
-fn acquire_env_lock_reporting_contention() -> Option<MutexGuard<'static, ()>> {
-    acquire_env_lock(tests::report_env_lock_contention)
-}
-
 pub(crate) fn lock_reporting_contention<'a, T>(
     lock: &'a std::sync::Mutex<T>,
     contended: impl FnOnce(),
@@ -52,7 +45,7 @@ impl EnvGuard {
     pub(crate) fn set<V: AsRef<OsStr>>(pairs: &[(&'static str, V)]) -> Self {
         let mut guard = Self {
             prev: Vec::with_capacity(pairs.len()),
-            _lock: acquire_env_lock_reporting_contention(),
+            _lock: acquire_env_lock(|| {}),
         };
         for (key, value) in pairs {
             guard.snapshot(key);
@@ -66,7 +59,7 @@ impl EnvGuard {
     pub(crate) fn unset(keys: &[&'static str]) -> Self {
         let mut guard = Self {
             prev: Vec::with_capacity(keys.len()),
-            _lock: acquire_env_lock_reporting_contention(),
+            _lock: acquire_env_lock(|| {}),
         };
         for key in keys {
             guard.snapshot(key);
@@ -88,7 +81,7 @@ impl EnvGuard {
     pub(crate) fn read_lock() -> Self {
         Self {
             prev: Vec::new(),
-            _lock: acquire_env_lock_reporting_contention(),
+            _lock: acquire_env_lock(|| {}),
         }
     }
 
@@ -170,7 +163,7 @@ pub(crate) struct TieWorkdirToNameGuard {
 
 impl TieWorkdirToNameGuard {
     pub(crate) fn set(enabled: bool) -> Self {
-        let lock = acquire_env_lock_reporting_contention();
+        let lock = acquire_env_lock(|| {});
         let previous = super::config::load_config()
             .ok()
             .flatten()
@@ -397,18 +390,6 @@ mod tests {
         }
     }
 
-    thread_local! {
-        static LOCK_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn report_env_lock_contention() {
-        LOCK_WAITING.with_borrow_mut(|waiting| {
-            if let Some(waiting) = waiting.take() {
-                let _ = waiting.send(());
-            }
-        });
-    }
-
     #[test]
     fn env_lock_orders_readers_and_path_derivation() {
         use std::sync::mpsc;
@@ -445,7 +426,7 @@ mod tests {
             let (contended, observed, exclusive) = std::thread::scope(|scope| {
                 let shim = shim.path();
                 let reader = scope.spawn(move || {
-                    LOCK_WAITING.with_borrow_mut(|waiting| *waiting = Some(waiting_tx));
+                    crate::test_env_lock::observe_env_lock_contention(waiting_tx);
                     let _guard = if derive_path {
                         path_prepended(shim)
                     } else {

@@ -28,22 +28,22 @@ const SESSION_COOKIE_FILENAME: &str = "cli_login_session";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
-pub(super) struct PassphraseSession {
+pub(crate) struct PassphraseSession {
     /// Full `aoe_session=<id>` pair, ready to send as the `Cookie` header.
-    pub(super) cookie: String,
+    pub(crate) cookie: String,
     /// Base64url (no padding) encoded 32-byte secret, sent as
     /// `X-Aoe-Device-Binding` on every request that uses `cookie`.
-    pub(super) binding_secret: String,
+    pub(crate) binding_secret: String,
 }
 
 /// In-memory cache for one `HttpClient`, backed by an on-disk cache (see
 /// `DaemonEndpoint::session_cache_dir`).
 #[derive(Debug, Clone, Default)]
-pub(super) struct PassphraseSessionCache(Arc<RwLock<Option<PassphraseSession>>>);
+pub(crate) struct PassphraseSessionCache(Arc<RwLock<Option<PassphraseSession>>>);
 
 impl PassphraseSessionCache {
     /// Cached session, loading it from disk on first use this process.
-    pub(super) fn get(&self, endpoint: &DaemonEndpoint) -> Option<PassphraseSession> {
+    pub(crate) fn get(&self, endpoint: &DaemonEndpoint) -> Option<PassphraseSession> {
         if let Some(session) = self.0.read().unwrap_or_else(|e| e.into_inner()).clone() {
             return Some(session);
         }
@@ -57,7 +57,7 @@ impl PassphraseSessionCache {
     /// deletes the persisted cookie file, so a subsequent [`get`](Self::get)
     /// can't reload the same rejected cookie straight back off disk. The
     /// device-binding secret is left in place; the new login reuses it.
-    pub(super) fn invalidate(&self, endpoint: &DaemonEndpoint) {
+    pub(crate) fn invalidate(&self, endpoint: &DaemonEndpoint) {
         *self.0.write().unwrap_or_else(|e| e.into_inner()) = None;
         if let Some(dir) = endpoint.session_cache_dir() {
             let _ = std::fs::remove_file(dir.join(SESSION_COOKIE_FILENAME));
@@ -75,7 +75,7 @@ impl PassphraseSessionCache {
 }
 
 /// Perform the passphrase login handshake and cache the resulting session.
-pub(super) async fn login(
+pub(crate) async fn login(
     endpoint: &DaemonEndpoint,
     cache: &PassphraseSessionCache,
 ) -> Result<PassphraseSession, HttpError> {
@@ -83,12 +83,12 @@ pub(super) async fn login(
         .resolved_passphrase()
         .ok_or(HttpError::Unauthorized)?;
     let binding_secret = device_binding_secret(endpoint);
-    let url = format!("{}/api/login", endpoint.base_url);
+    let (client, url) = login_client(format!("{}/api/login", endpoint.base_url))?;
     let body = serde_json::json!({
         "passphrase": passphrase,
         "device_binding_secret": binding_secret,
     });
-    let res = login_client()?.post(&url).json(&body).send().await?;
+    let res = client.post(url).json(&body).send().await?;
     let status = res.status();
     if !status.is_success() {
         let body = res.text().await.unwrap_or_default();
@@ -128,10 +128,10 @@ pub(super) async fn elevate(
     let passphrase = endpoint
         .resolved_passphrase()
         .ok_or(HttpError::Unauthorized)?;
-    let url = format!("{}/api/login/elevate", endpoint.base_url);
+    let (client, url) = login_client(format!("{}/api/login/elevate", endpoint.base_url))?;
     let body = serde_json::json!({ "passphrase": passphrase });
-    let res = login_client()?
-        .post(&url)
+    let res = client
+        .post(url)
         .header(header::COOKIE, &session.cookie)
         .header("X-Aoe-Device-Binding", &session.binding_secret)
         .json(&body)
@@ -145,16 +145,18 @@ pub(super) async fn elevate(
     Err(map_auth_error(status, body))
 }
 
-/// A dedicated client for the login POST with redirects disabled: a
-/// misconfigured or hostile daemon at the trusted URL could otherwise
-/// 307/308 the request (which reqwest re-POSTs, body included) to a
-/// different host, handing it the passphrase and device-binding secret.
-fn login_client() -> Result<reqwest::Client, HttpError> {
-    reqwest::Client::builder()
+/// Login secrets never follow redirects or use a proxy for a loopback destination.
+fn login_client(url: impl reqwest::IntoUrl) -> Result<(reqwest::Client, reqwest::Url), HttpError> {
+    let url = url.into_url()?;
+    let builder = reqwest::Client::builder()
         .timeout(LOGIN_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(HttpError::Transport)
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = if crate::daemon::is_loopback_url(&url) {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    Ok((builder.build()?, url))
 }
 
 fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {

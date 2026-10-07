@@ -108,6 +108,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "tmux",
     "http",
     "serve",
+    "runtime",
     "hooks",
     "sound",
     "telemetry",
@@ -143,6 +144,8 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "git.command",
     "web.client",
     "log.runtime",
+    "runtime.uds",
+    "runtime.ws",
 ];
 
 /// Only the filter hot-swaps; sink and rotation settings apply on restart.

@@ -22,6 +22,7 @@ pub mod push_send;
 pub mod rate_limit;
 pub(crate) mod reload;
 pub(crate) mod router;
+#[cfg(target_os = "linux")]
 pub(crate) mod runtime_uds;
 pub(crate) mod runtime_ws;
 pub(crate) mod serve_snapshot;

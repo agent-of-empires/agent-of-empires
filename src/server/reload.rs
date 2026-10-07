@@ -5,7 +5,6 @@ use crate::file_watch::FileWatchService;
 use crate::session::Instance;
 use crate::session::Status;
 use crate::session::Storage;
-use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,10 +53,8 @@ pub(crate) fn selectable_profiles() -> anyhow::Result<Vec<SelectableProfile>> {
             Err(_) if kind.is_symlink() => continue,
             Err(error) => return Err(error.into()),
         };
-        let identity = ProfileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        };
+        let (device, inode) = crate::process::metadata_identity(&metadata);
+        let identity = ProfileIdentity { device, inode };
         if kind.is_dir() {
             directories.push(SelectableProfile {
                 name,
@@ -1243,7 +1240,8 @@ mod tests {
             .to_path_buf();
         std::os::unix::fs::symlink(outside.path(), root.join("external")).unwrap();
         let storage = Storage::open_unwatched("external").unwrap();
-        let mut stored = Instance::new("external idle", "/repo");
+        let working_dir = outside.path().to_str().unwrap();
+        let mut stored = Instance::new("external idle", working_dir);
         stored.tool = "claude".into();
         stored.status = Status::Running;
         stored.lifecycle_generation = 1;
@@ -1273,27 +1271,17 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let session_name = crate::tmux::Session::generate_name(&stored.id, &stored.title);
+        let session = crate::tmux::Session::new(&stored.id, &stored.title).unwrap();
+        let session_name = session.name().to_owned();
         let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
-        let created = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "120",
-                "-y",
-                "40",
-                "printf '\u{273b} Worked for 1m 52s\n\u{276f}\n'; sleep 300",
-            ])
-            .output()
+        session
+            .create_with_size(
+                working_dir,
+                Some("printf '\u{273b} Worked for 1m 52s\n\u{276f}\n'; exec sleep 300"),
+                Some((120, 40)),
+                "external",
+            )
             .unwrap();
-        assert!(
-            created.status.success(),
-            "{}",
-            String::from_utf8_lossy(&created.stderr)
-        );
         crate::tmux::test_helpers::wait_for_pane_command(&session_name, "sleep");
         let cache_guard = crate::tmux::SessionCacheGuard::capture();
         cache_guard.force_present(&[&session_name]);
@@ -1655,7 +1643,7 @@ mod tests {
                 .to_path_buf();
             let identity = |path: &std::path::Path| {
                 let metadata = std::fs::metadata(path).unwrap();
-                (metadata.dev(), metadata.ino())
+                crate::process::metadata_identity(&metadata)
             };
             assert_ne!(identity(&root.join("main")), identity(outside.path()));
             for name in ["external-a", "external-z"] {

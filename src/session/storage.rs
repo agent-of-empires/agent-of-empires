@@ -320,20 +320,7 @@ where
     Ok(result)
 }
 
-/// A JSON registry's text, or `None` when the file is absent or blank. Both
-/// are legitimately empty, and neither is a reason to write a sidecar.
-///
-/// Absent and unreadable are different facts and this has to keep them apart.
-/// `Path::exists` is `stat(...).is_ok()`, so it answers "no" for a permission
-/// error just as it answers "no" for a file that is not there. Reading a
-/// profile this half cannot open as an empty registry is what let a profile
-/// with a sessions.json in it publish as fully healthy, with its rows simply
-/// absent and every read command reporting nothing at all.
-///
-/// Only `NotFound` is absence. Something that is there but is not a regular
-/// file -- a directory, most likely -- is not an empty registry either: it used
-/// to surface as `IsADirectory`, and folding it into "empty" would reintroduce
-/// the same silence one level up, with the health model unable to see it.
+/// Missing or blank registries are empty; unreadable and nonregular paths are errors.
 fn read_nonempty(path: &Path) -> Result<Option<String>> {
     let metadata = match fs::metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

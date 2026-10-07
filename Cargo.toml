@@ -184,9 +184,7 @@ tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"
 
-# WebSocket client for the structured view-in-TUI view: subscribes to the daemon's
-# `/sessions/{id}/acp/ws` stream and pumps frames into the local reducer. The
-# daemon itself uses axum's built-in WS support and never pulls this in.
+# WebSockets for daemon clients and the daemon's local UDS transport.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 
 # Capability-safe file opens for the session file-read endpoint (#3088): open
@@ -227,6 +225,7 @@ serve = ["web"]
 
 [dev-dependencies]
 serial_test = "4.0"
+jsonschema = { version = "0.58.6", default-features = false }
 # Test-only tokio clock control (`start_paused`), so the token-rotation
 # loop's grace deadline can be asserted without sleeping through it.
 # `cargo build` and released binaries never enable `test-util`.

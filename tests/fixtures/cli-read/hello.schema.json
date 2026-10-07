@@ -39,24 +39,12 @@
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.([0-9]{3}|[0-9]{6}|[0-9]{9}))?Z$"
     },
-    "safe_text": {
-      "type": "string",
-      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]*$"
-    },
     "profile_label": { "type": "string", "minLength": 1 },
     "profile_alias": {
       "type": "string",
       "minLength": 1,
       "pattern": "^[^/\\\\]+$",
       "not": { "enum": [".", "..", "all", "All", "aLl", "alL", "ALl", "AlL", "aLL", "ALL"] }
-    },
-    "absolute_path": {
-      "type": "string",
-      "pattern": "^/([^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*)?$"
-    },
-    "group_path": {
-      "type": "string",
-      "description": "Opaque stored group key, not a filesystem path."
     },
     "health_code": {
       "type": "string",

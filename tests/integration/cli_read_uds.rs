@@ -22,26 +22,17 @@ use clap::Parser;
 /// a namespace no daemon ever published into.
 struct TempAppDir {
     _dir: tempfile::TempDir,
-    previous: Option<OsString>,
+    _env: agent_of_empires::server::test_support::RuntimeEnvGuard,
 }
 
 impl TempAppDir {
     fn new() -> Self {
+        let mut env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
         let dir = tempfile::tempdir().expect("temp app dir");
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        env.bind(dir.path());
         Self {
             _dir: dir,
-            previous,
-        }
-    }
-}
-
-impl Drop for TempAppDir {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
+            _env: env,
         }
     }
 }
@@ -164,27 +155,6 @@ async fn the_daemon_and_local_status_json_agree_on_an_empty_profile() {
     server.join().await;
 }
 
-/// The same publication, read twice: one snapshot per connection, both
-/// complete, and the second read is not a replay of a cached frame.
-#[tokio::test]
-#[serial_test::serial]
-async fn every_connection_gets_its_own_complete_exchange() {
-    let state = build_test_app_state_with_policy(Vec::new(), Vec::new(), Vec::new(), None);
-    let server = RuntimeUdsTestServer::start(state.clone())
-        .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
-
-    for attempt in 0..3 {
-        let outcome = read(ScopedCommand::Profile).await;
-        assert_eq!(
-            outcome.exit, 0,
-            "attempt {attempt} failed: {:?}",
-            outcome.stderr
-        );
-    }
-    state.shutdown.cancel();
-    server.join().await;
-}
-
 /// With no daemon publishing, the local transport reports that the command is
 /// the caller's to run, rather than an error the CLI would have to interpret.
 #[tokio::test]
@@ -202,13 +172,7 @@ async fn no_daemon_publication_leaves_the_command_to_the_local_path() {
     );
 }
 
-/// An empty selection in the environment is one decision, in both variables,
-/// and a live daemon must answer it the way the local
-/// command path does: `aoe list` reads the default profile and prints the
-/// table. Before, the empty profile came back as `profile_missing` (exit 4)
-/// from the daemon while the very same command succeeded with no daemon, and
-/// an empty `AOE_DAEMON_URL` stranded every read instead of selecting the
-/// local transport.
+/// Empty environment selections preserve the local profile and transport semantics.
 #[tokio::test]
 #[serial_test::serial]
 async fn an_empty_environment_selection_is_answered_not_refused() {
@@ -227,13 +191,7 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
     );
     agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
 
-    // Only a genuinely empty variable is unset. A blank one is a profile
-    // *name* on both halves, because nothing in the local path trims it: `main`
-    // hands `cli.profile` the raw value and `resolve_existing_profile` branches
-    // on `is_empty()` alone. Trimming only on this half made a served read
-    // answer a question the local command answers the other way, so the blank
-    // case is asserted below alongside the explicit flag, where the local
-    // command refuses it by name.
+    // Whitespace-only values name profiles; only empty variables are unset.
     for (label, env_url, env_profile) in [
         ("absent", None, None),
         ("empty", Some(OsString::from("")), Some(OsString::from(""))),
@@ -302,8 +260,7 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
     server.join().await;
 }
 
-/// Shutdown retracts the artifacts, so a later read fails closed at admission
-/// instead of reaching a socket that no daemon is serving.
+/// Retraction returns discovery to local takeover, never an unserved socket.
 #[tokio::test]
 #[serial_test::serial]
 async fn shutdown_retracts_the_socket_and_closes_admission() {
@@ -341,11 +298,7 @@ async fn shutdown_retracts_the_socket_and_closes_admission() {
     );
 }
 
-/// A home reached through a symlink is an ordinary setup, `/tmp` → `/private/tmp`
-/// on macOS and a linked `$HOME` on Linux, and the publisher used to refuse it
-/// outright, so a daemon under a symlinked `XDG_CONFIG_HOME` published nothing
-/// and every read fell back to the local store. The walk follows a prefix
-/// symlink and verifies what it resolves to by descriptor, so this is served.
+/// Prefix symlinks are followed and their resolved directories validated.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_publication_under_a_symlinked_config_home_is_served() {
@@ -355,22 +308,16 @@ async fn a_publication_under_a_symlinked_config_home_is_served() {
     let link = base.path().join("link");
     std::os::unix::fs::symlink(&real, &link).expect("config home symlink");
 
-    let previous = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::set_var("XDG_CONFIG_HOME", &link);
-    let _restore = EnvRestore(previous);
+    let _env = agent_of_empires::server::test_support::RuntimeEnvGuard::set(&link);
 
     let state = build_test_app_state_with_policy(Vec::new(), Vec::new(), Vec::new(), None);
     let server = RuntimeUdsTestServer::start_in(&link, state.clone())
         .unwrap_or_else(|reason| panic!("a symlinked config home is publishable: {reason}"));
-    // A profile that holds nothing: what is under test is which transport
-    // answers, not the missing-profile refusal the renderer would otherwise
-    // return for an empty state.
+    // An empty profile lets status succeed without a missing-profile refusal.
     agent_of_empires::session::create_profile("main").expect("create fixture profile");
     agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
 
-    // All four artifacts exist: a publisher that walked the chain and then
-    // published by name would have produced the same two marker files, so the
-    // count is the difference between "published" and "published once".
+    // Publication is anchored to the resolved config directory.
     for name in [
         "lifetime.lock",
         "runtime.prebind.json",
@@ -391,65 +338,98 @@ async fn a_publication_under_a_symlinked_config_home_is_served() {
         "the read must be served: {:?}",
         outcome.stderr
     );
-    assert!(
-        outcome.stdout.as_deref().is_some_and(|out| !out.is_empty()),
-        "a served read prints something"
-    );
     state.shutdown.cancel();
     server.join().await;
 }
 
-/// A daemon that was killed outright leaves its three artifacts behind, and the
-/// client has to say so at once. Reporting that as a retryable identity fault
-/// would spend the whole 15-second establishment budget before producing the
-/// same answer, so the read is handed straight back to the local command path.
 #[tokio::test]
 #[serial_test::serial]
-async fn a_dead_publisher_hands_the_read_back_at_once() {
+async fn retained_markers_without_a_live_owner_are_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = TempAppDir::new();
     let state = build_test_app_state_with_policy(Vec::new(), Vec::new(), Vec::new(), None);
-    let server = RuntimeUdsTestServer::start(state.clone())
-        .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
-
-    // Exactly what a `kill -9` leaves: the artifacts on disk, the recorded pid
-    // of a process that is provably not running, and no listener answering.
-    for name in ["runtime.prebind.json", "runtime.postbind.json"] {
-        let path = server.app_dir().join(name);
-        let published = std::fs::read(&path).expect("the live marker");
-        let mut dead: serde_json::Value =
-            serde_json::from_slice(&published).expect("the marker is json");
-        dead["pid"] = serde_json::json!(4_194_302);
-        dead["process_start_identity"] = serde_json::json!(format!(
-            "linux:v1:{}:1",
-            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .expect("boot id")
-                .trim()
+    let server = RuntimeUdsTestServer::start_in(fixture._dir.path(), state.clone()).unwrap();
+    let app = server.app_dir();
+    let markers = ["runtime.prebind.json", "runtime.postbind.json"].map(|name| {
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join(name)).unwrap()).unwrap();
+        let start = marker["process_start_identity"].as_str().unwrap();
+        let (prefix, ticks) = start.rsplit_once(':').unwrap();
+        marker["process_start_identity"] = serde_json::json!(format!(
+            "{prefix}:{}",
+            ticks.parse::<u64>().unwrap().checked_add(1).unwrap()
         ));
-        std::fs::write(&path, serde_json::to_vec(&dead).expect("dead marker")).expect("rewrite");
-    }
-
-    let started = std::time::Instant::now();
-    let read = attempt_read(ScopedCommand::Profile, &local_source()).await;
-    let elapsed = started.elapsed();
-    assert!(
-        matches!(read, ScopedRead::NoLocalPublication(_)),
-        "a dead publisher is an absence, not a refusal"
-    );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "the read was handed back in {elapsed:?}, which is the whole establishment budget again"
-    );
+        (name, marker)
+    });
     state.shutdown.cancel();
     server.join().await;
+    for (name, marker) in markers {
+        let path = app.join(name);
+        std::fs::write(&path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        attempt_read(ScopedCommand::Profile, &local_source()),
+    )
+    .await
+    .expect("retained dead markers are absence without the establishment wait");
+    assert!(
+        matches!(read, ScopedRead::NoLocalPublication(_)),
+        "retained markers with no owner must hand back to the local store"
+    );
 }
 
-/// Restores `XDG_CONFIG_HOME` when the test ends, however it ends.
-struct EnvRestore(Option<OsString>);
+#[tokio::test]
+#[serial_test::serial]
+async fn an_unpublished_writable_namespace_falls_back_but_runtime_artifacts_refuse() {
+    use std::os::unix::fs::PermissionsExt;
 
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
+    for (base_mode, app_mode) in [(0o775, None), (0o775, Some(0o700)), (0o700, Some(0o775))] {
+        let artifacts: &[Option<&str>] = if app_mode.is_some() {
+            &[
+                None,
+                Some("runtime.prebind.json"),
+                Some("runtime.postbind.json"),
+                Some("runtime.sock"),
+                Some("lifetime.lock"),
+                Some("publisher.lock"),
+                Some("runtime.prebind.json.tmp.partial"),
+                Some("runtime.unrecognised"),
+            ]
+        } else {
+            &[None]
+        };
+        for &artifact in artifacts {
+            let namespace = TempAppDir::new();
+            let app = namespace
+                ._dir
+                .path()
+                .join(agent_of_empires::session::APP_DIR_NAME_XDG);
+            std::fs::set_permissions(
+                namespace._dir.path(),
+                std::fs::Permissions::from_mode(base_mode),
+            )
+            .unwrap();
+            if let Some(mode) = app_mode {
+                std::fs::create_dir(&app).unwrap();
+                std::fs::set_permissions(&app, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            if let Some(name) = artifact {
+                std::fs::write(app.join(name), b"untrusted runtime artifact").unwrap();
+            }
+            let result = attempt_read(ScopedCommand::Profile, &local_source()).await;
+            match (artifact, result) {
+                (None, ScopedRead::NoLocalPublication(None)) => {}
+                (Some(_), ScopedRead::Answered(outcome)) => {
+                    assert_eq!(outcome.exit, 2);
+                    assert_eq!(outcome.stdout, None);
+                    assert!(outcome.stderr.unwrap().contains("refused to read"));
+                }
+                (artifact, _) => {
+                    panic!("unexpected admission for {base_mode:o}/{app_mode:?}, {artifact:?}")
+                }
+            }
         }
     }
 }

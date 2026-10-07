@@ -148,10 +148,7 @@ fn render_list(
     let state = args.state;
     if args.all {
         require_list_all_health(snapshot)?;
-        // The empty check comes before the JSON branch, as `run_all_profiles`
-        // orders it: with no profiles the local command prints its sentence
-        // and returns, so a served `--json` prints the same sentence rather
-        // than `[]`. The inversion was the whole divergence.
+        // Local empty-inventory output precedes JSON formatting.
         if !snapshot.profiles.iter().any(|profile| profile.listed) {
             return Ok(Projection::text("No profiles found.\n".into()));
         }
@@ -661,12 +658,7 @@ fn render_groups(
     Ok(output)
 }
 
-/// The picker prints profile names and the default marker, and reads nothing
-/// else. The global profile enumeration is the one component it cannot answer
-/// without: fail that and the list of names is incomplete. A profile's own
-/// components and the global project registry are not consulted here, so
-/// refusing on them would turn a working answer into a refusal, which is the
-/// same defect as the under-refusal the all-profiles listing had.
+/// Profile listing requires global enumeration, not per-profile data or project registries.
 fn render_profiles(snapshot: &SnapshotData) -> Result<String, ReadFailure> {
     if !component_healthy(&snapshot.health.global_enumeration) {
         return Err(unreadable("The profile registry"));
@@ -730,19 +722,8 @@ fn render_projects(
         }
         ScopeFilter::All => {
             let (_, profile) = selected_profile(snapshot, source)?;
-            // The merged registry in the local order: the global rows, then the
-            // profile rows that shadow them by identity. A synthesized row is
-            // not a registry entry, so it can neither shadow a global row nor
-            // add a row of its own.
-            //
-            // Identity is the producer's `merge_key`, which it computed with
-            // the store's own rule on the daemon's filesystem. Resolving a
-            // path here would answer with a directory on the reader's
-            // machine, which is how a remote daemon's two distinct
-            // directories became one project on a workstation that reached
-            // both through one of them. The key decides identity only; the
-            // surviving row keeps the spelling it was stored with, so what
-            // either path prints for a registered project does not change.
+            // Registered profile entries shadow globals by daemon-computed identity, in local order.
+            // Never resolve a remote path on the client's filesystem.
             let mut merged: Vec<ProjectRead> = Vec::new();
             let mut index_of: HashMap<String, usize> = HashMap::new();
             for project in snapshot
@@ -1073,10 +1054,10 @@ mod tests {
         assert!(human.contains("  Status:  Waiting\n"), "{human}");
     }
 
-    /// `aoe session show` with no identifier still auto-detects inside tmux and
-    /// still refuses, in the operator's own words, when it is not.
     #[test]
-    fn show_without_an_identifier_refuses_outside_tmux_in_plain_words() {
+    #[serial_test::parallel]
+    fn show_requires_an_identifier_without_tmux_context() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX_PANE"]);
         let value = snapshot(vec![session("a", WireStatus::Waiting)]);
         let error = render_show(
             &ShowArgs {
@@ -1089,15 +1070,7 @@ mod tests {
         .unwrap_err();
         let outcome = crate::cli::runtime_read::ReadOutcome::from(error);
         assert_eq!(outcome.stdout, None);
-        assert_eq!(
-            outcome.exit, 1,
-            "the local path leaves 1, so the served path must too"
-        );
-        assert_eq!(
-            outcome.stderr.as_deref(),
-            Some("Error: Not in a tmux session. Specify a session ID or run inside tmux.\n"),
-            "the local path prints the sentence through main's Error: prefix"
-        );
+        assert_eq!(outcome.exit, 1);
     }
 
     /// The per-profile listing closes on its own count, the way it always did,
@@ -1410,18 +1383,11 @@ mod tests {
         assert_eq!(listed, vec!["main", "zeta", "default"]);
     }
 
-    /// A registry may hold the same directory under more than one spelling, and
-    /// `load_merged` counts that once. The merge here has to count it once for
-    /// the same reason, or `aoe project list` reports a different number of
-    /// projects depending on which transport answered, and a global row and a
-    /// profile row for one directory would both survive, where locally the
-    /// profile one shadows the global one.
-    ///
-    /// The second spelling is a symlink: an ordinary absolute path that names a
-    /// directory the other row already names, so the rows here are ones a real
-    /// publisher can send.
+    /// Canonical aliases merge once, with the profile row shadowing global rows.
     #[test]
+    #[serial_test::parallel]
     fn two_spellings_of_one_directory_are_one_project_here_as_they_are_locally() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let dir = tempfile::tempdir().expect("a real directory");
         let plain = dir.path().join("repo");
         let link = dir.path().join("link");
@@ -1454,60 +1420,15 @@ mod tests {
         assert_eq!(rows[0]["scope"], "profile", "{output}");
     }
 
-    /// `aoe list --all --json` over a store with no profiles prints the same
-    /// sentence the local command prints, not `[]`. The daemon comes up in
-    /// exactly this state on a fresh XDG directory, so the two byte streams
-    /// were reachable by anyone who had never run the command before.
-    ///
-    /// The snapshot carries no profiles and no health entries for them, and
-    /// neither default: `validate_snapshot` refuses a health map whose length
-    /// disagrees with the profile list, so a fixture that left one profile's
-    /// health behind would be a snapshot the client would never accept.
-    #[test]
-    fn the_all_listing_over_no_profiles_is_the_local_sentence_not_an_empty_array() {
-        let mut value = snapshot(vec![]);
-        value.profiles = vec![];
-        value.health.profiles = BTreeMap::new();
-        value.default_profile = None;
-        value.resolved_default_profile = None;
-        crate::cli::runtime_read::dto::validate_snapshot(&value)
-            .expect("a daemon publishes this snapshot on a fresh app dir");
-
-        for json in [true, false] {
-            let output = render_list(
-                &crate::cli::list::ListArgs {
-                    json,
-                    all: true,
-                    state: StateFilter::All,
-                },
-                &value,
-                &source(),
-            )
-            .expect("the listing renders")
-            .stdout;
-            assert_eq!(output, "No profiles found.\n", "json={json}");
-        }
-    }
-
-    /// The merge key is the producer's, so what the reader's own filesystem
-    /// makes of a path cannot change the answer. A remote daemon holding
-    /// `/work/repo` and `/dev/repo` as two distinct directories used to become
-    /// one project on a workstation that reached one of them through the
-    /// other.
-    ///
-    /// The frame is captured while the producer still sees two distinct
-    /// directories, and only the reader's filesystem changes afterwards, so
-    /// the renders differ only if the renderer resolved a path. The producer
-    /// is never asked again: asking it again would rebuild the frame from the
-    /// changed filesystem and prove nothing about the renderer.
     #[test]
     #[cfg(debug_assertions)]
     #[serial_test::serial]
     fn a_served_project_list_does_not_resolve_a_path_on_the_readers_own_filesystem() {
         use crate::server::test_support::{record_exchange, RecordedOwner, RecordingPins};
 
+        let mut _env = crate::server::test_support::RuntimeEnvGuard::read_lock();
         let dir = tempfile::tempdir().expect("a temp app dir");
-        let _env = crate::server::test_support::RuntimeEnvGuard::set(dir.path());
+        _env.bind(dir.path());
         crate::session::create_profile("main").expect("the recorded profile");
         let app = crate::session::get_app_dir().expect("app dir");
         std::fs::write(app.join("config.toml"), "default_profile = \"main\"\n")

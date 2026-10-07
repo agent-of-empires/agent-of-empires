@@ -7,6 +7,13 @@ use std::process::Command;
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };
+pub(super) fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+pub(super) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
 pub(super) fn rename_exclusive(
     source_dir: &std::os::fd::OwnedFd,
     source: &std::ffi::OsStr,

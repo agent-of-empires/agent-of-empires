@@ -980,8 +980,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal)
     .await?;
 
-    // The signal handler already cancelled `state.shutdown`, so the accept loop
-    // has already returned and retracted its artifacts by the time this joins.
+    // Await the cancelled local publisher task, including its retraction attempt.
     if let Some(runtime_uds) = runtime_uds {
         let _ = runtime_uds.await;
     }
@@ -1001,43 +1000,32 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Publish the local runtime read and serve it, unless this daemon is in a mode
-/// that must leave nothing on disk.
-///
-/// CityHall client mode is exactly that: its route refuses the read with the
-/// mode's own 403, so publishing a namespace it will never serve would leave
-/// a lock, two markers and a 0600 socket behind for nothing.
+/// Publish only when local admission is available and CityHall is disabled.
+#[cfg(target_os = "linux")]
 fn publish_runtime_uds(state: &Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
     if state.cityhall_mode {
-        info!(
-            target: "runtime.uds",
-            "not publishing the local runtime read while CityHall lockdown is on"
-        );
         return None;
     }
-    match super::runtime_uds::publish() {
-        Ok(published) => {
-            info!(
-                target: "runtime.uds",
-                namespace = super::runtime_ws::NAMESPACE,
-                "local runtime read published"
-            );
-            Some(crate::task_util::spawn_supervised(
-                "runtime.uds.serve",
-                crate::task_util::PanicPolicy::Log,
-                super::runtime_uds::serve(state.clone(), published),
-            ))
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: "runtime.uds",
-                code = error.code(),
-                %error,
-                "local runtime read not published; the HTTP route is unaffected"
-            );
-            None
-        }
-    }
+    let state = state.clone();
+    Some(crate::task_util::spawn_supervised(
+        "runtime.uds.serve",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            match super::runtime_uds::publish_when_available(&state.shutdown).await {
+                Ok(Some(published)) => {
+                    info!(target: "runtime.uds", namespace = super::runtime_ws::NAMESPACE, "local runtime read published");
+                    super::runtime_uds::serve(state, published).await;
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(target: "runtime.uds", code = error.code(), %error,
+                    "local runtime read not published; the HTTP route is unaffected"),
+            }
+        },
+    ))
+}
+#[cfg(not(target_os = "linux"))]
+fn publish_runtime_uds(_: &Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
+    None
 }
 
 /// Best-effort launch of `url` in the user's default browser.
@@ -1154,10 +1142,98 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_successor_waits_for_a_retained_reader_then_serves_the_cached_row() {
+        use crate::cli::definition::Cli;
+        use crate::cli::runtime_read::{attempt, classify, ReadRequestSource, ScopedRead};
+        use crate::server::runtime_uds::{LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, SOCKET_FILE};
+        use clap::Parser;
+        use std::fs::OpenOptions;
+
+        let (_base, _env) = crate::server::test_support::trusted_namespace().unwrap();
+        let mut row = crate::session::Instance::new("successor read", "/repo");
+        row.id = "successor-read".into();
+        row.source_profile = "main".into();
+        row.tool = "claude".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("main", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let app = crate::session::get_app_dir().unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(app.join(LOCK_FILE))
+            .unwrap();
+        fs2::FileExt::try_lock_shared(&reader).unwrap();
+
+        let successor = publish_runtime_uds(&state)
+            .expect("a transient client lock must not permanently disable local reads");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(owner) = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(app.join("publisher.lock"))
+                {
+                    match fs2::FileExt::try_lock_exclusive(&owner) {
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Ok(()) => fs2::FileExt::unlock(&owner).unwrap(),
+                        Err(error) => panic!("owner probe: {error}"),
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successor owns publication while waiting for the reader");
+        for name in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
+            assert!(
+                !app.join(name).exists(),
+                "publication must wait for reader release: {name}"
+            );
+        }
+        match crate::server::runtime_uds::try_publish() {
+            Err(error) => assert_eq!(error.code(), "namespace_busy"),
+            Ok(_) => panic!("a competing publisher acquired the waiting successor's namespace"),
+        }
+        drop(reader);
+
+        let cli = Cli::parse_from(["aoe", "session", "show", "successor-read", "--json"]);
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url: None,
+            token: None,
+            explicit_profile: Some("main".into()),
+            env_profile: None,
+        };
+        let outcome = match attempt(classify(cli.command.as_ref()).unwrap(), &source).await {
+            ScopedRead::Answered(outcome) => outcome,
+            ScopedRead::NoLocalPublication(_) => {
+                panic!("the waiting successor must serve, not fall back")
+            }
+        };
+        assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
+        let value: serde_json::Value = serde_json::from_str(&outcome.stdout.unwrap()).unwrap();
+        assert_eq!(value["id"], "successor-read");
+        assert_eq!(value["title"], "successor read");
+        assert_eq!(value["tool"], "claude");
+        state.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), successor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
+    #[serial_test::parallel]
     fn notifications_send_ready_status_and_stopping_to_notify_socket() {
         use std::os::unix::net::UnixDatagram;
+        let _exclusion = crate::session::test_support::EnvGuard::read_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notify.sock");
         let destinations = vec![(

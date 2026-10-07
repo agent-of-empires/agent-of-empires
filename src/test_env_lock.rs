@@ -1,40 +1,27 @@
-//! The one process-wide lock behind every test that mutates a process-global
-//! environment variable.
+//! Shared process-global environment exclusion for server and session fixtures.
 //!
-//! It lives here, and not in either guard's own `test_support` module, because
-//! the two guards disagree on visibility: `session::test_support` is
-//! `#[cfg(test)]`, while `server::test_support` is
-//! `#[cfg(any(test, debug_assertions))]` and the integration test binaries
-//! compile the library with debug assertions but without `cfg(test)`. A lock
-//! that only one of them can reach is two locks in all but name, and a second
-//! mutex for the same key defeats the structural guarantee documented on
-//! [`crate::session::test_support::restore_or_remove`]: the process environment
-//! is one slot per key, whatever the module boundaries say.
-//!
-//! Compiled under `any(test, debug_assertions)` because that is exactly the
-//! set of builds in which either guard exists. Outside it, nothing here is
-//! compiled and no test binary pays for it.
-//!
-//! The nesting rule is inherited from the original guard: a thread that
-//! already holds the lock through an outer guard does not re-lock the
-//! non-reentrant `Mutex` (that would deadlock the thread against itself), it
-//! inherits the outer guard's exclusion and acquires nothing.
-//! Same-thread nesting is race-free by construction, so skipping the re-lock
-//! loses no safety.
+//! Unit tests and debug integration tests use this same mutex.
+//! Same-thread nested guards retain the outer guard's exclusion.
 
 use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// The single lock for every environment key a test writes. There is no
-/// per-key refinement on purpose: `EnvGuard` shims a caller-chosen key, so no
-/// fixed list can bound which readers might race, and one lock is the only
-/// thing that keeps the open set safe.
+/// Guard callers choose arbitrary keys, so exclusion covers the whole environment.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {
     /// True while *this* thread already owns [`ENV_LOCK`] through an outer
     /// guard.
     static ENV_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+#[cfg(test)]
+thread_local! {
+    static LOCK_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_env_lock_contention(waiting: std::sync::mpsc::Sender<()>) {
+    LOCK_WAITING.with_borrow_mut(|slot| *slot = Some(waiting));
 }
 
 /// Acquire [`ENV_LOCK`] unless this thread already holds it, calling
@@ -49,6 +36,12 @@ pub(crate) fn acquire_env_lock(contended: impl FnOnce()) -> Option<MutexGuard<'s
         Ok(guard) => guard,
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
+            #[cfg(test)]
+            LOCK_WAITING.with_borrow_mut(|waiting| {
+                if let Some(waiting) = waiting.take() {
+                    let _ = waiting.send(());
+                }
+            });
             contended();
             ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
         }
@@ -81,22 +74,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// One lock, two guard types, proven rather than asserted.
-    ///
-    /// The claim is narrow and it is checked with a rendezvous, not a sleep:
-    /// `acquire_env_lock`'s contention callback fires *only* when the mutex
-    /// this thread tried is held by someone else, so receiving it on the
-    /// reader's thread while the holder is alive is direct evidence that the
-    /// two guard types share one mutex. The reader also cannot have finished
-    /// acquiring at that point, and it does finish once the holder drops.
-    ///
-    /// The first direction is the one that was broken: a `RuntimeEnvGuard`
-    /// holding `XDG_CONFIG_HOME`, against a reader taking the lock the way
-    /// every `session` test guard does. The guard is what makes this true, not
-    /// a `#[serial_test::serial]` group, which is exactly what an unannotated
-    /// `#[tokio::test]` relies on. `#[serial]` on the test itself
-    /// only keeps the two directions in this module from writing the same
-    /// environment key at each other.
+    /// The contention rendezvous proves both guard types use the same mutex.
     #[test]
     #[serial_test::serial]
     fn a_session_lock_taker_is_excluded_by_a_server_env_guard() {

@@ -64,14 +64,8 @@ fn registered(home: &Path, profile: Option<&str>) -> Vec<Value> {
     }
 }
 
-/// An empty variable writes where it always wrote, and still reads as the
-/// configured default.
-///
-/// The fixture is two profiles, `main` (the default) and `other`, a row
-/// registered in `other`, and a directory to register. Both halves are read
-/// from the registry, because that is what the selection chooses between;
-/// an earlier version used `aoe ps`, which reports rows a live tmux session
-/// provides, and so failed on any runner whose tmux could not expose one.
+/// An empty profile variable writes to main and reads the configured default.
+/// The registry identifies the profile chosen by each operation.
 #[test]
 #[serial]
 fn an_empty_profile_variable_writes_where_it_wrote_before_and_reads_as_the_default() {
@@ -131,8 +125,7 @@ fn an_empty_profile_variable_writes_where_it_wrote_before_and_reads_as_the_defau
         "an empty AGENT_OF_EMPIRES_PROFILE must not add to the global registry"
     );
 
-    // The read half is unchanged: the same empty value answers from the
-    // configured default, and from no other profile.
+    // Empty profile selections read the configured default.
     let listed: Vec<Value> =
         serde_json::from_str(&aoe(&home, &socket, "", &["project", "list", "--json"]))
             .expect("project list --json");

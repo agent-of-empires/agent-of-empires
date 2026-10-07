@@ -27,25 +27,23 @@ impl Drop for KillSession<'_> {
 #[test]
 #[serial]
 fn send_keys_keeps_a_trailing_semicolon() {
+    let mut _env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
+    let home = tempfile::tempdir().expect("owned home");
+    _env.bind(home.path());
     let socket = tmux_socket();
     let name = format!("{}send_keys_semicolon", tmux::SESSION_PREFIX);
     let _cleanup = KillSession {
         socket: &socket,
         name: &name,
     };
-    // `cat -v` echoes each submitted line back, so the pane shows what arrived.
-    let status = Command::new("tmux")
-        .arg("-S")
-        .arg(&socket)
-        .args(["new-session", "-d", "-s", &name, "cat -v"])
-        .status()
-        .expect("tmux new-session");
-    assert!(status.success(), "tmux new-session failed");
-    tmux::refresh_session_cache();
+    // App creation pins pane 0 even when the tmux server inherits another base index.
+    Session::from_name(&name)
+        .create(home.path().to_str().unwrap(), Some("cat -v"), "main")
+        .expect("create agent pane");
 
     Session::from_name(&name)
         .send_keys("ls;")

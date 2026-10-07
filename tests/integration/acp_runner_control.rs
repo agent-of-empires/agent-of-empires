@@ -1086,7 +1086,10 @@ fn runner_load_uses_requested_id_and_caches_response() {
                 "--cwd",
                 home.to_str().unwrap(),
                 "--",
-                "node",
+                crate::common::shim_node()
+                    .expect("Node runtime prerequisite")
+                    .to_str()
+                    .unwrap(),
                 fake_agent.to_str().unwrap(),
             ])
             .env("HOME", &home)
