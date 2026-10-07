@@ -108,6 +108,87 @@ fn tmux_server_identity(h: &TuiTestHarness, name: &str) -> (String, u32) {
     )
 }
 
+struct IsolatedTmuxServer {
+    socket_path: std::path::PathBuf,
+    home_path: std::path::PathBuf,
+}
+
+impl IsolatedTmuxServer {
+    fn new(home_path: &Path) -> Self {
+        Self {
+            socket_path: home_path.join("outside-tmux.sock"),
+            home_path: home_path.to_path_buf(),
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new("tmux");
+        command
+            .arg("-S")
+            .arg(&self.socket_path)
+            .env("HOME", &self.home_path)
+            .env("XDG_CONFIG_HOME", self.home_path.join(".config"))
+            .env("TERM", "xterm-256color");
+        command
+    }
+
+    fn new_detached(&self, name: &str, shell_command: &str) {
+        let output = self
+            .command()
+            .args(["new-session", "-d", "-s", name, "-x", "80", "-y", "24"])
+            .arg(shell_command)
+            .output()
+            .expect("create session on external tmux server");
+        assert!(
+            output.status.success(),
+            "external tmux new-session failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn display(&self, target: &str, format: &str) -> String {
+        let output = self
+            .command()
+            .args(["display-message", "-p", "-t", target, format])
+            .output()
+            .expect("read external tmux pane");
+        assert!(
+            output.status.success(),
+            "external tmux display-message failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn set_caller_context(&self, h: &mut TuiTestHarness, name: &str) -> (String, String) {
+        let env_path = h.home_path().join(format!("{name}-tmux-env"));
+        let shell_command = format!(
+            "printf '%s\\n%s\\n' \"$TMUX\" \"$TMUX_PANE\" > {} && sleep 600",
+            shell_words::quote(env_path.to_str().expect("external tmux env path"))
+        );
+        self.new_detached(name, &shell_command);
+        let (tmux, pane) = wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            let content = std::fs::read_to_string(&env_path).map_err(|error| error.to_string())?;
+            let mut lines = content.lines();
+            match (lines.next(), lines.next()) {
+                (Some(tmux), Some(pane)) if !tmux.is_empty() && !pane.is_empty() => {
+                    Ok((tmux.to_string(), pane.to_string()))
+                }
+                _ => Err("external tmux pane has not written its environment".to_string()),
+            }
+        });
+        h.set_env("TMUX", &tmux);
+        h.set_env("TMUX_PANE", &pane);
+        (tmux, pane)
+    }
+}
+
+impl Drop for IsolatedTmuxServer {
+    fn drop(&mut self) {
+        let _ = self.command().arg("kill-server").output();
+    }
+}
+
 #[test]
 #[parallel]
 fn cli_restart_all_keeps_the_calling_session_and_restarts_others() {
@@ -184,6 +265,110 @@ fn cli_restart_all_keeps_an_agent_with_an_auxiliary_shaped_title() {
         tmux_pane_pid(&h, &caller_name),
         caller_pid,
         "the calling pane process was replaced"
+    );
+}
+
+#[test]
+#[parallel]
+fn cli_restart_all_allows_a_verified_caller_on_another_tmux_server() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_restart_all_external_tmux_caller");
+    let project = h.project_path();
+    let managed_id = add_restartable_session(&h, &project, "Managed");
+    let managed_name = tmux_name(&managed_id, "Managed");
+    h.tmux_new_detached(&managed_name, "sleep 600");
+    let managed_pid = tmux_pane_pid(&h, &managed_name);
+    let managed_pane = h
+        .tmux()
+        .args(["display-message", "-p", "-t", &managed_name, "#{pane_id}"])
+        .output()
+        .expect("read managed pane id");
+    assert!(managed_pane.status.success());
+    let managed_pane = String::from_utf8_lossy(&managed_pane.stdout)
+        .trim()
+        .to_string();
+
+    let external = IsolatedTmuxServer::new(h.home_path());
+    let _ = external.set_caller_context(&mut h, "ordinary-shell");
+
+    let external_pane = external.display("ordinary-shell", "#{pane_id}");
+    let external_pid = external.display("ordinary-shell", "#{pane_pid}");
+    assert_eq!(
+        external_pane, managed_pane,
+        "the regression requires colliding pane ids on the two servers"
+    );
+
+    let output = h.run_cli_ok(&["session", "restart", "--all"]);
+
+    assert!(
+        !output.contains("Skipping current session"),
+        "an external shell must not be mistaken for an AoE session: {output}"
+    );
+    assert_eq!(
+        external.display("ordinary-shell", "#{pane_pid}"),
+        external_pid,
+        "the caller on the separate server was replaced"
+    );
+    assert!(h.tmux_has_session(&managed_name));
+    assert_ne!(
+        tmux_pane_pid(&h, &managed_name),
+        managed_pid,
+        "the managed restart target was not restarted"
+    );
+}
+
+#[test]
+#[parallel]
+fn cli_restart_all_allows_a_verified_external_caller_without_managed_sessions() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_restart_all_external_caller_without_managed_sessions");
+    let external = IsolatedTmuxServer::new(h.home_path());
+    let (_, pane) = external.set_caller_context(&mut h, "ordinary-shell");
+    let caller_pid = external.display("ordinary-shell", "#{pane_pid}");
+
+    let output = h.run_cli_ok(&["session", "restart", "--all"]);
+    assert!(
+        output.contains("No sessions to restart"),
+        "unexpected output: {output}"
+    );
+    assert_eq!(
+        external.display("ordinary-shell", "#{pane_pid}"),
+        caller_pid,
+        "the external caller changed while the configured server was absent"
+    );
+
+    h.tmux_new_detached("temporary-managed-session", "sleep 600");
+    let keep_empty = h
+        .tmux()
+        .args(["set-option", "-g", "exit-empty", "off"])
+        .output()
+        .expect("keep the configured tmux server alive without sessions");
+    assert!(
+        keep_empty.status.success(),
+        "set exit-empty failed: {}",
+        String::from_utf8_lossy(&keep_empty.stderr)
+    );
+    let kill_session = h
+        .tmux()
+        .args(["kill-session", "-t", "temporary-managed-session"])
+        .output()
+        .expect("leave the configured tmux server with no sessions");
+    assert!(
+        kill_session.status.success(),
+        "kill temporary session failed: {}",
+        String::from_utf8_lossy(&kill_session.stderr)
+    );
+
+    let output = h.run_cli_ok(&["session", "restart", "--all"]);
+    assert!(
+        output.contains("No sessions to restart"),
+        "unexpected output: {output}"
+    );
+    assert_eq!(external.display("ordinary-shell", "#{pane_id}"), pane);
+    assert_eq!(
+        external.display("ordinary-shell", "#{pane_pid}"),
+        caller_pid,
+        "the external caller changed while the configured server was empty"
     );
 }
 

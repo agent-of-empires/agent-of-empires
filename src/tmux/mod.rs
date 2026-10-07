@@ -188,6 +188,18 @@ pub(crate) fn tmux_query_command() -> Command {
     cmd
 }
 
+fn tmux_query_command_for_socket(socket: &str) -> Command {
+    let mut cmd = Command::new("tmux");
+    cmd.args(["-S", socket, "-u"]);
+    cmd.env_remove("TMUX");
+    cmd.env_remove("TMUX_PANE");
+    cmd.env_remove("LC_ALL");
+    cmd.env("LC_MESSAGES", "C");
+    #[cfg(unix)]
+    crate::process::reset_signals_on_exec(&mut cmd);
+    cmd
+}
+
 // Debug builds use `aoe_dev_*` so dev and release sessions never mix.
 pub const SESSION_PREFIX: &str = if cfg!(debug_assertions) {
     "aoe_dev_"
@@ -2038,7 +2050,7 @@ pub(crate) struct CurrentTmuxSession {
     pub(crate) kind: Option<SessionKind>,
 }
 
-/// Resolve the caller's pane on the configured server and retain its kind marker.
+/// Resolve the caller's pane on its server and retain its kind marker if AoE manages it.
 pub(crate) fn current_session_for_current_pane() -> anyhow::Result<Option<CurrentTmuxSession>> {
     let Some(pane_id) = std::env::var_os("TMUX_PANE") else {
         return Ok(None);
@@ -2054,7 +2066,7 @@ pub(crate) fn current_session_for_current_pane() -> anyhow::Result<Option<Curren
 
     let deadline = TmuxCommandDeadline::new();
     let format = "#{pane_id}|#{session_name}|#{socket_path}|#{pid}";
-    let mut command = tmux_query_command();
+    let mut command = tmux_query_command_for_socket(expected_socket);
     command.args(["display-message", "-p", "-t", pane_id, "-F", format]);
     let output = deadline
         .run(&mut command)
@@ -2067,19 +2079,30 @@ pub(crate) fn current_session_for_current_pane() -> anyhow::Result<Option<Curren
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let fields: Vec<_> = stdout.trim_end_matches(['\r', '\n']).split('|').collect();
-    if fields.len() != 4 || fields[0] != pane_id || fields[1].is_empty() {
+    let line = stdout.trim_end_matches(['\r', '\n']);
+    let (reported_pane, tail) = line.split_once('|').ok_or_else(|| {
+        anyhow::anyhow!("tmux returned an invalid context for caller pane {pane_id:?}")
+    })?;
+    let (session_name, server_context) = tail.split_once('|').ok_or_else(|| {
+        anyhow::anyhow!("tmux returned an invalid context for caller pane {pane_id:?}")
+    })?;
+    let (actual_socket, actual_pid) = parse_tmux_server_identity(server_context)?;
+    if reported_pane != pane_id || session_name.is_empty() {
         return Err(anyhow::anyhow!(
             "tmux returned an invalid context for caller pane {pane_id:?}"
         ));
     }
-    let actual_pid = fields[3]
-        .parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("tmux returned an invalid server PID"))?;
-    if fields[2] != expected_socket || actual_pid != expected_pid {
+    if actual_socket != expected_socket || actual_pid != expected_pid {
         return Err(anyhow::anyhow!(
-            "caller pane {pane_id:?} belongs to a different tmux server"
+            "TMUX does not match caller pane {pane_id:?}"
         ));
+    }
+
+    let Some((managed_socket, managed_pid)) = configured_tmux_server_identity(&deadline)? else {
+        return Ok(None);
+    };
+    if managed_socket != expected_socket || managed_pid != expected_pid {
+        return Ok(None);
     }
 
     let mut scan = session_scan_command();
@@ -2094,13 +2117,60 @@ pub(crate) fn current_session_for_current_pane() -> anyhow::Result<Option<Curren
     }
     let sessions = parse_session_scan(&String::from_utf8_lossy(&sessions_output.stdout));
     let session = sessions
-        .get(fields[1])
+        .get(session_name)
         .ok_or_else(|| anyhow::anyhow!("tmux no longer lists the caller's session"))?;
 
     Ok(Some(CurrentTmuxSession {
-        name: fields[1].to_string(),
+        name: session_name.to_string(),
         kind: session.kind,
     }))
+}
+
+fn configured_tmux_server_identity(
+    deadline: &TmuxCommandDeadline,
+) -> anyhow::Result<Option<(String, u32)>> {
+    let mut command = tmux_query_command();
+    command.args(["list-sessions", "-F", "#{socket_path}|#{pid}"]);
+    let output = deadline
+        .run(&mut command)
+        .map_err(|error| anyhow::anyhow!("failed to inspect configured tmux server: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if configured_tmux_server_is_absent(&stderr) {
+            return Ok(None);
+        }
+        return Err(anyhow::anyhow!(
+            "failed to inspect configured tmux server: {}",
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = stdout.lines().find(|line| !line.is_empty()) else {
+        return Ok(None);
+    };
+    let (socket, pid) = parse_tmux_server_identity(line)?;
+    Ok(Some((socket.to_string(), pid)))
+}
+
+fn configured_tmux_server_is_absent(stderr: &str) -> bool {
+    let stderr = stderr.trim();
+    stderr.starts_with("no server running on ")
+        || (stderr.starts_with("error connecting to ")
+            && stderr.ends_with("(No such file or directory)"))
+}
+
+fn parse_tmux_server_identity(value: &str) -> anyhow::Result<(&str, u32)> {
+    let (socket, pid) = value
+        .rsplit_once('|')
+        .ok_or_else(|| anyhow::anyhow!("tmux returned an invalid server context"))?;
+    if socket.is_empty() {
+        return Err(anyhow::anyhow!("tmux returned an invalid server socket"));
+    }
+    let pid = pid
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("tmux returned an invalid server PID"))?;
+    Ok((socket, pid))
 }
 
 /// Extract the socket path and server PID from tmux's `socket,pid,client` value.
