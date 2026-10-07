@@ -852,6 +852,32 @@ impl Session {
         Ok(self.capture_window_composited_with_cursor(lines)?.0)
     }
 
+    /// Plain capture of the last `lines` rows: wrapped lines joined (`-J`) and no
+    /// escapes (unlike `capture_pane`, which passes `-e`), so callers match on the
+    /// text rather than on embedded SGR sequences. Used to scrape the pane.
+    pub fn capture_plain(&self, lines: usize) -> Result<String> {
+        if !self.exists() {
+            return Ok(String::new());
+        }
+        let target = format!("{}:^.0", self.name);
+        let output = crate::tmux::tmux_command()
+            .args([
+                "capture-pane",
+                "-t",
+                &target,
+                "-p",
+                "-J",
+                "-S",
+                &format!("-{}", lines),
+            ])
+            .output()?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Ok(String::new())
+        }
+    }
+
     /// Full scrollback with wrapped lines joined and no escapes, for smart rename.
     pub fn capture_pane_full(&self) -> Result<String> {
         if !self.exists() {

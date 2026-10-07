@@ -1719,6 +1719,17 @@ impl HomeView {
         // it would point at unrelated content. Covers the live-send branch below too.
         self.clear_preview_selection();
 
+        // Ctrl+L toggles the terminal-view last-prompt footer. Intercepted ahead
+        // of the live-send relay below so it works while attached to a session,
+        // not only from the list.
+        if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.show_last_prompt = !self.show_last_prompt;
+            if !self.show_last_prompt {
+                self.last_prompt_cache = None;
+            }
+            return None;
+        }
+
         // Live-send capture normally wins over every other key handler: the home view is
         // a thin relay to the target pane, so dialog hotkeys, search and navigation
         // suspend until Ctrl+q. That holds while dialogs are keyboard-only, since

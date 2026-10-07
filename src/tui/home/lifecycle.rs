@@ -216,6 +216,8 @@ impl HomeView {
             selected_group: None,
             selected_group_profile: None,
             view_mode,
+            show_last_prompt: false,
+            last_prompt_cache: None,
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
