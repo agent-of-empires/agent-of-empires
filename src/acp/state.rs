@@ -741,8 +741,10 @@ pub enum Event {
     /// `/compact` replaced the model's context with a summary.
     ConversationCompacted,
     /// The summary the agent retained when compacting, after its
-    /// `ConversationCompacted`.
+    /// `ConversationCompacted`. A later one for the same compaction replaces
+    /// it; empty `text` clears it.
     ConversationCompactionSummary {
+        compaction_id: String,
         text: String,
     },
     AgentSwitched {

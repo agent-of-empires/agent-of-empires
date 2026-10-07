@@ -23,7 +23,7 @@ use crate::acp::acp_client::tool_context::{
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
-    map_update_to_events, AgentMessageDedup, CompactionTracker,
+    map_update_to_events, AgentMessageDedup, CompactionFold, CompactionTracker,
 };
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 
@@ -193,14 +193,17 @@ impl Shared {
             }
         }
         // Replayed compactions carry fresh ids and are dropped as transcript.
-        if !suppressing
-            && !self
+        if !suppressing {
+            let fold = self
                 .compaction
                 .lock()
                 .expect("compaction tracker mutex poisoned")
-                .observe(&mut notification.update)
-        {
-            return;
+                .observe(&mut notification.update);
+            match fold {
+                CompactionFold::Pass => {}
+                CompactionFold::Skip => return,
+                CompactionFold::Patch(event) => return self.emit(*event).await,
+            }
         }
         // One epoch per notification, so its signals belong to the prompt
         // that was current when it arrived.

@@ -339,7 +339,7 @@ export type AcpEvent =
   | "SessionCleared"
   | "ConversationCompactionStarted"
   | "ConversationCompacted"
-  | { ConversationCompactionSummary: { text: string } }
+  | { ConversationCompactionSummary: { compaction_id: string; text: string } }
   | { DiffEmitted: { diff: DiffPreview } }
   | "ThinkingStarted"
   | "ThinkingEnded"

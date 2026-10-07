@@ -67,10 +67,39 @@ fn blocks_text(blocks: &[ContentBlock]) -> String {
         .collect()
 }
 
-/// Folds a compaction's update stream before anything classifies it.
-/// claude-agent-acp re-sends a status-only terminal for the same id, which
-/// would otherwise draw a second divider. A summary streamed only as
-/// `compaction_summary_chunk`s is moved onto the completion that lacks one.
+/// A summary patch as an event: `None` when the update leaves the summary
+/// unchanged, empty text when it clears it.
+fn compaction_summary_event(
+    id: &CompactionId,
+    summary: &MaybeUndefined<Vec<ContentBlock>>,
+) -> Option<Event> {
+    let text = match summary {
+        MaybeUndefined::Undefined => return None,
+        MaybeUndefined::Null => String::new(),
+        MaybeUndefined::Value(blocks) => blocks_text(blocks),
+    };
+    Some(Event::ConversationCompactionSummary {
+        compaction_id: id.to_string(),
+        text: if text.trim().is_empty() {
+            String::new()
+        } else {
+            text
+        },
+    })
+}
+
+pub(super) enum CompactionFold {
+    Pass,
+    /// A chunk outside the open compaction, or claude-agent-acp's status-only
+    /// repeat of a terminal; neither may read as progress or a second divider.
+    Skip,
+    /// A later terminal for the same id: only its summary patch applies.
+    Patch(Box<Event>),
+}
+
+/// Folds a compaction's update stream before anything classifies it. A
+/// summary streamed only as `compaction_summary_chunk`s is moved onto the
+/// completion that lacks one.
 #[derive(Default)]
 pub(super) struct CompactionTracker {
     active: Option<CompactionId>,
@@ -79,29 +108,28 @@ pub(super) struct CompactionTracker {
 }
 
 impl CompactionTracker {
-    /// False when `update` must be skipped: a repeated terminal, or a chunk
-    /// outside the open compaction, which must not read as progress.
-    pub(super) fn observe(&mut self, update: &mut SessionUpdate) -> bool {
+    pub(super) fn observe(&mut self, update: &mut SessionUpdate) -> CompactionFold {
         match update {
             SessionUpdate::CompactionSummaryChunk(chunk) => {
                 if self.active.as_ref() != Some(&chunk.compaction_id) {
-                    return false;
+                    return CompactionFold::Skip;
                 }
                 if let ContentBlock::Text(t) = &chunk.content {
                     self.chunks.push_str(&t.text);
                 }
-                true
+                CompactionFold::Pass
             }
             SessionUpdate::CompactionUpdate(u) if u.status == CompactionStatus::InProgress => {
                 if self.active.as_ref() != Some(&u.compaction_id) {
                     self.active = Some(u.compaction_id.clone());
                     self.chunks.clear();
                 }
-                true
+                CompactionFold::Pass
             }
             SessionUpdate::CompactionUpdate(u) => {
                 if self.last_terminal.as_ref() == Some(&u.compaction_id) {
-                    return false;
+                    return compaction_summary_event(&u.compaction_id, &u.summary)
+                        .map_or(CompactionFold::Skip, |e| CompactionFold::Patch(Box::new(e)));
                 }
                 self.last_terminal = Some(u.compaction_id.clone());
                 let streamed = if self.active.as_ref() == Some(&u.compaction_id) {
@@ -117,9 +145,9 @@ impl CompactionTracker {
                     u.summary =
                         MaybeUndefined::Value(vec![ContentBlock::Text(TextContent::new(streamed))]);
                 }
-                true
+                CompactionFold::Pass
             }
-            _ => true,
+            _ => CompactionFold::Pass,
         }
     }
 }
@@ -542,10 +570,10 @@ pub(super) fn map_update_to_events(
             CompactionStatus::InProgress => vec![Event::ConversationCompactionStarted],
             CompactionStatus::Completed => {
                 let mut events = vec![Event::ConversationCompacted];
-                let text = update.summary.value().map(|b| blocks_text(b));
-                if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
-                    events.push(Event::ConversationCompactionSummary { text });
-                }
+                events.extend(compaction_summary_event(
+                    &update.compaction_id,
+                    &update.summary,
+                ));
                 events.push(cleared_plan());
                 events
             }
@@ -722,11 +750,37 @@ mod tests {
             "conversation_compaction_summary",
             "plan_updated",
         ];
-        let cases: Vec<(Vec<SessionUpdate>, Vec<&str>, Option<&str>)> = vec![
+        let started =
+            |tail: &[&'static str]| [&["conversation_compaction_started"][..], tail].concat();
+        let cases: Vec<(Vec<SessionUpdate>, Vec<&str>, Vec<&str>)> = vec![
             (
                 vec![start(), done(summary("kept")), done(none())],
-                [&["conversation_compaction_started"][..], &ok].concat(),
-                Some("kept"),
+                started(&ok),
+                vec!["kept"],
+            ),
+            // Same-id terminals patch the summary without a second divider.
+            (
+                vec![start(), done(summary("old")), done(summary("new"))],
+                started(&[&ok[..], &["conversation_compaction_summary"]].concat()),
+                vec!["old", "new"],
+            ),
+            (
+                vec![
+                    start(),
+                    done(summary("old")),
+                    done(serde_json::json!({"summary": null})),
+                ],
+                started(&[&ok[..], &["conversation_compaction_summary"]].concat()),
+                vec!["old", ""],
+            ),
+            (
+                vec![start(), done(none()), done(summary("late"))],
+                started(&[
+                    "conversation_compacted",
+                    "plan_updated",
+                    "conversation_compaction_summary",
+                ]),
+                vec!["late"],
             ),
             (
                 vec![
@@ -735,8 +789,8 @@ mod tests {
                     compaction_chunk("a", " two"),
                     done(none()),
                 ],
-                [&["conversation_compaction_started"][..], &ok].concat(),
-                Some("one two"),
+                started(&ok),
+                vec!["one two"],
             ),
             (
                 vec![
@@ -744,42 +798,44 @@ mod tests {
                     compaction_chunk("a", "partial"),
                     done(summary("full")),
                 ],
-                [&["conversation_compaction_started"][..], &ok].concat(),
-                Some("full"),
+                started(&ok),
+                vec!["full"],
             ),
             (
                 vec![start(), done(none())],
-                vec![
-                    "conversation_compaction_started",
-                    "conversation_compacted",
-                    "plan_updated",
-                ],
-                None,
+                started(&["conversation_compacted", "plan_updated"]),
+                vec![],
             ),
             (
                 vec![start(), compaction_update("a", "cancelled", none())],
-                vec!["conversation_compaction_started"],
-                None,
+                started(&[]),
+                vec![],
             ),
             (
                 vec![compaction_update("b", "completed", summary("kept"))],
                 ok.to_vec(),
-                Some("kept"),
+                vec!["kept"],
             ),
         ];
         for (updates, want, want_summary) in cases {
             let mut tracker = CompactionTracker::default();
             let events: Vec<Event> = updates
                 .into_iter()
-                .filter_map(|mut u| tracker.observe(&mut u).then(|| claude(u)))
-                .flatten()
+                .flat_map(|mut u| match tracker.observe(&mut u) {
+                    CompactionFold::Pass => claude(u),
+                    CompactionFold::Skip => Vec::new(),
+                    CompactionFold::Patch(e) => vec![*e],
+                })
                 .collect();
-            let got_summary = events.iter().find_map(|e| match e {
-                Event::ConversationCompactionSummary { text } => Some(text.as_str()),
-                _ => None,
-            });
+            let summaries: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ConversationCompactionSummary { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(
-                (kinds(&events), got_summary),
+                (kinds(&events), summaries),
                 (want.clone(), want_summary),
                 "{want:?}"
             );
@@ -788,9 +844,12 @@ mod tests {
         // A chunk after its terminal is dropped, so it cannot read as progress.
         let mut tracker = CompactionTracker::default();
         for mut u in [start(), done(none())] {
-            assert!(tracker.observe(&mut u));
+            assert!(matches!(tracker.observe(&mut u), CompactionFold::Pass));
         }
-        assert!(!tracker.observe(&mut compaction_chunk("a", "late")));
+        assert!(matches!(
+            tracker.observe(&mut compaction_chunk("a", "late")),
+            CompactionFold::Skip
+        ));
 
         let failed = compaction_update("a", "failed", serde_json::json!({"error": "aborted"}));
         assert!(matches!(
@@ -844,6 +903,7 @@ mod tests {
             (Event::ConversationCompacted, true),
             (
                 Event::ConversationCompactionSummary {
+                    compaction_id: "a".into(),
                     text: "kept".into(),
                 },
                 true,

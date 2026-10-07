@@ -2332,6 +2332,7 @@ mod tests {
                 answers: vec![answer("Proceed?", "Yes"), answer("Mode", "Fast")],
             },
             Event::ConversationCompactionSummary {
+                compaction_id: "c-1".into(),
                 text: "kept the codeword".into(),
             },
         ]);
