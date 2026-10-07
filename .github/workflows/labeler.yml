@@ -1,12 +1,9 @@
 name: Labeler
 
-# Adds `ci-macos` to PRs that touch macOS-sensitive code, so the macOS suite
-# runs before merge instead of after (#4228, #4245).
+# Adds `ci-macos` for macOS-sensitive PRs.
 #
-# pull_request_target so fork PRs can be labelled. Nothing from the PR is
-# checked out or executed: `detect` reads the file list and patches from the
-# API as data with a read-only GITHUB_TOKEN, and `label` holds the PAT but
-# runs one fixed `gh api` call whose only input is the PR number.
+# Runs from base; PR files and patches are data, never checked out or executed.
+# Detection uses a read-only token; only the fixed label call holds the PAT.
 
 on:
   pull_request_target:
@@ -33,7 +30,11 @@ jobs:
               'src/session/config/container_config/',
               '.github/actions/rust-toolchain/',
             ];
+            // Existing macOS-only bodies can change without touching their cfg.
             const exact = [
+              'src/hooks/dir_guard.rs', 'src/server/api/system.rs',
+              'src/session/mod.rs', 'src/sound/playback.rs',
+              'src/tui/clipboard.rs', 'src/tui/open_url.rs',
               'src/session/config/container_config.rs',
               'src/session/instance/container.rs',
               'src/session/sandbox_store_reclaim.rs',
