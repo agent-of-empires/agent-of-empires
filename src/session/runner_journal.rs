@@ -825,13 +825,13 @@ impl LaunchOrigin {
 
     pub(crate) fn validate_baseline_at(&self, row: &Instance, generation: u64) -> Result<()> {
         self.validate_plan_at(row, generation, self.plan.trashed)?;
-        self.validate_births(row)
+        self.validate_native_history(row)
     }
 
     pub(crate) fn validate_restored_at(&self, row: &Instance, generation: u64) -> Result<()> {
         anyhow::ensure!(self.plan.trashed, "original instance was not trashed");
         self.validate_plan_at(row, generation, false)?;
-        self.validate_births(row)
+        self.validate_native_history(row)
     }
 
     fn plan_matches_at(&self, row: &Instance, generation: u64, trashed: bool) -> bool {
@@ -874,7 +874,7 @@ impl LaunchOrigin {
         Ok(())
     }
 
-    fn validate_births(&self, row: &Instance) -> Result<()> {
+    fn validate_native_history(&self, row: &Instance) -> Result<()> {
         anyhow::ensure!(
             row.runner_journal
                 .launches()
@@ -1226,7 +1226,7 @@ impl OwnedStop {
             .context("original session disappeared during stop")?;
         self.current_projection()
             .validate_baseline_at(&row, self.generation)?;
-        self.original.validate_births(&row)?;
+        self.original.validate_native_history(&row)?;
         anyhow::ensure!(
             row.lifecycle_reservation_is_owned(self.operation, self.generation),
             "original stop claim was superseded"
@@ -1387,7 +1387,7 @@ pub(crate) fn release_settled_stop_under_locks(stop: &OwnedStop) -> Result<()> {
             .context("session disappeared after stop")?;
         stop.current_projection()
             .validate_baseline_at(row, stop.generation)?;
-        stop.original.validate_births(row)?;
+        stop.original.validate_native_history(row)?;
         release_settled_stop(row, stop.generation)
     })?;
     stop.finished
@@ -1413,7 +1413,7 @@ pub(crate) fn finish_owned_stop<T>(
             .context("session disappeared after stop")?;
         stop.current_projection()
             .validate_baseline_at(row, stop.generation)?;
-        stop.original.validate_births(row)?;
+        stop.original.validate_native_history(row)?;
         release_settled_stop(row, stop.generation)?;
         Ok(row.clone())
     })?;
@@ -2190,7 +2190,7 @@ impl JournalScope {
             Self::Stop(stop) => {
                 stop.current_projection()
                     .validate_baseline_at(row, stop.generation)?;
-                stop.original.validate_births(row)?;
+                stop.original.validate_native_history(row)?;
                 anyhow::ensure!(
                     row.lifecycle_reservation_is_owned(stop.operation, stop.generation),
                     "original lifecycle receipt was superseded before runner settlement"
