@@ -130,7 +130,7 @@ pub struct App {
     pending_daemon_start_open: Option<String>,
     pending_smart_rename: Option<String>,
     /// Outcome line of an in-flight "Auto-name now", which waits for the agent's one-shot.
-    smart_rename_rx: Option<tokio::sync::oneshot::Receiver<String>>,
+    smart_rename_rx: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     /// Debounce for structured preview-on-select, so fast navigation doesn't
     /// connect a WebSocket per keystroke.
     preview_mount_pending: Option<(String, std::time::Instant)>,
@@ -2148,9 +2148,11 @@ impl App {
         self.smart_rename_rx = Some(rx);
         let session_id = session_id.to_string();
         tokio::spawn(async move {
-            if let Err(e) = http.smart_rename(&session_id).await {
-                let _ = tx.send(format!("auto-name failed: {e}"));
-            }
+            let outcome = http
+                .smart_rename(&session_id)
+                .await
+                .map_err(|e| format!("auto-name failed: {e}"));
+            let _ = tx.send(outcome);
         });
     }
 
@@ -2160,7 +2162,8 @@ impl App {
             return false;
         };
         match rx.try_recv() {
-            Ok(failure) => {
+            Ok(Ok(())) => false,
+            Ok(Err(failure)) => {
                 self.set_status(failure);
                 true
             }
@@ -2168,7 +2171,10 @@ impl App {
                 self.smart_rename_rx = Some(rx);
                 false
             }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.set_status("auto-name ended unexpectedly");
+                true
+            }
         }
     }
 
