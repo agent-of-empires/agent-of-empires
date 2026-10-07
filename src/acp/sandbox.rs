@@ -1,15 +1,6 @@
 //! Sandbox container lifecycle for structured view sessions.
-//!
-//! The structured view spawn path mirrors the tmux path's sandbox handling: if
-//! the session's `Instance` has `sandbox_info`, create + start the
-//! Docker container, optionally run on_launch hooks inside it, and
-//! hand the `SandboxInfo` back to the caller so the supervisor can
-//! wrap the agent argv in `docker exec`.
-//!
-//! This lives in its own module so every structured view-spawn entry point
-//! (auto-spawn after create, view switch, manual `POST /spawn`,
-//! reconciler reattach fallback) goes through the same code path.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -18,47 +9,28 @@ use tokio::sync::{Mutex, RwLock};
 use crate::session::{Instance, SandboxInfo};
 
 /// Ensure the sandbox container for the named session is running.
-///
-/// `run_on_launch_hooks` controls whether profile/repo `on_launch`
-/// hooks fire after the container is up. Only the initial
-/// `auto-spawn after create` path passes `true`; every other entry
-/// point (view switch, manual `/spawn`, reconciler resume)
-/// passes `false` so hooks don't re-run on every reattach.
-///
-/// `instance_lock` is the per-session `state.instance_lock(id)`
-/// mutex. We hold it for the duration of the call so a concurrent
-/// `delete_session` (which acquires the same mutex) can't tear down
-/// the instance mid-create and leave us with an orphan docker
-/// container. Docker work runs on a blocking thread; the in-memory
-/// `Instance` is otherwise locked only for a short read snapshot
-/// and a short write to stamp the resolved `container_id`.
-///
-/// Returns the session's `sandbox_info` (with `container_id`
-/// populated); for non-sandboxed sessions it returns `None`.
 pub async fn ensure_container_for_session(
     instances: &RwLock<Vec<Instance>>,
+    mutation_epoch: &AtomicU64,
     instance_lock: &Arc<Mutex<()>>,
     session_id: &str,
     run_on_launch_hooks: bool,
 ) -> Result<Option<SandboxInfo>> {
-    // Hold the per-session mutex for the whole call so delete_session
-    // (which acquires the same lock) cannot interleave between the
-    // existence check and the container create.
     let _guard = instance_lock.lock().await;
 
-    ensure_container_for_session_locked(instances, session_id, run_on_launch_hooks).await
+    ensure_container_for_session_locked(instances, mutation_epoch, session_id, run_on_launch_hooks)
+        .await
 }
 
 /// Ensure the sandbox container while the caller already holds the
 /// per-session instance mutex.
 pub async fn ensure_container_for_session_locked(
     instances: &RwLock<Vec<Instance>>,
+    mutation_epoch: &AtomicU64,
     session_id: &str,
     run_on_launch_hooks: bool,
 ) -> Result<Option<SandboxInfo>> {
-    // Phase 1: short read on the instance list. Clone the Instance so
-    // the docker work can run on a blocking thread without holding
-    // any tokio lock.
+    // Phase 1: short read on the instance list.
     let mut instance_clone = {
         let guard = instances.read().await;
         let Some(inst) = guard.iter().find(|i| i.id == session_id) else {
@@ -71,12 +43,11 @@ pub async fn ensure_container_for_session_locked(
     };
 
     // Phase 2: docker create/start + workdir/hook resolution on a
-    // blocking thread. `get_container_for_instance` may pull an image
-    // and create the container, both of which can take many seconds;
-    // running it here keeps the tokio worker free for other requests.
+    // blocking thread.
     let session_id_owned = session_id.to_string();
-    let (sandbox_info, container_workdir, hooks, hook_env) =
+    let (sandbox_info, container_workdir, hooks, hook_env, rebuilt) =
         tokio::task::spawn_blocking(move || -> Result<_> {
+            let rebuilt = reconcile_provider_container(&mut instance_clone)?;
             let _container = instance_clone
                 .get_container_for_instance()
                 .context("ensuring sandbox container")?;
@@ -87,42 +58,31 @@ pub async fn ensure_container_for_session_locked(
             } else {
                 None
             };
-            let env = crate::session::repo_config::lifecycle_env_vars(&instance_clone);
-            Ok((instance_clone.sandbox_info.clone(), workdir, hooks, env))
+            let env = crate::session::config::repo_config::lifecycle_env_vars(&instance_clone);
+            Ok((
+                instance_clone.sandbox_info.clone(),
+                workdir,
+                hooks,
+                env,
+                rebuilt,
+            ))
         })
         .await
         .context("docker ensure task failed to join")??;
 
-    // Phase 3: brief write lock to stamp the resolved container_id (and the
-    // host-minted before_start env) back onto the live Instance so subsequent
-    // reads observe them. Carrying `before_start_env` back matters because the
-    // mint ran on the cloned instance above; without this, the next
-    // ensure_container_for_session would clone an empty cache and re-run the
-    // before_start hook on every view switch / spawn, re-minting credentials.
     if let Some(info) = &sandbox_info {
-        let mut guard = instances.write().await;
-        if let Some(inst) = guard.iter_mut().find(|i| i.id == session_id_owned) {
-            if let Some(ref mut sb) = inst.sandbox_info {
-                if sb.container_id.is_none() {
-                    sb.container_id = info.container_id.clone();
-                }
-                sb.before_start_env = info.before_start_env.clone();
-            }
-        }
+        record_built_sandbox(instances, mutation_epoch, &session_id_owned, info, rebuilt).await;
     }
 
     // Phase 4: run on_launch hooks outside the instances lock (the
-    // per-session mutex is still held for the call's lifetime). Hooks
-    // are shell commands that can themselves take seconds, so wrap in
-    // spawn_blocking. Best-effort: failures are logged and the spawn
-    // proceeds.
+    // per-session mutex is still held for the call's lifetime).
     if let (Some(cmds), Some(info)) = (hooks, sandbox_info.as_ref()) {
         if !cmds.is_empty() {
             let container_name = info.container_name.clone();
             let workdir = container_workdir.clone();
             let sid = session_id.to_string();
             match tokio::task::spawn_blocking(move || {
-                crate::session::repo_config::execute_hooks_in_container_best_effort(
+                crate::session::config::repo_config::execute_hooks_in_container_best_effort(
                     &cmds,
                     &container_name,
                     &workdir,
@@ -153,4 +113,207 @@ pub async fn ensure_container_for_session_locked(
     }
 
     Ok(sandbox_info)
+}
+
+/// Copy what the build learned onto the live row.
+async fn record_built_sandbox(
+    instances: &RwLock<Vec<Instance>>,
+    mutation_epoch: &AtomicU64,
+    session_id: &str,
+    info: &SandboxInfo,
+    rebuilt: bool,
+) {
+    let mut guard = instances.write().await;
+    let Some(sb) = guard
+        .iter_mut()
+        .find(|i| i.id == session_id)
+        .and_then(|i| i.sandbox_info.as_mut())
+    else {
+        return;
+    };
+    if sb.container_id.is_none() {
+        sb.container_id = info.container_id.clone();
+    }
+    sb.before_start_env = info.before_start_env.clone();
+    // A disk snapshot read before the rebuild would restore the old stamp, and
+    // the next ensure would discard this container. The watcher may already
+    // have applied the new stamp, so a rebuild invalidates even when it matches.
+    if rebuilt || sb.provider != info.provider {
+        sb.provider = info.provider.clone();
+        mutation_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Rebuild the container when the session's provider pick no longer matches the
+/// provider it was built for. The GCP ADC bind mount is decided at
+/// container-create time, so a container built for another provider has the
+/// wrong credential mounts. A container built before the pick existed records
+/// `None`, which matches no explicit pick and so is rebuilt once.
+fn reconcile_provider_container(instance: &mut Instance) -> Result<bool> {
+    reconcile_provider_container_with(instance, |id| {
+        crate::containers::DockerContainer::from_session_id(id).discard()
+    })
+}
+
+/// Returns whether the old container was discarded.
+///
+/// The new stamp reaches disk after the discard and before the rebuild. A
+/// reload restores the disk row, so a stamp held only in memory would have the
+/// next resume discard the rebuilt, correct container again. Written any
+/// earlier, a failed discard would leave the stamp claiming mounts the old
+/// container lacks. A failed write leaves no container, so the next resume
+/// retries; a failed rebuild leaves the stamp, so the next resume builds for it.
+fn reconcile_provider_container_with(
+    instance: &mut Instance,
+    discard: impl FnOnce(&str) -> crate::containers::Teardown,
+) -> Result<bool> {
+    let Some(sandbox) = instance.sandbox_info.as_mut() else {
+        return Ok(false);
+    };
+    if sandbox.provider == instance.agent_provider {
+        return Ok(false);
+    }
+    let built_for = sandbox.provider.clone();
+    if let crate::containers::Teardown::Failed(e) = discard(&instance.id) {
+        anyhow::bail!(
+            "failed to remove sandbox container {} built for a different provider; remove it \
+             before switching, or the session keeps the old provider's credential mounts: {e}",
+            crate::containers::DockerContainer::from_session_id(&instance.id).name
+        );
+    }
+    sandbox.provider = instance.agent_provider.clone();
+    instance
+        .persist_sandbox_provider()
+        .context("recording the provider the sandbox container is rebuilt for")?;
+    tracing::info!(
+        target: "acp.sandbox",
+        session = %instance.id,
+        built_for = ?built_for,
+        provider = ?instance.agent_provider,
+        "recreating sandbox container for the new provider"
+    );
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::containers::Teardown;
+
+    fn sandboxed(provider_built_for: Option<&str>) -> Instance {
+        let mut inst = Instance::new("claude", "/tmp/aoe-provider-stamp");
+        inst.agent_provider = Some("vertex".to_string());
+        inst.sandbox_info = Some(SandboxInfo {
+            provider: provider_built_for.map(str::to_string),
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-stamp".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        inst
+    }
+
+    fn stored_stamp(id: &str) -> Option<String> {
+        crate::server::test_support::load_instances_from_disk_for_test("default")
+            .into_iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.sandbox_info)
+            .and_then(|s| s.provider)
+    }
+
+    /// A poll that read the pre-rebuild row must not land after the build, even
+    /// when the watcher already applied the new stamp from disk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_rebuild_invalidates_snapshots_read_before_it() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        let old = sandboxed(None);
+        let id = old.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![old.clone()]);
+        let mut rebuilt = old.clone();
+        rebuilt.sandbox_info.as_mut().unwrap().provider = Some("vertex".to_string());
+        let reload = |snapshot: &Instance, read_epoch| {
+            crate::server::reload::reload_state_instances_from_disk(
+                &state,
+                vec![snapshot.clone()],
+                Vec::new(),
+                crate::server::state::StatusSource::DiskOnly,
+                read_epoch,
+            )
+        };
+
+        let stale_epoch = state.mutation_epoch.load(Ordering::SeqCst);
+        reload(&rebuilt, stale_epoch).await;
+        record_built_sandbox(
+            &state.instances,
+            &state.mutation_epoch,
+            &id,
+            rebuilt.sandbox_info.as_ref().unwrap(),
+            true,
+        )
+        .await;
+        reload(&old, stale_epoch).await;
+
+        let stamp = state.instances.read().await[0]
+            .sandbox_info
+            .as_ref()
+            .and_then(|s| s.provider.clone());
+        assert_eq!(stamp.as_deref(), Some("vertex"));
+    }
+
+    /// The path every resume takes, not only a switch: a rebuild survives a
+    /// reload and the next same-provider resume leaves it alone, while a
+    /// failed discard records nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_rebuild_is_recorded_on_disk_before_it_runs() {
+        for (case, outcome, rebuilt) in [
+            ("removed", Teardown::Removed, true),
+            ("already gone", Teardown::AlreadyGone, true),
+            (
+                "discard failed",
+                Teardown::Failed(crate::containers::error::DockerError::DaemonNotRunning),
+                false,
+            ),
+        ] {
+            let _tmp = crate::session::test_support::isolate_app_dir();
+            let mut inst = sandboxed(None);
+            let id = inst.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![inst.clone()],
+            );
+
+            let mut discards = 0;
+            let result = reconcile_provider_container_with(&mut inst, |_| {
+                discards += 1;
+                outcome
+            });
+            assert_eq!(result.is_ok(), rebuilt, "{case}: {result:?}");
+            let expected = rebuilt.then(|| "vertex".to_string());
+            assert_eq!(stored_stamp(&id), expected, "{case}");
+            if !rebuilt {
+                continue;
+            }
+
+            let mut reloaded =
+                crate::server::test_support::load_instances_from_disk_for_test("default")
+                    .into_iter()
+                    .find(|i| i.id == id)
+                    .expect("seeded row");
+            let again = reconcile_provider_container_with(&mut reloaded, |_| {
+                discards += 1;
+                Teardown::Removed
+            });
+            assert!(
+                !again.unwrap(),
+                "{case}: the rebuilt container must survive"
+            );
+            assert_eq!(discards, 1, "{case}");
+        }
+    }
 }

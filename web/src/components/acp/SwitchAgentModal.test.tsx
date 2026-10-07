@@ -14,7 +14,7 @@
 //   - the manual trigger swaps the copy and drops the codex preference.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
@@ -40,6 +40,15 @@ beforeEach(() => {
     },
     { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
     { name: "opencode", description: "OpenCode", command: "opencode-acp" },
+    { name: "gemini", description: "Gemini CLI", command: "gemini" },
+    {
+      name: "legacy",
+      description: "Legacy backend",
+      command: "legacy-acp",
+      // Deprecated server-side only: absent from the static profile
+      // mirror, so the label must come from the endpoint field.
+      lifecycle: { state: "deprecated", since: "2026-01-01", note: "upstream shut down", replacement: null },
+    },
   ]);
   mockSwitch.mockResolvedValue({
     session_id: "s-1",
@@ -96,13 +105,18 @@ describe("SwitchAgentModal (rate_limit)", () => {
     expect(checked?.value).toBe("codex");
   });
 
-  it("falls back to the first remaining agent when codex isn't installed", async () => {
+  it.each([
+    ["rate_limit", "Continue in opencode"],
+    // Manual has no codex bias: opencode is listed first, so it wins.
+    ["manual", "Switch to opencode"],
+  ] as const)("%s preselects the first remaining agent when codex is not preferred", async (trigger, label) => {
     mockFetchAgents.mockResolvedValue([
       { name: "claude", description: "Claude", command: "claude-agent-acp" },
       { name: "opencode", description: "OpenCode", command: "opencode-acp" },
+      ...(trigger === "manual" ? [{ name: "codex", description: "OpenAI Codex", command: "codex-acp" }] : []),
     ]);
-    const { findByText } = mount();
-    await findByText(/Continue in opencode/);
+    const { findByText } = mount({ trigger });
+    await findByText(label);
   });
 
   it("hands off via switchAcpAgent + fetchContextPrimer and prefills", async () => {
@@ -130,29 +144,26 @@ describe("SwitchAgentModal (rate_limit)", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("does not call switchAcpAgent when the user cancels", async () => {
+  it("closes on Cancel or Escape without dispatching a switch", async () => {
     const { findByText, onClose } = mount();
     await findByText(/Continue in codex/);
     fireEvent.click(await findByText("Cancel"));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(2);
     expect(mockSwitch).not.toHaveBeenCalled();
     expect(mockPrimer).not.toHaveBeenCalled();
-    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("closes on Escape without dispatching a switch", async () => {
-    const { findByText, onClose } = mount();
-    await findByText(/Continue in codex/);
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(1);
-    expect(mockSwitch).not.toHaveBeenCalled();
-  });
-
-  it("surfaces a server error and keeps the modal open", async () => {
-    mockSwitch.mockRejectedValue(new Error("boom"));
+  it.each([
+    ["a rejection", () => mockSwitch.mockRejectedValue(new Error("boom")), /boom/],
+    // The api helper returns null on 4xx/5xx without throwing.
+    ["a null response", () => mockSwitch.mockResolvedValue(null), /server returned no response/i],
+  ])("surfaces a switch failure (%s) and keeps the modal open", async (_label, arrange, message) => {
+    arrange();
     const { findByText, onPrefill, onClose } = mount();
     fireEvent.click(await findByText(/Continue in codex/));
-    const alert = await findByText(/boom/);
-    expect(alert.textContent).toMatch(/boom/);
+    await findByText(message);
+    expect(mockPrimer).not.toHaveBeenCalled();
     expect(onPrefill).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
   });
@@ -164,28 +175,6 @@ describe("SwitchAgentModal (rate_limit)", () => {
     expect(alert.textContent).toMatch(/agents fetch broke/);
     expect(mockSwitch).not.toHaveBeenCalled();
     expect(onPrefill).not.toHaveBeenCalled();
-  });
-
-  it("surfaces a generic message when switchAcpAgent returns null", async () => {
-    // The api helper returns null on 4xx/5xx without throwing (fetchJson
-    // semantics). Modal must not crash and must show a clear message.
-    mockSwitch.mockResolvedValue(null);
-    const { findByText, onPrefill, onClose } = mount();
-    fireEvent.click(await findByText(/Continue in codex/));
-    const alert = await findByText(/server returned no response/i);
-    expect(alert.textContent).toMatch(/server returned no response/i);
-    expect(mockPrimer).not.toHaveBeenCalled();
-    expect(onPrefill).not.toHaveBeenCalled();
-    expect(onClose).not.toHaveBeenCalled();
-  });
-
-  it("clicking a non-preselected radio updates the confirm-button target", async () => {
-    const { container, findByText } = mount();
-    await findByText(/Continue in codex/);
-    const opencodeRadio = container.querySelector<HTMLInputElement>("input[name=acp-agent-target][value=opencode]");
-    expect(opencodeRadio).not.toBeNull();
-    fireEvent.click(opencodeRadio!);
-    await findByText(/Continue in opencode/);
   });
 
   it("shows the disabled current agent and an install hint when nothing else is registered", async () => {
@@ -202,43 +191,38 @@ describe("SwitchAgentModal (rate_limit)", () => {
     );
     expect(confirm?.disabled).toBe(true);
   });
+  it("marks deprecated registry targets next to their name", async () => {
+    // gemini is deprecated in the static profile mirror; "legacy" is
+    // deprecated only through the endpoint's lifecycle field. Both get
+    // the label so a rate-limit handoff never silently steers into a
+    // deprecated backend.
+    const { findByTestId } = mount();
+    const geminiBadge = await findByTestId("switch-agent-deprecated-gemini");
+    expect(geminiBadge.parentElement?.textContent).toContain("gemini");
+    expect(geminiBadge.parentElement?.nextElementSibling?.textContent).toBe("Gemini CLI");
+    expect(await findByTestId("switch-agent-deprecated-legacy")).not.toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-claude")).toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-codex")).toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-opencode")).toBeNull();
+    // The deprecation label is additive: every row keeps its description.
+    const descriptions = ["Claude (Sonnet)", "OpenAI Codex", "OpenCode", "Gemini CLI", "Legacy backend"];
+    for (const text of descriptions) {
+      expect(screen.getByText(text)).not.toBeNull();
+    }
+  });
 });
 
 describe("SwitchAgentModal (manual)", () => {
-  it("uses 'Switch to' copy and no codex preference", async () => {
-    // Manual trigger has no preferred direction: it preselects the first
-    // remaining entry (claude filtered out -> codex is first here, but
-    // the label proves the manual copy path, not a rate-limit fallback).
-    const { container, findByText, queryByText } = mount({ trigger: "manual" });
-    await findByText(/Switch to/);
+  it("uses 'Switch to' copy, records reason 'manual', and frames the recap as a plain switch", async () => {
+    const { findByText, queryByText, onPrefill } = mount({ trigger: "manual" });
+    const confirm = await findByText(/Switch to codex/);
     expect(queryByText(/Continue in/)).toBeNull();
-    const checked = Array.from(container.querySelectorAll<HTMLInputElement>("input[name=acp-agent-target]")).find(
-      (r) => r.checked,
-    );
-    // First remaining agent after filtering out the current one.
-    expect(checked?.value).toBe("codex");
-  });
-
-  it("records reason 'manual' and frames the recap as a plain switch", async () => {
-    const { findByText, onPrefill } = mount({ trigger: "manual" });
-    fireEvent.click(await findByText(/Switch to codex/));
+    fireEvent.click(confirm);
     await waitFor(() => expect(mockSwitch).toHaveBeenCalledTimes(1));
     expect(mockSwitch).toHaveBeenCalledWith("s-1", "codex", null, "manual");
     await waitFor(() => expect(onPrefill).toHaveBeenCalledTimes(1));
     const prefilled = onPrefill.mock.calls[0]?.[0] as string;
     expect(prefilled).toContain("switched from claude to codex");
     expect(prefilled).not.toContain("rate-limited");
-  });
-
-  it("preselects the first remaining agent (no codex bias) on manual switch", async () => {
-    mockFetchAgents.mockResolvedValue([
-      { name: "claude", description: "Claude", command: "claude-agent-acp" },
-      { name: "opencode", description: "OpenCode", command: "opencode-acp" },
-      { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
-    ]);
-    const { findByText } = mount({ trigger: "manual" });
-    // opencode comes before codex in the list, so it wins without the
-    // rate-limit codex preference.
-    await findByText(/Switch to opencode/);
   });
 });

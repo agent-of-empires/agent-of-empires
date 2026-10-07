@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Tests for UpdateBanner. The banner polls `/api/system/update-status` on
-// mount and renders a top-of-app notice when an update is available and the
-// check mode is not `auto`/`off`. Dismiss persists server-side via
-// dismissUpdate (keyed by latest_version) and hides the banner optimistically.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -43,13 +38,7 @@ afterEach(() => {
 });
 
 describe("UpdateBanner", () => {
-  it("renders nothing before the first poll resolves", () => {
-    fetchUpdateStatus.mockReturnValue(new Promise(() => {}));
-    const { container } = render(<UpdateBanner />);
-    expect(container.firstChild).toBeNull();
-  });
-
-  it("renders the banner with both versions when an update is available", async () => {
+  it("renders the banner with both versions and the release link only when a URL is set", async () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus());
     render(<UpdateBanner />);
 
@@ -57,47 +46,33 @@ describe("UpdateBanner", () => {
     expect(banner.getAttribute("aria-label")).toBe("Update available: v1.1.0");
     expect(banner.textContent).toContain("v1.0.0");
     expect(banner.textContent).toContain("v1.1.0");
-
     const link = screen.getByText("Release notes") as HTMLAnchorElement;
     expect(link.getAttribute("href")).toBe("https://example.com/releases/1.1.0");
-  });
+    cleanup();
 
-  it("renders nothing when no update is available", async () => {
-    fetchUpdateStatus.mockResolvedValue(makeStatus({ update_available: false }));
-    const { container } = render(<UpdateBanner />);
-    await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
-    expect(container.querySelector('[role="status"]')).toBeNull();
-  });
-
-  it("renders nothing in auto mode even when an update is available", async () => {
-    fetchUpdateStatus.mockResolvedValue(makeStatus({ update_check_mode: "auto" }));
-    const { container } = render(<UpdateBanner />);
-    await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
-    expect(container.querySelector('[role="status"]')).toBeNull();
-  });
-
-  // In "off" mode the server reports update_available: false, so the banner
-  // never has anything to render; the client only special-cases "auto". The
-  // no-update suppression is the off-mode contract, covered above.
-  it("renders nothing in off mode (server reports no update available)", async () => {
-    fetchUpdateStatus.mockResolvedValue(makeStatus({ update_check_mode: "off", update_available: false }));
-    const { container } = render(<UpdateBanner />);
-    await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
-    expect(container.querySelector('[role="status"]')).toBeNull();
-  });
-
-  it("renders nothing when the version was already dismissed server-side", async () => {
-    fetchUpdateStatus.mockResolvedValue(makeStatus({ dismissed_version: "1.1.0" }));
-    const { container } = render(<UpdateBanner />);
-    await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
-    expect(container.querySelector('[role="status"]')).toBeNull();
-  });
-
-  it("omits the release-notes link when release_url is null", async () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus({ release_url: null }));
     render(<UpdateBanner />);
     await screen.findByRole("status");
     expect(screen.queryByText("Release notes")).toBeNull();
+  });
+
+  it("renders nothing before the first poll resolves", () => {
+    fetchUpdateStatus.mockReturnValue(new Promise(() => {}));
+    const { container } = render(<UpdateBanner />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  // "off" mode has no separate client path: the server reports update_available: false, so only "auto" is
+  // special-cased here.
+  it.each([
+    ["no update is available", { update_available: false }],
+    ["auto mode handles the install", { update_check_mode: "auto" }],
+    ["the version was already dismissed server-side", { dismissed_version: "1.1.0" }],
+  ] as [string, Partial<UpdateStatus>][])("renders nothing when %s", async (_name, overrides) => {
+    fetchUpdateStatus.mockResolvedValue(makeStatus(overrides));
+    const { container } = render(<UpdateBanner />);
+    await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
+    expect(container.querySelector('[role="status"]')).toBeNull();
   });
 
   it("dismiss hides the banner optimistically and persists via dismissUpdate", async () => {
@@ -105,8 +80,7 @@ describe("UpdateBanner", () => {
     const { container } = render(<UpdateBanner />);
 
     await screen.findByRole("status");
-    const dismissBtn = screen.getByLabelText("Dismiss update notice");
-    fireEvent.click(dismissBtn);
+    fireEvent.click(screen.getByLabelText("Dismiss update notice"));
 
     expect(dismissUpdate).toHaveBeenCalledTimes(1);
     expect(dismissUpdate).toHaveBeenCalledWith("1.1.0");

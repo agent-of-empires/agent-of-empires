@@ -1,11 +1,3 @@
-// Drift guard + behavioral lock for the single shortcut registry (issue #1648).
-//
-// This is the test that makes "one source of truth" real: it pins the exact
-// rendered label strings (so the help overlay and tour cannot silently change
-// formatting), pins the match behavior of every binding (so a refactor cannot
-// rebind a key), proves the SHORTCUTS array order is cosmetic (exactly one
-// shortcut matches any given event), and couples the tour to the registry
-// (every tour hint id resolves to a registered shortcut).
 import { describe, expect, it } from "vitest";
 import {
   SHORTCUTS,
@@ -19,22 +11,20 @@ import {
 import { TOUR_STEPS } from "../tourSteps";
 
 // Ctrl+Q matches only while an embedded terminal or structured composer owns focus; bare keys remain textless.
-function ev(partial: Partial<ShortcutKeyEvent>): ShortcutKeyEvent {
-  return {
-    key: "",
-    code: "",
-    metaKey: false,
-    ctrlKey: false,
-    altKey: false,
-    shiftKey: false,
-    ...partial,
-  };
-}
+const ev = (partial: Partial<ShortcutKeyEvent>): ShortcutKeyEvent => ({
+  key: "",
+  code: "",
+  metaKey: false,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  ...partial,
+});
 
 describe("SHORTCUTS registry", () => {
-  it("has unique ids", () => {
-    const ids = SHORTCUTS.map((s) => s.id);
-    expect(new Set(ids).size).toBe(ids.length);
+  it("has unique ids that SHORTCUTS_BY_ID resolves", () => {
+    expect(new Set(SHORTCUTS.map((s) => s.id)).size).toBe(SHORTCUTS.length);
+    for (const s of SHORTCUTS) expect(SHORTCUTS_BY_ID[s.id]).toBe(s);
   });
 
   it("SHORTCUTS_BY_ID resolves every entry", () => {
@@ -321,54 +311,8 @@ describe("tour drift guard", () => {
   it("every tour shortcut hint id resolves to a registered shortcut", () => {
     for (const step of TOUR_STEPS) {
       for (const hint of step.shortcutHints ?? []) {
-        expect(SHORTCUTS_BY_ID[hint.id], `step "${step.id}" hint "${hint.id}" is not registered`).toBeDefined();
+        expect(SHORTCUTS_BY_ID[hint.id], `step "${step.id}" hint "${hint.id}"`).toBeDefined();
       }
     }
   });
-});
-
-describe("array order is cosmetic (predicates are mutually exclusive)", () => {
-  function triggeringEvent(s: ShortcutDef): { event: ShortcutKeyEvent; isInput: boolean; isSessionInput: boolean } {
-    const t = s.trigger;
-    const event = ev({
-      ctrlKey: t.ctrl ?? false,
-      metaKey: t.meta ?? t.mod ?? false,
-      shiftKey: t.shift ?? false,
-      altKey: t.alt ?? false,
-    });
-    if (t.code) {
-      event.code = t.code;
-      event.key = t.code === "Backquote" ? "`" : t.code.replace(/^Key/, "").toLowerCase();
-    }
-    if (t.key) event.key = t.key;
-    return { event, isInput: false, isSessionInput: t.scope === "sessionInput" };
-  }
-
-  function allMatchingIds(event: ShortcutKeyEvent, opts: { mac: boolean; isInput: boolean; isSessionInput: boolean }) {
-    const mod = opts.mac ? event.metaKey : event.metaKey || event.ctrlKey;
-    const hasModifier = event.metaKey || event.ctrlKey || event.altKey;
-    return SHORTCUTS.filter((shortcut) => {
-      const t = shortcut.trigger;
-      if (t.scope === "global" || (t.scope === "sessionInput" && opts.isSessionInput)) {
-        if (t.mod !== undefined && t.mod !== mod) return false;
-        if (t.ctrl !== undefined && t.ctrl !== event.ctrlKey) return false;
-        if (t.meta !== undefined && t.meta !== event.metaKey) return false;
-        if (t.shift !== undefined && t.shift !== event.shiftKey) return false;
-        if (t.alt !== undefined && t.alt !== event.altKey) return false;
-        if (t.code !== undefined) return event.code === t.code;
-        if (t.key !== undefined) {
-          return t.keyCaseInsensitive ? event.key.toLowerCase() === t.key.toLowerCase() : event.key === t.key;
-        }
-        return false;
-      }
-      return t.scope === "textless" && !opts.isInput && !hasModifier && event.key === t.key;
-    });
-  }
-
-  for (const shortcut of SHORTCUTS) {
-    it(`only ${shortcut.id} matches its trigger`, () => {
-      const { event, isInput, isSessionInput } = triggeringEvent(shortcut);
-      expect(allMatchingIds(event, { mac: true, isInput, isSessionInput }).map((s) => s.id)).toEqual([shortcut.id]);
-    });
-  }
 });

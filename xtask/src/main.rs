@@ -1,4 +1,4 @@
-//! xtask - Development tasks for agent-of-empires
+//! xtask: development tasks for agent-of-empires.
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::collections::BTreeSet;
@@ -57,14 +57,12 @@ fn run_dev(_args: DevArgs) {
     std::process::exit(1);
 }
 
-/// Build the serve-enabled debug binary. Returns whether the build succeeded so
-/// the watch loop can keep the old backend running on a failed rebuild.
 #[cfg(unix)]
-fn build_serve() -> bool {
+fn build_web() -> bool {
     use std::process::Command;
-    eprintln!("[xtask dev] building aoe --features serve...");
+    eprintln!("[xtask dev] building aoe --features web...");
     Command::new("cargo")
-        .args(["build", "--features", "serve"])
+        .args(["build", "--features", "web"])
         .status()
         .map(|s| s.success())
         .unwrap_or_else(|e| {
@@ -73,8 +71,6 @@ fn build_serve() -> bool {
         })
 }
 
-/// Whether a bind host keeps the dev servers off the network. Anything else
-/// (notably `0.0.0.0`) exposes them to other devices and warrants a warning.
 #[cfg(unix)]
 fn host_is_loopback(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
@@ -85,8 +81,6 @@ fn child_exited(child: &mut std::process::Child) -> bool {
     matches!(child.try_wait(), Ok(Some(_)))
 }
 
-/// SIGTERM a child's process group, wait out a grace period, then SIGKILL the
-/// group if it is still alive. Reaps the child either way.
 #[cfg(unix)]
 fn terminate_group(child: &mut std::process::Child, grace: std::time::Duration) {
     use nix::sys::signal::{killpg, Signal};
@@ -110,8 +104,6 @@ fn terminate_group(child: &mut std::process::Child, grace: std::time::Duration) 
     let _ = child.wait();
 }
 
-/// Wait until the backend port is bindable again before respawning, so a restart
-/// does not race the old listener and fail with "address already in use".
 #[cfg(unix)]
 fn wait_for_port(port: u16, timeout: std::time::Duration) {
     use std::net::TcpListener;
@@ -126,10 +118,6 @@ fn wait_for_port(port: u16, timeout: std::time::Duration) {
     eprintln!("[xtask dev] port {port} still busy after waiting; respawning anyway");
 }
 
-/// Whether a changed path should trigger a backend rebuild: any `.rs` file, or
-/// the root `Cargo.toml` / `Cargo.lock`. The watch scope (src/ recursively plus
-/// the project root non-recursively) already excludes target/ and node_modules,
-/// so a plain extension and file-name check is enough.
 #[cfg(unix)]
 fn is_watch_relevant(path: &Path) -> bool {
     if path.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -141,15 +129,7 @@ fn is_watch_relevant(path: &Path) -> bool {
     )
 }
 
-/// Build the serve-enabled binary, then run it alongside the Vite dev server.
-/// Vite proxies `/api` and the AoE `/sessions/*` WebSocket relays to the
-/// backend via the `VITE_PROXY` env var it already honors. Each child runs in
-/// its own process group so a single Ctrl-C tears the whole tree down (npm
-/// spawns vite, vite may spawn esbuild) with no orphans.
-///
-/// With `--watch`, edits under `src/**` (plus `Cargo.toml` / `Cargo.lock`)
-/// rebuild the backend and restart `aoe serve`; the Vite child is left running
-/// so frontend HMR and the browser session survive the backend bounce.
+/// Each child runs in its own process group so one Ctrl-C tears the whole tree down.
 #[cfg(unix)]
 fn run_dev(args: DevArgs) {
     use std::os::unix::process::CommandExt;
@@ -158,13 +138,10 @@ fn run_dev(args: DevArgs) {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    // Build up front so build output doesn't interleave with Vite's startup
-    // and a broken build fails fast before either server comes up.
-    if !build_serve() {
+    if !build_web() {
         std::process::exit(1);
     }
 
-    // Honor CARGO_TARGET_DIR; cargo wrote the debug binary under it.
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let bin = Path::new(&target_dir).join("debug").join("aoe");
 
@@ -175,17 +152,9 @@ fn run_dev(args: DevArgs) {
             .expect("failed to install Ctrl-C handler");
     }
 
-    // Detach stdin from both children: each runs in its own (background)
-    // process group, so a TTY-driven raw-mode setup (Vite installs keypress
-    // shortcuts when stdin is a TTY) would raise SIGTTOU and suspend the
-    // child. Shutdown is driven by signals here, not per-server keystrokes,
-    // so neither child needs the terminal.
+    // Detach stdin: a background process group touching the TTY gets SIGTTOU.
     let serve_port = args.serve_port;
-    // The backend always stays on loopback: remote devices reach the dashboard
-    // through Vite, which proxies `/api` and the AoE `/sessions/*` WebSocket
-    // relays to the backend over 127.0.0.1. Binding it to a public interface
-    // would also trip `aoe serve`'s refusal to run `--no-auth` off-loopback
-    // without a proxy.
+    // The backend stays on loopback; remote devices reach it through Vite's proxy.
     let host = args.host.clone();
     let spawn_serve = || -> Child {
         Command::new(&bin)
@@ -196,11 +165,7 @@ fn run_dev(args: DevArgs) {
             .expect("failed to spawn `aoe serve`")
     };
 
-    // Clear any lingering serve already bound to the dev namespace before we
-    // spawn ours. An unclean prior `xtask dev` exit (or a stray dev daemon)
-    // leaves a serve PID file that makes the fresh foreground serve refuse to
-    // start with "already running", which then tears Vite down. Best-effort:
-    // ignore the "no daemon running" case and wait for the port to free up.
+    // A stale dev serve PID file would make the fresh serve refuse to start.
     {
         let stopped = Command::new(&bin)
             .args(["serve", "--stop"])
@@ -216,8 +181,6 @@ fn run_dev(args: DevArgs) {
         }
     }
 
-    // Tracked as an Option so a backend that exits under --watch can be marked
-    // dead and respawned on the next rebuild without tearing down Vite.
     let mut serve: Option<Child> = Some(spawn_serve());
 
     let mut vite = match Command::new("npm")
@@ -242,8 +205,6 @@ fn run_dev(args: DevArgs) {
     {
         Ok(child) => child,
         Err(e) => {
-            // serve is already up; tear its group down before bailing so we
-            // don't orphan a backend on the serve port.
             eprintln!("[xtask dev] failed to spawn `npm run dev`: {e}");
             if let Some(mut serve) = serve.take() {
                 terminate_group(&mut serve, Duration::from_secs(2));
@@ -271,8 +232,6 @@ fn run_dev(args: DevArgs) {
         );
     }
 
-    // Watch src/** plus the root Cargo.toml/Cargo.lock when --watch is set. The
-    // watcher must stay bound for the loop's lifetime; dropping it ends delivery.
     let (watch_tx, watch_rx) = std::sync::mpsc::channel::<()>();
     let _watcher = if args.watch {
         use notify::{RecursiveMode, Watcher};
@@ -284,9 +243,7 @@ fn run_dev(args: DevArgs) {
             }
         })
         .expect("failed to create file watcher");
-        // src/ recursively for .rs edits; the project root non-recursively so an
-        // editor's atomic-save rename-replace of Cargo.toml/Cargo.lock is caught
-        // (a direct file watch would detach when the inode is swapped).
+        // Watch the root non-recursively so an atomic-save rename of Cargo.toml is caught.
         watcher
             .watch(Path::new("src"), RecursiveMode::Recursive)
             .expect("failed to watch src/");
@@ -299,13 +256,9 @@ fn run_dev(args: DevArgs) {
         None
     };
 
-    // Trailing debounce: the first change arms a deadline; rapid follow-up saves
-    // (rustfmt, editor temp-file dances) collapse into a single rebuild.
     let debounce = Duration::from_millis(300);
     let mut rebuild_at: Option<Instant> = None;
 
-    // Supervise: stop on Ctrl-C, on Vite exiting, or (without --watch) on the
-    // backend exiting. Under --watch, rebuild and restart the backend on change.
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -339,7 +292,7 @@ fn run_dev(args: DevArgs) {
                 if Instant::now() >= at {
                     rebuild_at = None;
                     eprintln!("[xtask dev] change detected; rebuilding aoe...");
-                    if build_serve() {
+                    if build_web() {
                         if let Some(mut old) = serve.take() {
                             terminate_group(&mut old, Duration::from_secs(2));
                         }
@@ -356,8 +309,6 @@ fn run_dev(args: DevArgs) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Signal each live process group: SIGTERM, brief grace, then SIGKILL so the
-    // ports are always freed even if a child ignores the term.
     terminate_group(&mut vite, Duration::from_secs(2));
     if let Some(mut child) = serve.take() {
         terminate_group(&mut child, Duration::from_secs(2));
@@ -376,28 +327,163 @@ fn generate_cli_docs() {
     println!("Generated CLI documentation at {}", output_path.display());
 }
 
-fn collect_subcommand_paths(cmd: &clap::Command, prefix: &str, out: &mut BTreeSet<String>) {
-    for sub in cmd.get_subcommands() {
-        if sub.get_name() == "help" {
-            continue;
+#[derive(Default)]
+struct CliTree {
+    commands: BTreeSet<String>,
+    parents: BTreeSet<String>,
+    aliases: BTreeSet<String>,
+}
+
+impl CliTree {
+    fn from_command(cmd: &clap::Command) -> Self {
+        let mut tree = Self::default();
+        tree.walk(cmd, "", false);
+        tree
+    }
+
+    /// Walks every spelling of each command so `<alias> <sub>` resolves; any alias segment
+    /// keeps the path out of the advisory.
+    fn walk(&mut self, cmd: &clap::Command, prefix: &str, aliased: bool) {
+        for sub in cmd.get_subcommands() {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            let join = |name: &str| {
+                if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix} {name}")
+                }
+            };
+            let spellings = std::iter::once((sub.get_name(), false))
+                .chain(sub.get_all_aliases().map(|alias| (alias, true)));
+            for (name, is_alias) in spellings {
+                let path = join(name);
+                let aliased = aliased || is_alias;
+                if sub.has_subcommands() {
+                    self.parents.insert(path.clone());
+                }
+                if aliased {
+                    self.aliases.insert(path.clone());
+                } else {
+                    self.commands.insert(path.clone());
+                }
+                self.walk(sub, &path, aliased);
+            }
         }
-        let path = if prefix.is_empty() {
-            sub.get_name().to_string()
-        } else {
-            format!("{} {}", prefix, sub.get_name())
-        };
-        out.insert(path.clone());
-        collect_subcommand_paths(sub, &path, out);
+    }
+
+    fn is_known(&self, path: &str) -> bool {
+        self.commands.contains(path) || self.aliases.contains(path)
     }
 }
 
-/// How the skill's published version is sourced, which determines whether a
-/// top-level `version:` field is allowed in the frontmatter.
+/// Fenced code and inline backtick spans only; spans are line-local.
+fn code_spans(content: &str) -> Vec<&str> {
+    // A `json` or `text` fence is data, and `#` truncation would misread a payload.
+    fn is_shell_fence(info: &str) -> bool {
+        matches!(
+            info.trim(),
+            "" | "sh" | "bash" | "shell" | "zsh" | "console" | "shell-session"
+        )
+    }
+
+    let mut spans = Vec::new();
+    // Tracks "inside" separately from "is shell" so a data fence's close cannot open a shell one.
+    let mut fence: Option<bool> = None;
+    for line in content.lines() {
+        if let Some(info) = line.trim_start().strip_prefix("```") {
+            fence = match fence {
+                Some(_) => None,
+                None => Some(is_shell_fence(info)),
+            };
+            continue;
+        }
+        if let Some(is_shell) = fence {
+            if !is_shell {
+                continue;
+            }
+            // `#` starts a shell comment; dropping the tail can only under-check.
+            spans.push(line.split('#').next().unwrap_or(line));
+            continue;
+        }
+        let parts: Vec<&str> = line.split('`').collect();
+        if parts.len() % 2 == 1 {
+            spans.extend(parts.iter().skip(1).step_by(2));
+        }
+    }
+    spans
+}
+
+fn read_invocations(content: &str) -> Vec<Vec<String>> {
+    let re = regex::Regex::new(r"\baoe[ \t]+([a-z][a-z0-9 \t-]*)").unwrap();
+    let mut invocations = Vec::new();
+    for span in code_spans(content) {
+        for cap in re.captures_iter(span) {
+            let words: Vec<String> = cap[1]
+                .split_whitespace()
+                // A leading `-` is a flag, not a subcommand.
+                .take_while(|w| {
+                    !w.starts_with('-') && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                })
+                .map(str::to_string)
+                .collect();
+            if !words.is_empty() {
+                invocations.push(words);
+            }
+        }
+    }
+    invocations
+}
+
+/// `Ok(Some(path))` credits a canonical command, `Ok(None)` an alias or bare prefix, and
+/// `Err` is text to report as nonexistent.
+fn resolve_invocation(words: &[String], cli: &CliTree) -> Result<Option<String>, String> {
+    let mut resolved: Option<(String, usize)> = None;
+    let mut path = String::new();
+    for (index, word) in words.iter().enumerate() {
+        if path.is_empty() {
+            path = word.clone();
+        } else {
+            path = format!("{path} {word}");
+        }
+        if cli.is_known(&path) {
+            resolved = Some((path.clone(), index + 1));
+        }
+    }
+
+    let Some((resolved, consumed)) = resolved else {
+        return Err(words[0].clone());
+    };
+    if cli.parents.contains(&resolved) {
+        if let Some(next) = words.get(consumed) {
+            return Err(format!("{resolved} {next}"));
+        }
+    }
+    Ok(cli.commands.contains(&resolved).then_some(resolved))
+}
+
+fn check_invocations(content: &str, cli: &CliTree) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut referenced = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
+    for words in read_invocations(content) {
+        match resolve_invocation(&words, cli) {
+            Ok(Some(path)) => {
+                referenced.insert(path);
+            }
+            Ok(None) => {}
+            Err(bad) => {
+                unknown.insert(bad);
+            }
+        }
+    }
+    (referenced, unknown)
+}
+
 enum VersionRule {
-    /// clawhub manages the version via `_meta.json` and the release workflow's
-    /// `--version` flag, so a static `version:` field would go stale: forbid it.
+    /// clawhub manages the version via `_meta.json`, so a static field would go stale.
     Forbidden,
-    /// The Hermes Skills Hub requires a top-level `version:` field: require it.
+    /// The Hermes Skills Hub requires a top-level `version:` field.
     Required,
 }
 
@@ -407,10 +493,7 @@ fn check_skill() {
         ("contrib/hermes-skill/SKILL.md", VersionRule::Required),
     ];
 
-    // Build the clap command tree once; shared across every skill file.
-    let cli_cmd = agent_of_empires::cli::Cli::command();
-    let mut cli_commands: BTreeSet<String> = BTreeSet::new();
-    collect_subcommand_paths(&cli_cmd, "", &mut cli_commands);
+    let cli = CliTree::from_command(&agent_of_empires::cli::Cli::command());
 
     let mut has_error = false;
     let mut referenced: BTreeSet<String> = BTreeSet::new();
@@ -425,20 +508,13 @@ fn check_skill() {
 
         let content = fs::read_to_string(skill_path).expect("Failed to read SKILL.md");
 
-        if check_skill_file(
-            path_str,
-            &content,
-            version_rule,
-            &cli_commands,
-            &mut referenced,
-        ) {
+        if check_skill_file(path_str, &content, version_rule, &cli, &mut referenced) {
             has_error = true;
         }
     }
 
-    // Advisory: CLI commands not referenced in any skill file.
     let mut missing_from_skill = Vec::new();
-    for cli_cmd in &cli_commands {
+    for cli_cmd in &cli.commands {
         let mentioned = referenced.iter().any(|s| {
             s == cli_cmd
                 || cli_cmd.starts_with(&format!("{} ", s))
@@ -463,14 +539,11 @@ fn check_skill() {
     println!("Skill check passed.");
 }
 
-/// Validate one skill file's frontmatter version rule and command references.
-/// Referenced commands are accumulated into `referenced` for the shared
-/// advisory. Returns `true` if an error was found.
 fn check_skill_file(
     path_str: &str,
     content: &str,
     version_rule: &VersionRule,
-    cli_commands: &BTreeSet<String>,
+    cli: &CliTree,
     referenced: &mut BTreeSet<String>,
 ) -> bool {
     let mut has_error = false;
@@ -502,64 +575,135 @@ fn check_skill_file(
         _ => {}
     }
 
-    // Extract `aoe <words>` patterns and match longest valid subcommand path
-    let re = regex::Regex::new(r"aoe\s+([a-z][a-z0-9 -]*)").unwrap();
-    let mut skill_commands: BTreeSet<String> = BTreeSet::new();
-    for cap in re.captures_iter(content) {
-        let raw = cap[1].trim();
-        let words: Vec<&str> = raw
-            .split_whitespace()
-            .take_while(|w| {
-                !w.starts_with('-')
-                    && !w.starts_with('<')
-                    && !w.starts_with('"')
-                    && !w.starts_with('$')
-                    && !w.starts_with('/')
-                    && !w.starts_with('.')
-                    && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
-            })
-            .collect();
-
-        // Find the longest prefix that is a known CLI command
-        let mut best = String::new();
-        let mut path = String::new();
-        for word in &words {
-            if path.is_empty() {
-                path = word.to_string();
-            } else {
-                path = format!("{} {}", path, word);
-            }
-            if cli_commands.contains(&path) {
-                best = path.clone();
-            }
-        }
-        // If no exact match, use the first word if it's a known top-level command
-        if best.is_empty() && !words.is_empty() && cli_commands.contains(words[0]) {
-            best = words[0].to_string();
-        }
-        if !best.is_empty() {
-            skill_commands.insert(best);
-        }
+    let (found, unknown) = check_invocations(content, cli);
+    for bad in unknown {
+        eprintln!("ERROR: {path_str} references command 'aoe {bad}' which does not exist in CLI");
+        has_error = true;
     }
 
-    // Check for skill references to commands that don't exist
-    for skill_cmd in &skill_commands {
-        if !cli_commands.contains(skill_cmd) {
-            let is_prefix = cli_commands
-                .iter()
-                .any(|c| c.starts_with(&format!("{} ", skill_cmd)));
-            if !is_prefix {
-                eprintln!(
-                    "ERROR: {} references command 'aoe {}' which does not exist in CLI",
-                    path_str, skill_cmd
-                );
-                has_error = true;
-            }
-        }
-    }
-
-    referenced.extend(skill_commands);
+    referenced.extend(found);
     has_error
+}
+
+#[cfg(test)]
+mod skill_check_tests {
+    use super::{check_invocations, code_spans, CliTree};
+    use std::collections::BTreeSet;
+
+    fn set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn tree() -> CliTree {
+        CliTree {
+            commands: set(&[
+                "list",
+                "session",
+                "session capture",
+                "group",
+                "group create",
+            ]),
+            parents: set(&["session", "group"]),
+            aliases: set(&["ls", "group ls"]),
+        }
+    }
+
+    #[test]
+    fn code_spans_are_fences_and_paired_inline_spans() {
+        let cases: &[(&str, &[&str])] = &[
+            ("```sh\naoe list\n```", &["aoe list"]),
+            ("Run `aoe list` now.", &["aoe list"]),
+            (
+                "Two `aoe list` and `aoe group` spans.",
+                &["aoe list", "aoe group"],
+            ),
+            ("Use aoe list to see sessions.", &[]),
+            ("A stray ` and aoe list after it.", &[]),
+            ("name: aoe\ndescription: something", &[]),
+            ("```sh\n# aoe list is the listing\n```", &[""]),
+            ("```sh\naoe list # lists them\n```", &["aoe list "]),
+            ("~~~\naoe list\n~~~", &[]),
+            ("    aoe list", &[]),
+            ("```json\n\"note\": \"aoe manages sessions\"\n```", &[]),
+            ("```text\naoe makes it easy to run agents\n```", &[]),
+            (
+                "```json\n{}\n```\nprose aoe here\n```sh\naoe list\n```",
+                &["aoe list"],
+            ),
+            ("```json\n{}\n```\nRun `aoe list`.", &["aoe list"]),
+        ];
+        for (content, expected) in cases {
+            assert_eq!(&code_spans(content), expected, "spans of {content:?}");
+        }
+    }
+
+    #[test]
+    fn invocations_resolve_credit_and_reject() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("`aoe list`", &["list"], &[]),
+            ("`aoe session capture`", &["session capture"], &[]),
+            ("`aoe totallybogus`", &[], &["totallybogus"]),
+            ("`aoe session bogusverb`", &[], &["session bogusverb"]),
+            ("`aoe session pin`", &[], &["session pin"]),
+            ("`aoe group create mygroup`", &["group create"], &[]),
+            ("`aoe session capture my-id`", &["session capture"], &[]),
+            ("`aoe ls`", &[], &[]),
+            ("`aoe group ls`", &[], &[]),
+            ("`aoe list --json`", &["list"], &[]),
+            ("`aoe group --help`", &["group"], &[]),
+            ("`aoe session --json`", &["session"], &[]),
+            ("`aoe session capture <id>`", &["session capture"], &[]),
+            ("`aoe session`", &["session"], &[]),
+            (
+                "`aoe totallybogus` and `aoe totallybogus`",
+                &[],
+                &["totallybogus"],
+            ),
+            ("Use aoe totallybogus freely.", &[], &[]),
+        ];
+        let cli = tree();
+        for (content, credited, unknown) in cases {
+            let (referenced, reported) = check_invocations(content, &cli);
+            assert_eq!(referenced, set(credited), "credited for {content:?}");
+            assert_eq!(reported, set(unknown), "reported for {content:?}");
+        }
+    }
+
+    #[test]
+    fn aliases_expand_into_their_subcommand_paths() {
+        let cmd = clap::Command::new("aoe").subcommand(
+            clap::Command::new("group")
+                .alias("grp")
+                .subcommand(clap::Command::new("create").alias("new")),
+        );
+        let cli = CliTree::from_command(&cmd);
+        for path in ["group", "grp", "group create", "grp create", "grp new"] {
+            assert!(cli.is_known(path), "{path} must resolve");
+        }
+        assert_eq!(
+            cli.commands,
+            set(&["group", "group create"]),
+            "only the fully canonical paths belong in the advisory"
+        );
+        let (credited, unknown) = check_invocations("`aoe grp bogusverb`", &cli);
+        assert!(credited.is_empty());
+        assert_eq!(unknown, set(&["grp bogusverb"]));
+        let (credited, unknown) = check_invocations("`aoe grp create mygroup`", &cli);
+        assert!(credited.is_empty() && unknown.is_empty());
+    }
+
+    #[test]
+    fn aliases_are_read_from_the_clap_tree() {
+        use clap::CommandFactory;
+        let cli = CliTree::from_command(&agent_of_empires::cli::Cli::command());
+        assert!(!cli.aliases.is_empty(), "the CLI declares command aliases");
+        assert!(
+            cli.aliases
+                .iter()
+                .all(|alias| !cli.commands.contains(alias)),
+            "an alias must not also be advertised as a canonical command"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -568,27 +712,25 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn rust_sources_are_relevant() {
-        assert!(is_watch_relevant(Path::new("src/main.rs")));
-        assert!(is_watch_relevant(Path::new("src/server/mod.rs")));
-        assert!(is_watch_relevant(Path::new(
-            "/abs/agent-of-empires/src/tui/app.rs"
-        )));
-    }
-
-    #[test]
-    fn cargo_manifests_are_relevant() {
-        assert!(is_watch_relevant(Path::new("Cargo.toml")));
-        assert!(is_watch_relevant(Path::new("./Cargo.lock")));
-        assert!(is_watch_relevant(Path::new("/abs/repo/Cargo.toml")));
-    }
-
-    #[test]
-    fn unrelated_paths_are_ignored() {
-        assert!(!is_watch_relevant(Path::new("README.md")));
-        assert!(!is_watch_relevant(Path::new("target/debug/aoe")));
-        assert!(!is_watch_relevant(Path::new(".git/index")));
-        assert!(!is_watch_relevant(Path::new("Cargo.toml.swp")));
-        assert!(!is_watch_relevant(Path::new("web/src/App.tsx")));
+    fn only_rust_sources_and_cargo_manifests_trigger_a_rebuild() {
+        for relevant in [
+            "src/main.rs",
+            "src/server/mod.rs",
+            "/abs/agent-of-empires/src/tui/app.rs",
+            "Cargo.toml",
+            "./Cargo.lock",
+            "/abs/repo/Cargo.toml",
+        ] {
+            assert!(is_watch_relevant(Path::new(relevant)), "{relevant}");
+        }
+        for ignored in [
+            "README.md",
+            "target/debug/aoe",
+            ".git/index",
+            "Cargo.toml.swp",
+            "web/src/App.tsx",
+        ] {
+            assert!(!is_watch_relevant(Path::new(ignored)), "{ignored}");
+        }
     }
 }

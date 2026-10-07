@@ -1,25 +1,20 @@
 //! Single source of truth for home-view action keybindings.
 //!
-//! Every relocatable action (one that binds to a different chord in strict vs
-//! non-strict mode) is declared exactly once in [`BINDINGS`]. The dispatcher
-//! ([`resolve`]), the command palette, and the help overlay all derive from
-//! this table, so a binding can no longer drift between those surfaces.
+//! Every relocatable action (one that binds to a different chord in strict vs non-strict
+//! mode) is declared once in [`BINDINGS`], and the dispatcher ([`resolve`]), the command
+//! palette and the help overlay all derive from that table, so a binding cannot drift
+//! between surfaces.
 //!
-//! Pure navigation keys (arrows, `j`/`k`/`h`/`l`, Home/End, PageUp/Down,
-//! `{`/`}`, `<`/`>`, Enter, Tab) are NOT here: they never relocate between
-//! modes and were never the source of the strict-mode bugs. They stay as
-//! explicit arms in `dispatch_action_key`, tried after this table.
+//! Pure navigation keys (arrows, `j`/`k`/`h`/`l`, Home/End, PageUp/Down, `{`/`}`, `<`/`>`,
+//! Enter, Tab) are not here: they never relocate, so they stay as explicit arms in
+//! `dispatch_action_key`, tried after this table.
 //!
 //! ## Strict-mode relocation rule
 //!
-//! In strict mode bare lowercase letters are reserved for the typing-guard, so
-//! actions move under a modifier. The consistent rule, applied uniformly:
-//!   - the bare-lowercase (primary) action  -> `Shift`+letter
-//!   - the `Shift`+letter (secondary) action -> `Ctrl`+letter
-//!
-//! e.g. `d`=delete / `Shift+D`=diff (non-strict) become `Shift+D`=delete /
-//! `Ctrl+D`=diff (strict). `p`=projects / `Shift+P`=profiles likewise become
-//! `Shift+P`=projects / `Ctrl+P`=profiles.
+//! Strict mode reserves bare lowercase letters for the typing-guard, so each action moves
+//! under a modifier: the bare-lowercase action to `Shift`+letter, and the `Shift`+letter
+//! action to `Ctrl`+letter. So `d`=delete / `Shift+D`=diff become `Shift+D`=delete /
+//! `Ctrl+D`=diff, and `p`/`Shift+P` likewise.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -56,13 +51,21 @@ pub enum ActionId {
     Update,
     ToggleArchive,
     ToggleFavorite,
+    MoveRowUp,
+    MoveRowDown,
+    JumpPrevFinished,
+    JumpNextFinished,
     ToggleSnooze,
-    /// Toggle the selected session's unread marker (read -> manual-unread;
-    /// unread -> read). Gated behind the `session.unread_indicator` config
-    /// toggle (on by default); a no-op when disabled.
+    /// Toggle the selected session's unread marker. Gated behind
+    /// `session.unread_indicator` (on by default); a no-op when disabled.
     ToggleUnread,
     ToggleContainer,
     TogglePreviewInfo,
+    /// Toggle the system diagnostics strip (CPU and memory pressure plus agent and
+    /// process counts). Persisted via `session.show_diagnostics_pane`.
+    ToggleDiagnostics,
+    /// Open the read-only host and running-agent resource view.
+    OpenSystemHealth,
     SortPicker,
     GroupBy,
     NextWaiting,
@@ -70,38 +73,36 @@ pub enum ActionId {
     Plugins,
     /// Open the skills manager (palette only; no default chord).
     Skills,
-    /// Pin or unpin the selected project header (project view only). Pinning
-    /// registers the repo so the project persists in the view without any
-    /// sessions; unpinning removes the registry entry.
+    /// Pin or unpin the selected project header (project view only): pinning registers
+    /// the repo so the project persists without sessions, unpinning removes the entry.
     ToggleProjectPin,
-    /// Open the tips overlay (the browsable list from `crate::tips`). Has no
-    /// global hotkey on purpose; reached from the command palette, the tips
-    /// badge, and the `?` help screen, so it doesn't consume a scarce key.
+    /// Open the tips overlay from `crate::tips`. No global hotkey on purpose: it is
+    /// reached from the palette, the badge and the `?` screen, so it costs no key.
     Tips,
     /// Fork the selected session into a new independent session that resumes
     /// its conversation context (palette + context menu only; no chord).
     Fork,
-    /// Run the agent-driven "Auto-name now" one-shot for the selected
-    /// still-default-named session, on demand and even when auto-rename-on-start
-    /// is disabled (#3039). Terminal sessions rename locally; structured
-    /// sessions go through the daemon.
+    /// Run the agent-driven "Auto-name now" one-shot for the selected still-default-named
+    /// session, even when auto-rename-on-start is off (#3039). Terminal sessions rename
+    /// locally; structured sessions go through the daemon.
     AutoName,
 }
 
-/// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
-/// the uppercase letter `code` (terminals deliver `Shift+d` as `Char('D')`,
-/// and iOS Mosh delivers a bare uppercase keycode with no Shift modifier, so
-/// matching on the uppercase code rather than a Shift flag covers both).
+/// A single chord. `ctrl` requires the Control modifier; Shift is implicit in the
+/// uppercase `code`, since terminals deliver `Shift+d` as `Char('D')` and iOS Mosh
+/// delivers a bare uppercase keycode with no Shift modifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chord {
     pub code: KeyCode,
     pub ctrl: bool,
+    pub alt: bool,
 }
 
 const fn k(c: char) -> Chord {
     Chord {
         code: KeyCode::Char(c),
         ctrl: false,
+        alt: false,
     }
 }
 
@@ -109,6 +110,7 @@ const fn ctrl(c: char) -> Chord {
     Chord {
         code: KeyCode::Char(c),
         ctrl: true,
+        alt: false,
     }
 }
 
@@ -116,6 +118,23 @@ const fn f(n: u8) -> Chord {
     Chord {
         code: KeyCode::F(n),
         ctrl: false,
+        alt: false,
+    }
+}
+
+const fn ctrl_code(code: KeyCode) -> Chord {
+    Chord {
+        code,
+        ctrl: true,
+        alt: false,
+    }
+}
+
+const fn alt_code(code: KeyCode) -> Chord {
+    Chord {
+        code,
+        ctrl: false,
+        alt: true,
     }
 }
 
@@ -125,18 +144,20 @@ pub enum Context {
     Always,
     TerminalView,
     AttentionSort,
-    /// Favorites are actionable: either the Attention sort is active, where
-    /// favorite is a within-tier tiebreak, or `session.favorites_first` is on,
-    /// where it pins in every sort order. With neither, toggling a favorite
-    /// would have no visible effect, so the key stays inert.
+    /// Favorites are actionable when the Attention sort is active (favorite is a
+    /// within-tier tiebreak) or `session.favorites_first` is on (it pins in every sort).
+    /// With neither, toggling would have no visible effect, so the key stays inert.
     FavoritesUsable,
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
     ProjectGroupSelected,
-    /// The unread-session feature is enabled (`session.unread_indicator`). When
-    /// off, the binding is removed from dispatch so the key isn't swallowed by
-    /// a dead action; help and the command palette skip it separately.
+    /// The unread-session feature is enabled (`session.unread_indicator`). When off the
+    /// binding leaves dispatch so the key isn't swallowed by a dead action; help and the
+    /// palette skip it separately.
     UnreadEnabled,
+    /// Rows can be arranged by hand. Under a computed sort the action still resolves, so
+    /// the keys are not silently swallowed by cursor movement: it explains itself instead.
+    CustomSortable,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -157,8 +178,6 @@ pub struct PaletteMeta {
     pub title: &'static str,
     pub keywords: &'static [&'static str],
     pub group: PaletteGroup,
-    /// Only included when the `serve` feature is on (just the Serve command).
-    pub serve_only: bool,
 }
 
 pub struct Binding {
@@ -181,11 +200,12 @@ pub struct Ctx {
 }
 
 fn chord_matches(c: &Chord, key: &KeyEvent) -> bool {
-    // Match the Ctrl modifier exactly: a non-ctrl chord must NOT fire when
-    // Ctrl is held. Otherwise `k('q')` would also match Ctrl+Q (reserved for
-    // exiting live-send mode, #1569) and `k('d')` would match Ctrl+D, letting
-    // a modified chord trigger a bare-letter action.
-    key.code == c.code && key.modifiers.contains(KeyModifiers::CONTROL) == c.ctrl
+    // Match the Ctrl modifier exactly, or `k('q')` would also match Ctrl+Q (reserved for
+    // exiting live-send, #1569) and `k('d')` would match Ctrl+D, letting a modified chord
+    // trigger a bare-letter action.
+    key.code == c.code
+        && key.modifiers.contains(KeyModifiers::CONTROL) == c.ctrl
+        && key.modifiers.contains(KeyModifiers::ALT) == c.alt
 }
 
 fn context_holds(context: Context, ctx: &Ctx) -> bool {
@@ -199,12 +219,13 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
+        Context::CustomSortable => true,
     }
 }
 
-/// Resolve a key event to an action, honoring strict mode and context guards.
-/// Returns the first matching binding in table order; context-guarded entries
-/// are listed before the unguarded entries that share their chord.
+/// Resolve a key event to an action, honoring strict mode and context guards. Returns the
+/// first match in table order; context-guarded entries are listed before the unguarded
+/// entries sharing their chord.
 pub fn resolve(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ActionId> {
     for b in BINDINGS {
         let chords = if strict { b.strict } else { b.non_strict };
@@ -215,10 +236,10 @@ pub fn resolve(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ActionId> {
     None
 }
 
-/// A plugin-contributed action a key resolved to: a plugin id plus the command
-/// the keybind targets. At Tier 0 there is no executor, so resolving one is
-/// inspectable (and surfaces a "needs runtime" notice) but not yet runnable;
-/// the executor lands with the runtime host (#2095).
+/// A plugin-contributed action a key resolved to: a plugin id plus the command the keybind
+/// targets. At Tier 0 there is no executor, so resolving one is inspectable (and surfaces a
+/// "needs runtime" notice) but not runnable; the executor lands with the runtime host
+/// (#2095).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginAction {
     pub plugin_id: String,
@@ -226,10 +247,8 @@ pub struct PluginAction {
 }
 
 impl PluginAction {
-    /// Canonical external name, `plugin.<id>.<action>`. Idempotent: a manifest
-    /// keybind may already target a fully-qualified `plugin.<id>.<cmd>` command,
-    /// so an action that is already canonical is returned unchanged rather than
-    /// double-prefixed.
+    /// Canonical external name, `plugin.<id>.<action>`. Idempotent: a manifest keybind may
+    /// already target a fully-qualified command, which is returned unchanged.
     pub fn canonical(&self) -> String {
         if self.action.starts_with("plugin.") {
             return self.action.clone();
@@ -246,10 +265,9 @@ pub enum ResolvedAction {
     Plugin(PluginAction),
 }
 
-/// Resolve a key across the merged core + plugin binding tables. Core bindings
-/// (the static [`BINDINGS`] table, honoring strict mode and context) are tried
-/// first and always win; only then are active plugins' declared keybinds
-/// consulted. Returns `None` if nothing claims the chord.
+/// Resolve a key across the merged core and plugin binding tables. Core bindings (the
+/// static [`BINDINGS`], honoring strict mode and context) are tried first and always win;
+/// only then are active plugins' keybinds consulted. `None` if nothing claims the chord.
 pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ResolvedAction> {
     if let Some(id) = resolve(key, strict, ctx) {
         return Some(ResolvedAction::Core(id));
@@ -262,23 +280,19 @@ pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<Resolve
     None
 }
 
-/// Whether a plugin-declared keybind string (e.g. `Ctrl+Shift+G`) matches this
-/// key event. The structured view resolves daemon-provided command keybinds
-/// through this rather than the local registry, so it parses the raw chord
-/// string here. A chord string that does not parse never matches.
+/// Whether a plugin-declared keybind string (`Ctrl+Shift+G`) matches this key event. The
+/// structured view resolves daemon-provided command keybinds through this rather than the
+/// local registry, so it parses the raw chord string here; an unparseable string never
+/// matches.
 ///
-/// Only the structured view (serve-gated) executes plugin commands, so this is
-/// unused in a bare-core build; gate it to avoid a dead-code warning there.
-#[cfg(feature = "serve")]
 pub fn keybind_matches(key_str: &str, key: &KeyEvent) -> bool {
     parse_chord(key_str).is_some_and(|chord| chord_matches(&chord, key))
 }
 
-/// The active plugins' declared keybinds, parsed into `(chord, action)`. A
-/// keybind whose key string does not parse is skipped (its conflict-free state
-/// is surfaced by `aoe plugin info`).
-// ponytail: rebuilt per unmatched keypress; the active set is tiny and this is
-// not a hot path. Cache behind the registry generation if that ever changes.
+/// The active plugins' declared keybinds, parsed into `(chord, action)`. A keybind whose
+/// key string does not parse is skipped; `aoe plugin info` surfaces its state.
+// ponytail: rebuilt per unmatched keypress; the active set is tiny and this is not a hot
+// path. Cache behind the registry generation if that ever changes.
 fn plugin_bindings() -> Vec<(Chord, PluginAction)> {
     let mut out = Vec::new();
     for p in crate::plugin::registry().active() {
@@ -297,9 +311,8 @@ fn plugin_bindings() -> Vec<(Chord, PluginAction)> {
     out
 }
 
-/// Parse a key-chord string like `Ctrl+K`, `Shift+D`, `F5`, or `q` into a
-/// [`Chord`]. Supports `Ctrl`/`Shift` modifiers, single characters, and
-/// function keys. Returns `None` for anything else.
+/// Parse a key-chord string like `Ctrl+K`, `Shift+D`, `F5` or `q` into a [`Chord`],
+/// supporting `Ctrl`/`Shift`, single characters and function keys. `None` otherwise.
 pub fn parse_chord(s: &str) -> Option<Chord> {
     let mut ctrl = false;
     let mut shift = false;
@@ -308,9 +321,9 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
         match tok.to_ascii_lowercase().as_str() {
             "ctrl" | "control" => ctrl = true,
             "shift" => shift = true,
-            // Unsupported modifiers and a second key token are rejected rather
-            // than silently remapped: `Alt+K` must not collapse to a bare `k`
-            // that hijacks core navigation.
+            // Unsupported modifiers and a second key token are rejected rather than
+            // silently remapped: `Alt+K` must not collapse to a bare `k` that hijacks core
+            // navigation.
             "alt" | "option" | "meta" | "super" | "cmd" => return None,
             _ if key.is_none() => key = Some(tok),
             _ => return None,
@@ -318,9 +331,9 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
     }
     let key = key?;
     let code = if key.len() == 1 {
-        // Match the table's convention: bare letters are lowercase chars, Shift
-        // is encoded as the uppercase char (terminals deliver Ctrl+k as a
-        // lowercase Char with the CONTROL modifier, Shift+d as Char('D')).
+        // Match the table's convention: bare letters are lowercase chars and Shift is the
+        // uppercase char, since terminals deliver Ctrl+k as a lowercase Char with the
+        // CONTROL modifier and Shift+d as Char('D').
         let c = key.chars().next().unwrap();
         let c = if shift {
             c.to_ascii_uppercase()
@@ -334,7 +347,11 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
             .and_then(|n| n.parse::<u8>().ok())?;
         KeyCode::F(n)
     };
-    Some(Chord { code, ctrl })
+    Some(Chord {
+        code,
+        ctrl,
+        alt: false,
+    })
 }
 
 /// Whether a core binding already claims `chord` in either mode. Used by
@@ -348,9 +365,8 @@ pub fn core_shadows(chord: &Chord) -> bool {
     })
 }
 
-/// Human-readable label for a binding's primary chord in the given mode, e.g.
-/// `"D"`, `"Ctrl+D"`, `"F5"`. Returns `""` if the action has no binding in the
-/// requested mode (e.g. `NextWaiting` in strict).
+/// Human-readable label for a binding's primary chord in the given mode (`"D"`, `"Ctrl+D"`,
+/// `"F5"`), or `""` when the action has no binding in that mode.
 pub fn label(id: ActionId, strict: bool) -> String {
     let Some(b) = BINDINGS.iter().find(|b| b.id == id) else {
         return String::new();
@@ -360,11 +376,23 @@ pub fn label(id: ActionId, strict: bool) -> String {
 }
 
 fn format_chord(c: &Chord) -> String {
-    match c.code {
-        KeyCode::Char(ch) if c.ctrl => format!("Ctrl+{}", ch.to_ascii_uppercase()),
-        KeyCode::Char(ch) => ch.to_string(),
+    let key = match c.code {
+        KeyCode::Char(ch) => ch.to_ascii_uppercase().to_string(),
         KeyCode::F(n) => format!("F{n}"),
-        _ => String::new(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        _ => return String::new(),
+    };
+    // A bare letter keeps its lone-character form; every modified chord is spelled out, or
+    // the help overlay and the palette show the new arrow bindings with no key at all.
+    match (c.ctrl, c.alt, c.code) {
+        (false, false, KeyCode::Char(ch)) => ch.to_string(),
+        (true, true, _) => format!("Ctrl+Alt+{key}"),
+        (true, false, _) => format!("Ctrl+{key}"),
+        (false, true, _) => format!("Alt+{key}"),
+        (false, false, _) => key,
     }
 }
 
@@ -372,9 +400,9 @@ fn format_chord(c: &Chord) -> String {
 // one (search-cycle vs new, etc.) come first so they win when their guard holds.
 pub static BINDINGS: &[Binding] = &[
     // --- search cycle (only while matches are active; both modes) ---
-    // Only bare `n` cycles (forward, wrapping). `N`/Shift+N stays a new-session
-    // key in every state so a committed search never shadows it (#3038); the
-    // forward wrap keeps every match reachable, so there is no reverse binding.
+    // Only bare `n` cycles, forward and wrapping, so every match stays reachable with no
+    // reverse binding; `N` stays a new-session key in every state so a committed search
+    // never shadows it (#3038).
     Binding {
         id: ActionId::SearchNext,
         non_strict: &[k('n')],
@@ -382,6 +410,67 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::SearchActive,
         help: None,
         palette: None,
+    },
+    // --- manual row ordering (Custom sort) ---
+    Binding {
+        id: ActionId::MoveRowUp,
+        non_strict: &[ctrl_code(KeyCode::Up)],
+        strict: &[ctrl_code(KeyCode::Up)],
+        context: Context::CustomSortable,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Move row up (Custom sort)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Move row up",
+            keywords: &["order", "reorder", "move", "up"],
+            group: PaletteGroup::Actions,
+        }),
+    },
+    Binding {
+        id: ActionId::MoveRowDown,
+        non_strict: &[ctrl_code(KeyCode::Down)],
+        strict: &[ctrl_code(KeyCode::Down)],
+        context: Context::CustomSortable,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Move row down (Custom sort)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Move row down",
+            keywords: &["order", "reorder", "move", "down"],
+            group: PaletteGroup::Actions,
+        }),
+    },
+    Binding {
+        id: ActionId::JumpPrevFinished,
+        non_strict: &[alt_code(KeyCode::Up)],
+        strict: &[alt_code(KeyCode::Up)],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Attention,
+            desc: "Previous just-finished session",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Previous just-finished session",
+            keywords: &["finished", "done", "idle", "jump", "prev"],
+            group: PaletteGroup::Actions,
+        }),
+    },
+    Binding {
+        id: ActionId::JumpNextFinished,
+        non_strict: &[alt_code(KeyCode::Down)],
+        strict: &[alt_code(KeyCode::Down)],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Attention,
+            desc: "Next just-finished session",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Next just-finished session",
+            keywords: &["finished", "done", "idle", "jump", "next"],
+            group: PaletteGroup::Actions,
+        }),
     },
     // --- attention-sort triage ---
     Binding {
@@ -397,7 +486,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle favorite",
             keywords: &["star", "pin", "fav"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -413,7 +501,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle snooze",
             keywords: &["later", "defer", "wait"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     // --- terminal-view only ---
@@ -453,7 +540,30 @@ pub static BINDINGS: &[Binding] = &[
             title: "Show keyboard shortcuts",
             keywords: &["keys", "shortcuts"],
             group: PaletteGroup::Settings,
-            serve_only: false,
+        }),
+    },
+    Binding {
+        id: ActionId::ToggleDiagnostics,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Toggle system health strip",
+            keywords: &["system", "health", "memory", "cpu", "pressure"],
+            group: PaletteGroup::Settings,
+        }),
+    },
+    Binding {
+        id: ActionId::OpenSystemHealth,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Open System Health",
+            keywords: &["system", "health", "memory", "cpu", "agents", "processes"],
+            group: PaletteGroup::Views,
         }),
     },
     Binding {
@@ -491,7 +601,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "New session",
             keywords: &["create", "add", "spawn"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -507,7 +616,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "New session from selection",
             keywords: &["create", "duplicate", "clone"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     // New session from a saved project. Follows the bare->Shift relocation
@@ -525,7 +633,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "New session from saved project",
             keywords: &["project", "saved", "registry", "create"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -541,7 +648,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Attach to paired terminal",
             keywords: &["shell", "host"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -557,7 +663,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle Agent / Terminal view",
             keywords: &["switch", "shell"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -573,7 +678,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Send message to agent",
             keywords: &["prompt", "tell", "say"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -589,7 +693,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Respond to permission prompt",
             keywords: &["allow", "deny", "approve", "permission"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -605,7 +708,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Stop session / kill terminal",
             keywords: &["kill", "end", "halt", "terminal"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -621,7 +723,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Delete session or group",
             keywords: &["remove", "trash"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -637,7 +738,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Rename or move to group",
             keywords: &["title", "label", "move", "regroup"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -653,7 +753,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Edit worktree workdir name",
             keywords: &["worktree", "workdir", "directory", "branch", "rename"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -671,7 +770,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Add project to this session",
             keywords: &["repo", "attach", "worktree", "multi-repo", "workspace"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -687,7 +785,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Open diff view",
             keywords: &["git", "changes"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -703,7 +800,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Open serve (LAN / Tunnel)",
             keywords: &["web", "remote", "phone", "tunnel"],
             group: PaletteGroup::Settings,
-            serve_only: true,
         }),
     },
     Binding {
@@ -719,16 +815,12 @@ pub static BINDINGS: &[Binding] = &[
             title: "Open settings",
             keywords: &["preferences", "config"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
-    // Pin toggle shares `p` (Shift+P in strict) with Projects, but only fires
-    // when a project header is selected, so it must precede the Projects
-    // binding. On a project header `p` pins/unpins; everywhere else `p` still
-    // opens the projects dialog. The help desc names that gate ("group header
-    // only", the same idiom the Attention section uses) because the `?` overlay
-    // has no notion of context and lists both `p` rows unconditionally, which
-    // is what made the shared key look ambiguous in #3133.
+    // Pin toggle shares `p` (Shift+P in strict) with Projects but fires only on a project
+    // header, so it must precede the Projects binding. The help desc names that gate
+    // ("group header only") because the `?` overlay has no notion of context and lists both
+    // `p` rows unconditionally, which is what made the shared key look ambiguous in #3133.
     Binding {
         id: ActionId::ToggleProjectPin,
         non_strict: &[k('p')],
@@ -755,7 +847,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Manage projects",
             keywords: &["registry", "repos", "multi-repo", "workspace"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     Binding {
@@ -771,7 +862,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Switch profile",
             keywords: &["account", "switch"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     Binding {
@@ -787,15 +877,11 @@ pub static BINDINGS: &[Binding] = &[
             title: "Restart session",
             keywords: &["reload", "respawn", "reset"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
-    // `U` toggles read/unread, pinned to Shift+u in BOTH modes (matches the
-    // macOS Mail "mark unread" muscle memory and keeps the key stable). It does
-    // NOT participate in the strict relocation: `U` is already a modified key,
-    // so it satisfies strict mode's "no bare action letters" rule as-is.
-    // `u` updates (when available) and relocates the usual way: bare `u` in
-    // non-strict, `Ctrl+u` in strict.
+    // `U` toggles read/unread, pinned to Shift+u in both modes (matching macOS Mail muscle
+    // memory). It does not relocate under strict mode: a modified key already satisfies the
+    // "no bare action letters" rule. `u` updates and relocates the usual way.
     Binding {
         id: ActionId::ToggleUnread,
         non_strict: &[k('U')],
@@ -809,7 +895,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle read/unread",
             keywords: &["read", "unread", "seen", "flag", "viewed"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -836,7 +921,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle archive",
             keywords: &["park", "stash", "done", "zzz"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -852,7 +936,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle preview info header",
             keywords: &["hide", "show", "info", "header", "preview"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -869,7 +952,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Sort order",
             keywords: &["order", "sort", "pick"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -885,7 +967,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Group by",
             keywords: &["group", "project", "pick"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -901,13 +982,11 @@ pub static BINDINGS: &[Binding] = &[
             title: "Jump to next waiting / idle session",
             keywords: &["jump", "next", "waiting", "idle"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
-    // Tips overlay. No key chords: it's reached from the palette, the badge,
-    // and the `?` help screen, so it never shadows a typing-guard key. `help`
-    // is None because the help overlay skips keyless rows; it gets a bespoke
-    // row in `components/help.rs` instead.
+    // Tips overlay. No key chords: it is reached from the palette, the badge and the `?`
+    // screen, so it never shadows a typing-guard key. `help` is None because the overlay
+    // skips keyless rows and gives it a bespoke row in `components/help.rs`.
     Binding {
         id: ActionId::Tips,
         non_strict: &[],
@@ -918,7 +997,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Show tips",
             keywords: &["tips", "hints", "learn", "discover", "did you know"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     // Palette-only: no default chord in either mode; the manager opens from
@@ -933,7 +1011,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Manage plugins",
             keywords: &["plugin", "extension", "enable", "disable"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     // Palette-only: no default chord in either mode; the manager opens from
@@ -948,12 +1025,11 @@ pub static BINDINGS: &[Binding] = &[
             title: "Manage skills",
             keywords: &["skill", "skills", "prompt"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
-    // Palette-only: Shift+F collides with strict-mode ToggleFavorite under
-    // Attention sort and the home keyspace is saturated, so fork is reached
-    // from the command palette and the context menu only.
+    // Palette-only: Shift+F collides with strict-mode ToggleFavorite under Attention sort
+    // and the home keyspace is saturated, so fork is reached from the palette and the
+    // context menu.
     Binding {
         id: ActionId::Fork,
         non_strict: &[],
@@ -964,12 +1040,11 @@ pub static BINDINGS: &[Binding] = &[
             title: "Fork session (resume context, diverge)",
             keywords: &["fork", "branch", "duplicate", "clone", "context", "resume"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
-    // The mnemonic keys (a/A, n/N, r/R, t/T) are all taken and the home
-    // keyspace is saturated (see Fork above), so "Auto-name now" lands on the
-    // free v/V pair. Gated to a still-default-named session inside the handler.
+    // The mnemonic keys (a/A, n/N, r/R, t/T) are taken and the home keyspace is saturated
+    // (see Fork), so "Auto-name now" lands on the free v/V pair. Gated to a
+    // still-default-named session inside the handler.
     Binding {
         id: ActionId::AutoName,
         non_strict: &[k('v')],
@@ -983,7 +1058,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Auto-name now",
             keywords: &["rename", "title", "name", "auto", "smart", "generate"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
 ];
@@ -1012,9 +1086,15 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Restart => "restart",
         ActionId::ToggleArchive => "archive",
         ActionId::ToggleFavorite => "favorite",
+        ActionId::MoveRowUp => "move row up",
+        ActionId::MoveRowDown => "move row down",
+        ActionId::JumpPrevFinished => "previous working or just-finished session",
+        ActionId::JumpNextFinished => "next working or just-finished session",
         ActionId::ToggleSnooze => "snooze",
         ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
+        ActionId::ToggleDiagnostics => "toggle-diagnostics",
+        ActionId::OpenSystemHealth => "open-system-health",
         ActionId::SortPicker => "pick-sort",
         ActionId::GroupBy => "pick-group-by",
         ActionId::Help => "help",
@@ -1055,110 +1135,44 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    /// Serial: the favorites-first gate is a process-wide flag, so a parallel
-    /// test that applies config would race with these.
     #[test]
-    #[serial_test::serial]
-    fn favorite_key_follows_favorites_first_outside_attention() {
-        let original = crate::session::favorites_first();
-        let c = ctx();
-        assert_eq!(
-            c.sort_order,
-            SortOrder::Newest,
-            "precondition: not Attention"
-        );
-
-        crate::session::set_favorites_first(true);
-        assert_eq!(
-            resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite),
-            "favorites-first on: 'f' must work outside the Attention sort"
-        );
-
-        crate::session::set_favorites_first(false);
-        assert_ne!(
-            resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite),
-            "favorites-first off: 'f' stays inert outside the Attention sort"
-        );
-
-        crate::session::set_favorites_first(original);
+    fn parse_chord_accepts_ctrl_or_bare_keys_only() {
+        let chord = |code, ctrl| {
+            Some(Chord {
+                code,
+                ctrl,
+                alt: false,
+            })
+        };
+        let cases = [
+            ("Ctrl+K", chord(KeyCode::Char('k'), true)),
+            ("Shift+D", chord(KeyCode::Char('D'), false)),
+            ("q", chord(KeyCode::Char('q'), false)),
+            ("F5", chord(KeyCode::F(5), false)),
+            ("", None),
+            ("Ctrl+", None),
+            // Unknown modifiers must not collapse to a bare key that hijacks core
+            // navigation, and a chord may carry at most one key token.
+            ("Alt+K", None),
+            ("Ctrl+Alt+K", None),
+            ("Ctrl+K+J", None),
+            ("Meta+K", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(parse_chord(input), want, "{input:?}");
+        }
     }
 
     #[test]
-    #[serial_test::serial]
-    fn favorite_key_resolves_in_attention_sort_even_with_flag_off() {
-        let original = crate::session::favorites_first();
-        crate::session::set_favorites_first(false);
-
-        let mut c = ctx();
-        c.sort_order = SortOrder::Attention;
-        assert_eq!(
-            resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite)
-        );
-
-        crate::session::set_favorites_first(original);
-    }
-
-    #[test]
-    fn parse_chord_handles_modifiers_and_keys() {
-        assert_eq!(
-            parse_chord("Ctrl+K"),
-            Some(Chord {
-                code: KeyCode::Char('k'),
-                ctrl: true
-            })
-        );
-        assert_eq!(
-            parse_chord("Shift+D"),
-            Some(Chord {
-                code: KeyCode::Char('D'),
-                ctrl: false
-            })
-        );
-        assert_eq!(
-            parse_chord("q"),
-            Some(Chord {
-                code: KeyCode::Char('q'),
-                ctrl: false
-            })
-        );
-        assert_eq!(
-            parse_chord("F5"),
-            Some(Chord {
-                code: KeyCode::F(5),
-                ctrl: false
-            })
-        );
-        assert_eq!(parse_chord(""), None);
-        assert_eq!(parse_chord("Ctrl+"), None);
-    }
-
-    #[test]
-    fn parse_chord_rejects_unsupported_and_repeated_tokens() {
-        // Unknown modifiers must not collapse to a bare key that hijacks core
-        // navigation, and a chord may carry at most one key token.
-        assert_eq!(parse_chord("Alt+K"), None);
-        assert_eq!(parse_chord("Ctrl+Alt+K"), None);
-        assert_eq!(parse_chord("Ctrl+K+J"), None);
-        assert_eq!(parse_chord("Meta+K"), None);
-    }
-
-    #[test]
-    fn core_shadows_known_core_chords() {
-        // `q` is the Quit binding; an unbound chord is not shadowed.
+    fn core_chords_shadow_and_resolve_as_core_actions() {
+        // `q` is the Quit binding; an unbound chord is neither shadowed nor resolved. With
+        // no active plugins in the test process the merged resolver wraps core actions.
         assert!(core_shadows(&parse_chord("q").unwrap()));
         assert!(!core_shadows(&Chord {
             code: KeyCode::Char('z'),
-            ctrl: true
+            ctrl: true,
+            alt: false
         }));
-    }
-
-    #[test]
-    fn resolve_action_wraps_core_bindings() {
-        // With no active plugins in the test process, the merged resolver just
-        // returns the core action, wrapped as Core.
         let c = ctx();
         assert_eq!(
             resolve_action(&key('q'), false, &c),
@@ -1183,96 +1197,55 @@ mod tests {
         assert_eq!(already.canonical(), "plugin.acme.kit.do-thing");
     }
 
+    /// Non-strict binds bare letters; strict moves the primary action to Shift+letter and
+    /// the secondary to Ctrl+letter. Unread stays on Shift+U and sort on Ctrl+O in both.
     #[test]
-    fn non_strict_resolution() {
+    fn chord_resolution_by_mode() {
         let c = ctx();
-        let cases = [
-            ('d', ActionId::Delete),
-            ('D', ActionId::Diff),
-            ('r', ActionId::Rename),
-            ('R', ActionId::Serve),
-            ('t', ActionId::ToggleView),
-            ('T', ActionId::AttachTerminal),
-            ('n', ActionId::NewSession),
-            ('N', ActionId::NewFromSelection),
-            ('p', ActionId::Projects),
-            ('P', ActionId::Profiles),
-            ('o', ActionId::SortPicker),
-            ('g', ActionId::GroupBy),
-            ('q', ActionId::Quit),
-            // `u` is Update (unread lives on Shift+U); resolves regardless of
-            // whether an update is actually available.
-            ('u', ActionId::Update),
+        let non_strict = [
+            (key('d'), ActionId::Delete),
+            (key('D'), ActionId::Diff),
+            (key('r'), ActionId::Rename),
+            (key('R'), ActionId::Serve),
+            (key('t'), ActionId::ToggleView),
+            (key('T'), ActionId::AttachTerminal),
+            (key('n'), ActionId::NewSession),
+            (key('N'), ActionId::NewFromSelection),
+            (key('p'), ActionId::Projects),
+            (key('P'), ActionId::Profiles),
+            (key('o'), ActionId::SortPicker),
+            (key('g'), ActionId::GroupBy),
+            (key('q'), ActionId::Quit),
+            // `u` is Update regardless of whether an update is available.
+            (key('u'), ActionId::Update),
+            (key('U'), ActionId::ToggleUnread),
+            (ctrl_key('o'), ActionId::SortPicker),
         ];
-        for (ch, want) in cases {
-            assert_eq!(
-                resolve(&key(ch), false, &c),
-                Some(want),
-                "non-strict '{ch}'"
-            );
-        }
-    }
-
-    #[test]
-    fn shift_u_toggles_unread_in_both_modes_and_u_updates() {
-        let c = ctx();
-        // Unread is pinned to Shift+U regardless of strict mode.
-        assert_eq!(
-            resolve(&key('U'), false, &c),
-            Some(ActionId::ToggleUnread),
-            "non-strict U = unread"
-        );
-        assert_eq!(
-            resolve(&key('U'), true, &c),
-            Some(ActionId::ToggleUnread),
-            "strict U = unread"
-        );
-        // Update relocates the usual way: bare `u` in non-strict, `Ctrl+u`
-        // in strict (and never collides with unread on `U`).
-        assert_eq!(
-            resolve(&key('u'), false, &c),
-            Some(ActionId::Update),
-            "non-strict u = update"
-        );
-        assert_eq!(
-            resolve(&ctrl_key('u'), true, &c),
-            Some(ActionId::Update),
-            "strict Ctrl+u = update"
-        );
-    }
-
-    #[test]
-    fn strict_relocation_is_consistent() {
-        let c = ctx();
-        // Shift+letter (the uppercase code) drives the primary action; the
-        // secondary action moves to Ctrl+letter. No bare lowercase action keys.
-        let shifted = [
-            ('D', ActionId::Delete),
-            ('R', ActionId::Rename),
-            ('T', ActionId::ToggleView),
-            ('N', ActionId::NewSession),
-            ('P', ActionId::Projects),
-            ('O', ActionId::SortPicker),
-            ('U', ActionId::ToggleUnread),
+        let strict = [
+            (key('D'), ActionId::Delete),
+            (key('R'), ActionId::Rename),
+            (key('T'), ActionId::ToggleView),
+            (key('N'), ActionId::NewSession),
+            (key('P'), ActionId::Projects),
+            (key('O'), ActionId::SortPicker),
+            (key('U'), ActionId::ToggleUnread),
+            (ctrl_key('d'), ActionId::Diff),
+            (ctrl_key('r'), ActionId::Serve),
+            (ctrl_key('t'), ActionId::AttachTerminal),
+            (ctrl_key('n'), ActionId::NewFromSelection),
+            (ctrl_key('p'), ActionId::Profiles),
+            (ctrl_key('g'), ActionId::GroupBy),
+            (ctrl_key('u'), ActionId::Update),
+            (ctrl_key('o'), ActionId::SortPicker),
         ];
-        for (ch, want) in shifted {
-            assert_eq!(resolve(&key(ch), true, &c), Some(want), "strict '{ch}'");
-        }
-        let ctrled = [
-            ('d', ActionId::Diff),
-            ('r', ActionId::Serve),
-            ('t', ActionId::AttachTerminal),
-            ('n', ActionId::NewFromSelection),
-            ('p', ActionId::Profiles),
-            ('g', ActionId::GroupBy),
-            ('u', ActionId::Update),
-        ];
-        for (ch, want) in ctrled {
-            assert_eq!(
-                resolve(&ctrl_key(ch), true, &c),
-                Some(want),
-                "strict Ctrl+{ch}"
-            );
+        for (strict_mode, cases) in [(false, &non_strict[..]), (true, &strict[..])] {
+            for (event, want) in cases {
+                assert_eq!(
+                    resolve(event, strict_mode, &c),
+                    Some(*want),
+                    "strict={strict_mode} {event:?}"
+                );
+            }
         }
     }
 
@@ -1287,9 +1260,8 @@ mod tests {
         }
     }
 
-    // #3038: a committed search must never shadow Shift+N. Only bare `n` cycles
-    // (forward); every `N`/Shift+N chord stays a new-session action whether or
-    // not a search is committed.
+    // #3038: a committed search must never shadow Shift+N. Only bare `n` cycles; every
+    // `N` chord stays a new-session action.
     #[test]
     fn committed_search_cycles_n_but_never_shadows_shift_new_session() {
         let mut c = ctx();
@@ -1323,17 +1295,21 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn context_guards_gate_attention_and_terminal_actions() {
-        // Snooze only resolves in the Attention sort. Favorite resolves there
-        // too, but it has a second opening (`session.favorites_first`), so pin
-        // that off to isolate the Attention-only half of its guard; the flag
-        // itself is covered by
-        // `favorite_key_follows_favorites_first_outside_attention`.
+        // Snooze resolves only in the Attention sort. Favorite resolves there regardless
+        // of `session.favorites_first`, which only opens it outside Attention.
         let original = crate::session::favorites_first();
         crate::session::set_favorites_first(false);
 
         let mut c = ctx();
         assert_eq!(resolve(&key('f'), false, &c), None);
         assert_eq!(resolve(&key('h'), false, &c), None);
+        crate::session::set_favorites_first(true);
+        assert_eq!(
+            resolve(&key('f'), false, &c),
+            Some(ActionId::ToggleFavorite),
+            "favorites-first on: 'f' must work outside the Attention sort"
+        );
+        crate::session::set_favorites_first(false);
         c.sort_order = SortOrder::Attention;
         assert_eq!(
             resolve(&key('f'), false, &c),
@@ -1354,28 +1330,21 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_sorts_in_both_modes() {
+    fn system_health_actions_are_palette_only() {
         let c = ctx();
+        let f9 = KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE);
+        assert_ne!(resolve(&f9, false, &c), Some(ActionId::ToggleDiagnostics));
         assert_eq!(
-            resolve(&ctrl_key('o'), false, &c),
-            Some(ActionId::SortPicker)
+            palette_id(ActionId::ToggleDiagnostics),
+            "toggle-diagnostics"
         );
-        assert_eq!(
-            resolve(&ctrl_key('o'), true, &c),
-            Some(ActionId::SortPicker)
-        );
-    }
-
-    #[test]
-    fn fork_is_palette_only_no_chord() {
-        let c = ctx();
-        // No chord resolves to Fork in either mode (palette-only, like Plugins).
-        for ch in ['f', 'F'] {
-            assert_ne!(resolve(&key(ch), false, &c), Some(ActionId::Fork));
-            assert_ne!(resolve(&key(ch), true, &c), Some(ActionId::Fork));
+        assert_eq!(palette_id(ActionId::OpenSystemHealth), "open-system-health");
+        for action in [ActionId::ToggleDiagnostics, ActionId::OpenSystemHealth] {
+            let binding = BINDINGS.iter().find(|b| b.id == action).unwrap();
+            assert!(binding.non_strict.is_empty() && binding.strict.is_empty());
+            assert!(binding.help.is_none());
+            assert!(binding.palette.is_some());
         }
-        // Fork has a stable palette id.
-        assert_eq!(palette_id(ActionId::Fork), "fork");
     }
 
     #[test]
@@ -1391,12 +1360,11 @@ mod tests {
         assert_eq!(label(ActionId::NextWaiting, true), "");
     }
 
-    /// The `?` overlay renders one row per help-listed binding and never
-    /// consults `Context`, so two bindings sharing a chord show the same key
-    /// twice (#3133: `p` for the pin toggle and `p` for the projects dialog).
-    /// The convention that keeps that readable is that the guarded one states
-    /// when it applies. Enforced here rather than by asserting a desc string,
-    /// so it also catches a future guarded binding added onto a shared chord.
+    /// The `?` overlay renders one row per help-listed binding and never consults
+    /// `Context`, so two bindings sharing a chord show the same key twice (#3133). The
+    /// convention that keeps it readable is that the guarded one states when it applies,
+    /// enforced here rather than by asserting a desc string, so a future guarded binding on
+    /// a shared chord is caught too.
     #[test]
     fn shared_help_chords_document_their_guard() {
         // A qualifier the desc can use to say when the guarded action fires.
@@ -1421,5 +1389,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Modified chords spell out their key: without this the arrow bindings reach help and
+    /// the palette with an empty label, which is how they were invisible when first added.
+    #[test]
+    fn modified_chords_render_a_visible_key_label() {
+        for (id, expected) in [
+            (ActionId::MoveRowUp, "Ctrl+Up"),
+            (ActionId::MoveRowDown, "Ctrl+Down"),
+            (ActionId::JumpPrevFinished, "Alt+Up"),
+            (ActionId::JumpNextFinished, "Alt+Down"),
+        ] {
+            for strict in [false, true] {
+                assert_eq!(label(id, strict), expected, "{id:?} strict={strict}");
+            }
+        }
+        assert_eq!(label(ActionId::ToggleFavorite, false), "f");
     }
 }

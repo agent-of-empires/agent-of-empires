@@ -1,10 +1,4 @@
-//! Plugin core: load the compiled-in first-party plugins and expose their
-//! enabled/disabled state to every surface (CLI, TUI, web).
-//!
-//! This is the minimal core: a registry of builtin plugins you can enable or
-//! disable. The manifest types live in the `aoe-plugin-api` crate. External
-//! installs, capability grants, and the Tier 0 / Tier 1 contribution surface
-//! return in follow-up PRs.
+//! Plugin registry, installation, contributions, discovery, and worker host.
 
 pub mod auto_update;
 pub mod changelog;
@@ -20,35 +14,19 @@ pub mod source;
 pub mod update_check;
 pub mod view;
 
-// The Tier 1 worker host runs only in the `aoe serve` daemon, where the event
-// store and session storage it serves over the capability-gated API live. A
-// TUI-only build has no host, so these modules are gated with it.
-#[cfg(feature = "serve")]
 pub(crate) mod automation_policy;
-#[cfg(feature = "serve")]
 pub mod host;
-#[cfg(feature = "serve")]
 pub mod host_api;
-#[cfg(feature = "serve")]
 pub mod protocol;
-#[cfg(feature = "serve")]
 pub mod sandbox;
-#[cfg(feature = "serve")]
 pub mod session_api;
-#[cfg(feature = "serve")]
 pub mod ui_state;
 
-// Launch resolution is pure (PATH / filesystem probing) and is shared by the
-// serve-only host and the always-present installer, which runs a plugin's
-// build steps with the same argv-resolution policy. It carries no host state,
-// so it is not gated.
 pub mod launch;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-/// Directory holding externally installed plugins, one subdir per plugin id:
-/// `<app_dir>/plugins/<id>/`.
 pub fn plugins_dir() -> anyhow::Result<PathBuf> {
     Ok(crate::session::get_app_dir()?.join("plugins"))
 }
@@ -56,10 +34,6 @@ pub fn plugins_dir() -> anyhow::Result<PathBuf> {
 pub use registry::{LoadedPlugin, PluginRegistry};
 pub use view::PluginView;
 
-/// Lock recovery for the process-wide registry slot: a panic elsewhere must
-/// not poison it and take a TUI redraw / tokio task down on the next access.
-/// Recovering via `into_inner` is correct: the held data is a rebuildable
-/// cache, not partial-mutation-sensitive state.
 pub(crate) trait RwLockSafe<T> {
     fn read_safe(&self) -> std::sync::RwLockReadGuard<'_, T>;
     fn write_safe(&self) -> std::sync::RwLockWriteGuard<'_, T>;
@@ -76,9 +50,6 @@ impl<T> RwLockSafe<T> for RwLock<T> {
 
 static REGISTRY: RwLock<Option<Arc<PluginRegistry>>> = RwLock::new(None);
 
-/// The process-wide plugin registry, loaded on first use from the global
-/// config. Surfaces that toggle a plugin call [`reload_registry`] after
-/// persisting the change.
 pub fn registry() -> Arc<PluginRegistry> {
     if let Some(reg) = REGISTRY.read_safe().as_ref() {
         return reg.clone();
@@ -93,20 +64,26 @@ pub fn registry() -> Arc<PluginRegistry> {
     reg
 }
 
-/// Themes contributed by the active plugin set, as `(name, resolved path)`
-/// pairs. The theme registry layers these below builtins and user themes.
 pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
     let reg = registry();
     let active: Vec<&LoadedPlugin> = reg.active().collect();
     contributions::active_themes(&active)
 }
 
-/// Rebuild the registry from the current on-disk config (after an
-/// enable/disable), so the change is reflected the next time any surface reads
-/// the active set.
 pub fn reload_registry() -> Arc<PluginRegistry> {
     let config = crate::session::Config::load_or_warn();
     let reg = Arc::new(PluginRegistry::load(&config));
     *REGISTRY.write_safe() = Some(reg.clone());
     reg
+}
+
+#[cfg(test)]
+pub(crate) struct ReloadRegistryOnDrop;
+
+#[cfg(test)]
+impl Drop for ReloadRegistryOnDrop {
+    fn drop(&mut self) {
+        let _lock = crate::session::test_support::EnvGuard::unset(&[]);
+        reload_registry();
+    }
 }

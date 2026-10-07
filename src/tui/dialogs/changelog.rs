@@ -27,11 +27,9 @@ pub struct ChangelogDialog {
     scroll_offset: usize,
     display_lines: Vec<DisplayLine>,
     dialog_area: Rect,
-    /// Rect of the `[Got it]` button, captured during `render`. A click
-    /// anywhere dismisses, but the button is the call to action, so it
-    /// picks up the hover highlight to read as clickable.
+    /// The `[Got it]` button. A click anywhere dismisses, but the button
+    /// takes the hover highlight so it reads as clickable.
     got_it_button_area: Rect,
-    /// Whether the cursor is over `[Got it]`, for the hover highlight.
     hover: HoverState,
 }
 
@@ -103,10 +101,8 @@ impl ChangelogDialog {
         }
     }
 
-    /// A click anywhere inside the changelog dialog dismisses it,
-    /// matching the keyboard's "any of Enter/Esc/q/Space submits"
-    /// model. Returns None for clicks outside so the caller can decide
-    /// whether to swallow them.
+    /// A click anywhere inside dismisses, as any of Enter/Esc/q/Space does.
+    /// `None` outside, for the caller to decide.
     pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<()>> {
         if self
             .dialog_area
@@ -118,10 +114,7 @@ impl ChangelogDialog {
         }
     }
 
-    /// Highlight the `[Got it]` button when the cursor is over it. A
-    /// click anywhere still dismisses via `handle_click`; this only
-    /// signals the call to action. Returns `true` when the highlight
-    /// changed.
+    /// Highlight `[Got it]` under the cursor; true when it changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         self.hover.update(col, row, &[self.got_it_button_area])
     }
@@ -166,20 +159,10 @@ impl ChangelogDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width = (area.width * 80 / 100).clamp(60, 100);
         let dialog_height = (area.height * 80 / 100).clamp(16, 40);
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let block = super::toned_dialog_block(" What's New ", theme.accent, theme.accent);
+        let (dialog_area, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
         self.dialog_area = dialog_area;
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" What's New ")
-            .title_style(Style::default().fg(theme.accent).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -215,9 +198,8 @@ impl ChangelogDialog {
 
         const GOT_IT_WIDTH: u16 = 8; // "[Got it]"
         let button_area = chunks[1];
-        // The button line is "[Got it]" + scroll_hint, centered as one
-        // unit; mirror that centering to capture just the "[Got it]"
-        // cells for the hover highlight.
+        // The line centers "[Got it]" plus the scroll hint as one unit;
+        // mirror that to capture only the button's cells.
         let line_width = GOT_IT_WIDTH + scroll_hint.chars().count() as u16;
         self.got_it_button_area = if button_area.width >= line_width {
             let got_it_x = button_area.x + (button_area.width - line_width) / 2;
@@ -351,22 +333,18 @@ fn parse_release_body(body: &str) -> Vec<(Category, Vec<ChangeItem>)> {
     for raw in body.lines() {
         let trimmed = raw.trim();
 
-        // git-cliff emits "### Features" / "### Bug Fixes" / etc. Match those
-        // first so the prefix check below (which also catches "## ") doesn't
-        // swallow them.
+        // Match `###` first, or the `##` check below swallows it.
         if let Some(rest) = trimmed.strip_prefix("### ") {
             current_group = group_label_to_category(rest.trim());
             continue;
         }
-        // The version header ("## [1.8.0](url) - date") and any stray ## blocks
-        // reset the active group.
+        // The version header and any stray `##` reset the active group.
         if trimmed.starts_with("## ") {
             current_group = None;
             continue;
         }
 
-        // Real markdown bullets only — anything else (headers, the
-        // "**Full Changelog**: ..." footer, blank lines) is noise.
+        // Real markdown bullets only; headers and footers are noise.
         let bullet = if let Some(rest) = trimmed.strip_prefix("- ") {
             rest.trim()
         } else if let Some(rest) = trimmed.strip_prefix("* ") {
@@ -375,8 +353,7 @@ fn parse_release_body(body: &str) -> Vec<(Category, Vec<ChangeItem>)> {
             continue;
         };
 
-        // git-cliff renders the "New Contributors" roster as bullets too;
-        // skip them whether or not their `###` header was recognized.
+        // The "New Contributors" roster is bullets too; skip it.
         if bullet.contains("made their first contribution") {
             continue;
         }
@@ -539,11 +516,7 @@ fn capitalize_first(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
+    use crate::tui::dialogs::test_keys::key;
 
     fn dialog_with(lines: Vec<DisplayLine>) -> ChangelogDialog {
         ChangelogDialog {
@@ -556,71 +529,46 @@ mod tests {
     }
 
     #[test]
-    fn hover_highlights_got_it_button() {
-        let mut dialog = dialog_with(vec![DisplayLine::NoReleases]);
-        dialog.got_it_button_area = Rect::new(10, 20, 8, 1);
-
-        // Over [Got it]: highlight it.
-        assert!(dialog.handle_hover(12, 20));
-        assert_eq!(dialog.hover.current(), Some(dialog.got_it_button_area));
-
-        // Off the button clears the highlight.
-        assert!(dialog.handle_hover(0, 0));
-        assert_eq!(dialog.hover.current(), None);
-    }
-
-    #[test]
-    fn submit_keys_close_dialog() {
+    fn any_dismiss_key_closes_and_hover_lights_the_button() {
         for code in [
             KeyCode::Enter,
             KeyCode::Esc,
             KeyCode::Char('q'),
             KeyCode::Char(' '),
         ] {
-            let mut dialog = dialog_with(vec![DisplayLine::NoReleases]);
-            assert!(matches!(
-                dialog.handle_key(key(code)),
-                DialogResult::Submit(())
-            ));
+            assert!(
+                matches!(
+                    dialog_with(vec![DisplayLine::NoReleases]).handle_key(key(code)),
+                    DialogResult::Submit(())
+                ),
+                "{code:?}"
+            );
         }
+
+        let mut dialog = dialog_with(vec![DisplayLine::NoReleases]);
+        dialog.got_it_button_area = Rect::new(10, 20, 8, 1);
+        assert!(dialog.handle_hover(12, 20));
+        assert_eq!(dialog.hover.current(), Some(dialog.got_it_button_area));
+        assert!(dialog.handle_hover(0, 0));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]
-    fn scroll_down_advances_within_bounds() {
+    fn scrolling_clamps_at_both_ends() {
         let mut dialog = dialog_with(vec![
-            DisplayLine::VersionHeader {
-                version: "1.0.0".into(),
-                date: None,
-            },
-            DisplayLine::Separator,
             DisplayLine::Empty,
-            DisplayLine::Item(ChangeItem {
-                message: "x".into(),
-                scope: None,
-                pr_number: None,
-            }),
+            DisplayLine::Empty,
+            DisplayLine::Empty,
         ]);
         for _ in 0..10 {
             dialog.handle_key(key(KeyCode::Down));
         }
         assert_eq!(dialog.scroll_offset, dialog.display_lines.len() - 1);
-    }
-
-    #[test]
-    fn scroll_up_clamps_to_zero() {
-        let mut dialog = dialog_with(vec![DisplayLine::NoReleases]);
-        dialog.scroll_offset = 0;
-        dialog.handle_key(key(KeyCode::Up));
+        for _ in 0..10 {
+            dialog.handle_key(key(KeyCode::Up));
+        }
         assert_eq!(dialog.scroll_offset, 0);
-    }
 
-    #[test]
-    fn home_end_jump_to_extremes() {
-        let mut dialog = dialog_with(vec![
-            DisplayLine::Empty,
-            DisplayLine::Empty,
-            DisplayLine::Empty,
-        ]);
         dialog.handle_key(key(KeyCode::End));
         assert_eq!(dialog.scroll_offset, 2);
         dialog.handle_key(key(KeyCode::Home));
@@ -628,81 +576,79 @@ mod tests {
     }
 
     #[test]
-    fn empty_releases_emits_placeholder() {
-        let lines = build_display_lines(&[]);
-        assert_eq!(lines.len(), 1);
-        assert!(matches!(lines[0], DisplayLine::NoReleases));
-    }
+    fn markdown_bullets_flatten_into_scope_message_and_pr() {
+        // (raw bullet, message, pr)
+        let attribution: &[(&str, &str, Option<u32>)] = &[
+            (
+                "De-flake live ensure-session-restart status check in #1249 by @Seluj78 (39d4b40)",
+                "De-flake live ensure-session-restart status check",
+                Some(1249),
+            ),
+            (
+                "Some PR title without attribution",
+                "Some PR title without attribution",
+                None,
+            ),
+            // Only a hex-only trailing paren is the commit sha, so a
+            // parenthetical in the subject survives.
+            (
+                "foo (workaround) in #7 by @user (abc1234)",
+                "foo (workaround)",
+                Some(7),
+            ),
+        ];
+        for (raw, message, pr) in attribution {
+            assert_eq!(strip_attribution(raw), (message.to_string(), *pr), "{raw}");
+        }
 
-    #[test]
-    fn strip_attribution_extracts_pr_number() {
-        let (msg, pr) = strip_attribution(
-            "De-flake live ensure-session-restart status check in #1249 by @Seluj78 (39d4b40)",
-        );
-        assert_eq!(msg, "De-flake live ensure-session-restart status check");
-        assert_eq!(pr, Some(1249));
-    }
+        // (raw bullet, scope, rest)
+        let scopes: &[(&str, Option<&str>, &str)] = &[
+            (
+                "**acp:** Restore something",
+                Some("acp"),
+                "Restore something",
+            ),
+            (
+                "**acp/ws:** Restore drop-cancels-reader semantics",
+                Some("acp/ws"),
+                "Restore drop-cancels-reader semantics",
+            ),
+            (
+                "Force color for Antigravity launches",
+                None,
+                "Force color for Antigravity launches",
+            ),
+        ];
+        for (raw, scope, rest) in scopes {
+            let (got_scope, got_rest) = strip_bold_scope_prefix(raw);
+            assert_eq!(got_scope.as_deref(), *scope, "{raw}");
+            assert_eq!(got_rest, *rest, "{raw}");
+        }
 
-    #[test]
-    fn strip_attribution_handles_no_attribution() {
-        let (msg, pr) = strip_attribution("Some PR title without attribution");
-        assert_eq!(msg, "Some PR title without attribution");
-        assert_eq!(pr, None);
-    }
-
-    #[test]
-    fn strip_attribution_preserves_subject_parentheticals() {
-        // git-cliff appends ` (<hash>)` for the short commit SHA. Hex-only
-        // contents trigger the trailing-paren strip; anything else should
-        // survive so commits like "feat: foo (workaround)" don't get truncated.
-        let (msg, pr) = strip_attribution("foo (workaround) in #7 by @user (abc1234)");
-        assert_eq!(msg, "foo (workaround)");
-        assert_eq!(pr, Some(7));
-    }
-
-    #[test]
-    fn strip_bold_scope_prefix_extracts_scope() {
-        let (scope, rest) = strip_bold_scope_prefix("**acp:** Restore something");
-        assert_eq!(scope.as_deref(), Some("acp"));
-        assert_eq!(rest, "Restore something");
-    }
-
-    #[test]
-    fn strip_bold_scope_prefix_handles_multi_part_scope() {
-        let (scope, rest) =
-            strip_bold_scope_prefix("**acp/ws:** Restore drop-cancels-reader semantics");
-        assert_eq!(scope.as_deref(), Some("acp/ws"));
-        assert_eq!(rest, "Restore drop-cancels-reader semantics");
-    }
-
-    #[test]
-    fn strip_bold_scope_prefix_returns_none_when_no_bold() {
-        let (scope, rest) = strip_bold_scope_prefix("Force color for Antigravity launches");
-        assert!(scope.is_none());
-        assert_eq!(rest, "Force color for Antigravity launches");
-    }
-
-    #[test]
-    fn flatten_markdown_collapses_links_bold_and_code() {
-        let input = "**scope:** subj in [#1249](https://x/y/pull/1249) by [@u](https://x/u) ([`abc1234`](https://x/c/abc))";
         assert_eq!(
-            flatten_markdown(input),
+            flatten_markdown(
+                "**scope:** subj in [#1249](https://x/y/pull/1249) by [@u](https://x/u) ([`abc1234`](https://x/c/abc))"
+            ),
             "scope: subj in #1249 by @u (abc1234)"
         );
-    }
-
-    #[test]
-    fn flatten_markdown_leaves_orphan_brackets_alone() {
-        // Malformed links (no url) survive as plain text so the bullet stays
-        // readable.
+        // A malformed link survives as plain text, so the bullet stays readable.
         assert_eq!(
             flatten_markdown("plain [text] no url"),
             "plain [text] no url"
         );
+
+        for (input, want) in [
+            ("add feature", "Add feature"),
+            ("", ""),
+            ("a", "A"),
+            ("Already", "Already"),
+        ] {
+            assert_eq!(capitalize_first(input), want);
+        }
     }
 
     #[test]
-    fn parse_release_body_groups_by_section_header() {
+    fn a_release_body_groups_its_bullets_by_section_header() {
         let body = "\
 ## [1.8.0](https://github.com/o/r/releases/tag/v1.8.0) - 2026-05-22
 
@@ -730,51 +676,58 @@ mod tests {
         let labels: Vec<_> = groups.iter().map(|(c, _)| c.label()).collect();
         assert_eq!(labels, ["Features", "Bug Fixes", "Other Changes"]);
 
-        let features = &groups[0].1;
-        assert_eq!(features.len(), 1);
-        assert_eq!(features[0].scope.as_deref(), Some("tui"));
-        assert_eq!(features[0].message, "Full-screen multi-column help overlay");
-        assert_eq!(features[0].pr_number, Some(1410));
+        // (group index, item index, scope, message, pr)
+        let items: &[(usize, usize, Option<&str>, &str, Option<u32>)] = &[
+            (
+                0,
+                0,
+                Some("tui"),
+                "Full-screen multi-column help overlay",
+                Some(1410),
+            ),
+            (1, 0, Some("test"), "De-flake status check", Some(1249)),
+            (
+                1,
+                1,
+                None,
+                "Force color for Antigravity launches",
+                Some(1382),
+            ),
+            (2, 0, None, "Loose change with no scope", Some(999)),
+        ];
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[1].1.len(), 2);
+        assert_eq!(groups[2].1.len(), 1);
+        for (group, index, scope, message, pr) in items {
+            let item = &groups[*group].1[*index];
+            assert_eq!(item.scope.as_deref(), *scope, "{message}");
+            assert_eq!(item.message, *message);
+            assert_eq!(item.pr_number, *pr, "{message}");
+        }
 
-        let fixes = &groups[1].1;
-        assert_eq!(fixes.len(), 2);
-        assert_eq!(fixes[0].scope.as_deref(), Some("test"));
-        assert_eq!(fixes[0].message, "De-flake status check");
-        assert_eq!(fixes[0].pr_number, Some(1249));
-        assert!(fixes[1].scope.is_none());
-        assert_eq!(fixes[1].message, "Force color for Antigravity launches");
-        assert_eq!(fixes[1].pr_number, Some(1382));
-
-        let other = &groups[2].1;
-        assert_eq!(other.len(), 1);
-        assert_eq!(other[0].message, "Loose change with no scope");
-        assert_eq!(other[0].pr_number, Some(999));
-    }
-
-    #[test]
-    fn parse_release_body_handles_release_with_no_visible_groups() {
-        // git-cliff hides chore/build/ci/docs/style/refactor/test via skip
-        // rules in cliff.toml, so a release that only had those produces a
-        // body with just the version header and footer — no `### Group`
-        // sections, no bullets.
-        let body = "\
+        // cliff.toml skips chore/build/ci/docs/style/refactor/test, so a
+        // release of only those has no sections and no bullets at all.
+        let empty = "\
 ## [1.0.1](https://github.com/o/r/releases/tag/v1.0.1) - 2026-05-19
 
 
 **Full Changelog**: https://github.com/o/r/compare/v1.0.0...v1.0.1
 ";
-        let groups = parse_release_body(body);
-        assert!(groups.is_empty());
+        assert!(parse_release_body(empty).is_empty());
     }
 
     #[test]
-    fn build_display_lines_marks_no_user_facing_changes() {
-        let release = ReleaseInfo {
+    fn display_lines_cover_the_empty_the_silent_and_the_multi_release_cases() {
+        let lines = build_display_lines(&[]);
+        assert_eq!(lines.len(), 1);
+        assert!(matches!(lines[0], DisplayLine::NoReleases));
+
+        let silent = ReleaseInfo {
             version: "1.0.1".into(),
             body: "## [1.0.1](https://x/y/releases/tag/v1.0.1) - 2026-05-19\n\n**Full Changelog**: https://x/y/compare/v1.0.0...v1.0.1\n".into(),
             published_at: Some("2026-05-19T10:00:00Z".into()),
         };
-        let lines = build_display_lines(std::slice::from_ref(&release));
+        let lines = build_display_lines(std::slice::from_ref(&silent));
         // VersionHeader, Separator, Empty, NoUserFacingChanges.
         assert_eq!(lines.len(), 4);
         match &lines[0] {
@@ -782,16 +735,13 @@ mod tests {
                 assert_eq!(version, "1.0.1");
                 assert_eq!(date.as_deref(), Some("2026-05-19"));
             }
-            _ => panic!("expected version header first"),
+            _ => panic!("expected a version header first"),
         }
         assert!(matches!(
             lines.last().unwrap(),
             DisplayLine::NoUserFacingChanges
         ));
-    }
 
-    #[test]
-    fn build_display_lines_renders_multiple_releases() {
         let releases = vec![
             ReleaseInfo {
                 version: "1.1.0".into(),
@@ -805,30 +755,21 @@ mod tests {
             },
         ];
         let lines = build_display_lines(&releases);
-        let version_headers: Vec<_> = lines
+        let versions: Vec<_> = lines
             .iter()
             .filter_map(|l| match l {
                 DisplayLine::VersionHeader { version, .. } => Some(version.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(version_headers, ["1.1.0", "1.0.1"]);
-
-        let category_headers: Vec<_> = lines
+        assert_eq!(versions, ["1.1.0", "1.0.1"]);
+        let categories: Vec<_> = lines
             .iter()
             .filter_map(|l| match l {
                 DisplayLine::CategoryHeader(c) => Some(c.label()),
                 _ => None,
             })
             .collect();
-        assert_eq!(category_headers, ["Features", "Bug Fixes"]);
-    }
-
-    #[test]
-    fn capitalize_first_capitalizes_only_the_first_char() {
-        assert_eq!(capitalize_first("add feature"), "Add feature");
-        assert_eq!(capitalize_first(""), "");
-        assert_eq!(capitalize_first("a"), "A");
-        assert_eq!(capitalize_first("Already"), "Already");
+        assert_eq!(categories, ["Features", "Bug Fixes"]);
     }
 }

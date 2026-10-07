@@ -3,7 +3,9 @@
 use anyhow::{bail, Result};
 use clap::Args;
 
-use crate::session::{EnsureReadyError, EnsureReadyOutcome, Storage};
+use crate::acp::client::http::PromptDispositionWire;
+use crate::acp::client::{require_daemon, HttpClient};
+use crate::session::{EnsureReadyOutcome, Storage};
 
 #[derive(Args)]
 pub struct SendArgs {
@@ -24,6 +26,9 @@ pub struct SendArgs {
 pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (mut instances, _) = storage.load_with_groups()?;
+    for inst in &mut instances {
+        inst.source_profile = profile.to_string();
+    }
 
     if args.message.trim().is_empty() {
         bail!("Message cannot be empty");
@@ -33,10 +38,14 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let session_id = inst.id.clone();
     let session_title = inst.title.clone();
     let tool = inst.tool.clone();
+    let is_structured = inst.is_structured();
 
-    // Revive the pane if needed before delivering keystrokes. Without this,
-    // a send to a dead pane silently writes to a corpse with no agent to
-    // respond to it.
+    // Refuse before any revive; the terminal path rechecks under the lock right before sending.
+    inst.ensure_startable()?;
+    if is_structured {
+        return send_structured(&session_id, &session_title, &args.message, args.no_revive).await;
+    }
+
     if !args.no_revive {
         if let Some(target) = instances.iter_mut().find(|i| i.id == session_id) {
             match target.ensure_pane_ready() {
@@ -50,13 +59,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
                     bail!("Resume failed for sid {sid}; preserved for explicit retry")
                 }
                 Ok(EnsureReadyOutcome::AlreadyAlive) => {}
-                Err(EnsureReadyError::Transient(status)) => {
-                    bail!("Session is mid-lifecycle ({status:?}); cannot send right now")
-                }
-                Err(EnsureReadyError::StructuredView) => {
-                    bail!("Acp-mode sessions have no tmux pane; send is not supported")
-                }
-                Err(EnsureReadyError::Tmux(e)) => bail!("{}", e),
+                Err(e) => bail!("{e}"),
             }
         }
     }
@@ -69,30 +72,27 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         );
     }
 
+    tmux_session.wait_until_ready(
+        std::time::Duration::from_secs(5),
+        crate::agents::ready_marker(&tool),
+    );
+
+    let target = instances
+        .iter()
+        .find(|i| i.id == session_id)
+        .expect("resolved above");
+    let _input_lock = target.lock_for_input()?;
     let delay = crate::agents::send_keys_enter_delay(&tool);
     tmux_session.send_keys_with_delay(&args.message, delay)?;
 
-    // Stamp last_accessed_at so the "last activity" column reflects user
-    // interaction, and remap the status to Running. The agent has just been
-    // given fresh input; the next status poll will reconcile the real state,
-    // but flipping to Running immediately keeps the row from sticking on a
-    // stale Idle/Waiting label during the gap between send and poll.
-    // `touch_last_accessed` also auto-clears `archived_at` and `snoozed_until`
-    // (see Instance::touch_last_accessed), so a user can wake any sunk row by
-    // sending to it.
     let id_for_save = session_id.clone();
     if let Err(err) = storage.update(|instances, _groups| {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
-            inst.touch_last_accessed();
+            inst.touch_after_input();
             inst.status = crate::session::Status::Running;
         }
         Ok(())
     }) {
-        // The tmux send succeeded; the storage write is best-effort
-        // bookkeeping (status remap + auto-unarchive). Surfacing this as a
-        // hard error would tell the user "send failed" when the message
-        // actually reached the agent, so log a warning and keep the success
-        // line. The next status poll will reconcile the row anyway.
         tracing::warn!(
             ?err,
             "send: failed to persist status remap after successful send"
@@ -101,4 +101,126 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
 
     println!("Sent message to '{}'", session_title);
     Ok(())
+}
+
+/// ACP/structured-view sessions have no tmux pane; delivering a message means
+/// hitting the running daemon's prompt endpoint instead, the same path the
+/// web composer's send button uses. `no_revive` is enforced by the daemon
+/// itself (atomically, at admission), not checked here first, since a
+/// separate client-side liveness probe would race the daemon's own decision.
+async fn send_structured(
+    session_id: &str,
+    session_title: &str,
+    message: &str,
+    no_revive: bool,
+) -> Result<()> {
+    let endpoint = require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let dispatch = client.prompt(session_id, message, no_revive).await?;
+    let verb = match dispatch.disposition {
+        PromptDispositionWire::Sent => "Sent",
+        PromptDispositionWire::Steered => "Steered into",
+        PromptDispositionWire::Queued => "Queued",
+    };
+    println!("{verb} message to '{session_title}'");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Instance;
+    use serial_test::serial;
+
+    /// #4116: auto-revive refuses to start an archived or trashed session, terminal or structured.
+    #[tokio::test]
+    #[serial]
+    async fn send_does_not_revive_archived_or_trashed_session() {
+        let shelves: [(fn(&mut Instance), &str); 2] = [
+            (Instance::archive, "session is archived; unarchive it first"),
+            (Instance::trash, "session is in trash; restore it first"),
+        ];
+        for ((shelve, message), structured) in
+            shelves.into_iter().flat_map(|d| [(d, false), (d, true)])
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "send-blocked";
+            let mut inst = Instance::new("shelved", "/tmp/x");
+            if structured {
+                inst.view = crate::session::View::Structured;
+            }
+            shelve(&mut inst);
+            let id = inst.id.clone();
+            Storage::new_unwatched(profile)
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+
+            let args = SendArgs {
+                identifier: id.clone(),
+                message: "hello".to_string(),
+                no_revive: false,
+            };
+            let err = run(profile, args).await.unwrap_err();
+            assert_eq!(err.to_string(), message, "structured={structured}");
+            let tmux = crate::tmux::Session::new(&id, &inst.title).unwrap();
+            assert!(!tmux.exists());
+        }
+    }
+
+    /// #4116: an archived session with a live pane (`archive --no-kill`) takes no input and
+    /// stays archived, with or without `--no-revive`.
+    #[tokio::test]
+    #[serial]
+    async fn send_refuses_a_live_archived_pane() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+        for no_revive in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "send-live-archived";
+            let mut inst = Instance::new("live-archived", "/tmp/x");
+            inst.archive();
+            let id = inst.id.clone();
+            Storage::new_unwatched(profile)
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+            let created = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
+                .status();
+            if !created.map(|s| s.success()).unwrap_or(false) {
+                eprintln!("tmux new-session failed; skipping");
+                return;
+            }
+            crate::tmux::refresh_session_cache();
+
+            let args = SendArgs {
+                identifier: id.clone(),
+                message: "hello".to_string(),
+                no_revive,
+            };
+            let err = run(profile, args).await.unwrap_err();
+            let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &pane])
+                .output();
+            assert_eq!(
+                err.to_string(),
+                "session is archived; unarchive it first",
+                "no_revive={no_revive}"
+            );
+            assert!(stored[0].is_archived(), "no_revive={no_revive}");
+        }
+    }
 }

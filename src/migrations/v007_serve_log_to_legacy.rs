@@ -44,39 +44,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renames_serve_log_to_legacy() {
-        let temp = tempfile::tempdir().unwrap();
-        let src = temp.path().join("serve.log");
-        fs::write(&src, "old daemon output\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        assert!(!src.exists(), "serve.log should be gone");
-        let legacy = temp.path().join("serve.log.legacy");
-        assert!(legacy.exists(), "serve.log.legacy should exist");
-        assert_eq!(fs::read_to_string(&legacy).unwrap(), "old daemon output\n");
-    }
-
-    #[test]
-    fn noop_when_no_serve_log() {
-        let temp = tempfile::tempdir().unwrap();
-        run_in(temp.path()).unwrap();
-        assert!(!temp.path().join("serve.log.legacy").exists());
-    }
-
-    #[test]
-    fn idempotent_with_existing_legacy() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("serve.log"), "new bytes\n").unwrap();
-        fs::write(temp.path().join("serve.log.legacy"), "old bytes\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        // Running again with no serve.log present should be a no-op.
-        run_in(temp.path()).unwrap();
-        assert_eq!(
-            fs::read_to_string(temp.path().join("serve.log.legacy")).unwrap(),
-            "new bytes\n"
-        );
+    fn moves_serve_log_aside_as_legacy() {
+        // (serve.log, serve.log.legacy) before -> legacy after; serve.log is always gone.
+        for (log, legacy, expected) in [
+            (
+                Some("old daemon output\n"),
+                None,
+                Some("old daemon output\n"),
+            ),
+            (None, None, None),
+            (
+                Some("new bytes\n"),
+                Some("old bytes\n"),
+                Some("new bytes\n"),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (log_path, legacy_path) = (
+                temp.path().join("serve.log"),
+                temp.path().join("serve.log.legacy"),
+            );
+            for (path, content) in [(&log_path, log), (&legacy_path, legacy)] {
+                if let Some(content) = content {
+                    fs::write(path, content).unwrap();
+                }
+            }
+            // A second run, with no serve.log left, changes nothing.
+            for _ in 0..2 {
+                run_in(temp.path()).unwrap();
+                assert!(!log_path.exists(), "{log:?}");
+                assert_eq!(fs::read_to_string(&legacy_path).ok().as_deref(), expected);
+            }
+        }
     }
 }

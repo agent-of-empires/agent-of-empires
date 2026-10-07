@@ -1,12 +1,7 @@
 //! Native ratatui rendering of a structured view session.
 //!
-//! Consumes the same daemon HTTP / WebSocket surface that the web
-//! frontend uses; the per-frame reducer mirrors the activity semantics
-//! of `web/src/hooks/useAcp.ts` without the React-specific shapes.
-//!
-//! Directory name is `structured_view` (not `structured view`) to avoid colliding
-//! with `src/acp/` per the recipe in
-//! <https://github.com/agent-of-empires/agent-of-empires/issues/1018#issuecomment-4444040929>.
+//! Consumes the same daemon HTTP / WebSocket surface as the web frontend; the
+//! per-frame reducer mirrors the activity semantics of `web/src/hooks/useAcp.ts`.
 
 pub mod embedded;
 pub mod input;
@@ -21,7 +16,9 @@ use std::io::Stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event as CrosstermEvent, EventStream, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -29,38 +26,32 @@ use tokio::time::Instant;
 
 use self::input::{Focus, InputContext, Intent};
 use self::state::{
-    ChoicePicker, ChoicePurpose, FileIndex, MentionSession, StructuredViewState, ToastBanner,
-    ToastKind,
+    ChoicePicker, ChoicePurpose, FileIndex, MentionSession, PickerKind, StructuredViewState,
+    ToastBanner, ToastKind,
 };
-use crate::acp::approvals::ApprovalDecision;
 use crate::acp::client::{
-    require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError,
+    require_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
     PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
+use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 
-/// Per-keystroke redraw interval. The animations are minimal (just the
-/// blinking caret in the composer); 120ms keeps it from looking laggy
-/// without burning CPU.
+/// Per-keystroke redraw interval: fast enough for the blinking caret without
+/// burning CPU.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(120);
 /// Toasts auto-clear after this long.
 const TOAST_TTL: Duration = Duration::from_secs(4);
-/// How often to poll the daemon's plugin UI-state snapshot (#2402). Matches
-/// the web dashboard's cadence. The fetch runs on its own task so a slow or
-/// unreachable daemon never blocks the event loop on the HTTP client's
-/// 15-second timeout.
+/// Plugin UI-state poll cadence (#2402). The fetch runs on its own task so a
+/// slow or unreachable daemon never blocks the event loop.
 const PLUGIN_UI_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Set up an alternate-screen terminal, run the structured view against
-/// the given session, and tear it back down on exit. Used by the
-/// `aoe acp attach <id>` CLI verb to jump straight into the
-/// structured view without going through the home screen. Pair with
-/// `AOE_DAEMON_URL` for remote-attach against another machine's
-/// structured view daemon.
+/// Set up an alternate-screen terminal, run the structured view against the
+/// given session, and tear it down on exit. Used by `aoe acp attach <id>`;
+/// pair with `AOE_DAEMON_URL` to attach to another machine's daemon.
 pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -87,8 +78,7 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
         EnableMouseCapture
     )?;
     // Push the kitty enhancement stack so `Shift+Enter` arrives as
-    // `KeyEvent { Enter, SHIFT }` inside the structured-view composer
-    // (#2362). Best-effort like `TerminalGuard::enter`.
+    // `KeyEvent { Enter, SHIFT }` in the composer (#2362). Best-effort.
     #[cfg(unix)]
     let _ = execute!(
         stdout,
@@ -116,11 +106,9 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     result
 }
 
-/// Open the full-screen structured view for `session_id` and run its
-/// event loop until the user exits with `Esc`, or until the structured
-/// view daemon becomes unreachable in a way the view can't recover
-/// from. Used by the standalone `aoe acp attach` path; the home screen
-/// embeds the view in its preview pane instead (see [`embedded`]).
+/// Open the full-screen structured view for `session_id` and run its event loop
+/// until the user exits with `Esc` or the daemon becomes unrecoverable. The home
+/// screen embeds the view in its preview pane instead (see [`embedded`]).
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     event_stream: &mut EventStream,
@@ -148,11 +136,9 @@ pub async fn run(
             return Ok(());
         }
         Err(ManagerError::NoDaemonRunning(_)) => {
-            // Not a dead end: a structured session cannot function
-            // without the daemon, so offer to start a localhost one
-            // right here (Enter). Remote modes keep their manual
-            // commands on the same screen; auto-picking a tunnel on
-            // the user's behalf would hide that choice.
+            // A structured session cannot function without the daemon, so
+            // offer to start a localhost one here (Enter). Remote modes keep
+            // their manual commands: auto-picking a tunnel would hide the choice.
             match offer_daemon_start(terminal, event_stream, theme).await? {
                 Some(endpoint) => endpoint,
                 None => return Ok(()),
@@ -162,13 +148,9 @@ pub async fn run(
     run_for_endpoint(terminal, event_stream, theme, endpoint, session_id).await
 }
 
-/// Render the "no daemon running" screen with a one-key recovery:
-/// Enter spawns a localhost daemon (via the serve dialog's shared
-/// spawn path) and waits for it to become healthy, then returns its
-/// endpoint so the caller can proceed straight into the view. Any
-/// other key returns `None` (back to the session list). Spawn or
-/// health-check failures render an error screen and also return
-/// `None` after a dismiss keypress.
+/// Render the "no daemon running" screen. Enter spawns a localhost daemon and
+/// waits for it to become healthy, returning its endpoint; any other key, or a
+/// spawn or health-check failure, returns `None`.
 async fn offer_daemon_start(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     event_stream: &mut EventStream,
@@ -218,16 +200,11 @@ async fn offer_daemon_start(
     }
 }
 
-/// Same as [`run`] but the caller has already located the daemon
-/// endpoint (e.g. the remote-home picker that ran a session discovery
-/// step against a fixed `AOE_DAEMON_URL`). Skips `require_daemon` so
-/// the view doesn't re-run discovery / health-check when the caller
-/// has already done it.
-/// Everything a structured-view surface needs after connecting: the
-/// hydrated state, the folded startup error (if any), and the two
-/// side-channel receivers (plugin UI snapshots, session view metadata).
-/// Shared by the full-screen loop and the embedded (preview-pane)
-/// variant so the two cannot drift.
+/// Same as [`run`] but for a caller that already located the daemon endpoint,
+/// so discovery and the health check are not re-run.
+/// Everything a structured-view surface needs after connecting: hydrated state,
+/// the folded startup error, and the side-channel receivers. Shared by the
+/// full-screen loop and the embedded variant so the two cannot drift.
 /// One plugin poll tick from the daemon: the UI-state snapshot plus, when the
 /// fetch succeeded, the active command list. `commands` is `None` on a transient
 /// command-fetch failure so the last-good set is kept rather than wiped.
@@ -243,28 +220,25 @@ struct ViewSetup {
     session_info_rx: tokio::sync::mpsc::Receiver<ViewSideInfo>,
 }
 
-/// One-shot daemon reads the view wants at open but must not block on:
-/// the session header / path roots, and the resolved compaction-reminder
-/// threshold. Batched onto one channel because they share a task and both
-/// land before the first user interaction. A failed fetch degrades to the
-/// fallback header or a disabled reminder, never to a startup error.
+/// One-shot daemon reads the view wants at open but must not block on. A failed
+/// fetch degrades to the fallback header or a disabled reminder, never to a
+/// startup error.
 pub(crate) struct ViewSideInfo {
     session: Result<crate::acp::session_paths::SessionViewInfo, String>,
     compaction_reminder: Option<u8>,
+    /// Initial daemon-owned prompt-queue snapshot, so the queue strip and
+    /// ArrowUp recall reflect prompts queued elsewhere. Empty on a fetch error.
+    queued: Vec<QueuedPromptEntry>,
 }
 
-/// Hydrate the transcript via /replay, open the WebSocket, and spawn
-/// the side-channel tasks (session-info fetch, plugin UI-state poll).
-/// Both spawned tasks exit once their receiver is dropped, so the
-/// setup owns no cleanup obligations beyond dropping the `ViewSetup`.
+/// Hydrate the transcript via /replay, open the WebSocket, and spawn the
+/// side-channel tasks. Both exit once their receiver is dropped.
 async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSetup> {
     let http = HttpClient::new(endpoint.clone()).context("build structured view HTTP client")?;
 
-    // Hydrate the transcript via /replay before opening the WebSocket
-    // so the user sees the historical conversation immediately instead
-    // of a blank pane until live frames start arriving.
-    let initial = http.replay_paged(session_id, 0, REPLAY_PAGE_SIZE).await;
-    let ws_result = ws_connect(&endpoint, session_id, 0).await;
+    // `frames=0`: this view renders the server's folded projections, so the
+    // daemon skips forwarding the session's whole event history on open.
+    let ws_result = ws_connect_projections_only(&endpoint, session_id, 0).await;
 
     let (ws, ws_err) = match ws_result {
         Ok(handle) => (Some(handle), None),
@@ -272,9 +246,8 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
     };
 
     let mut state = StructuredViewState::new(session_id.to_string(), endpoint, http, ws);
-    // Land in the composer so the user can type immediately, live-view
-    // style. Reading history is scroll (wheel / PageUp/PageDown), not a
-    // focus switch, so there is no "which pane am I in" juggling.
+    // Land in the composer so the user can type immediately; reading history
+    // is scroll, not a focus switch.
     state.focus = Focus::Composer;
 
     let (session_info_tx, session_info_rx) = tokio::sync::mpsc::channel(1);
@@ -293,38 +266,32 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                     None
                 }
             };
+            let queued = match http.queue_list(&session_id).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::warn!(target: "acp.tui", "initial prompt-queue fetch failed; queue starts empty until the next refresh: {e}");
+                    Vec::new()
+                }
+            };
             let _ = session_info_tx
                 .send(ViewSideInfo {
                     session,
                     compaction_reminder,
+                    queued,
                 })
                 .await;
         });
     }
 
-    // Capture both startup-path errors before showing a toast so we
-    // can fold them into a single message when both fail (they
-    // usually share a root cause, e.g. 401 from the auth middleware).
-    let replay_err = match initial {
-        Ok(replay) => {
-            if replay.lost {
-                state.transcript.set_lagged();
-            }
-            for frame in &replay.frames {
-                state.transcript.apply(frame);
-            }
-            // `reconcile_selection` also focus-grabs a pending approval
-            // (modal). A pending elicitation is auto-presented by the
-            // caller, which owns the toast deadline its menu needs.
-            state.reconcile_selection();
-            state.reconcile_slash_selection();
-            None
-        }
-        Err(e) => {
-            tracing::warn!(target: "acp.tui", "initial replay failed: {e}");
-            Some(e.to_string())
-        }
-    };
+    // Seed the server-owned transcript rows via `?view=rows` so the pane paints
+    // history instead of blank; the WS snapshot reconciles by id. Capture the
+    // error rather than toasting, so a shared root cause folds into one message
+    // with the WS error below.
+    let replay_err = reseed_server_rows(&mut state).await;
+    // `reconcile_selection` also focus-grabs a pending approval (modal). A
+    // pending elicitation is auto-presented by the caller.
+    state.reconcile_selection();
+    state.reconcile_slash_selection();
 
     let ws_err_text = ws_err.map(|e| {
         tracing::warn!(target: "acp.tui.ws", "initial ws connect failed: {e}");
@@ -338,9 +305,8 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
         (None, None) => None,
     };
 
-    // Poll the daemon's plugin UI-state on its own task and stream snapshots
-    // back over a channel, so a slow daemon stalls neither input nor render.
-    // The task exits once the view returns and drops the receiver.
+    // Poll the daemon's plugin UI-state on its own task so a slow daemon stalls
+    // neither input nor render. The task exits once the receiver is dropped.
     let (plugin_tx, plugin_rx) = tokio::sync::mpsc::channel::<PluginPoll>(8);
     {
         let http = state.http.clone();
@@ -352,9 +318,8 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                 let snapshot = match http.plugin_ui_state().await {
                     Ok(snapshot) => snapshot,
                     // A fixed env credential cannot recover inside this view.
-                    // Stop instead of turning its 3-second poll into repeated
-                    // IP-wide lockouts. Local credentials refresh from disk,
-                    // so rotation does not reach this branch.
+                    // Stop rather than turn the 3-second poll into repeated
+                    // IP-wide lockouts.
                     Err(e) if !should_retry_plugin_ui_poll(&e) => {
                         tracing::warn!(
                             target: "acp.tui",
@@ -362,17 +327,16 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                         );
                         break;
                     }
-                    // Transient or older-daemon-without-the-endpoint: keep the
-                    // last good snapshot and retry on the next tick rather than
-                    // toasting repeatedly.
+                    // Transient, or an older daemon without the endpoint: keep
+                    // the last good snapshot and retry on the next tick.
                     Err(e) => {
                         tracing::debug!(target: "acp.tui", "plugin ui-state poll failed: {e}");
                         continue;
                     }
                 };
-                // Command metadata comes from the daemon so a remote-daemon
-                // session resolves plugins it doesn't have locally. A failed
-                // fetch leaves the last-good set in place (`None`).
+                // Command metadata comes from the daemon so a remote session
+                // resolves plugins it lacks locally; a failed fetch keeps the
+                // last-good set.
                 let commands = match http.plugin_commands().await {
                     Ok(commands) => Some(commands),
                     Err(e) => {
@@ -421,11 +385,12 @@ pub async fn run_for_endpoint(
     if let Some(text) = startup_toast {
         set_toast(&mut state, &mut toast_deadline, text, ToastKind::Error);
     }
-    // A question already pending in the replay presents its menu now, so
-    // opening onto a waiting elicitation shows the prompt immediately.
+    // A question already pending in the replay presents its menu now.
     auto_present_elicitation(&mut state, &mut toast_deadline);
 
     redraw(terminal, theme, &mut state)?;
+    #[cfg(feature = "e2e-tests")]
+    crate::tui::app::e2e_render_ack(true)?;
 
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -435,11 +400,26 @@ pub async fn run_for_endpoint(
             biased;
             evt = event_stream.next() => {
                 let Some(evt) = evt else {
-                    // EventStream closed; bail out so the parent App
-                    // can do its own cleanup.
+                            // EventStream closed; bail out for the parent
+                            // App's cleanup.
                     return Ok(());
                 };
                 let evt = evt.context("read terminal event")?;
+                #[cfg(feature = "e2e-tests")]
+                if matches!(evt, CrosstermEvent::Key(key) if key.code == crossterm::event::KeyCode::F(12))
+                    && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
+                    redraw(terminal, theme, &mut state)?;
+                    crate::tui::app::e2e_render_ack(false)?;
+                    continue;
+                }
+                if let CrosstermEvent::Mouse(m) = &evt {
+                    if m.kind == MouseEventKind::Moved {
+                        if handle_hover(&mut state, m.column, m.row) {
+                            redraw(terminal, theme, &mut state)?;
+                        }
+                        continue;
+                    }
+                }
                 let should_exit = handle_terminal_event(&mut state, evt, &mut toast_deadline).await?;
                 if should_exit {
                     return Ok(());
@@ -453,8 +433,8 @@ pub async fn run_for_endpoint(
                         redraw(terminal, theme, &mut state)?;
                     }
                     None => {
-                        // Either no ws handle or the channel closed.
-                        // Sleep briefly to avoid spinning the select loop.
+                        // No ws handle, or the channel closed. Sleep briefly
+                        // rather than spin the select loop.
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
@@ -500,6 +480,7 @@ fn apply_session_info(
 /// full-screen loop and the embedded preview.
 pub(crate) fn apply_side_info(state: &mut StructuredViewState, side: ViewSideInfo) {
     state.compaction_reminder_percent = side.compaction_reminder;
+    state.set_queue_snapshot(side.queued);
     match side.session {
         Ok(info) => apply_session_info(state, info),
         Err(e) => {
@@ -508,78 +489,76 @@ pub(crate) fn apply_side_info(state: &mut StructuredViewState, side: ViewSideInf
     }
 }
 
-/// Apply one WebSocket message to the view state: reduce a frame (with
-/// turn-edge queue draining), rehydrate from /replay on Lagged, or run
-/// the bounded-backoff reconnect on a dropped socket. Shared by the
-/// full-screen loop and the embedded (preview-pane) variant; callers
-/// redraw afterwards.
+/// Apply one WebSocket message to the view state: reduce a frame (with turn-edge
+/// queue draining), rehydrate from /replay on Lagged, or run the bounded-backoff
+/// reconnect. Shared with the embedded variant; callers redraw afterwards.
 async fn apply_ws_message(
     state: &mut StructuredViewState,
     toast_deadline: &mut Option<Instant>,
     msg: Result<WsMessage, WsError>,
 ) {
     match msg {
-        Ok(WsMessage::Frame(frame)) => {
+        // Raw frames still stream (they feed `aoe acp tail`); the view renders
+        // the two server-folded projections instead.
+        Ok(WsMessage::Frame(_)) => {}
+        Ok(WsMessage::ReducedState {
+            seq,
+            state: reduced,
+            unchanged,
+        }) => {
             let was_active = state.transcript.turn_active;
-            state.transcript.apply(&frame);
+            state
+                .transcript
+                .apply_reduced_state(seq, *reduced, &unchanged);
             state.reconcile_selection();
+            state.prune_dismissed_notices();
             auto_present_elicitation(state, toast_deadline);
             state.reconcile_slash_selection();
             let now_active = state.transcript.turn_active;
             if !was_active && now_active {
-                // Turn started (our own prompt echoed back, or
-                // another client's). The optimistic lock has
-                // served its purpose; release it.
+                // Turn started; the optimistic lock has served its purpose.
                 state.in_flight = false;
             } else if was_active && !now_active {
-                // Turn ended: release the lock and drain the
-                // next queued batch, if any.
+                // Turn ended: release the lock and pull the post-drain queue
+                // snapshot, since the daemon drains server-side at this edge.
                 state.in_flight = false;
-                maybe_drain(state, toast_deadline).await;
+                refresh_queue(state).await;
             }
+        }
+        Ok(WsMessage::TranscriptSnapshot(rows)) => {
+            // Server-folded rows on connect / reconnect. Reconcile by id, so an
+            // overlap with the initial replay is idempotent.
+            state.transcript.merge_server_rows(rows);
+        }
+        Ok(WsMessage::TranscriptDelta(delta)) => {
+            // One incremental row change folded from a live event.
+            state.transcript.apply_transcript_delta(*delta);
         }
         Ok(WsMessage::Lagged) => {
-            // Daemon evicted events we hadn't seen yet. Drop
-            // local reducer state and rehydrate from /replay.
-            state.transcript.reset();
-            match state
-                .http
-                .replay_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
-                .await
-            {
-                Ok(replay) => {
-                    if replay.lost {
-                        state.transcript.set_lagged();
-                    }
-                    for frame in &replay.frames {
-                        state.transcript.apply(frame);
-                    }
-                    state.reconcile_selection();
-                    auto_present_elicitation(state, toast_deadline);
-                    state.reconcile_slash_selection();
-                    // Re-derived turn state from the rebuilt
-                    // transcript; the lock no longer reflects
-                    // anything observable. Drain if idle.
-                    state.in_flight = false;
-                    maybe_drain(state, toast_deadline).await;
-                }
-                Err(e) => {
-                    set_toast(
-                        state,
-                        toast_deadline,
-                        format!("replay failed: {e}"),
-                        ToastKind::Error,
-                    );
-                }
+            // The daemon evicted events we never saw. It repairs its control
+            // fold at the source, but the row buffer still needs rebuilding and
+            // no reconnect happens on a lag.
+            state.transcript.drop_rows();
+            if let Some(e) = reseed_server_rows(state).await {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("replay failed: {e}"),
+                    ToastKind::Error,
+                );
             }
+            state.reconcile_selection();
+            auto_present_elicitation(state, toast_deadline);
+            state.reconcile_slash_selection();
+            // The optimistic lock no longer reflects anything observable.
+            // Resync the queue mirror too.
+            state.in_flight = false;
+            refresh_queue(state).await;
         }
         Err(e) => {
-            // WS dropped; show a banner and try to reconnect
-            // from the last seq we processed. Bounded backoff
-            // so a flaky daemon restart (e.g. a 2-second
-            // process bounce) survives without paging the
-            // user, but a permanently-down daemon doesn't
-            // pin a worker tight-looping retries.
+            // WS dropped; show a banner and reconnect from the last seq with
+            // bounded backoff, so a brief daemon bounce survives without paging
+            // the user and a dead daemon doesn't pin a worker retrying.
             tracing::warn!(target: "acp.tui.ws", "ws disconnect: {e}");
             set_toast(
                 state,
@@ -588,10 +567,9 @@ async fn apply_ws_message(
                 ToastKind::Error,
             );
             state.ws = None;
-            // Can't observe turn boundaries while the socket
-            // is down; drop the lock so a stuck send doesn't
-            // wedge the composer, and queue any new prompts
-            // (is_busy() is true while ws is None).
+            // Turn boundaries are unobservable while the socket is down: drop
+            // the lock so a stuck send doesn't wedge the composer, and queue new
+            // prompts (is_busy() is true while ws is None).
             state.in_flight = false;
             let since = state.transcript.last_seq;
             match reconnect_with_backoff(&state.endpoint, &state.session_id, since).await {
@@ -603,11 +581,9 @@ async fn apply_ws_message(
                         "ws reconnected".into(),
                         ToastKind::Info,
                     );
-                    // Resumed frames will re-derive turn state
-                    // and drain on the next edge, but if the
-                    // turn already ended before reconnect there
-                    // is no edge to wait for: drain now.
-                    maybe_drain(state, toast_deadline).await;
+                    // Resync the queue after the gap: the daemon may have
+                    // drained entries while the socket was down.
+                    refresh_queue(state).await;
                 }
                 Err(e) => {
                     set_toast(
@@ -622,9 +598,8 @@ async fn apply_ws_message(
     }
 }
 
-/// Show the next buffered plugin notification as a toast, but only when no
-/// toast is currently up, so app toasts (errors, send confirmations) are not
-/// pre-empted and queued notifications show one at a time.
+/// Show the next buffered plugin notification as a toast, but only when no toast
+/// is up, so app toasts are not pre-empted and queued ones show one at a time.
 fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
     if state.toast.is_some() {
         return;
@@ -636,11 +611,11 @@ fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Opti
         Tone::Warn | Tone::Danger => ToastKind::Error,
         _ => ToastKind::Info,
     };
-    // A notification carrying an href is a worker `ui.open_url`: the native TUI
-    // opens it directly the first (and only) time it is shown. The seq dedupe in
-    // `next_plugin_toast` guarantees one open per notification.
+    // A notification carrying an href is a worker `ui.open_url`; the seq dedupe
+    // in `next_plugin_toast` guarantees one open per notification.
     if let Some(href) = &n.href {
-        let _ = crate::tui::open_url::open_url(href);
+        let url = crate::tui::open_url::resolve_href(&state.endpoint.base_url, href);
+        let _ = crate::tui::open_url::open_url(&url);
     }
     let text = match &n.body {
         Some(body) => format!("{}: {body}", n.title),
@@ -657,9 +632,8 @@ async fn handle_terminal_event(
     let has_pending = !state.transcript.pending_approvals.is_empty();
     let intent = match evt {
         CrosstermEvent::Key(key) => {
-            // Skip key-release events on terminals that emit them (Windows
-            // crossterm, kitty enhanced protocol). Otherwise every keypress
-            // triggers two handle_key calls.
+            // Skip key-release events on terminals that emit them; otherwise
+            // every keypress triggers two handle_key calls.
             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 return Ok(false);
             }
@@ -677,16 +651,19 @@ async fn handle_terminal_event(
                     Some(ChoicePurpose::OpenLink)
                 ),
                 has_modes: !state.transcript.available_modes.is_empty(),
+                has_notices: state.visible_notices().next().is_some(),
+                // Esc-to-cancel and other action gates read this: it must
+                // track only the main turn, not a display-only background
+                // sub-agent signal (see `AcpTranscript.background_agent_active`),
+                // or Esc stops being inert while the main turn is genuinely
+                // idle (#4001).
                 agent_busy: state.transcript.turn_active || state.in_flight,
             };
             let intent = input::dispatch(state.focus, &key, ctx);
-            // Plugin keybinds are a fallback: consult them only for a key the
-            // view did not claim (`Ignore`), or a Ctrl-modified chord the
-            // composer would otherwise swallow as text. Composer text entry and
-            // the universal chords keep priority, mirroring how the home view
-            // resolves core bindings before plugin ones. Chords resolve against
-            // the daemon's command list (not the TUI's local registry) so a
-            // remote-daemon session can drive plugins installed only there.
+            // Plugin keybinds are a fallback: consulted only for a key the view
+            // did not claim (`Ignore`), or a Ctrl chord the composer would
+            // swallow as text. Chords resolve against the daemon's command list,
+            // so a remote session can drive plugins installed only there.
             let try_plugin = matches!(intent, Intent::Ignore)
                 || matches!(&intent, Intent::Compose(k) if k.modifiers.contains(KeyModifiers::CONTROL));
             if try_plugin {
@@ -706,28 +683,28 @@ async fn handle_terminal_event(
             }
             intent
         }
-        // Bracketed paste lands as one event with the raw text; it goes
-        // into the composer no matter which pane is focused (there is
-        // nowhere else pasted text could meaningfully go), pulling focus
-        // there so the result is visible.
+        // Bracketed paste goes into the composer whichever pane is focused,
+        // pulling focus there so the result is visible.
         CrosstermEvent::Paste(text) => {
             paste_into_composer(state, &text);
             ensure_files_loaded(state, toast_deadline).await;
             return Ok(false);
         }
-        CrosstermEvent::Mouse(mouse) => {
-            input::dispatch_mouse(&mouse, state.focus, state.layout.as_ref())
-        }
-        // Resize needs no bookkeeping: the caller redraws after every
-        // event and the next frame recomputes the layout.
+        CrosstermEvent::Mouse(mouse) => input::dispatch_mouse(
+            &mouse,
+            state.focus,
+            state.layout.as_ref(),
+            &state.mouse_targets.borrow(),
+        ),
+        // Resize needs no bookkeeping: the next frame recomputes the layout.
         _ => return Ok(false),
     };
     match intent {
         Intent::Ignore => Ok(false),
         Intent::Exit => Ok(true),
         Intent::SetFocus(focus) => {
-            // Approval focus only makes sense when there's one to
-            // select; otherwise fall through to transcript.
+            // Approval focus needs an approval to select; otherwise fall
+            // through to transcript.
             state.focus = if matches!(focus, Focus::Approval) && !has_pending {
                 Focus::Transcript
             } else {
@@ -737,8 +714,8 @@ async fn handle_terminal_event(
             if matches!(state.focus, Focus::Pane) {
                 state.pane_scroll = 0;
             }
-            // Leaving the composer ends any queue-recall browse; the
-            // in-progress text stays put as a draft.
+            // Leaving the composer ends any queue-recall browse; the text stays
+            // put as a draft.
             if state.focus != Focus::Composer {
                 state.cancel_recall();
             }
@@ -746,10 +723,9 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::Compose(k) => {
-            // ratatui_textarea consumes raw crossterm KeyEvent through
-            // its `Input` conversion. Snapshot the slash query first so
-            // we can detect a query-text change (vs. mere cursor motion)
-            // and reset the picker highlight only when the text shifts.
+            // ratatui_textarea consumes raw crossterm KeyEvent. Snapshot the
+            // slash query first to detect a text change (vs. cursor motion) and
+            // reset the picker highlight only then.
             let before = state.slash_query();
             state.composer.input(k);
             if state.slash_query() != before {
@@ -770,6 +746,11 @@ async fn handle_terminal_event(
             state.accept_selected_slash();
             Ok(false)
         }
+        Intent::SlashPick(idx) => {
+            state.slash_selected = idx;
+            state.accept_selected_slash();
+            Ok(false)
+        }
         Intent::SlashDismiss => {
             state.dismiss_slash();
             Ok(false)
@@ -779,6 +760,13 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::MentionAccept => {
+            accept_mention(state);
+            Ok(false)
+        }
+        Intent::MentionPick(idx) => {
+            if let Some(session) = state.mention.as_mut() {
+                session.selected = idx;
+            }
             accept_mention(state);
             Ok(false)
         }
@@ -796,30 +784,23 @@ async fn handle_terminal_event(
             // the recall state.
             let recall = state.recall.take();
             let text = state.take_composer_text();
-            // Submitting while browsing edits that queued entry in place,
-            // preserving its position rather than enqueuing a duplicate.
-            // If the entry drained between recall and now, the index is
-            // stale; fall through to the normal send / queue path so the
-            // edited text is never lost.
+            // Submitting while browsing edits that queued entry in place. If it
+            // drained between recall and now the index is stale, so fall through
+            // to the normal send / queue path and never lose the edited text.
             if !text.is_empty() {
                 if let Some(r) = recall {
-                    if state.queue.replace(r.index, text.clone()) {
-                        set_toast(
-                            state,
-                            toast_deadline,
-                            format!("edited queued prompt ({} waiting)", state.queue.len()),
-                            ToastKind::Info,
-                        );
-                        return Ok(false);
+                    // Edit the queued entry in place on the daemon by its stable
+                    // id; if it drained, fall through to send / queue.
+                    if let Some(id) = state.queue.id_at(r.index).map(str::to_string) {
+                        return Ok(edit_queued_prompt(state, toast_deadline, &id, &text).await);
                     }
                 }
             }
             if text.is_empty() {
-                // Empty Enter is a manual flush: if the agent is idle and
-                // prompts are stuck in the queue (e.g. a drain POST failed
-                // earlier), retry the drain. Otherwise just nudge the user.
+                // Empty Enter is a manual resync now that the daemon owns the
+                // drain: pull a fresh snapshot. Nothing to send.
                 if !state.is_busy() && !state.queue.is_empty() {
-                    maybe_drain(state, toast_deadline).await;
+                    refresh_queue(state).await;
                 } else {
                     set_toast(
                         state,
@@ -830,26 +811,19 @@ async fn handle_terminal_event(
                 }
                 return Ok(false);
             }
-            if state.should_queue_prompt() {
-                // A turn is running on an agent that cannot be steered
-                // (or the socket is down): park the prompt so it drains
-                // when the agent next goes idle.
-                state.queue.push(text);
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("queued ({} waiting)", state.queue.len()),
-                    ToastKind::Info,
-                );
+            // Double-submit lock covering only the window between our POST and
+            // its response; the daemon decides send vs. steer vs. queue.
+            if state.in_flight {
+                state.set_composer_text(&text);
                 return Ok(false);
             }
-            if send_prompt_now(state, toast_deadline, &text).await {
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("prompt sent ({} bytes)", text.len()),
-                    ToastKind::Info,
-                );
+            send_prompt_now(state, toast_deadline, &text).await;
+            Ok(false)
+        }
+        Intent::DismissNotice(id) => {
+            let id = id.or_else(|| state.visible_notices().next().map(|n| n.id.clone()));
+            if let Some(id) = id {
+                state.dismissed_notices.insert(id);
             }
             Ok(false)
         }
@@ -857,16 +831,7 @@ async fn handle_terminal_event(
             if state.queue.is_empty() {
                 return Ok(false);
             }
-            state.queue.clear();
-            // The browsed entry no longer exists; end the browse but keep
-            // whatever text is in the composer as a draft.
-            state.cancel_recall();
-            set_toast(
-                state,
-                toast_deadline,
-                "queue cleared".into(),
-                ToastKind::Info,
-            );
+            clear_queue(state, toast_deadline).await;
             Ok(false)
         }
         Intent::RecallQueued(delta) => {
@@ -900,9 +865,16 @@ async fn handle_terminal_event(
             else {
                 return Ok(false);
             };
+            let decision = match approval_key_outcome(&pending, decision) {
+                ApprovalKeyOutcome::Resolve(decision) => decision,
+                ApprovalKeyOutcome::OpenPicker => {
+                    state.choice = Some(approval_option_picker(&pending));
+                    return Ok(false);
+                }
+            };
             match state
                 .http
-                .resolve_approval(&state.session_id, &pending.nonce, decision)
+                .resolve_approval(&state.session_id, &pending.nonce, decision, None)
                 .await
             {
                 Ok(()) => {
@@ -912,12 +884,10 @@ async fn handle_terminal_event(
                         ApprovalDecisionWire::Deny => "denied",
                         ApprovalDecisionWire::Cancelled => "cancelled",
                     };
-                    // Clear the card now instead of waiting on the
-                    // ApprovalResolved broadcast, which the seq dedupe can
-                    // drop and leave the card stuck. See #1821.
-                    state
-                        .transcript
-                        .resolve_approval_locally(&pending.nonce, ApprovalDecision::from(decision));
+                    // Clear the card now rather than wait on the
+                    // ApprovalResolved broadcast, which the seq dedupe can drop
+                    // and leave the card stuck (#1821).
+                    state.transcript.resolve_approval_locally(&pending.nonce);
                     // The selected/last approval may have just disappeared;
                     // re-anchor focus like the replay/live-frame paths do.
                     state.reconcile_selection();
@@ -928,14 +898,10 @@ async fn handle_terminal_event(
                         ToastKind::Info,
                     );
                 }
-                // The daemon reports the nonce already gone: the approval
-                // resolved server-side (concurrent decision, watchdog
-                // cancel, or no matching option). Clear the card without an
-                // error toast. See #1821.
+                // The nonce is already gone: the approval resolved server-side.
+                // Clear the card without an error toast (#1821).
                 Err(HttpError::ApprovalGone) => {
-                    state
-                        .transcript
-                        .resolve_approval_locally(&pending.nonce, ApprovalDecision::from(decision));
+                    state.transcript.resolve_approval_locally(&pending.nonce);
                     state.reconcile_selection();
                     set_toast(
                         state,
@@ -1054,18 +1020,48 @@ async fn handle_terminal_event(
     }
 }
 
-/// Async pull from the structured view WebSocket. Returns `None` when no ws
-/// handle is currently attached so the select arm degrades to a
-/// timed wait instead of busy-looping.
+/// Track the pointer over the last frame's mouse targets: a picker row takes
+/// the highlight, as the arrow keys would, while a button only gets painted.
+/// Returns whether anything visible changed, so callers redraw only then.
+pub(super) fn handle_hover(state: &mut StructuredViewState, col: u16, row: u16) -> bool {
+    let pos = ratatui::layout::Position::new(col, row);
+    let (picker_row, buttons) = {
+        let targets = state.mouse_targets.borrow();
+        // The picker covers any button drawn under it.
+        let buttons: Vec<_> = if input::over_picker(&targets, pos) {
+            Vec::new()
+        } else {
+            targets.buttons.iter().map(|(rect, _)| *rect).collect()
+        };
+        (input::picker_row_at(&targets, pos), buttons)
+    };
+    let mut changed = state.hover.update(col, row, &buttons);
+    let hovered = picker_row.map(|(_, idx)| idx);
+    changed |= match picker_row.map(|(kind, _)| kind) {
+        Some(PickerKind::Choice) => state
+            .choice
+            .as_mut()
+            .is_some_and(|picker| crate::tui::dialogs::hover_select(&mut picker.selected, hovered)),
+        Some(PickerKind::Slash) => {
+            crate::tui::dialogs::hover_select(&mut state.slash_selected, hovered)
+        }
+        Some(PickerKind::Mention) => state.mention.as_mut().is_some_and(|session| {
+            crate::tui::dialogs::hover_select(&mut session.selected, hovered)
+        }),
+        None => false,
+    };
+    changed
+}
+
+/// Async pull from the structured view WebSocket. `None` when no ws handle is
+/// attached, so the select arm degrades to a timed wait instead of busy-looping.
 async fn recv_ws(state: &mut StructuredViewState) -> Option<Result<WsMessage, WsError>> {
     let ws = state.ws.as_mut()?;
     ws.recv().await
 }
 
-/// Reconnect with three attempts and 250ms / 500ms / 1000ms backoff.
-/// Daemon restarts on the same box come back in under a second; a
-/// remote daemon failure usually doesn't recover inside our budget,
-/// so the user gets a toast and can hit retry themselves.
+/// Reconnect with three attempts and 250ms / 500ms / 1000ms backoff: enough for
+/// a local daemon restart, not enough to pin a worker on a dead remote one.
 async fn reconnect_with_backoff(
     endpoint: &DaemonEndpoint,
     session_id: &str,
@@ -1077,7 +1073,7 @@ async fn reconnect_with_backoff(
         if i > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        match ws_connect(endpoint, session_id, since).await {
+        match ws_connect_projections_only(endpoint, session_id, since).await {
             Ok(handle) => return Ok(handle),
             Err(e) => {
                 tracing::debug!(
@@ -1093,8 +1089,7 @@ async fn reconnect_with_backoff(
 }
 
 /// Open the permission-mode picker over the modes the agent advertised,
-/// preselecting the current mode. No-op when none were announced (the
-/// `m` key is also gated on that, so this is defense in depth).
+/// preselecting the current one. No-op when none were announced.
 fn open_mode_picker(state: &mut StructuredViewState) {
     let modes = &state.transcript.available_modes;
     if modes.is_empty() {
@@ -1117,17 +1112,11 @@ fn open_mode_picker(state: &mut StructuredViewState) {
     });
 }
 
-/// Start the native answer flow for the oldest pending elicitation, when
-/// its form is answerable in the TUI: every required question is a
-/// single-select with options (the AskUserQuestion shape; its optional
-/// free-text "custom answer" fields are simply omitted). Richer forms
-/// (required free text, multi-select, numbers) punt to the web with a
-/// toast instead of half-answering.
-/// Present a pending single-select question as its answer menu, once
-/// per question, so an elicitation surfaces itself the way a native
-/// agent would (the menu just appears) without any focus juggling.
-/// Approvals take priority (they are already modal via
-/// `reconcile_selection`); a menu the user has open is left alone.
+/// Start the native answer flow for the oldest pending elicitation when every
+/// required question is a single-select with options (the AskUserQuestion
+/// shape). Richer forms punt to the web with a toast rather than half-answering.
+/// Present a pending single-select question as its answer menu, once per
+/// question. Approvals take priority; a menu the user has open is left alone.
 fn auto_present_elicitation(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
     if state.choice.is_some() || !state.transcript.pending_approvals.is_empty() {
         return;
@@ -1200,8 +1189,7 @@ fn question_picker(
         .clone()
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| {
-            // Later questions in a multi-question form advance with an
-            // empty lead-in; never render a blank picker title.
+            // Later questions advance with an empty lead-in; never a blank title.
             if message.trim().is_empty() {
                 "Answer".to_string()
             } else {
@@ -1225,9 +1213,57 @@ fn question_picker(
     }
 }
 
-/// Accept the open choice picker's highlighted option: set the mode, or
-/// record the answer and advance the elicitation flow (POSTing the
-/// accumulated answers once the last question is picked).
+/// What a decision key means for the selected approval.
+enum ApprovalKeyOutcome {
+    Resolve(ApprovalDecisionWire),
+    /// Ask which option the user meant before resolving anything.
+    OpenPicker,
+}
+
+/// Map a decision key onto what it can actually mean for this approval.
+///
+/// An answer list has no permission vocabulary, so an allow-shaped key opens the
+/// picker instead of guessing an option and `d` dismisses without answering.
+/// Dismissal must be `Cancelled`, not `Deny`, or the daemon would send the first
+/// reject-kind option as the user's answer (#3741).
+fn approval_key_outcome(
+    pending: &reducer::PendingApproval,
+    decision: ApprovalDecisionWire,
+) -> ApprovalKeyOutcome {
+    if !pending.choice || pending.options.is_empty() {
+        return ApprovalKeyOutcome::Resolve(decision);
+    }
+    match decision {
+        ApprovalDecisionWire::Deny => ApprovalKeyOutcome::Resolve(ApprovalDecisionWire::Cancelled),
+        ApprovalDecisionWire::Cancelled => ApprovalKeyOutcome::Resolve(decision),
+        ApprovalDecisionWire::Allow | ApprovalDecisionWire::AllowAlways => {
+            ApprovalKeyOutcome::OpenPicker
+        }
+    }
+}
+
+/// Build the option picker for a permission request whose options carry
+/// a question. Rows are `(option_id, name)`; accepting POSTs the chosen
+/// `option_id`. See #3741.
+fn approval_option_picker(pending: &reducer::PendingApproval) -> ChoicePicker {
+    ChoicePicker {
+        title: format!(" {} (Enter=pick · Esc=dismiss) ", pending.title),
+        options: pending
+            .options
+            .iter()
+            .map(|o| (o.option_id.clone(), o.name.clone()))
+            .collect(),
+        selected: 0,
+        purpose: ChoicePurpose::Approval {
+            nonce: pending.nonce.clone(),
+        },
+    }
+}
+
+/// Accept the open choice picker's highlighted option: set the mode,
+/// answer a permission question, or record the answer and advance the
+/// elicitation flow (POSTing the accumulated answers once the last
+/// question is picked).
 async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
     use crate::acp::elicitations::AnswerValue;
 
@@ -1260,6 +1296,51 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
                 );
             }
         },
+        // `value` is the option_id the agent offered; the server checks
+        // it still belongs to the pending request.
+        ChoicePurpose::Approval { nonce } => {
+            match state
+                .http
+                .resolve_approval(
+                    &state.session_id,
+                    &nonce,
+                    ApprovalDecisionWire::Allow,
+                    Some(value),
+                )
+                .await
+            {
+                // Clear locally now; the ApprovalResolved broadcast also
+                // clears it, but the seq dedupe can swallow that.
+                Ok(()) => {
+                    state.transcript.resolve_approval_locally(&nonce);
+                    state.reconcile_selection();
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("answered {label}"),
+                        ToastKind::Info,
+                    );
+                }
+                Err(HttpError::ApprovalGone) => {
+                    state.transcript.resolve_approval_locally(&nonce);
+                    state.reconcile_selection();
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        "question already answered".into(),
+                        ToastKind::Info,
+                    );
+                }
+                Err(e) => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("approval failed: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+            }
+        }
         ChoicePurpose::Elicitation {
             nonce,
             field_key,
@@ -1348,7 +1429,8 @@ async fn handle_plugin_command(
 /// Open one resolved plugin link in the browser (through the test seam) and
 /// toast the outcome.
 fn open_link(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>, href: &str) {
-    if let Err(e) = crate::tui::open_url::open_url(href) {
+    let url = crate::tui::open_url::resolve_href(&state.endpoint.base_url, href);
+    if let Err(e) = crate::tui::open_url::open_url(&url) {
         set_toast(
             state,
             toast_deadline,
@@ -1387,7 +1469,7 @@ fn open_link_picker(state: &mut StructuredViewState, links: Vec<(String, String)
 /// post-edit bookkeeping as typed input (slash-picker highlight reset,
 /// `@`-mention recompute). A modal approval or choice keeps focus while
 /// the paste is safely retained as a composer draft.
-fn paste_into_composer(state: &mut StructuredViewState, text: &str) {
+pub(super) fn paste_into_composer(state: &mut StructuredViewState, text: &str) {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     if state.focus != Focus::Composer
         && state.choice.is_none()
@@ -1589,50 +1671,168 @@ fn set_toast(
 /// echo clears it) so a rapid second Enter queues instead of double-
 /// firing; it is released on failure since no turn began. Returns whether
 /// the POST succeeded.
+/// POST a prompt and reflect whatever the daemon says it did with it.
+///
+/// The daemon owns the send / steer / queue decision (Tier 3), so this no
+/// longer predicts it. A `queued` disposition means the row already exists
+/// server-side, so pull the authoritative snapshot rather than synthesizing a
+/// local mirror entry. On a transport failure the composer text is restored so
+/// the prompt is never lost.
 async fn send_prompt_now(
     state: &mut StructuredViewState,
     toast_deadline: &mut Option<Instant>,
     text: &str,
-) -> bool {
+) {
+    use crate::acp::client::http::PromptDispositionWire;
     state.in_flight = true;
-    match state.http.prompt(&state.session_id, text).await {
-        Ok(()) => true,
+    match state.http.prompt(&state.session_id, text, false).await {
+        Ok(dispatch) => match dispatch.disposition {
+            PromptDispositionWire::Queued => {
+                // A queued prompt starts no turn, so nothing will clear the
+                // submit lock for us.
+                state.in_flight = false;
+                refresh_queue(state).await;
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("queued ({} waiting)", state.queue.len()),
+                    ToastKind::Info,
+                );
+            }
+            PromptDispositionWire::Sent | PromptDispositionWire::Steered => {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("prompt sent ({} bytes)", text.len()),
+                    ToastKind::Info,
+                );
+            }
+        },
         Err(e) => {
             state.in_flight = false;
+            state.set_composer_text(text);
             set_toast(
                 state,
                 toast_deadline,
                 format!("send failed: {e}"),
                 ToastKind::Error,
             );
-            false
         }
     }
 }
 
-/// Drain the next queued batch if the agent is idle. The batch is removed
-/// from the queue only after its POST succeeds, so a failed send leaves
-/// the prompts in place to retry (via the next turn-end edge or an empty-
-/// composer flush) instead of silently dropping them.
-async fn maybe_drain(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
-    if state.is_busy() || state.queue.is_empty() {
-        return;
+/// Edit a queued prompt's text on the daemon in place (by its stable id), then
+/// mirror the change locally. Always returns `false` (the dispatcher's
+/// should-exit flag). On failure the edited text is restored to the composer so
+/// it is not lost.
+async fn edit_queued_prompt(
+    state: &mut StructuredViewState,
+    toast_deadline: &mut Option<Instant>,
+    id: &str,
+    text: &str,
+) -> bool {
+    let http = state.http.clone();
+    let session_id = state.session_id.clone();
+    match http.queue_edit(&session_id, id, text).await {
+        Ok(()) => {
+            state.queue.set_text(id, text);
+            set_toast(
+                state,
+                toast_deadline,
+                format!("edited queued prompt ({} waiting)", state.queue.len()),
+                ToastKind::Info,
+            );
+        }
+        Err(e) => {
+            state.set_composer_text(text);
+            set_toast(
+                state,
+                toast_deadline,
+                format!("edit failed: {e}"),
+                ToastKind::Error,
+            );
+        }
     }
-    let Some((text, count)) = state.queue.next_batch() else {
-        return;
-    };
-    if send_prompt_now(state, toast_deadline, &text).await {
-        state.queue.drop_front(count);
-        // Keep an in-progress ArrowUp/ArrowDown browse pointing at the
-        // right entry now that the front of the queue shifted.
-        state.reconcile_recall_after_drain(count);
-        let remaining = state.queue.len();
-        let msg = if remaining == 0 {
-            "queue drained".to_string()
-        } else {
-            format!("draining queue ({remaining} waiting)")
-        };
-        set_toast(state, toast_deadline, msg, ToastKind::Info);
+    false
+}
+
+/// Clear the daemon-owned queue, then drop the local mirror and end any recall
+/// browse (keeping the composer text as a draft). Leaves the mirror intact on
+/// failure so the user can retry.
+async fn clear_queue(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
+    let http = state.http.clone();
+    let session_id = state.session_id.clone();
+    match http.queue_clear(&session_id).await {
+        Ok(()) => {
+            state.queue.clear();
+            state.cancel_recall();
+            set_toast(
+                state,
+                toast_deadline,
+                "queue cleared".into(),
+                ToastKind::Info,
+            );
+        }
+        Err(e) => {
+            set_toast(
+                state,
+                toast_deadline,
+                format!("clear failed: {e}"),
+                ToastKind::Error,
+            );
+        }
+    }
+}
+
+/// Open the session WebSocket for a view that reads only the folded
+/// projections, so the daemon skips forwarding the raw event frames.
+async fn ws_connect_projections_only(
+    endpoint: &DaemonEndpoint,
+    session_id: &str,
+    since: u64,
+) -> Result<crate::acp::client::WsHandle, WsError> {
+    ws_connect_with(endpoint, session_id, since, false).await
+}
+
+/// Fetch the server-folded transcript rows via `?view=rows` and reconcile
+/// them into the row buffer. Used on open and after a lag (a lag does not
+/// reconnect the socket, so no fresh `transcript_snapshot` arrives).
+/// Best-effort: a transient failure leaves the buffer for the WS snapshot or
+/// the next reseed to fill, and is returned so the caller can surface it.
+async fn reseed_server_rows(state: &mut StructuredViewState) -> Option<String> {
+    match state
+        .http
+        .replay_rows_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
+        .await
+    {
+        Ok((rows, lost)) => {
+            if lost {
+                state.transcript.set_lagged();
+            }
+            state.transcript.merge_server_rows(rows);
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "acp.tui",
+                "transcript rows replay failed; waiting for the WS snapshot: {e}"
+            );
+            Some(e.to_string())
+        }
+    }
+}
+
+/// Pull a fresh daemon queue snapshot into the mirror, preserving an active
+/// recall browse. Best-effort: a transient failure keeps the last snapshot
+/// rather than blanking the strip.
+async fn refresh_queue(state: &mut StructuredViewState) {
+    let http = state.http.clone();
+    let session_id = state.session_id.clone();
+    match http.queue_list(&session_id).await {
+        Ok(entries) => state.set_queue_snapshot(entries),
+        Err(e) => {
+            tracing::warn!(target: "acp.tui", "queue refresh failed; keeping last snapshot: {e}")
+        }
     }
 }
 
@@ -1723,6 +1923,8 @@ mod tests {
         assert_eq!(state.pane_scroll, u16::MAX);
         apply_pane_scroll(&mut state, i32::MIN);
         assert_eq!(state.pane_scroll, 0, "g jumps to the top");
+        apply_pane_scroll(&mut state, -5);
+        assert_eq!(state.pane_scroll, 0, "saturates at the top");
     }
 
     #[test]
@@ -1741,38 +1943,27 @@ mod tests {
     }
 
     #[test]
-    fn pane_scroll_up_at_the_top_saturates() {
-        let mut state = test_state();
-        state.last_pane_scroll_max.set(30);
-        apply_pane_scroll(&mut state, -5);
-        assert_eq!(state.pane_scroll, 0);
-    }
-
-    #[test]
     fn paste_inserts_at_caret_and_focuses_composer() {
-        let mut state = test_state();
-        state.focus = Focus::Transcript;
-        paste_into_composer(&mut state, "hello world");
-        assert_eq!(composer_text(&state), "hello world");
-        assert_eq!(state.focus, Focus::Composer);
-    }
-
-    #[test]
-    fn paste_normalizes_crlf_and_cr_to_newlines() {
-        let mut state = test_state();
-        state.focus = Focus::Composer;
-        paste_into_composer(&mut state, "one\r\ntwo\rthree");
-        assert_eq!(composer_text(&state), "one\ntwo\nthree");
-        assert_eq!(state.composer.lines().len(), 3);
-    }
-
-    #[test]
-    fn paste_appends_to_existing_draft() {
-        let mut state = test_state();
-        state.focus = Focus::Composer;
-        state.composer.insert_str("fix this: ");
-        paste_into_composer(&mut state, "Error: thing broke");
-        assert_eq!(composer_text(&state), "fix this: Error: thing broke");
+        // (draft, pasted, composer text after, mention picker opens)
+        for (draft, pasted, want, mention) in [
+            ("", "hello world", "hello world", false),
+            ("", "one\r\ntwo\rthree", "one\ntwo\nthree", false),
+            (
+                "fix this: ",
+                "Error: thing broke",
+                "fix this: Error: thing broke",
+                false,
+            ),
+            ("", "look at @src", "look at @src", true),
+        ] {
+            let mut state = test_state();
+            state.focus = Focus::Transcript;
+            state.composer.insert_str(draft);
+            paste_into_composer(&mut state, pasted);
+            assert_eq!(composer_text(&state), want);
+            assert_eq!(state.focus, Focus::Composer);
+            assert_eq!(state.mention.is_some(), mention, "{pasted:?}");
+        }
     }
 
     #[test]
@@ -1783,6 +1974,12 @@ mod tests {
             .pending_approvals
             .push(reducer::PendingApproval {
                 nonce: "approval-1".into(),
+                title: "Read file".into(),
+                kind: "read".into(),
+                args: r#"{"path":"src/lib.rs"}"#.into(),
+                destructive: false,
+                options: Vec::new(),
+                choice: false,
             });
         state.reconcile_selection();
         assert_eq!(state.focus, Focus::Approval);
@@ -1793,15 +1990,94 @@ mod tests {
         assert_eq!(state.focus, Focus::Approval);
     }
 
+    use crate::acp::approvals::{ApprovalOption, ApprovalOptionKind};
+
+    fn pending_approval(choice: bool, options: Vec<ApprovalOption>) -> reducer::PendingApproval {
+        reducer::PendingApproval {
+            nonce: "approval-1".into(),
+            title: "Pick a plan".into(),
+            kind: "other".into(),
+            args: "{}".into(),
+            destructive: false,
+            options,
+            choice,
+        }
+    }
+
+    fn answer_options(kind: ApprovalOptionKind) -> Vec<ApprovalOption> {
+        ["Alpha", "Bravo"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ApprovalOption {
+                option_id: format!("choice-{i}"),
+                name: (*name).into(),
+                kind,
+            })
+            .collect()
+    }
+
+    /// Dismissing an answer list must cancel, never deny: a deny is
+    /// resolved by kind server-side, so on a reject-kind answer list it
+    /// would send the first option as the user's answer. See #3741.
     #[test]
-    fn paste_opens_mention_picker_when_text_ends_in_at_token() {
-        let mut state = test_state();
-        state.focus = Focus::Composer;
-        paste_into_composer(&mut state, "look at @src");
-        assert!(
-            state.mention.is_some(),
-            "pasted trailing @-token should open the mention picker"
+    fn decision_keys_mean_different_things_on_an_answer_list() {
+        let allow_list = pending_approval(true, answer_options(ApprovalOptionKind::AllowOnce));
+        let reject_list = pending_approval(true, answer_options(ApprovalOptionKind::RejectOnce));
+        let plain = pending_approval(false, Vec::new());
+        // Flagged a choice, but with nothing to render: the trio stands.
+        let empty = pending_approval(true, Vec::new());
+
+        for list in [&allow_list, &reject_list] {
+            assert!(matches!(
+                approval_key_outcome(list, ApprovalDecisionWire::Deny),
+                ApprovalKeyOutcome::Resolve(ApprovalDecisionWire::Cancelled)
+            ));
+            for key in [
+                ApprovalDecisionWire::Allow,
+                ApprovalDecisionWire::AllowAlways,
+            ] {
+                assert!(matches!(
+                    approval_key_outcome(list, key),
+                    ApprovalKeyOutcome::OpenPicker
+                ));
+            }
+        }
+
+        for approval in [&plain, &empty] {
+            for key in [
+                ApprovalDecisionWire::Allow,
+                ApprovalDecisionWire::AllowAlways,
+                ApprovalDecisionWire::Deny,
+            ] {
+                assert!(
+                    matches!(
+                        approval_key_outcome(approval, key),
+                        ApprovalKeyOutcome::Resolve(resolved) if resolved == key
+                    ),
+                    "{key:?} must pass through unchanged"
+                );
+            }
+        }
+    }
+
+    /// A question option list becomes a picker whose rows submit the
+    /// agent's own `option_id`, not an allow-once guess. See #3741.
+    #[test]
+    fn approval_option_picker_submits_the_agents_option_ids() {
+        let pending = pending_approval(true, answer_options(ApprovalOptionKind::AllowOnce));
+        let picker = approval_option_picker(&pending);
+        assert!(picker.title.contains("Pick a plan"));
+        assert_eq!(
+            picker.options,
+            vec![
+                ("choice-0".to_string(), "Alpha".to_string()),
+                ("choice-1".to_string(), "Bravo".to_string()),
+            ]
         );
+        match picker.purpose {
+            ChoicePurpose::Approval { nonce } => assert_eq!(nonce, "approval-1"),
+            _ => panic!("expected approval purpose"),
+        }
     }
 
     fn mode(id: &str, name: &str) -> crate::acp::state::ModeInfo {
@@ -1822,13 +2098,10 @@ mod tests {
         assert_eq!(picker.selected, 1, "current mode preselected");
         assert_eq!(picker.options[1].0, "plan");
         assert!(matches!(picker.purpose, ChoicePurpose::Mode));
-    }
 
-    #[test]
-    fn mode_picker_noops_without_advertised_modes() {
         let mut state = test_state();
         open_mode_picker(&mut state);
-        assert!(state.choice.is_none());
+        assert!(state.choice.is_none(), "no advertised modes: no-op");
     }
 
     fn select_question(
@@ -1903,6 +2176,7 @@ mod tests {
                 select_question("question_0", "Proceed?", true, &["Yes", "No"]),
                 // The AskUserQuestion optional custom-answer box is skipped.
                 free_text_question("question_0_custom", false),
+                select_question("question_1", "Second?", true, &["C", "D"]),
             ],
         ));
         start_elicitation_answer(&mut state, &mut deadline);
@@ -1918,10 +2192,12 @@ mod tests {
             } => {
                 assert_eq!(nonce, &expected_nonce);
                 assert_eq!(field_key, "question_0");
-                assert!(remaining.is_empty());
+                // Later questions are asked in sequence.
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].field_key, "question_1");
                 assert!(answers.is_empty());
             }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+            ChoicePurpose::Mode | ChoicePurpose::OpenLink | ChoicePurpose::Approval { .. } => {
                 panic!("expected elicitation purpose")
             }
         }
@@ -1965,28 +2241,140 @@ mod tests {
         );
     }
 
-    #[test]
-    fn multi_question_form_asks_questions_in_sequence() {
-        let mut state = test_state();
-        let mut deadline = None;
-        state.transcript.pending_elicitations.push(pending(
-            &test_nonce(),
-            vec![
-                select_question("question_0", "First?", true, &["A", "B"]),
-                select_question("question_1", "Second?", true, &["C", "D"]),
-            ],
-        ));
-        start_elicitation_answer(&mut state, &mut deadline);
-        let picker = state.choice.as_ref().expect("picker open");
-        assert!(picker.title.contains("First?"));
-        match &picker.purpose {
-            ChoicePurpose::Elicitation { remaining, .. } => {
-                assert_eq!(remaining.len(), 1);
-                assert_eq!(remaining[0].field_key, "question_1");
-            }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
-                panic!("expected elicitation purpose")
-            }
+    fn draw(state: &mut StructuredViewState) {
+        let theme = Theme::default();
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| {
+                state.layout = Some(render::compute_layout(f.area(), state));
+                render::render(f, f.area(), &theme, state, true);
+            })
+            .expect("draw");
+    }
+
+    fn left_click(column: u16, row: u16) -> CrosstermEvent {
+        CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// Each picker's rows, as drawn, take the highlight on hover (reporting a
+    /// change only when it moves) and accept on click the way Enter would.
+    /// The choice picker's click is `ChoicePick`, covered by the dispatcher.
+    #[tokio::test]
+    async fn picker_rows_follow_hover_and_accept_on_click() {
+        let slash = || {
+            let mut state = test_state();
+            state.transcript.available_commands = ["compact", "clear", "cost"]
+                .iter()
+                .map(|name| crate::acp::state::AvailableCommand {
+                    name: (*name).into(),
+                    description: String::new(),
+                    accepts_input: false,
+                })
+                .collect();
+            state.composer.insert_str("/c");
+            state
+        };
+        let mention = || {
+            let mut state = test_state();
+            state.file_index = FileIndex::Loaded {
+                files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+                truncated: false,
+            };
+            state.composer.insert_str("@");
+            refresh_mention(&mut state);
+            state
+        };
+        let choice = || {
+            let mut state = test_state();
+            open_link_picker(
+                &mut state,
+                ["x", "y", "z"]
+                    .iter()
+                    .map(|l| (format!("https://{l}"), (*l).to_string()))
+                    .collect(),
+            );
+            state
+        };
+        let selected = |state: &StructuredViewState, kind| match kind {
+            PickerKind::Choice => state.choice.as_ref().map(|c| c.selected),
+            PickerKind::Slash => Some(state.slash_selected),
+            PickerKind::Mention => state.mention.as_ref().map(|m| m.selected),
+        };
+        let cases: [(PickerKind, &dyn Fn() -> StructuredViewState); 3] = [
+            (PickerKind::Slash, &slash),
+            (PickerKind::Mention, &mention),
+            (PickerKind::Choice, &choice),
+        ];
+        for (kind, setup) in cases {
+            let mut state = setup();
+            draw(&mut state);
+            let target = state.mouse_targets.borrow().picker.expect("picker drawn");
+            assert_eq!((target.kind, target.first), (kind, 0));
+            let (x, y) = (target.rows.x + 1, target.rows.y);
+            assert!(handle_hover(&mut state, x, y + 1), "{kind:?}");
+            assert_eq!(selected(&state, kind), Some(1), "{kind:?}");
+            assert!(!handle_hover(&mut state, x + 1, y + 1), "{kind:?} same row");
+            // The border row is not a row.
+            assert!(!handle_hover(&mut state, x, target.area.y), "{kind:?}");
+            assert_eq!(selected(&state, kind), Some(1), "{kind:?}");
+
+            // The third row, as ranked on screen.
+            let want = match kind {
+                PickerKind::Slash => format!("/{} ", state.slash_matches()[2].name),
+                PickerKind::Mention => format!(":file[{}] ", filtered_mention_files(&state)[2]),
+                PickerKind::Choice => continue,
+            };
+            let mut deadline = None;
+            handle_terminal_event(&mut state, left_click(x, y + 2), &mut deadline)
+                .await
+                .expect("click");
+            assert_eq!(composer_text(&state), want, "{kind:?}");
+            assert!(state.mention.is_none(), "{kind:?}");
         }
+    }
+
+    /// Approval buttons paint under the pointer without moving focus or the
+    /// selection, and go inert while a choice picker owns the keyboard.
+    #[test]
+    fn approval_buttons_hover_is_visual_only() {
+        let mut state = test_state();
+        state
+            .transcript
+            .pending_approvals
+            .push(pending_approval(false, Vec::new()));
+        state.reconcile_selection();
+        state.focus = Focus::Composer;
+        draw(&mut state);
+        let buttons = state.mouse_targets.borrow().buttons.clone();
+        let intents: Vec<_> = buttons.iter().map(|(_, i)| i.clone()).collect();
+        assert_eq!(
+            intents,
+            vec![
+                Intent::ResolveApproval(ApprovalDecisionWire::Allow),
+                Intent::ResolveApproval(ApprovalDecisionWire::AllowAlways),
+                Intent::ResolveApproval(ApprovalDecisionWire::Deny),
+                Intent::CancelInFlight,
+            ]
+        );
+        let deny = buttons[2].0;
+        assert!(handle_hover(&mut state, deny.x, deny.y));
+        assert_eq!(state.hover.current(), Some(deny));
+        assert!(!handle_hover(&mut state, deny.right() - 1, deny.y));
+        assert_eq!(state.focus, Focus::Composer);
+        assert!(handle_hover(&mut state, 0, 0));
+        assert_eq!(state.hover.current(), None);
+
+        state.choice = Some(approval_option_picker(&pending_approval(
+            true,
+            answer_options(ApprovalOptionKind::AllowOnce),
+        )));
+        draw(&mut state);
+        assert!(state.mouse_targets.borrow().buttons.is_empty());
     }
 }

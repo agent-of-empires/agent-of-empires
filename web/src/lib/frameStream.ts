@@ -1,35 +1,17 @@
-// Client half of the live-view compressed frame stream (see the `caps`
-// entry in src/server/live_ws.rs). The server sends binary WS messages
-// carrying one connection-lifetime raw-deflate stream, sync-flushed per
-// frame; the decompressed plaintext is a sequence of `u32-LE length ||
-// frame JSON` records. One stream rather than per-message compression on
-// purpose: consecutive frames are near-identical, so the shared dictionary
-// turns each into back-references (delta encoding without diff
-// bookkeeping), which is what keeps 60fps scroll bursts to a few hundred
-// bytes per frame.
+// Client half of the live-view compressed frame stream (see `caps` in src/server/live_ws.rs): one raw-deflate stream per connection of `u32-LE length || JSON` records, so near-identical frames compress to back-references.
 
-/** True when this browser can inflate the compressed frame stream; gates
- *  the client's `caps` advertisement, so unsupported browsers (and jsdom)
- *  simply keep receiving JSON text frames. */
+/** Gates the `caps` advertisement; others keep JSON text frames. */
 export function supportsFrameDeflate(): boolean {
   return typeof DecompressionStream === "function";
 }
 
 export interface FrameInflater {
-  /** Feed one binary WS message's bytes. Ordering is the caller's WS
-   *  message order; the stream is inherently sequential. */
+  /** Must be called in WS message order. */
   push(chunk: ArrayBuffer): void;
-  /** Tear down the stream (connection closed / hook unmounted). */
   dispose(): void;
 }
 
-/**
- * One inflater per WS connection. `onFrame` receives each decoded frame's
- * JSON text, in order. `onError` fires once on a corrupt stream (bad
- * record framing, inflate failure); the caller should drop the connection
- * and let its reconnect machinery redial, since a mid-stream inflate state
- * is unrecoverable.
- */
+/** `onError` fires once on a corrupt stream; the caller should reconnect. */
 export function createFrameInflater(onFrame: (json: string) => void, onError: (err: unknown) => void): FrameInflater {
   const stream = new DecompressionStream("deflate-raw");
   const writer = stream.writable.getWriter();
@@ -56,8 +38,7 @@ export function createFrameInflater(onFrame: (json: string) => void, onError: (e
           next.set(value, buf.length);
           buf = next;
         }
-        // Drain complete records; a record split across inflate chunks
-        // just waits for the rest.
+        // A record split across inflate chunks waits for the rest.
         let pos = 0;
         while (buf.length - pos >= 4) {
           const len = new DataView(buf.buffer, buf.byteOffset + pos, 4).getUint32(0, true);
@@ -74,8 +55,7 @@ export function createFrameInflater(onFrame: (json: string) => void, onError: (e
 
   return {
     push(chunk: ArrayBuffer) {
-      // Writes queue in order on the stream's internal queue; per-write
-      // await would serialize against inflate for no benefit.
+      // Writes queue in order internally.
       writer.write(new Uint8Array(chunk)).catch(fail);
     },
     dispose() {

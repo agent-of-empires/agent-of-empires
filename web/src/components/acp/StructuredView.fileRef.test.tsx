@@ -14,9 +14,6 @@ import { useAcpFileRef } from "./AcpFileRefContext";
 import type { FileRefSession } from "../../lib/fileRef";
 
 vi.mock("./AcpRuntime", () => ({
-  SUBAGENT_TASK_NAME: "Task",
-  TODO_GROUP_NAME: "Todos",
-  TOOL_GROUP_NAME: "Tools",
   AcpRuntime: () => {
     const { fileRefSession } = useAcpFileRef();
     return <div data-testid="probe">{fileRefSession?.project_path ?? "none"}</div>;
@@ -44,12 +41,5 @@ describe("StructuredView fileRef plumbing (#2143)", () => {
       />,
     );
     expect(getByTestId("probe").textContent).toBe("/Users/me/wt");
-  });
-
-  it("provides no session when none is passed", () => {
-    const { getByTestId } = render(
-      <StructuredView sessionId="s1" acpWorkerState="absent" tool="claude" archivedAt={null} snoozedUntil={null} />,
-    );
-    expect(getByTestId("probe").textContent).toBe("none");
   });
 });

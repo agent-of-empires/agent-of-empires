@@ -1,16 +1,4 @@
-// Browser-side error capture + batched relay to /api/client-log.
-//
-// Captures window.onerror, unhandledrejection, React ErrorBoundary
-// (via reportError), and explicit reportError() calls.
-//
-// Throttling: token-bucket (10 cap, 10/s refill) on entries. Batches
-// flush every 2s, on size threshold, on visibilitychange=hidden, and
-// on pagehide. Unload-time flush uses navigator.sendBeacon with a JSON
-// Blob since sendBeacon can't carry the Authorization header; the
-// cookie-mode auth still works in that path.
-//
-// URL sanitization: never log `window.location.href` raw, because we
-// embed the auth token in `?token=` and don't want it on disk.
+// Browser error capture relayed in batches to /api/client-log, token-bucket throttled, flushed on a timer, size, hide, and pagehide (via sendBeacon). URLs are sanitized because they may carry `?token=`.
 
 export type ClientLogLevel = "error" | "warn" | "info" | "debug";
 

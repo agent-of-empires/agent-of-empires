@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::TryRecvError;
 
-use crate::session::deletion::perform_deletion;
+use crate::session::deletion::execute_deletion;
 pub use crate::session::deletion::{DeletionRequest, DeletionResult};
 use crate::tui::worker::Worker;
 
@@ -13,7 +13,7 @@ pub struct DeletionPoller {
 impl DeletionPoller {
     pub fn new() -> Self {
         Self {
-            worker: Worker::spawn("aoe-deletion-poller", |request| perform_deletion(&request)),
+            worker: Worker::spawn("aoe-deletion-poller", execute_deletion),
         }
     }
 
@@ -46,8 +46,9 @@ mod tests {
     }
 
     #[test]
-    fn test_deletion_poller_channel_communication() {
+    fn deletion_poller_round_trips_a_request() {
         let poller = DeletionPoller::new();
+        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
         let instance = create_test_instance();
         let session_id = instance.id.clone();
 
@@ -73,12 +74,6 @@ mod tests {
         let result = result.expect("Timed out waiting for deletion result");
 
         assert_eq!(result.session_id, session_id);
-        assert!(result.success);
-    }
-
-    #[test]
-    fn test_deletion_poller_try_recv_returns_empty_when_idle() {
-        let poller = DeletionPoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
+        assert!(!result.success);
     }
 }

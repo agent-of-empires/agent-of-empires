@@ -6,7 +6,6 @@ import { isIOS, isStandalone } from "../platform";
 
 afterEach(() => {
   vi.restoreAllMocks();
-  // jsdom has neither of these by default; clear any per-test stubs.
   delete (window.navigator as unknown as { standalone?: boolean }).standalone;
   delete (window as unknown as { matchMedia?: unknown }).matchMedia;
 });

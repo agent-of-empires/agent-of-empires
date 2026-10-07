@@ -10,40 +10,72 @@ use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
 use crate::tui::components::{
     focused_input_spans, input_scroll, profile_cycler_spans, render_text_field,
     render_text_field_with_ghost, render_tool_config_overlay, set_prefixed_input_cursor_position,
-    tool_config_suffix_spans, tool_cycler_spans, visible_slice,
+    tool_cycler_spans, tool_row_suffix_spans, visible_slice,
 };
 use crate::tui::styles::Theme;
 
+/// What [`NewSessionDialog::render_list_field`] needs to draw one editable
+/// list: the two it serves differ only in wording and whether the add/edit
+/// input offers a ghost completion.
+struct ListField<'a> {
+    label: &'static str,
+    /// Plural noun in the collapsed `[N <unit>]` summary.
+    unit: &'static str,
+    hint: &'static str,
+    empty_hint: &'static str,
+    entries: &'a [String],
+    selected: usize,
+    expanded: bool,
+    editing: Option<&'a Input>,
+    adding_new: bool,
+    ghost: Option<String>,
+    focused: bool,
+}
+
+/// The first row of a field's rect: fields reserve a spacer row below their
+/// content, which the hover tint leaves alone.
+fn label_row(rect: Rect) -> Rect {
+    Rect {
+        height: rect.height.min(1),
+        ..rect
+    }
+}
+
+/// Hoverable rows of a config overlay: list entries first, since the list
+/// field's own rect spans them, then each field's label row.
+fn overlay_hover_rects(entries: &[(usize, Rect)], fields: &[(usize, Rect)]) -> Vec<Rect> {
+    entries
+        .iter()
+        .map(|(_, r)| *r)
+        .chain(fields.iter().map(|(_, r)| label_row(*r)))
+        .collect()
+}
+
 impl NewSessionDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Rebuilt every frame: layout changes (a profile gains/loses
-        // its description row, scratch toggles off worktree, etc.) move
-        // every subsequent field, so stale rects would point at the
-        // wrong row. Clearing here also wipes rects when an overlay
-        // mode replaces the main form, so a click during sandbox /
-        // tool / worktree config mode doesn't snap focus to whatever
-        // main-form field used to be under that cell.
+        // Rebuilt every frame: a layout change moves every later field, so a
+        // stale rect points at the wrong row. Clearing here also empties them
+        // while an overlay replaces the main form.
         self.focusable_rects.clear();
+        self.list_entry_rects.clear();
+        self.confirm_create_rects.clear();
+        self.hover_rects.clear();
 
-        // If loading, render the loading overlay instead
         if self.loading {
             self.render_loading(frame, area, theme);
             return;
         }
 
-        // If in sandbox config mode, render that overlay instead
         if self.sandbox_config_mode {
             self.render_sandbox_config(frame, area, theme);
             return;
         }
 
-        // If in tool config mode, render that overlay instead
         if self.tool_config_mode {
             self.render_tool_config(frame, area, theme);
             return;
         }
 
-        // If in worktree config mode, render that overlay instead
         if self.worktree_config_mode {
             self.render_worktree_config(frame, area, theme);
             return;
@@ -56,17 +88,11 @@ impl NewSessionDialog {
         let has_yolo = !self.selected_tool_always_yolo();
         let has_structured = self.structured_capable;
         let dialog_width = 80;
-        // Capture the full overlay area up front so the centered-pop
-        // pickers at the bottom of this function don't accidentally
-        // use a per-field `area` that the loop below shadows on every
-        // row. Without this the dir / group / branch / projects
-        // pickers anchor against whichever Layout chunk the local
-        // `area` last pointed at (typically the Group row) and render
-        // as a tiny strip inside the underlying dialog.
+        // Captured before the loop below shadows `area` per field, or the
+        // centered pickers anchor to whichever row it last held.
         let full_area = area;
-        // When the selected profile has a description, the profile row needs
-        // an extra line to render it beneath the name. We compute this once
-        // here so the layout constraint and the renderer agree on height.
+        // A profile description adds a line under the name; computed once so
+        // the constraint and the renderer agree on the height.
         let profile_field_height: u16 =
             if has_profile_selection && self.selected_profile_description().is_some() {
                 3
@@ -74,7 +100,6 @@ impl NewSessionDialog {
                 2
             };
 
-        // Build constraints dynamically based on visible fields only
         let mut constraints = Vec::new();
         if has_profile_selection {
             constraints.push(Constraint::Length(profile_field_height)); // Profile
@@ -98,12 +123,8 @@ impl NewSessionDialog {
         }
         constraints.push(Constraint::Length(2)); // Group (always, at the bottom)
 
-        // For errors, calculate how many lines we need based on the text length.
-        // Inner width = dialog_width - 2 (border) - 2 (margin) = 76.
-        // The regular hint line reserves 2 rows so the per-field keybind
-        // hints can wrap (e.g. when both path-shortcut hints and the global
-        // Ctrl+T scratch chip are present at once) instead of getting
-        // truncated mid-word at the modal edge.
+        // Inner width is 76: dialog width less borders and margin. The hint
+        // line reserves 2 rows so per-field hints wrap instead of truncating.
         let error_lines: u16 = if let Some(error) = &self.error_message {
             let inner_width = (dialog_width - 4) as usize;
             let error_text = format!("✗ Error: {}", error);
@@ -114,7 +135,6 @@ impl NewSessionDialog {
         };
         constraints.push(Constraint::Min(error_lines)); // Hints/errors
 
-        // Compute dialog height from actual constraints
         let fields_height: u16 = constraints
             .iter()
             .map(|c| match c {
@@ -125,19 +145,14 @@ impl NewSessionDialog {
             .sum();
         let dialog_height = fields_height + 4; // +2 border, +2 margin
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" New Session ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = crate::tui::dialogs::dialog_block(" New Session ", theme);
+        let (_, inner) = crate::tui::dialogs::render_dialog_frame(
+            frame,
+            area,
+            dialog_width,
+            dialog_height,
+            block,
+        );
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -145,45 +160,10 @@ impl NewSessionDialog {
             .constraints(constraints)
             .split(inner);
 
-        // Render fields sequentially, tracking chunk index to match dynamic constraints
         let mut ci = 0; // chunk index
 
-        // Field index calculations (must match handle_key).
-        // Field order: [profile], path, title, [tool], [structured], ...
-        let base = if has_profile_selection { 1 } else { 0 };
-        let title_field = base + 1;
-        let mut fi = base + 2 + if has_tool_selection { 1 } else { 0 };
-        let structured_field = if has_structured {
-            let f = fi;
-            fi += 1;
-            f
-        } else {
-            usize::MAX
-        };
-        let yolo_mode_field = if has_yolo {
-            let f = fi;
-            fi += 1;
-            f
-        } else {
-            usize::MAX
-        };
-        let worktree_field = if !is_host_only {
-            let f = fi;
-            fi += 1;
-            f
-        } else {
-            usize::MAX
-        };
-        let sandbox_field = if has_sandbox {
-            let f = fi;
-            fi += 1;
-            f
-        } else {
-            usize::MAX
-        };
-        let group_field = fi;
+        let fields = self.field_indices();
 
-        // Profile picker (only when multiple profiles)
         if has_profile_selection {
             let area = chunks[ci];
             self.render_profile_field(frame, area, theme);
@@ -191,8 +171,7 @@ impl NewSessionDialog {
             ci += 1;
         }
 
-        // Path (rendered first so the user picks the working directory
-        // before naming the session).
+        // Path precedes title: pick the directory before naming the session.
         let path_field_idx = self.path_field();
         let path_placeholder = if self.focused_field == path_field_idx {
             Some("(Ctrl+P to browse directories)")
@@ -204,48 +183,50 @@ impl NewSessionDialog {
         self.focusable_rects.push((path_field_idx, area));
         ci += 1;
 
-        // Title
         let area = chunks[ci];
         render_text_field(
             frame,
             area,
             "Title:",
             &self.title,
-            self.focused_field == title_field,
+            self.focused_field == fields.title,
             Some("(random civ)"),
             theme,
         );
-        self.focusable_rects.push((title_field, area));
+        self.focusable_rects.push((fields.title, area));
         ci += 1;
 
-        // Tool (always shown, interactive or read-only). The cycler itself is
-        // shared with the Restart dialog via `tool_cycler_spans`; the New
-        // dialog appends its own config summary and Ctrl+P hint afterwards.
-        let tool_field = base + 2;
-        let is_tool_focused = has_tool_selection && self.focused_field == tool_field;
+        // Always shown, interactive or read-only. Cycler and suffix ordering
+        // are shared with the Restart dialog.
+        let is_tool_focused = has_tool_selection && self.focused_field == fields.tool;
+        let selected_tool = self.available_tools[self.tool_index].as_str();
         let mut tool_spans = tool_cycler_spans(
             "Tool:",
-            self.available_tools[self.tool_index].as_str(),
+            selected_tool,
             self.tool_index,
             self.available_tools.len(),
+            true,
             is_tool_focused,
             theme,
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-        tool_spans.extend(tool_config_suffix_spans(has_config, is_tool_focused, theme));
+        tool_spans.extend(tool_row_suffix_spans(
+            selected_tool,
+            has_config,
+            is_tool_focused,
+            theme,
+        ));
         let area = chunks[ci];
         frame.render_widget(Paragraph::new(Line::from(tool_spans)), area);
-        // Push the tool rect only when interactive (multiple tools).
-        // A read-only tool row shouldn't accept focus on click.
+        // A read-only tool row must not accept focus on click.
         if has_tool_selection {
-            self.focusable_rects.push((tool_field, area));
+            self.focusable_rects.push((fields.tool, area));
         }
         ci += 1;
 
-        // Structured view checkbox (only for ACP-capable tools on serve builds)
         if has_structured {
-            let is_focused = self.focused_field == structured_field;
+            let is_focused = self.focused_field == fields.structured;
             let label_style = if is_focused {
                 Style::default().fg(theme.accent).underlined()
             } else {
@@ -280,13 +261,12 @@ impl NewSessionDialog {
             }
             let area = chunks[ci];
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
-            self.focusable_rects.push((structured_field, area));
+            self.focusable_rects.push((fields.structured, area));
             ci += 1;
         }
 
-        // YOLO Mode checkbox (hidden for AlwaysYolo agents like pi)
         if has_yolo {
-            let is_yolo_focused = self.focused_field == yolo_mode_field;
+            let is_yolo_focused = self.focused_field == fields.yolo;
             let yolo_label_style = if is_yolo_focused {
                 Style::default().fg(theme.accent).underlined()
             } else {
@@ -315,13 +295,12 @@ impl NewSessionDialog {
             ]);
             let area = chunks[ci];
             frame.render_widget(Paragraph::new(yolo_line), area);
-            self.focusable_rects.push((yolo_mode_field, area));
+            self.focusable_rects.push((fields.yolo, area));
             ci += 1;
         }
 
-        // Worktree checkbox (with config summary) -- hidden for host-only agents
         if !is_host_only {
-            let is_wt_focused = self.focused_field == worktree_field;
+            let is_wt_focused = self.focused_field == fields.worktree;
             let label_style = if is_wt_focused {
                 Style::default().fg(theme.accent).underlined()
             } else {
@@ -374,13 +353,12 @@ impl NewSessionDialog {
 
             let area = chunks[ci];
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
-            self.focusable_rects.push((worktree_field, area));
+            self.focusable_rects.push((fields.worktree, area));
             ci += 1;
         }
 
-        // Sandbox checkbox with summary (only when a container runtime is available)
         if has_sandbox {
-            let is_sandbox_focused = self.focused_field == sandbox_field;
+            let is_sandbox_focused = self.focused_field == fields.sandbox;
             let sandbox_label_style = if is_sandbox_focused {
                 Style::default().fg(theme.accent).underlined()
             } else {
@@ -417,13 +395,13 @@ impl NewSessionDialog {
 
             let area = chunks[ci];
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
-            self.focusable_rects.push((sandbox_field, area));
+            self.focusable_rects.push((fields.sandbox, area));
             ci += 1;
         }
 
         // Group (always visible, at the bottom before hints)
         let group_placeholder =
-            if !self.existing_groups.is_empty() && self.focused_field == group_field {
+            if !self.existing_groups.is_empty() && self.focused_field == fields.group {
                 Some("(Ctrl+P to browse groups)")
             } else {
                 None
@@ -434,12 +412,12 @@ impl NewSessionDialog {
             area,
             "Group:",
             &self.group,
-            self.focused_field == group_field,
+            self.focused_field == fields.group,
             group_placeholder,
             self.group_ghost_text(),
             theme,
         );
-        self.focusable_rects.push((group_field, area));
+        self.focusable_rects.push((fields.group, area));
         ci += 1;
 
         // Hints/errors (last chunk)
@@ -456,16 +434,22 @@ impl NewSessionDialog {
             } else {
                 Style::default().fg(theme.dimmed)
             };
-            let line = Line::from(vec![
-                Span::styled(
-                    "⚠ Path does not exist. Create? ",
-                    Style::default().fg(theme.error),
-                ),
-                Span::styled("[y]es", yes_style),
-                Span::raw(" "),
-                Span::styled("[N]o", no_style),
-            ]);
-            frame.render_widget(Paragraph::new(line), chunks[hint_chunk]);
+            let prompt = Span::styled(
+                "⚠ Path does not exist. Create? ",
+                Style::default().fg(theme.error),
+            );
+            let yes = Span::styled("[y]es", yes_style);
+            let no = Span::styled("[N]o", no_style);
+            let row = chunks[hint_chunk];
+            let yes_x = row.x + prompt.width() as u16;
+            let no_x = yes_x + yes.width() as u16 + 1;
+            for (choice, x, width) in [(true, yes_x, yes.width()), (false, no_x, no.width())] {
+                let width = (width as u16).min(row.right().saturating_sub(x));
+                self.confirm_create_rects
+                    .push((choice, Rect::new(x, row.y, width, 1)));
+            }
+            let line = Line::from(vec![prompt, yes, Span::raw(" "), no]);
+            frame.render_widget(Paragraph::new(line), row);
         } else if let Some(error) = &self.error_message {
             let error_text = format!("✗ Error: {}", error);
             let error_paragraph = Paragraph::new(error_text)
@@ -492,7 +476,7 @@ impl NewSessionDialog {
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" browse  "));
             }
-            if self.focused_field == group_field && !self.existing_groups.is_empty() {
+            if self.focused_field == fields.group && !self.existing_groups.is_empty() {
                 if self.group_ghost_text().is_some() {
                     hint_spans.push(Span::styled("→", Style::default().fg(theme.hint)));
                     hint_spans.push(Span::raw(" accept  "));
@@ -500,11 +484,17 @@ impl NewSessionDialog {
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" groups  "));
             }
-            if self.focused_field == tool_field {
+            if self.focused_field == fields.tool {
+                let last = self.available_tools.len().min(9);
+                hint_spans.push(Span::styled(
+                    format!("1-{last}"),
+                    Style::default().fg(theme.hint),
+                ));
+                hint_spans.push(Span::raw(" pick  "));
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" configure  "));
             }
-            if self.focused_field == worktree_field && self.worktree_enabled {
+            if self.focused_field == fields.worktree && self.worktree_enabled {
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" configure  "));
             }
@@ -539,6 +529,14 @@ impl NewSessionDialog {
                 chunks[hint_chunk],
             );
         }
+
+        let rects = self
+            .focusable_rects
+            .iter()
+            .map(|(_, r)| label_row(*r))
+            .chain(self.confirm_create_rects.iter().map(|(_, r)| *r))
+            .collect();
+        self.paint_hover(frame, rects, theme);
 
         if self.show_help {
             self.render_help_overlay(frame, full_area, theme);
@@ -721,19 +719,14 @@ impl NewSessionDialog {
             .sum();
         let dialog_height = fields_height + 4;
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Sandbox Configuration ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = crate::tui::dialogs::dialog_block(" Sandbox Configuration ", theme);
+        let (_, inner) = crate::tui::dialogs::render_dialog_frame(
+            frame,
+            area,
+            dialog_width,
+            dialog_height,
+            block,
+        );
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -757,7 +750,24 @@ impl NewSessionDialog {
         ci += 1;
 
         // Environment
-        self.render_env_field(frame, chunks[ci], self.sandbox_focused_field == 1, theme);
+        self.list_entry_rects = self.render_list_field(
+            frame,
+            chunks[ci],
+            theme,
+            ListField {
+                label: "Environment",
+                unit: "items",
+                hint: " (a)dd (d)el (Enter)edit (Esc)close",
+                empty_hint: "    (press 'a' to add KEY or KEY=VALUE)",
+                entries: &self.extra_env,
+                selected: self.env_selected_index,
+                expanded: self.env_list_expanded,
+                editing: self.env_editing_input.as_ref(),
+                adding_new: self.env_adding_new,
+                ghost: None,
+                focused: self.sandbox_focused_field == 1,
+            },
+        );
         self.sandbox_config_rects.push((1, chunks[ci]));
         ci += 1;
 
@@ -775,6 +785,13 @@ impl NewSessionDialog {
             Span::raw(" back"),
         ];
         frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[ci]);
+
+        let rects = if self.env_editing_input.is_some() {
+            Vec::new()
+        } else {
+            overlay_hover_rects(&self.list_entry_rects, &self.sandbox_config_rects)
+        };
+        self.paint_hover(frame, rects, theme);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
@@ -797,6 +814,8 @@ impl NewSessionDialog {
             self.tool_config_focused_field,
             theme,
         );
+        let rects = overlay_hover_rects(&[], &self.tool_config_rects);
+        self.paint_hover(frame, rects, theme);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
@@ -843,19 +862,14 @@ impl NewSessionDialog {
 
         let title = " Worktree Configuration ";
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(title)
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = crate::tui::dialogs::dialog_block(title, theme);
+        let (_, inner) = crate::tui::dialogs::render_dialog_frame(
+            frame,
+            area,
+            dialog_width,
+            dialog_height,
+            block,
+        );
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -930,11 +944,26 @@ impl NewSessionDialog {
         }
 
         // Extra Repos
-        self.render_extra_repos_field(
+        self.list_entry_rects = self.render_list_field(
             frame,
             chunks[3],
-            self.worktree_config_focused_field == 3,
             theme,
+            ListField {
+                label: "Extra Repos",
+                unit: "repos",
+                hint: " (a)dd (d)el (Enter)edit (Ctrl+P)browse (Esc)close",
+                empty_hint: "    (press 'a' to add repo path)",
+                entries: &self.workspace_repos,
+                selected: self.workspace_repo_selected_index,
+                expanded: self.workspace_repos_expanded,
+                editing: self.workspace_repo_editing_input.as_ref(),
+                adding_new: self.workspace_repo_adding_new,
+                ghost: self
+                    .workspace_repo_ghost
+                    .as_ref()
+                    .map(|g| g.ghost_text.clone()),
+                focused: self.worktree_config_focused_field == 3,
+            },
         );
         self.worktree_config_rects.push((3, chunks[3]));
 
@@ -973,6 +1002,13 @@ impl NewSessionDialog {
             frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[4]);
         }
 
+        let rects = if self.workspace_repo_editing_input.is_some() {
+            Vec::new()
+        } else {
+            overlay_hover_rects(&self.list_entry_rects, &self.worktree_config_rects)
+        };
+        self.paint_hover(frame, rects, theme);
+
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
         }
@@ -990,272 +1026,134 @@ impl NewSessionDialog {
         }
     }
 
-    fn render_env_field(&self, frame: &mut Frame, area: Rect, is_focused: bool, theme: &Theme) {
-        let label_style = if is_focused {
-            Style::default().fg(theme.accent).underlined()
-        } else {
-            Style::default().fg(theme.text)
-        };
-
-        if !self.env_list_expanded {
-            // Collapsed view
-            let count = self.extra_env.len();
-            let summary = if count == 0 {
-                "(empty - press Enter to add)".to_string()
-            } else {
-                format!("[{} items]", count)
-            };
-            let summary_style = if count > 0 {
-                Style::default().fg(theme.accent)
-            } else {
-                Style::default().fg(theme.dimmed)
-            };
-
-            let line = Line::from(vec![
-                Span::styled("Environment:", label_style),
-                Span::raw(" "),
-                Span::styled(summary, summary_style),
-            ]);
-            frame.render_widget(Paragraph::new(line), area);
-        } else {
-            // Expanded view with list
-            let mut lines: Vec<Line> = Vec::new();
-            let mut cursor_row: Option<(usize, &'static str, &Input)> = None;
-
-            // Header with controls hint
-            let header = Line::from(vec![
-                Span::styled("Environment:", label_style),
-                Span::styled(
-                    " (a)dd (d)el (Enter)edit (Esc)close",
-                    Style::default().fg(theme.dimmed),
-                ),
-            ]);
-            lines.push(header);
-
-            // Check if we're in editing/adding mode
-            if let Some(ref input) = self.env_editing_input {
-                if self.env_adding_new {
-                    // Show existing items
-                    for (i, entry) in self.extra_env.iter().enumerate() {
-                        let prefix = if i == self.env_selected_index {
-                            "  > "
-                        } else {
-                            "    "
-                        };
-                        lines.push(Line::from(Span::styled(
-                            format!("{}{}", prefix, entry),
-                            Style::default().fg(theme.text),
-                        )));
-                    }
-                    // Show input for new item
-                    let input_line = Line::from(vec![
-                        Span::styled("  + ", Style::default().fg(theme.accent)),
-                        Span::styled(input.value(), Style::default().fg(theme.accent).bold()),
-                        Span::styled("_", Style::default().fg(theme.accent)),
-                    ]);
-                    lines.push(input_line);
-                    cursor_row = Some((lines.len() - 1, "  + ", input));
-                } else {
-                    // Editing existing item
-                    for (i, entry) in self.extra_env.iter().enumerate() {
-                        if i == self.env_selected_index {
-                            // Show editable input
-                            let input_line = Line::from(vec![
-                                Span::styled("  > ", Style::default().fg(theme.accent)),
-                                Span::styled(
-                                    input.value(),
-                                    Style::default().fg(theme.accent).bold(),
-                                ),
-                                Span::styled("_", Style::default().fg(theme.accent)),
-                            ]);
-                            lines.push(input_line);
-                            cursor_row = Some((lines.len() - 1, "  > ", input));
-                        } else {
-                            let prefix = "    ";
-                            lines.push(Line::from(Span::styled(
-                                format!("{}{}", prefix, entry),
-                                Style::default().fg(theme.text),
-                            )));
-                        }
-                    }
-                }
-            } else {
-                // Normal list display
-                if self.extra_env.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "    (press 'a' to add KEY or KEY=VALUE)",
-                        Style::default().fg(theme.dimmed),
-                    )));
-                } else {
-                    for (i, entry) in self.extra_env.iter().enumerate() {
-                        let is_selected = i == self.env_selected_index;
-                        let prefix = if is_selected { "  > " } else { "    " };
-                        let style = if is_selected {
-                            Style::default().fg(theme.accent).bold()
-                        } else {
-                            Style::default().fg(theme.text)
-                        };
-                        lines.push(Line::from(Span::styled(
-                            format!("{}{}", prefix, entry),
-                            style,
-                        )));
-                    }
-                }
-            }
-
-            frame.render_widget(Paragraph::new(lines), area);
-            if let Some((row, prefix, input)) = cursor_row {
-                Self::set_input_cursor_on_row(frame, area, row, prefix, input);
-            }
-        }
-    }
-
-    fn render_extra_repos_field(
+    /// One editable list field: `Environment` and `Extra Repos` differ only in
+    /// their labels, their summary unit, and whether the add/edit input offers
+    /// a path ghost completion.
+    /// Returns the rect of each entry row while the list is expanded and no
+    /// entry is being typed, keyed by entry index.
+    fn render_list_field(
         &self,
         frame: &mut Frame,
         area: Rect,
-        is_focused: bool,
         theme: &Theme,
-    ) {
-        let label_style = if is_focused {
+        spec: ListField<'_>,
+    ) -> Vec<(usize, Rect)> {
+        let label_style = if spec.focused {
             Style::default().fg(theme.accent).underlined()
         } else {
             Style::default().fg(theme.text)
         };
+        let label = Span::styled(format!("{}:", spec.label), label_style);
 
-        if !self.workspace_repos_expanded {
-            // Collapsed view
-            let count = self.workspace_repos.len();
-            let summary = if count == 0 {
-                "(empty - press Enter to add)".to_string()
-            } else {
-                format!("[{} repos]", count)
-            };
-            let summary_style = if count > 0 {
-                Style::default().fg(theme.accent)
-            } else {
-                Style::default().fg(theme.dimmed)
-            };
-
-            let line = Line::from(vec![
-                Span::styled("Extra Repos:", label_style),
-                Span::raw(" "),
-                Span::styled(summary, summary_style),
-            ]);
-            frame.render_widget(Paragraph::new(line), area);
-        } else {
-            // Expanded view with list
-            let mut lines: Vec<Line> = Vec::new();
-            let mut cursor_row: Option<(usize, &'static str, &Input)> = None;
-
-            let header = Line::from(vec![
-                Span::styled("Extra Repos:", label_style),
-                Span::styled(
-                    " (a)dd (d)el (Enter)edit (Ctrl+P)browse (Esc)close",
+        if !spec.expanded {
+            let count = spec.entries.len();
+            let (summary, style) = if count == 0 {
+                (
+                    "(empty - press Enter to add)".to_string(),
                     Style::default().fg(theme.dimmed),
-                ),
-            ]);
-            lines.push(header);
-
-            if let Some(ref input) = self.workspace_repo_editing_input {
-                let ghost_text = self
-                    .workspace_repo_ghost
-                    .as_ref()
-                    .map(|g| g.ghost_text.clone());
-
-                let prefix_width = 4; // "  + " or "  > "
-                let available_width = area.width.saturating_sub(prefix_width as u16) as usize;
-
-                let make_input_line = |prefix: &'static str,
-                                       val: &str,
-                                       ghost: &Option<String>,
-                                       th: &Theme,
-                                       inp: &Input|
-                 -> Line<'static> {
-                    let scroll = input_scroll(inp, available_width);
-                    let (visible_value, end_visible) = visible_slice(val, scroll, available_width);
-
-                    let mut spans = vec![
-                        Span::styled(prefix, Style::default().fg(th.accent)),
-                        Span::styled(visible_value, Style::default().fg(th.accent).bold()),
-                    ];
-                    if end_visible {
-                        if let Some(ref g) = ghost {
-                            spans.push(Span::styled(g.clone(), Style::default().fg(th.dimmed)));
-                        }
-                    }
-                    spans.push(Span::styled("_", Style::default().fg(th.accent)));
-                    Line::from(spans)
-                };
-
-                if self.workspace_repo_adding_new {
-                    for (i, entry) in self.workspace_repos.iter().enumerate() {
-                        let prefix = if i == self.workspace_repo_selected_index {
-                            "  > "
-                        } else {
-                            "    "
-                        };
-                        lines.push(Line::from(Span::styled(
-                            format!("{}{}", prefix, entry),
-                            Style::default().fg(theme.text),
-                        )));
-                    }
-                    lines.push(make_input_line(
-                        "  + ",
-                        input.value(),
-                        &ghost_text,
-                        theme,
-                        input,
-                    ));
-                    cursor_row = Some((lines.len() - 1, "  + ", input));
-                } else {
-                    for (i, entry) in self.workspace_repos.iter().enumerate() {
-                        if i == self.workspace_repo_selected_index {
-                            lines.push(make_input_line(
-                                "  > ",
-                                input.value(),
-                                &ghost_text,
-                                theme,
-                                input,
-                            ));
-                            cursor_row = Some((lines.len() - 1, "  > ", input));
-                        } else {
-                            let prefix = "    ";
-                            lines.push(Line::from(Span::styled(
-                                format!("{}{}", prefix, entry),
-                                Style::default().fg(theme.text),
-                            )));
-                        }
-                    }
-                }
+                )
             } else {
-                // Normal list display
-                if self.workspace_repos.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "    (press 'a' to add repo path)",
+                (
+                    format!("[{count} {}]", spec.unit),
+                    Style::default().fg(theme.accent),
+                )
+            };
+            let line = Line::from(vec![label, Span::raw(" "), Span::styled(summary, style)]);
+            frame.render_widget(Paragraph::new(line), area);
+            return Vec::new();
+        }
+
+        let mut lines = vec![Line::from(vec![
+            label,
+            Span::styled(spec.hint, Style::default().fg(theme.dimmed)),
+        ])];
+        let mut cursor_row: Option<(usize, &'static str, &Input)> = None;
+
+        // The ghost, when offered, renders after the value only once the
+        // visible window reaches the end of the input.
+        let prefix_width = 4usize; // "  + " or "  > "
+        let available_width = area.width.saturating_sub(prefix_width as u16) as usize;
+        let input_line = |prefix: &'static str, input: &Input| -> Line<'static> {
+            let scroll = input_scroll(input, available_width);
+            let (visible_value, end_visible) =
+                visible_slice(input.value(), scroll, available_width);
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(theme.accent)),
+                Span::styled(visible_value, Style::default().fg(theme.accent).bold()),
+            ];
+            if end_visible {
+                if let Some(ghost) = &spec.ghost {
+                    spans.push(Span::styled(
+                        ghost.clone(),
                         Style::default().fg(theme.dimmed),
-                    )));
-                } else {
-                    for (i, entry) in self.workspace_repos.iter().enumerate() {
-                        let is_selected = i == self.workspace_repo_selected_index;
-                        let prefix = if is_selected { "  > " } else { "    " };
-                        let style = if is_selected {
-                            Style::default().fg(theme.accent).bold()
-                        } else {
-                            Style::default().fg(theme.text)
-                        };
-                        lines.push(Line::from(Span::styled(
-                            format!("{}{}", prefix, entry),
-                            style,
-                        )));
+                    ));
+                }
+            }
+            spans.push(Span::styled("_", Style::default().fg(theme.accent)));
+            Line::from(spans)
+        };
+        // A selected row keeps its marker while another item is being typed,
+        // but drops the accent so the prompt reads as the active one.
+        let entry_line = |index: usize, entry: &String, editing: bool| {
+            let selected = index == spec.selected;
+            let prefix = if selected { "  > " } else { "    " };
+            let style = if selected && !editing {
+                Style::default().fg(theme.accent).bold()
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Line::from(Span::styled(format!("{prefix}{entry}"), style))
+        };
+
+        match spec.editing {
+            Some(input) if spec.adding_new => {
+                for (i, entry) in spec.entries.iter().enumerate() {
+                    lines.push(entry_line(i, entry, true));
+                }
+                lines.push(input_line("  + ", input));
+                cursor_row = Some((lines.len() - 1, "  + ", input));
+            }
+            Some(input) => {
+                for (i, entry) in spec.entries.iter().enumerate() {
+                    if i == spec.selected {
+                        lines.push(input_line("  > ", input));
+                        cursor_row = Some((lines.len() - 1, "  > ", input));
+                    } else {
+                        lines.push(entry_line(i, entry, true));
                     }
                 }
             }
-
-            frame.render_widget(Paragraph::new(lines), area);
-            if let Some((row, prefix, input)) = cursor_row {
-                Self::set_input_cursor_on_row(frame, area, row, prefix, input);
+            None if spec.entries.is_empty() => lines.push(Line::from(Span::styled(
+                spec.empty_hint,
+                Style::default().fg(theme.dimmed),
+            ))),
+            None => {
+                for (i, entry) in spec.entries.iter().enumerate() {
+                    lines.push(entry_line(i, entry, false));
+                }
             }
+        }
+
+        frame.render_widget(Paragraph::new(lines), area);
+        if let Some((row, prefix, input)) = cursor_row {
+            Self::set_input_cursor_on_row(frame, area, row, prefix, input);
+            return Vec::new();
+        }
+        // Row 0 is the label; entries follow until the area clips them.
+        (0..spec.entries.len())
+            .map_while(|i| {
+                let y = area.y + 1 + i as u16;
+                (y < area.bottom()).then(|| (i, Rect::new(area.x, y, area.width, 1)))
+            })
+            .collect()
+    }
+
+    /// Record the panel's hoverable rows and tint the one under the pointer.
+    /// Nothing is hoverable under the help overlay.
+    fn paint_hover(&mut self, frame: &mut Frame, rects: Vec<Rect>, theme: &Theme) {
+        self.hover_rects = if self.show_help { Vec::new() } else { rects };
+        if let Some(rect) = self.hover.current_in(&self.hover_rects) {
+            crate::tui::components::hover::paint_hover_bg(frame, rect, theme.selection);
         }
     }
 
@@ -1300,19 +1198,18 @@ impl NewSessionDialog {
             + if has_sandbox { 3 } else { 0 }
             + if show_sandbox_options_help { 12 } else { 0 };
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .title(" New Session Help ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = crate::tui::dialogs::toned_dialog_block(
+            " New Session Help ",
+            theme.border,
+            theme.title,
+        );
+        let (_, inner) = crate::tui::dialogs::render_dialog_frame(
+            frame,
+            area,
+            dialog_width,
+            dialog_height,
+            block,
+        );
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -1382,12 +1279,7 @@ impl NewSessionDialog {
             " Creating Session "
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(title)
-            .title_style(Style::default().fg(theme.title).bold());
+        let block = crate::tui::dialogs::dialog_block(title, theme);
 
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);

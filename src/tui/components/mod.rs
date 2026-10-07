@@ -3,13 +3,15 @@
 pub(crate) mod buttons;
 pub(crate) mod checkbox;
 mod cycler;
+pub(crate) mod diagnostics;
 mod dir_picker;
 mod help;
+pub(crate) mod hint_buttons;
 pub(crate) mod hover;
 mod list_picker;
 pub(crate) mod preview;
 pub(crate) mod scroll;
-mod text;
+pub(crate) mod text;
 mod text_input;
 mod tool_config;
 
@@ -18,12 +20,12 @@ pub use dir_picker::{DirPicker, DirPickerResult};
 pub use help::HelpOverlay;
 pub use list_picker::{ListPicker, ListPickerResult};
 pub use preview::{format_scroll_indicator, Preview};
-pub use text::truncate_to_width;
+pub use text::{fixed_width, prefix_within_width, rendered_width, truncate_to_width};
 pub(crate) use text_input::{focused_input_spans, input_scroll, visible_slice};
 pub use text_input::{
     longest_common_prefix, render_text_field, render_text_field_with_ghost,
     set_input_cursor_position, set_prefixed_input_cursor_position, GroupGhostCompletion,
 };
 pub use tool_config::{
-    handle_tool_config_key, render_tool_config_overlay, tool_config_suffix_spans, ToolConfigOutcome,
+    handle_tool_config_key, render_tool_config_overlay, tool_row_suffix_spans, ToolConfigOutcome,
 };

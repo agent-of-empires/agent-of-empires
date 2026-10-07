@@ -5,15 +5,13 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
-use crate::tui::components::buttons::render_yes_no;
+use crate::tui::components::buttons::render_buttons;
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
-use crate::tui::components::hover::HoverState;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
-/// The dialog's emphasis color. Destructive confirmations (delete, stop,
-/// cancel-a-running-hook) alarm in red; neutral ones (quitting, with
-/// sessions left running) use the calmer "heads-up" amber so a routine
-/// prompt doesn't read like a data-loss warning.
+/// The dialog's emphasis color: destructive prompts alarm in red, routine
+/// ones use a calmer amber so they do not read as data loss.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tone {
     Destructive,
@@ -26,14 +24,19 @@ pub struct ConfirmDialog {
     action: String,
     selected: bool, // true = Yes, false = No
     tone: Tone,
-    /// When set, the dialog shows a "don't warn me again" checkbox the
-    /// user can toggle with Space. The caller reads `dont_ask_again()`
-    /// on Submit to persist the opt-out. `None` hides the checkbox.
+    /// When set, a "don't warn me again" checkbox the caller reads back with
+    /// `dont_ask_again()` on Submit.
     dont_ask_again: Option<bool>,
+    /// An extra confirm key beside `y` and Enter, so the hotkey that opened
+    /// the dialog also accepts it. Unset elsewhere, so no stray keystroke can
+    /// fire an unrelated destructive confirm.
+    confirm_char: Option<char>,
+    /// Button labels, `("Yes", "No")` unless the caller names its verbs.
+    buttons: (String, String),
     yes_button_area: Rect,
     no_button_area: Rect,
-    /// Which Yes/No button the mouse is over, for the hover highlight.
-    /// Visual only; never changes `selected`.
+    checkbox_area: Rect,
+    /// The hovered target. Visual only; never changes `selected`.
     hover: HoverState,
 }
 
@@ -46,38 +49,54 @@ impl ConfirmDialog {
             selected: false,
             tone: Tone::Destructive,
             dont_ask_again: None,
+            confirm_char: None,
+            buttons: ("Yes".to_string(), "No".to_string()),
             yes_button_area: Rect::default(),
             no_button_area: Rect::default(),
+            checkbox_area: Rect::default(),
             hover: HoverState::default(),
         }
     }
 
-    /// Render with the calmer "heads-up" emphasis instead of the default
-    /// destructive red. For confirmations that aren't about losing data.
+    /// Use the calmer emphasis, for a confirm that is not about losing data.
     pub fn neutral(mut self) -> Self {
         self.tone = Tone::Neutral;
         self
     }
 
-    /// Offer a "don't warn me again" checkbox (unchecked to start). The
-    /// caller inspects `dont_ask_again()` after a Submit to act on it.
+    /// Accept another key as confirm, so the hotkey that opened the dialog
+    /// accepts it too. `Esc` / `n` still cancel.
+    pub fn confirmed_by(mut self, c: char) -> Self {
+        self.confirm_char = Some(c);
+        self
+    }
+
+    /// Name what the buttons do, where "Yes" alone would not.
+    pub fn buttons(mut self, yes: &str, no: &str) -> Self {
+        self.buttons = (yes.to_string(), no.to_string());
+        self
+    }
+
+    /// Offer a "don't warn me again" checkbox, unchecked to start.
     pub fn offering_dont_ask_again(mut self) -> Self {
         self.dont_ask_again = Some(false);
         self
     }
 
-    /// Whether the user ticked "don't warn me again". Always false when
-    /// the checkbox wasn't offered.
     pub fn dont_ask_again(&self) -> bool {
         self.dont_ask_again.unwrap_or(false)
     }
 
-    /// Route a left-click. `Some(Submit)` for `[Yes]`, `Some(Cancel)`
-    /// for `[No]`, `None` for clicks that hit elsewhere inside the
-    /// dialog. Mirrors UnifiedDeleteDialog so the home view's
-    /// `handle_dialog_click` can fan out the same way.
-    pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<()>> {
+    /// Route a left-click: `Submit` on `[Yes]`, `Cancel` on `[No]`, a toggle
+    /// on the "don't warn me again" checkbox, `None` anywhere else.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<()>> {
         let pos = ratatui::layout::Position::from((col, row));
+        if let Some(checked) = self.dont_ask_again.as_mut() {
+            if self.checkbox_area.contains(pos) {
+                *checked = !*checked;
+                return Some(DialogResult::Continue);
+            }
+        }
         if self.yes_button_area.contains(pos) {
             return Some(DialogResult::Submit(()));
         }
@@ -87,15 +106,19 @@ impl ConfirmDialog {
         None
     }
 
-    /// Highlight the Yes/No button under the cursor. Hover does not
-    /// change `selected`: otherwise the mouse drifting over the opposite
-    /// button between the user reading the prompt and pressing Enter
-    /// would silently flip which action fires. Click commits explicitly
-    /// via `handle_click`. Returns `true` when the highlighted button
-    /// changed so the caller can redraw.
+    /// Highlight the button under the cursor without changing `selected`:
+    /// a drift between reading the prompt and pressing Enter must not flip
+    /// which action fires. True when the highlight changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
-        self.hover
-            .update(col, row, &[self.yes_button_area, self.no_button_area])
+        self.hover.update(
+            col,
+            row,
+            &[
+                self.yes_button_area,
+                self.no_button_area,
+                self.checkbox_area,
+            ],
+        )
     }
 
     pub fn action(&self) -> &str {
@@ -109,6 +132,12 @@ impl ConfirmDialog {
         self.yes_button_area
     }
 
+    /// Whether `c` is the opt-in confirm key, ignoring ASCII case.
+    fn is_confirm_char(&self, c: char) -> bool {
+        self.confirm_char
+            .is_some_and(|k| k.eq_ignore_ascii_case(&c))
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => DialogResult::Cancel,
@@ -120,6 +149,7 @@ impl ConfirmDialog {
                 }
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => DialogResult::Submit(()),
+            KeyCode::Char(c) if self.is_confirm_char(c) => DialogResult::Submit(()),
             KeyCode::Char(' ') if self.dont_ask_again.is_some() => {
                 self.dont_ask_again = Some(!self.dont_ask_again.unwrap_or(false));
                 DialogResult::Continue
@@ -141,22 +171,16 @@ impl ConfirmDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Spacer rows separate message / checkbox / buttons so the dialog
-        // breathes; grow the height (and a touch of width) to fit them when
-        // the checkbox is shown. The height follows the wrapped message so
-        // a multi-sentence body (e.g. the switch-view confirm) is never
-        // clipped by a fixed row budget; short messages keep the historical
-        // minimum so routine confirms don't shrink.
+        // The height follows the wrapped message so a multi-sentence body is
+        // never clipped, with a minimum that keeps routine confirms compact.
         let width: u16 = if self.dont_ask_again.is_some() {
             56
         } else {
             50
         };
-        // Border (2) + horizontal layout margin (2) eat four columns.
         let text_width = width.saturating_sub(4).max(1);
         let message_rows = wrapped_line_count(&self.message, text_width as usize);
-        // Border (2) + vertical margin (2) + buttons (2); the checkbox
-        // variant adds spacer + checkbox + spacer.
+        // Border, margin and buttons, plus the checkbox row and its spacers.
         let chrome: u16 = if self.dont_ask_again.is_some() { 9 } else { 6 };
         let min_height: u16 = if self.dont_ask_again.is_some() { 11 } else { 8 };
         let height = (message_rows as u16)
@@ -171,12 +195,7 @@ impl ConfirmDialog {
             Tone::Destructive => theme.error,
             Tone::Neutral => theme.waiting,
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(emphasis))
-            .title(format!(" {} ", self.title))
-            .title_style(Style::default().fg(emphasis).bold());
+        let block = super::toned_dialog_block(format!(" {} ", self.title), emphasis, emphasis);
 
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
@@ -204,12 +223,26 @@ impl ConfirmDialog {
                 false,
                 CheckboxStyle::confirm(theme),
             );
+            self.checkbox_area = Rect {
+                width: (line.width() as u16).min(chunks[2].width),
+                ..chunks[2]
+            };
             frame.render_widget(Paragraph::new(line), chunks[2]);
-            let (yes, no) =
-                render_yes_no(frame, chunks[4], theme, self.selected, self.hover.current());
+            if let Some(rect) = self.hover.current_in(&[self.checkbox_area]) {
+                paint_hover_bg(frame, rect, theme.selection);
+            }
+            let (yes, no) = render_buttons(
+                frame,
+                chunks[4],
+                theme,
+                (&self.buttons.0, &self.buttons.1),
+                self.selected,
+                self.hover.current(),
+            );
             self.yes_button_area = yes;
             self.no_button_area = no;
         } else {
+            self.checkbox_area = Rect::default();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
@@ -217,8 +250,14 @@ impl ConfirmDialog {
                 .split(inner);
 
             self.render_message(frame, chunks[0], theme);
-            let (yes, no) =
-                render_yes_no(frame, chunks[1], theme, self.selected, self.hover.current());
+            let (yes, no) = render_buttons(
+                frame,
+                chunks[1],
+                theme,
+                (&self.buttons.0, &self.buttons.1),
+                self.selected,
+                self.hover.current(),
+            );
             self.yes_button_area = yes;
             self.no_button_area = no;
         }
@@ -232,11 +271,10 @@ impl ConfirmDialog {
     }
 }
 
-/// Rows a message occupies when word-wrapped at `width` columns.
-/// Greedy fill on whitespace with long words broken mid-word, matching
-/// ratatui's `Wrap { trim: true }` closely enough to size the dialog
-/// (a one-row overestimate just leaves a blank line; an underestimate
-/// would clip, which is what this exists to prevent).
+/// Rows a message occupies when word-wrapped at `width` columns: greedy fill
+/// on whitespace, long words broken mid-word. Close enough to ratatui's
+/// `Wrap { trim: true }` to size the dialog, and an overestimate is harmless
+/// where an underestimate would clip.
 fn wrapped_line_count(message: &str, width: usize) -> usize {
     let width = width.max(1);
     let mut rows = 0usize;
@@ -254,8 +292,7 @@ fn wrapped_line_count(message: &str, width: usize) -> usize {
                 used = len;
                 continue;
             }
-            // Either the first word on the row, or a word longer than
-            // the row: consume full rows until the remainder fits.
+            // First word on the row, or one longer than it.
             if used > 0 {
                 line_rows += 1;
             }
@@ -273,217 +310,25 @@ fn wrapped_line_count(message: &str, width: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::tui::dialogs::test_keys::key;
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+    fn dialog() -> ConfirmDialog {
+        ConfirmDialog::new("Test", "Message", "action")
     }
 
-    #[test]
-    fn test_default_selection_is_no() {
-        let dialog = ConfirmDialog::new("Test", "Are you sure?", "test_action");
-        assert!(!dialog.selected);
-    }
-
-    #[test]
-    fn test_action_accessor() {
-        let dialog = ConfirmDialog::new("Title", "Message", "delete");
-        assert_eq!(dialog.action(), "delete");
-    }
-
-    #[test]
-    fn test_esc_cancels() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_n_cancels() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        let result = dialog.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_uppercase_n_cancels() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        let result = dialog.handle_key(key(KeyCode::Char('N')));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_y_confirms() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        let result = dialog.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(result, DialogResult::Submit(())));
-    }
-
-    #[test]
-    fn test_uppercase_y_confirms() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        let result = dialog.handle_key(key(KeyCode::Char('Y')));
-        assert!(matches!(result, DialogResult::Submit(())));
-    }
-
-    #[test]
-    fn test_enter_with_no_selected_cancels() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_enter_with_yes_selected_submits() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        dialog.selected = true;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Submit(())));
-    }
-
-    #[test]
-    fn test_tab_toggles_selection() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        assert!(!dialog.selected);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert!(dialog.selected);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert!(!dialog.selected);
-    }
-
-    #[test]
-    fn test_left_selects_yes() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        dialog.handle_key(key(KeyCode::Left));
-        assert!(dialog.selected);
-    }
-
-    #[test]
-    fn test_right_selects_no() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        dialog.selected = true;
-        dialog.handle_key(key(KeyCode::Right));
-        assert!(!dialog.selected);
-    }
-
-    #[test]
-    fn test_h_selects_yes() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        dialog.handle_key(key(KeyCode::Char('h')));
-        assert!(dialog.selected);
-    }
-
-    #[test]
-    fn test_l_selects_no() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        dialog.selected = true;
-        dialog.handle_key(key(KeyCode::Char('l')));
-        assert!(!dialog.selected);
-    }
-
-    #[test]
-    fn test_unknown_key_continues() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        let result = dialog.handle_key(key(KeyCode::Char('x')));
-        assert!(matches!(result, DialogResult::Continue));
-    }
-
-    #[test]
-    fn dont_ask_again_defaults_false_when_not_offered() {
-        let mut dialog = ConfirmDialog::new("Test", "Message", "action");
-        assert!(!dialog.dont_ask_again());
-        // Space is inert when the checkbox isn't offered.
-        let result = dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(matches!(result, DialogResult::Continue));
-        assert!(!dialog.dont_ask_again());
-    }
-
-    #[test]
-    fn space_toggles_dont_ask_again_when_offered() {
-        let mut dialog = ConfirmDialog::new("Quit", "Quit?", "quit").offering_dont_ask_again();
-        assert!(!dialog.dont_ask_again());
-
-        let result = dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(matches!(result, DialogResult::Continue));
-        assert!(dialog.dont_ask_again());
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.dont_ask_again());
-    }
-
-    /// Render the quit dialog and return the foreground color of the cell
-    /// under a given character of the "Don't warn me again" label, plus the
-    /// top-border color. Guards the styling: the label must read as normal
-    /// text (not the disabled-looking `dimmed`), and the border must use the
-    /// neutral heads-up tone rather than destructive red.
-    #[test]
-    fn quit_dialog_label_is_readable_and_border_is_neutral() {
+    /// Draw `dialog` and return the screen as one newline-joined string plus
+    /// the buffer, for tests that need cell colors.
+    fn render_to(
+        dialog: &mut ConfirmDialog,
+        width: u16,
+        height: u16,
+    ) -> (String, ratatui::buffer::Buffer, crate::tui::styles::Theme) {
         use crate::tui::styles::load_theme;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut dialog = ConfirmDialog::new("Quit", "Quit aoe?", "quit")
-            .neutral()
-            .offering_dont_ask_again();
         let theme = load_theme("empire");
-        let backend = TestBackend::new(70, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| dialog.render(f, f.area(), &theme))
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-
-        // Find the checkbox row and the column where the label "D" starts.
-        let mut label_fg = None;
-        let mut border_fg = None;
-        for y in 0..buf.area.height {
-            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
-            if border_fg.is_none() && row.contains('╭') {
-                let bx = row.find('╭').unwrap() as u16;
-                border_fg = Some(buf[(bx, y)].fg);
-            }
-            if let Some(idx) = row.find("Don't warn") {
-                label_fg = Some(buf[(idx as u16, y)].fg);
-            }
-        }
-
-        assert_eq!(
-            label_fg,
-            Some(theme.text),
-            "checkbox label should use normal text color, not dimmed/disabled"
-        );
-        assert_ne!(
-            label_fg,
-            Some(theme.dimmed),
-            "checkbox label must not be dimmed"
-        );
-        assert_eq!(
-            border_fg,
-            Some(theme.waiting),
-            "neutral quit dialog should use the heads-up tone, not destructive red"
-        );
-        assert_ne!(border_fg, Some(theme.error));
-    }
-
-    /// A multi-sentence body (the switch-view confirm) must be fully
-    /// visible: the old fixed 8-row height clipped it to two lines with
-    /// the buttons painted over the rest (#2923 follow-up).
-    #[test]
-    fn long_message_is_not_clipped() {
-        use crate::tui::styles::load_theme;
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let body = "Switch this session to the structured view? The tmux pane \
-                    and its scrollback are destroyed; the agent restarts under \
-                    the aoe serve daemon (a local one is started if none is \
-                    running) with a fresh conversation.";
-        let mut dialog = ConfirmDialog::new("Switch to structured view", body, "switch_view");
-        let theme = load_theme("empire");
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|f| dialog.render(f, f.area(), &theme))
             .unwrap();
@@ -496,17 +341,189 @@ mod tests {
                     + "\n"
             })
             .collect();
+        (screen, buf, theme)
+    }
 
-        // The tail of the message survives wrapping, and the buttons
-        // render below it rather than over it.
-        assert!(
-            screen.contains("fresh"),
-            "message tail should be visible, not clipped:\n{screen}"
+    #[test]
+    fn keys_decide_the_dialog_and_move_the_selection() {
+        assert_eq!(dialog().action(), "action");
+        assert!(!dialog().selected, "No is the default");
+
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Enter,
+        ] {
+            assert!(
+                matches!(dialog().handle_key(key(code)), DialogResult::Cancel),
+                "{code:?}"
+            );
+        }
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
+            assert!(
+                matches!(dialog().handle_key(key(code)), DialogResult::Submit(())),
+                "{code:?}"
+            );
+        }
+        assert!(matches!(
+            dialog().handle_key(key(KeyCode::Char('x'))),
+            DialogResult::Continue
+        ));
+
+        let mut d = dialog();
+        d.selected = true;
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Submit(())
+        ));
+
+        // Left / h select Yes, Right / l select No, Tab flips.
+        for (code, want) in [
+            (KeyCode::Left, true),
+            (KeyCode::Right, false),
+            (KeyCode::Char('h'), true),
+            (KeyCode::Char('l'), false),
+        ] {
+            let mut d = dialog();
+            d.selected = !want;
+            d.handle_key(key(code));
+            assert_eq!(d.selected, want, "{code:?}");
+        }
+        let mut d = dialog();
+        for want in [true, false] {
+            d.handle_key(key(KeyCode::Tab));
+            assert_eq!(d.selected, want);
+        }
+    }
+
+    #[test]
+    fn confirmed_by_accepts_the_opening_hotkey() {
+        // Opted in, either case confirms.
+        let mut opted_in =
+            ConfirmDialog::new("Confirm Delete", "Message", "trash_session").confirmed_by('d');
+        for code in [KeyCode::Char('d'), KeyCode::Char('D')] {
+            assert!(
+                matches!(opted_in.handle_key(key(code)), DialogResult::Submit(())),
+                "{code:?}"
+            );
+        }
+
+        // A cancel key still wins over an opt-in confirm char.
+        let mut cancel_wins =
+            ConfirmDialog::new("Confirm Delete", "Message", "trash_session").confirmed_by('n');
+        assert!(matches!(
+            cancel_wins.handle_key(key(KeyCode::Char('n'))),
+            DialogResult::Cancel
+        ));
+
+        // Without the opt-in, `d` is inert, so no stray keystroke fires an
+        // unrelated confirm.
+        assert!(matches!(
+            ConfirmDialog::new("Quit", "Quit?", "quit").handle_key(key(KeyCode::Char('d'))),
+            DialogResult::Continue
+        ));
+    }
+
+    #[test]
+    fn the_dont_ask_again_checkbox_toggles_only_when_offered() {
+        let mut d = dialog();
+        assert!(!d.dont_ask_again());
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Char(' '))),
+            DialogResult::Continue
+        ));
+        assert!(!d.dont_ask_again(), "space is inert without the checkbox");
+
+        let mut d = ConfirmDialog::new("Quit", "Quit?", "quit").offering_dont_ask_again();
+        for want in [true, false] {
+            assert!(matches!(
+                d.handle_key(key(KeyCode::Char(' '))),
+                DialogResult::Continue
+            ));
+            assert_eq!(d.dont_ask_again(), want);
+        }
+
+        // And it survives into the submit the caller reads it on.
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Char('y'))),
+            DialogResult::Submit(())
+        ));
+        assert!(d.dont_ask_again());
+    }
+
+    #[test]
+    fn clicking_the_rendered_checkbox_toggles_it_and_hover_lights_it() {
+        let mut d = ConfirmDialog::new("Quit", "Quit?", "quit").offering_dont_ask_again();
+        let (screen, _buf, _theme) = render_to(&mut d, 70, 14);
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("Don't warn"))
+            .expect("checkbox row");
+        let x = line[..line.find("[ ]").unwrap()].chars().count() as u16;
+        let y = y as u16;
+
+        assert!(d.handle_hover(x, y));
+        assert_eq!(d.hover.current(), Some(d.checkbox_area));
+        for want in [true, false] {
+            assert!(matches!(d.handle_click(x, y), Some(DialogResult::Continue)));
+            assert_eq!(d.dont_ask_again(), want);
+        }
+
+        // Without the checkbox its row is inert.
+        let mut plain = dialog();
+        render_to(&mut plain, 70, 14);
+        assert!(plain.handle_click(x, y).is_none());
+        assert!(!plain.dont_ask_again());
+    }
+
+    #[test]
+    fn a_neutral_dialog_reads_as_a_heads_up_not_a_warning() {
+        let mut dialog = ConfirmDialog::new("Quit", "Quit aoe?", "quit")
+            .neutral()
+            .offering_dont_ask_again();
+        let (_screen, buf, theme) = render_to(&mut dialog, 70, 14);
+
+        let mut label_fg = None;
+        let mut border_fg = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if border_fg.is_none() {
+                if let Some(bx) = row.find('╭') {
+                    border_fg = Some(buf[(bx as u16, y)].fg);
+                }
+            }
+            if let Some(idx) = row.find("Don't warn") {
+                label_fg = Some(buf[(idx as u16, y)].fg);
+            }
+        }
+
+        assert_eq!(
+            label_fg,
+            Some(theme.text),
+            "the checkbox label must read as normal text, not disabled"
         );
-        assert!(
-            screen.contains("Yes") && screen.contains("No"),
-            "buttons should still render:\n{screen}"
+        assert_eq!(
+            border_fg,
+            Some(theme.waiting),
+            "a neutral dialog must not borrow the destructive red"
         );
+        assert_ne!(border_fg, Some(theme.error));
+    }
+
+    #[test]
+    fn a_multi_sentence_body_grows_the_dialog_instead_of_clipping() {
+        let body = "Switch this session to the structured view? The tmux pane \
+                    and its scrollback are destroyed; the agent restarts under \
+                    the aoe serve daemon (a local one is started if none is \
+                    running) with a fresh conversation.";
+        let mut dialog = ConfirmDialog::new("Switch to structured view", body, "switch_view");
+        let (screen, _buf, _theme) = render_to(&mut dialog, 80, 24);
+
+        assert!(screen.contains("fresh"), "message tail clipped:\n{screen}");
+        assert!(screen.contains("Yes") && screen.contains("No"), "{screen}");
         let msg_row = screen
             .lines()
             .position(|l| l.contains("fresh"))
@@ -517,29 +534,23 @@ mod tests {
             .expect("yes button row");
         assert!(
             yes_row > msg_row,
-            "buttons must be below the last message line (yes_row={yes_row}, msg_row={msg_row})"
+            "buttons must sit below the last message line, not over it"
         );
     }
 
-    /// Short bodies keep the historical compact height so routine
-    /// confirms don't change shape.
     #[test]
-    fn wrapped_line_count_basics() {
-        assert_eq!(wrapped_line_count("", 46), 1);
-        assert_eq!(wrapped_line_count("short", 46), 1);
-        assert_eq!(wrapped_line_count("a\nb", 46), 2);
-        // 10-char words at width 10: one per row.
-        assert_eq!(wrapped_line_count("aaaaaaaaaa bbbbbbbbbb", 10), 2);
+    fn wrapped_line_count_matches_the_renderer_closely_enough_to_size_the_dialog() {
+        // (message, width, rows)
+        let cases: &[(&str, usize, usize)] = &[
+            ("", 46, 1),
+            ("short", 46, 1),
+            ("a\nb", 46, 2),
+            ("aaaaaaaaaa bbbbbbbbbb", 10, 2),
+        ];
+        for (message, width, rows) in cases {
+            assert_eq!(wrapped_line_count(message, *width), *rows, "{message:?}");
+        }
         // A single word longer than the row breaks across rows.
         assert_eq!(wrapped_line_count(&"x".repeat(25), 10), 3);
-    }
-
-    #[test]
-    fn dont_ask_again_survives_into_submit() {
-        let mut dialog = ConfirmDialog::new("Quit", "Quit?", "quit").offering_dont_ask_again();
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        let result = dialog.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(result, DialogResult::Submit(())));
-        assert!(dialog.dont_ask_again());
     }
 }

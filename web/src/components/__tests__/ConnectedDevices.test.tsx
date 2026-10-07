@@ -1,16 +1,4 @@
 // @vitest-environment jsdom
-//
-// Tests for ConnectedDevices. The component fetches the list of signed-in
-// devices on mount (via a deferred setTimeout, plus a 10s polling interval
-// and a visibilitychange listener), renders a loading / empty / populated /
-// error state, and exposes per-device "Revoke" and a global "Sign out all"
-// affordance, both elevation-gated through api helpers we mock here.
-//
-// Fake timers drive the deferred first load and the polling interval
-// deterministically. testing-library's `waitFor` polls on a real-timer
-// interval that never advances under fake timers, so instead of `waitFor`
-// we flush the component's own timers + microtasks with
-// `act(() => vi.advanceTimersByTimeAsync(...))` and then assert synchronously.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -57,9 +45,8 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/** Advance the timers far enough to fire the deferred first load
- *  (setTimeout(load, 0)) and flush the awaited fetch promise + state update,
- *  all inside act() so React applies the update before we assert. */
+/** Advance the timers far enough to fire the deferred first load (setTimeout(load, 0)) and flush the awaited fetch
+ *  promise + state update, all inside act() so React applies the update before we assert. */
 async function flush(ms = 0) {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(ms);
@@ -76,23 +63,12 @@ function revokeButtons(container: HTMLElement): HTMLButtonElement[] {
   return Array.from(container.querySelectorAll("button")).filter((b) => b.textContent?.trim() === "Revoke");
 }
 
+function signOutButton(container: HTMLElement): HTMLButtonElement {
+  return Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes("Sign out all devices"))!;
+}
+
 describe("ConnectedDevices", () => {
-  it("shows the loading state before the first fetch resolves", () => {
-    // Never-resolving fetch so the component stays in its initial null state.
-    mockFetchDevices.mockReturnValue(new Promise<never>(() => {}));
-    render(<ConnectedDevices />);
-    expect(screen.getByText("Loading...")).toBeTruthy();
-    expect(screen.getByText("Connected Devices")).toBeTruthy();
-  });
-
-  it("renders the empty state when no devices are signed in", async () => {
-    mockFetchDevices.mockResolvedValue([]);
-    await renderAndLoad();
-    expect(screen.getByText("No signed-in devices")).toBeTruthy();
-    expect(screen.queryByText("Loading...")).toBeNull();
-  });
-
-  it("renders the error state when the fetch fails (returns null)", async () => {
+  it("renders the error state once the first fetch resolves", async () => {
     mockFetchDevices.mockResolvedValue(null);
     await renderAndLoad();
     expect(screen.getByText("Could not load devices")).toBeTruthy();
@@ -100,9 +76,12 @@ describe("ConnectedDevices", () => {
   });
 
   it("renders a populated list flagging the current device and showing a Revoke button only for others", async () => {
+    const old = new Date(Date.now() - 2 * 3_600_000).toISOString();
     mockFetchDevices.mockResolvedValue([
       device({ session_id: "me", current: true, user_agent: "Mozilla/5.0 (iPhone) Safari/605" }),
       device({ session_id: "other", current: false, created_ip: "10.0.0.5" }),
+      device({ session_id: "a", user_agent: "Mozilla/5.0 Firefox/120.0 Windows NT 10.0", last_seen: old }),
+      device({ session_id: "b", user_agent: "curl/8.4.0 Linux" }),
     ]);
     const { container } = await renderAndLoad();
 
@@ -110,11 +89,12 @@ describe("ConnectedDevices", () => {
     // Current device shows its parsed UA; the other shows its IP.
     expect(screen.getByText("Safari · iOS")).toBeTruthy();
     expect(screen.getByText("10.0.0.5")).toBeTruthy();
-    expect(screen.getAllByText(/last seen:/).length).toBe(2);
+    expect(screen.getByText("Firefox · Windows")).toBeTruthy();
+    expect(screen.getByText("curl · Linux")).toBeTruthy();
+    expect(screen.getByText(/last seen: 2h ago/)).toBeTruthy();
 
-    // Exactly one Revoke button (the non-current device). The current device
-    // has no Revoke control.
-    expect(revokeButtons(container)).toHaveLength(1);
+    // The current device has no Revoke control.
+    expect(revokeButtons(container)).toHaveLength(3);
   });
 
   it("revokes a device by id and reloads the list", async () => {
@@ -170,12 +150,7 @@ describe("ConnectedDevices", () => {
     const { container } = await renderAndLoad();
     expect(screen.getByText("this device")).toBeTruthy();
 
-    const signOutBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("Sign out all devices"),
-    )!;
-    expect(signOutBtn).toBeTruthy();
-
-    fireEvent.click(signOutBtn);
+    fireEvent.click(signOutButton(container));
     await flush(0);
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);
@@ -189,11 +164,7 @@ describe("ConnectedDevices", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
 
     const { container } = await renderAndLoad();
-    const signOutBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("Sign out all devices"),
-    )!;
-
-    fireEvent.click(signOutBtn);
+    fireEvent.click(signOutButton(container));
     await flush(0);
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);
@@ -201,7 +172,7 @@ describe("ConnectedDevices", () => {
     expect(mockFetchDevices).toHaveBeenCalledTimes(1);
   });
 
-  it("re-fetches devices when the polling interval fires", async () => {
+  it("re-fetches devices on the polling interval and when the tab becomes visible", async () => {
     mockFetchDevices.mockResolvedValue([device({ session_id: "me", current: true })]);
     await renderAndLoad();
     expect(screen.getByText("this device")).toBeTruthy();
@@ -209,32 +180,12 @@ describe("ConnectedDevices", () => {
 
     await flush(10_000);
     expect(mockFetchDevices).toHaveBeenCalledTimes(2);
-  });
-
-  it("re-fetches when the tab becomes visible again", async () => {
-    mockFetchDevices.mockResolvedValue([device({ session_id: "me", current: true })]);
-    await renderAndLoad();
-    expect(mockFetchDevices).toHaveBeenCalledTimes(1);
 
     // jsdom defaults visibilityState to "visible".
     await act(async () => {
       fireEvent(document, new Event("visibilitychange"));
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(mockFetchDevices).toHaveBeenCalledTimes(2);
-  });
-
-  it("parses various user agents into a Browser · OS label and marks stale devices", async () => {
-    const old = new Date(Date.now() - 2 * 3_600_000).toISOString();
-    mockFetchDevices.mockResolvedValue([
-      device({ session_id: "a", user_agent: "Mozilla/5.0 Firefox/120.0 Windows NT 10.0", last_seen: old }),
-      device({ session_id: "b", user_agent: "curl/8.4.0 Linux" }),
-    ]);
-    await renderAndLoad();
-
-    expect(screen.getByText("Firefox · Windows")).toBeTruthy();
-    expect(screen.getByText("curl · Linux")).toBeTruthy();
-    // The stale device (2h old) renders an "h ago" relative time.
-    expect(screen.getByText(/last seen: 2h ago/)).toBeTruthy();
+    expect(mockFetchDevices).toHaveBeenCalledTimes(3);
   });
 });

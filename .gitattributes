@@ -1,0 +1,20 @@
+# Source files are text: force a textual diff even if a stray control byte
+# would otherwise make git call the blob binary and hide the diff from review.
+# Paired with scripts/check-no-nul-in-source.py, which stops the byte landing.
+*.rs    diff
+*.ts    diff
+*.tsx   diff
+*.js    diff
+*.jsx   diff
+*.mjs   diff
+*.cjs   diff
+*.json  diff
+*.toml  diff
+*.md    diff
+*.css   diff
+*.html  diff
+*.yml   diff
+*.yaml  diff
+*.sh    diff
+*.py    diff
+*.nix   diff

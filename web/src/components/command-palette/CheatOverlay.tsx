@@ -2,8 +2,7 @@ import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import type { CheatEffect, CheatEffectKind } from "../../lib/cheats";
 
-// How long each effect lives before it self-cleans. Matches the CSS animation
-// durations in index.css; the overlay unmounts when the longest piece ends.
+// Matches the CSS animation durations in index.css.
 const CHEAT_DURATION_MS: Record<CheatEffectKind, number> = {
   fly: 1600,
   confetti: 2200,
@@ -15,13 +14,10 @@ const CONFETTI_COUNT = 14;
 
 interface Props {
   effect: CheatEffect;
-  // Bump to replay the same cheat; used as the React key by the caller.
   onDone: () => void;
 }
 
-// Full-screen, pointer-events-none overlay so palette interaction is never
-// blocked. Rendered into a body portal so the sprite is not clipped by the
-// palette card. Self-cleans by calling onDone after the effect duration.
+// Click-through body portal so the palette stays usable and sprites are not clipped.
 export function CheatOverlay({ effect, onDone }: Props) {
   useEffect(() => {
     const t = setTimeout(onDone, CHEAT_DURATION_MS[effect.kind]);

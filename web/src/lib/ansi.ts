@@ -1,28 +1,10 @@
 /* eslint-disable no-control-regex -- this file's whole job is to match ESC sequences */
-// ANSI SGR parser for Bash tool output.
-//
-// claude-agent-acp forwards `\x1b[...m` color escapes from commands
-// like `git status --color=always` and `gls --color=always`. Shiki's
-// bash grammar treats them as raw text, so the user sees literal
-// `[01;34m` noise unless we render them ourselves.
-//
-// We:
-//   1. Collapse `\r` (carriage-return repaints) so progress bars don't
-//      flatten into one concatenated line.
-//   2. Strip non-SGR CSI sequences (cursor movement, line erase, etc.)
-//      that would otherwise leak through as garbage characters.
-//   3. Walk the remaining SGR sequences (`\x1b[<n;n;…>m`) and emit
-//      typed segments the React layer can style.
+// ANSI SGR and OSC 8 hyperlink parser for tool output and the live terminal. One pass carries style and link target as a single state.
 
-// Any CSI sequence: ESC [ params final-byte (any letter).
 const ANY_CSI = /\[[\d;?]*[a-zA-Z]/g;
-// SGR specifically: same shape, terminated by `m`.
-const SGR = /\[([\d;]*)m/g;
-// CSI sequences other than SGR — anything ending in a letter that
-// isn't `m`. We match the full sequence so ANY_CSI followed by a
-// negative-set replace would risk eating SGR; instead use a
-// non-`m`-terminator pattern.
-const NON_SGR_CSI = /\[[\d;?]*[a-ln-zA-LN-Z]/g;
+
+// CSI (`m` is SGR, other final bytes dropped) or OSC terminated by BEL/ST (code 8 is a hyperlink, other codes dropped with their payload).
+const TOKEN = /\[([\d;?]*)([a-zA-Z])|\]([0-9]+)(?:;([^\x07]*))?(?:\\|\x07)/g;
 
 export interface AnsiStyle {
   fg?: string;
@@ -37,14 +19,17 @@ export interface AnsiStyle {
 export interface AnsiSegment {
   text: string;
   style: AnsiStyle;
+  url?: string;
 }
 
-// Match a real CSI sequence (`ESC [ params final-byte`), not just the
-// `ESC [` prefix. A markdown blob that quotes the literal characters
-// "\x1b[" — e.g. agent docs about color output — would otherwise trip
-// the ANSI fast path, find no SGR, and render as a plain `<pre>`
-// instead of going through Shiki for highlighting.
-const HAS_ANSI = /\x1b\[[\d;?]*[a-zA-Z]/;
+/** What can outlive a line: tmux resets style only on change, and links span lines. */
+export interface AnsiState {
+  style: AnsiStyle;
+  url?: string;
+}
+
+// A real sequence, not just a quoted `ESC [` prefix, so markdown still reaches Shiki. Hyperlink-only output counts.
+const HAS_ANSI = /\[[\d;?]*[a-zA-Z]|\][0-9]+(?:;[^\x07]*)?(?:\\|\x07)/;
 
 export function hasAnsi(text: string): boolean {
   return HAS_ANSI.test(text);
@@ -54,20 +39,12 @@ export function stripAnsi(text: string): string {
   return text.replace(ANY_CSI, "");
 }
 
-/** Collapse `\r` repaints: within each `\n`-separated line, drop
- *  everything before the last `\r` so progress bars show their
- *  final state instead of a concatenated history. CRLF line endings
- *  are preserved (a bare `\r` immediately before `\n` carries no
- *  redraw payload, and stripping it would corrupt Windows-emitted
- *  output). */
+/** Keep only the text after the last `\r` in each line so progress bars show their final state; CRLF is preserved. */
 export function collapseCarriageReturns(text: string): string {
   if (text.indexOf("\r") < 0) return text;
   return text
     .split("\n")
     .map((line) => {
-      // Strip a trailing `\r` (the leftover half of `\r\n`) before
-      // looking for redraw markers, then re-attach if no redraw was
-      // present so multi-line CRLF text round-trips unchanged.
       const hadCrlf = line.endsWith("\r");
       const body = hadCrlf ? line.slice(0, -1) : line;
       const idx = body.lastIndexOf("\r");
@@ -77,7 +54,7 @@ export function collapseCarriageReturns(text: string): string {
     .join("\n");
 }
 
-/** Standard ANSI 16-color palette (VS Code dark+ approximation). */
+/** Standard 16-color palette (VS Code dark+ approximation). */
 const FG: Record<number, string> = {
   30: "#000000",
   31: "#cd3131",
@@ -115,7 +92,6 @@ const BG: Record<number, string> = {
   107: "#ffffff",
 };
 
-/** xterm 256-color palette → CSS color. */
 function palette256(n: number): string {
   if (n < 16) {
     const ordered = [
@@ -150,14 +126,12 @@ function palette256(n: number): string {
 }
 
 function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
-  // ESC[m / ESC[0m → full reset. Treat empty params as 0.
   if (params.length === 0) return {};
   const next: AnsiStyle = { ...style };
   let i = 0;
   while (i < params.length) {
     const c = params[i];
     if (c === 0) {
-      // Reset all
       for (const k of Object.keys(next) as (keyof AnsiStyle)[]) {
         delete next[k];
       }
@@ -203,7 +177,7 @@ function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
       next.bg = BG[c];
       i++;
     } else if (c === 38 || c === 48) {
-      // Extended color: 38;5;n (256-color) or 38;2;r;g;b (truecolor).
+      // 38;5;n (256-color) or 38;2;r;g;b (truecolor).
       const target: "fg" | "bg" = c === 38 ? "fg" : "bg";
       const mode = params[i + 1];
       if (mode === 5) {
@@ -216,42 +190,53 @@ function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
         i++;
       }
     } else {
-      // Unknown / unsupported (e.g. 53 overline) — skip.
       i++;
     }
   }
   return next;
 }
 
-/** Parse a string with ANSI SGR codes into styled segments, starting from
- *  `initial` SGR state and reporting the state left in effect at the end.
- *  This is the resumable core behind [`parseAnsi`]: tmux emits a reset only
- *  when the style changes, so SGR state legitimately spans lines, and a
- *  per-line parse cache must thread the carried style through explicitly.
- *  Non-SGR CSI sequences and `\r` repaints are stripped/collapsed first. */
-export function parseAnsiFrom(text: string, initial: AnsiStyle): { segs: AnsiSegment[]; exit: AnsiStyle } {
-  const cleaned = collapseCarriageReturns(text).replace(NON_SGR_CSI, "");
+/** Resumable core of [`parseAnsi`], threading style and link state across lines. */
+export function parseAnsiFrom(text: string, initial: AnsiState): { segs: AnsiSegment[]; exit: AnsiState } {
+  const clean = collapseCarriageReturns(text);
   const segs: AnsiSegment[] = [];
   let last = 0;
-  let cur: AnsiStyle = { ...initial };
-  for (const m of cleaned.matchAll(SGR)) {
-    const idx = m.index ?? 0;
-    if (idx > last) {
-      segs.push({ text: cleaned.slice(last, idx), style: { ...cur } });
+  let style: AnsiStyle = { ...initial.style };
+  let url = initial.url;
+  // A dropped sequence leaves the state untouched, so surrounding text stays one span.
+  let restyled = true;
+  const emit = (chunk: string) => {
+    if (chunk.length === 0) return;
+    const prev = segs[segs.length - 1];
+    if (!restyled && prev) {
+      prev.text += chunk;
+      return;
     }
-    const raw = m[1] ?? "";
-    const params = raw === "" ? [] : raw.split(";").map((s) => Number(s));
-    cur = applySgr(cur, params);
+    segs.push({ text: chunk, style: { ...style }, url });
+    restyled = false;
+  };
+  for (const m of clean.matchAll(TOKEN)) {
+    const idx = m.index ?? 0;
+    emit(clean.slice(last, idx));
     last = idx + m[0].length;
+    if (m[2] !== undefined) {
+      if (m[2] !== "m") continue;
+      const raw = m[1] ?? "";
+      style = applySgr(style, raw === "" ? [] : raw.split(";").map((n) => Number(n)));
+      restyled = true;
+      continue;
+    }
+    if (m[3] !== "8") continue;
+    const payload = m[4] ?? "";
+    const sep = payload.indexOf(";");
+    // An empty URI closes the link; a second open retargets; an unclosed link runs to the end.
+    url = (sep >= 0 ? payload.slice(sep + 1) : "") || undefined;
+    restyled = true;
   }
-  if (last < cleaned.length) {
-    segs.push({ text: cleaned.slice(last), style: { ...cur } });
-  }
-  return { segs: segs.filter((s) => s.text.length > 0), exit: cur };
+  emit(clean.slice(last));
+  return { segs, exit: { style, url } };
 }
 
-/** Parse a string with ANSI SGR codes into styled segments. Non-SGR
- *  CSI sequences and `\r` repaints are stripped/collapsed first. */
 export function parseAnsi(text: string): AnsiSegment[] {
-  return parseAnsiFrom(text, {}).segs;
+  return parseAnsiFrom(text, { style: {} }).segs;
 }

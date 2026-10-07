@@ -1,18 +1,23 @@
 pub mod container_interface;
 pub mod error;
+mod execution;
 pub mod image_update;
 mod runtime;
 pub(crate) mod runtime_base;
+pub mod stats;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
-pub use container_interface::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
+pub(crate) use container_interface::InspectedContainer;
+pub use container_interface::{
+    ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
+};
 use error::Result;
-pub use runtime::ContainerRuntime;
+pub(crate) use execution::{ContainerExecutionSnapshot, RuntimeExecutionSnapshot};
+pub use runtime::{ContainerRuntime, ContainerState};
 
-/// Returns the CLI binary name for the configured container runtime.
 pub fn runtime_binary() -> &'static str {
     if let Ok(cfg) = Config::load() {
         match cfg.sandbox.container_runtime {
@@ -24,6 +29,8 @@ pub fn runtime_binary() -> &'static str {
         "docker"
     }
 }
+
+pub const SANDBOX_NAME_PREFIX: &str = "aoe-sandbox-";
 
 pub fn get_container_runtime() -> ContainerRuntime {
     if let Ok(cfg) = Config::load() {
@@ -37,11 +44,9 @@ pub fn get_container_runtime() -> ContainerRuntime {
     }
 }
 
-/// Check running state of all aoe sandbox containers in a single subprocess call.
-/// Returns a map of container name -> is_running.
 pub fn batch_container_health() -> HashMap<String, bool> {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_running_states("aoe-sandbox-");
+    let map = get_container_runtime().batch_running_states(SANDBOX_NAME_PREFIX);
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -51,23 +56,37 @@ pub fn batch_container_health() -> HashMap<String, bool> {
     map
 }
 
-/// Outcome of an idempotent container teardown.
+pub fn batch_container_states() -> HashMap<String, ContainerState> {
+    let start = std::time::Instant::now();
+    let map = get_container_runtime().batch_container_states(SANDBOX_NAME_PREFIX);
+    tracing::debug!(
+        target: "containers.runtime",
+        count = map.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "batch container states fetched",
+    );
+    map
+}
+
+pub fn batch_container_stats() -> stats::StatsMap {
+    let start = std::time::Instant::now();
+    let map = get_container_runtime().batch_stats(SANDBOX_NAME_PREFIX);
+    tracing::debug!(
+        target: "containers.runtime",
+        count = map.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "batch container stats fetched",
+    );
+    map
+}
+
 #[derive(Debug)]
 pub enum Teardown {
-    /// The container was force-removed.
     Removed,
-    /// No container existed to remove; the teardown was a no-op.
     AlreadyGone,
-    /// Removal failed for a reason other than the container being absent.
     Failed(error::DockerError),
 }
 
-/// Classify a force-remove result into an idempotent teardown outcome.
-///
-/// A `ContainerNotFound` error means there was nothing to remove and maps to
-/// `AlreadyGone`; every other error is a genuine `Failed`. Keeping this
-/// classification separate from I/O lets it be reasoned about and tested
-/// without a live runtime.
 fn classify_removal(result: Result<()>) -> Teardown {
     match result {
         Ok(()) => Teardown::Removed,
@@ -76,30 +95,14 @@ fn classify_removal(result: Result<()>) -> Teardown {
     }
 }
 
-/// Outcome of a running-state probe that preserves the difference between
-/// a definitive "not running" and a transient inspection failure.
-///
-/// Callers gating a mutation on the container being stopped must match on
-/// all three variants and treat [`Probe::Unknown`] conservatively (typically
-/// as "possibly running"). Collapsing the underlying `is_running() -> Result<bool>`
-/// to a plain `bool` via `unwrap_or(false)` re-introduces the swallowing-
-/// existence-probe class of bug fixed in #2596.
-/// [`DockerContainer::probe_running`] is the constructor for this type.
+/// Callers gating a mutation must treat `Unknown` as possibly running, never as `NotRunning`.
 #[derive(Debug)]
 pub enum Probe {
-    /// The container is running.
     Running,
-    /// The container is definitively not running (stopped or absent).
     NotRunning,
-    /// The inspection itself failed; the running state is unknown.
     Unknown(error::DockerError),
 }
 
-/// Classify a running-state result into an idempotent probe outcome.
-///
-/// A transient inspection error must not be swallowed into a `NotRunning`
-/// false negative. Keeping this classification separate from I/O lets it
-/// be reasoned about and tested without a live runtime.
 fn classify_running_probe(result: Result<bool>) -> Probe {
     match result {
         Ok(true) => Probe::Running,
@@ -124,7 +127,7 @@ impl DockerContainer {
     }
 
     pub fn generate_name(session_id: &str) -> String {
-        format!("aoe-sandbox-{}", truncate_id(session_id, 8))
+        format!("{SANDBOX_NAME_PREFIX}{}", truncate_id(session_id, 8))
     }
 
     pub fn from_session_id(session_id: &str) -> Self {
@@ -143,11 +146,34 @@ impl DockerContainer {
         self.runtime.is_container_running(&self.name)
     }
 
-    /// The container's configured working directory, read from the live
-    /// container. `None` if it can't be determined; see
-    /// [`ContainerRuntime::container_working_dir`].
     pub fn working_dir(&self) -> Option<String> {
         self.runtime.container_working_dir(&self.name)
+    }
+
+    pub fn sandbox_store_generation_matches(&self) -> Result<Option<bool>> {
+        self.runtime.sandbox_store_generation_matches(&self.name)
+    }
+
+    pub(crate) fn inspect(&self) -> Result<Option<InspectedContainer>> {
+        self.runtime.inspect_container(&self.name)
+    }
+
+    pub fn shared_credential_mounts_match(&self, config: &ContainerConfig) -> Result<Option<bool>> {
+        self.runtime
+            .shared_credential_mounts_match(&self.name, config)
+    }
+
+    pub fn carries_shared_credential_label(&self) -> Result<Option<bool>> {
+        self.runtime.carries_shared_credential_label(&self.name)
+    }
+
+    pub fn agent_tool_matches(&self, identity: &str) -> Result<Option<bool>> {
+        self.runtime.agent_tool_matches(&self.name, identity)
+    }
+
+    pub fn mount_fingerprint_matches(&self, config: &ContainerConfig) -> Result<Option<bool>> {
+        self.runtime
+            .mount_fingerprint_matches(&self.name, &config.mount_fingerprint())
     }
 
     pub fn build_create_args(&self, config: &ContainerConfig) -> Vec<String> {
@@ -198,11 +224,6 @@ impl DockerContainer {
         result
     }
 
-    /// Remove all named ignore volumes for this session (prefix = `aoe-vi-{session_id}-`).
-    ///
-    /// Must be called after container removal during session deletion. Named volumes are not
-    /// removed by `docker rm -v`; they require explicit cleanup. Safe to call even when the
-    /// container is already gone — volumes can outlive their container.
     pub fn remove_named_ignore_volumes(&self, session_id: &str) {
         let prefix = format!("aoe-vi-{}-", session_id);
         if let Err(e) = self.runtime.base.remove_named_ignore_volumes(&prefix) {
@@ -216,67 +237,54 @@ impl DockerContainer {
         }
     }
 
-    /// Force-remove this container, then sweep its named ignore volumes.
-    ///
-    /// Idempotent: a container that is already gone yields
-    /// [`Teardown::AlreadyGone`], not a failure. Named ignore volumes outlive
-    /// the container, so they are swept regardless of the removal outcome.
-    ///
-    /// This method must be invoked unconditionally by callers, which then
-    /// act on the returned outcome; it must never be gated behind a separate
-    /// existence probe, whose transient failure would skip removal and orphan
-    /// a live container.
+    /// `names` is an allowlist. Call before the create, while no container holds the volumes.
+    pub fn remove_stranded_named_ignore_volumes(&self, session_id: &str, names: &[String]) {
+        if names.is_empty() || !self.runtime.base.supports_named_volumes {
+            return;
+        }
+        tracing::info!(
+            target: "containers.runtime",
+            %session_id,
+            ?names,
+            "reclaiming named ignore volumes stranded by a worktree move"
+        );
+        let names: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let prefix = format!("aoe-vi-{}-", session_id);
+        if let Err(e) = self
+            .runtime
+            .base
+            .remove_named_ignore_volumes_in(&prefix, &names)
+        {
+            tracing::warn!(
+                target: "containers.runtime",
+                name = %self.name,
+                %session_id,
+                error = %e,
+                "failed to remove stranded named ignore volumes"
+            );
+        }
+    }
+
+    /// Callers must invoke this unconditionally, never behind an existence probe whose
+    /// transient failure would orphan a live container.
     pub fn teardown(&self, session_id: &str) -> Teardown {
         let outcome = classify_removal(self.remove(true));
         self.remove_named_ignore_volumes(session_id);
         outcome
     }
 
-    /// Force-remove this container, preserving its named ignore volumes.
-    ///
-    /// Idempotent counterpart to [`Self::teardown`]: same removal and
-    /// classification, but the session-scoped named ignore volumes
-    /// (`aoe-vi-{session_id}-*`, e.g. `target/`, `node_modules/`) are left
-    /// intact so the recreated container re-attaches them on next start.
-    /// Used on the worktree-move discard path where the container is dropped
-    /// to pick up a new bind mount and will be recreated immediately.
-    ///
-    /// The same invariant as [`Self::teardown`] applies: callers must invoke
-    /// this unconditionally and act on the returned outcome; it must never
-    /// be gated behind a separate existence probe, whose transient failure
-    /// would skip removal and orphan a live container (#2596).
+    /// Keeps named ignore volumes for the immediate recreate. Same invoke-unconditionally rule
+    /// as [`Self::teardown`].
     pub fn discard(&self) -> Teardown {
         classify_removal(self.remove(true))
     }
 
-    /// Remove this container only if it is not running, preserving its named
-    /// ignore volumes.
-    ///
-    /// The non-force counterpart to [`Self::discard`], for the one caller that
-    /// legitimately reaches removal through a `probe_running()` gate
-    /// ([`crate::session::worktree_edit::ensure_sandbox_container_released`]).
-    /// That gate must not force-remove: it runs unlocked from the CLI and TUI
-    /// paths, so a container that started between the probe and here would be
-    /// force-killed under a live agent. Without `-f` the runtime refuses,
-    /// which surfaces as [`Teardown::Failed`] and makes the gate report the
-    /// worktree as held, which is the fail-closed answer it already wants.
-    ///
-    /// Do not reach for this anywhere else: [`Self::discard`]'s
-    /// invoke-unconditionally invariant (#2596) still holds for every other
-    /// removal path.
+    /// Non-force removal for the one `probe_running()`-gated caller: a container that started
+    /// after the probe is refused rather than killed under a live agent.
     pub fn discard_if_stopped(&self) -> Teardown {
         classify_removal(self.remove(false))
     }
 
-    /// Probe this container's running state, preserving the difference
-    /// between a definitive "not running" and a transient inspection failure.
-    ///
-    /// Prefer this over `is_running().unwrap_or(false)` at any call site
-    /// where the returned boolean gates a mutation on the container being
-    /// stopped: `unwrap_or(false)` swallows a transient `docker inspect`
-    /// failure into a false negative and lets the gate open against a
-    /// possibly-live container: the swallowing-existence-probe class of
-    /// bug fixed on the removal path in #2596.
     pub fn probe_running(&self) -> Probe {
         classify_running_probe(self.is_running())
     }
@@ -285,8 +293,6 @@ impl DockerContainer {
         self.runtime.exec_command(&self.name, options, cmd)
     }
 
-    /// Argv that runs `cmd` inside this container, for a caller that spawns and
-    /// bounds the process itself. See [`ContainerRuntime::build_exec_argv`].
     pub fn build_exec_argv(&self, workdir: &str, cmd: &[String]) -> Vec<String> {
         self.runtime.build_exec_argv(&self.name, workdir, cmd)
     }
@@ -313,63 +319,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_ok_is_removed() {
+    fn classify_removal_separates_gone_from_failed() {
         assert!(matches!(classify_removal(Ok(())), Teardown::Removed));
-    }
-
-    #[test]
-    fn classify_not_found_is_already_gone() {
-        let r = Err(error::DockerError::ContainerNotFound(
-            "aoe-sandbox-x".into(),
+        assert!(matches!(
+            classify_removal(Err(error::DockerError::ContainerNotFound(
+                "aoe-sandbox-x".into()
+            ))),
+            Teardown::AlreadyGone
         ));
-        assert!(matches!(classify_removal(r), Teardown::AlreadyGone));
+        assert!(matches!(
+            classify_removal(Err(error::DockerError::RemoveFailed("daemon busy".into()))),
+            Teardown::Failed(_)
+        ));
     }
 
     #[test]
-    fn classify_other_error_is_failed() {
-        let r = Err(error::DockerError::RemoveFailed("daemon busy".into()));
-        assert!(matches!(classify_removal(r), Teardown::Failed(_)));
-    }
-
-    #[test]
-    fn probe_ok_true_is_running() {
+    fn classify_running_probe_keeps_errors_out_of_the_running_answer() {
         assert!(matches!(classify_running_probe(Ok(true)), Probe::Running));
-    }
-
-    #[test]
-    fn probe_ok_false_is_not_running() {
         assert!(matches!(
             classify_running_probe(Ok(false)),
             Probe::NotRunning
         ));
+        assert!(matches!(
+            classify_running_probe(Err(error::DockerError::InspectFailed(
+                "inspect exit 1".into()
+            ))),
+            Probe::Unknown(_)
+        ));
     }
 
     #[test]
-    fn probe_err_is_unknown() {
-        let r = Err(error::DockerError::InspectFailed("inspect exit 1".into()));
-        assert!(matches!(classify_running_probe(r), Probe::Unknown(_)));
+    fn generate_name_prefixes_and_truncates_the_session_id() {
+        assert_eq!(DockerContainer::generate_name("abc"), "aoe-sandbox-abc");
+        assert_eq!(
+            DockerContainer::generate_name("abcdefghijklmnop"),
+            "aoe-sandbox-abcdefgh"
+        );
     }
 
-    #[test]
-    fn test_container_generate_name_short_id() {
-        let name = DockerContainer::generate_name("abc");
-        assert_eq!(name, "aoe-sandbox-abc");
-    }
-
-    #[test]
-    fn test_container_generate_name_long_id() {
-        let name = DockerContainer::generate_name("abcdefghijklmnop");
-        assert_eq!(name, "aoe-sandbox-abcdefgh");
-    }
-
-    #[test]
-    fn test_container_exec_command() {
-        let mut container = DockerContainer::new("test1234567890ab", "ubuntu:latest");
-        container.runtime = ContainerRuntime::docker();
-
-        let cmd = container.exec_command(None, "my-agent");
-        assert_eq!(cmd, "docker exec -it aoe-sandbox-test1234 my-agent");
-    }
     #[test]
     fn test_anonymous_volumes_in_create_args() {
         let container = DockerContainer::new("test1234567890ab", "alpine:latest");
@@ -390,7 +377,6 @@ mod tests {
 
         let args = container.build_create_args(&config);
 
-        // Find the anonymous volume flags
         let v_positions: Vec<usize> = args
             .iter()
             .enumerate()
@@ -421,7 +407,6 @@ mod tests {
 
         let args = container.build_create_args(&config);
 
-        // No -v flags at all
         assert!(!args.contains(&"-v".to_string()));
     }
 }

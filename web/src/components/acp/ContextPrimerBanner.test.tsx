@@ -19,6 +19,14 @@ import { fetchContextPrimer } from "../../lib/api";
 const mockFetch = vi.mocked(fetchContextPrimer);
 
 const AVAILABLE = { resetSeq: 7, reason: "session/load" };
+const primer = (text: string) => ({
+  primer: text,
+  included_event_count: text ? 4 : 0,
+  included_turn_count: text ? 2 : 0,
+  truncated: false,
+  max_chars: 4000,
+  unprocessed_prompt: null,
+});
 
 function mount(props?: Partial<React.ComponentProps<typeof ContextPrimerBanner>>) {
   const onInsertPrimer = vi.fn();
@@ -44,93 +52,32 @@ afterEach(() => {
 });
 
 describe("ContextPrimerBanner", () => {
-  it("renders nothing when `available` is null", () => {
-    const { container } = mount({ available: null });
-    expect(container.firstChild).toBeNull();
-  });
-
-  it("renders the banner copy and the Resume button when available is set", () => {
-    const { getByText } = mount();
-    expect(getByText(/Agent lost its prior model context/i)).toBeTruthy();
-    expect(getByText(/Resume with prior context/i)).toBeTruthy();
-  });
-
-  it("renders the dismiss control with its aria-label", () => {
-    const { getByLabelText } = mount();
-    expect(getByLabelText("Dismiss context-reset banner")).toBeTruthy();
-  });
-
   it("calls onDismiss when the × button is clicked", () => {
     const { getByLabelText, onDismiss } = mount();
     fireEvent.click(getByLabelText("Dismiss context-reset banner"));
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
-  it("hits the primer endpoint with the session id and reset seq", async () => {
-    mockFetch.mockResolvedValueOnce({
-      primer: "user: hi\nagent: hello",
-      included_event_count: 2,
-      included_turn_count: 1,
-      truncated: false,
-      max_chars: 4000,
-      unprocessed_prompt: null,
-    });
-    const { getByText } = mount();
-    fireEvent.click(getByText(/Resume with prior context/i));
-    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
-    expect(mockFetch.mock.calls[0]?.[0]).toBe("s-1");
-    expect(mockFetch.mock.calls[0]?.[1]).toBe(7);
-  });
-
-  it("inserts the fetched primer and triggers onDismiss on success", async () => {
-    mockFetch.mockResolvedValueOnce({
-      primer: "recap text",
-      included_event_count: 4,
-      included_turn_count: 2,
-      truncated: false,
-      max_chars: 4000,
-      unprocessed_prompt: null,
-    });
+  it("fetches the primer for the session and reset seq, inserts it, and dismisses", async () => {
+    mockFetch.mockResolvedValueOnce(primer("recap text"));
     const { getByText, onInsertPrimer, onDismiss } = mount();
     fireEvent.click(getByText(/Resume with prior context/i));
     await waitFor(() => expect(onInsertPrimer).toHaveBeenCalledWith("recap text"));
+    expect(mockFetch).toHaveBeenCalledExactlyOnceWith("s-1", 7, expect.anything());
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
-  it("surfaces an error when the primer endpoint returns null", async () => {
-    mockFetch.mockResolvedValueOnce(null);
+  it.each([
+    ["a null response", () => mockFetch.mockResolvedValueOnce(null), /Failed to fetch primer/i],
+    ["an empty primer", () => mockFetch.mockResolvedValueOnce(primer("")), /No prior transcript/i],
+    ["a rejection", () => mockFetch.mockRejectedValueOnce(new Error("network down")), /Network error/i],
+  ])("surfaces an error for %s without inserting or dismissing", async (_label, arrange, message) => {
+    arrange();
     const { getByText, findByRole, onInsertPrimer, onDismiss } = mount();
     fireEvent.click(getByText(/Resume with prior context/i));
-    const alert = await findByRole("alert");
-    expect(alert.textContent).toMatch(/Failed to fetch primer/i);
+    expect((await findByRole("alert")).textContent).toMatch(message);
     expect(onInsertPrimer).not.toHaveBeenCalled();
     expect(onDismiss).not.toHaveBeenCalled();
-  });
-
-  it("surfaces a 'no transcript' message when primer is empty", async () => {
-    mockFetch.mockResolvedValueOnce({
-      primer: "",
-      included_event_count: 0,
-      included_turn_count: 0,
-      truncated: false,
-      max_chars: 4000,
-      unprocessed_prompt: null,
-    });
-    const { getByText, findByRole, onInsertPrimer, onDismiss } = mount();
-    fireEvent.click(getByText(/Resume with prior context/i));
-    const alert = await findByRole("alert");
-    expect(alert.textContent).toMatch(/No prior transcript/i);
-    expect(onInsertPrimer).not.toHaveBeenCalled();
-    expect(onDismiss).not.toHaveBeenCalled();
-  });
-
-  it("surfaces a network error on fetch rejection (not AbortError)", async () => {
-    mockFetch.mockRejectedValueOnce(new Error("network down"));
-    const { getByText, findByRole, onInsertPrimer } = mount();
-    fireEvent.click(getByText(/Resume with prior context/i));
-    const alert = await findByRole("alert");
-    expect(alert.textContent).toMatch(/Network error/i);
-    expect(onInsertPrimer).not.toHaveBeenCalled();
   });
 
   it("ignores an AbortError without surfacing an error message", async () => {

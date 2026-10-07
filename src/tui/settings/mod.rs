@@ -7,9 +7,9 @@ mod render;
 use tui_input::Input;
 
 use crate::session::{
-    list_profiles, load_profile_config, load_repo_config, merge_configs, profile_to_repo_config,
-    repo_config_to_profile, save_profile_config, save_repo_config, update_app_state, update_config,
-    Config, ProfileConfig, RepoConfig,
+    list_profiles_for_display, load_profile_config, load_repo_config, merge_configs,
+    profile_to_repo_config, repo_config_to_profile, save_profile_config, save_repo_config,
+    sort_profiles_for_display, update_app_state, update_config, Config, ProfileConfig, RepoConfig,
 };
 use crate::tui::dialogs::CustomInstructionDialog;
 
@@ -17,37 +17,21 @@ pub use fields::{FieldValue, HookField, SettingField, SettingsCategory};
 pub use input::SettingsAction;
 
 /// How long the "Settings saved" toast lingers before it auto-dismisses.
-/// Matches the dashboard's transient update-bar window (`app.rs`).
 const SUCCESS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Serialize a config (or `Option<RepoConfig>`) to JSON for change detection.
-/// Comparing the serialized form (the same representation that gets written to
-/// disk) sidesteps adding `PartialEq` to every nested config type, and a
-/// serialization failure degrades to `Null` so two failures compare equal
-/// rather than spuriously flagging changes.
+/// Serialize a config to JSON for change detection, so no nested config type
+/// needs `PartialEq`. A failure degrades to `Null` so two failures compare equal.
 fn config_to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
-/// Bonus a query token earns for matching a hit's title (category +
-/// label) rather than only its description prose. Sized to dominate any
-/// per-token nucleo score so title matches always rank first; a field
-/// that merely mentions the term in its description still matches, just
-/// lower in the popup.
+/// Bonus for matching a hit's title rather than only its description, sized to
+/// dominate any per-token nucleo score so title matches always rank first.
 const TITLE_MATCH_BONUS: u32 = 100_000;
 
-/// Fuzzy-score a field against a settings-search query. The query is
-/// split on whitespace and every token must fuzzy-match somewhere in
-/// `title` (category label + field label) or `full` (title +
-/// description); AND semantics, so "max workers" still matches "Max
-/// Concurrent Workers". Per-token scores are summed so closer matches
-/// rank higher, and a title match earns [`TITLE_MATCH_BONUS`] so
-/// "sandbox" surfaces the Sandbox tab's own settings before fields
-/// that only mention it in prose. An empty query scores every field 0,
-/// which keeps the popup listing all fields in their natural order.
-/// The fuzzy match also covers acronyms, so "mcw" finds "Max
-/// Concurrent Workers". Reuses the same nucleo pattern as the command
-/// palette.
+/// Fuzzy-score a field against a settings-search query: every whitespace token
+/// must match `title` or `full`, scores are summed, and a title match earns
+/// [`TITLE_MATCH_BONUS`]. An empty query scores 0, listing fields in order.
 fn fuzzy_settings_score(query: &str, title: &str, full: &str) -> Option<u32> {
     use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
     use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -80,7 +64,6 @@ fn fuzzy_settings_score(query: &str, title: &str, full: &str) -> Option<u32> {
     Some(total)
 }
 
-/// Which scope of settings is being edited
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsScope {
     #[default]
@@ -89,7 +72,6 @@ pub enum SettingsScope {
     Repo,
 }
 
-/// Focus state for the settings view
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsFocus {
     #[default]
@@ -97,7 +79,6 @@ pub enum SettingsFocus {
     Fields,
 }
 
-/// State for editing a list field
 #[derive(Debug, Clone, Default)]
 pub struct ListEditState {
     pub selected_index: usize,
@@ -105,27 +86,39 @@ pub struct ListEditState {
     pub adding_new: bool,
 }
 
-/// One result in the settings-search jump popup: a field that matched
-/// the user's query along with where it lives.
+/// Clickable parts of the expanded list editor, captured by render.
+#[derive(Default)]
+pub(super) struct ListEditHits {
+    /// Item index and screen rect per visible item row.
+    pub rows: Vec<(usize, ratatui::layout::Rect)>,
+    /// Header actions; a click acts like pressing the key.
+    pub actions: Vec<(crossterm::event::KeyCode, ratatui::layout::Rect)>,
+}
+
+impl ListEditHits {
+    pub fn rects(&self) -> Vec<ratatui::layout::Rect> {
+        let mut rects = crate::tui::dialogs::target_rects(&self.actions);
+        rects.extend(crate::tui::dialogs::target_rects(&self.rows));
+        rects
+    }
+}
+
+/// A field that matched the settings-search query, plus where it lives.
 #[derive(Debug, Clone)]
 pub(super) struct SearchHit {
     pub category: SettingsCategory,
-    /// Stable field identity (`SettingField::ident`) used to relocate the
-    /// cursor on jump, since fields are rebuilt from the schema per category.
+    /// Stable identity used to relocate the cursor on jump, since fields are
+    /// rebuilt from the schema per category.
     pub field_ident: String,
     pub field_label: String,
     pub category_label: &'static str,
-    /// Current value of the field at the time the hit list was built,
-    /// rendered dimmed after the label so the popup doubles as a quick
-    /// way to review settings without jumping to each one (issue #2932).
-    /// Safe to snapshot: editing is frozen while the popup is open.
+    /// Value snapshotted when the hit list was built. Safe because editing is
+    /// frozen while the popup is open.
     pub value_display: String,
 }
 
-/// One row in the left-hand categories panel. Sections are
-/// non-interactive dividers that group related categories visually
-/// (Sessions, Hooks, Environment, etc.); navigation skips past them
-/// and `selected_category` is always the index of a `Tab` row.
+/// A row in the categories panel. Sections are non-interactive dividers that
+/// navigation skips; `selected_category` is always the index of a `Tab` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CategoryRow {
     Section(&'static str),
@@ -141,169 +134,113 @@ impl CategoryRow {
     }
 }
 
-/// The settings view state
 pub struct SettingsView {
-    /// Current profile name being edited
     pub(super) profile: String,
 
-    /// All available profile names (sorted)
     pub(super) available_profiles: Vec<String>,
 
-    /// Project path for repo-level settings (None if no session selected)
     pub(super) project_path: Option<String>,
 
-    /// Repo-level config (original, for load/save)
     pub(super) repo_config: Option<RepoConfig>,
 
-    /// Repo config converted to ProfileConfig for TUI editing (overrides relative to resolved base)
+    /// Repo config as overrides relative to `resolved_base`.
     pub(super) repo_as_profile: ProfileConfig,
 
-    /// Resolved base config (global + profile merged) used as the "global" when editing Repo scope
+    /// Global + profile merged, the base that Repo scope overrides.
     pub(super) resolved_base: Config,
 
-    /// Which scope tab is selected
     pub(super) scope: SettingsScope,
 
-    /// Which panel has focus
     pub(super) focus: SettingsFocus,
 
-    /// Rows in the left-hand categories panel: a mix of non-interactive
-    /// section dividers and selectable category tabs. `selected_category`
-    /// is always the index of a `CategoryRow::Tab` entry.
     pub(super) categories: Vec<CategoryRow>,
 
-    /// Currently selected category-row index. Points at a `Tab`
-    /// row; navigation helpers maintain this invariant.
+    /// Always the index of a `Tab` row; navigation helpers keep it so.
     pub(super) selected_category: usize,
 
-    /// Fields for the current category
     pub(super) fields: Vec<SettingField>,
 
-    /// Currently selected field index
     pub(super) selected_field: usize,
 
-    /// Global config being edited
     pub(super) global_config: Config,
 
-    /// Profile config being edited (overrides)
     pub(super) profile_config: ProfileConfig,
 
-    /// Text input when editing a text/number field
     pub(super) editing_input: Option<Input>,
 
-    /// State for list editing
     pub(super) list_edit_state: Option<ListEditState>,
 
-    /// Custom instruction editor dialog
     pub(super) custom_instruction_dialog: Option<CustomInstructionDialog>,
 
-    /// Scroll offset for the fields panel (in lines)
     pub(super) fields_scroll_offset: u16,
 
-    /// Last known viewport height for the fields panel (set during render)
     pub(super) fields_viewport_height: u16,
 
-    /// Last known content width for the fields panel (set during render).
-    /// Used to compute description wrap heights outside the render pass,
-    /// so `ensure_field_visible` and the scroll math match what the
-    /// next frame will actually paint.
+    /// Content width captured during render, so scroll math outside the render
+    /// pass wraps descriptions the way the next frame will paint them.
     pub(super) fields_content_width: u16,
 
-    /// Whether there are unsaved changes. Recomputed on every edit by diffing
-    /// the live configs against [`Self::baseline_*`], so reverting a field back
-    /// to its saved value clears the flag rather than latching it (issue #2083).
+    /// Recomputed against `baseline_*`, so reverting an edit clears it.
     pub(super) has_changes: bool,
 
-    /// Serialized snapshots of the editable configs as of the last load or
-    /// save. The unsaved-changes flag compares the live configs against these.
+    /// The editable configs as of the last load or save.
     pub(super) baseline_global: serde_json::Value,
     pub(super) baseline_profile: serde_json::Value,
     pub(super) baseline_repo: serde_json::Value,
 
-    /// Whether the help overlay is shown
     pub(super) show_help: bool,
 
-    /// Error message to display
     pub(super) error_message: Option<String>,
 
-    /// Success message to display (e.g. "Settings saved"). Rendered in the
-    /// footer status row, not over the fields.
     pub(super) success_message: Option<String>,
 
-    /// When the success toast should auto-dismiss. Set alongside
-    /// `success_message` on save so the "Settings saved" notice fades on its
-    /// own if the user just walks away, mirroring the dashboard's transient
-    /// update bar. Errors are sticky and have no expiry.
+    /// When the success toast auto-dismisses. Errors are sticky and have none.
     pub(super) success_message_expires_at: Option<std::time::Instant>,
 
-    /// The settings-search query. `Some` while search is active: the
-    /// permanent bar becomes the input and the jump popup renders
-    /// beneath it with the ranked hits; keys route to the query + hit
-    /// list until the user picks a hit (Enter jumps to it) or hits
-    /// Esc. `None` is the idle bar with its placeholder.
+    /// `Some` while search is active: keys route to the query and hit list
+    /// until Enter jumps or Esc closes. `None` is the idle bar.
     pub(super) search_input: Option<Input>,
 
-    /// Hits that match the current `search_input` query, recomputed
-    /// each time the query changes. Empty query lists every
-    /// interactive field across every category, so the user can
-    /// browse the full catalog as a flat list sorted by category
-    /// then by field order.
+    /// Hits for the current query; an empty query lists every field.
     pub(super) search_hits: Vec<SearchHit>,
 
-    /// Cursor inside `search_hits`, bounded by `search_hits.len()`
-    /// so it stays valid as the query narrows.
     pub(super) search_selected: usize,
 
-    /// Captured by the popup render: the screen row of each visible
-    /// hit along with its `search_hits` index. Drives click + hover
-    /// routing without re-deriving the scroll math (the command
-    /// palette's `visible_item_rows` pattern).
+    /// Screen row and `search_hits` index per visible hit, captured by the
+    /// popup render so click and hover need no scroll math.
     pub(super) search_hit_rows: Vec<(u16, usize)>,
 
-    /// Rect of the rendered popup frame. Click routing uses it to
-    /// distinguish "inside popup but missed a row" (no-op) from
-    /// "outside popup" (dismiss).
+    /// Popup frame, so a click inside it that misses a row is a no-op rather
+    /// than a dismiss.
     pub(super) search_popup_area: ratatui::layout::Rect,
 
-    /// Rect of the permanent search bar, captured each frame so a
-    /// click on the idle bar opens the search like typing `/` does.
+    /// Search bar, so clicking the idle bar opens search like `/`.
     pub(super) search_bar_rect: ratatui::layout::Rect,
 
-    /// Hit rect per scope tab in the header. Captured during render
-    /// so a click on `[ Global ]` / `[ Profile ]` / `[ Repo ]` can
-    /// switch scope without going through the keyboard. Cleared and
-    /// repopulated each frame.
+    /// Hit rect per scope tab, so a click can switch scope.
     pub(super) scope_tab_rects: Vec<(SettingsScope, ratatui::layout::Rect)>,
-    /// Hit rect per row in the categories panel, indexed into
-    /// `self.categories`. Only Tab rows are pushed; Section dividers
-    /// are skipped so a click on a heading is a no-op.
+    /// Hit rect per `categories` Tab row; Section dividers are skipped.
     pub(super) category_rects: Vec<(usize, ratatui::layout::Rect)>,
-    /// Hit rect per visible field row, indexed into `self.fields`.
-    /// Skipped while a field is being edited or a list is being
-    /// edited so a stray click during composition doesn't reset focus.
+    /// Hit rect per visible `fields` row, empty while editing so a stray click
+    /// during composition cannot reset focus.
     pub(super) field_rects: Vec<(usize, ratatui::layout::Rect)>,
-    /// Rect of the fields-panel scrollbar, captured each frame so the
-    /// wheel and a grab-drag on the bar can move the fields viewport.
-    /// A zero-area rect (the default when content fits) makes the
-    /// hit test miss, so there's nothing to grab when nothing scrolls.
+    /// Fields-panel scrollbar. Zero-area when content fits, so nothing to grab.
     pub(super) scrollbar_area: ratatui::layout::Rect,
-    /// Last `(col, row)` reported by a `MouseEventKind::Moved` event
-    /// while a non-editing settings surface is in view. Drives the
-    /// hover highlight on scope chips, categories, and fields, kept
-    /// separate from `selected_*` / `focus` so the mouse never
-    /// disturbs the keyboard cursor. Cleared on every keypress so
-    /// hover doesn't linger after the user switches modalities.
+    /// Last hovered cell, kept apart from `selected_*` so the mouse never
+    /// disturbs the keyboard cursor. Cleared on every keypress.
     pub(super) mouse_pos: Option<(u16, u16)>,
+    /// Expanded list editor hit rects; empty while no list is open.
+    pub(super) list_edit_hits: ListEditHits,
+    /// Visual only: `(d)elete` acts on the selection, which the pointer must
+    /// not retarget on its way to the header.
+    pub(super) list_hover: crate::tui::components::hover::HoverState,
 
-    /// Embedded plugin manager for the Plugins category: the same dialog the
-    /// command palette opens (`crate::tui::dialogs::PluginManagerDialog`),
-    /// hosted inline so the builtin plugin list lives on the settings screen.
-    /// One implementation, reused; it reloads its own list on mutation.
+    /// The command palette's plugin manager, hosted inline in the Plugins
+    /// category.
     pub(super) plugin_manager: crate::tui::dialogs::PluginManagerDialog,
 
-    /// Sub-focus within the Plugins category's right pane: `false` targets
-    /// the plugin manager (top), `true` the editable plugin settings fields
-    /// beneath it. Tab toggles; reset when the field list rebuilds.
+    /// Plugins right pane sub-focus: `true` targets the settings fields below
+    /// the manager. Tab toggles; reset when the field list rebuilds.
     pub(super) plugins_fields_focus: bool,
 }
 
@@ -322,7 +259,8 @@ impl SettingsView {
             .map(repo_config_to_profile)
             .unwrap_or_default();
 
-        let mut available_profiles = match list_profiles() {
+        // The profile-scope cycler is a picker, so `default` sorts last.
+        let mut available_profiles = match list_profiles_for_display() {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(target: "tui.settings", "Failed to list profiles: {e}");
@@ -331,7 +269,7 @@ impl SettingsView {
         };
         if !available_profiles.contains(&profile.to_string()) {
             available_profiles.push(profile.to_string());
-            available_profiles.sort();
+            sort_profiles_for_display(&mut available_profiles);
         }
 
         let categories = Self::categories_for_scope(SettingsScope::Global);
@@ -350,8 +288,6 @@ impl SettingsView {
             scope: SettingsScope::Global,
             focus: SettingsFocus::Categories,
             categories,
-            // 0 is the leading section divider; seek to the first
-            // Tab below so the user lands on a real category.
             selected_category: 0,
             fields: Vec::new(),
             selected_field: 0,
@@ -382,23 +318,21 @@ impl SettingsView {
             field_rects: Vec::new(),
             scrollbar_area: ratatui::layout::Rect::default(),
             mouse_pos: None,
+            list_edit_hits: ListEditHits::default(),
+            list_hover: Default::default(),
             plugin_manager: crate::tui::dialogs::PluginManagerDialog::embedded(),
             plugins_fields_focus: false,
         };
 
-        // The constructor parks `selected_category` at 0, which is the
-        // first section divider in the layout. Snap to the first real
-        // Tab before the first render so the cursor lands on Theme.
+        // 0 is the leading section divider; land on the first real Tab.
         view.selected_category = view.first_tab_index();
         view.rebuild_fields();
         Ok(view)
     }
 
-    /// Build the categories-panel layout. Categories are grouped under
-    /// section dividers (Appearance / Sessions / Hooks / Environment /
-    /// Notifications / System) so the list isn't 14 unrelated tabs in
-    /// arbitrary order. Status Hooks is dropped in Repo scope (the only
-    /// scope-conditional category today).
+    /// Categories grouped under section dividers. Status Hooks, Tmux and Sound
+    /// are dropped in Repo scope: `REPO_OVERRIDABLE_SECTIONS` excludes them, so
+    /// a repo edit there would strand at save.
     fn categories_for_scope(scope: SettingsScope) -> Vec<CategoryRow> {
         let mut rows: Vec<CategoryRow> = Vec::new();
         let push_section = |rows: &mut Vec<CategoryRow>, label: &'static str| {
@@ -427,10 +361,14 @@ impl SettingsView {
         push_section(&mut rows, "Environment");
         push_tab(&mut rows, SettingsCategory::Sandbox);
         push_tab(&mut rows, SettingsCategory::Worktree);
-        push_tab(&mut rows, SettingsCategory::Tmux);
+        if scope != SettingsScope::Repo {
+            push_tab(&mut rows, SettingsCategory::Tmux);
+        }
 
         push_section(&mut rows, "Notifications");
-        push_tab(&mut rows, SettingsCategory::Sound);
+        if scope != SettingsScope::Repo {
+            push_tab(&mut rows, SettingsCategory::Sound);
+        }
         push_tab(&mut rows, SettingsCategory::Web);
 
         push_section(&mut rows, "System");
@@ -456,31 +394,19 @@ impl SettingsView {
     /// selection.
     pub(super) fn hovered_scope(&self) -> Option<SettingsScope> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.scope_tab_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(scope, _)| *scope)
+        crate::tui::dialogs::hit(&self.scope_tab_rects, col, row)
     }
 
     /// Category-row index under the mouse cursor, if any.
     pub(super) fn hovered_category(&self) -> Option<usize> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.category_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(idx, _)| *idx)
+        crate::tui::dialogs::hit(&self.category_rects, col, row)
     }
 
     /// Field-row index under the mouse cursor, if any.
     pub(super) fn hovered_field(&self) -> Option<usize> {
         let (col, row) = self.mouse_pos?;
-        let pos = ratatui::layout::Position::from((col, row));
-        self.field_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(idx, _)| *idx)
+        crate::tui::dialogs::hit(&self.field_rects, col, row)
     }
 
     /// The category at `selected_category`, by invariant always a
@@ -560,7 +486,7 @@ impl SettingsView {
             let selected = self.plugin_manager.selected().map(|p| p.id.clone());
             self.fields.retain(|f| {
                 f.schema_section()
-                    .and_then(crate::session::settings_schema::section_plugin_id)
+                    .and_then(crate::session::config::settings_schema::section_plugin_id)
                     == selected.as_deref()
             });
         }
@@ -718,6 +644,12 @@ impl SettingsView {
             .saturating_sub(self.fields_viewport_height)
     }
 
+    /// Whether the help overlay or instruction editor covers the panels, so
+    /// wheel and scrollbar input must not move the fields behind it.
+    pub(super) fn has_overlay(&self) -> bool {
+        self.show_help || self.custom_instruction_dialog.is_some()
+    }
+
     /// Move the fields viewport by the wheel. `up` scrolls toward the top.
     /// When the search popup is open the wheel drives its ranked-hit
     /// cursor instead, matching the Up/Down keys. Returns true when
@@ -733,6 +665,9 @@ impl SettingsView {
         // step lands mid-row and reads as jumpy. Line granularity keeps
         // the panel gliding.
         const STEP: u16 = 1;
+        if self.has_overlay() {
+            return false;
+        }
         if self.search_input.is_some() {
             if up {
                 if self.search_selected > 0 {
@@ -767,7 +702,7 @@ impl SettingsView {
     /// further left.
     pub fn hit_scrollbar(&self, col: u16, row: u16) -> bool {
         let bar = self.scrollbar_area;
-        if bar.width == 0 {
+        if bar.width == 0 || self.has_overlay() {
             return false;
         }
         let left = bar.x.saturating_sub(1);
@@ -888,7 +823,7 @@ impl SettingsView {
                 let baseline = self.baseline_global.clone();
                 update_config(|c| -> anyhow::Result<()> {
                     let mut fresh = serde_json::to_value(&*c)?;
-                    crate::session::settings_schema::apply_changed_leaves(
+                    crate::session::config::settings_schema::apply_changed_leaves(
                         &mut fresh, &baseline, &edited,
                     );
                     *c = serde_json::from_value(fresh)?;
@@ -1157,39 +1092,76 @@ mod plugin_enabled_changes_tests {
     use serde_json::json;
 
     #[test]
-    fn detects_toggles_and_ignores_unchanged() {
-        let before = json!({
-            "a": { "enabled": true },
-            "b": { "enabled": false },
-            "c": { "enabled": true, "settings": { "k": 1 } },
-        });
-        let after = Some(json!({
-            "a": { "enabled": false },
-            "b": { "enabled": false },
-            "c": { "enabled": true, "settings": { "k": 2 } },
-        }));
-        let changes = plugin_enabled_changes(Some(&before), &after);
-        assert_eq!(changes, vec![("a".to_string(), false)]);
+    fn reports_only_the_toggles() {
+        // (before, after, expected changes). An id absent from `before`
+        // counts as enabled, so only a fresh disable is a change; an id
+        // dropped from `after` reverts to enabled.
+        let cases: &[(
+            Option<serde_json::Value>,
+            serde_json::Value,
+            Vec<(&str, bool)>,
+        )] = &[
+            (
+                Some(json!({
+                    "a": { "enabled": true },
+                    "b": { "enabled": false },
+                    "c": { "enabled": true, "settings": { "k": 1 } },
+                })),
+                json!({
+                    "a": { "enabled": false },
+                    "b": { "enabled": false },
+                    "c": { "enabled": true, "settings": { "k": 2 } },
+                }),
+                vec![("a", false)],
+            ),
+            (
+                None,
+                json!({ "fresh-off": { "enabled": false }, "fresh-on": { "enabled": true } }),
+                vec![("fresh-off", false)],
+            ),
+            (
+                Some(json!({ "gone": { "enabled": false } })),
+                json!({}),
+                vec![("gone", true)],
+            ),
+        ];
+        for (before, after, want) in cases {
+            let want: Vec<(String, bool)> =
+                want.iter().map(|(id, on)| (id.to_string(), *on)).collect();
+            assert_eq!(
+                plugin_enabled_changes(before.as_ref(), &Some(after.clone())),
+                want
+            );
+        }
     }
+}
 
-    #[test]
-    fn absent_entry_counts_as_enabled() {
-        // A new id appearing as disabled is a change; one appearing enabled
-        // is not (enabled is the default for unknown ids).
-        let after = Some(json!({
-            "fresh-off": { "enabled": false },
-            "fresh-on": { "enabled": true },
-        }));
-        let changes = plugin_enabled_changes(None, &after);
-        assert_eq!(changes, vec![("fresh-off".to_string(), false)]);
-    }
+#[cfg(test)]
+mod categories_for_scope_tests {
+    use super::{CategoryRow, SettingsCategory, SettingsScope, SettingsView};
 
+    /// StatusHooks, Tmux and Sound are gated off Repo scope: their sections
+    /// are not repo-overridable, so a Repo tab would strand edits at save.
     #[test]
-    fn dropped_disabled_entry_reverts_to_enabled() {
-        let before = json!({ "gone": { "enabled": false } });
-        let after = Some(json!({}));
-        let changes = plugin_enabled_changes(Some(&before), &after);
-        assert_eq!(changes, vec![("gone".to_string(), true)]);
+    fn repo_scope_drops_non_repo_overridable_categories() {
+        let has_tab = |rows: &[CategoryRow], cat| rows.iter().any(|r| r.as_tab() == Some(cat));
+        let repo = SettingsView::categories_for_scope(SettingsScope::Repo);
+        let global = SettingsView::categories_for_scope(SettingsScope::Global);
+        for cat in [
+            SettingsCategory::StatusHooks,
+            SettingsCategory::Tmux,
+            SettingsCategory::Sound,
+        ] {
+            assert!(!has_tab(&repo, cat), "{cat:?} must be absent under Repo");
+            assert!(
+                has_tab(&global, cat),
+                "{cat:?} must be present under Global"
+            );
+        }
+        assert!(
+            has_tab(&repo, SettingsCategory::Sandbox),
+            "repo-overridable"
+        );
     }
 }
 
@@ -1200,10 +1172,9 @@ pub(super) mod test_util {
     use crate::session::Storage;
     use tempfile::TempDir;
 
-    /// A `SettingsView` against an isolated app dir, shared by the
-    /// input and render test modules. Keep both guards alive for the
-    /// test body: the env is restored when `AppDirGuard` drops, before
-    /// the `TempDir` deletes itself.
+    /// A `SettingsView` over an isolated app dir. Keep both guards alive for
+    /// the test body: `AppDirGuard` restores the env before the `TempDir`
+    /// deletes itself.
     pub fn fresh_view() -> (TempDir, AppDirGuard, SettingsView) {
         let temp = TempDir::new().unwrap();
         let guard = isolate_app_dir_at(temp.path());
@@ -1220,11 +1191,8 @@ mod dirty_tracking_tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    /// Returns the `HomeGuard` first so it drops before the `TempDir`:
-    /// the env is restored before the tempdir is deleted, and the guard
-    /// holds the process-global env lock for the whole test body. The old
-    /// bare `set_var` never restored HOME, leaking a since-deleted tempdir
-    /// HOME into later tests (the #2600 failure mode).
+    /// The `HomeGuard` comes first so it drops before the `TempDir`, and it
+    /// holds the process-global env lock for the whole body.
     fn fresh_view() -> (
         crate::session::test_support::HomeGuard,
         TempDir,
@@ -1237,12 +1205,11 @@ mod dirty_tracking_tests {
         (home, temp, view)
     }
 
-    /// Editing a setting and then reverting it to the saved value must not
-    /// leave the view reporting unsaved changes (issue #2083). The flag is
-    /// diff-based, not a one-way latch.
+    /// The unsaved-changes flag is diff-based, not a one-way latch, and a
+    /// save resets the baseline it diffs against.
     #[test]
     #[serial]
-    fn reverting_an_edit_clears_unsaved_changes() {
+    fn unsaved_changes_track_the_diff_from_the_last_save() {
         let (_home, _temp, mut view) = fresh_view();
         assert!(!view.has_changes, "a freshly loaded view is clean");
 
@@ -1258,14 +1225,8 @@ mod dirty_tracking_tests {
             !view.has_changes,
             "reverting the edit should clear unsaved changes"
         );
-    }
 
-    /// Saving adopts the live config as the new baseline, so an edit that
-    /// matches a previously-saved value is correctly seen as a change again.
-    #[test]
-    #[serial]
-    fn save_resets_the_baseline() {
-        let (_home, _temp, mut view) = fresh_view();
+        // Saving adopts the live config as the new baseline.
         view.scope = SettingsScope::Profile;
 
         view.profile_config.description = Some("from-save".to_string());
@@ -1284,25 +1245,21 @@ mod dirty_tracking_tests {
         );
     }
 
-    /// The clobber this PR exists to kill, at the Settings pane. A global
-    /// field written by another process while the pane sits open must survive
-    /// the save. The old `*c = self.global_config.clone()` wrote the
-    /// open-time snapshot verbatim and silently reverted it, the same way the
-    /// removed `save_config` did.
+    /// A global field written by another process while the pane sits open
+    /// must survive the save, rather than being reverted by the open-time
+    /// snapshot.
     #[test]
     #[serial]
     fn global_save_preserves_concurrent_external_edit() {
         let (_home, _temp, mut view) = fresh_view();
         view.scope = SettingsScope::Global;
 
-        // The user edits one field in the pane.
         view.global_config.default_profile = "edited-by-user".to_string();
         view.recompute_dirty();
 
-        // Meanwhile a peer process writes an unrelated global field straight
-        // to disk, after this view took its baseline snapshot.
+        // A peer writes an unrelated global field after the baseline snapshot.
         crate::session::config::update_config(|c| {
-            c.session.confirm_delete = true;
+            c.session.confirm_delete = false;
         })
         .unwrap();
 
@@ -1314,13 +1271,11 @@ mod dirty_tracking_tests {
             "the field the user edited must be applied"
         );
         assert!(
-            on_disk.session.confirm_delete,
+            !on_disk.session.confirm_delete,
             "a peer's concurrent edit to a field the user never touched must survive the save"
         );
     }
 
-    /// A save that changes nothing must not write the snapshot over a peer's
-    /// concurrent edits either.
     #[test]
     #[serial]
     fn global_save_with_no_edits_preserves_concurrent_external_edit() {
@@ -1328,29 +1283,26 @@ mod dirty_tracking_tests {
         view.scope = SettingsScope::Global;
 
         crate::session::config::update_config(|c| {
-            c.session.confirm_delete = true;
+            c.session.confirm_delete = false;
         })
         .unwrap();
 
         view.save().unwrap();
 
         assert!(
-            Config::load().unwrap().session.confirm_delete,
+            !Config::load().unwrap().session.confirm_delete,
             "an edit-free save must not revert a peer's write"
         );
     }
 
-    /// A lifecycle operation resync must keep unsaved staged edits: the
-    /// staged diff is re-applied per user-editable field on top of the disk
-    /// state, while a lifecycle-owned field (the grant) always takes the disk
-    /// value, even on a plugin the user also staged an edit for.
+    /// A resync re-applies the staged diff per user-editable field over the
+    /// disk state, while a lifecycle-owned field takes the disk value.
     #[test]
     #[serial]
     fn resync_after_plugin_mutation_preserves_staged_edits() {
         let (_home, _temp, mut view) = fresh_view();
         view.scope = SettingsScope::Global;
 
-        // The user stages (unsaved): disable plugin "a".
         view.global_config
             .plugins
             .entry("a".to_string())
@@ -1359,8 +1311,7 @@ mod dirty_tracking_tests {
         view.recompute_dirty();
         assert!(view.has_changes);
 
-        // A lifecycle operation rewrites plugin config on disk: grants "a"
-        // and installs "b".
+        // A lifecycle operation grants "a" and installs "b" on disk.
         crate::session::config::update_config(|c| {
             let a = c.plugins.entry("a".to_string()).or_default();
             a.grant = Some(crate::session::CapabilityGrant {
@@ -1387,10 +1338,8 @@ mod dirty_tracking_tests {
         assert!(view.has_changes, "the staged toggle keeps the view dirty");
     }
 
-    /// The Plugins tab is Global-only, so `]` from either of its sub-panes
-    /// switches scope like on every other Global-only tab (Telemetry),
-    /// falling back to the new scope's first tab, instead of the manager
-    /// pane swallowing the key.
+    /// The Plugins tab is Global-only, so `]` from either sub-pane switches
+    /// scope and falls back to the new scope's first tab.
     #[test]
     #[serial]
     fn scope_keys_from_plugins_tab_switch_scope_in_both_sub_panes() {
@@ -1424,8 +1373,7 @@ mod dirty_tracking_tests {
         }
     }
 
-    /// A staged entry for a plugin with no config row on disk (a first toggle
-    /// for a builtin) survives a resync; it was never in the baseline, so no
+    /// A staged entry that was never in the baseline survives a resync: no
     /// lifecycle operation can have removed it.
     #[test]
     #[serial]
@@ -1464,49 +1412,34 @@ mod search_tests {
     const TITLE: &str = "Session Max Concurrent Workers";
     const FULL: &str = "Session Max Concurrent Workers How many agents run at once";
 
-    /// An empty query scores every field 0 so the popup lists all of them.
     #[test]
-    fn empty_query_matches_everything() {
-        assert_eq!(fuzzy_settings_score("", TITLE, FULL), Some(0));
-        assert_eq!(fuzzy_settings_score("   ", TITLE, FULL), Some(0));
-    }
+    fn every_token_must_match_and_a_title_hit_outranks_a_description_hit() {
+        // An empty query scores 0, so the popup lists every field.
+        for query in ["", "   "] {
+            assert_eq!(fuzzy_settings_score(query, TITLE, FULL), Some(0));
+        }
 
-    /// The acronym story: "mcw" must fuzzy-match "Max Concurrent Workers",
-    /// which the old substring search could not do.
-    #[test]
-    fn acronym_matches() {
-        assert!(
-            fuzzy_settings_score("mcw", TITLE, FULL).is_some(),
-            "'mcw' should match Max Concurrent Workers"
-        );
-        assert!(
-            fuzzy_settings_score(
-                "mcw",
-                "Appearance Theme",
-                "Appearance Theme Dashboard looks"
-            )
-            .is_none(),
-            "'mcw' should not match an unrelated field"
-        );
-    }
-
-    /// Multi-token queries keep AND semantics: every whitespace token must
-    /// match, so "max workers" still finds the field even out of order.
-    #[test]
-    fn multi_token_requires_all_tokens() {
-        assert!(fuzzy_settings_score("max workers", TITLE, FULL).is_some());
-        assert!(fuzzy_settings_score("workers max", TITLE, FULL).is_some());
+        // Fuzzy matching covers acronyms, and multi-token queries keep AND
+        // semantics in any order.
+        for query in ["mcw", "max workers", "workers max"] {
+            assert!(
+                fuzzy_settings_score(query, TITLE, FULL).is_some(),
+                "{query}"
+            );
+        }
         assert!(
             fuzzy_settings_score("max banana", TITLE, FULL).is_none(),
             "a token with no match drops the field"
         );
-    }
+        assert!(fuzzy_settings_score(
+            "mcw",
+            "Appearance Theme",
+            "Appearance Theme Dashboard looks"
+        )
+        .is_none());
 
-    /// A title (category + label) match must outrank a match that only
-    /// appears in the description, so "sandbox" surfaces the Sandbox
-    /// tab's own settings before fields that mention it in prose.
-    #[test]
-    fn title_matches_outrank_description_matches() {
+        // So "sandbox" surfaces the Sandbox tab's own settings ahead of the
+        // fields that only mention it in prose.
         let title_hit = fuzzy_settings_score(
             "sandbox",
             "Sandbox Default Image",
@@ -1532,8 +1465,7 @@ mod scroll_tests {
     use ratatui::layout::Rect;
     use serial_test::serial;
 
-    /// Force the fields panel to overflow its viewport so the scroll math
-    /// has room to move. Uses the real fields the default category loads.
+    /// Overflow the fields panel so the scroll math has room to move.
     fn make_overflowing(view: &mut super::SettingsView) {
         assert!(
             view.fields.len() > 1,
@@ -1548,9 +1480,7 @@ mod scroll_tests {
         );
     }
 
-    /// Regression for the dead scroll wheel in Settings: a wheel-down must
-    /// advance the fields offset, and wheel-up must bring it back, both
-    /// clamped to the panel bounds.
+    /// A wheel advances the fields offset either way, clamped to the panel.
     #[test]
     #[serial]
     fn wheel_scrolls_fields_panel_with_clamping() {
@@ -1565,8 +1495,6 @@ mod scroll_tests {
             "one wheel notch scrolls one line"
         );
 
-        // Scroll to the floor and confirm it clamps (no scrolling blank
-        // space past the last field into view).
         for _ in 0..50 {
             view.handle_wheel_scroll(false);
         }
@@ -1576,7 +1504,6 @@ mod scroll_tests {
             "a wheel at the bottom is a no-op"
         );
 
-        // And back up to the top.
         for _ in 0..50 {
             view.handle_wheel_scroll(true);
         }
@@ -1587,11 +1514,11 @@ mod scroll_tests {
         );
     }
 
-    /// The scrollbar hit test covers the 1-cell bar plus the padding
-    /// column to its left, and misses everything outside that band.
+    /// The hit test covers the bar plus the padding column to its left, and
+    /// a drag maps the track row onto the scroll range.
     #[test]
     #[serial]
-    fn hit_scrollbar_covers_the_bar_and_its_padding_column() {
+    fn scrollbar_hit_test_and_drag() {
         let (_t, _guard, mut view) = fresh_view();
         view.scrollbar_area = Rect::new(70, 3, 1, 10);
 
@@ -1602,18 +1529,10 @@ mod scroll_tests {
         assert!(!view.hit_scrollbar(70, 2), "above the track is a miss");
         assert!(!view.hit_scrollbar(70, 13), "below the track is a miss");
 
-        // With no bar drawn (nothing overflows) nothing is grabbable.
         view.scrollbar_area = Rect::default();
         assert!(!view.hit_scrollbar(70, 5), "no bar => no hit");
-    }
 
-    /// Regression for grab-drag on the right bar: dragging the thumb to
-    /// the track bottom pins the offset to the max, and to the top pins
-    /// it to zero.
-    #[test]
-    #[serial]
-    fn scrollbar_drag_maps_row_to_offset() {
-        let (_t, _guard, mut view) = fresh_view();
+        // Dragging the thumb pins the offset to either end of the track.
         make_overflowing(&mut view);
         let max = view.max_fields_scroll();
         view.scrollbar_area = Rect::new(70, 3, 1, 10); // rows 3..=12
@@ -1624,13 +1543,12 @@ mod scroll_tests {
         assert!(view.scrollbar_drag_to_row(3), "drag to the top moves");
         assert_eq!(view.fields_scroll_offset, 0, "top of track => 0");
 
-        // A row past the track bottom is clamped, not extrapolated.
         view.scrollbar_drag_to_row(99);
         assert_eq!(view.fields_scroll_offset, max, "past-bottom clamps to max");
     }
 
-    /// While the search popup is open the wheel drives the ranked-hit
-    /// cursor instead of the background fields, matching Up/Down.
+    /// While the popup is open the wheel drives the hit cursor, not the
+    /// fields behind it.
     #[test]
     #[serial]
     fn wheel_moves_search_selection_when_popup_open() {

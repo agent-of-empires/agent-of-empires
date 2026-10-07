@@ -19,94 +19,60 @@ afterEach(() => {
 });
 
 describe("ToolErrorBody", () => {
-  it("renders children verbatim when status is 'running'", () => {
-    const { getByText, queryByText } = render(
-      <ToolErrorBody status="running" errorText="ignored">
-        <div>child body</div>
-      </ToolErrorBody>,
-    );
-    expect(getByText("child body")).toBeTruthy();
-    expect(queryByText(/tool failed/i)).toBeNull();
+  it("renders children verbatim unless status is 'err'", () => {
+    for (const status of ["running", "ok"] as const) {
+      const { getByText, queryByText } = render(
+        <ToolErrorBody status={status} errorText="ignored">
+          <div>child body</div>
+        </ToolErrorBody>,
+      );
+      expect(getByText("child body")).toBeTruthy();
+      expect(queryByText(/tool failed/i)).toBeNull();
+      cleanup();
+    }
   });
 
-  it("renders children verbatim when status is 'ok'", () => {
-    const { getByText, queryByText } = render(
-      <ToolErrorBody status="ok" errorText="ignored">
-        <div>child body</div>
-      </ToolErrorBody>,
-    );
-    expect(getByText("child body")).toBeTruthy();
-    expect(queryByText(/tool failed/i)).toBeNull();
-  });
-
-  it("renders the error chrome and the unwrapped body on status 'err'", () => {
+  it("on err, shows the unwrapped body with linebreaks and the attempted action collapsed", () => {
     const { getByText, container } = render(
-      <ToolErrorBody status="err" errorText="<tool_use_error>File does not exist.</tool_use_error>">
+      <ToolErrorBody status="err" errorText={"<tool_use_error>line one\nline two</tool_use_error>"}>
         <div>attempted body</div>
       </ToolErrorBody>,
     );
     expect(getByText(/tool failed/i)).toBeTruthy();
     expect(getByText("agent-reported error")).toBeTruthy();
-    expect(container.textContent).toContain("File does not exist.");
-  });
-
-  it("hides the attempted-action details by default on err", () => {
-    const { container } = render(
-      <ToolErrorBody status="err" errorText="<error>boom</error>">
-        <div>attempted body</div>
-      </ToolErrorBody>,
-    );
-    const details = container.querySelector("details");
-    expect(details).not.toBeNull();
-    expect(details?.hasAttribute("open")).toBe(false);
-  });
-
-  it("renders the summary copy on the collapsible details", () => {
-    const { getByText } = render(
-      <ToolErrorBody status="err" errorText="<error>boom</error>">
-        <div>attempted body</div>
-      </ToolErrorBody>,
-    );
+    expect(container.querySelector("pre")?.textContent).toBe("line one\nline two");
     expect(getByText(/Show attempted action/i)).toBeTruthy();
+    expect(container.querySelector("details")?.hasAttribute("open")).toBe(false);
   });
 
-  it("renders an explicit fallback when errorText is empty / missing", () => {
-    const { container } = render(
-      <ToolErrorBody status="err" errorText="">
-        <div>attempted body</div>
-      </ToolErrorBody>,
-    );
-    expect(container.textContent).toContain("(no error detail provided)");
+  it("labels the chip from the wrapper tag and omits it for a raw body", () => {
+    const cases: [string, string, string | null][] = [
+      ["<custom_wrapper>weird failure</custom_wrapper>", "weird failure", "custom_wrapper"],
+      ["file not found: foo.rs", "file not found: foo.rs", null],
+    ];
+    for (const [errorText, body, chip] of cases) {
+      const { queryByText, container } = render(
+        <ToolErrorBody status="err" errorText={errorText}>
+          <div>attempted body</div>
+        </ToolErrorBody>,
+      );
+      expect(container.textContent).toContain(body);
+      if (chip) expect(queryByText(chip)).toBeTruthy();
+      expect(queryByText("agent-reported error")).toBeNull();
+      cleanup();
+    }
   });
 
-  it("renders the explicit fallback when errorText is undefined", () => {
-    const { container } = render(
-      <ToolErrorBody status="err">
-        <div>attempted body</div>
-      </ToolErrorBody>,
-    );
-    expect(container.textContent).toContain("(no error detail provided)");
-  });
-
-  it("omits the wrapper-tag chip when the error body is raw (no wrapper)", () => {
-    const { queryByText, container } = render(
-      <ToolErrorBody status="err" errorText="file not found: foo.rs">
-        <div>attempted body</div>
-      </ToolErrorBody>,
-    );
-    expect(container.textContent).toContain("file not found: foo.rs");
-    // describeToolErrorTag(null) is null → no chip rendered.
-    expect(queryByText("agent-reported error")).toBeNull();
-  });
-
-  it("passes through arbitrary single-pair wrapper tags as the chip label", () => {
-    const { getByText, container } = render(
-      <ToolErrorBody status="err" errorText="<custom_wrapper>weird failure</custom_wrapper>">
-        <div>attempted body</div>
-      </ToolErrorBody>,
-    );
-    expect(getByText("custom_wrapper")).toBeTruthy();
-    expect(container.textContent).toContain("weird failure");
+  it("renders an explicit fallback when errorText is empty or missing", () => {
+    for (const errorText of ["", undefined]) {
+      const { container } = render(
+        <ToolErrorBody status="err" errorText={errorText}>
+          <div>attempted body</div>
+        </ToolErrorBody>,
+      );
+      expect(container.textContent).toContain("(no error detail provided)");
+      cleanup();
+    }
   });
 
   it("does not render the attempted-action details when children is empty", () => {
@@ -116,16 +82,5 @@ describe("ToolErrorBody", () => {
       </ToolErrorBody>,
     );
     expect(container.querySelector("details")).toBeNull();
-  });
-
-  it("preserves linebreaks in the error body", () => {
-    const { container } = render(
-      <ToolErrorBody status="err" errorText={"<tool_use_error>line one\nline two\nline three</tool_use_error>"}>
-        <div>attempted body</div>
-      </ToolErrorBody>,
-    );
-    const pre = container.querySelector("pre");
-    expect(pre).not.toBeNull();
-    expect(pre?.textContent).toBe("line one\nline two\nline three");
   });
 });

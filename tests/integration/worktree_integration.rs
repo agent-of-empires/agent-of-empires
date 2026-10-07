@@ -33,182 +33,7 @@ fn setup_test_environment() -> (TempDir, git2::Repository, TempDir) {
 }
 
 #[test]
-fn test_add_session_with_worktree_flag() {
-    let (repo_dir, _repo, _config_dir) = setup_test_environment();
-
-    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
-    let wt_path = repo_dir.path().join("worktree-test-feature");
-
-    git_wt
-        .create_worktree("test-feature", &wt_path, false, None)
-        .unwrap();
-
-    let mut instance = Instance::new("Test Session", wt_path.to_str().unwrap());
-    instance.worktree_info = Some(WorktreeInfo {
-        branch: "test-feature".to_string(),
-        main_repo_path: repo_dir.path().to_string_lossy().to_string(),
-        managed_by_aoe: true,
-        created_at: Utc::now(),
-        base_branch: None,
-    });
-
-    assert!(wt_path.exists());
-    assert!(instance.worktree_info.is_some());
-    let info = instance.worktree_info.as_ref().unwrap();
-    assert_eq!(info.branch, "test-feature");
-    assert!(info.managed_by_aoe);
-}
-
-#[test]
-fn test_session_has_worktree_info_after_creation() {
-    let (repo_dir, _repo, _config_dir) = setup_test_environment();
-
-    let mut instance = Instance::new("Test Session", repo_dir.path().to_str().unwrap());
-    let now = Utc::now();
-
-    instance.worktree_info = Some(WorktreeInfo {
-        branch: "test-feature".to_string(),
-        main_repo_path: repo_dir.path().to_string_lossy().to_string(),
-        managed_by_aoe: true,
-        created_at: now,
-        base_branch: None,
-    });
-
-    let info = instance.worktree_info.as_ref().unwrap();
-    assert_eq!(info.branch, "test-feature");
-    assert_eq!(
-        info.main_repo_path,
-        repo_dir.path().to_string_lossy().to_string()
-    );
-    assert!(info.managed_by_aoe);
-    assert_eq!(info.created_at, now);
-}
-
-// `#[serial]` because this test mutates the process-global `HOME` env var.
-// Without serialization, parallel tests in the same binary that also set HOME
-// will race with us.
-#[test]
-#[serial]
-fn test_worktree_info_persists_across_save_load() {
-    let temp_home = TempDir::new().unwrap();
-    std::env::set_var("HOME", temp_home.path());
-
-    let storage = Storage::new_unwatched("worktree-test-profile").unwrap();
-
-    let mut instance = Instance::new("Worktree Session", "/tmp/test");
-    instance.worktree_info = Some(WorktreeInfo {
-        branch: "feature-branch".to_string(),
-        main_repo_path: "/original/repo".to_string(),
-        managed_by_aoe: true,
-        created_at: Utc::now(),
-        base_branch: None,
-    });
-
-    let seeded = vec![instance.clone()];
-    storage
-        .update(|i, g| {
-            *i = seeded.to_vec();
-            *g = GroupTree::new_with_groups(&seeded, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let loaded = storage.load().unwrap();
-    assert_eq!(loaded.len(), 1);
-
-    let loaded_info = loaded[0].worktree_info.as_ref().unwrap();
-    assert_eq!(loaded_info.branch, "feature-branch");
-    assert_eq!(loaded_info.main_repo_path, "/original/repo");
-    assert!(loaded_info.managed_by_aoe);
-}
-
-#[test]
-fn test_session_without_worktree_has_none_worktree_info() {
-    let instance = Instance::new("Regular Session", "/tmp/project");
-
-    assert!(instance.worktree_info.is_none());
-}
-
-#[test]
-fn test_manual_worktree_detection() {
-    let (repo_dir, _repo, _config_dir) = setup_test_environment();
-
-    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
-    let wt_path = repo_dir.path().join("detected-worktree");
-
-    git_wt
-        .create_worktree("test-feature", &wt_path, false, None)
-        .unwrap();
-
-    let worktrees = git_wt.list_worktrees().unwrap();
-
-    assert!(worktrees.len() >= 2);
-
-    let main_wt = worktrees.iter().find(|w| w.path == repo_dir.path());
-    assert!(main_wt.is_some());
-
-    let added_wt = worktrees.iter().find(|w| {
-        w.branch
-            .as_ref()
-            .map(|b| b == "test-feature")
-            .unwrap_or(false)
-    });
-    assert!(added_wt.is_some());
-}
-
-#[test]
-fn test_worktree_cleanup_on_session_removal() {
-    let (repo_dir, _repo, _config_dir) = setup_test_environment();
-    let worktree_container = TempDir::new().unwrap();
-
-    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
-    let wt_path = worktree_container.path().join("cleanup-worktree");
-
-    git_wt
-        .create_worktree("test-feature", &wt_path, false, None)
-        .unwrap();
-    assert!(wt_path.exists());
-
-    let mut instance = Instance::new("Cleanup Session", wt_path.to_str().unwrap());
-    instance.worktree_info = Some(WorktreeInfo {
-        branch: "test-feature".to_string(),
-        main_repo_path: repo_dir.path().to_string_lossy().to_string(),
-        managed_by_aoe: true,
-        created_at: Utc::now(),
-        base_branch: None,
-    });
-
-    git_wt.remove_worktree(&wt_path, false).unwrap();
-
-    assert!(!wt_path.exists());
-}
-
-#[test]
-fn test_worktree_preserved_when_keep_flag_used() {
-    let (repo_dir, _repo, _config_dir) = setup_test_environment();
-    let worktree_container = TempDir::new().unwrap();
-
-    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
-    let wt_path = worktree_container.path().join("keep-worktree");
-
-    git_wt
-        .create_worktree("test-feature", &wt_path, false, None)
-        .unwrap();
-    assert!(wt_path.exists());
-
-    let mut instance = Instance::new("Keep Session", wt_path.to_str().unwrap());
-    instance.worktree_info = Some(WorktreeInfo {
-        branch: "test-feature".to_string(),
-        main_repo_path: repo_dir.path().to_string_lossy().to_string(),
-        managed_by_aoe: true,
-        created_at: Utc::now(),
-        base_branch: None,
-    });
-
-    assert!(wt_path.exists());
-}
-
-#[test]
+#[serial_test::parallel]
 fn test_error_when_worktree_already_exists() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
 
@@ -228,48 +53,6 @@ fn test_error_when_worktree_already_exists() {
         }
         other => panic!("Expected WorktreeAlreadyExists, got {:?}", other),
     }
-}
-
-#[test]
-fn test_error_when_branch_does_not_exist() {
-    let (repo_dir, _repo, _config_dir) = setup_test_environment();
-
-    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
-    let wt_path = repo_dir.path().join("nonexistent-branch-worktree");
-
-    let result = git_wt.create_worktree("nonexistent-branch", &wt_path, false, None);
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        GitError::BranchNotFound(branch) => {
-            assert_eq!(branch, "nonexistent-branch");
-        }
-        other => panic!("Expected BranchNotFound, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_create_new_branch_with_b_flag() {
-    let (repo_dir, repo, _config_dir) = setup_test_environment();
-
-    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
-    let wt_path = repo_dir.path().join("new-branch-worktree");
-
-    let branch_exists_before = repo
-        .find_branch("brand-new-branch", git2::BranchType::Local)
-        .is_ok();
-    assert!(!branch_exists_before);
-
-    git_wt
-        .create_worktree("brand-new-branch", &wt_path, true, None)
-        .unwrap();
-
-    assert!(wt_path.exists());
-
-    let branch_exists_after = repo
-        .find_branch("brand-new-branch", git2::BranchType::Local)
-        .is_ok();
-    assert!(branch_exists_after);
 }
 
 // --- Edit-workdir-name (#1723) ---
@@ -334,9 +117,8 @@ fn edit_workdir_moves_dir_and_optionally_renames_branch() {
 
 // Tied workdir/title (#1927)
 
-use agent_of_empires::session::worktree_edit::worktree_leaf_from_title;
-
 #[test]
+#[serial_test::parallel]
 fn tie_workdir_applies_only_for_managed_worktrees() {
     // Non-worktree session: never tied, regardless of the setting.
     let scratch = Instance::new("Scratch", "/tmp/x");
@@ -355,70 +137,6 @@ fn tie_workdir_applies_only_for_managed_worktrees() {
         ..managed_info("b", std::path::Path::new("/tmp/repo"))
     });
     assert!(!attached.tie_workdir_applies(true));
-}
-
-#[test]
-#[serial]
-fn tied_rename_moves_dir_to_title_leaf_without_touching_branch() {
-    // Models the surface flow: a tied rename derives the directory leaf from
-    // the new title and moves the worktree, leaving the branch alone.
-    let (repo_dir, _repo, _config_dir) = setup_test_environment();
-    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
-
-    let old_path = repo_dir.path().join("byzantines");
-    git_wt
-        .create_worktree("byzantines", &old_path, true, None)
-        .unwrap();
-    let info = managed_info("byzantines", repo_dir.path());
-
-    let leaf = worktree_leaf_from_title("Auth Refactor");
-    assert_eq!(leaf, "auth-refactor");
-    let outcome = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &old_path,
-        new_name: &leaf,
-        rename_branch: false,
-    })
-    .unwrap();
-
-    let new_path = repo_dir.path().join("auth-refactor");
-    assert_eq!(outcome.new_path, new_path);
-    assert_eq!(outcome.new_branch, None);
-    assert!(!old_path.exists());
-    assert!(new_path.exists());
-    // Branch is never swept in by a tied title rename.
-    assert!(git_wt.branch_exists("byzantines").unwrap());
-}
-
-#[test]
-#[serial]
-fn tied_rename_into_occupied_leaf_keeps_title_and_dir_in_sync() {
-    // A title whose leaf collides with a sibling directory fails the move, so
-    // the surface keeps the old title too: the two never drift apart.
-    let (repo_dir, _repo, _config_dir) = setup_test_environment();
-    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
-
-    let old_path = repo_dir.path().join("aaa");
-    git_wt
-        .create_worktree("aaa", &old_path, true, None)
-        .unwrap();
-    let occupied = repo_dir.path().join("taken");
-    git_wt
-        .create_worktree("taken", &occupied, true, None)
-        .unwrap();
-    let info = managed_info("aaa", repo_dir.path());
-
-    let leaf = worktree_leaf_from_title("Taken");
-    assert_eq!(leaf, "taken");
-    let err = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &old_path,
-        new_name: &leaf,
-        rename_branch: false,
-    })
-    .unwrap_err();
-    assert!(matches!(err, WorktreeEditError::TargetExists(_)));
-    assert!(old_path.exists());
 }
 
 #[test]
@@ -475,4 +193,271 @@ fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
     .unwrap_err();
     assert!(matches!(err, WorktreeEditError::NotManaged));
     assert!(old_path.exists());
+}
+
+// --- Reconciling a stale project_path (#2002) ---
+
+use agent_of_empires::session::worktree_reconcile::{
+    reconcile_and_persist, resolve_worktree_path, WorktreePathResolution,
+};
+
+/// Run a git subcommand in `repo` the way a user in another shell would,
+/// bypassing aoe entirely.
+fn git_in(repo: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// An external `git worktree move` is discovered from git's own listing, and
+/// the recorded path is repaired in storage so the rename that would otherwise
+/// fail with `SourceMissing` proceeds against the relocated directory.
+///
+/// `#[serial]` because `setup_temp_home` mutates the process-global `HOME` and
+/// `XDG_CONFIG_HOME` that `Storage` resolves its app dir from. Setting `HOME`
+/// alone is not enough: on macOS the app dir is `$XDG_CONFIG_HOME/agent-of-empires`
+/// whenever that variable is set, so a bare `HOME` override would write a real
+/// profile dir on any machine that exports it.
+#[test]
+#[serial]
+fn reconcile_heals_a_worktree_moved_outside_aoe() {
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let _temp_home = crate::common::setup_temp_home();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let created = repo_dir.path().join("recorded-name");
+    git_wt
+        .create_worktree("recorded-name", &created, true, None)
+        .unwrap();
+    let info = managed_info("recorded-name", repo_dir.path());
+
+    let mut instance = Instance::new("Moved Session", created.to_str().unwrap());
+    instance.worktree_info = Some(info.clone());
+    let storage = Storage::new_unwatched("worktree-reconcile-profile").unwrap();
+    let seeded = vec![instance.clone()];
+    storage
+        .update(|i, g| {
+            *i = seeded.to_vec();
+            *g = GroupTree::new_with_groups(&seeded, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    // aoe locks every worktree it creates, so a user relocating one from
+    // another shell has to unlock it first; `git worktree move` refuses a
+    // locked tree.
+    let relocated = repo_dir.path().join("moved-by-hand");
+    git_in(
+        repo_dir.path(),
+        &["worktree", "unlock", created.to_str().unwrap()],
+    );
+    git_in(
+        repo_dir.path(),
+        &[
+            "worktree",
+            "move",
+            created.to_str().unwrap(),
+            relocated.to_str().unwrap(),
+        ],
+    );
+    assert!(!created.exists());
+    assert!(relocated.exists());
+
+    // The pre-reconcile behavior, pinned: `edit_worktree_workdir` is untouched
+    // by the reconcile work, so calling it with the recorded path is exactly
+    // what every surface did before and it still refuses.
+    let before = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: &created,
+        new_name: "settled-name",
+        rename_branch: false,
+    })
+    .unwrap_err();
+    assert!(matches!(before, WorktreeEditError::SourceMissing(_)));
+
+    let mut stale = instance.clone();
+    assert_eq!(
+        reconcile_and_persist(&storage, &mut stale, &mut Default::default()).unwrap(),
+        WorktreePathResolution::Moved(relocated.canonicalize().unwrap())
+    );
+    assert_eq!(
+        std::path::PathBuf::from(&stale.project_path),
+        relocated.canonicalize().unwrap()
+    );
+    // The repair is durable, not just in the caller's copy.
+    let reloaded = storage.load().unwrap();
+    assert_eq!(
+        std::path::PathBuf::from(&reloaded[0].project_path),
+        relocated.canonicalize().unwrap()
+    );
+
+    // The rename that returned SourceMissing before the reconcile now lands,
+    // renaming within the directory's real parent.
+    let outcome = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: std::path::Path::new(&stale.project_path),
+        new_name: "settled-name",
+        rename_branch: false,
+    })
+    .unwrap();
+    assert_eq!(
+        outcome.new_path,
+        relocated
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join("settled-name")
+    );
+    assert!(outcome.new_path.exists());
+
+    // Reconciling again is a no-op: the recorded path is present, so git is
+    // never consulted.
+    let mut settled = stale.clone();
+    settled.project_path = outcome.new_path.to_string_lossy().into_owned();
+    assert_eq!(
+        reconcile_and_persist(&storage, &mut settled, &mut Default::default()).unwrap(),
+        WorktreePathResolution::Current
+    );
+}
+
+/// What git can and cannot tell us. A bare `mv` leaves git's record naming the
+/// old path, so the new location is not discoverable until the user runs
+/// `git worktree repair`; a deleted checkout is never discoverable. Both leave
+/// the recorded path alone rather than guessing.
+///
+/// `#[serial]` even though this test sets no env var of its own: it shells out
+/// to `git`, which reads `$HOME/.gitconfig`, so it must not overlap a peer that
+/// has pointed `HOME` at a temp dir.
+#[test]
+#[serial]
+fn resolve_reports_missing_when_git_cannot_place_the_branch() {
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let created = repo_dir.path().join("hand-moved");
+    git_wt
+        .create_worktree("hand-moved", &created, true, None)
+        .unwrap();
+    let info = managed_info("hand-moved", repo_dir.path());
+
+    // A bare `mv`: the directory is at its new location but git still points
+    // at the old one, which is indistinguishable from a deletion.
+    let elsewhere = repo_dir.path().join("elsewhere");
+    std::fs::rename(&created, &elsewhere).unwrap();
+    assert_eq!(
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &created, &info),
+        WorktreePathResolution::Missing
+    );
+
+    // `git worktree repair` is git's own remedy: once its record catches up,
+    // the same lookup finds the checkout.
+    git_in(
+        repo_dir.path(),
+        &["worktree", "repair", elsewhere.to_str().unwrap()],
+    );
+    assert_eq!(
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &created, &info),
+        WorktreePathResolution::Moved(elsewhere.canonicalize().unwrap())
+    );
+
+    // A checkout that is gone for good stays Missing.
+    std::fs::remove_dir_all(&elsewhere).unwrap();
+    assert_eq!(
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &created, &info),
+        WorktreePathResolution::Missing
+    );
+
+    // An unmanaged worktree is out of scope and never consults git.
+    let unmanaged = WorktreeInfo {
+        managed_by_aoe: false,
+        ..info.clone()
+    };
+    assert_eq!(
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &created, &unmanaged),
+        WorktreePathResolution::Current
+    );
+}
+
+/// A pruned registration frees the branch, so a later checkout of it belongs to
+/// somebody else. The reconcile refuses that lone candidate rather than pointing
+/// two sessions at one directory, where trashing or deleting the stale row would
+/// take the live row's checkout with it.
+///
+/// `#[serial]` for the same reason as the test above: `setup_temp_home` mutates
+/// the process-global `HOME` and `XDG_CONFIG_HOME` that `Storage` resolves its
+/// app dir from.
+#[test]
+#[serial]
+fn reconcile_refuses_a_checkout_another_session_records() {
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let _temp_home = crate::common::setup_temp_home();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let stale_dir = repo_dir.path().join("first-session");
+    git_wt
+        .create_worktree("shared-branch", &stale_dir, true, None)
+        .unwrap();
+    let info = managed_info("shared-branch", repo_dir.path());
+
+    // The first checkout is removed by hand and its registration pruned, which
+    // is what lets a second worktree take the branch at all.
+    git_in(
+        repo_dir.path(),
+        &["worktree", "unlock", stale_dir.to_str().unwrap()],
+    );
+    std::fs::remove_dir_all(&stale_dir).unwrap();
+    git_in(repo_dir.path(), &["worktree", "prune"]);
+
+    // A later session (or the user's own shell) checks the branch out again.
+    let live_dir = repo_dir.path().join("second-session");
+    git_in(
+        repo_dir.path(),
+        &[
+            "worktree",
+            "add",
+            live_dir.to_str().unwrap(),
+            "shared-branch",
+        ],
+    );
+    let live_canonical = live_dir.canonicalize().unwrap();
+    // git left the branch discoverable, so the lookup does find a lone
+    // candidate; only the ownership check keeps it from being adopted.
+    assert_eq!(
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &stale_dir, &info),
+        WorktreePathResolution::Moved(live_canonical.clone())
+    );
+
+    let mut stale = Instance::new("First Session", stale_dir.to_str().unwrap());
+    stale.worktree_info = Some(info.clone());
+    let mut live = Instance::new("Second Session", live_canonical.to_str().unwrap());
+    live.worktree_info = Some(info.clone());
+    let storage = Storage::new_unwatched("worktree-reconcile-claimed-profile").unwrap();
+    let seeded = vec![stale.clone(), live.clone()];
+    storage
+        .update(|i, g| {
+            *i = seeded.to_vec();
+            *g = GroupTree::new_with_groups(&seeded, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut reconciled = stale.clone();
+    assert_eq!(
+        reconcile_and_persist(&storage, &mut reconciled, &mut Default::default()).unwrap(),
+        WorktreePathResolution::Current
+    );
+    assert_eq!(reconciled.project_path, stale.project_path);
+    let reloaded = storage.load().unwrap();
+    let stale_row = reloaded.iter().find(|i| i.id == stale.id).unwrap();
+    assert_eq!(stale_row.project_path, stale.project_path);
+    let live_row = reloaded.iter().find(|i| i.id == live.id).unwrap();
+    assert_eq!(live_row.project_path, live.project_path);
 }

@@ -1,45 +1,39 @@
-// Git fixture helpers for live Playwright specs.
-//
-// Used by:
-//   - `tests/live/git-clone.spec.ts`: spins up a throwaway bare repo so
-//     the wizard can clone from `file://`. The matching server-side
-//     validator accepts `file://` URLs by design; see
-//     `src/server/api/git.rs::looks_like_git_url` for the allowlist.
-//   - `tests/live/right-panel-*.spec.ts`: builds a non-bare working repo
-//     with a committed `main` branch plus uncommitted modifications, so
-//     `aoe add` registers the dir as a session and the diff endpoint
-//     surfaces those modifications against the base branch.
+// Git repositories for live specs.
 
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const GIT_ENV = {
+  // Ignore the developer's global git config (gpgsign, hooksPath); identity and branch are pinned.
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
   GIT_AUTHOR_NAME: "t",
   GIT_AUTHOR_EMAIL: "t@t",
   GIT_COMMITTER_NAME: "t",
   GIT_COMMITTER_EMAIL: "t@t",
 };
 
+/** Preserve the fixture environment, never the invoking shell's Git overrides. */
+export function gitEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const clean: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (!name.startsWith("GIT_")) clean[name] = value;
+  }
+  return { ...clean, ...GIT_ENV };
+}
+
 export interface BareRepoFixture {
-  /** Absolute path of the bare repo on disk. */
   path: string;
-  /** `file://` URL pointing at `path`, ready to feed into the wizard input. */
   url: string;
 }
 
-/**
- * Create a throwaway local bare git repo so a live `aoe serve` can clone
- * from `file://...`. Parent dir must already exist (the harness home tree
- * is created before this helper runs).
- *
- * Returns the absolute path and the `file://` URL.
- */
-export function createBareRepo(parentDir: string, name = "bare.git"): BareRepoFixture {
+/** An empty bare repo under an existing parent, clonable via its `file://` URL. */
+export function createBareRepo(parentDir: string, env: NodeJS.ProcessEnv, name = "bare.git"): BareRepoFixture {
   const path = join(parentDir, name);
   mkdirSync(parentDir, { recursive: true });
   const res = spawnSync("git", ["init", "--bare", "--quiet", path], {
-    env: { ...process.env, ...GIT_ENV },
+    env: gitEnv(env),
   });
   if (res.status !== 0) {
     throw new Error(`git init --bare failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
@@ -47,10 +41,10 @@ export function createBareRepo(parentDir: string, name = "bare.git"): BareRepoFi
   return { path, url: `file://${path}` };
 }
 
-function runGit(cwd: string, args: string[]): void {
+function runGit(cwd: string, args: string[], env: NodeJS.ProcessEnv): void {
   const res = spawnSync("git", args, {
     cwd,
-    env: { ...process.env, ...GIT_ENV },
+    env: gitEnv(env),
   });
   if (res.status !== 0) {
     throw new Error(
@@ -59,31 +53,23 @@ function runGit(cwd: string, args: string[]): void {
   }
 }
 
-/**
- * Initialize a non-bare working repo at `repoPath` on `defaultBranch`
- * with an initial empty commit so subsequent diffs have a base to
- * compare against. Uses `-b <branch>` so the default branch is
- * deterministic across hosts where `init.defaultBranch` may be unset.
- */
-export function initWorkingRepo(repoPath: string, opts: { defaultBranch?: string } = {}): { path: string } {
+/** A working repo on `defaultBranch` with one empty commit to diff against. */
+export function initWorkingRepo(
+  repoPath: string,
+  env: NodeJS.ProcessEnv,
+  opts: { defaultBranch?: string } = {},
+): { path: string } {
   const branch = opts.defaultBranch ?? "main";
   mkdirSync(repoPath, { recursive: true });
-  runGit(repoPath, ["init", "-q", "-b", branch]);
-  runGit(repoPath, ["commit", "--allow-empty", "-q", "-m", "init"]);
+  runGit(repoPath, ["init", "-q", "-b", branch], env);
+  runGit(repoPath, ["commit", "--allow-empty", "-q", "-m", "init"], env);
   return { path: repoPath };
 }
 
-/**
- * Create a throwaway bare repo that already contains one commit on
- * `defaultBranch`. Unlike {@link createBareRepo}, this one has a branch to
- * check out, so it can be cloned as a bare repo + worktree (cloning an
- * empty bare repo leaves `git worktree add` with no reference to resolve).
- * Built by committing into a temporary working repo, then cloning it bare.
- *
- * Returns the absolute path and the `file://` URL.
- */
+/** A bare repo with one commit, so a bare clone has a branch to check out as a worktree. */
 export function createSeededBareRepo(
   parentDir: string,
+  env: NodeJS.ProcessEnv,
   opts: { name?: string; defaultBranch?: string } = {},
 ): BareRepoFixture {
   const name = opts.name ?? "seeded-bare.git";
@@ -91,9 +77,9 @@ export function createSeededBareRepo(
   mkdirSync(parentDir, { recursive: true });
   const path = join(parentDir, name);
   const workdir = join(parentDir, `${name}.src`);
-  initWorkingRepo(workdir, { defaultBranch: branch });
+  initWorkingRepo(workdir, env, { defaultBranch: branch });
   const res = spawnSync("git", ["clone", "--bare", "--quiet", workdir, path], {
-    env: { ...process.env, ...GIT_ENV },
+    env: gitEnv(env),
   });
   if (res.status !== 0) {
     throw new Error(`git clone --bare failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
@@ -101,12 +87,7 @@ export function createSeededBareRepo(
   return { path, url: `file://${path}` };
 }
 
-/**
- * Write a set of files into a repo (uncommitted). Paths are joined onto
- * `repoPath`; nested directories are created automatically. Use to
- * stage uncommitted modifications visible to the diff endpoint, or as
- * the source for a follow-up `commitAll`.
- */
+/** Write files (creating directories) without committing. */
 export function writeFiles(repoPath: string, files: Record<string, string>): void {
   for (const [relPath, content] of Object.entries(files)) {
     const abs = join(repoPath, relPath);
@@ -115,27 +96,18 @@ export function writeFiles(repoPath: string, files: Record<string, string>): voi
   }
 }
 
-/**
- * Write a binary file (raw bytes) into a repo (uncommitted). Useful
- * for exercising the diff viewer's "Binary file changed" branch.
- */
 export function writeBinaryFile(repoPath: string, relPath: string, bytes: Uint8Array): void {
   const abs = join(repoPath, relPath);
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, bytes);
 }
 
-/** Stage every change in the working tree and commit with `message`. */
-export function commitAll(repoPath: string, message: string): void {
-  runGit(repoPath, ["add", "-A"]);
-  runGit(repoPath, ["commit", "-q", "-m", message]);
+export function commitAll(repoPath: string, message: string, env: NodeJS.ProcessEnv): void {
+  runGit(repoPath, ["add", "-A"], env);
+  runGit(repoPath, ["commit", "-q", "-m", message], env);
 }
 
-/**
- * Deterministic large-file content generator. Produces `lineCount`
- * lines, each unique so virtualization tests can grep for specific
- * mid-file lines without ambiguity.
- */
+/** `lineCount` unique lines, so a specific mid-file line can be located. */
 export function generateLargeFileContent(lineCount: number, prefix = "line"): string {
   const lines = new Array<string>(lineCount);
   for (let i = 0; i < lineCount; i++) {
@@ -144,12 +116,7 @@ export function generateLargeFileContent(lineCount: number, prefix = "line"): st
   return lines.join("\n") + "\n";
 }
 
-/**
- * Minimal valid PNG byte sequence (8-byte signature + IHDR + IEND).
- * Just enough to make `git diff` classify the file as binary; not a
- * decodable image. Returned as a fresh `Uint8Array` so callers can
- * pass it to `writeBinaryFile` without sharing buffer state.
- */
+/** PNG signature bytes: enough for git to classify the file as binary. */
 export function pngStubBytes(): Uint8Array {
   return new Uint8Array([
     0x89,

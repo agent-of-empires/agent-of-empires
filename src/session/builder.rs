@@ -1,9 +1,9 @@
 //! Instance creation and cleanup utilities.
-//!
-//! This module provides shared logic for building new session instances,
-//! used by both synchronous (TUI operations) and asynchronous (background poller) code paths.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Result};
 use chrono::Utc;
@@ -16,19 +16,52 @@ use super::{
     civilizations, Config, Instance, SandboxInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 
+/// Applies per-session launch values over the config defaults for
+/// `instance.tool`. Empty strings and `None` count as unset. Command priority:
+/// per-session > `agent_command_override` > `custom_agents` > the value already
+/// on `instance`.
+pub(crate) fn apply_agent_launch_config(
+    instance: &mut Instance,
+    session: &super::config::SessionConfig,
+    extra_args: &str,
+    command_override: &str,
+    yolo_mode: Option<bool>,
+) {
+    let extra = match extra_args {
+        "" => session
+            .agent_extra_args
+            .get(&instance.tool)
+            .map_or("", String::as_str),
+        set => set,
+    };
+    if !extra.is_empty() {
+        instance.extra_args = extra.to_string();
+    }
+
+    let command = match command_override {
+        "" => session.resolve_tool_command(&instance.tool),
+        set => set.to_string(),
+    };
+    if !command.is_empty() {
+        instance.command = command;
+    }
+
+    instance.yolo_mode = yolo_mode.unwrap_or(session.yolo_mode_default);
+}
+
 /// Parameters for creating a new session instance.
 #[derive(Debug, Clone)]
 pub struct InstanceParams {
     pub title: String,
+    /// `title` was typed by the user, so the agent may be given it as its own session name.
+    pub title_typed: bool,
     pub path: String,
     pub group: String,
     pub tool: String,
     pub worktree_enabled: bool,
     pub worktree_branch: Option<String>,
     pub create_new_branch: bool,
-    /// Branch to base a freshly-created worktree branch on. Only honored
-    /// when `create_new_branch` is true. `None` falls back to the
-    /// repository's detected default branch. See #948.
+    /// Branch to base a freshly-created worktree branch on.
     pub base_branch: Option<String>,
     pub sandbox: bool,
     /// The sandbox image to use. Required when sandbox is true.
@@ -43,10 +76,11 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
-    /// Scratch session: ignore `path`, provision a fresh directory under
-    /// `<app_dir>/scratch/<id>/`, and persist `instance.scratch = true` so
-    /// the deletion path removes the directory. Mutually exclusive with
-    /// worktree/workspace and with non-empty `extra_repo_paths`.
+    /// Per-repo base branches as `(selector, base)` pairs, from `aoe add --repo-base
+    /// <selector>=<ref>` or the web wizard.
+    pub repo_base_branches: Vec<(String, String)>,
+    /// Scratch session: ignore `path`, provision a fresh directory under `<app_dir>/scratch/<id>/`,
+    /// and persist `instance.scratch = true` so the deletion path removes the directory.
     pub scratch: bool,
     /// One-shot fork seed. When `Some`, the freshly-built instance is set up
     /// to fork its parent on first launch instead of starting fresh.
@@ -65,10 +99,12 @@ pub struct BuildResult {
     pub warnings: Vec<String>,
 }
 
-/// Info about a worktree created during instance building.
+/// A worktree provisioned during instance building and owned by this build.
 pub struct CreatedWorktree {
     pub path: PathBuf,
     pub main_repo_path: PathBuf,
+    /// Branch created by this build. `None` when attaching an existing branch.
+    pub owned_branch: Option<String>,
 }
 
 /// Result of creating a multi-repo workspace.
@@ -88,9 +124,8 @@ fn normalize_base(s: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Resolve a repo's effective base branch with precedence:
-/// explicit session base > per-project default > global/profile default.
-/// `None` means "auto-detect the repo's default branch".
+/// Resolve a repo's effective base branch with precedence: explicit session base > per-project
+/// default > global/profile default.
 pub(crate) fn resolve_base_branch(
     session: Option<&str>,
     project: Option<&str>,
@@ -101,11 +136,7 @@ pub(crate) fn resolve_base_branch(
         .or_else(|| normalize_base(global))
 }
 
-/// Resolve one repo's effective base branch, consulting its registered
-/// per-project default. The registry stores each project at its repo root, so
-/// the lookup keys on `find_main_repo(repo_path)`; `repo_path` itself may be a
-/// subdirectory or a worktree, which would miss a root-keyed entry. Precedence:
-/// explicit session base > per-project default > global/profile default.
+/// Resolve one repo's effective base branch, consulting its registered per-project default.
 fn resolve_repo_base_branch(
     repo_path: &std::path::Path,
     session: Option<&str>,
@@ -119,16 +150,58 @@ fn resolve_repo_base_branch(
     resolve_base_branch(session, project, global)
 }
 
-/// Map of canonical repo path to configured default base branch for every
-/// registered project (global + profile) that sets one. Used to fill in the
-/// per-project layer of `resolve_repo_base_branch` for the launch repo and any
-/// extra repos when building a session.
+/// Match `(selector, base)` pairs to the repos a session is being built from.
+pub(crate) fn resolve_repo_base_selectors(
+    repos: &[PathBuf],
+    pairs: &[(String, String)],
+) -> Result<std::collections::HashMap<PathBuf, String>> {
+    let mut out = std::collections::HashMap::new();
+    for (selector, base) in pairs {
+        let sel = selector.trim();
+        let Some(base) = normalize_base(Some(base)) else {
+            bail!("No base branch given for repo '{}'", sel);
+        };
+        let matches: Vec<&PathBuf> = repos
+            .iter()
+            .filter(|p| {
+                p.as_os_str() == sel
+                    || p.file_name()
+                        .is_some_and(|n| n == std::ffi::OsStr::new(sel))
+            })
+            .collect();
+        match matches.as_slice() {
+            [one] => {
+                if out.insert((*one).clone(), base).is_some() {
+                    bail!("Repo '{}' was given a base branch twice", sel);
+                }
+            }
+            [] => {
+                let known: Vec<String> = repos
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .collect();
+                bail!(
+                    "No repo named '{}' in this session. Available: {}",
+                    sel,
+                    known.join(", ")
+                );
+            }
+            _ => bail!(
+                "Repo name '{}' is ambiguous; pass the full path instead",
+                sel
+            ),
+        }
+    }
+    Ok(out)
+}
+
+/// Map of canonical repo path to configured default base branch for every registered project
+/// (global + profile) that sets one.
 pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
     crate::session::projects::load_merged(profile)
         .unwrap_or_else(|e| {
-            // Don't fork worktrees from the wrong base in silence: if the
-            // registry can't be read, log it so the missing per-project
-            // defaults are explainable instead of mysterious.
+            // Don't fork worktrees from the wrong base in silence: if the registry can't be read,
+            // log it so the missing per-project defaults are explainable instead of mysterious.
             tracing::warn!(
                 target: "session.create",
                 "Failed to load project registry for base-branch defaults; \
@@ -149,20 +222,14 @@ pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<
         .collect()
 }
 
-/// One repository in a multi-repo workspace, paired with the base branch its
-/// freshly-created worktree branch should fork from. `base_branch` is the
-/// fully resolved value (`None` means auto-detect the repo's default branch);
-/// callers apply the session > per-project > global precedence before building
-/// this list.
+/// One repository in a multi-repo workspace, paired with the base branch its freshly-created
+/// worktree branch should fork from.
 pub struct WorkspaceRepoSpec {
     pub path: PathBuf,
     pub base_branch: Option<String>,
 }
 
 /// Create a multi-repo workspace with worktrees for each repository.
-///
-/// Validates repo paths, detects name collisions, creates worktrees inside
-/// a shared workspace directory, and rolls back on any error.
 pub fn create_workspace(
     primary: &WorkspaceRepoSpec,
     extra_repos: &[WorkspaceRepoSpec],
@@ -182,9 +249,7 @@ pub fn create_workspace(
     let workspace_dir = workspace_path.to_string_lossy().to_string();
     std::fs::create_dir_all(&workspace_path)?;
 
-    // (canonicalized path, resolved base branch) for the primary repo followed
-    // by every extra repo. The primary path is left as the caller passed it;
-    // extras are canonicalized to match how they are stored/compared.
+    // (canonicalized path, resolved base branch) for the primary repo followed by every extra repo.
     let all_repos: Vec<(PathBuf, Option<String>)> =
         std::iter::once((primary.path.clone(), primary.base_branch.clone()))
             .chain(extra_repos.iter().map(|r| {
@@ -213,10 +278,9 @@ pub fn create_workspace(
     }
 
     let cleanup = |created: &[CreatedWorktree], ws_path: &std::path::Path| {
-        for wt in created {
-            if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-                let _ = git_wt.remove_worktree(&wt.path, false);
-            }
+        let protection = CleanupProtection::default();
+        for worktree in created {
+            cleanup_created_worktree(worktree, "workspace worktree", &protection);
         }
         let _ = std::fs::remove_dir_all(ws_path);
     };
@@ -262,11 +326,7 @@ pub fn create_workspace(
         });
     }
 
-    // Run create_worktree for every repo concurrently. Each worktree lives in
-    // a different directory and uses a different main repo, so the operations
-    // are independent. Network IO (git fetch + git submodule update) dominates
-    // each step, so fanning out cuts wall time roughly to that of the slowest
-    // repo.
+    // Run create_worktree for every repo concurrently.
     let create_start = std::time::Instant::now();
     let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
         std::thread::scope(|scope| {
@@ -329,6 +389,7 @@ pub fn create_workspace(
                 created_worktrees.push(CreatedWorktree {
                     path: plan.worktree_subdir.clone(),
                     main_repo_path: plan.main_repo_path.clone(),
+                    owned_branch: create_new_branch.then(|| branch.to_string()),
                 });
                 repos.push(WorkspaceRepo {
                     name: plan.repo_name.clone(),
@@ -337,10 +398,15 @@ pub fn create_workspace(
                     worktree_path: plan.worktree_subdir.to_string_lossy().to_string(),
                     main_repo_path: plan.main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
-                    // The builder always creates the branch it names, so branch
-                    // and worktree ownership coincide for a repo present at
-                    // creation. Only `attach_project` can set this.
+                    // The builder always creates the branch it names, so branch and worktree
+                    // ownership coincide for a repo present at creation.
                     branch_preexisting: false,
+                    // The ref this repo's branch was forked from, so the diff view can default to
+                    // it per repo.
+                    base_branch: create_new_branch
+                        .then(|| plan.base_branch.clone())
+                        .flatten(),
+                    base_branch_override: None,
                 });
             }
             Err(msg) => errors.push(msg),
@@ -375,10 +441,6 @@ pub fn create_workspace(
 }
 
 /// Build an instance with all setup (worktree resolution, sandbox config).
-///
-/// This does NOT start the instance or create Docker containers - that happens
-/// separately via `instance.start()`. This separation allows for proper cleanup
-/// if starting fails.
 pub fn build_instance(
     params: InstanceParams,
     existing_titles: &[&str],
@@ -416,25 +478,23 @@ pub fn build_instance(
         }
     }
 
-    // Scratch sessions have no project repo, so config resolution falls
-    // back to global+profile defaults (`Path::new("")` makes
-    // `resolve_config_with_repo` skip the repo-config layer cleanly).
+    // Scratch sessions have no project repo, so config resolution falls back to global+profile
+    // defaults (`Path::new("")` makes `resolve_config_with_repo` skip the repo-config layer
+    // cleanly).
     let config_path = if params.scratch {
         std::path::PathBuf::new()
     } else {
         std::path::PathBuf::from(&params.path)
     };
     let config =
-        super::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
+        super::config::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
             tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
             Config::default()
         });
 
     let mut final_path = if params.scratch {
-        // Provisioning happens after `Instance::new` so we can key the
-        // directory on the generated instance id. Leave `final_path` empty
-        // for now; the worktree/workspace and path-existence blocks below
-        // are gated on the same flag.
+        // Provisioning happens after `Instance::new` so we can key the directory on the generated
+        // instance id.
         String::new()
     } else {
         PathBuf::from(&params.path)
@@ -491,17 +551,21 @@ pub fn build_instance(
             let global_default = config.worktree.default_base_branch.as_deref();
             let project_bases = project_base_branches(profile);
 
-            // Every repo, including the launch repo, forks from its own
-            // registered per-project default when no explicit session base is
-            // given. Keyed by repo root so a launch path inside a subdirectory
-            // still matches a root-registered project.
+            // An explicit per-repo base outranks every shared layer, which is the point: one repo
+            // forks from develop while the others fork from their own epic branches.
+            let mut all_paths = vec![primary_path.clone()];
+            all_paths.extend(params.extra_repo_paths.iter().map(PathBuf::from));
+            let per_repo = resolve_repo_base_selectors(&all_paths, &params.repo_base_branches)?;
+            let base_for = |path: &PathBuf| {
+                per_repo.get(path).cloned().or_else(|| {
+                    // Every repo, including the launch repo, otherwise forks from its own
+                    // registered per-project default when no explicit session base is given.
+                    resolve_repo_base_branch(path, session_base, &project_bases, global_default)
+                })
+            };
+
             let primary = WorkspaceRepoSpec {
-                base_branch: resolve_repo_base_branch(
-                    &primary_path,
-                    session_base,
-                    &project_bases,
-                    global_default,
-                ),
+                base_branch: base_for(&primary_path),
                 path: primary_path,
             };
             let extra_repos: Vec<WorkspaceRepoSpec> = params
@@ -510,12 +574,7 @@ pub fn build_instance(
                 .map(|p| {
                     let path = PathBuf::from(p);
                     WorkspaceRepoSpec {
-                        base_branch: resolve_repo_base_branch(
-                            &path,
-                            session_base,
-                            &project_bases,
-                            global_default,
-                        ),
+                        base_branch: base_for(&path),
                         path,
                     }
                 })
@@ -538,11 +597,8 @@ pub fn build_instance(
             // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
-                // Typed error (not a bare `bail!` string) so the web handler's
-                // whitelist forwards an actionable message instead of the
-                // opaque "Failed to create session". The context keeps the
-                // fuller tip for callers that surface the anyhow chain (CLI,
-                // TUI).
+                // Typed error (not a bare `bail!` string) so the web handler's whitelist forwards
+                // an actionable message instead of the opaque "Failed to create session".
                 return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
                     "Worktree mode requires a git repository, but this path is not one: {}\n\
                      Tip: start an in-place session (no worktree) here, or point at a git repository.",
@@ -590,6 +646,7 @@ pub fn build_instance(
                     created_worktree = Some(CreatedWorktree {
                         path: worktree_path,
                         main_repo_path: main_repo_path.clone(),
+                        owned_branch: None,
                     });
                     worktree_info = Some(WorktreeInfo {
                         branch: branch.clone(),
@@ -607,16 +664,22 @@ pub fn build_instance(
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
                 }
 
-                // The launch repo forks from its registered per-project default
-                // when no explicit session base is given (then global/profile,
-                // then auto-detect). Keyed by repo root via the shared helper.
+                // One repo, so a per-repo base can only name this one.
+                let per_repo = resolve_repo_base_selectors(
+                    std::slice::from_ref(&main_repo_path),
+                    &params.repo_base_branches,
+                )?;
+                // The launch repo otherwise forks from its registered per-project default when no
+                // explicit session base is given (then global/profile, then auto-detect).
                 let project_bases = project_base_branches(profile);
-                let base = resolve_repo_base_branch(
-                    &main_repo_path,
-                    params.base_branch.as_deref(),
-                    &project_bases,
-                    config.worktree.default_base_branch.as_deref(),
-                );
+                let base = per_repo.get(&main_repo_path).cloned().or_else(|| {
+                    resolve_repo_base_branch(
+                        &main_repo_path,
+                        params.base_branch.as_deref(),
+                        &project_bases,
+                        config.worktree.default_base_branch.as_deref(),
+                    )
+                });
 
                 let w = git_wt.create_worktree(branch, &worktree_path, true, base.as_deref())?;
                 warnings.extend(w);
@@ -625,6 +688,7 @@ pub fn build_instance(
                 created_worktree = Some(CreatedWorktree {
                     path: worktree_path,
                     main_repo_path: main_repo_path.clone(),
+                    owned_branch: Some(branch.clone()),
                 });
                 worktree_info = Some(WorktreeInfo {
                     branch: branch.clone(),
@@ -637,11 +701,8 @@ pub fn build_instance(
         }
     }
 
-    // For scratch sessions, `final_path` is intentionally empty here; the
-    // scratch directory is provisioned below after `Instance::new` runs (we
-    // need the instance id to name the directory). For all other sessions,
-    // catch the typed-a-bad-path case before tmux silently falls back to
-    // the home directory.
+    // For scratch sessions, `final_path` is intentionally empty here; the scratch directory is
+    // provisioned below after `Instance::new` runs (we need the instance id to name the directory).
     if !params.scratch {
         let final_path_buf = PathBuf::from(&final_path);
         if !final_path_buf.exists() {
@@ -653,6 +714,7 @@ pub fn build_instance(
     }
 
     let mut instance = Instance::new(&final_title, &final_path);
+    instance.first_launch_names_agent = params.title_typed;
     if params.scratch {
         let dir = super::scratch::provision_scratch_dir(&instance.id)?;
         instance.project_path = dir.to_string_lossy().to_string();
@@ -670,39 +732,31 @@ pub fn build_instance(
         .filter(|a| a.set_default_command)
         .map(|a| a.binary.to_string())
         .unwrap_or_default();
+    if let Some(notice) =
+        crate::agents::get_agent(&params.tool).and_then(crate::agents::AgentDef::lifecycle_notice)
+    {
+        // Non-blocking: deprecated agents still launch; every support path
+        // is unchanged. The warning only informs.
+        tracing::warn!(target: "session.builder", "agent '{}' is {notice}", params.tool);
+    }
     instance.worktree_info = worktree_info;
     instance.workspace_info = workspace_info;
-    instance.yolo_mode = params.yolo_mode;
-
-    // Apply command overrides and custom agent commands from resolved config.
-    // Priority: per-session params > agent_command_override > custom_agents > AgentDef default.
-    if !params.command_override.is_empty() {
-        instance.command = params.command_override;
-    } else {
-        let resolved = config.session.resolve_tool_command(&params.tool);
-        if !resolved.is_empty() {
-            instance.command = resolved;
-        }
-    }
+    apply_agent_launch_config(
+        &mut instance,
+        &config.session,
+        &params.extra_args,
+        &params.command_override,
+        Some(params.yolo_mode),
+    );
     if instance.command.trim().is_empty() && crate::agents::get_agent(&params.tool).is_none() {
         bail!(
             "No launch command resolved for custom agent '{}'. Config may have changed since validation.",
             params.tool
         );
     }
-    if !params.extra_args.is_empty() {
-        instance.extra_args = params.extra_args;
-    } else if let Some(extra) = config.session.agent_extra_args.get(&params.tool) {
-        if !extra.is_empty() {
-            instance.extra_args = extra.clone();
-        }
-    }
 
     if params.sandbox {
-        // Surface env-resolution warnings up-front. `collect_environment`
-        // silently drops entries whose host source var is unset (typo,
-        // shell sourcing gap, daemon's frozen env). Without this check
-        // the value is missing in the container with no UI signal.
+        // Surface env-resolution warnings up-front.
         let effective_env: &[String] = if params.extra_env.is_empty() {
             &config.sandbox.environment
         } else {
@@ -722,6 +776,7 @@ pub fn build_instance(
             },
             custom_instruction: config.sandbox.custom_instruction.clone(),
             before_start_env: Vec::new(),
+            provider: None,
             container_workdir: None,
         });
     }
@@ -729,34 +784,42 @@ pub fn build_instance(
     if let Some(seed) = params.fork_seed {
         match seed {
             crate::session::ForkSeed::Terminal {
-                parent_agent_session_id,
+                parent,
                 child_session_id,
+                unattributed_parent_agent,
             } => {
-                // Pre-pin the child id so it is durable on disk before launch,
-                // and carry the parent on the one-shot Fork intent.
+                // Only an unattributed parent needs this: the launch
+                // identity-checks a qualified one itself. The parent's
+                // capability came from its own row's agent, so the child must
+                // actually launch that same agent.
+                if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
+                    let launched = Instance::execution_agent_for(
+                        &instance.tool,
+                        instance.get_tool_command(),
+                        &config.session,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    crate::session::fork::ensure_child_matches_parent_agent(
+                        Some(parent_agent),
+                        launched.name,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
                 instance.agent_session_id = Some(child_session_id);
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent_agent_session_id,
+                    from: parent.session_id.clone(),
                 };
+                instance.resume_binding = Some(*parent);
             }
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
             } => {
-                // Structured fork: force the structured view, seed the parent
-                // for the ACP session/fork handshake, and replay history into
-                // the (empty) event store on first connect. The marker fields
-                // live behind the serve feature, so without it a structured
-                // fork is inapplicable and this arm is a no-op. Bind the field
-                // to `_` on bare-core so the destructure reads it without an
-                // `allow(unused_variables)` suppression (AGENTS.md).
-                #[cfg(feature = "serve")]
-                {
-                    instance.view = crate::session::View::Structured;
-                    instance.fork_pending = Some(parent_acp_session_id);
-                    instance.import_pending = Some(true);
-                }
-                #[cfg(not(feature = "serve"))]
-                let _ = parent_acp_session_id;
+                // Structured fork: force the structured view, seed the parent for the ACP
+                // session/fork handshake, and replay history into the (empty) event store on first
+                // connect.
+                instance.view = crate::session::View::Structured;
+                instance.fork_pending = Some(parent_acp_session_id);
+                instance.import_pending = Some(true);
             }
         }
     }
@@ -769,26 +832,131 @@ pub fn build_instance(
     })
 }
 
+#[derive(Default)]
+struct CleanupProtection<'a> {
+    owner: Option<&'a Instance>,
+}
+
+impl CleanupProtection<'_> {
+    fn paths_equal(left: &Path, right: &Path) -> bool {
+        left == right
+            || left
+                .canonicalize()
+                .ok()
+                .zip(right.canonicalize().ok())
+                .is_some_and(|(left, right)| left == right)
+    }
+
+    /// Exact matches protect a winner-owned worktree; containment protects a
+    /// winner path nested under a workspace root from recursive root cleanup.
+    fn path_references_target(reference: &Path, target: &Path) -> bool {
+        if reference == target || reference.starts_with(target) {
+            return true;
+        }
+        reference
+            .canonicalize()
+            .ok()
+            .zip(target.canonicalize().ok())
+            .is_some_and(|(reference, target)| reference == target || reference.starts_with(target))
+    }
+
+    fn references_path(&self, target: &Path) -> bool {
+        let Some(owner) = self.owner else {
+            return false;
+        };
+        if Self::path_references_target(Path::new(&owner.project_path), target) {
+            return true;
+        }
+        owner.workspace_info.as_ref().is_some_and(|workspace| {
+            Self::path_references_target(Path::new(&workspace.workspace_dir), target)
+                || workspace.repos.iter().any(|repo| {
+                    Self::path_references_target(Path::new(&repo.worktree_path), target)
+                })
+        })
+    }
+
+    fn references_branch(&self, main_repo_path: &Path, branch: &str) -> bool {
+        let Some(owner) = self.owner else {
+            return false;
+        };
+        owner.worktree_info.as_ref().is_some_and(|worktree| {
+            Self::paths_equal(Path::new(&worktree.main_repo_path), main_repo_path)
+                && worktree.branch == branch
+        }) || owner.workspace_info.as_ref().is_some_and(|workspace| {
+            workspace.repos.iter().any(|repo| {
+                Self::paths_equal(Path::new(&repo.main_repo_path), main_repo_path)
+                    && repo.branch == branch
+            })
+        })
+    }
+}
+
+/// Remove a worktree and then its build-owned branch. The branch stays intact
+/// when worktree removal fails because Git still considers it checked out.
+fn cleanup_created_worktree(
+    created: &CreatedWorktree,
+    label: &str,
+    protection: &CleanupProtection<'_>,
+) {
+    if protection.references_path(&created.path) {
+        tracing::debug!(
+            target: "session.create",
+            path = %created.path.display(),
+            "Preserving {label} referenced by the persisted uniqueness winner"
+        );
+        return;
+    }
+    let Ok(worktree) = GitWorktree::new(created.main_repo_path.clone()) else {
+        return;
+    };
+    if let Err(error) = worktree.remove_worktree(&created.path, false) {
+        tracing::warn!(target: "session.create", "Failed to clean up {label}: {error}");
+        return;
+    }
+    if let Some(branch) = created
+        .owned_branch
+        .as_deref()
+        .filter(|branch| !protection.references_branch(&created.main_repo_path, branch))
+    {
+        if let Err(error) = worktree.delete_branch(branch) {
+            tracing::warn!(target: "session.create", branch, "Failed to clean up branch: {error}");
+        }
+    }
+}
+
 /// Clean up resources created during a failed or cancelled instance build.
-///
-/// This handles:
-/// - Removing worktrees created by aoe
-/// - Removing Docker containers
-/// - Killing tmux sessions
 pub fn cleanup_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
+    protected_owner: Option<&Instance>,
 ) {
-    // Scratch dirs are provisioned eagerly inside `build_instance`
-    // (well before this helper's other cleanup targets exist), so an
-    // abort between provisioning and the caller finishing the session
-    // would otherwise leak the directory on disk. Guard the removal
-    // through `is_scratch_path` so a tampered `project_path` cannot
-    // wipe unrelated app data.
+    // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
+    // row.
+    instance.kill_all_tmux_sessions_without_lifecycle_row();
+
+    if let Some(sandbox) = &instance.sandbox_info {
+        if sandbox.enabled {
+            // Direct idempotent teardown, never gated on a separate existence probe.
+            let container = containers::DockerContainer::from_session_id(&instance.id);
+            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
+                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
+            }
+        }
+    }
+
+    let protection = CleanupProtection {
+        owner: protected_owner,
+    };
+
+    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
+    // cleanup targets exist), so an abort between provisioning and the caller finishing the session
+    // would otherwise leak the directory on disk.
     if instance.scratch {
         let scratch_path = PathBuf::from(&instance.project_path);
-        if super::scratch::is_scratch_path(&scratch_path) {
+        if !protection.references_path(&scratch_path)
+            && super::scratch::is_scratch_path(&scratch_path)
+        {
             if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
                 tracing::warn!(
                     target: "session.create",
@@ -799,57 +967,29 @@ pub fn cleanup_instance(
         }
     }
 
-    if let Some(wt) = created_worktree {
-        if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-            if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
-                tracing::warn!(target: "session.create", "Failed to clean up worktree: {}", e);
-            }
-        }
+    if let Some(worktree) = created_worktree {
+        cleanup_created_worktree(worktree, "worktree", &protection);
     }
 
-    // Workspace worktree cleanup
-    for wt in created_workspace_worktrees {
-        if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-            if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
-                tracing::warn!(target: "session.create", "Failed to clean up workspace worktree: {}", e);
-            }
+    for worktree in created_workspace_worktrees {
+        cleanup_created_worktree(worktree, "workspace worktree", &protection);
+    }
+    if let Some(workspace) = &instance.workspace_info {
+        let workspace_dir = Path::new(&workspace.workspace_dir);
+        if !protection.references_path(workspace_dir) {
+            let _ = std::fs::remove_dir_all(workspace_dir);
         }
     }
-    // Clean up workspace directory if workspace was created
-    if let Some(ws_info) = &instance.workspace_info {
-        let _ = std::fs::remove_dir_all(&ws_info.workspace_dir);
-    }
-
-    if let Some(sandbox) = &instance.sandbox_info {
-        if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence
-            // probe: a transient `inspect` failure must not skip removal and
-            // orphan a live container. Volumes are swept inside `teardown`.
-            let container = containers::DockerContainer::from_session_id(&instance.id);
-            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
-                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
-            }
-        }
-    }
-
-    let _ = instance.kill();
 }
 
-/// Structured-view (ACP) helpers for the TUI create paths. The web create
-/// path does the equivalent inline in `src/server/api/sessions.rs` (it also
-/// handles explicit agent / model / import fields the TUI wizard doesn't
-/// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
-/// keyed on how explicit the user's flag was. Keep the three in sync.
-#[cfg(feature = "serve")]
+/// Structured-view (ACP) helpers for the TUI create paths.
 pub mod structured {
     use super::Instance;
 
-    /// True when `tool` can back a structured-view session: it resolves in
-    /// the ACP agent registry, or the resolved config declares a parsable
-    /// `[session.agent_acp_cmd]` command for it. Mirrors the server create
-    /// path's capability re-validation; deliberately NOT the aoe-agent
-    /// fallback (`pick_acp_agent_name`), which would make every tool look
-    /// capable.
+    /// True when `tool` can back a structured-view session: it resolves in the ACP agent registry,
+    /// the resolved config declares a parsable `[session.agent_acp_cmd]` command for it, or it is a
+    /// custom agent that inherits a registry-backed base through `[session.agent_detect_as]` (e.g.
+    /// a Claude wrapper that only overrides profile/oauth locations).
     pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
         crate::acp::agent_registry::AgentRegistry::with_defaults()
             .get(tool)
@@ -859,18 +999,12 @@ pub mod structured {
                 .agent_acp_cmd
                 .get(tool)
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+            || crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as).is_some()
     }
 
-    /// Pre-create validation for an explicit structured-view choice from the
-    /// new-session wizard, run BEFORE any worktree / scratch / container is
-    /// provisioned so a refusal can't orphan resources (same ordering as the
-    /// CLI's precondition). Returns a user-facing message on refusal.
-    ///
-    /// The adapter-on-PATH check only runs when the user has no command
-    /// override for the tool: an override swaps the binary the spawn will
-    /// actually exec (see #1910), and second-guessing it here could refuse a
-    /// working setup. With an override, a genuinely missing adapter surfaces
-    /// as the structured view's startup-error banner instead.
+    /// Pre-create validation for an explicit structured-view choice from the new-session wizard,
+    /// run BEFORE any worktree / scratch / container is provisioned so a refusal can't orphan
+    /// resources (same ordering as the CLI's precondition).
     pub fn validate_structured_choice(
         tool: &str,
         command_override: &str,
@@ -892,7 +1026,14 @@ pub mod structured {
             None => match config.session.agent_acp_cmd.get(tool) {
                 Some(cmd) => crate::acp::AgentSpec::from_acp_cmd(tool, cmd)
                     .map_err(|e| format!("invalid [session.agent_acp_cmd] for `{tool}`: {e}"))?,
-                None => unreachable!("tool_acp_capable implies a resolvable spec"),
+                // A custom agent that inherits a registry-backed base runs the
+                // base agent's adapter, so the on-PATH check targets that.
+                None => match crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as)
+                    .and_then(|base| registry.get(&base).cloned())
+                {
+                    Some(spec) => spec,
+                    None => unreachable!("tool_acp_capable implies a resolvable spec"),
+                },
             },
         };
         if !crate::cli::acp::command_present(&spec.command) {
@@ -907,14 +1048,10 @@ pub mod structured {
         Ok(())
     }
 
-    /// Apply a validated structured-view choice to a freshly-built instance:
-    /// set the persisted view and pin the per-agent default model, the same
-    /// post-build step the web create handler runs. Re-validates capability
-    /// defensively (downgrading to terminal with a warning) so a caller that
-    /// skipped [`validate_structured_choice`] can't persist a structured
-    /// session no agent can serve.
+    /// Apply a validated structured-view choice to a freshly-built instance: set the persisted view
+    /// and pin the per-agent default model, the same post-build step the web create handler runs.
     pub fn apply_structured_choice(instance: &mut Instance) {
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &instance.source_profile,
             std::path::Path::new(&instance.project_path),
         );
@@ -928,9 +1065,8 @@ pub mod structured {
             return;
         }
         instance.view = crate::session::View::Structured;
-        // Pin the per-agent default model so the composer shows it and the
-        // session stays on it (mirrors the CLI and web create paths). The
-        // wizard sets no explicit model, so the default is the only input.
+        // Pin the per-agent default model so the composer shows it and the session stays on it
+        // (mirrors the CLI and web create paths).
         let defaults = config.acp.acp_defaults_for(&instance.tool);
         instance.agent_model = crate::session::config::resolve_spawn_model_effort(
             defaults,
@@ -999,9 +1135,7 @@ pub(crate) fn collect_taken_branches_for_derived_dedupe(
     taken
 }
 
-/// Origin of an effective worktree branch name. The builder uses this to decide
-/// whether collisions with existing branches should be resolved by suffixing
-/// (Derived) or surfaced as an error (Explicit).
+/// Origin of an effective worktree branch name.
 #[derive(Debug, Clone)]
 pub(crate) enum BranchSource {
     /// User typed this name explicitly. Treat conflicts as a hard error.
@@ -1020,21 +1154,16 @@ fn resolve_worktree_branch(
     }
     Some(
         match worktree_branch.map(str::trim).filter(|b| !b.is_empty()) {
-            // Defense-in-depth: even if the frontend slug missed a forbidden
-            // char (or the caller is a CLI/API user typing a title-shaped
-            // string into the branch field), sanitise here so libgit2 never
-            // sees a value it'll reject with InvalidSpec. `/` is preserved
-            // since it's the legal namespace separator in git refs.
+            // Defense-in-depth: even if the frontend slug missed a forbidden char (or the caller is
+            // a CLI/API user typing a title-shaped string into the branch field), sanitise here so
+            // libgit2 never sees a value it'll reject with InvalidSpec.
             Some(b) => BranchSource::Explicit(git_sanitize_branch_name(b)),
             None => BranchSource::Derived(branch_name_from_title(final_title)),
         },
     )
 }
 
-/// Replace characters that git ref names cannot contain (per
-/// `git-check-ref-format(1)`) with '-'. Unlike `branch_name_from_title`
-/// this keeps the user's casing and preserves '/' so `feat/auth`-style
-/// branches survive when the user types them explicitly.
+/// Replace characters that git ref names cannot contain (per `git-check-ref-format(1)`) with '-'.
 pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_was_dash = false;
@@ -1055,10 +1184,9 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     }
     // Disallowed multi-char sequences: ".." and "@{".
     let mut out = out.replace("..", "-").replace("@{", "-");
-    // Strip the ".lock" suffix from every slash-separated component, not
-    // just the last one; git-check-ref-format(1) rejects any component
-    // ending in ".lock" (e.g. `foo.lock/bar` is just as invalid as
-    // `foo.lock`).
+    // Strip the ".lock" suffix from every slash-separated component, not just the last one;
+    // git-check-ref-format(1) rejects any component ending in ".lock" (e.g. `foo.lock/bar` is just
+    // as invalid as `foo.lock`).
     out = out
         .split('/')
         .map(|mut seg| {
@@ -1085,8 +1213,6 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
 }
 
 /// Find the next branch name not present in `taken`.
-/// If `base` is free, returns it unchanged. Otherwise appends `-2`, `-3`, …
-/// until a free name is found.
 fn branch_collision_key(branch: &str) -> String {
     branch.to_ascii_lowercase()
 }
@@ -1118,9 +1244,6 @@ fn dedupe_branch_name(base: &str, taken: &HashSet<String>) -> String {
 }
 
 /// Map Latin ligatures and stroked letters to their conventional ASCII expansions.
-/// NFKD decomposition handles accented characters (é → e + combining acute, then
-/// the combining mark is dropped by the ASCII filter), but ligatures and stroked
-/// letters have no canonical decomposition, so we expand them here.
 fn expand_ligature(c: char) -> Option<&'static str> {
     Some(match c {
         'ß' => "ss",
@@ -1147,11 +1270,8 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
     let mut last_was_dash = false;
 
     let mut push_processed = |ch: char| {
-        // Preserve '/' as git's namespace separator (so a title like
-        // `jacob/feature-1` yields a branch `jacob/feature-1`). The worktree
-        // folder leaf is sanitized separately via `sanitize_branch_name`, so
-        // the slash never reaches a path. Never emit a leading, trailing, or
-        // doubled slash; trim any pending dash before it.
+        // Preserve '/' as git's namespace separator (so a title like `jacob/feature-1` yields a
+        // branch `jacob/feature-1`).
         if ch == '/' {
             while branch.ends_with('-') {
                 branch.pop();
@@ -1234,42 +1354,26 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_title_with_worktree_uses_branch_name() {
-        let title = resolve_title("", Some("feature-auth"), true, &[], &HashSet::new()).unwrap();
-        assert_eq!(title, "feature-auth");
-    }
-
-    #[test]
-    fn test_empty_title_without_worktree_uses_civilization() {
-        let title = resolve_title("", None, false, &[], &HashSet::new()).unwrap();
-        assert!(
-            civilizations::CIVILIZATIONS.contains(&title.as_str()),
-            "Expected a civilization name, got: {}",
-            title
+    fn resolve_title_prefers_explicit_then_branch_then_civilization() {
+        let taken = HashSet::new();
+        assert_eq!(
+            resolve_title("My Session", Some("feature-auth"), true, &[], &taken).unwrap(),
+            "My Session"
         );
-    }
+        assert_eq!(
+            resolve_title("Custom Name", None, false, &[], &taken).unwrap(),
+            "Custom Name"
+        );
+        assert_eq!(
+            resolve_title("", Some("feature-auth"), true, &[], &taken).unwrap(),
+            "feature-auth"
+        );
+        let generated = resolve_title("", None, false, &[], &taken).unwrap();
+        assert!(
+            civilizations::CIVILIZATIONS.contains(&generated.as_str()),
+            "expected a civilization name, got: {generated}"
+        );
 
-    #[test]
-    fn test_provided_title_with_worktree_keeps_title() {
-        let title = resolve_title(
-            "My Session",
-            Some("feature-auth"),
-            true,
-            &[],
-            &HashSet::new(),
-        )
-        .unwrap();
-        assert_eq!(title, "My Session");
-    }
-
-    #[test]
-    fn test_provided_title_without_worktree_keeps_title() {
-        let title = resolve_title("Custom Name", None, false, &[], &HashSet::new()).unwrap();
-        assert_eq!(title, "Custom Name");
-    }
-
-    #[test]
-    fn test_empty_worktree_title_skips_civ_with_taken_branch() {
         let existing: Vec<&str> = civilizations::CIVILIZATIONS
             .iter()
             .copied()
@@ -1318,168 +1422,102 @@ mod tests {
     }
 
     #[test]
-    fn test_worktree_branch_derived_from_title_when_name_empty() {
-        let branch = resolve_worktree_branch(true, None, "Fix Login Flow").unwrap();
-        assert!(matches!(branch, BranchSource::Derived(ref s) if s == "fix-login-flow"));
-    }
-
-    #[test]
-    fn test_worktree_branch_preserves_explicit_name() {
-        // The git-safe sanitiser leaves valid refs alone: '/' is a legal
-        // namespace separator, so `feat/auth` survives unchanged.
-        let branch = resolve_worktree_branch(true, Some("feat/auth"), "Fix Login Flow").unwrap();
-        assert!(matches!(branch, BranchSource::Explicit(ref s) if s == "feat/auth"));
-    }
-
-    #[test]
-    fn test_worktree_branch_sanitizes_explicit_with_spaces() {
-        // Without this, the value reaches libgit2 and surfaces as the opaque
-        // 'reference name … is not valid' InvalidSpec error in the dashboard.
-        let branch =
-            resolve_worktree_branch(true, Some("Exploration and issues v2"), "Fix Login Flow")
-                .unwrap();
+    fn resolve_worktree_branch_cases() {
+        let branch = |name: Option<&str>| resolve_worktree_branch(true, name, "Fix Login Flow");
+        assert!(matches!(branch(None), Some(BranchSource::Derived(s)) if s == "fix-login-flow"));
         assert!(
-            matches!(branch, BranchSource::Explicit(ref s) if s == "Exploration-and-issues-v2")
+            matches!(branch(Some("feat/auth")), Some(BranchSource::Explicit(s)) if s == "feat/auth")
+        );
+        assert!(
+            matches!(branch(Some("Exploration and issues v2")), Some(BranchSource::Explicit(s)) if s == "Exploration-and-issues-v2")
+        );
+        assert!(
+            resolve_worktree_branch(false, Some("feat/auth"), "Fix Login Flow").is_none(),
+            "no worktree means no branch to resolve"
         );
     }
 
     #[test]
-    fn test_git_sanitize_branch_name_passes_through_valid_refs() {
-        assert_eq!(git_sanitize_branch_name("feat/auth"), "feat/auth");
-        assert_eq!(git_sanitize_branch_name("release-1.2.3"), "release-1.2.3");
-        assert_eq!(
-            git_sanitize_branch_name("user_name/topic"),
-            "user_name/topic"
-        );
+    fn git_sanitize_branch_name_cases() {
+        for (input, want) in [
+            // Valid refs pass through untouched.
+            ("feat/auth", "feat/auth"),
+            ("release-1.2.3", "release-1.2.3"),
+            ("user_name/topic", "user_name/topic"),
+            // Characters git forbids in a ref.
+            ("has spaces", "has-spaces"),
+            ("a:b?c*d", "a-b-c-d"),
+            ("ref^name", "ref-name"),
+            ("a..b", "a-b"),
+            ("a@{b", "a-b"),
+            // Trimmed edges.
+            ("  hello  ", "hello"),
+            ("-leading", "leading"),
+            (".hidden", "hidden"),
+            ("/foo", "foo"),
+            ("foo/", "foo"),
+            // `.lock` is stripped per component, however many are stacked.
+            ("foo.lock", "foo"),
+            ("foo.lock/bar", "foo/bar"),
+            ("feat/release.lock/v2", "feat/release/v2"),
+            ("foo.lock.lock", "foo"),
+            ("feat/release.lock.lock/v2.lock.lock", "feat/release/v2"),
+            // Nothing usable, or a ref with a reserved meaning of its own.
+            ("", "session"),
+            ("@", "session"),
+            ("HEAD", "session"),
+        ] {
+            assert_eq!(git_sanitize_branch_name(input), want, "input {input:?}");
+        }
     }
 
     #[test]
-    fn test_git_sanitize_branch_name_replaces_forbidden_chars() {
-        assert_eq!(git_sanitize_branch_name("has spaces"), "has-spaces");
-        assert_eq!(git_sanitize_branch_name("a:b?c*d"), "a-b-c-d");
-        assert_eq!(git_sanitize_branch_name("ref^name"), "ref-name");
-        assert_eq!(git_sanitize_branch_name("a..b"), "a-b");
-        assert_eq!(git_sanitize_branch_name("a@{b"), "a-b");
+    fn branch_name_from_title_cases() {
+        for (title, want) in [
+            // Git-hostile punctuation.
+            ("Fix: login @ mobile #42", "fix-login-mobile-42"),
+            ("feat/auth.refactor", "feat/auth-refactor"),
+            // Slashes are kept as path separators but never doubled or dangling.
+            ("jacob/feature-1", "jacob/feature-1"),
+            ("/leading", "leading"),
+            ("trailing/", "trailing"),
+            ("a//b", "a/b"),
+            ("a / b", "a/b"),
+            // Latin diacritics and ligatures fold to ASCII.
+            ("café fix", "cafe-fix"),
+            ("naïve solution", "naive-solution"),
+            ("Straße", "strasse"),
+            ("Łódź", "lodz"),
+            ("crème brûlée", "creme-brulee"),
+            ("œuvre", "oeuvre"),
+            // Scripts with no ASCII folding drop out.
+            ("测试", "session"),
+            ("🚀 ship", "ship"),
+        ] {
+            assert_eq!(branch_name_from_title(title), want, "title {title:?}");
+        }
     }
 
     #[test]
-    fn test_git_sanitize_branch_name_trims_edges() {
-        assert_eq!(git_sanitize_branch_name("  hello  "), "hello");
-        assert_eq!(git_sanitize_branch_name("-leading"), "leading");
-        assert_eq!(git_sanitize_branch_name(".hidden"), "hidden");
-        assert_eq!(git_sanitize_branch_name("/foo"), "foo");
-        assert_eq!(git_sanitize_branch_name("foo/"), "foo");
-        assert_eq!(git_sanitize_branch_name("foo.lock"), "foo");
-        assert_eq!(git_sanitize_branch_name(""), "session");
-    }
-
-    #[test]
-    fn test_git_sanitize_branch_name_strips_interior_lock_suffix() {
-        // git-check-ref-format rejects ANY slash-separated component ending
-        // in ".lock", not just the trailing one.
-        assert_eq!(git_sanitize_branch_name("foo.lock/bar"), "foo/bar");
-        assert_eq!(
-            git_sanitize_branch_name("feat/release.lock/v2"),
-            "feat/release/v2"
-        );
-        assert_eq!(git_sanitize_branch_name("foo.lock.lock"), "foo");
-        assert_eq!(
-            git_sanitize_branch_name("feat/release.lock.lock/v2.lock.lock"),
-            "feat/release/v2"
-        );
-    }
-
-    #[test]
-    fn test_git_sanitize_branch_name_rejects_special_complete_refs() {
-        // git-check-ref-format also rejects special complete ref names; fall
-        // back to "session" rather than producing a name libgit2 will refuse.
-        assert_eq!(git_sanitize_branch_name("@"), "session");
-        assert_eq!(git_sanitize_branch_name("HEAD"), "session");
-    }
-
-    #[test]
-    fn test_worktree_branch_disabled_without_worktree() {
-        assert!(resolve_worktree_branch(false, Some("feat/auth"), "Fix Login Flow").is_none());
-    }
-
-    #[test]
-    fn test_branch_name_from_title_sanitizes_git_hostile_chars() {
-        assert_eq!(
-            branch_name_from_title("Fix: login @ mobile #42"),
-            "fix-login-mobile-42"
-        );
-        // '/' is the legal git namespace separator and is preserved; '.' is
-        // still folded to '-'.
-        assert_eq!(
-            branch_name_from_title("feat/auth.refactor"),
-            "feat/auth-refactor"
-        );
-    }
-
-    #[test]
-    fn test_branch_name_from_title_preserves_slashes() {
-        // The motivating case: a `user/topic` title keeps its slash in the
-        // branch, while the worktree folder leaf is sanitized elsewhere.
-        assert_eq!(branch_name_from_title("jacob/feature-1"), "jacob/feature-1");
-        // No leading, trailing, or doubled slash; dashes around a slash are
-        // trimmed.
-        assert_eq!(branch_name_from_title("/leading"), "leading");
-        assert_eq!(branch_name_from_title("trailing/"), "trailing");
-        assert_eq!(branch_name_from_title("a//b"), "a/b");
-        assert_eq!(branch_name_from_title("a / b"), "a/b");
-    }
-
-    #[test]
-    fn test_branch_name_from_title_folds_latin_diacritics() {
-        assert_eq!(branch_name_from_title("café fix"), "cafe-fix");
-        assert_eq!(branch_name_from_title("naïve solution"), "naive-solution");
-        assert_eq!(branch_name_from_title("Straße"), "strasse");
-        assert_eq!(branch_name_from_title("Łódź"), "lodz");
-        assert_eq!(branch_name_from_title("crème brûlée"), "creme-brulee");
-        assert_eq!(branch_name_from_title("œuvre"), "oeuvre");
-    }
-
-    #[test]
-    fn test_branch_name_from_title_drops_unsupported_scripts() {
-        // CJK and emoji are not in the Latin transliteration table, so they're
-        // stripped (current best-effort behavior). The "session" fallback kicks in
-        // when nothing usable remains.
-        assert_eq!(branch_name_from_title("测试"), "session");
-        assert_eq!(branch_name_from_title("🚀 ship"), "ship");
-    }
-
-    #[test]
-    fn test_dedupe_branch_name_returns_base_when_free() {
-        let taken = std::collections::HashSet::new();
-        assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug");
-    }
-
-    #[test]
-    fn test_dedupe_branch_name_appends_suffix_on_collision() {
+    fn dedupe_branch_name_suffixes_past_every_taken_name() {
         let mut taken = HashSet::new();
+        assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug");
+
         taken.insert("fix-bug".to_string());
         assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug-2");
 
-        taken.insert("fix-bug-2".to_string());
-        taken.insert("fix-bug-3".to_string());
+        taken.extend(["fix-bug-2".to_string(), "fix-bug-3".to_string()]);
         assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug-4");
-    }
 
-    #[test]
-    fn test_dedupe_branch_name_matches_case_insensitively() {
-        let mut taken = HashSet::new();
         taken.insert("Tatars".to_string());
-
-        assert_eq!(dedupe_branch_name("tatars", &taken), "tatars-2");
+        assert_eq!(
+            dedupe_branch_name("tatars", &taken),
+            "tatars-2",
+            "collisions are case-insensitive"
+        );
     }
 
-    /// Init a non-bare repo named `name` inside its own TempDir with one
-    /// commit. Returns the TempDir (path is the repo root).
     fn init_repo_with_commit(name: &str) -> tempfile::TempDir {
-        // We want the directory's file_name to be `name` so the parallel
-        // error message references it. TempDir uses random suffixes, so we
-        // create a wrapping TempDir and then a known-named subdir inside it
-        // by leveraging tempfile::Builder.
         let parent = tempfile::Builder::new()
             .prefix("aoe-test-")
             .tempdir()
@@ -1502,10 +1540,6 @@ mod tests {
 
     #[test]
     fn test_create_workspace_reports_all_concurrent_failures() {
-        // Two repos that each only have a "main"/"master" branch. Asking for
-        // a non-existent branch with create_new_branch=false makes both
-        // create_worktree calls fail in parallel; the bail! message must
-        // include both repo names.
         let parent_a = init_repo_with_commit("repo-a-fail");
         let parent_b = init_repo_with_commit("repo-b-fail");
         let repo_a = parent_a.path().join("repo-a-fail");
@@ -1553,66 +1587,20 @@ mod tests {
     }
 
     #[test]
-    fn test_create_workspace_single_failure_keeps_simple_message() {
-        // One bad repo; the message should NOT use the multi-error format
-        // (no "(N repos):" prefix) and SHOULD use the singular phrasing.
-        let parent_a = init_repo_with_commit("repo-solo-fail");
-        let repo_a = parent_a.path().join("repo-solo-fail");
-        let workspaces_root = tempfile::TempDir::new().unwrap();
-        let template = workspaces_root
-            .path()
-            .join("{branch}")
-            .to_string_lossy()
-            .into_owned();
-
-        let result = create_workspace(
-            &WorkspaceRepoSpec {
-                path: repo_a,
-                base_branch: None,
-            },
-            &[],
-            "nonexistent-branch",
-            false,
-            &template,
-            true,
-        );
-
-        let err = match result {
-            Ok(_) => panic!("single-repo failure should still surface"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("Failed to create worktree for"),
-            "singular phrasing missing: {msg}"
-        );
-        assert!(
-            !msg.contains("repos):"),
-            "single-failure path should not use multi-error wording: {msg}"
-        );
-        assert!(msg.contains("repo-solo-fail"), "repo name missing: {msg}");
-    }
-
-    #[test]
     fn resolve_base_branch_precedence() {
-        // Explicit session base wins over everything.
         assert_eq!(
             resolve_base_branch(Some("session"), Some("project"), Some("global")),
             Some("session".to_string())
         );
-        // Per-project default fills in when there is no session base.
         assert_eq!(
             resolve_base_branch(None, Some("project"), Some("global")),
             Some("project".to_string())
         );
-        // Global/profile default is the last configured layer.
         assert_eq!(
             resolve_base_branch(None, None, Some("global")),
             Some("global".to_string())
         );
-        // Nothing set means auto-detect.
         assert_eq!(resolve_base_branch(None, None, None), None);
-        // Empty/whitespace at any layer is treated as unset and skipped.
         assert_eq!(
             resolve_base_branch(Some("   "), Some(""), Some("global")),
             Some("global".to_string())
@@ -1628,53 +1616,34 @@ mod tests {
         let mut bases = std::collections::HashMap::new();
         bases.insert(key, "develop".to_string());
 
-        // No explicit session base: the launch repo forks from its registered
-        // per-project default.
         assert_eq!(
             resolve_repo_base_branch(&root, None, &bases, Some("global")),
             Some("develop".to_string())
         );
 
-        // Explicit session base still wins over the per-project default.
         assert_eq!(
             resolve_repo_base_branch(&root, Some("hotfix"), &bases, Some("global")),
             Some("hotfix".to_string())
         );
 
-        // No registered entry for this repo: fall back to the global default.
         let empty = std::collections::HashMap::new();
         assert_eq!(
             resolve_repo_base_branch(&root, None, &empty, Some("global")),
             Some("global".to_string())
         );
-    }
 
-    #[test]
-    fn resolve_repo_base_branch_matches_when_launching_from_a_worktree() {
-        // A session launched from a linked worktree of the registered repo
-        // still resolves the project default, because find_main_repo maps the
-        // worktree back to its main repo (the registry's key).
-        let (parent, _tip) = init_repo_with_branch("proj", "release");
-        let root = parent.path().join("proj");
-        let main_wt = GitWorktree::new(root.clone()).unwrap();
+        // Launching from a linked worktree still keys by the main repo root.
         let wt_path = parent.path().join("proj-wt");
-        main_wt
+        GitWorktree::new(root.clone())
+            .unwrap()
             .create_worktree("wt-branch", &wt_path, true, None)
             .unwrap();
-
-        let key = crate::session::projects::canonical_key(&root.to_string_lossy());
-        let mut bases = std::collections::HashMap::new();
-        bases.insert(key, "develop".to_string());
-
         assert_eq!(
             resolve_repo_base_branch(&wt_path, None, &bases, None),
             Some("develop".to_string())
         );
     }
 
-    /// Create a repo with `main` plus a second branch holding a distinct
-    /// commit. Returns the parent TempDir and the second branch's tip oid so a
-    /// test can assert a worktree forked from it instead of `main`.
     fn init_repo_with_branch(name: &str, branch: &str) -> (tempfile::TempDir, git2::Oid) {
         let parent = tempfile::Builder::new()
             .prefix("aoe-test-")
@@ -1696,7 +1665,6 @@ mod tests {
             .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        // Branch off and add a distinct commit so the tip differs from `main`.
         let base = repo.find_commit(base_commit).unwrap();
         repo.branch(branch, &base, false).unwrap();
         std::fs::write(dir.join("RELEASE.md"), "release\n").unwrap();
@@ -1716,8 +1684,6 @@ mod tests {
 
     #[test]
     fn create_workspace_honors_per_repo_base_branch() {
-        // The extra repo's worktree should fork from its own configured base
-        // branch, while the primary repo forks from its default branch.
         let (parent_primary, _) = init_repo_with_branch("primary", "release");
         let (parent_extra, extra_release_tip) = init_repo_with_branch("extra", "release");
         let primary = parent_primary.path().join("primary");
@@ -1759,13 +1725,171 @@ mod tests {
             extra_release_tip,
             "extra repo worktree should branch from its configured `release` base"
         );
+        assert_eq!(extra_repo.base_branch.as_deref(), Some("release"));
+        assert_eq!(
+            result
+                .workspace_info
+                .repos
+                .iter()
+                .find(|r| r.name == "primary")
+                .unwrap()
+                .base_branch,
+            None,
+            "a repo with no configured base records none, so the diff falls through to detection"
+        );
+        assert!(result
+            .created_worktrees
+            .iter()
+            .all(|worktree| worktree.owned_branch.as_deref() == Some("feature-x")));
+        for worktree in &result.created_worktrees {
+            cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
+            let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
+            assert!(repo
+                .find_branch("feature-x", git2::BranchType::Local)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn create_workspace_records_no_base_when_attaching_an_existing_branch() {
+        let (parent_primary, _) = init_repo_with_branch("primary", "feature-x");
+        let primary = parent_primary.path().join("primary");
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let template = workspaces_root
+            .path()
+            .join("{branch}")
+            .to_string_lossy()
+            .into_owned();
+
+        let result = create_workspace(
+            &WorkspaceRepoSpec {
+                path: primary,
+                base_branch: Some("main".to_string()),
+            },
+            &[],
+            "feature-x",
+            false,
+            &template,
+            true,
+        )
+        .expect("workspace creation should succeed");
+
+        assert_eq!(result.workspace_info.repos[0].base_branch, None);
+        assert_eq!(result.created_worktrees[0].owned_branch, None);
+        let worktree = &result.created_worktrees[0];
+        cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
+        let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
+        assert!(repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn cleanup_keeps_owned_branch_when_worktree_removal_fails() {
+        let (parent, _) = init_repo_with_branch("cleanup", "release");
+        let main_repo_path = parent.path().join("cleanup");
+        let worktree_path = parent.path().join("dirty-worktree");
+        let git = GitWorktree::new(main_repo_path.clone()).unwrap();
+        git.create_worktree("rollback-branch", &worktree_path, true, None)
+            .unwrap();
+        std::fs::write(worktree_path.join("README.md"), "dirty\n").unwrap();
+
+        let created = CreatedWorktree {
+            path: worktree_path.clone(),
+            main_repo_path: main_repo_path.clone(),
+            owned_branch: Some("rollback-branch".to_string()),
+        };
+        cleanup_created_worktree(&created, "test worktree", &CleanupProtection::default());
+
+        assert!(worktree_path.exists(), "dirty worktree must survive");
+        let repo = git2::Repository::open(&main_repo_path).unwrap();
+        assert!(
+            repo.find_branch("rollback-branch", git2::BranchType::Local)
+                .is_ok(),
+            "owned branch must not be deleted while its worktree remains"
+        );
+
+        git.remove_worktree(&worktree_path, true).unwrap();
+        git.delete_branch("rollback-branch").unwrap();
+    }
+
+    #[test]
+    fn resolve_repo_base_selectors_matches_name_or_path() {
+        let repos = vec![
+            PathBuf::from("/src/app"),
+            PathBuf::from("/src/api"),
+            PathBuf::from("/elsewhere/web"),
+        ];
+
+        let out = resolve_repo_base_selectors(
+            &repos,
+            &[
+                ("api".to_string(), "epic/checkout".to_string()),
+                ("/elsewhere/web".to_string(), " develop ".to_string()),
+            ],
+        )
+        .expect("both selectors resolve");
+        assert_eq!(
+            out.get(&PathBuf::from("/src/api")).map(String::as_str),
+            Some("epic/checkout")
+        );
+        assert_eq!(
+            out.get(&PathBuf::from("/elsewhere/web"))
+                .map(String::as_str),
+            Some("develop")
+        );
+        assert!(!out.contains_key(&PathBuf::from("/src/app")));
+
+        assert!(resolve_repo_base_selectors(&repos, &[]).unwrap().is_empty());
+
+        let cases = [
+            (
+                vec![("nope".to_string(), "develop".to_string())],
+                "No repo named",
+            ),
+            (
+                vec![("api".to_string(), "  ".to_string())],
+                "No base branch",
+            ),
+            (
+                vec![
+                    ("api".to_string(), "develop".to_string()),
+                    ("/src/api".to_string(), "main".to_string()),
+                ],
+                "twice",
+            ),
+        ];
+        for (pairs, expected) in cases {
+            let err = resolve_repo_base_selectors(&repos, &pairs)
+                .expect_err("should reject")
+                .to_string();
+            assert!(err.contains(expected), "got: {err}");
+        }
+
+        let subdir = vec![PathBuf::from("/src/api/crates/core")];
+        assert!(
+            resolve_repo_base_selectors(&subdir, &[("api".to_string(), "develop".to_string())])
+                .is_err(),
+            "a repo name must not resolve against a subdirectory path"
+        );
+        assert!(resolve_repo_base_selectors(
+            &subdir,
+            &[("core".to_string(), "develop".to_string())]
+        )
+        .is_ok());
+
+        let dupes = vec![PathBuf::from("/a/api"), PathBuf::from("/b/api")];
+        let err = resolve_repo_base_selectors(&dupes, &[("api".to_string(), "x".to_string())])
+            .expect_err("ambiguous name")
+            .to_string();
+        assert!(err.contains("ambiguous"), "got: {err}");
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let config_home = temp_home.join(".config");
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
             config_home.join(crate::session::APP_DIR_NAME_XDG)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1777,6 +1901,7 @@ mod tests {
     fn custom_agent_params(project_path: &std::path::Path, tool: &str) -> InstanceParams {
         InstanceParams {
             title: "custom session".to_string(),
+            title_typed: false,
             path: project_path.to_string_lossy().to_string(),
             group: String::new(),
             tool: tool.to_string(),
@@ -1791,16 +1916,88 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: None,
         }
     }
 
     #[test]
+    fn apply_agent_launch_config_prefers_set_session_values_over_config() {
+        // (session extra, config extra, session command, config override,
+        //  session yolo, config yolo) -> (extra, command, yolo)
+        let cases = [
+            (("", None, "", None, None, false), ("", "claude", false)),
+            (
+                ("", Some("--cfg"), "", Some("wrap"), None, true),
+                ("--cfg", "wrap", true),
+            ),
+            (
+                ("", Some(""), "", Some(""), None, false),
+                ("", "claude", false),
+            ),
+            (
+                (
+                    "--mine",
+                    Some("--cfg"),
+                    "mine",
+                    Some("wrap"),
+                    Some(false),
+                    true,
+                ),
+                ("--mine", "mine", false),
+            ),
+        ];
+        for ((extra, cfg_extra, cmd, cfg_cmd, yolo, cfg_yolo), expected) in cases {
+            let mut session = crate::session::config::SessionConfig {
+                yolo_mode_default: cfg_yolo,
+                ..Default::default()
+            };
+            if let Some(v) = cfg_extra {
+                session.agent_extra_args.insert("claude".into(), v.into());
+            }
+            if let Some(v) = cfg_cmd {
+                session
+                    .agent_command_override
+                    .insert("claude".into(), v.into());
+            }
+            let mut inst = Instance::new("t", "/p");
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            apply_agent_launch_config(&mut inst, &session, extra, cmd, yolo);
+            assert_eq!(
+                (
+                    inst.extra_args.as_str(),
+                    inst.command.as_str(),
+                    inst.yolo_mode
+                ),
+                expected,
+                "extra={extra:?} cfg_extra={cfg_extra:?} cmd={cmd:?} cfg_cmd={cfg_cmd:?}"
+            );
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
-    fn build_instance_preserves_custom_agent_detect_as_mapping() {
+    fn only_a_typed_title_names_the_agent() {
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+        for (typed, expected) in [(true, true), (false, false)] {
+            let mut params = custom_agent_params(project.path(), "claude");
+            params.title_typed = typed;
+            let instance = build_instance(params, &[], &[], "default")
+                .unwrap()
+                .instance;
+            assert_eq!(instance.first_launch_names_agent, expected, "typed {typed}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_resolves_custom_agent_commands_and_detect_as() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(
@@ -1808,6 +2005,9 @@ mod tests {
             r#"
                 [session.custom_agents]
                 remote-claude = "ssh -t host claude"
+                remote-opencode = "ssh -t host opencode"
+
+                whitespace-agent = "   "
 
                 [session.agent_detect_as]
                 remote-claude = "claude"
@@ -1815,6 +2015,7 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-claude"),
@@ -1827,119 +2028,48 @@ mod tests {
         assert_eq!(result.instance.tool, "remote-claude");
         assert_eq!(result.instance.command, "ssh -t host claude");
         assert_eq!(result.instance.detect_as, "claude");
-    }
 
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_keeps_empty_detect_as_without_mapping() {
-        let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(
-            app_dir.join("config.toml"),
-            r#"
-                [session.custom_agents]
-                remote-opencode = "ssh -t host opencode"
-            "#,
-        )
-        .unwrap();
-        let project = tempfile::tempdir().unwrap();
-
-        let result = build_instance(
+        let unmapped = build_instance(
             custom_agent_params(project.path(), "remote-opencode"),
             &[],
             &[],
             "default",
         )
         .unwrap();
+        assert_eq!(unmapped.instance.command, "ssh -t host opencode");
+        assert_eq!(unmapped.instance.detect_as, "");
 
-        assert_eq!(result.instance.tool, "remote-opencode");
-        assert_eq!(result.instance.command, "ssh -t host opencode");
-        assert_eq!(result.instance.detect_as, "");
+        for tool in ["remote-missing", "whitespace-agent"] {
+            let Err(err) = build_instance(
+                custom_agent_params(project.path(), tool),
+                &[],
+                &[],
+                "default",
+            ) else {
+                panic!("{tool}: custom agent without a command should fail");
+            };
+            assert!(
+                err.to_string().contains(&format!(
+                    "No launch command resolved for custom agent '{tool}'"
+                )),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
     #[serial_test::serial]
-    fn build_instance_rejects_custom_agent_without_resolved_command() {
+    fn build_instance_provisions_scratch_and_rejects_invalid_worktree_requests() {
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("config.toml"), "").unwrap();
-        let project = tempfile::tempdir().unwrap();
-
-        let result = build_instance(
-            custom_agent_params(project.path(), "remote-missing"),
-            &[],
-            &[],
-            "default",
-        );
-        let err = match result {
-            Ok(_) => panic!("custom agent without a command should fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("No launch command resolved for custom agent 'remote-missing'"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_rejects_custom_agent_with_whitespace_only_command() {
-        let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(
-            app_dir.join("config.toml"),
-            r#"
-                [session.custom_agents]
-                whitespace-agent = "   "
-            "#,
-        )
-        .unwrap();
-        let project = tempfile::tempdir().unwrap();
-
-        let result = build_instance(
-            custom_agent_params(project.path(), "whitespace-agent"),
-            &[],
-            &[],
-            "default",
-        );
-        let err = match result {
-            Ok(_) => panic!("custom agent with whitespace-only command should fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("No launch command resolved for custom agent 'whitespace-agent'"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_scratch_provisions_app_dir() {
-        let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(app_dir.join("config.toml"), "").unwrap();
 
         let mut params = custom_agent_params(std::path::Path::new(""), "claude");
-        params.tool = "claude".to_string();
-        params.path = String::new();
         params.scratch = true;
-        params.sandbox = false;
-
-        let result = build_instance(params, &[], &[], "default")
+        let result = build_instance(params.clone(), &[], &[], "default")
             .expect("scratch build must succeed without a project path");
-
         assert!(
             result.instance.scratch,
             "scratch flag must be persisted on the instance"
@@ -1947,57 +2077,40 @@ mod tests {
         let provisioned = std::path::PathBuf::from(&result.instance.project_path);
         assert!(provisioned.exists());
         assert!(super::super::scratch::is_scratch_path(&provisioned));
-
         let _ = std::fs::remove_dir_all(&provisioned);
-    }
 
-    #[test]
-    fn build_instance_applies_terminal_fork_seed() {
-        use crate::session::ForkSeed;
-        let params = InstanceParams {
-            title: "Forked".into(),
-            path: "/tmp".into(),
-            group: String::new(),
-            tool: "claude".into(),
-            worktree_enabled: false,
-            worktree_branch: None,
-            create_new_branch: false,
-            base_branch: None,
-            sandbox: false,
-            sandbox_image: String::new(),
-            yolo_mode: false,
-            extra_env: vec![],
-            extra_args: String::new(),
-            command_override: String::new(),
-            extra_repo_paths: vec![],
-            scratch: false,
-            fork_seed: Some(ForkSeed::Terminal {
-                parent_agent_session_id: "parent-uuid".into(),
-                child_session_id: "child-uuid".into(),
-            }),
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+        let Err(err) = build_instance(params, &[], &[], "default") else {
+            panic!("scratch + worktree must error");
         };
-        let inst = build_instance(params, &[], &[], "default")
-            .unwrap()
-            .instance;
-        // The pre-pinned child id lives in agent_session_id; the parent rides on
-        // the one-shot Fork intent.
-        assert_eq!(inst.agent_session_id.as_deref(), Some("child-uuid"));
         assert!(
-            matches!(
-                inst.resume_intent,
-                crate::session::instance::ResumeIntent::Fork { ref from } if from == "parent-uuid"
-            ),
-            "fork intent must carry the parent id in `from`, got {:?}",
-            inst.resume_intent
+            err.to_string()
+                .contains("Cannot combine --scratch with worktree mode"),
+            "unexpected error: {err}"
+        );
+
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+        let Err(err) = build_instance(params, &[], &[], "default") else {
+            panic!("worktree on a non-git path must error");
+        };
+        assert!(
+            err.chain()
+                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
+                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
+            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
         );
     }
 
-    #[cfg(feature = "serve")]
-    #[test]
     fn build_instance_applies_structured_fork_seed() {
         use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
             title: "Forked".into(),
+            title_typed: false,
             path: "/tmp".into(),
             group: String::new(),
             tool: "claude".into(),
@@ -2012,6 +2125,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Structured {
                 parent_acp_session_id: "parent-acp-id".into(),
@@ -2020,16 +2134,9 @@ mod tests {
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()
             .instance;
-        // The structured arm forces the structured view and sets the two paired
-        // one-shot markers: fork_pending carries the parent for session/fork,
-        // and import_pending replays history into the fresh event store. A
-        // regression on any of the three should fail here, not only in the
-        // aggregate structured e2e.
         assert_eq!(inst.view, crate::session::View::Structured);
         assert_eq!(inst.fork_pending.as_deref(), Some("parent-acp-id"));
         assert_eq!(inst.import_pending, Some(true));
-        // Structured fork does not pre-pin an agent id (the adapter mints the
-        // child id at handshake) and leaves the terminal Fork intent unset.
         assert!(inst.agent_session_id.is_none());
         assert!(!matches!(
             inst.resume_intent,
@@ -2037,61 +2144,148 @@ mod tests {
         ));
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_rejects_scratch_with_worktree() {
-        let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("config.toml"), "").unwrap();
-
-        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
-        params.tool = "claude".to_string();
-        params.scratch = true;
-        params.worktree_enabled = true;
-        params.worktree_branch = Some("feat".to_string());
-
-        let err = match build_instance(params, &[], &[], "default") {
-            Ok(_) => panic!("scratch + worktree must error"),
-            Err(e) => e,
+    fn build_instance_applies_terminal_fork_seed() {
+        use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        // The CLI e2e covers the separate application in `add.rs`; this is the
+        // arm `build_instance` owns, which pins the child conversation and the
+        // parent the first launch must fork from.
+        let parent = crate::session::ConversationBinding {
+            session_id: "parent-conversation".into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![std::path::PathBuf::from("/tmp/store")],
+                configuration: Vec::new(),
+                cwd: "/tmp".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
         };
-        assert!(
-            err.to_string()
-                .contains("Cannot combine --scratch with worktree mode"),
-            "unexpected error: {err}"
+        let params = InstanceParams {
+            title: "Forked".into(),
+            title_typed: false,
+            path: "/tmp".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: vec![],
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: vec![],
+            repo_base_branches: Vec::new(),
+            scratch: false,
+            fork_seed: Some(ForkSeed::Terminal {
+                parent: Box::new(parent.clone()),
+                child_session_id: "child-conversation".into(),
+                unattributed_parent_agent: None,
+            }),
+        };
+        let inst = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance;
+        assert_eq!(inst.agent_session_id.as_deref(), Some("child-conversation"));
+        assert_eq!(
+            inst.resume_intent,
+            crate::session::ResumeIntent::Fork {
+                from: "parent-conversation".into()
+            }
         );
+        assert_eq!(inst.resume_binding.as_ref(), Some(&parent));
     }
 
     #[test]
     #[serial_test::serial]
-    fn build_instance_worktree_on_non_git_path_returns_typed_not_a_git_repo() {
-        // A worktree requested on a plain (non-git) folder must fail with the
-        // typed GitError::NotAGitRepo, not a bare `bail!` string. The web
-        // handler only forwards an actionable message for whitelisted typed
-        // GitError variants, so a string bail would surface the opaque
-        // "Failed to create session" instead.
-        let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+    fn fork_seed_builds_apply_the_seed_and_restore_default_profile_registry() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        const ALIAS_AGENT: &str = "fork-seed-registry-alias";
+        const RULE_AGENT: &str = "fork-seed-registry-rule";
+        let cases: &[(&str, fn())] = &[
+            ("terminal", build_instance_applies_terminal_fork_seed),
+            ("structured", build_instance_applies_structured_fork_seed),
+        ];
 
-        let project = tempfile::tempdir().unwrap();
-        let mut params = custom_agent_params(project.path(), "claude");
-        params.tool = "claude".to_string();
-        params.worktree_enabled = true;
-        params.worktree_branch = Some("feat".to_string());
+        for (label, run) in cases {
+            let _cleanup = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+            let mut sentinels = crate::session::Config::default();
+            sentinels
+                .session
+                .agent_detect_as
+                .insert(ALIAS_AGENT.to_string(), "codex".to_string());
+            sentinels
+                .agents
+                .entry(RULE_AGENT.to_string())
+                .or_default()
+                .status_rules = vec![crate::session::config::StatusRule {
+                status: crate::agents::HookStatus::Running,
+                contains: Some("fork-seed-working".to_string()),
+                regex: None,
+            }];
+            crate::tmux::status_rules::install_from_config("default", &sentinels);
 
-        let err = match build_instance(params, &[], &[], "default") {
-            Ok(_) => panic!("worktree on a non-git path must error"),
-            Err(e) => e,
+            run();
+
+            let alias = crate::tmux::status_rules::effective_detect_as("default", ALIAS_AGENT, "");
+            let rule =
+                crate::tmux::status_rules::detect("default", RULE_AGENT, "fork-seed-working");
+            assert_eq!(
+                (alias.as_ref(), rule),
+                ("codex", Some(crate::session::Status::Running)),
+                "{label}: fork-seed build must restore the prior alias and compiled rule"
+            );
+        }
+    }
+
+    /// The parent's capability is checked against the parent row's own agent,
+    /// and the launch skips identity checking for an unattributed binding, so
+    /// a child that would launch another agent must be refused here rather
+    /// than fork a conversation it cannot resume.
+    #[test]
+    #[serial_test::serial]
+    fn a_fork_child_that_would_launch_another_agent_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut parent = crate::session::Instance::new("parent", root.path().to_str().unwrap());
+        parent.tool = "claude".into();
+        parent.agent_session_id = Some("legacy-uuid".into());
+        parent.agent_session_binding =
+            Some(crate::session::ConversationBinding::unknown("legacy-uuid"));
+        let seed = crate::session::fork::terminal_fork_seed(
+            parent.fork_parent_ref().unwrap(),
+            "child-uuid".into(),
+        )
+        .expect("an unattributed parent is admitted");
+
+        let mut same_agent = custom_agent_params(root.path(), "claude");
+        same_agent.command_override = "claude".into();
+        same_agent.fork_seed = Some(seed.clone());
+        assert_eq!(
+            build_instance(same_agent, &[], &[], "default")
+                .expect("a child launching the parent's own agent still forks")
+                .instance
+                .agent_session_id
+                .as_deref(),
+            Some("child-uuid")
+        );
+
+        let mut other_agent = custom_agent_params(root.path(), "codex");
+        other_agent.command_override = "codex".into();
+        other_agent.fork_seed = Some(seed);
+        let refused = match build_instance(other_agent, &[], &[], "default") {
+            Ok(_) => panic!("a child launching another agent cannot carry the conversation"),
+            Err(error) => error.to_string(),
         };
         assert!(
-            err.chain()
-                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
-                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
-            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
+            refused.contains("codex") && refused.contains("claude"),
+            "the refusal must name both agents: {refused}"
         );
     }
 }

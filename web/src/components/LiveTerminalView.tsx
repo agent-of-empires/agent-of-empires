@@ -1,28 +1,33 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useLiveTerminal } from "../hooks/useLiveTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
+import { TerminalComposeSheet } from "./TerminalComposeSheet";
 import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
+import { ArrowJoystick } from "./ArrowJoystick";
+import { useWebSettings } from "../hooks/useWebSettings";
+import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
-import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
+import { ensureSession, ensureTerminal, isStartRefusal, pasteImage } from "../lib/api";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
 import type { SessionResponse } from "../lib/types";
+import { reportError } from "../lib/toastBus";
 import {
   FOCUS_TERMINAL_EVENT,
   consumePendingTerminalFocus,
   setPendingTerminalFocus,
   type FocusTerminalDetail,
 } from "../lib/terminalFocus";
+import { StrokeIcon } from "./icons";
 
 interface Props {
   session: SessionResponse;
   active?: boolean;
-  /** Which tmux surface this view renders. The agent pane is the
-   *  default; the paired host/container shells reuse the same chrome
-   *  with their own WS route, ensure call, and focus target. */
+  /** Which tmux surface this view renders. */
   surface?: "agent" | "paired-host" | "paired-container";
   /** Paired-terminal instance index for the tabbed terminal groups (#2437).
    *  Ignored for the agent surface; 0 is the primary paired shell. */
@@ -39,29 +44,21 @@ const SURFACES = {
   },
 };
 
-/**
- * Touch-device agent terminal: chrome around the capture-snapshot live
- * pane (MobileLiveTerminal). Deliberately carries NONE of the xterm-era
- * keyboard machinery: there is no PTY to protect from SIGWINCH storms,
- * so the soft keyboard is handled by letting the layout shrink naturally
- * (`100dvh` shrinks with the keyboard on iOS PWA / iOS 26 / Android; the
- * App root pin is dropped for live sessions) plus a visualViewport-based
- * bottom inset for iOS regular Safari, where the layout viewport does
- * not shrink. The pane re-pins itself to the bottom when its container
- * resizes, which is all a bottom-anchored chat-style surface needs.
- */
+/** Touch-device agent terminal: chrome around the capture-snapshot live pane (MobileLiveTerminal). */
 export function LiveTerminalView({ session, active = true, surface = "agent", terminalIndex = 0 }: Props) {
   const base = SURFACES[surface];
   const { focusTarget, dataTerm } = base;
   // Paired terminals carry their instance index as a query param so the
   // server attaches the right tmux session; the agent surface ignores it.
   const wsPath = surface === "agent" ? base.wsPath : `${base.wsPath}?index=${terminalIndex}`;
-  // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is
-  // pointless with a physical keyboard, so it stays off fine-pointer devices
-  // now that this view also renders on desktop.
+  // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is pointless with a physical keyboard, so it
+  // stays off fine-pointer devices now that this view also renders on desktop.
   const coarse = useIsCoarsePointer();
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
+  const [ensureWarning, setEnsureWarning] = useState<string | null>(null);
   const [ensureError, setEnsureError] = useState<string | null>(null);
+  // An archived or trashed session stays refused until unarchived or restored, so Retry is pointless.
+  const [ensureRetryable, setEnsureRetryable] = useState(true);
   const clipboardArmRef = useRef<ArmedClipboardWrite | null>(null);
   const receiveAgentClipboard = useCallback((text: string) => {
     const armed = clipboardArmRef.current;
@@ -80,24 +77,79 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     [],
   );
   const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath, receiveAgentClipboard);
-  // The viewport hook supplies the iOS-regular-Safari bottom inset and
-  // the occlusion-based keyboardOpen used to gate the pane's sizing
-  // latch (occlusion is what shrinks the container, whichever element is
-  // focused). The CHROME's open/closed state still comes from input
-  // focus below, which is exact where occlusion heuristics misread.
+  // The viewport hook supplies the iOS-regular-Safari bottom inset and the occlusion-based keyboardOpen used to
+  // gate the pane's sizing latch (occlusion is what shrinks the container, whichever element is focused).
   const { keyboardHeight, keyboardOpen } = useMobileKeyboard();
   const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
   const ctrlActiveRef = useRef(false);
+  const clearCtrl = useCallback(() => setCtrlActive(false), []);
   useEffect(() => {
     ctrlActiveRef.current = ctrlActive;
   }, [ctrlActive]);
+  const [composeOpen, setComposeOpen] = useState(false);
+
+  const notOwner = live.state.ownerKnown && !live.state.isOwner;
+  const lastUndeliveredToastRef = useRef(0);
+  // Throttled, so a held repeat key does not stack toasts.
+  const reportUndelivered = useCallback(() => {
+    const now = Date.now();
+    if (now - lastUndeliveredToastRef.current < 2000) return;
+    lastUndeliveredToastRef.current = now;
+    reportError(
+      notOwner
+        ? "Not sent: this session is live on another device. Take over first."
+        : "Not sent: terminal not connected.",
+    );
+  }, [notOwner]);
+  const { sendData, sendPaste } = live;
+  // Explicit sends (toolbar, paste, compose) report a drop; typed keys stay quiet.
+  const sendDataOrReport = useCallback(
+    (data: string) => {
+      const ok = sendData(data);
+      if (!ok) reportUndelivered();
+      return ok;
+    },
+    [sendData, reportUndelivered],
+  );
+  const sendPasteOrReport = useCallback(
+    (text: string, submit: boolean) => {
+      const ok = sendPaste(text, submit);
+      if (!ok) reportUndelivered();
+      return ok;
+    },
+    [sendPaste, reportUndelivered],
+  );
+  // Out of band like the toolbar keys, so the retained IME syllable stops shadowing the line.
+  const sendArrow = useCallback(
+    (sequence: string) => {
+      invalidateRetainedImeContext(inputRef.current);
+      sendDataOrReport(sequence);
+    },
+    [sendDataOrReport],
+  );
+  const submitCompose = useCallback(
+    (text: string, submit: boolean) => {
+      invalidateRetainedImeContext(inputRef.current);
+      return sendPasteOrReport(text, submit);
+    },
+    [sendPasteOrReport],
+  );
+  const { settings: webSettings } = useWebSettings();
+  const openCompose = useCallback(() => flushSync(() => setComposeOpen(true)), []);
+  const closeCompose = useCallback((refocusTerminal: boolean) => {
+    // Focus first, inside the tap, so iOS keeps the keyboard up for the terminal.
+    if (refocusTerminal) inputRef.current?.focus();
+    setComposeOpen(false);
+  }, []);
 
   const [trackedSessionId, setTrackedSessionId] = useState(session.id);
   if (session.id !== trackedSessionId) {
     setTrackedSessionId(session.id);
+    setComposeOpen(false);
     setEnsureState("pending");
+    setEnsureWarning(null);
     setEnsureError(null);
   }
   const lastEnsuredSessionIdRef = useRef<string | null>(null);
@@ -113,6 +165,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     return false;
   }, []);
 
+  // A refused ensure re-runs once the session is unarchived or restored.
+  const shelved = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     if (lastEnsuredSessionIdRef.current === session.id) {
       if (consumePendingTerminalFocus(focusTarget)) focusSelf();
@@ -122,22 +176,21 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
-        : ensureTerminal(session.id, terminalIndex, surface === "paired-container").then((ok) => ({
-            ok,
-            message: null as string | null,
-          }));
+        : ensureTerminal(session.id, terminalIndex, surface === "paired-container");
     ensure.then((res) => {
       if (controller.signal.aborted) return;
       if (res.ok) {
         lastEnsuredSessionIdRef.current = session.id;
+        setEnsureWarning(res.message ?? null);
         setEnsureState("ready");
       } else {
         setEnsureState("error");
         setEnsureError(res.message ?? "Could not start session.");
+        setEnsureRetryable(!isStartRefusal(res.error));
       }
     });
     return () => controller.abort();
-  }, [session.id, focusSelf, surface, focusTarget, terminalIndex]);
+  }, [session.id, shelved, focusSelf, surface, focusTarget, terminalIndex]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {
@@ -165,18 +218,17 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       const ensure =
         surface === "agent"
           ? ensureSession(session.id, controller.signal)
-          : ensureTerminal(session.id, terminalIndex, surface === "paired-container").then((ok) => ({
-              ok,
-              message: null as string | null,
-            }));
+          : ensureTerminal(session.id, terminalIndex, surface === "paired-container");
       ensure.then((res) => {
         if (controller.signal.aborted) return;
         if (res.ok) {
           lastEnsuredSessionIdRef.current = session.id;
+          setEnsureWarning(res.message ?? null);
           setEnsureState("ready");
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
+          setEnsureRetryable(!isStartRefusal(res.error));
         }
       });
       return "pending";
@@ -206,17 +258,19 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         <span className="text-xs text-status-error max-w-md break-words">
           {ensureError ?? "Could not start session."}
         </span>
-        <button onClick={retryEnsure} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
-          Retry
-        </button>
+        {ensureRetryable && (
+          <button
+            onClick={retryEnsure}
+            className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
+          >
+            Retry
+          </button>
+        )}
       </div>
     );
   }
 
-  // iOS regular Safari is the one platform where the layout viewport
-  // does NOT shrink with the keyboard; inset the pane by the measured
-  // keyboard height there. Everywhere else this is 0 and dvh shrink
-  // does the work.
+  // Keyboard-open lift only.
   const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 
   return (
@@ -226,17 +280,13 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       data-term={dataTerm}
       data-pane-focused={inputFocused || undefined}
     >
-      {/* Frame the pane like the TUI does: a faint always-on border marks the
-          box edges and brightens to the teal `terminal-active` color when this
-          pane is selected (its input has focus), so on a multi-pane desktop it
-          is obvious which box keystrokes go to. This is a pointer-events-none
-          overlay (not a ring on the container) because the terminal scroller is
-          an `absolute inset-0` element with an opaque background that would
-          paint over an inset ring on any ancestor. */}
+      {/* Frame the pane like the TUI does: a faint always-on border marks the box edges and brightens to the teal
+         `terminal-active` color when this pane is selected (its input has focus), so on a multi-pane desktop it
+         is obvious which box keystrokes go to. */}
       <div
         aria-hidden="true"
         className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
-          inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
+          coarse ? "" : inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
         }`}
       />
 
@@ -249,7 +299,15 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         onRetry={live.manualReconnect}
       />
 
-      {live.state.connected && !live.state.isOwner && (
+      {ensureWarning && (
+        <div className="absolute left-0 right-0 top-12 z-20 flex justify-center px-3 pointer-events-none">
+          <span className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
+            {ensureWarning}
+          </span>
+        </div>
+      )}
+
+      {live.state.connected && live.state.ownerKnown && !live.state.isOwner && (
         <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">
           <button
             type="button"
@@ -257,19 +315,9 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
             data-live-takeover
             className="flex items-center gap-1.5 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-500 active:bg-brand-700 border border-brand-400/50 rounded-full px-4 py-2 shadow-lg cursor-pointer animate-fade-in"
           >
-            <svg
-              width="13"
-              height="13"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
+            <StrokeIcon size={13} strokeWidth="2.5" hidden>
               <path d="M9 18l6-6-6-6" />
-            </svg>
+            </StrokeIcon>
             Live on another device. Take over
           </button>
         </div>
@@ -277,12 +325,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
 
       <div
         className="flex-1 overflow-hidden bg-[var(--term-bg)] relative"
-        // Click-to-type, like every terminal. The rendered pane is plain
-        // (non-focusable) DOM text, so clicking it blurs the hidden input to
-        // <body> and the session reads as view-only. On a fine pointer, a
-        // plain click refocuses the input; a click that ends a text selection
-        // is left alone so select-to-copy still works. Touch devices focus via
-        // the keyboard toggle, not taps (which scroll).
+        // Click-to-type, like every terminal.
         onClick={() => {
           if (coarse) return;
           const sel = window.getSelection();
@@ -292,6 +335,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       >
         <MobileLiveTerminal
           frame={live.state.frame}
+          liveStats={live.state.stats}
+          transport={live.state.transport}
           armAgentClipboard={armAgentClipboard}
           connected={live.state.connected}
           active={active}
@@ -302,26 +347,41 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           enterReading={live.enterReading}
           returnToLive={live.returnToLive}
           sendData={live.sendData}
+          sendPaste={sendPasteOrReport}
           uploadPastedImage={uploadPastedImage}
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
           ctrlActiveRef={ctrlActiveRef}
-          clearCtrl={() => setCtrlActive(false)}
+          clearCtrl={clearCtrl}
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
           bottomAlign={surface === "agent"}
           keyboardOpen={keyboardOpen}
         />
         {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
+        {coarse && live.state.connected && webSettings.showArrowJoystick && <ArrowJoystick onArrow={sendArrow} />}
       </div>
 
       {coarse && live.state.connected && (
         <MobileTerminalToolbar
-          sendData={live.sendData}
+          keys={webSettings.mobileToolbarKeys}
+          sendData={sendDataOrReport}
+          sendPaste={sendPasteOrReport}
+          onCompose={openCompose}
           inputElRef={inputRef}
           keyboardOpen={inputFocused}
+          compact={!keyboardOpen && !inputFocused}
           ctrlActive={ctrlActive}
           onCtrlToggle={() => setCtrlActive((v) => !v)}
+        />
+      )}
+
+      {composeOpen && (
+        <TerminalComposeSheet
+          draftKey={`${session.id}:${surface}:${terminalIndex}`}
+          bottomInset={keyboardHeight}
+          onSubmit={submitCompose}
+          onClose={closeCompose}
         />
       )}
     </div>

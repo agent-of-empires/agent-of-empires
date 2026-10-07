@@ -1,14 +1,8 @@
 // @vitest-environment jsdom
-//
-// Coverage for useSessions.applySession (#2489): it swaps a single session
-// for a fresh server snapshot (the trash/restore response) so the sidebar
-// re-buckets immediately, and is a no-op when the id is absent.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
-// The mount effect polls fetchSessions; stub it so the hook stays inert and
-// the test only exercises injectSession + applySession.
 vi.mock("../../lib/api", () => ({
   fetchSessions: vi.fn().mockResolvedValue(null),
 }));

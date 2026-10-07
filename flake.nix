@@ -33,9 +33,14 @@
             # every other compile-time embedded asset has to be unioned in
             # explicitly: the acp-worker/adapters manifests that
             # src/acp/adapters.rs reads with include_bytes! (#3204), and
+            # assets/session, the identity extension that lets supported agents
+            # publish their own conversation id, and
             # docker/Dockerfile, which the agent_compat test embeds to pin the
-            # sandbox npm floor (the aoe-test and aoe-clippy checks compile test
-            # code, so they need it even though the packages do not).
+            # sandbox npm floor, and acp-worker/aoe-agent (manifest, lock and
+            # sources), which src/acp/adapters.rs embeds to install the
+            # in-tree agent and the acp::node test reads to pin `engines.node`
+            # to the Node floor (the aoe-test and aoe-clippy checks compile
+            # test code, so they need these even though the packages do not).
             # `scripts/check-nix-embedded-assets.py` fails CI if a new embedded
             # asset lands without being added here.
             src = pkgs.lib.fileset.toSource {
@@ -43,7 +48,13 @@
               fileset = pkgs.lib.fileset.unions [
                 (craneLib.fileset.commonCargoSources ./.)
                 ./acp-worker/adapters
+                ./acp-worker/aoe-agent/package.json
+                ./acp-worker/aoe-agent/package-lock.json
+                ./acp-worker/aoe-agent/src
+                ./acp-worker/test-shim/shim.mjs
+                ./assets
                 ./docker
+                ./web/tests/helpers/fakeAcpAgent.mjs
               ];
             };
             strictDeps = true;
@@ -75,7 +86,9 @@
                 Supports Claude Code, OpenCode, Mistral Vibe, Codex CLI, and Gemini CLI.
               '';
               homepage = "https://github.com/agent-of-empires/agent-of-empires";
-              license = licenses.mit;
+              # MIT throughout, plus Apache-2.0 for the herdr-derived state
+              # machine in src/tui/hyperlink.rs (see THIRD_PARTY_NOTICES.md).
+              license = with licenses; [ mit asl20 ];
               platforms = platforms.unix;
               mainProgram = "aoe";
             };
@@ -91,7 +104,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-WhIMmXkJS68GxNHwSaFOUQ/GSE2MgznOj2WCrrtQ/d4=";
+            npmDepsHash = "sha256-HPD3+bajeSFTC6gnEyZ/rc2HQfeWUgPHon/5hORI34A=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out
@@ -103,10 +116,10 @@
           # build.rs respects AOE_WEB_DIST to use the pre-built frontend.
           # buildDepsOnly uses a dummy crate source so AOE_WEB_DIST is irrelevant there.
           commonArgsWithWeb = commonArgs // {
-            cargoExtraArgs = "--package agent-of-empires --features serve";
+            cargoExtraArgs = "--package agent-of-empires --features web";
           };
 
-          # Rust dep cache compiled with --features serve (no npm involved).
+          # Rust dep cache compiled with --features web (no npm involved).
           cargoArtifactsWithWeb = craneLib.buildDepsOnly commonArgsWithWeb;
 
           aoeWithWeb = craneLib.buildPackage (commonArgsWithWeb // {
@@ -169,7 +182,7 @@
             packages = with pkgs; [
               rust-analyzer
               tmux
-              nodejs # for web frontend development (--features serve)
+              nodejs # for web frontend development (--features web)
             ];
           };
         };

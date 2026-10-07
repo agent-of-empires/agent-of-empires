@@ -1,11 +1,6 @@
-// Helpers for the @-mention file picker. The hook fetches the
-// session's workspace file list once on mount and memoizes it; the
-// fuzzyFilter helper is used by both the file adapter and any other
-// place that wants prefix-then-substring ordering.
-
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-/** Lightweight fuzzy filter: prefer prefix matches, then substring. */
+/** Prefix matches, then label substrings, then description substrings; shorter labels first. */
 export function fuzzyFilter<T extends { label: string; description?: string }>(
   items: T[],
   query: string,
@@ -28,18 +23,12 @@ export function fuzzyFilter<T extends { label: string; description?: string }>(
     .map((x) => x.it);
 }
 
-/**
- * Subscribe to the workspace file index once per sessionId. Backed by
- * `GET /api/sessions/:id/acp/files` which walks the session's
- * project_path tree (capped at 5k entries).
- */
+/** The session's workspace file list, fetched once per session. */
 export function useFilesIndex(sessionId: string): {
   files: string[];
   loading: boolean;
-  /** True when the last fetch failed. Lets a caller distinguish "this session
-   *  has no files" from "we could not read the list". See #3088 review. */
+  /** The last fetch failed, as opposed to an empty list. */
   error: boolean;
-  /** Re-run the fetch, so a failed list is not a dead end. */
   reload: () => void;
 } {
   const [files, setFiles] = useState<string[]>([]);
@@ -47,7 +36,6 @@ export function useFilesIndex(sessionId: string): {
   const [error, setError] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const reload = useCallback(() => setAttempt((n) => n + 1), []);
-  // Render-time: reset loading when sessionId changes
   const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
   if (sessionId !== trackedSessionId) {
     setTrackedSessionId(sessionId);
@@ -55,7 +43,6 @@ export function useFilesIndex(sessionId: string): {
   }
   useEffect(() => {
     let cancelled = false;
-    // loading is set to true in render-time above when sessionId changes
     fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/files`)
       .then((r) => {
         if (!r.ok) throw new Error(`files list failed: ${r.status}`);

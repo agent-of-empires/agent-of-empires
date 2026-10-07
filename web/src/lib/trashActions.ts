@@ -1,34 +1,21 @@
-// Trash / restore action loops (#2489), extracted from App so the
-// per-session apply + aggregate toast logic is unit-testable rather than
-// reachable only through the structured-view bundle.
+// Trash, restore, and delete loops with aggregate toasts, extracted from App for unit testing.
 
 import { deleteWorkspace, restoreSession, trashSession } from "./api";
 import type { DeleteSessionOptions } from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
 
-/** Resolve the session ids to restore when the trashed-banner Restore button
- *  fires for `sessionId`. Restore is a whole-workspace action (a workspace
- *  only lands in Trash when all its sessions are), so this returns every
- *  session id in the workspace containing `sessionId`, matching the sidebar
- *  Trash action. Falls back to just `[sessionId]` when no workspace groups it.
- *  See #2593. */
+/** A workspace is only trashed as a whole, so restore every session of the workspace containing `sessionId`. */
 export function trashedWorkspaceRestoreIds(workspaces: Workspace[], sessionId: string): string[] {
   const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
   return ws ? ws.sessions.map((s) => s.id) : [sessionId];
 }
 
-/** A toast sink; both methods are optional so callers can pass the bus
- *  handler before it is wired without a guard. */
 export interface Notifier {
   error?: (message: string) => void;
   info?: (message: string) => void;
 }
 
-/** Per-workspace worktree/branch/sandbox cleanup flags, any-session-wins.
- *  All sessions in a workspace share one worktree/branch, so a flag is on
- *  when any session in the workspace opts into it and can act on it. Shared by
- *  the per-workspace delete dialog defaults and the Empty Trash bulk purge so
- *  the two derivations cannot drift (#3167). */
+/** Cleanup flags are on when any session in the workspace opts in; shared by the delete dialog and Empty Trash. */
 export function workspaceCleanupDefaults(sessions: SessionResponse[]): {
   delete_worktree: boolean;
   delete_branch: boolean;
@@ -41,16 +28,23 @@ export function workspaceCleanupDefaults(sessions: SessionResponse[]): {
   };
 }
 
+/** Sessions outside `selected` working in a worktree `selected` would clean up. The server keeps that worktree and its branch. */
+export function sessionsSharingWorktree(selected: SessionResponse[], all: SessionResponse[]): SessionResponse[] {
+  const trim = (path: string) => path.replace(/\/+$/, "");
+  const ids = new Set(selected.map((s) => s.id));
+  const roots = selected.filter((s) => s.has_cleanable_worktree).map((s) => trim(s.project_path));
+  return all.filter((s) => {
+    const path = trim(s.project_path);
+    return !ids.has(s.id) && roots.some((root) => path === root || path.startsWith(`${root}/`));
+  });
+}
+
 interface TrashDeps {
-  /** Re-bucket a session from the trash/restore response without waiting for
-   *  the next poll. */
   applySession: (session: SessionResponse) => void;
   notify: Notifier | null;
 }
 
-/** Trash every id, applying each returned snapshot. On a failed id, calls
- *  `onError(id)` so the caller can flag the row. Returns true iff all
- *  succeeded; toasts the aggregate result. */
+/** On a failed id, calls `onError(id)`. Returns true iff all succeeded. */
 export async function trashSessions(
   ids: string[],
   deps: TrashDeps & { onError: (id: string) => void },
@@ -74,25 +68,14 @@ export async function trashSessions(
 }
 
 interface DeleteWorkspaceDeps {
-  /** Reflect a per-session lifecycle status optimistically (Deleting / Error). */
   setStatus: (id: string, status: SessionStatus) => void;
-  /** Drop a deleted session's local-only state (acp cache, draft, comments).
-   *  Run only after the server delete for that id succeeds. */
+  /** Runs only after the server confirms the delete. */
   purgeLocal: (id: string) => void;
-  /** Navigate away from the deleted session (to the dashboard root). */
   navigateHome: () => void;
   notify: Notifier | null;
 }
 
-/** Permanently delete every session in a workspace via the atomic backend
- *  endpoint (#2536). All sessions share one git worktree and branch; the server
- *  removes the shared worktree/branch exactly once (on `sessions[0]`, torn down
- *  last) and record-only-deletes the rest, so a mid-delete disconnect can no
- *  longer strand a record against an already-removed worktree. Redirects home
- *  only once the currently-open session was actually deleted, not merely because
- *  it belonged to the workspace (#2539). Local cleanup runs per id only after
- *  the server confirms that id was deleted, so a failure never strands a draft
- *  or cache. */
+/** Atomic delete of `sessions`; the server keeps a worktree any other session still uses. Local cleanup and the redirect home only follow confirmed deletions. */
 export async function deleteWorkspaceSessions(
   sessions: SessionResponse[],
   options: DeleteSessionOptions,
@@ -112,10 +95,7 @@ export async function deleteWorkspaceSessions(
     return;
   }
 
-  // The server reports exactly which ids it removed and which failed. Purge
-  // local state only for confirmed-deleted ids; flag only explicitly-failed
-  // ids as Error. An id in neither set (e.g. a concurrent restore kept the
-  // row) is left untouched for the next poll to reconcile.
+  // Ids in neither set (e.g. restored concurrently) are left for the next poll.
   const deleted = new Set(result.deleted ?? []);
   const failed = new Set((result.failed ?? []).map((f) => f.id));
   for (const id of ids) {
@@ -132,13 +112,11 @@ export async function deleteWorkspaceSessions(
     deps.notify?.error?.("Some sessions could not be deleted");
     return;
   }
-  // `messages` carries any user-facing note from `perform_deletion` (e.g. a
-  // kept scratch path); surface the first.
+  // `messages` carries notes like a kept scratch path.
   deps.notify?.info?.(result.messages?.[0] ?? (ids.length > 1 ? "Sessions deleted" : "Session deleted"));
 }
 
-/** Restore every id, applying each returned snapshot. Returns true iff all
- *  succeeded; toasts the aggregate result. */
+/** Returns true iff all succeeded. */
 export async function restoreSessions(ids: string[], deps: TrashDeps): Promise<boolean> {
   let anyFailed = false;
   for (const id of ids) {

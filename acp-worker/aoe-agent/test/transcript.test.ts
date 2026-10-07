@@ -3,87 +3,89 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendTurn, loadTranscript } from "../src/transcript.ts";
+import {
+  appendTurn,
+  createTranscript,
+  loadTranscript,
+} from "../src/transcript.ts";
 
-const FILE = "transcript.jsonl";
+const ID = "a".repeat(32);
+const FILE = `aoe-agent-${ID}.jsonl`;
 
-async function tmpDir(): Promise<string> {
-  return mkdtemp(join(tmpdir(), "aoe-agent-transcript-"));
+/** Run `body` against a fresh directory, removed however it ends. */
+async function inTmpDir(body: (dir: string) => Promise<void>): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), "aoe-agent-transcript-"));
+  try {
+    await body(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
-test("round-trips appended exchanges in order", async () => {
-  const dir = await tmpDir();
-  try {
-    await appendTurn(dir, "hello", "hi there");
-    await appendTurn(dir, "again", "yep");
-    const messages = await loadTranscript(dir);
-    assert.deepEqual(messages, [
+/** Write a transcript file directly, bypassing `appendTurn`. */
+async function writeRecords(dir: string, records: unknown[]): Promise<void> {
+  const lines = records.map((r) =>
+    typeof r === "string" ? r : JSON.stringify(r),
+  );
+  await writeFile(join(dir, FILE), lines.join("\n") + "\n");
+}
+
+test("round-trips appended exchanges in order, newlines included", () =>
+  inTmpDir(async (dir) => {
+    await createTranscript(dir, ID);
+    await appendTurn(dir, ID, "hello", "hi there");
+    await appendTurn(dir, ID, "line1\nline2", "reply\nwith\nnewlines");
+    assert.deepEqual(await loadTranscript(dir, ID), [
       { role: "user", content: "hello" },
       { role: "assistant", content: "hi there" },
-      { role: "user", content: "again" },
-      { role: "assistant", content: "yep" },
-    ]);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("missing file loads as empty history", async () => {
-  const dir = await tmpDir();
-  try {
-    assert.deepEqual(await loadTranscript(dir), []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("skips malformed and schema-invalid records", async () => {
-  const dir = await tmpDir();
-  try {
-    const lines = [
-      JSON.stringify({ role: "user", content: "keep me" }),
-      "{ not valid json",
-      JSON.stringify({ role: "system", content: "wrong role" }),
-      JSON.stringify({ role: "assistant", content: 42 }),
-      JSON.stringify({ role: "assistant", content: "keep me too" }),
-    ];
-    await writeFile(join(dir, FILE), lines.join("\n") + "\n");
-    assert.deepEqual(await loadTranscript(dir), [
-      { role: "user", content: "keep me" },
-      { role: "assistant", content: "keep me too" },
-    ]);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("drops a trailing lone user record (torn write)", async () => {
-  const dir = await tmpDir();
-  try {
-    const lines = [
-      JSON.stringify({ role: "user", content: "q1" }),
-      JSON.stringify({ role: "assistant", content: "a1" }),
-      JSON.stringify({ role: "user", content: "q2 with no reply" }),
-    ];
-    await writeFile(join(dir, FILE), lines.join("\n") + "\n");
-    assert.deepEqual(await loadTranscript(dir), [
-      { role: "user", content: "q1" },
-      { role: "assistant", content: "a1" },
-    ]);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("preserves embedded newlines in content", async () => {
-  const dir = await tmpDir();
-  try {
-    await appendTurn(dir, "line1\nline2", "reply\nwith\nnewlines");
-    assert.deepEqual(await loadTranscript(dir), [
       { role: "user", content: "line1\nline2" },
       { role: "assistant", content: "reply\nwith\nnewlines" },
     ]);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+  }));
+
+test("missing native file fails rather than claiming an empty resume", () =>
+  inTmpDir(async (dir) => {
+    await assert.rejects(loadTranscript(dir, ID), { code: "ENOENT" });
+  }));
+
+test("skips malformed and schema-invalid records", () =>
+  inTmpDir(async (dir) => {
+    await writeRecords(dir, [
+      { role: "user", content: "keep me" },
+      "{ not valid json",
+      { role: "system", content: "wrong role" },
+      { role: "assistant", content: 42 },
+      { role: "assistant", content: "keep me too" },
+    ]);
+    assert.deepEqual(await loadTranscript(dir, ID), [
+      { role: "user", content: "keep me" },
+      { role: "assistant", content: "keep me too" },
+    ]);
+  }));
+
+test("drops a trailing lone user record (torn write)", () =>
+  inTmpDir(async (dir) => {
+    await writeRecords(dir, [
+      { role: "user", content: "q1" },
+      { role: "assistant", content: "a1" },
+      { role: "user", content: "q2 with no reply" },
+    ]);
+    assert.deepEqual(await loadTranscript(dir, ID), [
+      { role: "user", content: "q1" },
+      { role: "assistant", content: "a1" },
+    ]);
+  }));
+
+test("creating an existing native ID cannot erase its history", () =>
+  inTmpDir(async (dir) => {
+    await assert.rejects(appendTurn(dir, ID, "unregistered", "reply"), {
+      code: "ENOENT",
+    });
+    await createTranscript(dir, ID);
+    await appendTurn(dir, ID, "keep", "reply");
+    await assert.rejects(createTranscript(dir, ID), { code: "EEXIST" });
+    assert.deepEqual(await loadTranscript(dir, ID), [
+      { role: "user", content: "keep" },
+      { role: "assistant", content: "reply" },
+    ]);
+  }));

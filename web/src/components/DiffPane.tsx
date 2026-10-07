@@ -17,14 +17,13 @@ interface Props {
   commentsEnabled: boolean;
   commentsCount: number;
   commentsSendEnabled: boolean;
-  commentsSendDisabledReason?: string;
+  commentsSendDisabledReason: string;
   onOpenSendDialog: () => void;
   onDiscardAllComments: () => void;
 }
 
-/** Body of the "diff" pane: comments banner, per-session plugin detail
- *  badges/panels, and the changed-file list. Pure content; the dock supplies
- *  the frame, resize, and dock-location chrome. */
+/** Body of the "diff" pane: comments banner, per-session plugin detail badges/panels, and the changed-file list.
+ *  */
 export function DiffPane({
   session,
   sessionId,

@@ -1,10 +1,6 @@
-import { parseAnsi, parseAnsiFrom, type AnsiSegment, type AnsiStyle } from "./ansi";
+import { parseAnsi, parseAnsiFrom, type AnsiSegment, type AnsiState } from "./ansi";
 
-// Frame helpers for the mobile live terminal: turn one `capture-pane -e`
-// snapshot into per-line styled segments the component can render as DOM
-// rows. SGR state legitimately spans lines (tmux emits a reset only when
-// the style changes), so the split happens AFTER parsing, carrying each
-// segment's style across the newline.
+// Split a `capture-pane -e` snapshot into styled rows. SGR state spans lines, so split after parsing.
 
 export function ansiToLines(content: string): AnsiSegment[][] {
   const segs = parseAnsi(content);
@@ -14,13 +10,11 @@ export function ansiToLines(content: string): AnsiSegment[][] {
     parts.forEach((part, i) => {
       if (i > 0) lines.push([]);
       if (part.length > 0) {
-        lines[lines.length - 1]!.push({ text: part, style: seg.style });
+        lines[lines.length - 1]!.push({ text: part, style: seg.style, url: seg.url });
       }
     });
   }
-  // capture-pane terminates every line, including the last, with `\n`;
-  // drop the phantom empty line that trailing terminator creates so the
-  // last rendered row is the pane's real bottom row.
+  // capture-pane terminates the last line too; drop the phantom empty row.
   if (lines.length > 1 && lines[lines.length - 1]!.length === 0) {
     lines.pop();
   }
@@ -29,48 +23,28 @@ export function ansiToLines(content: string): AnsiSegment[][] {
 
 interface CachedLine {
   segs: AnsiSegment[];
-  /** SGR state left in effect after this line, threaded into the next. */
-  exit: AnsiStyle;
+  /** Escape state left in effect after this line. */
+  exit: AnsiState;
 }
 
-/** Key for the SGR state a line is entered with. Two identical raw lines
- *  parsed under different carried styles are different render results, so
- *  the entry state is part of the cache key. */
-function styleKey(s: AnsiStyle): string {
-  return `${s.fg ?? ""}|${s.bg ?? ""}|${+!!s.bold}${+!!s.dim}${+!!s.italic}${+!!s.underline}${+!!s.inverse}`;
+/** A line's render depends on the style and hyperlink it is entered with, so both are in the key. */
+function styleKey({ style: s, url }: AnsiState): string {
+  return `${s.fg ?? ""}|${s.bg ?? ""}|${+!!s.bold}${+!!s.dim}${+!!s.italic}${+!!s.underline}${+!!s.inverse}|${url ?? ""}`;
 }
 
-/**
- * Frame-to-frame parse cache for [`ansiToLines`]-equivalent output.
- *
- * A streamed capture frame is byte-identical to the previous one on almost
- * every line (only the tail moves), yet re-parsing the whole window per
- * frame made every line's segment arrays fresh objects, which both burned
- * main-thread time on multi-thousand-line reading windows and defeated the
- * row memoization downstream (every mounted row re-rendered per frame, the
- * scroll-jank driver on phones). `lines()` parses per line, keyed on
- * (entry SGR state, raw line), and returns the SAME segment arrays for
- * unchanged lines, so identity-based memo and WeakMap caches hold.
- *
- * Two-generation eviction: entries used by the current frame move to the
- * live generation; the rest are dropped when the next frame arrives.
- * Memory is bounded to two frames' unique lines, and re-running on the
- * same content (React StrictMode double-invoke) converges to identical
- * output and identities.
- */
+/** Per-line parse cache that returns the same segment arrays for unchanged lines, keeping row memoization intact across frames. Two generations: entries unused by the current frame are dropped on the next. */
 export class LineParseCache {
   private live = new Map<string, CachedLine>();
   private prev = new Map<string, CachedLine>();
 
-  lines(content: string): AnsiSegment[][] {
+  lines(content: string | readonly string[]): AnsiSegment[][] {
     this.prev = this.live;
     this.live = new Map();
-    const raw = content.split("\n");
+    const raw = typeof content === "string" ? content.split("\n") : content;
     const lines: AnsiSegment[][] = [];
-    let entry: AnsiStyle = {};
+    let entry: AnsiState = { style: {} };
     for (const r of raw) {
-      // NUL separator: it appears in neither a style key (CSS color
-      // strings) nor capture-pane text, so the key cannot be ambiguous.
+      // NUL appears in neither style keys nor pane text, so the key is unambiguous.
       const key = styleKey(entry) + "\u0000" + r;
       let hit = this.live.get(key) ?? this.prev.get(key);
       if (!hit) {
@@ -81,37 +55,42 @@ export class LineParseCache {
       lines.push(hit.segs);
       entry = hit.exit;
     }
-    // Mirror ansiToLines: capture-pane terminates every line, including
-    // the last, with `\n`; drop the phantom empty line that creates.
-    if (lines.length > 1 && lines[lines.length - 1]!.length === 0) {
+    // A row array from the hook has already dropped the phantom trailing line.
+    if (typeof content === "string" && lines.length > 1 && lines[lines.length - 1]!.length === 0) {
       lines.pop();
     }
     return lines;
   }
 }
 
-/** Plain text of one rendered line (for tests / cursor math). */
 export function lineText(line: AnsiSegment[]): string {
   return line.map((s) => s.text).join("");
 }
 
-// Match http(s) URLs so agent output in the terminal view can be linkified.
-// ponytail: plain per-line regex, no OSC 8 / reflow tracking (there is no
-// xterm here). A URL split across wrapped visual rows linkifies only its
-// first part; upgrade to reflow-aware matching only if that proves painful.
+// Per-line matching only: a URL wrapped across rows links just its first part.
 const URL_RE = /https?:\/\/\S+/g;
-// Trailing punctuation that is usually sentence/wrapping syntax, not the URL
-// (e.g. `see https://x.com/a).`). Stripped from the match; re-emitted as text.
+
+/** Pane output is agent-controlled, so only http(s) targets become hrefs. */
+export function isHttpUrl(url: string): boolean {
+  // A control byte in a target is never legitimate and would let pane output
+  // inject escapes into whatever re-emits it.
+  // eslint-disable-next-line no-control-regex
+  if (!/^https?:\/\//i.test(url) || /[\u0000-\u001f\u007f]/.test(url)) return false;
+  try {
+    // `https://` alone names no host.
+    return new URL(url).hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+// Trailing sentence punctuation, re-emitted as text.
 const URL_TRAILING = /[.,;:!?)\]}'">]+$/;
 
 export interface UrlPart {
   text: string;
-  /** The href when this part is a link, else null. */
   url: string | null;
 }
 
-/** Split one line of plain text into link and non-link parts. Returns a
- *  single non-link part when there are no URLs. */
 export function splitUrls(text: string): UrlPart[] {
   const parts: UrlPart[] = [];
   let last = 0;
@@ -119,8 +98,7 @@ export function splitUrls(text: string): UrlPart[] {
     const start = m.index;
     const raw = m[0];
     const trimmed = raw.replace(URL_TRAILING, "");
-    // Keep the trimmed form only if a host character survives; otherwise the
-    // match was scheme + punctuation and the original stands.
+    // Keep the trimmed form only if a host character survives.
     const url = /^https?:\/\/\S/.test(trimmed) ? trimmed : raw;
     if (start > last) parts.push({ text: text.slice(last, start), url: null });
     parts.push({ text: url, url });
@@ -131,56 +109,178 @@ export function splitUrls(text: string): UrlPart[] {
   return parts;
 }
 
-// Terminal cell widths, wcwidth-style: combining marks and zero-width
-// joiners take no cell; East Asian Wide/Fullwidth and emoji take two.
-// tmux wraps by cells, so wrapping (and the cursor math built on it)
-// must count the same way, not in UTF-16 code units.
+// Cell widths per grapheme cluster, aligned with tmux 3.6a: marks, ZWJ and variation selectors take no column; VS16 emoji, flags and ZWJ chains take two.
 const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]|\p{M}/u;
+const EMOJI_TAIL = /^[\uFE0E\uFE0F]$/u;
+// Skin tones fold into a modifier base only. tmux uses its own ~70-entry list, so bases like U+270B measure 2 here but 4 in tmux.
+const SKIN_TONE = /^[\u{1F3FB}-\u{1F3FF}]$/u;
+const MODIFIER_BASE = /\p{Emoji_Modifier_Base}/u;
+const REGIONAL_INDICATOR = /[\u{1F1E6}-\u{1F1FF}]/u;
 const WIDE =
   /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}]|\p{Emoji_Presentation}/u;
 const ASCII_PRINTABLE_ONLY = /^[\x20-\x7E]*$/;
+const ZWJ = "\u200D";
 
 export function cellWidth(codePoint: string): number {
-  if (ZERO_WIDTH.test(codePoint)) return 0;
+  if (ZERO_WIDTH.test(codePoint) || EMOJI_TAIL.test(codePoint)) return 0;
   return WIDE.test(codePoint) ? 2 : 1;
+}
+
+/** Shared by splitGraphemes and clusterSpanAt so cluster rules cannot drift. */
+function composesOnto(base: string, next: string): boolean {
+  if (SKIN_TONE.test(next)) return MODIFIER_BASE.test(base);
+  return ZERO_WIDTH.test(next) || EMOJI_TAIL.test(next);
+}
+
+function splitGraphemes(text: string): string[] {
+  const clusters: string[] = [];
+  const chars = [...text];
+  let i = 0;
+  while (i < chars.length) {
+    const base = chars[i]!;
+    let cluster = base;
+    if (chars[i + 1] === "\uFE0F" && chars[i + 2] === "\u20E3") {
+      // Keycap sequence: one two-cell cluster even on an ASCII base.
+      cluster += chars[++i]!;
+      cluster += chars[++i]!;
+    } else if (REGIONAL_INDICATOR.test(cluster)) {
+      // Pair on parity within the maximal RI run.
+      let runStart = i;
+      while (runStart > 0 && REGIONAL_INDICATOR.test(chars[runStart - 1]!)) runStart--;
+      if ((i - runStart) % 2 === 0 && REGIONAL_INDICATOR.test(chars[i + 1] ?? "")) {
+        cluster += chars[++i]!;
+      }
+    } else if (!ASCII_PRINTABLE_ONLY.test(cluster)) {
+      for (;;) {
+        const next = chars[i + 1];
+        if (next === undefined) break;
+        if (next === ZWJ) {
+          cluster += next;
+          i++;
+          const joined = chars[i + 1];
+          if (joined === undefined || ASCII_PRINTABLE_ONLY.test(joined)) break;
+          cluster += joined;
+          i++;
+          continue;
+        }
+        if (composesOnto(base, next)) {
+          cluster += next;
+          i++;
+          continue;
+        }
+        break;
+      }
+    }
+    clusters.push(cluster);
+    i++;
+  }
+  return clusters;
+}
+
+function graphemeWidth(cluster: string): number {
+  const cps = [...cluster];
+  const riCount = cps.filter((c) => REGIONAL_INDICATOR.test(c)).length;
+  // An orphan U+20E3 or U+200D with no base is an ordinary zero-width mark.
+  if (cps.length > 1 && cps.some((c) => c === "\u20E3")) return 2;
+  if (riCount >= 2) return 2;
+  if (riCount === 1 && cps.length === 1) return 1;
+  if (cps.length > 1 && cps.some((c) => c === ZWJ)) return 2;
+  if (cps.length > 1 && cps[cps.length - 1] === "\uFE0F") return 2;
+  return cellWidth(cps[0]!);
 }
 
 export function textWidth(text: string): number {
   if (ASCII_PRINTABLE_ONLY.test(text)) return text.length;
-  let width = 0;
-  for (const ch of text) width += cellWidth(ch);
-  return width;
+  return splitGraphemes(text).reduce((n, c) => n + graphemeWidth(c), 0);
 }
 
-/** Find the code point in `text` whose terminal cell range contains `col`
- *  (cell units from the start of `text`), or null if `col` falls at or
- *  past the end. Iterates code points (an emoji's surrogate pair never
- *  splits) and counts cells the same way `textWidth`/`wrapLine` do, so a
- *  cursor column from tmux (already cell-based) lands on the right glyph
- *  even when wide CJK or zero-width characters precede it. */
+/** Code point starting the cluster whose cells contain `col`, or null past the end. */
 export function findCursorCharIndex(text: string, col: number): number | null {
-  if (ASCII_PRINTABLE_ONLY.test(text)) {
-    return col >= 0 && col < text.length ? col : null;
-  }
   let c = 0;
-  let i = 0;
-  for (const ch of text) {
-    const w = cellWidth(ch);
-    if (col >= c && col < c + w) return i;
+  let pos = 0;
+  for (const cluster of splitGraphemes(text)) {
+    const w = graphemeWidth(cluster);
+    if (col >= c && col < c + w) return pos;
     c += w;
-    i++;
+    pos += [...cluster].length;
   }
   return null;
 }
 
-/** Hard-wrap one styled line at `cols` terminal cells, preserving
- *  segment styles across the breaks. Lines at or under the limit return
- *  a single visual row (the normal case: the pane is sized to the
- *  viewer's grid, so this is the identity). Wider lines appear when
- *  another writer resized the tmux window out from under the viewer;
- *  wrapping keeps them readable until the server re-asserts the grid.
- *  Iterates code points (an emoji's surrogate pair never splits) and
- *  counts cells, so CJK and emoji wrap where tmux would wrap them. */
+/** Printable ASCII flows; every other contiguous stretch becomes one `cells x cellWidth` box so fallback fonts cannot shift columns (#3342). Stretches stay in one text node to keep bidi, shaping and emoji composition intact. */
+export interface CellRun {
+  text: string;
+  /** Zero-width marks add no cells. */
+  cells: number;
+  fixed: boolean;
+}
+
+/** Marks and emoji tails glue onto the preceding run (else browsers draw dotted circles); a fixed stretch swallows contiguous non-ASCII. */
+export function splitCellRuns(text: string): CellRun[] {
+  const runs: CellRun[] = [];
+  let flow = "";
+  let fixedStretch = "";
+  const flushFlow = () => {
+    if (flow) {
+      runs.push({ text: flow, cells: textWidth(flow), fixed: false });
+      flow = "";
+    }
+  };
+  const flushFixed = () => {
+    if (fixedStretch) {
+      runs.push({ text: fixedStretch, cells: textWidth(fixedStretch), fixed: true });
+      fixedStretch = "";
+    }
+  };
+  const chars = [...text];
+  let i = 0;
+  while (i < chars.length) {
+    const ch = chars[i]!;
+    if (ASCII_PRINTABLE_ONLY.test(ch)) {
+      flushFixed();
+      flow += ch;
+    } else if (ZERO_WIDTH.test(ch)) {
+      if (fixedStretch) fixedStretch += ch;
+      else flow += ch;
+    } else if (EMOJI_TAIL.test(ch)) {
+      if (fixedStretch) fixedStretch += ch;
+      else flow += ch;
+    } else {
+      flushFlow();
+      fixedStretch += ch;
+    }
+    i++;
+  }
+  flushFlow();
+  flushFixed();
+  return runs;
+}
+
+/** Code-point range of the cluster containing `charIndex`, mirroring splitCellRuns so the cursor cell never strands a composition tail. */
+export function clusterSpanAt(text: string, charIndex: number): [number, number] {
+  const chars = [...text];
+  let start = charIndex;
+  let end = charIndex + 1;
+  const glueAt = (k: number) => k >= 0 && k < chars.length && composesOnto(chars[start] ?? "", chars[k]!);
+  while (glueAt(end)) end++;
+  // Pair on parity so a cursor between adjacent flags stays on its own flag.
+  let runStart = start;
+  while (runStart > 0 && REGIONAL_INDICATOR.test(chars[runStart - 1] ?? "")) runStart--;
+  const onRi = REGIONAL_INDICATOR.test(chars[start] ?? "");
+  const oddInRun = (start - runStart) % 2 === 1;
+  if (onRi && (oddInRun || REGIONAL_INDICATOR.test(chars[start + 1] ?? ""))) {
+    if (oddInRun) start--;
+    end = Math.max(end, start + 2);
+    while (glueAt(end)) end++;
+  }
+  while (chars[end - 1] === "\u200D") {
+    end++;
+    while (glueAt(end)) end++;
+  }
+  return [Math.max(start, 0), Math.min(end, chars.length)];
+}
+
+/** Hard-wrap at `cols` cells, preserving styles. Only needed when another client resized the tmux window. */
 export function wrapLine(line: AnsiSegment[], cols: number): AnsiSegment[][] {
   if (!Number.isFinite(cols) || cols <= 0) return [line];
   const total = line.reduce((n, s) => n + textWidth(s.text), 0);
@@ -192,21 +292,20 @@ export function wrapLine(line: AnsiSegment[], cols: number): AnsiSegment[][] {
     let chunk = "";
     const flushChunk = () => {
       if (chunk.length > 0) {
-        current.push({ text: chunk, style: seg.style });
+        current.push({ text: chunk, style: seg.style, url: seg.url });
         chunk = "";
       }
     };
-    for (const ch of seg.text) {
-      const w = cellWidth(ch);
-      // A wide char that doesn't fit wraps whole (terminals leave the
-      // last cell empty); zero-width marks stay with their base char.
+    for (const cluster of splitGraphemes(seg.text)) {
+      const w = graphemeWidth(cluster);
+      // A cluster that doesn't fit wraps whole; zero-width members stay with their base.
       if (used + w > cols && used > 0) {
         flushChunk();
         rows.push(current);
         current = [];
         used = 0;
       }
-      chunk += ch;
+      chunk += cluster;
       used += w;
     }
     flushChunk();

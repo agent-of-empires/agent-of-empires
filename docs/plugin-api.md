@@ -1,17 +1,6 @@
 # Plugin API Reference
 
-The field-by-field reference for `aoe-plugin.toml`, the manifest every Agent of
-Empires plugin ships. The schema lives in the `aoe-plugin-api` crate
-(`PluginManifest`) and is the source of truth; this page documents it for plugin
-authors. The host parses the manifest strictly (unknown keys are rejected), so
-every key here maps to a schema field.
-
-For a guided introduction see [Writing Plugins](development/writing-plugins.md).
-To scaffold a working plugin, use the starter template:
-
-```sh
-cookiecutter gh:agent-of-empires/plugin-template
-```
+The field-by-field reference for `aoe-plugin.toml`, the manifest every Agent of Empires plugin ships. The schema lives in the `aoe-plugin-api` crate (`PluginManifest`) and is the source of truth; the host parses it strictly, so unknown keys are rejected and every key here maps to a schema field. For a guided introduction, see [Writing Plugins](development/writing-plugins.md).
 
 ## Versioning
 
@@ -19,10 +8,10 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `12`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
+| `api_version` | The manifest *schema* version. The current schema is `14`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields, `12` grew the pane block vocabulary (see [Pane payload](#pane-payload)): the `callout`, `bar` and `columns` kinds, clickable `row`s carrying `params`, header summaries and scrollable bodies on `section`, `disabled` / `variant` / `href` on `action`, and a pane-level `footer`.
+Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
 
 ## Top-level fields
 
@@ -30,7 +19,7 @@ Schema additions by `api_version`: `2` added contributions (commands, keybinds, 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 8
+api_version = 13
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -41,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `12`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `14`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -50,18 +39,11 @@ capabilities = ["runtime.worker"]
 
 ## Plugin id
 
-A dotted, lowercase ASCII identifier such as `dev.example.review-helper`. Each
-dot-separated segment starts with a lowercase letter and may contain digits and
-hyphens; the whole id is at most 64 bytes. The `aoe.*` and `agent-of-empires.*`
-namespaces are reserved for bundled and officially featured plugins; a community
-install cannot claim them.
+A dotted, lowercase ASCII identifier such as `dev.example.review-helper`. Each dot-separated segment starts with a lowercase letter and may contain digits and hyphens; the whole id is at most 64 bytes. The `aoe.*` and `agent-of-empires.*` namespaces are reserved for bundled and officially featured plugins; a community install cannot claim them.
 
 ## Capabilities
 
-Capabilities gate runtime resource access. They are prompted once at install and
-pinned to the manifest hash; an update that widens them must be re-approved.
-Declare only what the worker uses. Static contributions (commands, keybinds,
-themes, ui, status) need no capability.
+Capabilities gate runtime resource access. They are prompted once at install and pinned to the manifest hash, so an update that widens them must be re-approved. Declare only what the worker uses; static contributions (commands, keybinds, themes, ui, status) need none.
 
 | Capability | Grants |
 |---|---|
@@ -106,7 +88,7 @@ description = "Show the status summary."
 | `description` | string | no | Help text. |
 | `action` | table | no | A client-executed action. Requires `api_version >= 6` and the `browser_open` capability. |
 
-### Command action
+A command `action` is a client-executed action instead of a worker call. The only `kind` is `open-ui-link`, which opens the `href` from the plugin's own `(slot, id)` UI-state entry in the browser, with no worker round-trip; that pair must match a declared `[[ui]]` entry on a per-session slot.
 
 ```toml
 [commands.action]
@@ -114,10 +96,6 @@ kind = "open-ui-link"
 slot = "row-badge"
 id = "my_badge"
 ```
-
-The only `kind` is `open-ui-link`: it opens the `href` from the plugin's own
-`(slot, id)` UI-state entry in the browser, with no worker round-trip. The
-`(slot, id)` pair must match a declared `[[ui]]` entry on a per-session slot.
 
 ## Keybinds
 
@@ -134,20 +112,16 @@ key = "Ctrl+Shift+G"
 
 ## Settings
 
-Plugin-declared settings, rendered on the TUI and web settings surfaces and
-stored under `[plugins."<id>".settings]`. The worker reads them via the
-`config.get` host RPC.
+Plugin-declared settings, rendered on the TUI and web settings surfaces and stored under `[plugins."<id>".settings]`. The worker reads them via the `config.get` host RPC.
 
 ```toml
 [[settings]]
 key = "refresh_secs"
 label = "Refresh interval (seconds)"
-description = "How often the worker polls."
 type = "integer"
 default = 120
 min = 0
 max = 86400
-advanced = true
 ```
 
 | Key | Type | Required | Notes |
@@ -179,12 +153,11 @@ Setting types:
 | `dynamic_multi_select` | Multi-select (checkbox list) whose choices the host resolves from `option_source`; the stored value is an array of chosen values. Object-list item fields only (`api_version >= 11`). |
 | `cron` | Validated 5-field cron expression text field (`api_version >= 9`). |
 | `object_list` | A repeatable list of structured items described by `fields` (`api_version >= 9`). |
+| `string_list` | Freeform add/remove list of user-typed strings; no closed option set. Top-level setting or object-list item field (`api_version >= 14`). |
 
 ### Dynamic selects (`api_version >= 9`)
 
-A `dynamic_select` renders a dropdown whose options the **host** resolves at
-render time, so the plugin never ships a hardcoded list that could drift from
-the host's real agents, models, or projects. Set `option_source` to one of:
+A `dynamic_select`'s options are resolved by the **host** at render time, so the plugin never ships a list that could drift from the host's real agents, models, or projects. Set `option_source` to one of:
 
 | `option_source` | Choices |
 |---|---|
@@ -194,69 +167,36 @@ the host's real agents, models, or projects. Set `option_source` to one of:
 | `projects` | Registered projects (value is the project path). |
 | `groups` | Existing session group paths. |
 
-`depends_on` names sibling keys whose current values parameterize the source;
-`acp.models` and `acp.modes` require the selected agent. When the selected
-agent's option catalog has never been discovered, resolving `acp.models` /
-`acp.modes` runs a one-shot handshake probe (see `acp.capabilities.probe`) to
-populate it, so the picker self-fills on first open instead of staying empty
-until the agent has run a live session. Saved ids are advisory: the host
-revalidates them when a session is actually created, so a model that later
-disappears from the catalog surfaces as an error at creation, not silently at
-save.
+`depends_on` names sibling keys whose values parameterize the source, which `acp.models` and `acp.modes` require. When that agent's catalog has never been discovered, resolving them runs a one-shot handshake probe (see `acp.capabilities.probe`), so the picker self-fills on first open. Saved ids are advisory: the host revalidates at session creation, so a model that later disappears surfaces as an error then rather than silently at save.
 
 ### Object lists (`api_version >= 9`)
 
-An `object_list` is a repeatable list of structured records (for example, a
-cron plugin's schedule entries), stored on disk as a TOML array of tables under
-`[[plugins."<id>".settings.<key>]]`. It is **one level deep**: each item field
-is declared in `fields` and cannot itself be an `object_list`. Every item
-carries a stable id under `item_id_key` (host-generated on add, never changed on
-edit or reorder) so a worker can track an entry across edits.
+An `object_list` is a repeatable list of structured records (a scheduler's entries, say), stored as a TOML array of tables under `[[plugins."<id>".settings.<key>]]`. It is **one level deep**: item fields are declared in `fields` and cannot themselves be an `object_list`. Every item carries a stable id under `item_id_key`, host-generated on add and never changed on edit or reorder, so a worker can track an entry across edits.
 
 ```toml
 [[settings]]
 key = "jobs"
-label = "Scheduled jobs"
 type = "object_list"
 item_id_key = "id"
 max_items = 50
 
 [[settings.fields]]
 key = "agent_id"
-label = "Agent"
 type = "dynamic_select"
 option_source = "acp.agents"
 required = true
 
 [[settings.fields]]
-key = "model_id"
-label = "Model"
-type = "dynamic_select"
-option_source = "acp.models"
-depends_on = ["agent_id"]
-
-[[settings.fields]]
 key = "schedule"
-label = "Schedule"
 type = "cron"
 required = true
 ```
 
-Each item field takes the same `key` / `label` / `description` / `type` /
-`options` / `min` / `max` / `default` / `multiline` / `option_source` /
-`depends_on` keys as a top-level setting, plus `required` (the item must carry a
-non-empty value). An
-item field's `type` cannot be `object_list`. An item field may be a
-`dynamic_multi_select` (`api_version >= 11`): like `dynamic_select` it names an
-`option_source` and may `depends_on` siblings, but its stored value is an array
-of the chosen option values.
+An item field takes the same keys as a top-level setting (`key`, `label`, `description`, `type`, `options`, `min`, `max`, `default`, `multiline`, `option_source`, `depends_on`) plus `required`. It may be a `dynamic_multi_select` (`api_version >= 11`), whose stored value is an array of the chosen option values, or a `string_list` (`api_version >= 14`), whose stored value is an array of freeform user-typed strings.
 
 ## Session-driving RPCs
 
-With `api_version >= 9` a worker can discover ACP capabilities and create
-host-owned structured sessions, the primitives an automation plugin (for
-example a scheduler) needs. These are worker RPCs, not manifest keys; the host
-enforces a strict security model around them.
+With `api_version >= 9` a worker can discover ACP capabilities and create host-owned structured sessions, the primitives an automation plugin (for example a scheduler) needs. These are worker RPCs, not manifest keys; the host enforces a strict security model around them.
 
 | Method | Capability | Purpose |
 |---|---|---|
@@ -266,59 +206,27 @@ enforces a strict security model around them.
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
 
-**Project selection (`api_version >= 11`).** `sessions.create` takes an optional
-`project_path` and an optional `extra_project_paths` array. Omitting
-`project_path` (or sending it empty) creates a **scratch** session: a throwaway
-working directory with no repository, hence no trust anchor. When present, the
-`project_path` is the trust-checked primary repo and each `extra_project_paths`
-entry is an additional repo of a multi-repo session; combining extras with a
-scratch session (no `project_path`) is refused. Every path is canonicalized and
-existence-checked host-side, fail-closed (capped per call).
+**Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
 
-**Sandbox (`api_version >= 11`).** Set `sandbox: true` to run the session inside
-the host's container sandbox. The host uses its own configured sandbox image; a
-plugin cannot pick an image. Sandboxing only *narrows* what the agent can reach,
-so it needs no grant beyond `session.create`. The create fails synchronously
-when no container runtime is installed or running; when one is present the
-container starts asynchronously after the create returns, so image-pull or
-startup problems surface on the session later, not as a create error.
+**Sandbox (`api_version >= 11`).** `sandbox: true` runs the session in the host's container sandbox, on the host's own configured image. It only narrows what the agent can reach, so it needs no grant beyond `session.create`. The create fails synchronously when no runtime is installed, but the container starts asynchronously, so image-pull problems surface on the session later.
 
-**Approval-mode classification.** The plugin proposes a `mode_id`; the **host**
-decides its security class, never the plugin. A mode is *interactive* (omitted /
-adapter default), *guarded* (a reviewed read-only or plan preset), or
-*unattended* (a bypass or auto-write mode, and every mode the host does not
-recognize, which fail closed to unattended). An unattended mode requires the
-distinct `session.unattended` grant on top of `session.create`.
+**Approval-mode classification.** The plugin proposes a `mode_id`; the **host** decides its security class. A mode is *interactive* (omitted, adapter default), *guarded* (a reviewed read-only or plan preset), or *unattended* (a bypass or auto-write mode, plus every mode the host does not recognize, which fail closed). An unattended mode requires `session.unattended` on top of `session.create`.
 
-**Repository trust is enforced regardless of grants.** A session against a
-repository whose hooks need approval is refused even with `session.unattended`;
-a plugin cannot pre-approve repository trust. See
-[Unattended sessions](development/internals/plugin-system.md#unattended-plugin-sessions)
-for the full model.
+**Repository trust holds regardless of grants.** A session against a repository whose hooks need approval is refused even with `session.unattended`; a plugin cannot pre-approve trust. See [Unattended sessions](development/internals/plugin-system.md#unattended-plugin-sessions).
 
-**Ownership.** `sessions.turn.send` only reaches a session the calling plugin
-created; a plugin cannot deliver turns to a user's or another plugin's session.
+**Ownership.** `sessions.turn.send` reaches only a session the calling plugin created.
 
-**Idempotency.** `sessions.create` accepts an `idempotency_key` scoped to the
-plugin: retrying with the same key and payload returns the existing session
-(`created: false`); a different payload under the same key is a conflict.
+**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`.
 
-**Limits.** Per plugin: 20 session creates per hour, 5 active plugin-created
-sessions, 120 turns per hour. Exceeding a limit returns a `rate_limited` /
-`concurrency_limited` error. Disabling the plugin stops all of its automation.
+**Idempotency.** `sessions.create` takes a plugin-scoped `idempotency_key`: retrying with the same key and payload returns the existing session (`created: false`), while a different payload under that key is a conflict.
 
-**Settings-change events.** After a settings write the host sends the plugin's
-worker a `plugin.settings.changed` notification carrying `{ revision,
-changed_keys }`; the worker re-reads the affected values via `config.get`
-(whose response includes the current `revision`). Polling `config.get` remains
-a fallback for a worker that was down when the write landed.
+**Limits.** Per plugin: 20 creates per hour, 5 active plugin-created sessions, 120 turns per hour, reported as `rate_limited` or `concurrency_limited`. Disabling the plugin stops all of its automation.
+
+**Settings-change events.** After a settings write the host notifies the worker with `plugin.settings.changed` carrying `{ revision, changed_keys }`; the worker re-reads those values with `config.get`, whose response carries the current `revision`. Polling that method is the fallback for a worker that was down.
 
 ## Plugin storage
 
-A worker has a host-backed, private key/value store, namespaced by its plugin
-id, that survives daemon and worker restarts (it is not the install directory,
-which an upgrade can replace). No capability beyond `runtime.worker` is needed:
-a plugin can only reach its own namespace.
+A worker has a host-backed private key/value store, namespaced by its plugin id, that survives daemon and worker restarts (unlike the install directory, which an upgrade can replace). It needs no capability beyond `runtime.worker`, since a plugin can only reach its own namespace.
 
 | Method | Params | Returns |
 |---|---|---|
@@ -327,14 +235,11 @@ a plugin can only reach its own namespace.
 | `plugin.storage.cas` | `{ key, expected, value }` | `{ swapped, current }` |
 | `plugin.storage.remove` | `{ key }` | `{ removed }` |
 
-Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swap)
-enables safe concurrent updates: the write applies only when the stored value
-equals `expected`.
+Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swap) enables safe concurrent updates: the write applies only when the stored value equals `expected`.
 
 ## UI slots
 
-Declares the host-rendered slots the worker pushes state into via the
-`ui.state.set` host RPC.
+Declares the host-rendered slots the worker pushes state into via the `ui.state.set` host RPC.
 
 ```toml
 [[ui]]
@@ -357,15 +262,29 @@ id = "my_pane"
 | `row-column` | per-session | A text column on the session row. |
 | `detail-badge` | per-session | A badge in the session detail view. |
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
-| `settings-page` | global | A full page under Settings, using the same block vocabulary as `pane` (requires `api_version >= 10`). |
+| `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
-| `tool-card-badge` | per-session | A pill on a transcript MCP or skill tool-call card, matched by target (requires `api_version >= 10`). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
+
+### Badge payload
+
+`status-bar`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
+
+Give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
+
+```json
+{ "items": [
+  { "text": "5h 40%", "group": "usage" },
+  { "text": "7d 12%", "group": "usage" },
+  { "text": "stale", "tone": "warn" }
+] }
+```
+
+Items without a `group` stay separate chips, and each distinct `group` cycles independently. The position is kept per browser tab and is never sent to the worker. A cycling chip ignores `href`; a group with a single item renders as a normal chip. The TUI cannot click and shows the first item with text.
 
 ### Pane payload
 
-A `pane` entry renders a dockable tool-window. The worker pushes it with
-`ui.state.set`:
+A `pane` entry renders a dockable tool-window, pushed with `ui.state.set`:
 
 ```json
 {
@@ -386,16 +305,7 @@ A `pane` entry renders a dockable tool-window. The worker pushes it with
 | `icon` | string | Lucide name for the activity-bar / dock-tab icon. A manifest `icon_asset` outranks it. |
 | `footer` | table | A status line pinned below the scrolling block list: `text` left, tone-colored `value` right, plus an optional `icon`. Requires `api_version >= 12`. |
 
-The whole payload is capped at 64 KiB. Everything else on the entry is validated
-strictly, but `blocks` is stored as opaque JSON: **each surface renders the kinds
-it knows and silently drops the rest.** That is the forward-compatibility
-contract, and it cuts both ways. A new kind needs no host change, and an older
-host will render nothing for it, so a pane whose layout depends on a newer kind
-should say so with `api_version` (and `aoe_version`) rather than degrade silently.
-
-The `settings-page` slot takes the same block vocabulary, minus
-`default_location` and `footer` (a full page is not docked, so neither has
-anything to attach to).
+The payload is capped at 64 KiB. Everything but `blocks` is validated strictly; `blocks` is opaque JSON, and **each surface renders the kinds it knows and drops the rest.** That forward-compatibility contract cuts both ways: a new kind needs no host change, but an older host renders nothing for it, so a pane that depends on a newer kind should say so with `api_version` and `aoe_version`.
 
 #### Block kinds
 
@@ -408,152 +318,65 @@ anything to attach to).
 | `section` | | `title`, `children`, `value`, `value_tone`, `badges`, `icon`, `tone`, `boxed`, `scroll`, `collapsible`, `collapsed` |
 | `callout` | one of `title` / `detail` | `icon`, `tone`, `color`, `actions` |
 | `bar` | `segments` | `caption` |
+| `sparkline` | `values` | `max`, `tone`, `bands`, `caption` (requires `api_version >= 13`) |
 | `columns` | `children` | |
 | `action` | `label`, plus one of `method` / `href` / `disabled` | `icon`, `tone`, `tooltip`, `variant` |
 | `comment` | one of `author` / `body` | `path`, `line`, `resolved`, `href` |
 
-`tone` is one of `neutral` / `info` / `success` / `warn` / `danger`. `color` is a
-validated `#rgb` / `#rrggbb` literal for a hue no tone names (a merged PR's
-purple); anything else is ignored.
+`tone` is one of `neutral` / `info` / `success` / `warn` / `danger`. `color` is a validated `#rgb` / `#rrggbb` literal for a hue no tone names (a merged PR's purple); anything else is ignored.
 
-**`row`** lays out at most two lines: `prefix` (mono, tone-tinted) and `label`
-lead the first with `value` pinned right, and `sublabel` leads the second with
-`badges` pinned right. `value_tone` colors the trailing token independently of the
-row, for a status glyph beside a neutral scalar such as a timestamp. `mono`
-monospaces the row's own text. Each entry in `badges` is `{ text?, icon?, tone?,
-tooltip? }` and renders as a compact glyph or token, not a pill.
+An `href` renders as a link only when it is an `http(s)` URL or a path starting with a single `/` and containing no backslash, tab or line break. A link to a dashboard route navigates in place; any other link opens in a new tab, including a path that normalizes to `//host` such as `/..//evil.com`, which opens on the dashboard's own origin.
 
-A `method` makes the row body a button that fires that worker method; an `href`
-alongside it becomes a separate trailing open-externally link, so a selectable row
-can still link out. With `href` alone the whole row is the link. `selected` marks
-the row as the pane's current subject.
+**`row`** lays out at most two lines: `prefix` (mono, tone-tinted) and `label` lead the first with `value` pinned right; `sublabel` leads the second with `badges` (`{ text?, icon?, tone?, tooltip? }`) pinned right. `value_tone` colors the trailing token independently of the row, and `mono` monospaces the row's text. A `method` makes the row body a button firing that worker method, and an `href` alongside it becomes a separate trailing link-out; with `href` alone the whole row is the link. `selected` marks the row as the pane's current subject.
 
-**`section`** groups `children`. The header takes a right-pinned `value` summary
-or a run of `badges` (count pills). `boxed` draws it as a bordered card, `scroll`
-caps the body height so a long list scrolls inside the section instead of pushing
-the rest of the pane away, and `collapsible` folds it via a native `<details>`
-(`collapsed` sets the initial state).
+**`section`** groups `children`, with a right-pinned `value` summary or `badges` in its header. `boxed` draws a bordered card, `scroll` caps the body height so a long list scrolls inside the section, and `collapsible` folds it via a native `<details>` (`collapsed` sets the initial state).
 
-**`callout`** is a tone-bordered verdict card: a glyph, a `title`, a `detail`
-paragraph, and its own `actions` laid out full width. Use it for the one thing the
-pane is telling the user; use a `section` for a list.
+**`callout`** is a tone-bordered verdict card: glyph, `title`, `detail` paragraph, and full-width `actions`. Use it for the one thing the pane is telling the user, and a `section` for a list.
 
-**`bar`** is a proportional stacked bar over `segments`, each
-`{ value, tone?, color?, label? }`. Segments without a positive numeric `value` are
-dropped, and a bar left with nothing renders nothing. `caption` sits beneath it.
+**`bar`** stacks `segments` (`{ value, tone?, color?, label? }`) proportionally; segments without a positive `value` are dropped and a bar left with nothing renders nothing. **`sparkline`** plots `values` (oldest first) as a history line, with `max` fixing the top of the scale so a series does not auto-scale each refresh and `bands` (`{ at, tone }` thresholds) recoloring each sample by the highest band it reaches. Both take a `caption` beneath.
 
-**`columns`** lays its `children` side by side in equal fractions. A single child
-spans the full width, so eliding one card collapses the row cleanly rather than
-leaving a gap.
+**`columns`** lays its `children` out in equal fractions, and a single child spans the full width, so eliding one card collapses the row cleanly.
 
-**`action`** forwards `method` to the worker (see [Pane actions](#pane-actions)).
-With `href` and no `method` it is a link-out button instead, for something the host
-cannot do itself. `disabled` renders it inert, which is how a blocked state reads
-without pretending to be clickable; a disabled action never navigates either.
-`variant: "primary"` gives the brand-filled treatment.
+**`action`** forwards `method` to the worker (see [Pane actions](#pane-actions)); with `href` and no `method` it is a link-out button. `disabled` renders it inert and non-navigating, and `variant: "primary"` gives the brand-filled treatment.
 
 #### Pane actions
 
-Clicking an `action` block, or a `row` carrying a `method`, POSTs to
-`/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the
-block's own `params` object, forwarded verbatim, so one method can serve every row
-in a list:
+Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded verbatim, so one method can serve every row in a list:
 
 ```json
 { "kind": "row", "label": "warn when daemon is stale", "prefix": "#3231",
   "method": "github.select_pr", "params": { "pr": "o/r#3231" } }
 ```
 
-The host merges in the authoritative `session_id` (a plugin cannot spoof it) and
-delivers the call to the worker as a **fire-and-forget JSON-RPC notification**:
-there is no reply and no return value. The worker does its work and re-pushes its
-UI state; the clicked control spins until the plugin's UI revision moves, with a
-15s timeout fallback. Actions are read-write-mode only and are not passphrase
-gated, so treat every method as reachable by anyone who can use the dashboard.
+The host merges in the authoritative `session_id` (a plugin cannot spoof it) and delivers the call as a **fire-and-forget JSON-RPC notification**: no reply, no return value. The worker does its work and re-pushes its UI state, and the clicked control spins until the plugin's UI revision moves, with a 15s timeout. Actions are read-write-mode only and are not passphrase gated, so treat every method as reachable by anyone who can use the dashboard.
 
-The native TUI renders panes read-only for now: it draws the text of every kind
-above (dropping icons, hrefs and tooltips, and stacking `columns`) but cannot fire
-an action, so `action` blocks appear as inert `[action] <label>` labels.
+The TUI renders panes read-only: it draws the text of every kind (dropping icons, hrefs, and tooltips, and stacking `columns`) but cannot fire an action, so `action` blocks appear as inert `[action] <label>` labels.
 
 ### Composer action payload
 
-A `composer-action` entry renders a host-owned button in the web dashboard ACP
-composer. The worker pushes it with `ui.state.set`:
+A `composer-action` entry renders a host-owned button in the dashboard's ACP composer, pushed with `ui.state.set`. `label` and `method` are required; `icon`, `tooltip`, `tone`, and `disabled` are optional.
+
+```json
+{ "label": "Dictate", "method": "dictation.start", "icon": "mic" }
+```
+
+On click the dashboard POSTs `method` to `/api/plugins/{id}/action` with the active `session_id`. With `composer.read` the forwarded params also carry `{ "composer": { "text", "selection_start", "selection_end" } }`, a click-scoped snapshot of the draft; without it the server strips that snapshot before forwarding.
+
+To mutate the draft, include a `draft_operation` in the pushed payload, which requires `composer.write`:
 
 ```json
 {
   "label": "Dictate",
   "method": "dictation.start",
-  "icon": "mic",
-  "tooltip": "Start dictation",
-  "tone": "info",
-  "disabled": false
+  "draft_operation": { "kind": "insert-text", "id": "transcript-1", "text": "Hello." }
 }
 ```
 
-`label` and `method` are required. On click, the dashboard POSTs `method` to
-`/api/plugins/{id}/action` with the active `session_id`. When the plugin has
-`composer.read`, the forwarded params include:
-
-```json
-{
-  "composer": {
-    "text": "current draft",
-    "selection_start": 0,
-    "selection_end": 5
-  }
-}
-```
-
-Without `composer.read`, the server strips that snapshot before forwarding the
-action to the worker.
-
-To mutate the draft, include a `draft_operation` in the pushed payload. This
-requires `composer.write`.
-
-```json
-{
-  "label": "Dictate",
-  "method": "dictation.start",
-  "draft_operation": {
-    "kind": "insert-text",
-    "id": "transcript-1",
-    "text": "Hello from dictation."
-  }
-}
-```
-
-`kind` is `insert-text`, `replace-selection`, or `set-text`. `id` must be stable
-and non-empty; the web dashboard applies each operation id once so a persistent
-UI-state entry cannot replay the edit on every poll.
-
-### Tool-card badge payload
-
-A `tool-card-badge` entry attaches provenance pills to transcript tool-call
-cards. Declare one slot id per session and push a single entry whose `items`
-list carries every badge you want; the host matches each `item` to a card by its
-`target`. `target.kind` is `mcp` or `skill` and `target.name` is the raw MCP
-server name or skill name (matched exactly, not canonicalized), since an MCP
-server and a skill can share a name. Requires `api_version >= 10`.
-
-```json
-{
-  "items": [
-    { "target": { "kind": "mcp", "name": "github" }, "text": "Company", "tone": "info", "icon": "building-2" },
-    { "target": { "kind": "skill", "name": "deploy" }, "text": "Verified" }
-  ]
-}
-```
-
-Each item needs `text` or `icon` (a badge with neither renders nothing) and a
-non-empty target name; `tone` and `tooltip` are optional. Empty `items: []`
-clears the plugin's badges. Rendered in the web dashboard; the native TUI ignores
-this slot for now.
+`kind` is `insert-text`, `replace-selection`, or `set-text`. `id` must be stable and non-empty: the dashboard applies each operation id once, so a persistent UI-state entry cannot replay the edit on every poll.
 
 ## Status
 
-Status segments the plugin contributes, consumed by the status surface. Requires
-`api_version >= 4`.
+Status segments the plugin contributes, consumed by the status surface. Requires `api_version >= 4`.
 
 ```toml
 [[status]]
@@ -581,8 +404,7 @@ path = "themes/my-theme.toml"
 
 ## Screenshots
 
-Up to 8 marketplace screenshots, shown in the plugin detail view. Requires
-`api_version >= 5`.
+Up to 8 marketplace screenshots, shown in the plugin detail view. Requires `api_version >= 5`.
 
 ```toml
 [[screenshots]]
@@ -599,8 +421,7 @@ caption = "Live status in the pane."
 
 ## Runtime
 
-The worker the host spawns and supervises. Omit it for a static, metadata-only
-plugin. Two kinds.
+The worker the host spawns and supervises, in one of two kinds. Omit it for a static, metadata-only plugin.
 
 ### Command
 
@@ -622,9 +443,7 @@ platforms = ["linux", "macos"]
 | `system` | bool | no | Resolve `command[0]` on the host `PATH` (for genuine system tools only). Defaults to `false`. |
 | `build` | array | no | Ordered build steps, run once at install or update inside the plugin directory, in the user's interactive shell. |
 
-Build into `.aoe-build/` (the host's build-output directory); the host excludes
-it from the plugin tree hash, so a venv, `node_modules`, or `target/` there does
-not break integrity verification.
+Build into `.aoe-build/` (the host's build-output directory); the host excludes it from the plugin tree hash, so a venv, `node_modules`, or `target/` there does not break integrity verification.
 
 #### Build step
 

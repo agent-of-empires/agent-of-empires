@@ -7,18 +7,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::DiffView;
 use crate::tui::dialogs::DialogResult;
 
-/// Result of handling a key event in the diff view
 pub enum DiffAction {
-    /// Continue showing the diff view
     Continue,
-    /// Close the diff view
     Close,
-    /// Launch external editor for a file
     EditFile(PathBuf),
 }
 
 impl DiffView {
-    /// Handle a key event
     pub fn handle_key(&mut self, key: KeyEvent) -> DiffAction {
         // Handle warning dialog first (modal)
         if let Some(ref mut dialog) = self.warning_dialog {
@@ -54,11 +49,47 @@ impl DiffView {
         self.handle_normal_key(key)
     }
 
-    /// Route a left-click. Currently only the file-list panel accepts
-    /// click input (select the clicked file). Clicks elsewhere are
-    /// swallowed by the modal but no-op.
+    /// Whether the warning dialog or help overlay covers the diff. It then
+    /// owns every click, hover and wheel event on the screen.
+    pub fn has_modal(&self) -> bool {
+        self.warning_dialog.is_some() || self.show_help || self.branch_select.is_some()
+    }
+
+    /// An open modal takes every click; otherwise a file-list row selects.
     pub fn handle_click(&mut self, col: u16, row: u16) {
+        if let Some(dialog) = &self.warning_dialog {
+            if dialog.handle_click(col, row).is_some() {
+                self.warning_dialog = None;
+            }
+            return;
+        }
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
         let pos = ratatui::layout::Position::from((col, row));
+        if let Some(state) = &mut self.branch_select {
+            use crate::tui::dialogs::hit;
+            let mouse = &self.branch_mouse;
+            // A row applies its branch like Enter; the scroll indicators step
+            // like the arrows; a click outside closes like Esc.
+            let indicators = [
+                (KeyCode::Up, mouse.more_above),
+                (KeyCode::Down, mouse.more_below),
+            ];
+            let key = if !mouse.dialog.contains(pos) {
+                KeyCode::Esc
+            } else if let Some(idx) = hit(&mouse.rows, col, row) {
+                state.selected = idx;
+                KeyCode::Enter
+            } else if let Some(key) = hit(&indicators, col, row) {
+                key
+            } else {
+                return;
+            };
+            self.handle_branch_select_key(KeyEvent::from(key));
+            return;
+        }
         if self.file_list_inner.contains(pos) {
             let row_in_list = (row - self.file_list_inner.y) as usize;
             let file_index = self.file_list_scroll_offset + row_in_list;
@@ -69,12 +100,15 @@ impl DiffView {
         }
     }
 
-    /// Hover does not move the file-list selection. Otherwise pressing
-    /// j/k after a stray mouse drift would jump to whichever file the
-    /// cursor last crossed instead of advancing from the actually
-    /// selected one. Click still selects.
-    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
-        false
+    /// Hover never moves the file-list selection, which j/k advance from.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if self.branch_select.is_some() {
+            let rects = self.branch_mouse.rects();
+            return self.branch_mouse.hover.update(col, row, &rects);
+        }
+        self.warning_dialog
+            .as_mut()
+            .is_some_and(|dialog| dialog.handle_hover(col, row))
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> DiffAction {
@@ -154,6 +188,12 @@ impl DiffView {
                 DiffAction::Continue
             }
 
+            // Toggle Markdown between rendered prose and its raw diff.
+            (KeyCode::Char('m'), _) => {
+                self.toggle_markdown_rendering();
+                DiffAction::Continue
+            }
+
             // Resize file list panel
             (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
                 self.shrink_file_list();
@@ -213,56 +253,70 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn make_diff_view_with_warning() -> DiffView {
-        let mut view = DiffView::test_default();
-        view.warning_dialog = Some(InfoDialog::new("Warning", "Test warning"));
-        view
-    }
-
     fn make_diff_view_no_warning() -> DiffView {
         DiffView::test_default()
     }
 
     #[test]
-    fn test_warning_dialog_blocks_normal_keys() {
-        let mut view = make_diff_view_with_warning();
-        // 'q' would normally close the view, but with warning dialog open it should not
-        let action = view.handle_key(key(KeyCode::Char('q')));
-        assert!(matches!(action, DiffAction::Continue));
-        // Dialog should still be there (q doesn't dismiss InfoDialog)
-        assert!(view.warning_dialog.is_some());
-    }
-
-    #[test]
-    fn test_warning_dialog_dismissed_by_enter() {
-        let mut view = make_diff_view_with_warning();
-        let action = view.handle_key(key(KeyCode::Enter));
-        assert!(matches!(action, DiffAction::Continue));
-        assert!(view.warning_dialog.is_none());
-    }
-
-    #[test]
-    fn test_warning_dialog_dismissed_by_esc() {
-        let mut view = make_diff_view_with_warning();
-        let action = view.handle_key(key(KeyCode::Esc));
-        assert!(matches!(action, DiffAction::Continue));
-        assert!(view.warning_dialog.is_none());
-    }
-
-    #[test]
-    fn test_warning_dialog_dismissed_by_space() {
-        let mut view = make_diff_view_with_warning();
-        let action = view.handle_key(key(KeyCode::Char(' ')));
-        assert!(matches!(action, DiffAction::Continue));
-        assert!(view.warning_dialog.is_none());
-    }
-
-    #[test]
-    fn test_normal_keys_work_without_warning() {
+    fn warning_dialog_swallows_keys_until_dismissed() {
+        // 'q' closes the view normally, but not while the warning is up, and
+        // it does not dismiss the InfoDialog either.
+        for (code, dismissed) in [
+            (KeyCode::Char('q'), false),
+            (KeyCode::Enter, true),
+            (KeyCode::Esc, true),
+            (KeyCode::Char(' '), true),
+        ] {
+            let mut view = DiffView::test_default();
+            view.warning_dialog = Some(InfoDialog::new("Warning", "Test warning"));
+            assert!(matches!(view.handle_key(key(code)), DiffAction::Continue));
+            assert_eq!(view.warning_dialog.is_none(), dismissed, "{code:?}");
+        }
         let mut view = make_diff_view_no_warning();
-        // 'q' should close the view when no dialog
-        let action = view.handle_key(key(KeyCode::Char('q')));
-        assert!(matches!(action, DiffAction::Close));
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Char('q'))),
+            DiffAction::Close
+        ));
+    }
+
+    /// A rendered view, so its modals capture their real hit rects.
+    fn rendered(warning: bool, help: bool) -> DiffView {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut view = DiffView::test_default();
+        if warning {
+            view.warning_dialog = Some(InfoDialog::new("Warning", "Test warning"));
+        }
+        view.show_help = help;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let theme = crate::tui::styles::Theme::default();
+        terminal
+            .draw(|frame| view.render(frame, frame.area(), &theme))
+            .unwrap();
+        view
+    }
+
+    #[test]
+    fn modals_own_clicks_and_hover_until_dismissed() {
+        // The 50x9 warning centers on 120x40 with [OK] at columns 58..62, row 20.
+        // (warning, help, click, modal still open)
+        let cases = [
+            (true, false, (60, 18), false),
+            (true, false, (1, 1), true),
+            (false, true, (1, 1), false),
+            (false, false, (1, 1), false),
+        ];
+        for (warning, help, (col, row), open) in cases {
+            let mut view = rendered(warning, help);
+            view.handle_click(col, row);
+            assert_eq!(view.has_modal(), open, "{warning} {help} at {col},{row}");
+        }
+
+        let mut view = rendered(true, false);
+        assert!(view.handle_hover(59, 20), "hovering [OK] highlights it");
+        assert!(!view.handle_hover(60, 20));
+        assert!(view.handle_hover(1, 1), "leaving [OK] clears it");
+        let mut view = rendered(false, false);
+        assert!(!view.handle_hover(59, 20), "no modal, nothing to highlight");
     }
 
     fn diff_file(path: &str) -> crate::git::diff::DiffFile {
@@ -275,35 +329,80 @@ mod tests {
         }
     }
 
+    fn cache_file_contents(view: &mut DiffView, path: &str, is_binary: bool) {
+        view.file_contents_cache.insert(
+            std::path::PathBuf::from(path),
+            crate::git::diff::FileContents {
+                path: std::path::PathBuf::from(path),
+                old_path: None,
+                status: crate::git::diff::FileStatus::Modified,
+                old_content: String::new(),
+                new_content: "# Preview".to_string(),
+                patch: String::new(),
+                is_binary,
+            },
+        );
+    }
+
     #[test]
-    fn selected_path_string_returns_the_selected_file_path() {
+    fn selected_path_and_markdown_detection() {
+        let view = make_diff_view_no_warning();
+        assert_eq!(view.selected_path_string(), None);
         let mut view = make_diff_view_no_warning();
         view.files = vec![diff_file("src/app/foo.rs"), diff_file("README.md")];
         view.selected_file = 1;
         assert_eq!(view.selected_path_string().as_deref(), Some("README.md"));
+
+        // Markdown extensions are case-insensitive.
+        for (path, markdown) in [
+            ("README.md", true),
+            ("guide.markdown", true),
+            ("NOTES.MD", true),
+            ("src/main.rs", false),
+        ] {
+            let mut view = make_diff_view_no_warning();
+            view.files = vec![diff_file(path)];
+            assert_eq!(view.selected_file_is_markdown(), markdown, "{path}");
+        }
     }
 
     #[test]
-    fn selected_path_string_is_none_without_files() {
-        let view = make_diff_view_no_warning();
-        assert_eq!(view.selected_path_string(), None);
-    }
-
-    #[test]
-    fn y_key_is_wired_and_continues() {
-        // Empty file list: the handler short-circuits before touching the
-        // clipboard, so this asserts the binding without a real clipboard write.
-        let mut view = make_diff_view_no_warning();
-        let action = view.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(action, DiffAction::Continue));
+    fn m_key_toggles_only_text_markdown_and_resets_scroll() {
+        // (path, binary, rendered after one press, scroll after)
+        for (path, is_binary, rendered, scroll) in [
+            ("README.md", false, false, 0),
+            ("src/main.rs", false, true, 7),
+            ("README.md", true, true, 7),
+        ] {
+            let mut view = make_diff_view_no_warning();
+            view.files = vec![diff_file(path)];
+            cache_file_contents(&mut view, path, is_binary);
+            view.scroll_offset = 7;
+            assert!(matches!(
+                view.handle_key(key(KeyCode::Char('m'))),
+                DiffAction::Continue
+            ));
+            assert_eq!(
+                view.markdown_rendered, rendered,
+                "{path} binary={is_binary}"
+            );
+            assert_eq!(view.scroll_offset, scroll, "{path} binary={is_binary}");
+            view.handle_key(key(KeyCode::Char('m')));
+            assert!(view.markdown_rendered, "{path} toggles back");
+        }
     }
 
     #[test]
     fn y_key_sets_copied_confirmation() {
-        // Exercises the message path the empty-list test skips. This goes
-        // through the best-effort clipboard helper: a no-op in CI without a
-        // clipboard tool, and a local `cargo test` briefly writes the path to
-        // the system clipboard.
+        if !crate::tui::isolated_test_process(
+            "tui::diff::input::tests::y_key_sets_copied_confirmation",
+            std::time::Duration::from_secs(5),
+        ) {
+            return;
+        }
+        let empty_bin = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("PATH", empty_bin.path())]);
+        // Native clipboard tools cannot launch; OSC52 goes to captured output.
         let mut view = make_diff_view_no_warning();
         view.files = vec![diff_file("src/app/foo.rs")];
         view.selected_file = 0;

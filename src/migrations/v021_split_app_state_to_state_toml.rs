@@ -1,20 +1,8 @@
 //! Migration v021: move `[app_state]` out of `config.toml` into a sibling
-//! `state.toml`.
-//!
-//! `app_state` is global-only runtime/UI bookkeeping (welcome/tour seen,
-//! last browse dir, tips seen, sort order, ...), not a settings-schema
-//! section. Keeping it inside `config.toml` put its high write churn (every
-//! sidebar toggle, every tip dismissal) on the same lock as real settings
-//! changes, so a UI toggle and a settings save contended for the same file.
-//! Splitting it into its own file, with its own lock, removes that churn from
-//! the settings path entirely (see `session::config::update_config` /
-//! `session::config::update_app_state`). `state.toml` still gets the same
-//! serialised read-modify-write guarantee as `config.toml`, via
-//! `storage::locked_update`, so two `aoe` processes never lose an update.
-//!
-//! Global app dir only: unlike v020's per-profile setting, `app_state` has
-//! always been global-only (never merged from a profile override), so there
-//! is no `profiles/*/config.toml` to walk.
+//! `state.toml`, so its UI write churn (sidebar toggles, tip dismissals) stops
+//! sharing a lock with settings saves. `state.toml` gets the same serialised
+//! read-modify-write guarantee via `storage::locked_update`. Global app dir
+//! only: `app_state` was never profile-overridable.
 
 use anyhow::Result;
 use std::fs;
@@ -74,56 +62,58 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// An existing state.toml is authoritative, and an unparseable config
+    /// must never block boot.
     #[test]
     fn moves_app_state_to_state_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.toml"),
-            "default_profile = \"work\"\n\n[app_state]\nhas_seen_welcome = true\n",
-        )
-        .unwrap();
-
-        run_in(dir.path()).unwrap();
-
-        let config: toml::Table = fs::read_to_string(dir.path().join("config.toml"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(config["default_profile"].as_str(), Some("work"));
-        assert!(!config.contains_key("app_state"));
-
-        let state: toml::Table = fs::read_to_string(dir.path().join("state.toml"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(state["has_seen_welcome"].as_bool(), Some(true));
-    }
-
-    #[test]
-    fn existing_state_toml_wins_but_key_still_stripped() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.toml"),
-            "[app_state]\nhas_seen_welcome = true\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("state.toml"), "has_seen_welcome = false\n").unwrap();
-
-        run_in(dir.path()).unwrap();
-
-        let config: toml::Table = fs::read_to_string(dir.path().join("config.toml"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(!config.contains_key("app_state"));
-
-        // The pre-existing state.toml is authoritative; the migration must
-        // not overwrite it with the value it found in config.toml.
-        let state: toml::Table = fs::read_to_string(dir.path().join("state.toml"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(state["has_seen_welcome"].as_bool(), Some(false));
+        let cases: [(Option<&str>, Option<&str>, Option<&str>, Option<&str>); 5] = [
+            (
+                Some("default_profile = \"work\"\n\n[app_state]\nhas_seen_welcome = true\n"),
+                None,
+                Some("default_profile = \"work\"\n"),
+                Some("has_seen_welcome = true\n"),
+            ),
+            (
+                Some("[app_state]\nhas_seen_welcome = true\n"),
+                Some("has_seen_welcome = false\n"),
+                Some(""),
+                Some("has_seen_welcome = false\n"),
+            ),
+            (
+                Some("default_profile = \"work\"\n"),
+                None,
+                Some("default_profile = \"work\"\n"),
+                None,
+            ),
+            (None, None, None, None),
+            (
+                Some("not valid toml [[["),
+                None,
+                Some("not valid toml [[["),
+                None,
+            ),
+        ];
+        let read = |path: &Path| {
+            fs::read_to_string(path)
+                .ok()
+                .map(|s| s.parse::<toml::Table>().unwrap_or_default())
+        };
+        let parse = |s: Option<&str>| s.map(|s| s.parse::<toml::Table>().unwrap_or_default());
+        for (config, state, config_after, state_after) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (config_path, state_path) = (
+                dir.path().join("config.toml"),
+                dir.path().join("state.toml"),
+            );
+            for (path, content) in [(&config_path, config), (&state_path, state)] {
+                if let Some(content) = content {
+                    fs::write(path, content).unwrap();
+                }
+            }
+            run_in(dir.path()).unwrap();
+            assert_eq!(read(&config_path), parse(config_after), "{config:?}");
+            assert_eq!(read(&state_path), parse(state_after), "{config:?}");
+        }
     }
 
     /// A `config.toml` symlinked into a dotfiles repo must survive the
@@ -165,42 +155,5 @@ mod tests {
             "the rewrite must land on the symlink target, got: {config:?}"
         );
         assert_eq!(config["default_profile"].as_str(), Some("work"));
-    }
-
-    #[test]
-    fn noop_when_no_app_state_present() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.toml"),
-            "default_profile = \"work\"\n",
-        )
-        .unwrap();
-
-        run_in(dir.path()).unwrap();
-
-        assert!(!dir.path().join("state.toml").exists());
-        let config: toml::Table = fs::read_to_string(dir.path().join("config.toml"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(config["default_profile"].as_str(), Some("work"));
-    }
-
-    #[test]
-    fn noop_when_config_toml_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        run_in(dir.path()).unwrap();
-        assert!(!dir.path().join("state.toml").exists());
-    }
-
-    #[test]
-    fn soft_fails_on_unparseable_config() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("config.toml"), "not valid toml [[[").unwrap();
-
-        // Must not error; boot should never be blocked by a malformed config.
-        run_in(dir.path()).unwrap();
-
-        assert!(!dir.path().join("state.toml").exists());
     }
 }

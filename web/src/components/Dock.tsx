@@ -25,9 +25,7 @@ interface Props {
   tabs: string[];
   /** Active tab id; falls back to the first tab if stale/missing. */
   active: string | null;
-  /** Title + icon for a tab id (built-in from the registry, or a plugin pane).
-   *  A callback rather than an array prop so the icon component is resolved
-   *  inside the dock, keeping the parent's render free of element arrays. */
+  /** Title + icon for a tab id (built-in from the registry, or a plugin pane). */
   descriptorFor: (id: string) => PaneDisplay;
   renderBody: (id: string) => ReactNode;
   onActivate: (id: string) => void;
@@ -41,9 +39,7 @@ interface Props {
 const btn =
   "w-5 h-5 flex items-center justify-center shrink-0 rounded text-text-dim hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors";
 
-/** A vertical bar marking where a dragged tab would land. Rendered inline
- *  between tabs (cross-group drops only, see Dock), so it costs 2px of strip
- *  width and no reflow of the tab bodies. */
+/** A vertical bar marking where a dragged tab would land. */
 function InsertionMarker() {
   return <div data-testid="pane-insertion-marker" className="w-0.5 self-stretch bg-brand-500 shrink-0" />;
 }
@@ -58,11 +54,7 @@ interface SortableTabProps {
   onClose: (id: string) => void;
 }
 
-/** One draggable tab. The drag listeners sit on the activation button (not the
- *  close button), and the MouseSensor's 8px distance means a stationary click
- *  still activates rather than starting a drag. Only `listeners` are spread,
- *  not dnd-kit's `attributes`, which would inject a conflicting role/aria onto
- *  the role="tab" button. */
+/** One draggable tab. */
 function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onClose }: SortableTabProps) {
   const { setNodeRef, listeners, transform, transition, isDragging } = useSortable({
     id,
@@ -109,11 +101,8 @@ function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onC
   );
 }
 
-/** A half of a group body that, while a tab is dragged, lifts the drop into a
- *  fresh group before or after this one. The tall right column stacks groups
- *  (top / bottom halves), the wide bottom strip splits side by side (left /
- *  right halves). Mounted only during a drag, so it never intercepts ordinary
- *  clicks on the pane body (terminals, iframes). */
+/** A half of a group body that, while a tab is dragged, lifts the drop into a fresh group before or after this
+ *  one. */
 function SplitDropZone({
   location,
   groupIndex,
@@ -144,17 +133,7 @@ function SplitDropZone({
   );
 }
 
-/** Renders one dock group: a tab strip plus the active tab's body. Each tab
- *  carries its pane's icon, title, and a close control; the strip also offers
- *  move-to-other-dock and a new-terminal button. Only the active body is
- *  mounted; the terminal/diff state it shows is server-side (tmux session, diff
- *  API), so re-mounting on a tab switch is cheap. The parent maps a dock's
- *  groups to one Dock each and hides a dock with no groups.
- *
- *  Tabs reorder within a group and move across groups/docks via drag-and-drop
- *  (the shared DndContext lives in PaneDndController); the move button stays as
- *  the keyboard/click affordance. Dropping on the strip joins this group;
- *  dropping on a body half splits into a new sibling group. */
+/** Renders one dock group: a tab strip plus the active tab's body. */
 export function Dock({
   location,
   groupIndex,
@@ -177,9 +156,8 @@ export function Dock({
   const target: DockLocation = location === "right" ? "bottom" : "right";
   const MoveIcon = location === "right" ? PanelBottom : PanelRight;
   const activeName = descriptorFor(activeId).title.toLowerCase();
-  // Highlight + mark only a drop into a *different* group; a within-group
-  // reorder reads from the tabs sliding apart, so a marker there would double
-  // up with the gap.
+  // Highlight + mark only a drop into a *different* group; a within-group reorder reads from the tabs sliding
+  // apart, so a marker there would double up with the gap.
   const isSourceGroup = source?.dock === location && source.group === groupIndex;
   const isDropTarget =
     !!dropTarget &&

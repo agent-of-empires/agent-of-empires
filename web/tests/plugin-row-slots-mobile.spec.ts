@@ -1,42 +1,26 @@
-// Mocked-Playwright coverage for the plugin row slots on a narrow mobile
-// sidebar (#2514).
-//
-// The github plugin's row-badge (icon chips) and row-column (status text) used
-// to render inline on the session-name line. On the narrow mobile drawer the
-// truncating name kept its width, so the column squeezed to zero and the
-// shrink-0 badges overflowed past the row's right edge. They now sit on their
-// own line (PluginRowLine), so both stay within the row regardless of how long
-// the session name is. This drives the real-CSS layout at a mobile viewport,
-// which jsdom cannot reproduce.
+// #2514: the github plugin's row-badge chips and row-column status used to
+// render inline with the session name, so on the narrow mobile drawer the
+// truncating name kept its width and the shrink-0 badges overflowed the row.
+// They now sit on their own line. Real CSS at a mobile viewport, which jsdom
+// cannot reproduce.
 
 import { test, expect } from "./helpers/mockedTest";
+import { sessionResponse as baseSession } from "./helpers/sessions";
+import { mockStaticApis } from "./helpers/apiMocks";
 import { Page } from "@playwright/test";
 
 const LONG_TITLE = "this-is-a-deliberately-very-long-session-name-that-eats-the-whole-row-width-on-mobile";
 
-function sessionResponse() {
-  return {
+const sessionResponse = () =>
+  baseSession({
     id: "s1",
     title: LONG_TITLE,
     project_path: "/tmp/repo",
-    group_path: "/tmp/repo",
-    tool: "claude",
-    status: "Idle",
-    yolo_mode: false,
     created_at: "2025-01-01T00:00:00Z",
-    last_accessed_at: null,
-    idle_entered_at: null,
-    last_error: null,
     branch: "feature/x",
-    main_repo_path: null,
-    is_sandboxed: false,
     favorited: false,
     urgent: false,
-    has_terminal: true,
-    profile: "default",
-    workspace_repos: [],
-  };
-}
+  });
 
 // One icon chip per repo across a multi-repo workspace: enough shrink-0 badges
 // that the old inline layout overflowed the narrow row instead of wrapping.
@@ -63,18 +47,15 @@ const UI_ENTRIES = [
   },
 ];
 
-async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+async function mockApis(page: Page, entries: unknown[] = UI_ENTRIES) {
+  await mockStaticApis(page);
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
       json: { sessions: [sessionResponse()], workspace_ordering: ["/tmp/repo::feature/x"] },
     });
   });
-  await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: UI_ENTRIES, notifications: [] } }));
-  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
-  }
+  await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries, notifications: [] } }));
 }
 
 // A child element is "within" the row when its right edge does not spill past
@@ -111,5 +92,39 @@ test.describe("Plugin row slots on a mobile sidebar (#2514)", () => {
     // to zero or clipped past its right edge.
     expect(await allWithinRow(page, column)).toBe(true);
     expect(await allWithinRow(page, badge)).toBe(true);
+  });
+
+  test("clicking a grouped badge cycles its values without selecting the row", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await mockApis(page, [
+      {
+        plugin_id: "acme.kit",
+        slot: "row-badge",
+        id: "usage",
+        session_id: "s1",
+        payload: {
+          items: [
+            { text: "5h 40%", group: "usage" },
+            { text: "7d 12%", group: "usage" },
+            { text: "stale", tone: "warn" },
+          ],
+        },
+      },
+    ]);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Toggle sidebar" }).click();
+    await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(1, { timeout: 8000 });
+
+    const chip = page.locator("button[data-plugin-slot='row-badge']");
+    await expect(chip).toHaveText("5h 40%");
+    const url = page.url();
+    await chip.click();
+    await expect(chip).toHaveText("7d 12%");
+    await chip.click();
+    await expect(chip).toHaveText("5h 40%");
+    await expect(page.getByText("stale")).toBeVisible();
+    expect(page.url()).toBe(url);
+    // The drawer stays open: a click on the chip must not reach the row's select handler.
+    await expect(page.locator("[data-testid='sidebar-session-row']")).toBeVisible();
   });
 });

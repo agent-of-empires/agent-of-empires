@@ -29,11 +29,7 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       getActions()[matched.shortcut.action]();
     };
 
-    // Capture phase so we observe the keydown before xterm.js's helper
-    // textarea sees it. xterm.js calls stopPropagation on a handful of
-    // modifier combos (Cmd/Ctrl + letter), which otherwise blocks global
-    // shortcuts like Cmd+K, Cmd+`, and Ctrl+Alt+B whenever the terminal
-    // is focused.
+    // Capture phase: xterm.js stops propagation of Cmd/Ctrl combos.
     document.addEventListener("keydown", handler, true);
     return () => document.removeEventListener("keydown", handler, true);
   }, [getActions]);

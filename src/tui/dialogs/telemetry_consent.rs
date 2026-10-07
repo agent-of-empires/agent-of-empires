@@ -1,11 +1,6 @@
-//! Standalone telemetry opt-in popup.
-//!
-//! Shown once to users who completed the first-run walkthrough before
-//! telemetry existed (the walkthrough itself carries the prompt as its second
-//! pane for new users). `Submit(true)` opts in, `Submit(false)` / `Cancel`
-//! declines; the caller marks the prompt answered in either case so it never
-//! re-appears. Startup gating ensures it never renders on top of the changelog
-//! or the version update modal.
+//! Telemetry opt-in for users who finished the first-run walkthrough before
+//! telemetry existed; new users get the prompt as a walkthrough pane. The
+//! caller marks the prompt answered either way, so it never re-appears.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
@@ -17,14 +12,11 @@ use crate::tui::styles::Theme;
 
 #[derive(Default)]
 pub struct TelemetryConsentDialog {
-    /// Focused option: `Some(true)` = Enable, `Some(false)` = Decline,
-    /// `None` = nothing focused yet. There is no default focus on purpose:
-    /// a reflexive Enter does nothing until the user makes an explicit
-    /// left/right choice, so the prompt can't be dismissed without reading.
+    /// `Some(true)` = Enable, `Some(false)` = Decline. Nothing is focused by
+    /// default, so a reflexive Enter cannot dismiss the prompt unread.
     selected: Option<bool>,
     enable_button_area: Rect,
     decline_button_area: Rect,
-    /// Which button the mouse is over (0 = Enable, 1 = Decline). Visual only.
     hovered: Option<usize>,
 }
 
@@ -35,12 +27,10 @@ impl TelemetryConsentDialog {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<bool> {
         match key.code {
-            // Esc is the standard cancel; treat it as a decline.
             KeyCode::Esc => DialogResult::Submit(false),
-            // Enter confirms a chosen side. With no choice it is a no-op so the
-            // user can't blow past the prompt, EXCEPT under DO_NOT_TRACK, where
-            // the dialog shows no buttons and explicitly says "Press Enter or
-            // Esc to dismiss", so Enter must dismiss (as a decline).
+            // With no choice made Enter is inert, so the prompt cannot be
+            // blown past. Under DO_NOT_TRACK there are no buttons and the body
+            // says Enter dismisses, so there it declines.
             KeyCode::Enter | KeyCode::Char(' ') => match self.selected {
                 Some(choice) => DialogResult::Submit(choice),
                 None if crate::telemetry::do_not_track() => DialogResult::Submit(false),
@@ -73,8 +63,7 @@ impl TelemetryConsentDialog {
         None
     }
 
-    /// Update the hover highlight. Returns true when it changed (so the caller
-    /// can skip redrawing on every pixel of mouse drift).
+    /// Update the hover highlight; true when it changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         let pos = Position::from((col, row));
         let new = if self.enable_button_area.contains(pos) {
@@ -91,17 +80,9 @@ impl TelemetryConsentDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dnt = crate::telemetry::do_not_track();
-        let dialog_area = super::centered_rect(area, 76, if dnt { 13 } else { 17 });
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Usage telemetry ")
-            .title_style(Style::default().fg(theme.accent).bold());
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::toned_dialog_block(" Usage telemetry ", theme.accent, theme.accent);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, 76, if dnt { 13 } else { 17 }, block);
 
         if dnt {
             let chunks = Layout::default()
@@ -113,9 +94,7 @@ impl TelemetryConsentDialog {
             return;
         }
 
-        // body (top) · [Enable] [Not now] · "change any time" hint (bottom).
-        // The hint sits under the buttons so the action is what the eye lands
-        // on, not the fine print.
+        // The hint sits under the buttons, so the eye lands on the action.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -162,8 +141,8 @@ impl TelemetryConsentDialog {
         // chunks[1] is a one-row gap between the body and the buttons.
         self.render_buttons(frame, chunks[2], theme);
 
-        // No default focus: tell the user how to choose so a bare Enter (which
-        // is intentionally inert here) isn't a dead end.
+        // With no default focus, say how to choose, or the inert Enter is a
+        // dead end.
         let keys = Paragraph::new(Span::styled(
             "←/→ or Tab to choose, then Enter to confirm",
             Style::default().fg(theme.hint).italic(),
@@ -180,8 +159,7 @@ impl TelemetryConsentDialog {
     }
 
     fn render_dnt(&mut self, frame: &mut Frame, body_area: Rect, footer: Rect, theme: &Theme) {
-        // DO_NOT_TRACK forces telemetry off; surface that rather than offering
-        // a toggle that would do nothing.
+        // DO_NOT_TRACK forces telemetry off, so offer no inert toggle.
         self.enable_button_area = Rect::default();
         self.decline_button_area = Rect::default();
         let body = Paragraph::new(vec![
@@ -245,8 +223,7 @@ impl TelemetryConsentDialog {
             self.decline_button_area = Rect::default();
             return;
         }
-        let left_pad = (area.width - row_width) / 2;
-        let enable_x = area.x + left_pad;
+        let enable_x = super::centered_x(area, row_width);
         let decline_x = enable_x + (enable_label.len() + gap.len()) as u16;
         self.enable_button_area = Rect::new(enable_x, area.y, enable_label.len() as u16, 1);
         self.decline_button_area = Rect::new(decline_x, area.y, decline_label.len() as u16, 1);
@@ -272,22 +249,26 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    // `#[serial]` because `render` reads `DO_NOT_TRACK`, which other telemetry
-    // tests mutate. With it set, `render_dnt` zeroes the button areas and the
-    // click lands on nothing, so a parallel run flakes this assertion.
     #[test]
     #[serial]
     fn click_after_render_submits_the_hit_button() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        unsafe { std::env::remove_var("DO_NOT_TRACK") };
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
         let theme = crate::tui::styles::load_theme("zinc");
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut d = TelemetryConsentDialog::new();
         term.draw(|f| d.render(f, f.area(), &theme)).unwrap();
-        // Clicking the rendered [Enable] / [Not now] glyphs commits directly.
+        // The rects cover the drawn labels, so both brackets are clickable.
         let enable = d.enable_button_area;
         let decline = d.decline_button_area;
+        let buf = term.backend().buffer();
+        for (rect, label) in [(enable, "[Enable]"), (decline, "[Not now]")] {
+            let drawn: String = (rect.x..rect.right())
+                .map(|x| buf[(x, rect.y)].symbol())
+                .collect();
+            assert_eq!(drawn, label);
+        }
         assert!(matches!(
             d.handle_click(enable.x, enable.y),
             Some(DialogResult::Submit(true))
@@ -299,27 +280,42 @@ mod tests {
     }
 
     #[test]
-    fn no_default_focus() {
-        assert_eq!(TelemetryConsentDialog::new().selected, None);
-    }
-
-    // `#[serial]` because `handle_key` reads the `DO_NOT_TRACK` env var, which
-    // other telemetry tests mutate; serializing keeps it deterministic.
-    #[test]
     #[serial]
-    fn enter_with_no_focus_is_inert() {
-        // The whole point of no default focus: a reflexive Enter must not
-        // dismiss the prompt until the user has chosen a side.
-        unsafe { std::env::remove_var("DO_NOT_TRACK") };
-        let mut d = TelemetryConsentDialog::new();
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Enter)),
-            DialogResult::Continue
-        ));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char(' '))),
-            DialogResult::Continue
-        ));
+    fn keys_focus_a_side_before_enter_decides() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
+        assert_eq!(TelemetryConsentDialog::new().selected, None);
+        // (keys, focus after, outcome of the last key). With no default focus a
+        // reflexive Enter or Space must not dismiss the prompt.
+        let cases = [
+            (&[KeyCode::Enter][..], None, DialogResult::Continue),
+            (&[KeyCode::Char(' ')], None, DialogResult::Continue),
+            (&[KeyCode::Esc], None, DialogResult::Submit(false)),
+            (&[KeyCode::Tab], Some(true), DialogResult::Continue),
+            (
+                &[KeyCode::Tab, KeyCode::Tab],
+                Some(false),
+                DialogResult::Continue,
+            ),
+            (
+                &[KeyCode::Left, KeyCode::Enter],
+                Some(true),
+                DialogResult::Submit(true),
+            ),
+            (
+                &[KeyCode::Right, KeyCode::Enter],
+                Some(false),
+                DialogResult::Submit(false),
+            ),
+        ];
+        for (keys, selected, want) in cases {
+            let mut d = TelemetryConsentDialog::new();
+            let mut last = DialogResult::Continue;
+            for code in keys {
+                last = d.handle_key(k(*code));
+            }
+            assert_eq!(d.selected, selected, "{keys:?}");
+            assert_eq!(last, want, "{keys:?}");
+        }
     }
 
     #[test]
@@ -327,62 +323,8 @@ mod tests {
     fn enter_dismisses_under_do_not_track() {
         // Under DO_NOT_TRACK the popup shows no buttons and says "Press Enter
         // or Esc to dismiss", so Enter with no selection must decline-dismiss.
-        unsafe { std::env::set_var("DO_NOT_TRACK", "1") };
+        let _env = crate::session::test_support::EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
         let mut d = TelemetryConsentDialog::new();
-        let result = d.handle_key(k(KeyCode::Enter));
-        unsafe { std::env::remove_var("DO_NOT_TRACK") };
-        assert!(matches!(result, DialogResult::Submit(false)));
-    }
-
-    #[test]
-    fn tab_focuses_then_enter_confirms() {
-        let mut d = TelemetryConsentDialog::new();
-        // Tab from no focus lands on Enable; a second Tab flips to Decline.
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Tab)),
-            DialogResult::Continue
-        ));
-        assert_eq!(d.selected, Some(true));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Tab)),
-            DialogResult::Continue
-        ));
-        assert_eq!(d.selected, Some(false));
-    }
-
-    #[test]
-    fn esc_declines() {
-        assert!(matches!(
-            TelemetryConsentDialog::new().handle_key(k(KeyCode::Esc)),
-            DialogResult::Submit(false)
-        ));
-    }
-
-    #[test]
-    fn left_focuses_enable_then_enter_opts_in() {
-        let mut d = TelemetryConsentDialog::new();
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Left)),
-            DialogResult::Continue
-        ));
-        assert_eq!(d.selected, Some(true));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Enter)),
-            DialogResult::Submit(true)
-        ));
-    }
-
-    #[test]
-    fn right_focuses_decline_then_enter_declines() {
-        let mut d = TelemetryConsentDialog::new();
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Right)),
-            DialogResult::Continue
-        ));
-        assert_eq!(d.selected, Some(false));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Enter)),
-            DialogResult::Submit(false)
-        ));
+        assert_eq!(d.handle_key(k(KeyCode::Enter)), DialogResult::Submit(false));
     }
 }

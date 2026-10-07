@@ -1,68 +1,74 @@
-/**
- * On-disk conversation transcript for aoe-agent.
- *
- * aoe passes AOE_ARTIFACT_DIR (a per-session, restart-persistent app-data
- * dir). We append one completed user/assistant exchange per turn so that a
- * later `session/load` after an `aoe serve` restart can seed the model's
- * context. Only text turns are stored; that mirrors what the in-memory
- * history already holds (tool calls live inside a single streamText turn and
- * are never carried across turns), and keeps the format provider-neutral so a
- * transcript round-trips across a model switch.
- *
- * ponytail: append-only, one exchange per turn. A whole-file rewrite would be
- * O(n) per turn and could truncate the only copy on a mid-write crash. Switch
- * to a retention cap here if transcripts ever grow unbounded (#1005 open
- * question); today the model's context window bounds effective growth.
- */
-
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+/** Native-ID-scoped text history within the AoE instance artifact directory. */
+import { constants } from "node:fs";
+import { mkdir, open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ModelMessage } from "ai";
 
-const TRANSCRIPT_FILE = "transcript.jsonl";
+function transcriptPath(dir: string, sessionId: string): string {
+  if (!/^[a-f0-9]{32}$/.test(sessionId)) {
+    throw new Error("Invalid aoe-agent session ID");
+  }
+  return join(dir, `aoe-agent-${sessionId}.jsonl`);
+}
+
+/** Publish even an empty conversation before acknowledging session/new. */
+export async function createTranscript(
+  dir: string,
+  sessionId: string,
+): Promise<void> {
+  const path = transcriptPath(dir, sessionId);
+  await mkdir(dir, { recursive: true });
+  const file = await open(path, "wx", 0o600);
+  try {
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  const directory = await open(dir, "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
 
 interface TurnMessage {
   role: "user" | "assistant";
   content: string;
 }
 
-/**
- * Append one completed exchange as a single write, so a crash between the two
- * records cannot leave a half-written pair (the write lands whole or a torn
- * tail that JSON.parse rejects on load). Creates the directory if aoe has not.
- */
+/** Append only to the conversation created for this native ID. */
 export async function appendTurn(
   dir: string,
+  sessionId: string,
   user: string,
   assistant: string,
 ): Promise<void> {
-  await mkdir(dir, { recursive: true });
   const line =
     JSON.stringify({ role: "user", content: user } satisfies TurnMessage) +
     "\n" +
-    JSON.stringify(
-      { role: "assistant", content: assistant } satisfies TurnMessage,
-    ) +
+    JSON.stringify({
+      role: "assistant",
+      content: assistant,
+    } satisfies TurnMessage) +
     "\n";
-  await appendFile(join(dir, TRANSCRIPT_FILE), line, { mode: 0o600 });
+  const file = await open(
+    transcriptPath(dir, sessionId),
+    constants.O_WRONLY | constants.O_APPEND,
+  );
+  try {
+    await file.writeFile(line);
+  } finally {
+    await file.close();
+  }
 }
 
-/**
- * Read the transcript back as ModelMessages. Malformed and schema-invalid
- * records are skipped rather than aborting the load. A trailing lone user
- * record (a turn whose assistant reply never got written, e.g. a crash between
- * the paired writes) is dropped so the resumed history always ends on an
- * assistant turn and stays strictly alternating. A missing file loads as an
- * empty history.
- */
-export async function loadTranscript(dir: string): Promise<ModelMessage[]> {
-  let raw: string;
-  try {
-    raw = await readFile(join(dir, TRANSCRIPT_FILE), "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw err;
-  }
+/** Skip malformed records and a torn trailing user turn; missing IDs fail. */
+export async function loadTranscript(
+  dir: string,
+  sessionId: string,
+): Promise<ModelMessage[]> {
+  const raw = await readFile(transcriptPath(dir, sessionId), "utf8");
 
   const messages: ModelMessage[] = [];
   for (const line of raw.split("\n")) {
@@ -87,5 +93,7 @@ function isTurnMessage(value: unknown): value is TurnMessage {
   if (typeof value !== "object" || value === null) return false;
   const role = (value as { role?: unknown }).role;
   const content = (value as { content?: unknown }).content;
-  return (role === "user" || role === "assistant") && typeof content === "string";
+  return (
+    (role === "user" || role === "assistant") && typeof content === "string"
+  );
 }

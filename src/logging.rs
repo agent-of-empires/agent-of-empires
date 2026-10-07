@@ -1,15 +1,4 @@
-//! Centralized logging configuration + runtime filter control.
-//!
-//! Single source of truth for env-var resolution, default-filter
-//! construction, and the reloadable subscriber handle. Both the main
-//! daemon and structured view runner subprocesses use this module so they
-//! agree on what `AOE_LOG_LEVEL=debug` means.
-//!
-//! The process-global `FilterController` is exposed via free
-//! functions (`set_filter`, `set_level`, `current_filter`). Tracing's
-//! subscriber is already a process-wide singleton; we mirror that
-//! design rather than threading a handle through application state.
-//! `Mutex<Option<Arc<_>>>` (over `OnceLock`) so tests can reset.
+//! Logging configuration, subscriber init, and the process-wide runtime filter controller.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,10 +13,7 @@ use tracing_subscriber::Registry;
 
 use crate::session::config::{LoggingConfig, RotationKind};
 
-/// Which context the running process is in. Drives whether `[logging].output`
-/// is honored or coerced to `File`. Contexts where the stdout sink would
-/// corrupt the UI (TUI alt-screen) or get discarded (daemon child's
-/// detached stdio, structured view runner) force the file sink.
+/// Contexts whose stdout is the UI or discarded force the file sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessContext {
     Tui,
@@ -37,16 +23,11 @@ pub enum ProcessContext {
     OneShotCli,
 }
 
-/// Output of `resolve_sink`. The `warning` is deferred until after subscriber
-/// init so it can be emitted through tracing rather than dropped silently.
 pub struct SinkResolution {
     pub target: SubscriberTarget,
     pub warning: Option<String>,
 }
 
-/// Resolve the configured log file path. Relative `file_path` values join
-/// onto `app_dir`; absolute paths are used verbatim. Used by every site
-/// that names the log file (main, runner, aoe logs, TUI serve dialog).
 pub fn resolve_log_path(cfg: &LoggingConfig, app_dir: &Path) -> PathBuf {
     let p = Path::new(&cfg.file_path);
     if p.is_absolute() {
@@ -56,10 +37,6 @@ pub fn resolve_log_path(cfg: &LoggingConfig, app_dir: &Path) -> PathBuf {
     }
 }
 
-/// Pick the subscriber sink for this process. `output = "stdout"` is
-/// honored only when the context can safely write to stdout; otherwise
-/// the resolution carries a `warning` describing the coercion so the
-/// caller can emit it through the now-live subscriber.
 pub fn resolve_sink(cfg: &LoggingConfig, app_dir: &Path, ctx: ProcessContext) -> SinkResolution {
     use crate::session::config::SinkKind;
 
@@ -93,9 +70,6 @@ pub fn resolve_sink(cfg: &LoggingConfig, app_dir: &Path, ctx: ProcessContext) ->
     }
 }
 
-/// Rotation thresholds resolved from `[logging]`. Built once at subscriber
-/// init and held by the `SizeRotatingWriter`; not hot-swappable (sink and
-/// rotation knobs require restart, see `apply_persisted_config`).
 #[derive(Debug, Clone, Copy)]
 pub struct RotationPolicy {
     pub kind: RotationKind,
@@ -105,9 +79,7 @@ pub struct RotationPolicy {
 
 impl From<&LoggingConfig> for RotationPolicy {
     fn from(cfg: &LoggingConfig) -> Self {
-        // Defensive clamp: a hand-edited keep_count = 0 would otherwise yield
-        // a rotation that deletes the only copy. UI fields enforce >= 1; this
-        // makes the invariant hold for any path into the writer.
+        // keep_count = 0 would rotate away the only copy.
         Self {
             kind: cfg.rotation,
             max_size_bytes: cfg.max_size_mib.saturating_mul(1024 * 1024),
@@ -116,10 +88,6 @@ impl From<&LoggingConfig> for RotationPolicy {
     }
 }
 
-/// Top-level tracing target roots. The default filter expands a
-/// single level (e.g. "debug") to one directive per root so user-defined
-/// targets like `auth.token`, `process.signal`, `git.command` inherit
-/// the same level.
 pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "agent_of_empires",
     "acp",
@@ -132,13 +100,8 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "migrations",
     "plugin",
     "web",
-    // `log` is the meta-target prefix for filter-swap audit events
-    // (`log.runtime`). Without this, `log.runtime` would be dropped
-    // under any expanded-level filter that has no global default.
+    // `log` carries filter-swap audit events (`log.runtime`).
     "log",
-    // User-facing surfaces that previously fell under `agent_of_empires`
-    // and were therefore indistinguishable from generic library code.
-    // Each is a separate ownership boundary the user can dial up/down.
     "cli",
     "tui",
     "session",
@@ -151,17 +114,6 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "smart_rename",
 ];
 
-/// Sub-targets users can tune individually from the settings UI.
-/// Order is the UI ordering. Anything not in this list still works
-/// in the runtime endpoint as a raw filter, but won't have a dropdown.
-///
-/// Kept intentionally short. The list is for the UI dropdown only;
-/// callers can always set arbitrary EnvFilter directives via the
-/// settings TUI's raw field or `PATCH /api/log-level`. Adding an
-/// entry here is only worth it when we have evidence we'll want to
-/// dial that area in isolation. Sub-targets emitted by code (e.g.
-/// `http.request`, `cli.serve`, `tui.home`) work fine even when not
-/// listed; they just won't have a one-click row in the settings UI.
 pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "acp.protocol",
     "acp.protocol.stderr",
@@ -193,18 +145,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "log.runtime",
 ];
 
-/// Apply a persisted `LoggingConfig` to the running subscriber + persist
-/// runtime_filter so structured view runners pick it up via the notify watcher.
-/// Both the TUI save path and the web `PATCH /api/settings` path call
-/// this after `update_config`, so settings changes take effect live
-/// without a daemon restart.
-///
-/// Only the filter (default_level plus per-target overrides) hot-swaps.
-/// Sink-shape knobs (output, file_path, rotation, max_size_mib, keep_count)
-/// require a process restart: the tracing subscriber is a global singleton
-/// installed once at startup, and the rotating writer holds its policy
-/// and file handle for the life of the process. The settings UI surfaces
-/// a restart hint when those fields change.
+/// Only the filter hot-swaps; sink and rotation settings apply on restart.
 pub fn apply_persisted_config(
     default_level: &str,
     targets: &std::collections::BTreeMap<String, String>,
@@ -215,9 +156,7 @@ pub fn apply_persisted_config(
     };
     match set_filter(&filter) {
         Ok(swap) => {
-            // Skip the log and the disk write on a no-op: persisting an
-            // unchanged directive needlessly re-fires every runner's watcher
-            // (#1894).
+            // Persisting an unchanged directive would re-fire every runner's watcher.
             if swap.changed {
                 tracing::info!(
                     target: "log.runtime",
@@ -230,8 +169,6 @@ pub fn apply_persisted_config(
             }
         }
         Err(LogFilterError::Unavailable) => {
-            // No reload handle installed (e.g. TUI process). Still persist
-            // so a runner watching the file gets the update.
             persist_runtime_filter(&filter, app_dir);
         }
         Err(e) => {
@@ -245,12 +182,7 @@ pub fn apply_persisted_config(
     }
 }
 
-/// Compose an EnvFilter directive from a baseline level + per-target overrides.
-/// Used both at startup (when no env var is set) and by the settings write path
-/// when a user updates `[logging]`.
-///
-/// Per-target overrides win over the baseline because EnvFilter is
-/// last-wins-per-target: the override directives are emitted AFTER the roots.
+/// Overrides follow the roots because EnvFilter is last-wins per target.
 pub fn build_filter_from_config(
     default_level: &str,
     targets: &std::collections::BTreeMap<String, String>,
@@ -272,18 +204,11 @@ pub fn build_filter_from_config(
     Some(s)
 }
 
-/// Load `[logging]` from `config.toml` and build an EnvFilter directive.
-/// Returns `None` when no config file exists, when it fails to parse, or
-/// when the level value is unrecognised. Callers fall back to
-/// `serve_default_filter()` in that case.
 pub fn load_persisted_filter() -> Option<String> {
     let config = crate::session::load_config().ok().flatten()?;
     build_filter_from_config(&config.logging.default_level, &config.logging.targets)
 }
 
-/// Info-baseline filter directive. Used as the universal fallback when
-/// neither env nor config produce one — both `aoe serve` and the TUI
-/// must come up with *some* filter so the subscriber can be installed.
 pub fn serve_default_filter() -> String {
     LogConfig::serve_default()
         .filter_string()
@@ -322,8 +247,6 @@ impl LogLevel {
     }
 }
 
-/// Resolved logging configuration. Pure data; env-touching lives only in
-/// `from_env` so the rest of the module is unit-testable without env hacks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogConfig {
     pub level: Option<LogLevel>,
@@ -350,7 +273,6 @@ impl LogConfig {
         }
     }
 
-    /// Default for foreground `aoe serve` (info level, no overlays).
     pub fn serve_default() -> Self {
         Self {
             level: Some(LogLevel::Info),
@@ -359,7 +281,6 @@ impl LogConfig {
         }
     }
 
-    /// EnvFilter directive string. None when level unset.
     pub fn filter_string(&self) -> Option<String> {
         let level = self.level?;
         let mut s = Self::filter_for_level(level);
@@ -374,7 +295,6 @@ impl LogConfig {
         Some(s)
     }
 
-    /// Expand a level to one directive per target root.
     pub fn filter_for_level(level: LogLevel) -> String {
         let lvl = level.as_str();
         DEFAULT_TARGET_ROOTS
@@ -410,8 +330,7 @@ impl FilterController {
         if directive.is_empty() {
             return Err(LogFilterError::Invalid("empty filter".into()));
         }
-        // Bare global levels would enable debug for hyper/rustls/tower etc.
-        // Use set_level when you mean "everything we own at this level".
+        // Bare global levels would enable debug for hyper/rustls/tower.
         if LogLevel::parse(directive).is_some() {
             return Err(LogFilterError::BareGlobalLevel);
         }
@@ -432,15 +351,9 @@ impl FilterController {
     }
 
     fn swap(&self, filter: EnvFilter, directive: String) -> Result<SwapResult, LogFilterError> {
-        // Hold the `current` lock across the compare and the modify so two
-        // concurrent swaps cannot interleave and both observe `changed`.
         let mut current = self.current.lock().unwrap();
         let previous = current.clone();
-        // No-op: the active directive already equals the requested one.
-        // Skip the reload-handle modify entirely and report `changed=false`
-        // so callers stay silent. A no-op swap that logged at INFO is what
-        // fed the file-watch OOM loop in #1894: the log line landed in the
-        // watched dir and re-triggered the watcher.
+        // A logged no-op swap lands in the watched dir and re-triggers the watcher.
         if previous == directive {
             return Ok(SwapResult {
                 previous,
@@ -464,9 +377,6 @@ impl FilterController {
 pub struct SwapResult {
     pub previous: String,
     pub current: String,
-    /// `false` when the requested directive already matched the active one,
-    /// so the swap was a no-op. Callers gate logging and persistence on this
-    /// to avoid the self-sustaining file-watch loop (#1894).
     pub changed: bool,
 }
 
@@ -492,28 +402,14 @@ impl std::fmt::Display for LogFilterError {
 
 impl std::error::Error for LogFilterError {}
 
-/// Optional top-of-stack layer injected at subscriber init. Only the
-/// serve daemon supplies a real one (the per-session tee, see
-/// `crate::acp::session_tee`); the acp module is `serve`-gated, so without
-/// that feature the slot is the no-op `Identity` layer and callers always
-/// pass `None`.
-#[cfg(feature = "serve")]
 pub type TeeLayer = crate::acp::session_tee::SessionTeeLayer;
-#[cfg(not(feature = "serve"))]
-pub type TeeLayer = tracing_subscriber::layer::Identity;
 
 pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
     init_subscriber_with_options(target, filter, false, None)
 }
 
-/// Event formatter that mirrors the default Full output (RFC3339-ish
-/// timestamp, level, target, fields, message) but omits the span chain
-/// prefix. Used when `[logging].show_spans = false`, the project
-/// default, so that idle polling requests do not flood the log with
-/// `http_request{request_id=... method=GET path=...}` prefixes on every
-/// downstream event. The full default formatter is still available when
-/// the user opts in via the settings toggle.
-struct NoSpanFormat;
+/// Default Full output without the span chain prefix.
+pub(crate) struct NoSpanFormat;
 
 impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for NoSpanFormat
 where
@@ -539,10 +435,6 @@ where
     }
 }
 
-/// Initialize tracing with explicit formatter options. `show_spans = true`
-/// prefixes every event with the span chain (e.g. `http_request{request_id=...}`),
-/// which enables grep-correlation across async boundaries but adds noise on
-/// idle polling endpoints. `false` (the default) drops the prefix.
 pub fn init_subscriber_with_options(
     target: SubscriberTarget,
     filter: String,
@@ -560,22 +452,12 @@ pub fn init_subscriber_with_options(
     };
     let (reload_layer, handle) = reload::Layer::new(parsed);
 
-    // tracing-subscriber's default Full formatter hard-codes the span
-    // chain prefix into the event line, and the `with_current_span` /
-    // `with_span_list` toggles only exist on the JSON formatter (not on
-    // `fmt::Layer` or `format::Format<Full, _>` for non-JSON output).
-    // When `show_spans` is false we therefore install a small custom
-    // FormatEvent that emits the same timestamp / level / target /
-    // message but skips the span list. When true we install the default
-    // Full formatter.
+    // Only the JSON formatter can drop spans, so a custom FormatEvent does it here.
     let install_result = match target {
         SubscriberTarget::File(path, policy) => match SizeRotatingWriter::new(path.clone(), policy)
         {
             Ok(mut writer) => {
-                // Raw marker is written before tracing takes ownership so it
-                // appears in the file even when the user's filter would drop
-                // an info-level event. Forensic boundary; not load-bearing
-                // for the TUI dialog (which uses captured offset).
+                // Filter-immune boundary between process runs.
                 write_raw_startup_marker(&mut writer);
                 let mw = std::sync::Mutex::new(writer);
                 if show_spans {
@@ -604,8 +486,6 @@ pub fn init_subscriber_with_options(
             Err(e) => Err(format!("open log file {}: {e}", path.display())),
         },
         SubscriberTarget::Stdout => {
-            // Marker on stdout too so a piped foreground serve preserves the
-            // boundary in tools that grep the captured output.
             write_raw_startup_marker(&mut std::io::stdout());
             if show_spans {
                 let fmt_layer = tracing_subscriber::fmt::layer().with_ansi(false);
@@ -635,8 +515,6 @@ pub fn init_subscriber_with_options(
                 inner: handle,
                 current: Mutex::new(filter),
             });
-            // Best-effort tracing marker (respects user filter). Cheap to
-            // emit and useful for grep when filter allows info.
             tracing::info!(
                 target: "log.runtime",
                 version = env!("CARGO_PKG_VERSION"),
@@ -655,9 +533,6 @@ pub fn init_subscriber_with_options(
     }
 }
 
-/// Append a one-line marker directly through the writer before the tracing
-/// subscriber takes it over. Filter-immune so it survives any user level
-/// setting and gives forensic readers a boundary between process runs.
 fn write_raw_startup_marker(writer: &mut dyn Write) {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -673,19 +548,9 @@ fn write_raw_startup_marker(writer: &mut dyn Write) {
     let _ = writer.flush();
 }
 
-/// Multi-process safe size-based rotating file writer.
-///
-/// - Buffers bytes until `\n` so a rotation never splits one tracing event
-///   across `debug.log` and `debug.log.1`. A pathological 8 KiB without a
-///   newline still flushes to bound memory.
-/// - On every stat-on-tick (16 KiB written or any line >= 16 KiB), checks
-///   whether another process rotated the file out from under us via inode
-///   comparison, and reopens the current path if so.
-/// - When this process needs to rotate (file size >= threshold), takes a
-///   `fs2` advisory lock on `{path}.lock` and rotates under the lock. The
-///   OS releases the lock on process exit, so a crashed rotater never
-///   wedges future rotations. The lockfile is intentionally left on disk
-///   between rotations.
+/// Size-based rotating writer safe across processes. Buffers to `\n` so rotation never
+/// splits an event, detects another process's rotation by inode, and rotates under an
+/// `fs2` lock on `{path}.lock`, which stays on disk.
 pub struct SizeRotatingWriter {
     path: PathBuf,
     file: std::fs::File,
@@ -712,8 +577,6 @@ impl SizeRotatingWriter {
             bytes_since_stat: 0,
             line_buf: Vec::with_capacity(1024),
         };
-        // Pre-existing oversized file gets rotated at startup so the first
-        // event of a fresh run isn't appended to a stale 50 MiB file.
         let _ = writer.check_rotation();
         Ok(writer)
     }
@@ -737,9 +600,7 @@ impl SizeRotatingWriter {
             return Ok(());
         }
         self.bytes_since_stat = self.bytes_since_stat.saturating_add(line.len() as u64);
-        // Stat every STAT_TICK_BYTES OR when accumulated bytes start
-        // approaching the threshold (so a small max_size_bytes doesn't get
-        // overshot N× before the stat tick fires).
+        // Also stat near a small threshold so it is not overshot before the tick.
         let tick = STAT_TICK_BYTES.min(self.policy.max_size_bytes / 4).max(1);
         if self.bytes_since_stat >= tick || line.len() as u64 >= tick {
             let _ = self.check_rotation();
@@ -756,9 +617,6 @@ impl SizeRotatingWriter {
             Ok(meta) => {
                 let path_inode = file_inode(&meta);
                 if path_inode != self.fd_inode {
-                    // Another process rotated debug.log → debug.log.1 while we
-                    // had it open. Reopen the new current; our fd would
-                    // otherwise keep writing to the now-archived inode.
                     let (file, ino) = Self::open_and_stat(&self.path)?;
                     self.file = file;
                     self.fd_inode = ino;
@@ -769,7 +627,6 @@ impl SizeRotatingWriter {
                 }
             }
             Err(_) => {
-                // Path missing (deleted out from under us). Reopen.
                 let (file, ino) = Self::open_and_stat(&self.path)?;
                 self.file = file;
                 self.fd_inode = ino;
@@ -789,18 +646,13 @@ impl SizeRotatingWriter {
         match lock_file.try_lock_exclusive() {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Another process is rotating; let them. Bounded loss: our fd
-                // still references the file that the winner is about to
-                // rename, so events written before the next stat tick land in
-                // `.1` rather than fresh `debug.log`. The next `check_rotation`
-                // detects the inode mismatch and reopens.
+                // Another process is rotating; the next check sees the inode change and reopens.
                 return Ok(());
             }
             Err(e) => return Err(e),
         }
 
-        // Re-stat under lock to avoid double-rotation when two processes race
-        // through `check_rotation` simultaneously.
+        // Re-stat under the lock so two racing processes do not both rotate.
         let size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         if size >= self.policy.max_size_bytes {
             let _ = self.file.sync_all();
@@ -812,10 +664,7 @@ impl SizeRotatingWriter {
             }
             let dst = path_with_suffix(&self.path, ".1");
             let _ = std::fs::rename(&self.path, &dst);
-            // Sweep orphan files above the current keep_count: if the user
-            // lowered the threshold between runs, the in-place rename chain
-            // doesn't touch indices > keep. Walk upward until two consecutive
-            // misses to keep the cost bounded.
+            // Sweep indices above keep_count left behind when the user lowered it.
             let mut misses = 0;
             let mut i = u32::from(keep) + 1;
             while misses < 2 {
@@ -832,9 +681,7 @@ impl SizeRotatingWriter {
             self.file = file;
             self.fd_inode = ino;
         }
-        // fs2 releases the lock when `lock_file` drops. We deliberately
-        // leave the lockfile on disk; removing it races with another
-        // process about to open and lock it.
+        // Removing the lockfile would race another process about to lock it.
         Ok(())
     }
 }
@@ -926,16 +773,10 @@ pub fn set_level(level: LogLevel) -> Result<SwapResult, LogFilterError> {
         .set_level(level)
 }
 
-/// Path of the shared runtime-filter file inside `app_dir`. Daemon writes
-/// here on every successful swap; structured view runner subprocesses watch it
-/// with `notify` and apply the same filter to their own subscribers.
 pub fn runtime_filter_path(app_dir: &std::path::Path) -> std::path::PathBuf {
     app_dir.join("runtime_filter")
 }
 
-/// Atomically persist a filter directive to `<app_dir>/runtime_filter`.
-/// Write-and-rename so concurrent readers never see a half-written file.
-/// Owner-only permissions match the other `serve.*` artifacts.
 pub fn persist_runtime_filter(directive: &str, app_dir: &std::path::Path) {
     if let Err(e) = std::fs::create_dir_all(app_dir) {
         tracing::warn!(target: "log.runtime", error = %e, "could not create app dir for runtime_filter");
@@ -957,15 +798,6 @@ pub fn persist_runtime_filter(directive: &str, app_dir: &std::path::Path) {
     }
 }
 
-/// Background task: watch `<app_dir>/runtime_filter` and apply changes
-/// to this process's `FilterController`. Used by the structured view runner so
-/// the daemon's `aoe log-level` propagates to runners without restart.
-///
-/// Subscribes via the shared [`crate::file_watch::FileWatchService`] (one
-/// `notify::RecommendedWatcher` per process). The function holds the
-/// returned `SubscriptionHandle` for its entire lifetime; dropping the
-/// future deregisters the subscription and unwatches the directory if no
-/// other consumer needs it.
 pub async fn watch_runtime_filter(
     svc: std::sync::Arc<crate::file_watch::FileWatchService>,
     app_dir: std::path::PathBuf,
@@ -977,10 +809,8 @@ pub async fn watch_runtime_filter(
         WatchSpec {
             dir: app_dir.clone(),
             matcher: FileMatcher::Exact(target.clone()),
-            // `apply_filter_file` is idempotent; no debounce needed.
             debounce: None,
         },
-        // Capacity 4: low-rate source.
         4,
     );
     let (mut rx, _handle) = match result {
@@ -996,12 +826,8 @@ pub async fn watch_runtime_filter(
         }
     };
 
-    // Apply once at startup if the file is already there. This matches the
-    // pre-migration ordering: priming runs only AFTER subscribe succeeds.
     apply_filter_file(&target);
 
-    // Drain the channel for the lifetime of the task. `_handle` keeps the
-    // subscription alive; dropping it on function exit unsubscribes.
     while rx.recv().await.is_some() {
         apply_filter_file(&target);
     }
@@ -1017,8 +843,7 @@ fn apply_filter_file(path: &std::path::Path) {
         return;
     }
     match set_filter(directive) {
-        // No-op swaps stay silent: logging here would write into the watched
-        // dir and re-trigger the watcher (#1894).
+        // Logging here would write into the watched dir and re-trigger the watcher.
         Ok(swap) if swap.changed => tracing::info!(
             target: "log.runtime",
             previous = %swap.previous,
@@ -1034,14 +859,18 @@ fn apply_filter_file(path: &std::path::Path) {
             "runner filter swap failed"
         ),
     }
+    #[cfg(debug_assertions)]
+    if path.with_extension("observe").exists() {
+        std::fs::write(path.with_extension("applied"), directive)
+            .expect("publish e2e filter application");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Env-touching tests must serialize.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::session::test_support::EnvGuard;
 
     #[test]
     fn log_level_parse_accepts_known() {
@@ -1050,137 +879,6 @@ mod tests {
         assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
         assert_eq!(LogLevel::parse("trace "), Some(LogLevel::Trace));
         assert_eq!(LogLevel::parse("bogus"), None);
-    }
-
-    /// Build a `FilterController` backed by a reload handle, installed as
-    /// the thread-local default subscriber so the reload handle's `modify`
-    /// can upgrade its weak reference. The returned guard must outlive the
-    /// controller; the default is thread-scoped, so it does not collide
-    /// with the process-global subscriber other tests install.
-    fn test_controller(initial: &str) -> (FilterController, tracing::subscriber::DefaultGuard) {
-        let filter = EnvFilter::builder()
-            .with_regex(false)
-            .parse(initial)
-            .expect("valid initial filter");
-        let (layer, handle) = reload::Layer::new(filter);
-        let guard = tracing::subscriber::set_default(Registry::default().with(layer));
-        let controller = FilterController {
-            inner: handle,
-            current: Mutex::new(initial.to_string()),
-        };
-        (controller, guard)
-    }
-
-    #[test]
-    fn swap_reports_changed_then_noop() {
-        let (c, _guard) = test_controller("agent_of_empires=info");
-        let first = c.set_filter("agent_of_empires=debug").expect("swap ok");
-        assert!(
-            first.changed,
-            "first swap to a new directive must report changed"
-        );
-        assert_eq!(first.previous, "agent_of_empires=info");
-        assert_eq!(first.current, "agent_of_empires=debug");
-
-        // Re-applying the identical directive (the #1894 file-watch case)
-        // must be a silent no-op so callers do not log or persist.
-        let second = c.set_filter("agent_of_empires=debug").expect("swap ok");
-        assert!(!second.changed, "identical re-apply must report no-op");
-        assert_eq!(second.previous, second.current);
-        assert_eq!(c.current(), "agent_of_empires=debug");
-    }
-
-    #[test]
-    fn filter_for_level_expands_all_roots() {
-        let s = LogConfig::filter_for_level(LogLevel::Debug);
-        for root in DEFAULT_TARGET_ROOTS {
-            assert!(
-                s.contains(&format!("{root}=debug")),
-                "missing {root} in {s}"
-            );
-        }
-    }
-
-    #[test]
-    fn smart_rename_target_is_captured_by_default_filter() {
-        // The expanded filter has no global default directive, so a target that
-        // is not a known root is dropped at every level. smart_rename emits under
-        // `target: "smart_rename"`; without a root entry its skip/success lines
-        // are invisible and the feature cannot be diagnosed.
-        let s = LogConfig::filter_for_level(LogLevel::Debug);
-        assert!(
-            s.contains("smart_rename=debug"),
-            "smart_rename root missing from filter: {s}"
-        );
-    }
-
-    #[test]
-    fn filter_string_overlay_acp() {
-        let cfg = LogConfig {
-            level: Some(LogLevel::Info),
-            acp_trace: true,
-            terminal_trace: false,
-        };
-        let s = cfg.filter_string().unwrap();
-        assert!(s.contains("agent_client_protocol=debug"));
-        assert!(s.contains("transport_actor=trace"));
-    }
-
-    #[test]
-    fn filter_string_overlay_terminal() {
-        let cfg = LogConfig {
-            level: Some(LogLevel::Info),
-            acp_trace: false,
-            terminal_trace: true,
-        };
-        let s = cfg.filter_string().unwrap();
-        assert!(s.ends_with(",terminal=trace"));
-    }
-
-    #[test]
-    fn filter_string_none_when_level_unset() {
-        let cfg = LogConfig {
-            level: None,
-            acp_trace: false,
-            terminal_trace: false,
-        };
-        assert!(cfg.filter_string().is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn from_env_no_vars() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("AOE_LOG_LEVEL");
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
-        std::env::remove_var("AOE_ACP_TRACE");
-        std::env::remove_var("AOE_TERMINAL_TRACE");
-        let cfg = LogConfig::from_env();
-        assert_eq!(cfg.level, None);
-        assert!(!cfg.acp_trace);
-        assert!(!cfg.terminal_trace);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn from_env_aoe_log_level() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("AOE_LOG_LEVEL", "trace");
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
-        let cfg = LogConfig::from_env();
-        std::env::remove_var("AOE_LOG_LEVEL");
-        assert_eq!(cfg.level, Some(LogLevel::Trace));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn from_env_legacy_debug_flag() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("AOE_LOG_LEVEL");
-        std::env::set_var("AGENT_OF_EMPIRES_DEBUG", "1");
-        let cfg = LogConfig::from_env();
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
-        assert_eq!(cfg.level, Some(LogLevel::Debug));
     }
 
     fn with_test_controller<F>(initial: &str, f: F)
@@ -1201,50 +899,81 @@ mod tests {
     }
 
     #[test]
-    fn controller_swap_returns_previous() {
-        with_test_controller("info", |c| {
-            let r = c.set_level(LogLevel::Debug).unwrap();
-            assert_eq!(r.previous, "info");
-            assert!(r.current.contains("agent_of_empires=debug"));
-            assert_eq!(c.current(), r.current);
+    fn swap_reports_previous_then_noop() {
+        with_test_controller("agent_of_empires=info", |c| {
+            let first = c.set_level(LogLevel::Debug).expect("swap ok");
+            assert!(first.changed, "a new directive must report changed");
+            assert_eq!(first.previous, "agent_of_empires=info");
+            assert!(first.current.contains("agent_of_empires=debug"));
+            assert_eq!(c.current(), first.current);
+
+            let second = c.set_filter(&first.current).expect("swap ok");
+            assert!(!second.changed, "identical re-apply must report no-op");
+            assert_eq!(second.previous, second.current);
         });
     }
 
     #[test]
-    fn controller_rejects_bare_global_level() {
+    fn set_filter_validates_directives() {
         with_test_controller("info", |c| {
-            let err = c.set_filter("debug").unwrap_err();
-            assert!(matches!(err, LogFilterError::BareGlobalLevel));
-        });
-    }
-
-    #[test]
-    fn controller_accepts_targeted_filter() {
-        with_test_controller("info", |c| {
+            assert!(matches!(
+                c.set_filter("debug").unwrap_err(),
+                LogFilterError::BareGlobalLevel
+            ));
+            for bad in ["   ", "acp=notalevel"] {
+                assert!(
+                    matches!(c.set_filter(bad).unwrap_err(), LogFilterError::Invalid(_)),
+                    "{bad:?}"
+                );
+            }
+            assert_eq!(c.current(), "info", "rejected filters must not apply");
             c.set_filter("acp.protocol=trace,info").unwrap();
             assert_eq!(c.current(), "acp.protocol=trace,info");
         });
     }
 
     #[test]
-    fn controller_rejects_empty_filter() {
-        with_test_controller("info", |c| {
-            assert!(matches!(
-                c.set_filter("   ").unwrap_err(),
-                LogFilterError::Invalid(_)
-            ));
-        });
+    fn filter_string_applies_trace_overlays() {
+        let cfg = |level, acp_trace, terminal_trace| LogConfig {
+            level,
+            acp_trace,
+            terminal_trace,
+        };
+        assert!(cfg(None, true, true).filter_string().is_none());
+        let acp = cfg(Some(LogLevel::Info), true, false)
+            .filter_string()
+            .unwrap();
+        assert!(acp.contains("agent_client_protocol=debug"));
+        assert!(acp.contains("transport_actor=trace"));
+        let terminal = cfg(Some(LogLevel::Info), false, true)
+            .filter_string()
+            .unwrap();
+        assert!(terminal.ends_with(",terminal=trace"));
     }
 
     #[test]
-    fn controller_rejects_invalid_level() {
-        with_test_controller("info", |c| {
-            // Unknown level name; EnvFilter rejects.
-            assert!(matches!(
-                c.set_filter("acp=notalevel").unwrap_err(),
-                LogFilterError::Invalid(_)
-            ));
-        });
+    #[serial_test::serial]
+    fn from_env_reads_level_and_legacy_debug_flag() {
+        let vars = [
+            "AOE_LOG_LEVEL",
+            "AGENT_OF_EMPIRES_DEBUG",
+            "AOE_ACP_TRACE",
+            "AOE_TERMINAL_TRACE",
+        ];
+        let cases: [(&[(&str, &str)], Option<LogLevel>); 3] = [
+            (&[], None),
+            (&[("AOE_LOG_LEVEL", "trace")], Some(LogLevel::Trace)),
+            (&[("AGENT_OF_EMPIRES_DEBUG", "1")], Some(LogLevel::Debug)),
+        ];
+        for (set, expected) in cases {
+            let mut env = EnvGuard::unset(&vars);
+            for (key, value) in set {
+                env = env.and_set(key, value);
+            }
+            let cfg = LogConfig::from_env();
+            assert_eq!(cfg.level, expected, "{set:?}");
+            assert!(!cfg.acp_trace && !cfg.terminal_trace);
+        }
     }
 
     fn make_cfg(rotation: RotationKind, max_mib: u64, keep: u8) -> LoggingConfig {
@@ -1261,90 +990,52 @@ mod tests {
     }
 
     #[test]
-    fn resolve_log_path_relative_joins_app_dir() {
-        let cfg = make_cfg(RotationKind::Size, 50, 5);
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        assert_eq!(resolve_log_path(&cfg, &dir), dir.join("debug.log"));
-    }
-
-    #[test]
-    fn resolve_log_path_absolute_used_verbatim() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        cfg.file_path = "/var/log/aoe.log".into();
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        assert_eq!(
-            resolve_log_path(&cfg, &dir),
-            std::path::PathBuf::from("/var/log/aoe.log")
-        );
-    }
-
-    #[test]
-    fn resolve_sink_tui_with_stdout_coerces_to_file_with_warning() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        cfg.output = crate::session::config::SinkKind::Stdout;
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        let r = resolve_sink(&cfg, &dir, ProcessContext::Tui);
-        assert!(matches!(r.target, SubscriberTarget::File(_, _)));
-        assert!(r.warning.is_some(), "coercion should surface a warning");
-    }
-
-    #[test]
-    fn resolve_sink_serve_foreground_honors_stdout() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        cfg.output = crate::session::config::SinkKind::Stdout;
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        let r = resolve_sink(&cfg, &dir, ProcessContext::ServeForeground);
-        assert!(matches!(r.target, SubscriberTarget::Stdout));
-        assert!(r.warning.is_none());
-    }
-
-    #[test]
     fn rotation_writer_rotates_at_threshold() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("debug.log");
-        // 4 KiB threshold so the test runs fast.
         let policy = RotationPolicy {
             kind: RotationKind::Size,
             max_size_bytes: 4 * 1024,
             keep_count: 3,
         };
         let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        // Write 5 KiB worth of one-line events; each line forces stat-on-tick
-        // when crossing 16 KiB but actual size check uses metadata so the
-        // 4 KiB threshold triggers on the first oversized stat.
+        w.write_all(b"first half ").unwrap();
+        w.write_all(b"second half\n").unwrap();
+        w.flush().unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("first half second half\n"),
+            "split write should re-coalesce in one line, got: {contents:?}"
+        );
         for i in 0..200 {
             writeln!(&mut w, "line {i:050}").unwrap();
         }
         w.flush().unwrap();
         drop(w);
-        let rotated = path.with_extension("log.1");
-        assert!(rotated.exists(), "expected rotated file at {:?}", rotated);
+        assert!(path.with_extension("log.1").exists());
     }
 
     #[test]
-    fn rotation_writer_keeps_at_most_keep_count() {
+    fn rotation_writer_startup_rotates_and_sweeps_past_keep_count() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("debug.log");
-        // Seed pre-existing rotated files to simulate prior rotations.
-        std::fs::write(path.with_extension("log.1"), b"old 1").unwrap();
-        std::fs::write(path.with_extension("log.2"), b"old 2").unwrap();
-        std::fs::write(path.with_extension("log.3"), b"old 3").unwrap();
-        // Threshold low enough to rotate on first emit.
+        for n in 1..=5 {
+            std::fs::write(path.with_extension(format!("log.{n}")), b"old").unwrap();
+        }
+        std::fs::write(&path, vec![b'x'; 200]).unwrap();
         let policy = RotationPolicy {
             kind: RotationKind::Size,
             max_size_bytes: 64,
-            keep_count: 3,
+            keep_count: 2,
         };
-        std::fs::write(&path, vec![b'x'; 200]).unwrap();
-        let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        writeln!(&mut w, "trigger rotation now padded out to be large enough").unwrap();
-        w.flush().unwrap();
-        drop(w);
-        // .1, .2, .3 should exist; .4 should NOT.
-        assert!(
-            !path.with_extension("log.4").exists(),
-            "keep_count=3 must drop .4"
-        );
+        let _w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        for n in 1..=5 {
+            assert_eq!(
+                path.with_extension(format!("log.{n}")).exists(),
+                n <= 2,
+                ".{n} with keep_count=2"
+            );
+        }
     }
 
     #[test]
@@ -1371,86 +1062,44 @@ mod tests {
     }
 
     #[test]
-    fn rotation_writer_line_buffers_across_partial_writes() {
-        // Simulate the multi-write pattern from `tracing-subscriber::fmt`:
-        // two write() calls for the same logical event. Ensure both halves
-        // land in the same line (no rotation can split mid-line).
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-        let policy = RotationPolicy {
-            kind: RotationKind::Size,
-            max_size_bytes: 1024 * 1024,
-            keep_count: 3,
-        };
-        let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        w.write_all(b"first half ").unwrap();
-        w.write_all(b"second half\n").unwrap();
-        w.flush().unwrap();
-        drop(w);
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            contents.contains("first half second half\n"),
-            "split write should re-coalesce in one line, got: {:?}",
-            contents
-        );
+    fn resolve_log_path_joins_only_relative_paths() {
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        for (file_path, expected) in [
+            ("debug.log", dir.join("debug.log")),
+            (
+                "/var/log/aoe.log",
+                std::path::PathBuf::from("/var/log/aoe.log"),
+            ),
+        ] {
+            let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+            cfg.file_path = file_path.into();
+            assert_eq!(resolve_log_path(&cfg, &dir), expected);
+        }
     }
 
+    /// Only a foreground serve may log to stdout; the TUI owns the terminal,
+    /// so it is coerced to the file with a warning.
     #[test]
-    fn rotation_writer_startup_rotates_oversize_existing_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-        // Pre-seed oversized file.
-        std::fs::write(&path, vec![b'x'; 200]).unwrap();
-        let policy = RotationPolicy {
-            kind: RotationKind::Size,
-            max_size_bytes: 64,
-            keep_count: 3,
-        };
-        let _w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        // .1 should now exist (startup rotation triggered in new()).
-        assert!(path.with_extension("log.1").exists());
-    }
-
-    #[test]
-    fn rotation_writer_sweeps_orphans_when_keep_count_reduced() {
-        // User lowered keep_count from 5 to 2 between runs. The rename chain
-        // only touches indices 1..=keep, so .3, .4, .5 would orphan forever
-        // without the sweep.
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-        std::fs::write(path.with_extension("log.1"), b"old 1").unwrap();
-        std::fs::write(path.with_extension("log.2"), b"old 2").unwrap();
-        std::fs::write(path.with_extension("log.3"), b"old 3").unwrap();
-        std::fs::write(path.with_extension("log.4"), b"old 4").unwrap();
-        std::fs::write(path.with_extension("log.5"), b"old 5").unwrap();
-        let policy = RotationPolicy {
-            kind: RotationKind::Size,
-            max_size_bytes: 64,
-            keep_count: 2,
-        };
-        std::fs::write(&path, vec![b'x'; 200]).unwrap();
-        let _w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
-        // After startup rotation: .1 (was current), .2 (was .1) survive.
-        assert!(path.with_extension("log.1").exists(), ".1 must exist");
-        assert!(path.with_extension("log.2").exists(), ".2 must exist");
-        assert!(
-            !path.with_extension("log.3").exists(),
-            ".3 must be swept by orphan sweep"
-        );
-        assert!(
-            !path.with_extension("log.4").exists(),
-            ".4 must be swept by orphan sweep"
-        );
-        assert!(
-            !path.with_extension("log.5").exists(),
-            ".5 must be swept by orphan sweep"
-        );
+    fn resolve_sink_honors_stdout_only_outside_the_tui() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+        cfg.output = crate::session::config::SinkKind::Stdout;
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        for (context, to_stdout) in [
+            (ProcessContext::Tui, false),
+            (ProcessContext::ServeForeground, true),
+        ] {
+            let r = resolve_sink(&cfg, &dir, context);
+            assert_eq!(matches!(r.target, SubscriberTarget::Stdout), to_stdout);
+            assert_eq!(
+                r.warning.is_some(),
+                !to_stdout,
+                "coercion surfaces a warning"
+            );
+        }
     }
 
     #[test]
     fn rotation_policy_clamps_keep_count_zero_to_one() {
-        // Defense-in-depth: a hand-edited config with keep_count = 0 would
-        // otherwise yield a writer that deletes the only copy on rotation.
         let mut cfg = make_cfg(RotationKind::Size, 50, 0);
         cfg.keep_count = 0;
         let policy = RotationPolicy::from(&cfg);

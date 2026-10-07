@@ -1,46 +1,41 @@
 import { useCallback, useSyncExternalStore } from "react";
 
+import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "../lib/conversationFontSize";
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
+import { DEFAULT_TOOLBAR_KEYS, normalizeToolbarKeys, type ToolbarKeyId } from "../lib/terminalToolbarKeys";
 
 const STORAGE_KEY = "aoe-web-settings";
 
 export interface WebSettings {
   mobileFontSize: number;
   desktopFontSize: number;
+  structuredMobileFontSize: number;
+  structuredDesktopFontSize: number;
   terminalFontFamily: string;
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
   maxPersistentTerminals: number;
   diffViewMode: "flat" | "tree";
   diffViewLayout: "unified" | "split";
-  /** How Markdown files render in the file viewer: `rendered` shows formatted
-   *  HTML (default), `raw` shows the syntax-highlighted source / diff. Only
-   *  affects `.md`/`.markdown` files. Client-local. See #3088. */
   markdownPreview: "rendered" | "raw";
   collapsedDiffDirs: string[];
-  /** Which edge the session sidebar slides in from on mobile. Client-local;
-   *  desktop layout (md:static) is unaffected. See #2244. */
   sidebarSide: "left" | "right";
-  /** Compact (slim) sidebar rail: fixed narrow width, status icon + truncated
-   *  title only, trailing badges hidden. Client-local; reclaims horizontal
-   *  space on mobile/foldable without hiding the sidebar. See #2288. */
   sidebarCompact: boolean;
-  /** Auto-open the diff pane in newly opened sessions (#3035). Off keeps it
-   *  closed by default; the activity-bar toggle still opens it on demand. */
   autoOpenDiffPane: boolean;
-  /** Auto-open a terminal pane in newly opened sessions (#3035). */
   autoOpenTerminalPane: boolean;
-  /** Auto-open plugin panes (e.g. the GitHub PR pane) when available (#3035).
-   *  Unlike the diff/terminal flags this is an ongoing policy: turning it back
-   *  on can add newly available plugin panes to existing sessions too. */
   autoOpenPluginPanes: boolean;
+  /** Ordered key row above the soft keyboard in the live terminal. */
+  mobileToolbarKeys: ToolbarKeyId[];
+  showArrowJoystick: boolean;
 }
 
 function getDefaults(): WebSettings {
   return {
     mobileFontSize: 8,
     desktopFontSize: 14,
+    structuredMobileFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
+    structuredDesktopFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     terminalFontFamily: "",
     autoOpenKeyboard: true,
     persistentTerminals: false,
@@ -53,7 +48,9 @@ function getDefaults(): WebSettings {
     sidebarCompact: false,
     autoOpenDiffPane: true,
     autoOpenTerminalPane: true,
-    autoOpenPluginPanes: true,
+    autoOpenPluginPanes: false,
+    mobileToolbarKeys: [...DEFAULT_TOOLBAR_KEYS],
+    showArrowJoystick: true,
   };
 }
 
@@ -65,17 +62,16 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
   const defaults = getDefaults();
   return {
     ...settings,
-    persistentTerminals:
-      typeof settings.persistentTerminals === "boolean" ? settings.persistentTerminals : defaults.persistentTerminals,
+    persistentTerminals: normalizeBool(settings.persistentTerminals, defaults.persistentTerminals),
     maxPersistentTerminals: normalizePersistentTerminalLimit(settings.maxPersistentTerminals),
-    // localStorage is user-editable: a corrupted stringy "false" must not read
-    // truthy and silently auto-open panes the user disabled.
+    structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),
+    structuredDesktopFontSize: normalizeConversationFontSize(settings.structuredDesktopFontSize),
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
     autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
     autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),
     autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),
-    // Same reason: a corrupted value must not reach the viewer as a third state
-    // that renders neither the rendered nor the raw branch.
+    mobileToolbarKeys: normalizeToolbarKeys(settings.mobileToolbarKeys),
+    showArrowJoystick: normalizeBool(settings.showArrowJoystick, defaults.showArrowJoystick),
     markdownPreview:
       settings.markdownPreview === "rendered" || settings.markdownPreview === "raw"
         ? settings.markdownPreview
@@ -89,34 +85,21 @@ function getSnapshot(): WebSettings {
     try {
       return normalizeSnapshot({ ...getDefaults(), ...JSON.parse(raw) });
     } catch {
-      // malformed JSON; fall through to defaults
+      // Malformed JSON; use defaults.
     }
   }
   return getDefaults();
 }
 
-/** Fresh, normalized settings read outside React. Used by non-reactive code
- *  paths (e.g. the pane-layout `setStore` updater) that must read the latest
- *  prefs synchronously without subscribing, avoiding a stale closure. */
-export function getWebSettingsSnapshot(): WebSettings {
-  return getSnapshot();
-}
+export { getSnapshot as getWebSettingsSnapshot };
 
-// Subscribers for useSyncExternalStore
-let listeners: Array<() => void> = [];
+const listeners = new Set<() => void>();
 
 function subscribe(listener: () => void) {
-  listeners = [...listeners, listener];
-  return () => {
-    listeners = listeners.filter((l) => l !== listener);
-  };
+  listeners.add(listener);
+  return () => void listeners.delete(listener);
 }
 
-function emitChange() {
-  for (const l of listeners) l();
-}
-
-// Cache snapshot to return stable reference when nothing changed
 let cachedRaw: string | null = null;
 let cachedSettings: WebSettings = getDefaults();
 
@@ -139,7 +122,7 @@ export function useWebSettings() {
       console.warn("aoe-web-settings: failed to persist (storage full or disabled)");
     }
     cachedRaw = null;
-    emitChange();
+    for (const l of listeners) l();
   }, []);
 
   return { settings, update };

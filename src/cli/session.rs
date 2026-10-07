@@ -1,11 +1,14 @@
 //! `agent-of-empires session` subcommands implementation
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::session::{ClaimOp, GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
+use crate::session::{
+    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
+    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+};
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
@@ -38,14 +41,15 @@ pub enum SessionCommands {
     /// Auto-detect current session
     Current(CurrentArgs),
 
-    /// Attach another repo to an existing session, so an agent that turns out
-    /// to need a second repo can keep working in the same conversation instead
-    /// of the session being recreated. Creates a worktree for the repo and
-    /// restarts the agent so it can see it; the conversation is kept. See #3103.
+    /// Attach another repo to an existing session, creating a worktree for it
+    /// and restarting the agent. Moving the session's working directory is
+    /// refused while its resume target is a known conversation bound to that
+    /// directory. Explicitly clear the resume target to start a new conversation
+    /// after attaching. An implicitly preallocated ID is re-linked. See #3103.
     AddProject(AddProjectArgs),
 
-    /// Set the resume target for a session (pin a conversation or force a
-    /// one-shot fresh start)
+    /// Set the resume target for a session; an agent whose exact native resume
+    /// AoE cannot resolve is refused
     SetSessionId(SetSessionIdArgs),
 
     /// Set or clear the per-session diff base branch. The diff view
@@ -64,9 +68,9 @@ pub enum SessionCommands {
     /// Mark a session as a favorite. With `session.favorites_first` on (the
     /// default), favorited rows pin to the top of their sibling scope in every
     /// sort order; with it off, they pin within their status tier in the
-    /// Attention sort only. Either way the row renders with a leading `*`
-    /// marker plus bold and underline wherever the pin applies. Snoozing a
-    /// favorite suspends the pin until it wakes.
+    /// Attention sort only. Either way the row shows a `✦` in the session list
+    /// gutter wherever the pin applies. Snoozing a favorite suspends the pin
+    /// until it wakes.
     Favorite(SessionIdArgs),
 
     /// Clear the favorite flag on a session.
@@ -120,7 +124,6 @@ pub struct ImportArgs {
     /// Import as structured-view sessions (rendered in the web dashboard and
     /// the structured TUI view) instead of terminal/tmux sessions. Structured
     /// sessions replay their transcript under `aoe serve`.
-    #[cfg(feature = "serve")]
     #[arg(long)]
     pub structured: bool,
 
@@ -206,6 +209,10 @@ pub struct RenameArgs {
     /// Off by default; ignored for untied / non-worktree sessions.
     #[arg(long)]
     rename_branch: bool,
+
+    /// Rename the Git branch without moving the worktree directory
+    #[arg(long, conflicts_with = "rename_branch")]
+    branch: Option<String>,
 }
 
 #[derive(Args)]
@@ -275,10 +282,14 @@ struct CaptureOutput {
 pub struct SetSessionIdArgs {
     /// Session ID or title
     identifier: String,
-    /// Resume target: a UUID/sid pins the next launches to that
-    /// conversation; an empty string forces a one-shot fresh start (after
-    /// which the system reverts to auto-resume).
+    /// Conversation to resume. An empty string requests a one-shot fresh
+    /// start, which only a terminal session can take: a structured session
+    /// keeps its ACP conversation and needs the native ID plus an explicit
+    /// `--store` and a bound Claude conversation.
     session_id: String,
+    /// Assert the native store: a Claude store directory, or a Pi/OMP transcript file.
+    #[arg(long)]
+    store: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -305,10 +316,16 @@ pub struct SetBaseArgs {
     /// remote-qualified like `upstream/main`). Required unless
     /// `--clear` is passed.
     pub branch: Option<String>,
-    /// Clear the override and fall back to the profile default /
-    /// auto-detected base.
+    /// Clear the override and fall back to the recorded creation base,
+    /// then the profile default, then the auto-detected base.
     #[arg(long, conflicts_with = "branch")]
     pub clear: bool,
+    /// Workspace repo to set the base for, by directory name (as shown in
+    /// the diff panel and `aoe list --json`). Required on a multi-repo
+    /// workspace session, where each repo has its own base; omit it on a
+    /// single-repo session.
+    #[arg(long)]
+    pub repo: Option<String>,
 }
 
 #[derive(Args)]
@@ -329,11 +346,40 @@ struct SessionDetails {
     tool: String,
     command: String,
     status: String,
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
     profile: String,
+}
+
+fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
+    SessionDetails {
+        id: inst.id.clone(),
+        title: inst.title.clone(),
+        path: inst.project_path.clone(),
+        group: inst.group_path.clone(),
+        tool: inst.tool.clone(),
+        command: inst.command.clone(),
+        status: format!("{:?}", inst.status).to_lowercase(),
+        state: super::list::state_tag(inst),
+        trashed_at: inst.trashed_at,
+        archived_at: inst.archived_at,
+        snoozed_until: super::list::active_snoozed_until(inst),
+        pinned_at: inst.pinned_at,
+        agent_session_id: inst.agent_session_id.clone(),
+        parent_session_id: inst.parent_session_id.clone(),
+        profile: profile.to_string(),
+    }
 }
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
@@ -353,11 +399,17 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
-        SessionCommands::Favorite(args) => favorite_session(profile, args).await,
-        SessionCommands::Unfavorite(args) => unfavorite_session(profile, args).await,
+        SessionCommands::Favorite(args) => {
+            mark_session(profile, args, "Favorited", Instance::favorite).await
+        }
+        SessionCommands::Unfavorite(args) => {
+            mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
+        }
         SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
-        SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
+        SessionCommands::Unarchive(args) => {
+            mark_session(profile, args, "Unarchived", Instance::unarchive).await
+        }
         SessionCommands::Restore(args) => restore_session(profile, args).await,
         SessionCommands::Import(args) => import_sessions(profile, args).await,
         SessionCommands::ListTrash => list_trash(profile).await,
@@ -365,40 +417,32 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     }
 }
 
-async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
+/// Flips one boolean marker on a session and reports it with `verb`.
+async fn mark_session(
+    profile: &str,
+    args: SessionIdArgs,
+    verb: &str,
+    apply: fn(&mut Instance),
+) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
-            inst.favorite();
+            apply(inst);
             Ok(inst.title.clone())
         })
     })?;
-    println!("Favorited: {}", title);
-    Ok(())
-}
-
-async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.unfavorite();
-            Ok(inst.title.clone())
-        })
-    })?;
-    println!("Unfavorited: {}", title);
+    println!("{verb}: {title}");
     Ok(())
 }
 
 async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
-    // `none`/`clear`/empty clears the label; anything else must be a palette
-    // member (validated inside `Instance::set_color`).
     let normalized = args.color.trim().to_lowercase();
     let new_color = match normalized.as_str() {
         "none" | "clear" | "" => None,
         other => Some(other.to_string()),
     };
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (title, color) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.set_color(new_color.clone())
@@ -417,26 +461,26 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
 async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): resolve identifier.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
     let inst = inst.clone();
 
-    // Phase 2 (unlocked): tmux work. Agent kill split from ancillary so
-    // the CLI prints a warn on agent failure. #1868.
+    let _lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&id)
+        .context("failed to acquire instance archive lock")?;
     if !args.no_kill {
-        if let Err(e) = inst.kill() {
+        if let Err(e) = inst.kill_locked() {
             eprintln!("Warning: failed to kill agent tmux session: {}", e);
         }
-        inst.kill_ancillary_tmux_sessions();
+        inst.kill_ancillary_tmux_sessions_locked();
     }
 
-    // Phase 3 (locked, fast): set archived_at by id.
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.archive();
+            stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
             Ok(true)
         } else {
             Ok(false)
@@ -453,26 +497,9 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     }
 }
 
-async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.unarchive();
-            Ok(inst.title.clone())
-        })
-    })?;
-    println!("Unarchived: {}", title);
-    Ok(())
-}
-
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Resolve within the trashed subset only. The CLI advertises the argument
-    // as an id OR title, and a live or archived session can share a title/path
-    // with a trashed one; resolving against the full list would let that row
-    // win and make `untrash()` a silent no-op on an already-live session.
-    // See #2489.
     let (instances, _groups) = storage.load_with_groups()?;
     let trashed: Vec<_> = instances
         .iter()
@@ -484,36 +511,29 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .clone();
     let restore_id = inst.id.clone();
 
-    // Symmetric claim (#2541): win the Restore claim under the flock BEFORE the
-    // unlocked worktree move, so a concurrent purge from another process cannot
-    // tear the worktree down while this restore relocates it. A fresh Purge
-    // claim wins here and the restore bails.
-    let claim = storage.update(|instances, _groups| {
-        Ok(crate::session::claim::decide_restore_claim(
-            instances,
-            &restore_id,
-            chrono::Utc::now(),
-        ))
+    let _lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&restore_id)
+        .context("failed to acquire instance restore lock")?;
+    let decision = storage.update(|instances, _groups| {
+        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
+            .map_err(anyhow::Error::new)
     })?;
-    match claim {
+    let restore_generation = match decision {
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {
             anyhow::bail!("No trashed session matching '{}'", args.identifier)
         }
-        crate::session::claim::RestoreClaimDecision::PurgeInProgress => anyhow::bail!(
-            "Session {} is being purged by another process, so it was not restored",
-            inst.title
+        crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
+            "Session {} is {}, so it was not restored",
+            inst.title,
+            holder.busy_reason()
         ),
-        crate::session::claim::RestoreClaimDecision::Claimed => {}
-    }
+        crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
+    };
 
-    // Move the worktree back to its pre-trash location before flipping the
-    // marker. Strict: if the original path is occupied or git refuses, leave
-    // the session trashed and surface the error rather than restoring it to
-    // the holding-area path.
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
     {
-        release_restore_claim(&storage, &restore_id);
+        release_restore_reservation(&storage, &restore_id, restore_generation);
         anyhow::bail!("Cannot restore worktree: {reason}");
     }
     let restored_path = inst.project_path.clone();
@@ -523,14 +543,15 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         Ok(crate::session::claim::finalize_restore_commit(
             instances,
             &restore_id,
+            restore_generation,
             &restored_path,
             &restored_pre,
         ))
     })?;
     match commit {
         crate::session::claim::RestoreCommit::Committed => {}
-        crate::session::claim::RestoreCommit::PurgeStoleClaim => anyhow::bail!(
-            "Session {} was claimed by a purge mid-restore, so it was not restored",
+        crate::session::claim::RestoreCommit::Superseded => anyhow::bail!(
+            "Session {} lost its lifecycle reservation during restore",
             inst.title
         ),
         crate::session::claim::RestoreCommit::AlreadyGone => {
@@ -541,12 +562,13 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Release a Restore claim after a failed worktree move, ownership-guarded so a
-/// peer's fresh Purge claim (stale-override) is never cleared. See #2541.
-fn release_restore_claim(storage: &Storage, restore_id: &str) {
+fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: u64) {
     let _ = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == restore_id) {
-            stored.clear_op_claim_if_owned(ClaimOp::Restore);
+        if let Some(stored) = instances
+            .iter_mut()
+            .find(|instance| instance.id == restore_id)
+        {
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
         }
         Ok(())
     });
@@ -574,69 +596,40 @@ async fn list_trash(profile: &str) -> Result<()> {
 async fn empty_trash(profile: &str) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): snapshot the trashed sessions and run the slow
-    // teardown for each. Purge is permanent; force removal so a dirty
-    // worktree cannot keep an emptied session pinned in the trash.
     let (instances, _groups) = storage.load_with_groups()?;
-    let trashed: Vec<_> = instances
+    let mut trashed: Vec<_> = instances
         .iter()
         .filter(|i| i.is_trashed())
         .cloned()
         .collect();
+    for instance in &mut trashed {
+        instance.source_profile = storage.profile().to_string();
+    }
+    trashed.sort_by(|left, right| left.id.cmp(&right.id));
     if trashed.is_empty() {
         println!("Trash is empty.");
         return Ok(());
     }
 
-    let mut purged_ids = Vec::new();
-    // Rows we claimed and tore down but whose teardown/transcript purge failed:
-    // genuinely kept for retry (distinct from rows a peer is restoring). See #2541.
-    let mut claimed_failed_ids = Vec::new();
-    // Rows a peer is restoring: either it holds a fresh Restore claim
-    // (RestoreInProgress) or it already un-trashed the row before our claim
-    // (Restored). Either way we never tore anything down, so they are benign and
-    // reported as one figure.
+    let mut removed = 0usize;
+    let mut restored_after_teardown = 0usize;
+    let mut kept_for_retry = 0usize;
     let mut being_restored_elsewhere = 0usize;
+    let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
-        // Per-row claim just before each teardown (#2541), via the shared
-        // decision. A single up-front batch claim would risk overrunning the
-        // TTL for late rows in a large empty-trash; claiming per row keeps every
-        // teardown inside a fresh claim. Only a `Claimed` decision tears down;
-        // every other outcome is skipped and counted for an honest report.
-        let claim = storage.update(|all_instances, _groups| {
-            Ok(crate::session::claim::decide_purge_claim(
-                all_instances,
-                &inst.id,
-                true,
-                chrono::Utc::now(),
-            ))
-        })?;
-        match claim {
-            crate::session::claim::PurgeClaimDecision::Claimed => {}
-            crate::session::claim::PurgeClaimDecision::RestoreInProgress
-            | crate::session::claim::PurgeClaimDecision::Restored => {
-                being_restored_elsewhere += 1;
-                continue;
-            }
-            crate::session::claim::PurgeClaimDecision::AlreadyGone => continue,
-        }
-
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&inst.project_path),
         );
         let delete_worktree =
             config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
-        // Tie branch deletion to worktree deletion + config so it also fires
-        // for multi-repo workspace sessions (which have no `worktree_info`);
-        // `perform_deletion` keys the workspace-repo branch cleanup off this
-        // same flag. See #2489.
         let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
         let delete_sandbox =
             inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
-
-        let result = crate::session::deletion::perform_deletion(
-            &crate::session::deletion::DeletionRequest {
+        let row_storage = Storage::open_unwatched(profile)?;
+        let reservation = crate::session::deletion::PurgeTransaction::reserve(
+            row_storage,
+            crate::session::deletion::DeletionRequest {
                 session_id: inst.id.clone(),
                 instance: inst.clone(),
                 delete_worktree,
@@ -646,51 +639,51 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 detach_hooks: false,
                 keep_scratch: false,
             },
-        );
+        )?;
+        let transaction = match reservation {
+            crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
+            crate::session::deletion::PurgeReservation::Rejected(result) => {
+                match result.disposition {
+                    crate::session::deletion::DeletionDisposition::KeptRestored => {
+                        being_restored_elsewhere += 1;
+                    }
+                    crate::session::deletion::DeletionDisposition::Busy => {
+                        being_purged_elsewhere += 1;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        };
+        let result = transaction.run_hooks().complete_with(|instance| {
+            super::purge_acp_transcript(instance).map_err(|error| {
+                format!("transcript not purged, keeping session in trash: {error}")
+            })
+        });
         for err in &result.errors {
             eprintln!("Warning ({}): {}", inst.title, err);
         }
-        // Only after teardown succeeded: purge the durable structured-view
-        // transcript (the daemon does this via the supervisor; the CLI opens
-        // the event store directly since it has no live worker) and drop the
-        // session row. Doing the irreversible transcript delete last keeps a
-        // failed purge fully restorable, and keeping the row on failure (here
-        // or in perform_deletion) lets the orphaned worktree/container/
-        // transcript be retried instead of abandoned. See #2489.
-        if result.success {
-            match super::purge_acp_transcript(inst) {
-                Ok(()) => purged_ids.push(inst.id.clone()),
-                Err(e) => {
-                    eprintln!(
-                        "Warning ({}): transcript not purged, keeping session in trash: {}",
-                        inst.title, e
-                    );
-                    claimed_failed_ids.push(inst.id.clone());
+        match result.disposition {
+            crate::session::deletion::DeletionDisposition::Removed => removed += 1,
+            crate::session::deletion::DeletionDisposition::KeptRestored => {
+                if result.teardown_started {
+                    restored_after_teardown += 1;
+                } else {
+                    being_restored_elsewhere += 1;
                 }
             }
-        } else {
-            claimed_failed_ids.push(inst.id.clone());
+            crate::session::deletion::DeletionDisposition::Busy => {
+                being_purged_elsewhere += 1;
+            }
+            crate::session::deletion::DeletionDisposition::Failed => kept_for_retry += 1,
+            crate::session::deletion::DeletionDisposition::AlreadyGone => {}
         }
     }
-
-    // Phase 2 (locked): drop every successfully-purged id from the latest disk
-    // state. #2534: revalidate under the lock; a candidate restored mid-purge
-    // (no longer trashed) must survive even though its teardown already ran on
-    // the snapshot. #2527: report the count actually removed, not the candidate
-    // count. `kept_for_retry` counts only rows we claimed whose teardown failed,
-    // NOT rows a peer is restoring (those are reported separately). See #2541.
-    let purged_set: HashSet<String> = purged_ids.into_iter().collect();
-    let claimed_failed_set: HashSet<String> = claimed_failed_ids.into_iter().collect();
-    let outcome = storage.update(|all_instances, _groups| {
-        Ok(super::finalize_empty_trash(
-            all_instances,
-            &purged_set,
-            &claimed_failed_set,
-        ))
-    })?;
-    // A restore that raced our teardown (after it began) is the only case that
-    // risks orphaned artifacts, so it gets the repair warning; benign
-    // being-restored-elsewhere rows (no teardown ran) do not.
+    let outcome = super::EmptyTrashOutcome {
+        removed,
+        restored_after_teardown,
+        kept_for_retry,
+    };
     if outcome.restored_after_teardown > 0 {
         eprintln!(
             "Warning: {} session(s) were restored mid-purge after teardown began; kept the \
@@ -699,8 +692,6 @@ async fn empty_trash(profile: &str) -> Result<()> {
             outcome.restored_after_teardown
         );
     }
-    // Each figure is its own disjoint category, so the "restored mid-purge"
-    // count matches the warning above exactly (no summary/warning mismatch).
     let mut parts = vec![format!("purged {} session(s)", outcome.removed)];
     if outcome.kept_for_retry > 0 {
         parts.push(format!("kept {} for retry", outcome.kept_for_retry));
@@ -708,6 +699,11 @@ async fn empty_trash(profile: &str) -> Result<()> {
     if being_restored_elsewhere > 0 {
         parts.push(format!(
             "{being_restored_elsewhere} being restored by another process"
+        ));
+    }
+    if being_purged_elsewhere > 0 {
+        parts.push(format!(
+            "{being_purged_elsewhere} being purged by another process"
         ));
     }
     if outcome.restored_after_teardown > 0 {
@@ -725,11 +721,8 @@ async fn empty_trash(profile: &str) -> Result<()> {
 }
 
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
-    let config = crate::session::profile_config::resolve_config(profile)?;
+    let config = crate::session::config::profile_config::resolve_config(profile)?;
 
-    // `--minutes` overrides the profile default; otherwise use the
-    // configured `snooze_duration_minutes`. Validate either way so the
-    // on-disk config can't sneak in an out of range value.
     let raw_minutes = args
         .minutes
         .map(|m| m as u64)
@@ -763,40 +756,14 @@ async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): snapshot the target by identifier, rehydrate
-    // `source_profile` so config resolution honors the right profile.
-    // `source_profile` is runtime-only (skip_serializing) so storage-loaded
-    // instances always come back blank.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "start")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    // Snapshot the sid for the same reason `restart_session` does: a persisted
-    // `ResumeIntent::Cleared` (from `aoe session set-session-id <id> ""`) makes
-    // `acquire_session_id` drop it on this launch, but the abandoned rollout
-    // lingers and stays newest-by-mtime, so the fresh poller's immediate first
-    // poll can re-observe it and the drain below would silently revert the
-    // user's clear.
-    let prior_sid = working.agent_session_id.clone();
+    let _ = working.start_with_size_opts(crate::terminal::get_size(), false)?;
 
-    // Phase 2 (unlocked): tmux work happens outside the cross-process flock
-    // so a slow agent startup does not block peer mutators on the same
-    // profile (daemon poller, sibling CLI invocations).
-    working.start_with_size(crate::terminal::get_size())?;
-
-    // Cleared on this launch, so the sid we came in with is abandoned.
-    if working.agent_session_id.is_none() {
-        if let Some(sid) = prior_sid {
-            working.retroactive_capture_excludes.insert(sid);
-        }
-    }
-
-    // The CLI has no long-lived loop to drain the just-started session-id
-    // poller, so a capture-deferred agent would exit with agent_session_id unset
-    // and silently lose resume. Wait briefly for the poller and persist via the
-    // same drain the TUI/daemon use.
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
         &mut working,
@@ -808,8 +775,9 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let title = working.title.clone();
     let id = working.id.clone();
 
-    // Phase 3 (locked, fast): merge the post-start instance back by id, so
-    // any concurrent mutation to OTHER sessions during phase 2 is preserved.
+    let _merge_lock = storage
+        .acquire_instance_lifecycle_lock(&id)
+        .context("failed to acquire instance start merge lock")?;
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.merge_post_start(&working);
@@ -834,16 +802,6 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Acp-mode sessions are not backed by tmux; their ACP worker is owned
-/// by `aoe serve`'s supervisor (auto-spawned by the reconciler within ~2s
-/// of the session appearing on disk). Calling `start`/`stop`/`restart`
-/// from the CLI silently no-ops, which previously misled users into
-/// thinking the session was up. Bail loudly with the actual remediation.
-///
-/// `structured_view` is gated behind the `serve` feature; without it the
-/// field doesn't exist on `Instance` and no session can be in structured view
-/// mode, so this is a no-op shim.
-#[cfg(feature = "serve")]
 fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
     if inst.is_structured() {
         bail!(
@@ -857,15 +815,6 @@ fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "serve"))]
-fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
-    Ok(())
-}
-
-/// Resolve the scan roots for `aoe session import`. Empty input means the
-/// current directory. Each root is canonicalized (falling back to the path as
-/// given if it does not resolve) so the component-aware filter compares against
-/// absolute paths.
 fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
     let raw: Vec<std::path::PathBuf> = if paths.is_empty() {
         vec![std::env::current_dir()?]
@@ -878,9 +827,6 @@ fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
         .collect())
 }
 
-/// True when `id` is already imported by some instance, so a re-run does not
-/// create duplicates. Checks the terminal resume target, the poller-observed
-/// id, and (serve builds) the structured-view id.
 fn already_imported(instances: &[Instance], id: &str) -> bool {
     instances.iter().any(|inst| {
         if inst.agent_session_id.as_deref() == Some(id) {
@@ -889,7 +835,6 @@ fn already_imported(instances: &[Instance], id: &str) -> bool {
         if matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id) {
             return true;
         }
-        #[cfg(feature = "serve")]
         if inst.acp_session_id.as_deref() == Some(id) {
             return true;
         }
@@ -897,14 +842,11 @@ fn already_imported(instances: &[Instance], id: &str) -> bool {
     })
 }
 
-/// Build the AoE `Instance` for one discovered Claude session. Terminal imports
-/// pin `resume_intent` so the first launch emits `claude --resume <id>`;
-/// structured imports (serve only) seed the fields the reconciler reads to
-/// replay the transcript.
 fn build_import_instance(
     s: &crate::session::claude_import::ClaudeSessionSummary,
     structured: bool,
     group: &str,
+    session_config: &crate::session::config::SessionConfig,
 ) -> Instance {
     let title = s.title.clone().unwrap_or_else(|| {
         let short = s.session_id.get(..8).unwrap_or(s.session_id.as_str());
@@ -912,6 +854,7 @@ fn build_import_instance(
     });
     let mut inst = Instance::new(&title, &s.cwd);
     inst.tool = "claude".to_string();
+    crate::session::builder::apply_agent_launch_config(&mut inst, session_config, "", "", None);
     if !group.is_empty() {
         inst.group_path = group.to_string();
     }
@@ -919,7 +862,6 @@ fn build_import_instance(
     inst
 }
 
-#[cfg(feature = "serve")]
 fn apply_import_mode(
     inst: &mut Instance,
     s: &crate::session::claude_import::ClaudeSessionSummary,
@@ -931,40 +873,40 @@ fn apply_import_mode(
         inst.import_pending = Some(true);
     } else {
         inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: s.session_id.clone(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![s.config_dir.clone()],
+                configuration: Vec::new(),
+                cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
+                filesystem: "host".into(),
+                cwd_filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: crate::session::ConversationProvenance::Imported,
+            transcript_path: None,
+        });
     }
 }
 
-#[cfg(not(feature = "serve"))]
-fn apply_import_mode(
-    inst: &mut Instance,
-    s: &crate::session::claude_import::ClaudeSessionSummary,
-    _structured: bool,
-) {
-    inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
-}
-
 async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
-    use crate::session::claude_import::{scan_sessions, sessions_under_paths, MAX_SESSIONS};
+    use crate::session::claude_import::{scan_sessions, sessions_under_paths};
+    use crate::session::import::{worktree_dir_markers, Owned, MAX_SESSIONS};
 
-    #[cfg(feature = "serve")]
     let structured = args.structured;
-    #[cfg(not(feature = "serve"))]
-    let structured = false;
 
-    // Discover, then narrow to the requested paths unless --all.
+    let provisioned = Owned::new(&[], worktree_dir_markers());
     let mut discovered = scan_sessions();
+    discovered.retain(|s| !provisioned.excludes(&s.session_id, &s.cwd));
     if !args.all {
         let roots = resolve_import_roots(&args.paths)?;
         discovered = sessions_under_paths(discovered, &roots);
     }
 
-    // A session whose recorded cwd no longer exists cannot be resumed:
-    // `claude --resume` resolves the transcript by cwd, so a dead cwd would
-    // silently start a fresh conversation. Skip and report those.
     let (candidates, missing_cwd): (Vec<_>, Vec<_>) =
         discovered.into_iter().partition(|s| s.cwd_exists);
 
-    // Dedupe against sessions already imported into this profile.
     let (existing, _groups) = Storage::open_unwatched(profile)?.load_with_groups()?;
     let candidate_count = candidates.len();
     let mut to_import: Vec<_> = candidates
@@ -973,7 +915,6 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         .collect();
     let already = candidate_count - to_import.len();
 
-    // Bulk safety backstop; the picker cap also applies to the CLI.
     let capped = to_import.len() > MAX_SESSIONS;
     if capped {
         to_import.truncate(MAX_SESSIONS);
@@ -1030,15 +971,24 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
 
     let group = args.group.clone().unwrap_or_default();
+    let session_configs: Vec<_> = to_import
+        .iter()
+        .map(|s| {
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                std::path::Path::new(&s.cwd),
+            )
+            .session
+        })
+        .collect();
     let storage = Storage::open_unwatched(profile)?;
     let created_ids = storage.update(|all_instances, groups| {
         let mut ids = Vec::new();
-        for s in &to_import {
-            // Re-check under the lock so a concurrent import does not duplicate.
+        for (s, session_config) in to_import.iter().zip(&session_configs) {
             if already_imported(all_instances, &s.session_id) {
                 continue;
             }
-            let inst = build_import_instance(s, structured, &group);
+            let inst = build_import_instance(s, structured, &group, session_config);
             ids.push(inst.id.clone());
             all_instances.push(inst.clone());
             if !inst.group_path.is_empty() {
@@ -1071,9 +1021,6 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
-/// Start freshly imported terminal sessions, spawning each tmux pane. Mirrors
-/// `start_session`'s three-phase pattern; failures are reported per session and
-/// do not abort the rest.
 fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let file_watch = crate::file_watch::FileWatchService::noop();
@@ -1084,19 +1031,10 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
         };
         let mut working = inst.clone();
         working.source_profile = profile.to_string();
-        // See `start_session`: a cleared sid whose rollout is still newest on
-        // disk would be re-adopted by the drain below.
-        let prior_sid = working.agent_session_id.clone();
         if let Err(e) = working.start_with_size(crate::terminal::get_size()) {
             eprintln!("Warning: failed to start {}: {e}", working.title);
             continue;
         }
-        if working.agent_session_id.is_none() {
-            if let Some(sid) = prior_sid {
-                working.retroactive_capture_excludes.insert(sid);
-            }
-        }
-        // Persist the poller-observed id before exit (see start_session).
         crate::session::sync::capture_launched_session_id_blocking(
             &mut working,
             &file_watch,
@@ -1115,21 +1053,14 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// CLI handler for `aoe session stop`.
-///
-/// Treats a docker inspect failure ([`crate::containers::Probe::Unknown`])
-/// as "possibly running" so the session stop proceeds rather than printing
-/// "Session is not running" against a container whose state cannot be
-/// confirmed. The `warn!` for the Unknown case is emitted inside
-/// [`crate::session::Instance::stop`], so this call site does not re-warn.
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): resolve identifier, do tmux/container shutdown.
-    // Loaded snapshot is read-only here; the persistence happens in phase 2.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "stop")?;
+    let mut working = inst.clone();
+    working.source_profile = profile.to_string();
     let session_id = inst.id.clone();
     let title = inst.title.clone();
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
@@ -1145,19 +1076,9 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         return Ok(());
     }
 
-    inst.stop()?;
+    working.stop()?;
 
-    // Phase 2 (locked): persist Stopped status by id so it survives TUI
-    // restarts. Field-level merge preserves any concurrent mutation that
-    // landed between phase 1 and phase 2.
-    let landed = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
-            stored.status = crate::session::Status::Stopped;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    })?;
+    let landed = storage.load()?.iter().any(|stored| stored.id == session_id);
     if !landed {
         bail!(
             "Session {} was removed by another process before stop could land",
@@ -1187,9 +1108,6 @@ async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()
 async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): snapshot the targets. We don't hold the flock
-    // across the parallel restart fan-out below; phase 3 re-loads under
-    // the lock and merges by id.
     let (instances, _groups) = storage.load_with_groups()?;
     let target_ids = pick_targets_for_restart_all(&instances);
     if target_ids.is_empty() {
@@ -1201,11 +1119,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let size = crate::terminal::get_size();
     let parallel = parallel.max(1);
 
-    // Clone each target into its worker. `source_profile` is runtime-only
-    // (skip_serializing) so storage-loaded instances always come back
-    // blank; rehydrate it from the storage profile so start-time config
-    // resolution honors the right profile's overrides (sandbox.environment,
-    // on_launch hooks, etc.).
     let mut targets: Vec<crate::session::Instance> = Vec::with_capacity(total);
     for id in &target_ids {
         if let Some(inst) = instances.iter().find(|i| &i.id == id) {
@@ -1222,7 +1135,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         Result<StartOutcome>,
     )> = tokio::task::JoinSet::new();
 
-    // Phase 2 (unlocked): parallel tmux restarts.
     for mut inst in targets {
         let permit_sem = semaphore.clone();
         join_set.spawn(async move {
@@ -1232,21 +1144,8 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 .expect("semaphore not closed");
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
-                let prior_sid = inst.agent_session_id.clone();
                 let result = inst.restart_with_size(size);
-                // Drain the fresh poller so a fresh-relaunched capture-deferred
-                // agent persists its new agent_session_id. No-op for Resumed /
-                // ResumeFailed. In spawn_blocking: off the runtime, parallel,
-                // bounded by the semaphore.
                 if result.is_ok() {
-                    if matches!(
-                        result,
-                        Ok(StartOutcome::Fresh) | Ok(StartOutcome::FreshAfterFailedResume { .. })
-                    ) {
-                        if let Some(sid) = prior_sid {
-                            inst.retroactive_capture_excludes.insert(sid);
-                        }
-                    }
                     let file_watch = crate::file_watch::FileWatchService::noop();
                     crate::session::sync::capture_launched_session_id_blocking(
                         &mut inst,
@@ -1273,8 +1172,16 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut fresh_after_failed_resume: Vec<(String, String)> = Vec::new();
     let mut restarted: Vec<crate::session::Instance> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let (title, inst_opt, result) = joined.expect("JoinSet shouldn't panic on join itself");
+        // Archived or trashed after selection: the launch refused before touching anything.
+        if let Err(e) = &result {
+            if let Some(blocked) = e.downcast_ref::<crate::session::StartBlocked>() {
+                skipped.push((title, blocked.to_string()));
+                continue;
+            }
+        }
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
         if let Some(inst) = inst_opt {
             restarted.push(inst);
@@ -1293,11 +1200,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         }
     }
 
-    // Phase 3 (locked, fast): merge each restarted instance by id into the
-    // freshly-loaded persisted state. Concurrent mutations to OTHER
-    // sessions during phase 2 (status updates from a parallel daemon
-    // poller, sibling CLI invocations, ...) are preserved because the
-    // closure receives the latest disk state.
     let orphaned: Vec<(String, String)> = storage.update(|instances, _groups| {
         let mut orphaned = Vec::new();
         for restarted_inst in restarted {
@@ -1315,7 +1217,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         Ok(orphaned)
     })?;
 
-    // Sessions can share a title across paths; orphan filter keys on id.
     let orphaned_ids: HashSet<&String> = orphaned.iter().map(|(id, _)| id).collect();
     succeeded.retain(|(id, _)| !orphaned_ids.contains(id));
 
@@ -1341,6 +1242,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             println!("  · {}", title);
         }
     }
+    if !skipped.is_empty() {
+        println!("⏭ {} skipped:", skipped.len());
+        for (title, reason) in &skipped {
+            println!("  · {}: {}", title, reason);
+        }
+    }
     if !failed.is_empty() {
         println!("✗ {} failed:", failed.len());
         for (title, err) in &failed {
@@ -1352,97 +1259,68 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     Ok(())
 }
 
-/// Sessions in `Deleting` or `Creating` are mid-transition; restarting them
-/// would race the deletion/boot path. Acp-mode sessions are skipped
-/// because their lifecycle is owned by `aoe serve`'s supervisor, not
-/// tmux: a CLI-side restart would no-op silently and (with the explicit
-/// bail in `restart_session`) flood `--all` with per-session errors.
-/// Everything else is fair game; agents have their own resume-or-restart
-/// logic on the next start.
 fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<String> {
     use crate::session::Status;
     instances
         .iter()
         .filter(|i| !matches!(i.status, Status::Deleting | Status::Creating))
-        .filter(|_i| {
-            #[cfg(feature = "serve")]
-            {
-                !_i.is_structured()
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                true
-            }
-        })
+        .filter(|i| !i.is_structured() && i.ensure_startable().is_ok())
         .map(|i| i.id.clone())
         .collect()
+}
+
+/// Type the restart wake message under the input lock, so an archive or trash that landed after
+/// the relaunch wins and nothing is typed into the shelved pane.
+fn send_restart_wake(
+    working: &Instance,
+    tmux_session: &crate::tmux::Session,
+    wake_msg: &str,
+) -> Result<bool> {
+    if !tmux_session.exists() {
+        return Ok(false);
+    }
+    let _input_lock = working.lock_for_input()?;
+    let delay = crate::agents::send_keys_enter_delay(&working.tool);
+    tmux_session.send_keys_with_delay(wake_msg, delay)?;
+    Ok(true)
 }
 
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): snapshot the target by identifier and
-    // rehydrate `source_profile` for config resolution.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "restart")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    // Snapshot the sid before `restart_with_size` clears it on a forced-fresh
-    // path: the abandoned rollout lingers and stays newest-by-mtime, so the
-    // fresh poller can re-observe it. Excluded below so the drain rejects it.
-    let prior_sid = working.agent_session_id.clone();
-
-    // Phase 2 (unlocked): tmux restart, agent boot, optional wake-up
-    // send-keys. Slow; the cross-process flock is not held here so peer
-    // mutators on this profile are not starved.
-    let outcome = working.restart_with_size(crate::terminal::get_size())?;
+    let outcome = working.restart_with_resume_policy(
+        crate::terminal::get_size(),
+        false,
+        crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+    )?;
     let title = working.title.clone();
     let session_id = working.id.clone();
     let tool = working.tool.clone();
 
-    // Resolve the configured wake message (global default with per-profile
-    // override). Empty string is the documented opt-out: the restart still
-    // runs but no keys are sent.
     let wake_msg = crate::session::resolve_config(profile)
         .map(|c| c.session.restart_wake_message.clone())
         .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
 
     let mut wake_succeeded = false;
     if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
-        // Restart re-execs the agent at a blank prompt; nudge it back into
-        // its prior task. Poll capture-pane for steady-state output instead
-        // of a blind sleep, so the keys land as soon as the agent is at a
-        // prompt and don't get stranded mid-banner on slow machines.
-        wait_for_pane_ready(&session_id, &title, std::time::Duration::from_secs(5)).await;
-
         let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
-        if tmux_session.exists() {
-            let delay = crate::agents::send_keys_enter_delay(&tool);
-            match tmux_session.send_keys_with_delay(&wake_msg, delay) {
-                Ok(()) => {
-                    wake_succeeded = true;
-                }
-                Err(e) => {
-                    eprintln!("Warning: failed to send wake-up message: {}", e);
-                }
-            }
+        tmux_session.wait_until_ready(
+            std::time::Duration::from_secs(5),
+            crate::agents::ready_marker(&tool),
+        );
+
+        match send_restart_wake(&working, &tmux_session, &wake_msg) {
+            Ok(sent) => wake_succeeded = sent,
+            Err(e) => eprintln!("Warning: failed to send wake-up message: {}", e),
         }
     }
 
-    // Restart starts a fresh session-id poller; a capture-deferred agent that
-    // relaunches fresh mints a new agent_session_id no CLI loop would drain.
-    // Same drain as `session start`; no-op for Resumed (sid kept) and
-    // ResumeFailed (poller cleared). After the wake wait, so it is usually ready.
-    if matches!(
-        outcome,
-        StartOutcome::Fresh | StartOutcome::FreshAfterFailedResume { .. }
-    ) {
-        if let Some(sid) = prior_sid {
-            working.retroactive_capture_excludes.insert(sid);
-        }
-    }
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
         &mut working,
@@ -1451,13 +1329,14 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         true,
     );
 
-    // touch_last_accessed runs on `stored`, not `working`: its fields are
-    // peer-mutable and do not belong in `merge_post_restart`.
+    let _merge_lock = storage
+        .acquire_instance_lifecycle_lock(&session_id)
+        .context("failed to acquire instance restart merge lock")?;
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
             stored.merge_post_restart(&working);
             if wake_succeeded {
-                stored.touch_last_accessed();
+                stored.touch_after_input();
             }
             Ok(true)
         } else {
@@ -1493,30 +1372,14 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Poll the tmux pane until capture-pane content stops changing for two
-/// consecutive samples (the agent has finished printing its startup banner
-/// and is sitting at a prompt) or `max_wait` elapses. Failsafe: always
-/// returns by `max_wait` so the caller's send-keys still runs even if the
-/// pane never settles.
-async fn wait_for_pane_ready(session_id: &str, title: &str, max_wait: std::time::Duration) {
-    let Ok(tmux) = crate::tmux::Session::new(session_id, title) else {
-        return;
-    };
-    let poll_interval = std::time::Duration::from_millis(200);
-    let start = std::time::Instant::now();
-    let mut last: Option<String> = None;
-    while start.elapsed() < max_wait {
-        tokio::time::sleep(poll_interval).await;
-        let Ok(now) = tmux.capture_pane(5) else {
-            continue;
-        };
-        if now.trim().len() > 20 {
-            if last.as_deref() == Some(&now) {
-                return;
-            }
-            last = Some(now);
-        }
-    }
+fn supervise_attach_capture(
+    inst: &mut Instance,
+    attach: impl FnOnce(&Instance) -> Result<()>,
+) -> Result<()> {
+    inst.maybe_start_poller();
+    let result = attach(inst);
+    inst.stop_and_flush_poller();
+    result
 }
 
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -1534,8 +1397,9 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
-    tmux_session.attach()?;
-    Ok(())
+    let mut working = inst.clone();
+    working.source_profile = profile.to_string();
+    supervise_attach_capture(&mut working, |_| tmux_session.attach())
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
@@ -1545,7 +1409,6 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     let mut inst = if let Some(id) = &args.identifier {
         super::resolve_session(id, &instances)?.clone()
     } else {
-        // Auto-detect from tmux
         let current_session = std::env::var("TMUX_PANE")
             .ok()
             .and_then(|_| crate::tmux::get_current_session_name());
@@ -1562,28 +1425,17 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
         }
     };
+    inst.source_profile = storage.profile().to_string();
 
-    // Refresh status from tmux so the output reflects current state
-    // rather than the stale persisted value.
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
+
     crate::tmux::refresh_session_cache();
-    inst.update_status();
+    inst.update_status_once(None, None);
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
     inst.self_heal_session_id(profile, &contended);
 
     if args.json {
-        let details = SessionDetails {
-            id: inst.id.clone(),
-            title: inst.title.clone(),
-            path: inst.project_path.clone(),
-            group: inst.group_path.clone(),
-            tool: inst.tool.clone(),
-            command: inst.command.clone(),
-            status: format!("{:?}", inst.status).to_lowercase(),
-            agent_session_id: inst.agent_session_id.clone(),
-            parent_session_id: inst.parent_session_id.clone(),
-            profile: storage.profile().to_string(),
-        };
-        super::output::print_json(&details)?;
+        super::output::print_json(&session_details(&inst, storage.profile()))?;
     } else {
         println!("Session: {}", inst.title);
         println!("  ID:      {}", inst.id);
@@ -1592,13 +1444,42 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
         println!("  Tool:    {}", inst.tool);
         println!("  Command: {}", inst.command);
         println!("  Status:  {:?}", inst.status);
+        if let Some(at) = inst.trashed_at.or(inst.archived_at) {
+            println!(
+                "  State:   {} ({})",
+                super::list::state_tag(&inst),
+                at.to_rfc3339()
+            );
+        }
         println!("  Profile: {}", storage.profile());
-        if let Some(parent_id) = &inst.parent_session_id {
-            println!("  Parent:  {}", parent_id);
+        for line in relationship_lines(&inst, &instances) {
+            println!("{line}");
         }
     }
 
     Ok(())
+}
+
+fn relationship_lines(
+    inst: &crate::session::Instance,
+    instances: &[crate::session::Instance],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(parent_id) = &inst.parent_session_id {
+        lines.push(match instances.iter().find(|i| &i.id == parent_id) {
+            Some(parent) => format!("  Parent:  {} ({parent_id})", parent.title),
+            None => format!("  Parent:  {parent_id}"),
+        });
+    }
+    let mut children = instances
+        .iter()
+        .filter(|i| i.parent_session_id.as_deref() == Some(inst.id.as_str()))
+        .peekable();
+    if children.peek().is_some() {
+        lines.push("  Children:".to_string());
+        lines.extend(children.map(|child| format!("    {} ({})", child.title, child.id)));
+    }
+    lines
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
@@ -1624,36 +1505,58 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         }
     };
 
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
+
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     let (content, status) = if !tmux_session.exists() {
         (String::new(), "stopped".to_string())
     } else {
         let raw = tmux_session.capture_pane(args.lines)?;
-        let detection_tool = if inst.detect_as.is_empty() {
+        let hook_alias =
+            crate::tmux::status_rules::effective_detect_as(profile, &inst.tool, &inst.detect_as);
+        let manifest_tool: &str = if hook_alias.is_empty() {
             &inst.tool
         } else {
-            &inst.detect_as
+            &hook_alias
         };
-        let status = if let Some(hook_status) = crate::hooks::read_hook_status(&inst.id) {
-            if detection_tool == "codex" && hook_status == crate::session::Status::Running {
-                let status_raw;
-                let status_content = if args.lines >= 50 {
-                    raw.as_str()
-                } else {
-                    status_raw = tmux_session
-                        .capture_pane(50)
-                        .unwrap_or_else(|_| raw.clone());
-                    status_raw.as_str()
-                };
-                crate::tmux::reconcile_codex_hook_status(hook_status, status_content)
-            } else {
-                hook_status
+        let rules_tool =
+            crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
+        let hook = crate::hooks::read_hook_status(&inst.id).map(|status| {
+            crate::tmux::detect::HookObservation {
+                status,
+                age: crate::hooks::read_hook_status_age(&inst.id),
             }
+        });
+        let status = if crate::tmux::detect::has_manifest(manifest_tool) {
+            let status_raw;
+            let status_content = if args.lines >= 50 {
+                raw.as_str()
+            } else {
+                status_raw = tmux_session
+                    .capture_pane(50)
+                    .unwrap_or_else(|_| raw.clone());
+                status_raw.as_str()
+            };
+            let osc_title = crate::tmux::utils::pane_title(tmux_session.name()).unwrap_or_default();
+            crate::tmux::detect_with_rules(
+                profile,
+                &rules_tool,
+                manifest_tool,
+                &crate::tmux::utils::strip_ansi(status_content),
+                &osc_title,
+                hook,
+            )
+            .and_then(|d| d.status)
+            .unwrap_or_default()
         } else {
-            tmux_session
-                .detect_status(detection_tool)
-                .unwrap_or_default()
+            let hook = hook.filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));
+            match hook {
+                Some(hook) => hook.status,
+                None => tmux_session
+                    .detect_status(profile, &rules_tool)
+                    .unwrap_or_default(),
+            }
         };
         let content = if args.strip_ansi {
             crate::tmux::utils::strip_ansi(&raw)
@@ -1680,19 +1583,28 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
     Ok(())
 }
 
+fn rename_success_message(
+    persisted_old_title: &str,
+    committed_title: &str,
+    title_requested: bool,
+) -> String {
+    if title_requested && persisted_old_title != committed_title {
+        format!("✓ Renamed session: {persisted_old_title} → {committed_title}")
+    } else {
+        format!("✓ Updated session: {committed_title}")
+    }
+}
+
 async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
-    if args.title.is_none() && args.group.is_none() {
-        bail!("At least one of --title or --group must be specified");
+    if args.title.is_none() && args.group.is_none() && args.branch.is_none() {
+        bail!("At least one of --title, --group or --branch must be specified");
     }
 
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): resolve the target id (auto-detect from tmux if
-    // no identifier given) and the old/new title pair so we can do the
-    // tmux rename outside the storage flock.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = if let Some(id) = &args.identifier {
-        super::resolve_session(id, &instances)?
+        super::resolve_session(id, &instances)?.clone()
     } else {
         let current_session = std::env::var("TMUX_PANE")
             .ok()
@@ -1702,6 +1614,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             instances
                 .iter()
                 .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
+                .cloned()
                 .ok_or_else(|| {
                     anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
                 })?
@@ -1711,8 +1624,41 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     };
 
     let id = inst.id.clone();
-    let old_title = inst.title.clone();
+    let title_requested = args.title.is_some();
+    let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
 
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _session_title_lock = if session_lock_required {
+        Some(
+            crate::session::acquire_session_title_lock(&id)
+                .context("failed to acquire session title lock")?,
+        )
+    } else {
+        None
+    };
+    let _lifecycle_lock = if session_lock_required {
+        Some(
+            storage
+                .acquire_instance_lifecycle_lock(&id)
+                .context("failed to acquire session lifecycle lock")?,
+        )
+    } else {
+        None
+    };
+    let (authoritative_instances, _groups) = storage.load_with_groups()?;
+    let inst = authoritative_instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    let mut inst = inst.clone();
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+        &storage,
+        &mut inst,
+        &mut Default::default(),
+    ) {
+        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
+    }
+    let old_title = inst.title.clone();
     let effective_title = args
         .title
         .clone()
@@ -1722,44 +1668,107 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let new_group = args.group.as_ref().map(|g| g.trim().to_string());
     let title_changed = old_title != effective_title;
 
-    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
-    // its directory leaf to match the title (and optionally the branch), so
-    // the two cannot drift. Decided per-session from the resolved setting.
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
+    let tied_edit = args.branch.is_none() && tied && (args.title.is_some() || args.rename_branch);
+    let duplicate_path = if tied_edit {
+        crate::session::worktree_edit::derived_worktree_path(
+            std::path::Path::new(&inst.project_path),
+            &effective_title,
+        )
+    } else {
+        inst.project_path.clone()
+    };
+    let pair_changed = title_changed
+        || duplicate_path.trim_end_matches('/') != inst.project_path.trim_end_matches('/');
+    if pair_changed
+        && is_duplicate_session(
+            authoritative_instances.iter(),
+            &effective_title,
+            &duplicate_path,
+            Some(&id),
+        )
+    {
+        return Err(duplicate_session_error(&effective_title));
+    }
 
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
-    if tied && (title_changed || args.rename_branch) {
+    if let Some(branch) = &args.branch {
+        let info = inst
+            .worktree_info
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Branch-only rename requires a managed worktree"))?;
+        if branch != &info.branch {
+            let path = std::path::Path::new(&inst.project_path).canonicalize()?;
+            let repo = std::path::Path::new(&info.main_repo_path).canonicalize()?;
+            let same_branch = |main_repo: &str, name: &str| {
+                name == info.branch
+                    && std::path::Path::new(main_repo).canonicalize().ok().as_ref() == Some(&repo)
+            };
+            for other_profile in crate::session::list_profiles()? {
+                let rows = Storage::open_unwatched(&other_profile)?.load()?;
+                if rows.iter().any(|other| {
+                    other.id != id
+                        && !other.is_trashed()
+                        && (std::path::Path::new(&other.project_path)
+                            .canonicalize()
+                            .ok()
+                            .as_ref()
+                            == Some(&path)
+                            || other
+                                .worktree_info
+                                .as_ref()
+                                .is_some_and(|wt| same_branch(&wt.main_repo_path, &wt.branch))
+                            || other.workspace_info.as_ref().is_some_and(|workspace| {
+                                workspace
+                                    .repos
+                                    .iter()
+                                    .any(|wt| same_branch(&wt.main_repo_path, &wt.branch))
+                            }))
+                }) {
+                    bail!("Another session shares this branch or worktree in profile {other_profile}; rename is not isolated");
+                }
+            }
+        }
+        if crate::session::worktree_edit::rename_worktree_branch(
+            info,
+            std::path::Path::new(&inst.project_path),
+            branch,
+        )? {
+            new_branch = Some(branch.clone());
+        }
+    } else if tied_edit {
         let current_path = inst.project_path.clone();
         let worktree_info = inst
             .worktree_info
             .clone()
             .expect("tie_workdir_applies implies worktree_info is Some");
-        // Persisted status can lag the live tmux pane; moving a running
-        // worktree is unsafe, so recompute before enforcing the gate.
-        let mut live = inst.clone();
-        crate::tmux::refresh_session_cache();
-        live.update_status();
         let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
-        // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so `git worktree move` would fail. The gate
-        // drops a merely-stopped container to free the mount and only reports
-        // held for a live one, which the user has to stop. Gated on the
-        // directory actually moving so a branch-only rename does not discard a
-        // container for a move that never happens.
         let moves_worktree = crate::session::worktree_edit::worktree_move_required(
             std::path::Path::new(&current_path),
             &leaf,
         );
-        if live.status.blocks_worktree_edit()
-            || (moves_worktree
+        let renames_branch = crate::session::worktree_edit::worktree_branch_rename_required(
+            &worktree_info,
+            &leaf,
+            args.rename_branch,
+        );
+        let is_sandboxed = inst.is_sandboxed();
+        if moves_worktree || renames_branch {
+            let mut live = inst.clone();
+            live.source_profile = profile.to_string();
+            crate::tmux::refresh_session_cache();
+            live.update_status_with_metadata(None, None);
+            let container_holds = !live.status.blocks_worktree_edit()
+                && moves_worktree
                 && crate::session::worktree_edit::ensure_sandbox_container_released(
                     &id,
-                    live.is_sandboxed(),
-                ))
-        {
-            bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
+                    is_sandboxed,
+                );
+            if live.status.blocks_worktree_edit() || container_holds {
+                bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
+            }
         }
         match crate::session::worktree_edit::edit_worktree_workdir(
             crate::session::worktree_edit::WorktreeEditRequest {
@@ -1770,21 +1779,15 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             },
         ) {
             Ok(outcome) => {
-                // The dir moved (path changed): a sandbox container created
-                // against the old path is now stale, so drop it to force a
-                // fresh create on next start. A branch-only edit leaves the
-                // path (and the mount) unchanged.
                 if outcome.new_path != std::path::Path::new(&current_path) {
                     crate::session::worktree_edit::discard_sandbox_container_after_move(
                         &id,
-                        live.is_sandboxed(),
+                        is_sandboxed,
                     );
                 }
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
                 new_branch = outcome.new_branch;
             }
-            // The title slug maps to the current leaf and no branch rename was
-            // requested: nothing to move, fall through to a plain title rename.
             Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
             Err(e) => return Err(e.into()),
         }
@@ -1792,32 +1795,15 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
     }
 
-    // Phase 2 (unlocked): tmux rename if the title changed. Side effect on
-    // the running tmux server, fast but external state, do it outside the
-    // closure.
-    if title_changed {
-        let tmux_session = crate::tmux::Session::new(&id, &old_title)?;
-        if tmux_session.exists() {
-            let new_tmux_name = crate::tmux::Session::generate_name(&id, &effective_title);
-            if let Err(e) = tmux_session.rename(&new_tmux_name) {
-                eprintln!("Warning: failed to rename tmux session: {}", e);
-            } else {
-                crate::tmux::refresh_session_cache();
-            }
-        }
-    }
-
-    // Phase 3 (locked): persist the new title and (optional) new group.
-    // Re-resolve by id under the lock so concurrent mutations to other
-    // sessions are preserved. `create_group` is idempotent and only runs
-    // when the closure actually mutated `group_path`, so `groups.json` is
-    // rewritten only on real group changes (cf. `update`'s diff check).
     let persist = storage.update(|instances, groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-        inst.title = effective_title.clone();
+        let persisted_old_title = inst.title.clone();
+        if title_requested {
+            inst.title = effective_title.clone();
+        }
         if let Some(path) = &new_path {
             inst.project_path = path.clone();
         }
@@ -1829,36 +1815,586 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         if let Some(group) = &new_group {
             inst.group_path = group.clone();
         }
+        let committed_title = inst.title.clone();
         let group_path = inst.group_path.clone();
         if !group_path.is_empty() {
             let mut group_tree = GroupTree::new_with_groups(instances, groups);
             group_tree.create_group(&group_path);
             *groups = group_tree.get_all_groups();
         }
-        Ok(())
+        Ok((persisted_old_title, committed_title))
     });
-    if let Err(e) = persist {
-        // When the git move already landed, surface that the disk and metadata
-        // are out of sync rather than a bare persist error.
-        if let Some(path) = &new_path {
-            bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {e}. Re-run to retry.");
+    let (persisted_old_title, committed_title) = match persist {
+        Ok(titles) => titles,
+        Err(error) => {
+            if args.branch.is_some() {
+                if let Some(branch) = &new_branch {
+                    let info = inst
+                        .worktree_info
+                        .as_ref()
+                        .expect("branch rename checked worktree metadata");
+                    let stored = storage.load().map_err(|_| anyhow::anyhow!("Session metadata write failed ({error}) and its state cannot be read. Branch is {branch}; directory unchanged. Inspect before retrying."))?;
+                    let persisted_branch = stored
+                        .iter()
+                        .find(|row| row.id == id)
+                        .and_then(|row| row.worktree_info.as_ref())
+                        .map(|wt| wt.branch.as_str());
+                    if persisted_branch == Some(info.branch.as_str()) {
+                        if let Err(rollback) =
+                            crate::session::worktree_edit::rollback_worktree_branch(
+                                info,
+                                std::path::Path::new(&inst.project_path),
+                                branch,
+                            )
+                        {
+                            bail!("Session metadata failed: {error}; branch rollback also failed: {rollback}. The directory is unchanged; inspect Git and session metadata before continuing.");
+                        }
+                    } else if persisted_branch != Some(branch.as_str()) {
+                        bail!("Session metadata failed: {error}; its branch changed concurrently. Directory unchanged; inspect before continuing.");
+                    }
+                }
+            }
+            if let Some(path) = &new_path {
+                bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {error}. Re-run to retry.");
+            }
+            return Err(error);
         }
-        return Err(e);
+    };
+    drop(_identity_lock);
+
+    let committed_title_changed = title_requested && persisted_old_title != committed_title;
+    if committed_title_changed {
+        let rekey_id = id.clone();
+        let rekey_old_title = persisted_old_title.clone();
+        let rekey_new_title = committed_title.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!("Warning: failed to rename tmux session: {error}"),
+            Err(error) => eprintln!("Warning: tmux rename task failed: {error}"),
+        }
     }
 
+    if args.branch.is_some() {
+        if let Some(branch) = &new_branch {
+            println!("✓ Branch renamed to: {branch} (worktree directory unchanged)");
+        }
+    }
     if let Some(path) = &new_path {
         println!("✓ Worktree moved to: {}", path);
         if let Some(branch) = &new_branch {
             println!("  Branch renamed to: {}", branch);
         }
     }
-    if title_changed {
-        println!("✓ Renamed session: {} → {}", old_title, effective_title);
-    } else {
-        println!("✓ Updated session: {}", effective_title);
-    }
+    println!(
+        "{}",
+        rename_success_message(&persisted_old_title, &committed_title, title_requested,)
+    );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::{rename_session, rename_success_message, RenameArgs};
+    use crate::session::{Instance, Status, Storage};
+    use serial_test::serial;
+
+    fn args(
+        id: &str,
+        title: Option<&str>,
+        group: Option<&str>,
+        branch: Option<&str>,
+    ) -> RenameArgs {
+        RenameArgs {
+            identifier: Some(id.to_string()),
+            title: title.map(str::to_owned),
+            group: group.map(str::to_owned),
+            rename_branch: false,
+            branch: branch.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn branch_rename_preserves_worktree_and_updates_metadata() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree = dir.path().join("agent-fixed");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |path: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "agent-old",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let head = git(&worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(worktree.join("uncommitted.txt"), "keep me").unwrap();
+        let storage = Storage::new_unwatched("branch-only").unwrap();
+        let mut target = Instance::new("Old Title", worktree.to_str().unwrap());
+        target.status = Status::Running;
+        target.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "agent-old".into(),
+            main_repo_path: repo.to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: Some("main".into()),
+        });
+        let id = target.id.clone();
+        storage
+            .update(|instances, _| {
+                instances.push(target);
+                Ok(())
+            })
+            .unwrap();
+        let external = dir.path().join("external");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--force",
+                external.to_str().unwrap(),
+                "agent-old",
+            ],
+        );
+        std::fs::write(external.join("external.txt"), "keep external").unwrap();
+        let before = serde_json::to_value(storage.load().unwrap()).unwrap();
+        let shared = rename_session(
+            "branch-only",
+            args(&id, Some("Must not apply"), None, Some("blocked-shared")),
+        )
+        .await
+        .unwrap_err();
+        assert!(shared.to_string().contains("another Git worktree"));
+        assert_eq!(
+            serde_json::to_value(storage.load().unwrap()).unwrap(),
+            before
+        );
+        for path in [&worktree, &external] {
+            assert_eq!(git(path, &["branch", "--show-current"]), "agent-old");
+            assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+        }
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(external.join("external.txt")).unwrap(),
+            "keep external"
+        );
+        assert!(git(&repo, &["branch", "--list", "blocked-shared"]).is_empty());
+        git(
+            &repo,
+            &["worktree", "remove", "--force", external.to_str().unwrap()],
+        );
+        for branch in ["olof/bemlo-123-task", "olof/bemlo-123-task"] {
+            rename_session("branch-only", args(&id, Some(branch), None, Some(branch)))
+                .await
+                .unwrap();
+        }
+        let target = storage.load().unwrap().pop().unwrap();
+        assert_eq!(target.project_path, worktree.to_str().unwrap());
+        assert_eq!(target.title, "olof/bemlo-123-task");
+        assert_eq!(target.worktree_info.unwrap().branch, "olof/bemlo-123-task");
+        assert_eq!(
+            git(&worktree, &["branch", "--show-current"]),
+            "olof/bemlo-123-task"
+        );
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+        for branch in ["bad name", "-option", "bad..name", "refs/heads/"] {
+            assert!(rename_session(
+                "branch-only",
+                args(&id, Some("Must not apply"), None, Some(branch)),
+            )
+            .await
+            .is_err());
+        }
+        git(&repo, &["remote", "add", "origin", "."]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/olof/bemlo-123-task",
+            ],
+        );
+        for title in [Some("Updated title"), None, Some("olof/bemlo-123-task")] {
+            rename_session(
+                "branch-only",
+                RenameArgs {
+                    identifier: Some(id.clone()),
+                    title: title.map(str::to_owned),
+                    group: None,
+                    rename_branch: false,
+                    branch: Some("olof/bemlo-123-task".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let current = storage.load().unwrap().pop().unwrap();
+            assert_eq!(current.title, title.unwrap_or("Updated title"));
+            assert_eq!(current.project_path, worktree.to_str().unwrap());
+            assert_eq!(current.worktree_info.unwrap().branch, "olof/bemlo-123-task");
+            assert_eq!(
+                git(&worktree, &["branch", "--show-current"]),
+                "olof/bemlo-123-task"
+            );
+            assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+            assert_eq!(
+                std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+                "keep me"
+            );
+        }
+        let protected = rename_session(
+            "branch-only",
+            args(&id, None, None, Some("blocked-default")),
+        )
+        .await
+        .unwrap_err();
+        assert!(protected.to_string().contains("default branch"));
+        git(
+            &repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        let peer_storage = Storage::new_unwatched("branch-peer").unwrap();
+        for with_worktree_info in [true, false] {
+            let mut peer = Instance::new("Peer", worktree.join(".").to_str().unwrap());
+            if with_worktree_info {
+                peer.worktree_info = storage.load().unwrap()[0].worktree_info.clone();
+                peer.worktree_info.as_mut().unwrap().managed_by_aoe = false;
+            }
+            peer_storage
+                .update(|rows, _| {
+                    *rows = vec![peer];
+                    Ok(())
+                })
+                .unwrap();
+            let shared = rename_session(
+                "branch-only",
+                args(&id, Some("Must not apply"), None, Some("would-change-peer")),
+            )
+            .await
+            .unwrap_err();
+            assert!(shared.to_string().contains("profile branch-peer"));
+            assert_eq!(
+                git(&worktree, &["branch", "--show-current"]),
+                "olof/bemlo-123-task"
+            );
+            assert_eq!(storage.load().unwrap()[0].title, "olof/bemlo-123-task");
+        }
+        peer_storage
+            .update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .unwrap();
+        let error = rename_session(
+            "branch-only",
+            args(&id, Some("collision"), None, Some("main")),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(storage.load().unwrap()[0].title, "olof/bemlo-123-task");
+        assert_eq!(
+            git(&worktree, &["branch", "--show-current"]),
+            "olof/bemlo-123-task"
+        );
+
+        let info = storage.load().unwrap()[0].worktree_info.clone().unwrap();
+        git(&worktree, &["branch", "-m", "rollback-source"]);
+        git(&worktree, &["checkout", "-b", "external-checkout"]);
+        let refs = git(&repo, &["show-ref", "--heads"]);
+        let error = crate::session::worktree_edit::rollback_worktree_branch(
+            &info,
+            &worktree,
+            "rollback-source",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed concurrently"));
+        assert_eq!(git(&repo, &["show-ref", "--heads"]), refs);
+        assert_eq!(
+            git(&worktree, &["branch", "--show-current"]),
+            "external-checkout"
+        );
+        assert_eq!(
+            storage.load().unwrap()[0]
+                .worktree_info
+                .as_ref()
+                .unwrap()
+                .branch,
+            info.branch
+        );
+        git(&worktree, &["checkout", "rollback-source"]);
+        crate::session::worktree_edit::rollback_worktree_branch(
+            &info,
+            &worktree,
+            "rollback-source",
+        )
+        .unwrap();
+        assert_eq!(git(&worktree, &["branch", "--show-current"]), info.branch);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rename_rejects_duplicate_pair_but_allows_group_only_change() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("rename-duplicate").unwrap();
+        let existing = Instance::new("main branch", "/tmp/repo/");
+        let target = Instance::new("throwaway", "/tmp/repo");
+        let target_id = target.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![existing, target];
+                Ok(())
+            })
+            .unwrap();
+
+        let error = rename_session(
+            "rename-duplicate",
+            args(&target_id, Some("main branch"), None, None),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+
+        rename_session(
+            "rename-duplicate",
+            args(&target_id, None, Some("work"), None),
+        )
+        .await
+        .unwrap();
+
+        let instances = storage.load().unwrap();
+        let target = instances
+            .iter()
+            .find(|instance| instance.id == target_id)
+            .unwrap();
+        assert_eq!(target.title, "throwaway");
+        assert_eq!(target.group_path, "work");
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
+        let mut tied = Instance::new("main branch", "/tmp/worktrees/drifted");
+        tied.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "drifted".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let tied_id = tied.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![existing, tied];
+                Ok(())
+            })
+            .unwrap();
+
+        let error = rename_session(
+            "rename-duplicate",
+            args(&tied_id, Some("main branch"), None, None),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+        let tied = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.id == tied_id)
+            .unwrap();
+        assert_eq!(tied.title, "main branch");
+        assert_eq!(tied.project_path, "/tmp/worktrees/drifted");
+
+        let mut active = Instance::new("Main Branch", "/tmp/worktrees/main-branch");
+        active.status = Status::Running;
+        active.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "main-branch".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let active_id = active.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![active];
+                Ok(())
+            })
+            .unwrap();
+
+        rename_session(
+            "rename-duplicate",
+            args(&active_id, Some("Main Branch"), None, None),
+        )
+        .await
+        .expect("active cwd-stable title no-op must succeed");
+        let active = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.id == active_id)
+            .unwrap();
+        assert_eq!(active.title, "Main Branch");
+        assert_eq!(active.project_path, "/tmp/worktrees/main-branch");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn worktree_edit_consults_profile_status_rules() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux not available");
+            return;
+        }
+        const PROFILE: &str = "worktree-edit-profile-rules";
+        const AGENT: &str = "worktree-edit-rules-agent";
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(false);
+        crate::session::config::update_config(|config| {
+            config.default_profile = "main".to_string();
+        })
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let profile_config =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &profile_config,
+            format!(
+                "[[agents.{AGENT}.status_rules]]\nstatus = \"running\"\ncontains = \"agent-busy\"\n"
+            ),
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("agent-old");
+        std::fs::create_dir(&worktree).unwrap();
+        let mut target = Instance::new("Busy", worktree.to_str().unwrap());
+        target.tool = AGENT.to_string();
+        target.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "agent-old".into(),
+            main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let id = target.id.clone();
+        let tmux_name = crate::tmux::Session::generate_name(&target.id, &target.title);
+        let storage = Storage::new_unwatched(PROFILE).unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(target);
+                Ok(())
+            })
+            .unwrap();
+
+        let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &tmux_name,
+                "printf 'agent-busy\\n'; sleep 300",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let captured = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &tmux_name])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&captured.stdout).contains("agent-busy") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pane never painted");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let error = super::set_worktree_name(
+            PROFILE,
+            super::SetWorktreeNameArgs {
+                identifier: Some(id),
+                name: "agent-new".into(),
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("while the session is active"),
+            "{error}"
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            storage.load().unwrap()[0].project_path,
+            worktree.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn group_only_success_uses_authoritative_committed_title() {
+        assert_eq!(
+            rename_success_message("stale resolver title", "peer committed title", false),
+            "✓ Updated session: peer committed title"
+        );
+    }
 }
 
 async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<()> {
@@ -1883,31 +2419,55 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     };
 
     let id = inst.id.clone();
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&id)
+        .context("failed to acquire worktree rename lifecycle lock")?;
+    let authoritative_instances = storage.load()?;
+    let inst = authoritative_instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    let mut inst = inst.clone();
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+        &storage,
+        &mut inst,
+        &mut Default::default(),
+    ) {
+        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
+    }
     let current_path = inst.project_path.clone();
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
     };
-    // When tied (#1927) the directory follows the title, so reject the
-    // standalone edit and point at the unified rename instead.
     if inst.tie_workdir_applies(
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
             .tie_workdir_to_name,
     ) {
         bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
     }
-    // Persisted status can lag the real tmux pane, and moving the worktree of
-    // a still-running session is unsafe. Recompute from live tmux state before
-    // enforcing the guard.
+    let duplicate_path = crate::session::worktree_edit::target_worktree_path(
+        std::path::Path::new(&current_path),
+        args.name.trim(),
+    )
+    .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
+    .to_string_lossy()
+    .into_owned();
+    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
+        && is_duplicate_session(
+            authoritative_instances.iter(),
+            &inst.title,
+            &duplicate_path,
+            Some(&id),
+        )
+    {
+        return Err(duplicate_session_error(&inst.title));
+    }
     let mut live = inst.clone();
+    live.source_profile = profile.to_string();
     crate::tmux::refresh_session_cache();
-    live.update_status();
-    // A sandbox container keeps the worktree dir mounted even while the agent
-    // is Idle, so the move would fail. The gate drops a merely-stopped
-    // container to free the mount and only reports held for a live one, which
-    // the user has to stop, same as the active-status case. Gated on the
-    // directory actually moving so a no-op or branch-only edit does not discard
-    // a container for a move that never happens.
+    live.update_status_with_metadata(None, None);
     let moves_worktree = crate::session::worktree_edit::worktree_move_required(
         std::path::Path::new(&current_path),
         args.name.trim(),
@@ -1930,9 +2490,6 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             rename_branch: args.rename_branch,
         },
     )?;
-    // The dir moved (path changed): a sandbox container created against the old
-    // path is now stale, so drop it to force a fresh create on next start. A
-    // branch-only edit leaves the path (and the mount) unchanged.
     if outcome.new_path != std::path::Path::new(&current_path) {
         crate::session::worktree_edit::discard_sandbox_container_after_move(
             &id,
@@ -1961,6 +2518,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
                 "Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {e}. Re-run to retry."
             )
         })?;
+    drop(_identity_lock);
 
     println!("✓ Worktree moved to: {}", new_path);
     if let Some(branch) = &new_branch {
@@ -1970,14 +2528,12 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
 }
 
 async fn current_session(args: CurrentArgs) -> Result<()> {
-    // Auto-detect profile and session from tmux
     let current_session = std::env::var("TMUX_PANE")
         .ok()
         .and_then(|_| crate::tmux::get_current_session_name());
 
     let session_name = current_session.ok_or_else(|| anyhow::anyhow!("Not in a tmux session"))?;
 
-    // Search all profiles for this session
     let profiles = crate::session::list_profiles()?;
 
     for profile_name in &profiles {
@@ -2031,32 +2587,39 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     };
 
     let storage = Storage::open_unwatched(profile)?;
-    let (title, tool) = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            #[cfg(feature = "serve")]
+    let target_id = {
+        let instances = storage.load()?;
+        super::resolve_session(&args.identifier, &instances)?
+            .id
+            .clone()
+    };
+    let lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&target_id)
+        .context("failed to acquire instance resume-target lock")?;
+    let title = storage.update(|instances, _groups| {
+        super::patch_instance(instances, &target_id, |inst| {
+            inst.source_profile = storage.profile().to_string();
             if inst.is_structured() {
-                anyhow::bail!(
-                    "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
-                    inst.title
-                );
+                anyhow::ensure!(args.store.is_some() && matches!((&new_intent, inst.acp_session_id.as_deref()), (crate::session::ResumeIntent::Use(sid), Some(acp_sid)) if sid == acp_sid),
+                    "ACP manages its own conversation; a native handoff assertion requires its current ID and an explicit --store");
             }
+            let binding = match &new_intent {
+                crate::session::ResumeIntent::Use(sid) => Some(inst.asserted_resume_binding(sid, args.store.as_deref())?),
+                _ => None,
+            };
+            anyhow::ensure!(!inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
+                "ACP terminal handoff is supported only for an explicitly bound Claude conversation");
+            inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
-            Ok((inst.title.clone(), inst.tool.clone()))
+            Ok(inst.title.clone())
         })
     })?;
+    drop(lifecycle_lock);
 
     match &new_intent {
         crate::session::ResumeIntent::Use(id) => {
             println!("✓ Set resume target for '{}': {}", title, id);
-            if let Some(agent) = crate::agents::get_agent(&tool) {
-                if matches!(
-                    agent.resume_strategy,
-                    crate::agents::ResumeStrategy::Unsupported
-                ) {
-                    eprintln!("Warning: {} does not support session resume; this ID will be stored but not used.", tool);
-                }
-            }
         }
         crate::session::ResumeIntent::Cleared => {
             println!(
@@ -2071,16 +2634,6 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// `aoe session add-project <session> <path|name>`. See #3103.
-///
-/// Attaching converts the session into a multi-repo workspace, so unless it
-/// already is one its working directory moves. That means stopping it, doing the
-/// conversion, and starting it again, which is what
-/// `attach_project::quiesce_for_conversion` / `resume_after_conversion` do for
-/// every blocking surface. A live structured worker is signalled through the
-/// same restart marker `aoe acp restart` uses, because the supervisor lives in
-/// `aoe serve`; the marker is written after the persist so the daemon cannot
-/// respawn the worker into the directory the conversion is moving.
 async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let instances = storage.load()?;
@@ -2089,12 +2642,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let title = inst.title.clone();
     let is_sandboxed = inst.is_sandboxed();
 
-    // Attaching restarts the agent, so a turn in flight would lose its reply (or,
-    // in `Waiting`, a pending approval). The daemon refuses this on the
-    // event-log probe; the CLI has no handle on that store, so it uses the status
-    // set `blocks_worktree_edit` encodes for exactly this class of operation. The
-    // unambiguous states (Creating, Deleting, trashed, archived) are refused in
-    // `attach_project::plan`, shared with every other surface.
     if inst.status.blocks_worktree_edit() {
         bail!(
             "'{title}' has a turn in flight and attaching restarts the agent. Wait for it to \
@@ -2102,8 +2649,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         );
     }
 
-    // A path-shaped argument is used as-is; a bare name is a registry lookup,
-    // matching how `aoe add --projects` resolves its extras.
     let repo_path = if std::path::Path::new(&args.project).exists()
         || args.project.contains(std::path::MAIN_SEPARATOR)
     {
@@ -2123,8 +2668,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         crate::session::attach_project::ExistingBranch::Refuse
     };
 
-    // Validate before stopping anything: a refusal here must not cost the user a
-    // stopped session.
     let plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
     let restarts = crate::session::attach_project::needs_restart(&plan, is_sandboxed);
     let quiesced = if restarts {
@@ -2137,8 +2680,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
         Ok(outcome) => outcome,
         Err(e) => {
-            // The rollback already undid the filesystem half; bringing the
-            // session back is the only thing left that would otherwise persist.
             crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
             return Err(e);
         }
@@ -2167,11 +2708,7 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     }
 
     if restarts {
-        if quiesced.worker_was_running {
-            println!("Restarting the agent so it comes up with the new repo; the conversation is preserved.");
-        } else {
-            println!("Restarting the session so it comes up with the new repo.");
-        }
+        println!("Restarting the session so it comes up with the new repo.");
     } else {
         println!("The agent is already working in this directory, so nothing was restarted.");
     }
@@ -2194,6 +2731,8 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     let id = inst.id.clone();
     let title = inst.title.clone();
 
+    let target = resolve_base_target(inst, args.repo.as_deref())?;
+
     let new_value = if args.clear {
         None
     } else {
@@ -2201,43 +2740,96 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
         if trimmed.is_empty() {
             bail!("Branch name is empty. Pass --clear to remove the override.");
         }
-        let validate_path = inst
-            .workspace_info
-            .as_ref()
-            .and_then(|w| w.repos.first().map(|r| r.worktree_path.clone()))
-            .unwrap_or_else(|| inst.project_path.clone());
         if let Err(e) =
-            crate::git::diff::validate_ref(std::path::Path::new(&validate_path), &trimmed)
+            crate::git::diff::validate_ref(std::path::Path::new(&target.validate_path), &trimmed)
         {
             bail!(
                 "Branch '{}' does not resolve in {}: {}",
                 trimmed,
-                validate_path,
+                target.validate_path,
                 e
             );
         }
         Some(trimmed)
     };
 
+    let repo_name = target.repo_name.clone();
     storage.update(|instances, _groups| {
         let stored = instances
             .iter_mut()
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
-        stored.base_branch_override = new_value.clone();
+        match repo_name.as_deref() {
+            Some(name) => {
+                let repo = stored
+                    .workspace_info
+                    .as_mut()
+                    .and_then(|ws| ws.repos.iter_mut().find(|r| r.name == name))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Repo '{}' is no longer part of this session; nothing was changed",
+                            name
+                        )
+                    })?;
+                repo.base_branch_override = new_value.clone();
+            }
+            None => stored.base_branch_override = new_value.clone(),
+        }
         Ok(())
     })?;
 
+    let label = match target.repo_name {
+        Some(ref name) => format!("'{title}' / '{name}'"),
+        None => format!("'{title}'"),
+    };
     match new_value {
-        Some(ref v) => println!("✓ Set diff base for '{}': {}", title, v),
-        None => println!("✓ Cleared diff base override for '{}'", title),
+        Some(ref v) => println!("✓ Set diff base for {}: {}", label, v),
+        None => println!("✓ Cleared diff base override for {}", label),
     }
     Ok(())
 }
 
+#[derive(Debug)]
+struct BaseTarget {
+    repo_name: Option<String>,
+    validate_path: String,
+}
+
+fn resolve_base_target(inst: &crate::session::Instance, repo: Option<&str>) -> Result<BaseTarget> {
+    let names = || {
+        inst.all_repos()
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match repo {
+        Some(name) => match inst.all_repos().iter().find(|r| r.name == name) {
+            Some(r) => Ok(BaseTarget {
+                repo_name: Some(r.name.clone()),
+                validate_path: r.worktree_path.clone(),
+            }),
+            None if inst.all_repos().is_empty() => bail!(
+                "This session has no workspace repos, so --repo does not apply. Drop it to set \
+                 the session's own diff base."
+            ),
+            None => bail!("Unknown repo '{}'. This session has: {}", name, names()),
+        },
+        None if inst.workspace_info.is_some() => bail!(
+            "This session is a multi-repo workspace, and each repo has its own diff base.\nPass \
+             --repo <name> to pick one. Available: {}",
+            names()
+        ),
+        None => Ok(BaseTarget {
+            repo_name: None,
+            validate_path: inst.project_path.clone(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod restart_args_tests {
-    use super::SessionCommands;
+    use super::{supervise_attach_capture, SessionCommands};
     use clap::Parser;
 
     #[derive(Parser)]
@@ -2247,118 +2839,171 @@ mod restart_args_tests {
     }
 
     #[test]
-    fn restart_with_identifier_still_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "claude-3"])
-            .expect("identifier-only must parse");
-        match cli.cmd {
-            SessionCommands::Restart(args) => {
-                assert!(!args.all);
-                assert_eq!(args.identifier.as_deref(), Some("claude-3"));
-                assert_eq!(args.parallel, 3);
-            }
-            _ => panic!("wrong subcommand"),
-        }
-    }
+    #[serial_test::serial]
+    fn attach_supervision_starts_before_attach_and_flushes_every_return() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "attach-capture-supervision";
+        let mut inst = crate::session::Instance::new("attach", "/tmp/attach");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("d38740e4-bd1f-43d7-8727-485652e4678e".to_string());
+        inst.mark_pi_extension_launched_for_test();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _| {
+                *instances = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
 
-    /// Refusing an existing branch is the default, because a same-named branch
-    /// in another repo can hold unrelated commits.
-    #[test]
-    fn add_project_parses_its_identifier_project_and_branch_opt_in() {
-        let cases = [
-            (vec!["aoe", "add-project", "claude-3", "../frontend"], false),
-            (
-                vec![
-                    "aoe",
-                    "add-project",
-                    "claude-3",
-                    "../frontend",
-                    "--attach-existing-branch",
-                ],
-                true,
-            ),
-        ];
-        for (argv, attach_existing) in cases {
-            let cli = Cli::try_parse_from(&argv).expect("add-project must parse");
-            match cli.cmd {
-                SessionCommands::AddProject(args) => {
-                    assert_eq!(args.identifier, "claude-3");
-                    assert_eq!(args.project, "../frontend");
-                    assert_eq!(args.attach_existing_branch, attach_existing, "{argv:?}");
-                }
-                _ => panic!("wrong subcommand"),
-            }
-        }
-    }
+        let first = "01a053b6-c470-78de-9d8f-bc00ef05332a";
+        supervise_attach_capture(&mut inst, |live| {
+            assert!(
+                live.session_id_poller_is_running(),
+                "capture must be supervised before the blocking attach call"
+            );
+            crate::session::publish_host_pi_transcript(&live.id, first, home.path());
+            Ok(())
+        })
+        .unwrap();
+        assert!(inst.session_id_poller.is_none());
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(first)
+        );
 
-    #[test]
-    fn restart_all_alone_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "--all"]).expect("--all alone must parse");
-        match cli.cmd {
-            SessionCommands::Restart(args) => {
-                assert!(args.all);
-                assert!(args.identifier.is_none());
-                assert_eq!(args.parallel, 3);
-            }
-            _ => panic!("wrong subcommand"),
-        }
-    }
+        let second = "01a053b6-c470-78de-9d8f-bc00ef05332b";
+        let result = supervise_attach_capture(&mut inst, |live| {
+            crate::session::publish_host_pi_transcript(&live.id, second, home.path());
+            Err(anyhow::anyhow!("fake attach failure"))
+        });
 
-    #[test]
-    fn restart_all_with_parallel_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "--all", "--parallel", "5"])
-            .expect("--all --parallel must parse");
-        match cli.cmd {
-            SessionCommands::Restart(args) => {
-                assert!(args.all);
-                assert_eq!(args.parallel, 5);
-            }
-            _ => panic!("wrong subcommand"),
-        }
-    }
-
-    #[test]
-    fn restart_identifier_and_all_conflicts() {
-        let result = Cli::try_parse_from(["aoe", "restart", "claude-3", "--all"]);
+        assert_eq!(result.unwrap_err().to_string(), "fake attach failure");
         assert!(
-            result.is_err(),
-            "passing both identifier and --all should error"
+            inst.session_id_poller.is_none(),
+            "an immediate nested attach return must not orphan its poller"
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(second),
+            "the final /new identity must be durable even when attach returns an error"
         );
     }
 
     #[test]
-    fn set_base_with_branch_parses() {
-        let cli = Cli::try_parse_from(["aoe", "set-base", "claude-3", "upstream/main"])
-            .expect("set-base with branch must parse");
-        match cli.cmd {
-            SessionCommands::SetBase(args) => {
-                assert_eq!(args.identifier, "claude-3");
-                assert_eq!(args.branch.as_deref(), Some("upstream/main"));
-                assert!(!args.clear);
-            }
-            _ => panic!("wrong subcommand"),
-        }
+    fn restart_parses_identifier_all_and_parallel() {
+        let restart = |argv: &[&str]| {
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                SessionCommands::Restart(args) => (args.all, args.identifier, args.parallel),
+                _ => panic!("wrong subcommand"),
+            })
+        };
+        assert_eq!(
+            restart(&["aoe", "restart", "claude-3"]).unwrap(),
+            (false, Some("claude-3".to_string()), 3)
+        );
+        assert_eq!(
+            restart(&["aoe", "restart", "--all"]).unwrap(),
+            (true, None, 3)
+        );
+        assert_eq!(
+            restart(&["aoe", "restart", "--all", "--parallel", "5"]).unwrap(),
+            (true, None, 5)
+        );
+        assert!(restart(&["aoe", "restart", "claude-3", "--all"]).is_err());
     }
 
     #[test]
-    fn set_base_with_clear_parses() {
-        let cli = Cli::try_parse_from(["aoe", "set-base", "claude-3", "--clear"])
-            .expect("set-base --clear must parse");
-        match cli.cmd {
-            SessionCommands::SetBase(args) => {
-                assert_eq!(args.identifier, "claude-3");
-                assert!(args.branch.is_none());
-                assert!(args.clear);
-            }
-            _ => panic!("wrong subcommand"),
-        }
+    fn set_base_parses_branch_or_clear_but_not_both() {
+        let set_base = |argv: &[&str]| {
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                SessionCommands::SetBase(args) => (args.identifier, args.branch, args.clear),
+                _ => panic!("wrong subcommand"),
+            })
+        };
+        assert_eq!(
+            set_base(&["aoe", "set-base", "claude-3", "upstream/main"]).unwrap(),
+            (
+                "claude-3".to_string(),
+                Some("upstream/main".to_string()),
+                false
+            )
+        );
+        assert_eq!(
+            set_base(&["aoe", "set-base", "claude-3", "--clear"]).unwrap(),
+            ("claude-3".to_string(), None, true)
+        );
+        assert!(set_base(&["aoe", "set-base", "claude-3", "main", "--clear"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod set_base_target_tests {
+    use super::resolve_base_target;
+    use crate::session::{Instance, WorkspaceInfo, WorkspaceRepo};
+
+    fn workspace_instance() -> Instance {
+        let mut inst = Instance::new("ws", "/ws");
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: "/ws".to_string(),
+            repos: ["api", "web"]
+                .iter()
+                .map(|n| WorkspaceRepo {
+                    name: n.to_string(),
+                    source_path: format!("/src/{n}"),
+                    branch: "feature/x".to_string(),
+                    worktree_path: format!("/ws/{n}"),
+                    main_repo_path: format!("/src/{n}"),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                })
+                .collect(),
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        inst
     }
 
     #[test]
-    fn set_base_branch_and_clear_conflicts() {
-        let result = Cli::try_parse_from(["aoe", "set-base", "claude-3", "main", "--clear"]);
+    fn workspace_requires_a_known_repo_and_targets_its_own_worktree() {
+        let inst = workspace_instance();
+        let target = resolve_base_target(&inst, Some("web")).expect("named repo resolves");
+        assert_eq!(target.repo_name.as_deref(), Some("web"));
+        assert_eq!(target.validate_path, "/ws/web");
+
+        let err = resolve_base_target(&inst, Some("nope"))
+            .unwrap_err()
+            .to_string();
         assert!(
-            result.is_err(),
-            "passing both branch and --clear should error"
+            err.contains("api, web"),
+            "should list the repos, got: {err}"
+        );
+
+        let err = resolve_base_target(&inst, None).unwrap_err().to_string();
+        assert!(
+            err.contains("--repo") && err.contains("api, web"),
+            "should demand a repo and list them, got: {err}"
+        );
+    }
+
+    #[test]
+    fn single_repo_session_targets_its_own_checkout() {
+        let inst = Instance::new("solo", "/tmp/solo");
+        let target = resolve_base_target(&inst, None).expect("single repo resolves");
+        assert_eq!(target.repo_name, None);
+        assert_eq!(target.validate_path, "/tmp/solo");
+
+        let err = resolve_base_target(&inst, Some("api"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no workspace repos"),
+            "should explain --repo does not apply, got: {err}"
         );
     }
 }
@@ -2368,115 +3013,160 @@ mod target_filter_tests {
     use super::pick_targets_for_restart_all;
     use crate::session::{Instance, Status};
 
-    fn instance_with_status(id: &str, status: Status) -> Instance {
-        let mut inst = Instance::new(id, "/tmp");
-        inst.id = id.to_string();
-        inst.status = status;
-        inst
-    }
-
     #[test]
-    fn skips_deleting_and_creating() {
+    fn restart_all_skips_transient_archived_and_trashed() {
+        let instance = |id: &str, status: Status| {
+            let mut inst = Instance::new(id, "/tmp");
+            inst.id = id.to_string();
+            inst.status = status;
+            inst
+        };
         let instances = vec![
-            instance_with_status("running", Status::Running),
-            instance_with_status("idle", Status::Idle),
-            instance_with_status("stopped", Status::Stopped),
-            instance_with_status("error", Status::Error),
-            instance_with_status("waiting", Status::Waiting),
-            instance_with_status("starting", Status::Starting),
-            instance_with_status("unknown", Status::Unknown),
-            instance_with_status("deleting", Status::Deleting),
-            instance_with_status("creating", Status::Creating),
+            instance("running", Status::Running),
+            instance("idle", Status::Idle),
+            instance("stopped", Status::Stopped),
+            instance("error", Status::Error),
+            instance("waiting", Status::Waiting),
+            instance("starting", Status::Starting),
+            instance("unknown", Status::Unknown),
+            instance("deleting", Status::Deleting),
+            instance("creating", Status::Creating),
+            {
+                let mut inst = instance("archived", Status::Idle);
+                inst.archive();
+                inst
+            },
+            {
+                let mut inst = instance("trashed", Status::Stopped);
+                inst.trash();
+                inst
+            },
         ];
         let mut picked = pick_targets_for_restart_all(&instances);
         picked.sort();
-        let mut expected = vec![
-            "error".to_string(),
-            "idle".to_string(),
-            "running".to_string(),
-            "starting".to_string(),
-            "stopped".to_string(),
-            "unknown".to_string(),
-            "waiting".to_string(),
-        ];
-        expected.sort();
-        assert_eq!(picked, expected);
-    }
-
-    #[test]
-    fn empty_input_yields_empty_targets() {
+        assert_eq!(
+            picked,
+            ["error", "idle", "running", "starting", "stopped", "unknown", "waiting"]
+        );
         assert!(pick_targets_for_restart_all(&[]).is_empty());
     }
 }
 
+/// #4116: CLI start and restart refuse an archived or trashed session.
 #[cfg(test)]
-mod set_session_id_tests {
-    use super::{set_session_id, SetSessionIdArgs};
-    use crate::session::{Instance, ResumeIntent, Storage};
+mod start_blocked_tests {
+    use super::{restart_session, send_restart_wake, start_session, SessionIdArgs};
+    use crate::session::{Instance, Storage};
     use serial_test::serial;
-    use tempfile::tempdir;
 
-    #[tokio::test]
+    /// The restart wake runs after the relaunch released its locks; a peer archive that landed
+    /// since wins, so nothing is typed into the pane and the row stays archived.
+    #[test]
     #[serial]
-    async fn set_session_id_clears_resume_probe_failed_marker() {
-        let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-
-        let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
-        let mut inst = Instance::new("marked_session", "/tmp/x");
-        inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
-        inst.resume_probe_failed_sid = Some("11111111-1111-1111-1111-111111111111".to_string());
-        let id = inst.id.clone();
-        let on_disk = inst.clone();
-        storage
-            .update(|i, g| {
-                *i = vec![on_disk.clone()];
-                *g =
-                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
-                        .get_all_groups();
+    fn restart_wake_is_not_typed_into_a_row_archived_since_the_relaunch() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "restart-wake-archived";
+        let mut working = Instance::new("restart-wake", "/tmp/x");
+        working.source_profile = profile.to_string();
+        let mut peer = working.clone();
+        peer.archive();
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![peer];
                 Ok(())
             })
             .unwrap();
+        let pane = crate::tmux::Session::generate_name(&working.id, &working.title);
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &pane, "cat"])
+            .status();
+        if !created.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("tmux new-session failed; skipping");
+            return;
+        }
+        crate::tmux::refresh_session_cache();
 
-        set_session_id(
-            "set-sid-clear-marker",
-            SetSessionIdArgs {
-                identifier: id.clone(),
-                session_id: "22222222-2222-2222-2222-222222222222".to_string(),
-            },
-        )
-        .await
-        .unwrap();
+        let session = crate::tmux::Session::new(&working.id, &working.title).unwrap();
+        let result = send_restart_wake(&working, &session, "wake-4116");
+        let captured = crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", &pane])
+            .output()
+            .unwrap();
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &pane])
+            .output();
 
-        let loaded = storage.load().unwrap();
-        let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
-        assert_eq!(
-            inst_disk.resume_intent,
-            ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
-        );
-        assert_eq!(inst_disk.resume_probe_failed_sid, None);
+        let err = result.expect_err("an archived row takes no wake message");
+        assert_eq!(err.to_string(), "session is archived; unarchive it first");
+        assert!(!String::from_utf8_lossy(&captured.stdout).contains("wake-4116"));
+        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert!(stored[0].is_archived());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn start_and_restart_refuse_archived_and_trashed_sessions() {
+        let shelves: [(fn(&mut Instance), &str); 2] = [
+            (Instance::archive, "session is archived; unarchive it first"),
+            (Instance::trash, "session is in trash; restore it first"),
+        ];
+        for (shelve, message) in shelves {
+            for restart in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+                let profile = "start-blocked";
+                let mut inst = Instance::new("shelved", "/tmp/x");
+                shelve(&mut inst);
+                let id = inst.id.clone();
+                Storage::new_unwatched(profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        *rows = vec![inst.clone()];
+                        Ok(())
+                    })
+                    .unwrap();
+
+                let args = SessionIdArgs {
+                    identifier: id.clone(),
+                };
+                let err = if restart {
+                    restart_session(profile, args).await
+                } else {
+                    start_session(profile, args).await
+                }
+                .unwrap_err();
+                assert_eq!(err.to_string(), message, "restart={restart}");
+                let tmux = crate::tmux::Session::new(&id, &inst.title).unwrap();
+                assert!(!tmux.exists());
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod set_color_tests {
-    use super::{set_color_session, SetColorArgs};
-    use crate::session::{Instance, Storage};
+mod session_mutation_tests {
+    use super::{set_color_session, set_session_id, SetColorArgs, SetSessionIdArgs};
+    use crate::session::{Instance, ResumeIntent, Storage};
     use serial_test::serial;
     use tempfile::tempdir;
 
-    async fn seed(profile: &str) -> (Storage, String) {
+    const SID_A: &str = "11111111-1111-1111-1111-111111111111";
+    const SID_B: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn seed(profile: &str, inst: Instance) -> (Storage, String) {
         let storage = Storage::new_unwatched(profile).unwrap();
-        let inst = Instance::new("color_session", "/tmp/x");
         let id = inst.id.clone();
-        let on_disk = inst.clone();
         storage
-            .update(|i, g| {
-                *i = vec![on_disk.clone()];
-                *g =
-                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+            .update(|rows, groups| {
+                *rows = vec![inst.clone()];
+                *groups =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&inst), &[])
                         .get_all_groups();
                 Ok(())
             })
@@ -2484,126 +3174,135 @@ mod set_color_tests {
         (storage, id)
     }
 
+    fn stored(storage: &Storage, id: &str) -> Instance {
+        storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+    }
+
     #[tokio::test]
     #[serial]
-    async fn set_color_persists_palette_value_and_clears() {
+    async fn set_session_id_replaces_intent_and_clears_the_resume_probe_marker() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-
-        let (storage, id) = seed("set-color-ok").await;
-
-        set_color_session(
-            "set-color-ok",
-            SetColorArgs {
-                identifier: id.clone(),
-                color: "Red".to_string(), // case-insensitive
-            },
-        )
-        .await
-        .unwrap();
-        let loaded = storage.load().unwrap();
-        assert_eq!(
-            loaded.iter().find(|i| i.id == id).unwrap().color.as_deref(),
-            Some("red")
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
         );
 
-        set_color_session(
-            "set-color-ok",
-            SetColorArgs {
+        let mut inst = Instance::new("marked_session", "/tmp/x");
+        inst.agent_session_id = Some(SID_A.to_string());
+        inst.resume_probe_failed_sid = Some(SID_A.to_string());
+        let (storage, id) = seed("set-sid-clear-marker", inst);
+
+        set_session_id(
+            "set-sid-clear-marker",
+            SetSessionIdArgs {
                 identifier: id.clone(),
-                color: "none".to_string(),
+                session_id: SID_B.to_string(),
+                store: None,
             },
         )
         .await
         .unwrap();
-        let loaded = storage.load().unwrap();
-        assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
+
+        let row = stored(&storage, &id);
+        assert_eq!(row.resume_intent, ResumeIntent::Use(SID_B.to_string()));
+        assert_eq!(row.resume_probe_failed_sid, None);
     }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_rejects_unknown_color() {
-        let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-
-        let (storage, id) = seed("set-color-bad").await;
-
-        let result = set_color_session(
-            "set-color-bad",
-            SetColorArgs {
-                identifier: id.clone(),
-                color: "chartreuse".to_string(),
-            },
-        )
-        .await;
-        assert!(result.is_err(), "unknown color must error");
-        // The rejected write must not have touched disk.
-        let loaded = storage.load().unwrap();
-        assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
-    }
-}
-
-#[cfg(all(test, feature = "serve"))]
-mod acp_reject_tests {
-    use super::{set_session_id, SetSessionIdArgs};
-    use crate::session::{Instance, Storage};
-    use serial_test::serial;
-    use tempfile::tempdir;
 
     #[tokio::test]
     #[serial]
     async fn set_session_id_rejects_structured_view_session() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
-        let storage = Storage::new_unwatched("acp-reject").unwrap();
         let mut inst = Instance::new("acp_session", "/tmp/x");
         inst.view = crate::session::View::Structured;
-        let id = inst.id.clone();
-        let on_disk = inst.clone();
-        storage
-            .update(|i, g| {
-                *i = vec![on_disk.clone()];
-                *g =
-                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
-                        .get_all_groups();
-                Ok(())
-            })
-            .unwrap();
+        let (storage, id) = seed("acp-reject", inst);
 
-        let result = set_session_id(
+        let _err = set_session_id(
             "acp-reject",
             SetSessionIdArgs {
                 identifier: id.clone(),
-                session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                session_id: SID_A.to_string(),
+                store: None,
             },
         )
-        .await;
+        .await
+        .expect_err("set-session-id must reject structured view-mode sessions");
 
-        let err = result.expect_err("set-session-id must reject structured view-mode sessions");
-        let msg = format!("{:#}", err);
+        let row = stored(&storage, &id);
+        assert_eq!(
+            row.resume_intent,
+            ResumeIntent::Default,
+            "rejected call must not mutate intent"
+        );
+        assert_eq!(
+            row.agent_session_id, None,
+            "rejected call must not mutate sid"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_color_normalizes_clears_and_rejects_unknown_values() {
+        let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        let (storage, id) = seed("set-color", Instance::new("color_session", "/tmp/x"));
+        let set = |color: &str| {
+            set_color_session(
+                "set-color",
+                SetColorArgs {
+                    identifier: id.clone(),
+                    color: color.to_string(),
+                },
+            )
+        };
+
+        set("Red")
+            .await
+            .expect("palette names are case-insensitive");
+        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
+
+        set("chartreuse")
+            .await
+            .expect_err("unknown color must error");
+        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
+
+        set("none").await.unwrap();
+        assert_eq!(stored(&storage, &id).color, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+        std::fs::create_dir_all(profiles.join("real")).unwrap();
+
+        let msg = set_color_session(
+            "ghost-profile",
+            SetColorArgs {
+                identifier: "whatever".to_string(),
+                color: "red".to_string(),
+            },
+        )
+        .await
+        .expect_err("unknown profile must error")
+        .to_string();
         assert!(
-            msg.contains("acp"),
-            "error must mention structured view: {}",
-            msg
+            msg.contains("does not exist"),
+            "expected the unknown-profile error, got: {msg}"
         );
-
-        let loaded = storage.load().unwrap();
-        let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
-        assert_eq!(
-            inst_disk.resume_intent,
-            crate::session::ResumeIntent::Default,
-            "rejected call must not mutate intent",
-        );
-        assert_eq!(
-            inst_disk.agent_session_id, None,
-            "rejected call must not mutate sid",
+        assert!(
+            !profiles.join("ghost-profile").exists(),
+            "set-color must not mint profiles/ghost-profile"
         );
     }
 }
@@ -2616,6 +3315,7 @@ mod import_tests {
     fn summary(id: &str, cwd: &str, title: Option<&str>) -> ClaudeSessionSummary {
         ClaudeSessionSummary {
             session_id: id.to_string(),
+            config_dir: std::path::PathBuf::from("/claude-import-store"),
             cwd: cwd.to_string(),
             title: title.map(str::to_string),
             last_modified_ms: 0,
@@ -2624,49 +3324,244 @@ mod import_tests {
     }
 
     #[test]
-    fn terminal_import_pins_resume_target() {
-        let s = summary("abc123-def456", "/home/me/proj", Some("Fix bug"));
-        let inst = build_import_instance(&s, false, "");
-        assert_eq!(inst.tool, "claude");
-        assert_eq!(inst.project_path, "/home/me/proj");
-        assert_eq!(inst.title, "Fix bug");
+    fn build_import_instance_pins_the_replay_target_for_each_view() {
+        let defaults = crate::session::config::SessionConfig::default();
+        let terminal = build_import_instance(
+            &summary("abc123-def456", "/home/me/proj", Some("Fix bug")),
+            false,
+            "",
+            &defaults,
+        );
+        assert_eq!(terminal.tool, "claude");
+        assert_eq!(terminal.project_path, "/home/me/proj");
+        assert_eq!(terminal.title, "Fix bug");
+        assert!(terminal.extra_args.is_empty() && terminal.command.is_empty());
+        assert!(!terminal.yolo_mode);
         assert_eq!(
-            inst.resume_intent,
+            terminal.resume_intent,
             ResumeIntent::Use("abc123-def456".to_string())
         );
+
+        let untitled = build_import_instance(
+            &summary("abcdef12-3456-7890", "/home/me/proj", None),
+            false,
+            "team/imports",
+            &defaults,
+        );
+        assert_eq!(untitled.title, "Claude import abcdef12");
+        assert_eq!(untitled.group_path, "team/imports");
+
+        let structured = build_import_instance(
+            &summary("sid-1", "/home/me/proj", Some("x")),
+            true,
+            "",
+            &defaults,
+        );
+        assert!(structured.is_structured());
+        assert_eq!(structured.acp_session_id.as_deref(), Some("sid-1"));
+        assert_eq!(structured.import_pending, Some(true));
+        assert_eq!(structured.resume_intent, ResumeIntent::Default);
+
+        let mut configured = crate::session::config::SessionConfig::default();
+        configured
+            .agent_extra_args
+            .insert("claude".into(), "--remote-control".into());
+        configured
+            .agent_command_override
+            .insert("claude".into(), "claude-wrapper".into());
+        configured.yolo_mode_default = true;
+        for view_structured in [false, true] {
+            let inst = build_import_instance(
+                &summary("sid-2", "/home/me/proj", None),
+                view_structured,
+                "",
+                &configured,
+            );
+            assert_eq!(inst.extra_args, "--remote-control", "{view_structured}");
+            assert_eq!(inst.command, "claude-wrapper", "{view_structured}");
+            assert!(inst.yolo_mode, "{view_structured}");
+        }
     }
 
     #[test]
-    fn title_falls_back_to_short_id() {
-        let s = summary("abcdef12-3456-7890", "/home/me/proj", None);
-        let inst = build_import_instance(&s, false, "team/imports");
-        assert_eq!(inst.title, "Claude import abcdef12");
-        assert_eq!(inst.group_path, "team/imports");
-    }
-
-    #[cfg(feature = "serve")]
-    #[test]
-    fn structured_import_seeds_replay_fields() {
-        let s = summary("sid-1", "/home/me/proj", Some("x"));
-        let inst = build_import_instance(&s, true, "");
-        assert!(inst.is_structured());
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-1"));
-        assert_eq!(inst.import_pending, Some(true));
-        // Structured imports do not pin a terminal resume target.
-        assert_eq!(inst.resume_intent, ResumeIntent::Default);
-    }
-
-    #[test]
-    fn already_imported_matches_resume_and_observed_ids() {
+    fn already_imported_matches_every_spelling_of_a_claim() {
         let mut by_resume = Instance::new("a", "/p");
         by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
         let mut by_observed = Instance::new("b", "/p");
         by_observed.agent_session_id = Some("id-2".to_string());
-        let fresh = Instance::new("c", "/p");
-        let instances = vec![by_resume, by_observed, fresh];
+        let mut by_structured = Instance::new("c", "/p");
+        by_structured.acp_session_id = Some("id-3".to_string());
+        let fresh = Instance::new("d", "/p");
+        let instances = vec![by_resume, by_observed, by_structured, fresh];
 
-        assert!(already_imported(&instances, "id-1"));
-        assert!(already_imported(&instances, "id-2"));
-        assert!(!already_imported(&instances, "id-3"));
+        for (id, claimed) in [
+            ("id-1", true),
+            ("id-2", true),
+            ("id-3", true),
+            ("id-4", false),
+        ] {
+            assert_eq!(already_imported(&instances, id), claimed, "{id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod show_json_tests {
+    use super::*;
+
+    #[test]
+    fn relationship_lines_name_parent_and_children() {
+        let parent = Instance::new("orchestrator", "/repo");
+        let mut child = Instance::new("worker", "/repo");
+        child.parent_session_id = Some(parent.id.clone());
+        let mut orphan = Instance::new("stray", "/repo");
+        orphan.parent_session_id = Some("gone".to_string());
+        let instances = vec![parent.clone(), child.clone(), orphan.clone()];
+
+        for (inst, expected) in [
+            (
+                &parent,
+                vec![
+                    "  Children:".to_string(),
+                    format!("    worker ({})", child.id),
+                ],
+            ),
+            (
+                &child,
+                vec![format!("  Parent:  orchestrator ({})", parent.id)],
+            ),
+            (&orphan, vec!["  Parent:  gone".to_string()]),
+        ] {
+            assert_eq!(
+                relationship_lines(inst, &instances),
+                expected,
+                "{}",
+                inst.title
+            );
+        }
+    }
+
+    #[test]
+    fn show_json_reports_state_and_only_the_timestamps_that_apply() {
+        let plain = Instance::new("z", "/repo");
+        let serialized = serde_json::to_string(&session_details(&plain, "p")).unwrap();
+        assert!(!serialized.contains("trashed_at"), "{serialized}");
+        assert!(!serialized.contains("archived_at"), "{serialized}");
+        assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
+
+        let mut archived = Instance::new("z", "/repo");
+        archived.archive();
+        let details = session_details(&archived, "p");
+        assert_eq!(details.state, "archived");
+        assert!(details.archived_at.is_some());
+        assert!(details.trashed_at.is_none());
+
+        let mut trashed = archived;
+        trashed.trash();
+        let details = session_details(&trashed, "p");
+        assert_eq!(
+            details.state, "trashed",
+            "trash outranks an earlier archive"
+        );
+        assert!(details.trashed_at.is_some());
+        assert!(details.archived_at.is_some());
+    }
+
+    #[test]
+    fn show_json_mirrors_the_api_snooze_and_pin_keys() {
+        let now = chrono::Utc::now();
+        let future = now + chrono::Duration::minutes(15);
+        let past = now - chrono::Duration::minutes(15);
+        let row = |f: &dyn Fn(&mut Instance)| {
+            let mut inst = Instance::new("z", "/repo");
+            f(&mut inst);
+            inst
+        };
+        let check = |label: &str, f: &dyn Fn(&mut Instance), snooze: bool, pin: bool, state| {
+            let value = serde_json::to_value(session_details(&row(f), "p")).unwrap();
+            let seen = (
+                value.get("snoozed_until").is_some(),
+                value.get("pinned_at").is_some(),
+                value["state"].as_str(),
+            );
+            assert_eq!(seen, (snooze, pin, Some(state)), "{label}: {value}");
+        };
+
+        check("plain row", &|_| {}, false, false, "live");
+        check(
+            "active snooze",
+            &|i| i.snoozed_until = Some(future),
+            true,
+            false,
+            "live",
+        );
+        check(
+            "expired snooze",
+            &|i| i.snoozed_until = Some(past),
+            false,
+            false,
+            "live",
+        );
+        check("pinned", &|i| i.pinned_at = Some(now), false, true, "live");
+        check(
+            "snoozed and archived",
+            &|i| {
+                i.archived_at = Some(now);
+                i.snoozed_until = Some(future);
+            },
+            true,
+            false,
+            "archived",
+        );
+        check(
+            "pinned and snoozed",
+            &|i| {
+                i.pinned_at = Some(now);
+                i.snoozed_until = Some(future);
+            },
+            true,
+            true,
+            "live",
+        );
+        check(
+            "trashed and snoozed",
+            &|i| {
+                i.snooze(30);
+                i.trash();
+            },
+            true,
+            false,
+            "trashed",
+        );
+        check(
+            "trashed and pinned",
+            &|i| {
+                i.pin();
+                i.trash();
+            },
+            false,
+            true,
+            "trashed",
+        );
+        check(
+            "pinned and archived",
+            &|i| {
+                i.archived_at = Some(now);
+                i.pinned_at = Some(now);
+            },
+            false,
+            true,
+            "archived",
+        );
+
+        let active = serde_json::to_value(session_details(
+            &row(&|i| i.snoozed_until = Some(future)),
+            "p",
+        ))
+        .unwrap();
+        assert_eq!(
+            active["snoozed_until"],
+            serde_json::to_value(future).unwrap()
+        );
     }
 }

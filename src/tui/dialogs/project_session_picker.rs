@@ -25,9 +25,8 @@ impl ProjectSessionPickerDialog {
         Self { picker, projects }
     }
 
-    /// Resolve a label chosen from the picker back to the project's path.
-    /// Labels embed the path so they are unique; matching on the label is
-    /// safe even when two scopes share a name.
+    /// Resolve a picked label back to its path. Labels embed the path, so they
+    /// stay unique when two scopes share a name.
     fn path_for_label(&self, label: &str) -> Option<String> {
         self.projects
             .iter()
@@ -84,33 +83,23 @@ mod tests {
     }
 
     #[test]
-    fn enter_submits_path_not_label() {
-        let mut dialog = ProjectSessionPickerDialog::new(sample_projects());
-        match dialog.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(path) => assert_eq!(path, "/tmp/alpha"),
-            _ => panic!("expected Submit"),
-        }
-    }
-
-    #[test]
-    fn esc_cancels() {
-        let mut dialog = ProjectSessionPickerDialog::new(sample_projects());
-        assert!(matches!(
-            dialog.handle_key(key(KeyCode::Esc)),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn filter_then_select_resolves_correct_path() {
-        let mut dialog = ProjectSessionPickerDialog::new(sample_projects());
-        // Filter down to "beta" then select.
-        dialog.handle_key(key(KeyCode::Char('b')));
-        dialog.handle_key(key(KeyCode::Char('e')));
-        dialog.handle_key(key(KeyCode::Char('t')));
-        match dialog.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(path) => assert_eq!(path, "/tmp/beta"),
-            _ => panic!("expected Submit"),
+    fn keys_resolve_the_project_path_not_its_label() {
+        use KeyCode::{Char, Enter, Esc};
+        let cases: [(&[KeyCode], DialogResult<String>); 3] = [
+            (&[Enter], DialogResult::Submit("/tmp/alpha".into())),
+            (&[Esc], DialogResult::Cancel),
+            (
+                &[Char('b'), Char('e'), Char('t'), Enter],
+                DialogResult::Submit("/tmp/beta".into()),
+            ),
+        ];
+        for (keys, want) in cases {
+            let mut dialog = ProjectSessionPickerDialog::new(sample_projects());
+            let mut last = DialogResult::Continue;
+            for code in keys {
+                last = dialog.handle_key(key(*code));
+            }
+            assert_eq!(last, want, "{keys:?}");
         }
     }
 }

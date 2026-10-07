@@ -7,18 +7,21 @@ export default defineConfig({
   vite: {
     plugins: [tailwindcss()],
   },
-  // The "cockpit" docs were renamed to "structured-view" (the web dashboard's
-  // default structured view). Redirect the old URLs so external links and search
-  // results keep working. Astro emits static meta-refresh pages for these
-  // on `astro build`, which works on the GitHub Pages static host.
+  // Removed or renamed docs pages.
   redirects: {
     '/docs/cockpit/': '/docs/structured-view/',
-    '/docs/cockpit/setup/': '/docs/structured-view/setup/',
+    '/docs/cockpit/setup/': '/docs/structured-view/',
     '/docs/cockpit/interface/': '/docs/structured-view/interface/',
     '/docs/cockpit/controls/': '/docs/structured-view/controls/',
-    '/docs/cockpit/persistence/': '/docs/structured-view/persistence/',
+    '/docs/cockpit/persistence/': '/docs/structured-view/',
     '/docs/cockpit/troubleshooting/': '/docs/structured-view/troubleshooting/',
-    '/docs/cockpit/multi-agent/': '/docs/structured-view/multi-agent/',
+    '/docs/cockpit/multi-agent/': '/docs/structured-view/',
+    '/guides/podman/': '/guides/sandbox/',
+    '/guides/apple-containers/': '/guides/sandbox/',
+    '/guides/agent-override/': '/docs/guides/configuration/#agent-command-overrides',
+    '/guides/web/diff/': '/guides/diff-view/',
+    '/guides/web/settings/': '/guides/web/dashboard/#settings-and-profiles',
+    '/guides/session-fork/': '/guides/session-resume/#forking-a-session',
   },
   integrations: [
     sitemap({

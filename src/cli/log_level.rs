@@ -1,9 +1,4 @@
 //! `aoe log-level` — get or change the running daemon's tracing filter.
-//!
-//! Calls the daemon's `/api/log-level` endpoint over HTTP using the
-//! token embedded in `serve.url`. Does not require the daemon to be
-//! daemonised — a foreground `aoe serve` is reachable if its
-//! `serve.url` file is current.
 
 use anyhow::{bail, Context, Result};
 use clap::Args;

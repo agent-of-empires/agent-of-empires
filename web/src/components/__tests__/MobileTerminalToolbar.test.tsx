@@ -1,94 +1,227 @@
 // @vitest-environment jsdom
-//
-// Unit tests for MobileTerminalToolbar's keyboard wiring (#1432). The strip
-// is never rendered under the chromium Playwright coverage run (pointer:coarse
-// does not match there), so these exercise it directly: the keyboard-open
-// paste fallback branch and the Ctrl latch. The parent (a live terminal
-// view) always owns the keyboard inset now, so the strip carries none.
 
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MobileTerminalToolbar } from "../MobileTerminalToolbar";
+import { HOLD_REPEAT_DELAY_MS, HOLD_REPEAT_INTERVAL_MS } from "../../hooks/useHoldRepeat";
+import {
+  DEFAULT_TOOLBAR_KEYS,
+  MAX_TOOLBAR_KEYS,
+  TOOLBAR_KEY_CATALOG,
+  type ToolbarKeyId,
+} from "../../lib/terminalToolbarKeys";
 
 afterEach(() => {
   cleanup();
-  // Drop the per-test isSecureContext override (set in the paste-branch test)
-  // so it falls back to the default and does not leak into other tests.
+  vi.useRealTimers();
   delete (window as { isSecureContext?: boolean }).isSecureContext;
+  delete (navigator as { clipboard?: unknown }).clipboard;
 });
 
-interface Overrides {
-  keyboardOpen?: boolean;
-  sendData?: (data: string) => void;
+function secureContext(value: boolean) {
+  Object.defineProperty(window, "isSecureContext", { value, configurable: true });
 }
 
-function renderToolbar(overrides: Overrides = {}) {
-  const sendData = overrides.sendData ?? vi.fn();
-  const inputElRef = { current: null };
+function renderToolbar(
+  opts: {
+    keys?: readonly ToolbarKeyId[];
+    inputEl?: HTMLTextAreaElement | null;
+    keyboardOpen?: boolean;
+    compact?: boolean;
+  } = {},
+) {
+  const sendData = vi.fn<(data: string) => boolean>(() => true);
+  const sendPaste = vi.fn<(text: string, submit: boolean) => boolean>(() => true);
+  const onCompose = vi.fn();
   const result = render(
     <MobileTerminalToolbar
+      keys={opts.keys ?? TOOLBAR_KEY_CATALOG.map((k) => k.id)}
       sendData={sendData}
-      inputElRef={inputElRef}
-      keyboardOpen={overrides.keyboardOpen ?? false}
+      sendPaste={sendPaste}
+      onCompose={onCompose}
+      inputElRef={{ current: opts.inputEl ?? null }}
+      keyboardOpen={opts.keyboardOpen ?? false}
+      compact={opts.compact ?? false}
       ctrlActive={false}
       onCtrlToggle={vi.fn()}
     />,
   );
-  return { ...result, sendData };
+  return { ...result, sendData, sendPaste, onCompose };
 }
 
-describe("MobileTerminalToolbar", () => {
-  it("carries no inline keyboard inset (the parent owns it)", () => {
-    const { container } = renderToolbar();
-    const strip = container.firstChild as HTMLElement;
-    expect(strip.style.paddingBottom).toBe("");
+describe("MobileTerminalToolbar keys", () => {
+  it("renders the configured keys in order, and nothing for an empty row", () => {
+    renderToolbar({ keys: DEFAULT_TOOLBAR_KEYS });
+    expect(screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual([
+      "Escape",
+      "Tab",
+      "Ctrl",
+      "Paste from clipboard",
+      "Compose",
+    ]);
+    cleanup();
+    renderToolbar({ keys: ["enter", "esc"] });
+    expect(screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual(["Enter", "Escape"]);
+    cleanup();
+    expect(renderToolbar({ keys: [] }).container.firstChild).toBeNull();
   });
 
-  it("renders the action buttons", () => {
-    renderToolbar();
-    expect(screen.getByLabelText("Paste from clipboard")).toBeTruthy();
-    expect(screen.getByLabelText("Ctrl")).toBeTruthy();
+  it("ends the compact row with Enter unless the row already has it or is full", () => {
+    const labels = () => screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"));
+    renderToolbar({ keys: ["esc", "tab"], compact: true });
+    expect(labels()).toEqual(["Escape", "Tab", "Enter"]);
+    cleanup();
+    renderToolbar({ keys: ["enter", "esc"], compact: true });
+    expect(labels()).toEqual(["Enter", "Escape"]);
+    cleanup();
+    const full = TOOLBAR_KEY_CATALOG.map((k) => k.id)
+      .filter((id) => id !== "enter")
+      .slice(0, MAX_TOOLBAR_KEYS);
+    renderToolbar({ keys: full, compact: true });
+    expect(labels()).not.toContain("Enter");
   });
 
-  it("takes the keyboard-open paste branch when an editable is focused", async () => {
-    // Force the execCommand fallback path: skip the Clipboard API branch.
-    Object.defineProperty(window, "isSecureContext", {
-      value: false,
+  it.each(TOOLBAR_KEY_CATALOG.filter((k) => k.data).map((k) => [k.name, k.id, k.data!] as const))(
+    "a tap on %s sends its sequence once",
+    (name, id, data) => {
+      const { sendData } = renderToolbar({ keys: [id] });
+      const key = screen.getByLabelText(name);
+      fireEvent.pointerDown(key);
+      fireEvent.pointerUp(key);
+      fireEvent.click(key);
+      expect(sendData.mock.calls).toEqual([[data]]);
+    },
+  );
+
+  it("repeats a held key until release, without a trailing tap", () => {
+    vi.useFakeTimers();
+    const { sendData } = renderToolbar({ keys: ["backspace"] });
+    const back = screen.getByLabelText("Backspace");
+    fireEvent.pointerDown(back);
+    act(() => vi.advanceTimersByTime(HOLD_REPEAT_DELAY_MS - 1));
+    expect(sendData).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1 + 2 * HOLD_REPEAT_INTERVAL_MS));
+    expect(sendData).toHaveBeenCalledTimes(3);
+    fireEvent.pointerUp(back);
+    fireEvent.click(back);
+    act(() => vi.advanceTimersByTime(10 * HOLD_REPEAT_INTERVAL_MS));
+    expect(sendData).toHaveBeenCalledTimes(3);
+    expect(new Set(sendData.mock.calls.map(([d]) => d))).toEqual(new Set(["\x7f"]));
+  });
+
+  it("sends nothing when the browser cancels the touch", () => {
+    vi.useFakeTimers();
+    const { sendData } = renderToolbar({ keys: ["page-up"] });
+    const key = screen.getByLabelText("Page up");
+    fireEvent.pointerDown(key);
+    fireEvent.pointerCancel(key);
+    act(() => vi.advanceTimersByTime(HOLD_REPEAT_DELAY_MS * 2));
+    expect(sendData).not.toHaveBeenCalled();
+  });
+
+  // Every toolbar send bypasses the textarea's beforeinput, so the retained syllable must be gone before the PTY
+  // sees the key, or the next Korean keystroke rewrites the stale value into the new line.
+  it("drops the retained IME shadow before each out-of-band send", () => {
+    vi.useFakeTimers();
+    const proxy = document.createElement("textarea");
+    proxy.setAttribute("data-keyboard-proxy", "");
+    document.body.append(proxy);
+    const local = document.createElement("textarea");
+    // Asserted inside the mock: an implementation that sent first and
+    // cleared afterwards would still pass a check made after the call.
+    const seen: Array<{ data: string; local: string; proxy: string }> = [];
+    const { sendData } = renderToolbar({ inputEl: local });
+    sendData.mockImplementation((data: string) => {
+      seen.push({ data, local: local.value, proxy: proxy.value });
+      return true;
+    });
+
+    for (const label of ["Tab", "Escape", "Ctrl+C interrupt"]) {
+      local.value = "ㅎ";
+      proxy.value = "ㅎ";
+      fireEvent.click(screen.getByLabelText(label));
+    }
+    local.value = "ㅎ";
+    proxy.value = "ㅎ";
+    const back = screen.getByLabelText("Backspace");
+    fireEvent.pointerDown(back);
+    act(() => vi.advanceTimersByTime(HOLD_REPEAT_DELAY_MS));
+    fireEvent.pointerUp(back);
+
+    expect(seen.map((s) => s.data)).toEqual(["\t", "\x1b", "\x03", "\x7f"]);
+    expect(seen.some((s) => s.local.includes("ㅎ") || s.proxy.includes("ㅎ"))).toBe(false);
+    proxy.remove();
+  });
+});
+
+describe("MobileTerminalToolbar paste", () => {
+  it("sends clipboard text as one tmux paste", async () => {
+    secureContext(true);
+    const item = {
+      types: ["text/plain"],
+      getType: async () => new Blob(["line 1\nline 2"], { type: "text/plain" }),
+    };
+    Object.defineProperty(navigator, "clipboard", { value: { read: async () => [item] }, configurable: true });
+    const { sendData, sendPaste, onCompose } = renderToolbar({ keyboardOpen: true });
+
+    fireEvent.click(screen.getByLabelText("Paste from clipboard"));
+    await waitFor(() => expect(sendPaste).toHaveBeenCalledWith("line 1\nline 2", false));
+    expect(sendData).not.toHaveBeenCalled();
+    expect(onCompose).not.toHaveBeenCalled();
+  });
+
+  it("opens the compose sheet when the clipboard read is refused", async () => {
+    secureContext(true);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { read: async () => Promise.reject(new Error("denied")) },
       configurable: true,
     });
-    const { sendData } = renderToolbar({ keyboardOpen: true });
+    const { sendPaste, onCompose } = renderToolbar();
 
+    fireEvent.click(screen.getByLabelText("Paste from clipboard"));
+    await waitFor(() => expect(onCompose).toHaveBeenCalledTimes(1));
+    expect(sendPaste).not.toHaveBeenCalled();
+  });
+
+  it("on a plain-HTTP origin pastes through execCommand into the focused input, else opens compose", async () => {
+    secureContext(false);
     const editable = document.createElement("textarea");
     document.body.appendChild(editable);
     editable.focus();
 
-    fireEvent.click(screen.getByLabelText("Paste from clipboard"));
-    // The onClick handler is async; let its microtasks settle. With no
-    // clipboard data recovered it falls through without sending anything.
-    await new Promise((r) => setTimeout(r, 0));
-
-    expect(sendData).not.toHaveBeenCalled();
+    for (const [granted, composes] of [
+      [true, 0],
+      [false, 1],
+    ] as const) {
+      const execCommand = vi.fn(() => granted);
+      Object.defineProperty(document, "execCommand", { value: execCommand, configurable: true });
+      const { sendData, sendPaste, onCompose, unmount } = renderToolbar({ keyboardOpen: true });
+      fireEvent.click(screen.getByLabelText("Paste from clipboard"));
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("paste"));
+      // The focused input's own paste handler sends; the toolbar never does.
+      expect(sendData).not.toHaveBeenCalled();
+      expect(sendPaste).not.toHaveBeenCalled();
+      expect(onCompose).toHaveBeenCalledTimes(composes);
+      unmount();
+    }
     document.body.removeChild(editable);
   });
 });
 
-// User story (ported from the live Playwright acp-stories suite): the
-// Ctrl toggle latches the modifier so the next keystroke combines with
-// Ctrl. Tapping Ctrl flips aria-pressed to "true"; tapping again flips
-// it back. The latch state lives in the parent (TerminalView /
-// PairedTerminal hold a useState and pass `onCtrlToggle={() =>
-// setCtrlActive(v => !v)}`); this harness mirrors that wiring so the
-// toolbar's aria-pressed contract is exercised end to end. The
-// modifier-applied keystroke itself is handled by the terminal helper
-// textarea and is out of scope here.
-function CtrlLatchHarness({ sendData }: { sendData: (data: string) => void }) {
+// User story (ported from the live Playwright acp-stories suite): the Ctrl toggle latches the modifier so the next
+// keystroke combines with Ctrl.
+function CtrlLatchHarness({ sendData }: { sendData: (data: string) => boolean }) {
   const [ctrlActive, setCtrlActive] = useState(false);
   return (
     <MobileTerminalToolbar
+      keys={["ctrl", "ctrl-c"]}
       sendData={sendData}
+      sendPaste={vi.fn()}
+      onCompose={vi.fn()}
       inputElRef={{ current: null }}
       keyboardOpen={false}
+      compact={false}
       ctrlActive={ctrlActive}
       onCtrlToggle={() => setCtrlActive((v) => !v)}
     />
@@ -96,26 +229,18 @@ function CtrlLatchHarness({ sendData }: { sendData: (data: string) => void }) {
 }
 
 describe("MobileTerminalToolbar Ctrl latch", () => {
-  it("tapping Ctrl latches (aria-pressed true) and tapping again unlatches", () => {
-    render(<CtrlLatchHarness sendData={vi.fn()} />);
-    const ctrl = screen.getByRole("button", { name: "Ctrl" });
-    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
-
-    fireEvent.click(ctrl);
-    expect(ctrl.getAttribute("aria-pressed")).toBe("true");
-
-    fireEvent.click(ctrl);
-    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
-  });
-
-  it("Ctrl+C interrupt clears an active latch", () => {
-    const sendData = vi.fn();
+  it("tapping Ctrl toggles the latch and Ctrl+C interrupt clears it", () => {
+    const sendData = vi.fn(() => true);
     render(<CtrlLatchHarness sendData={sendData} />);
     const ctrl = screen.getByRole("button", { name: "Ctrl" });
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
 
     fireEvent.click(ctrl);
     expect(ctrl.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(ctrl);
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
 
+    fireEvent.click(ctrl);
     fireEvent.click(screen.getByRole("button", { name: "Ctrl+C interrupt" }));
     expect(sendData).toHaveBeenCalledWith("\x03");
     expect(ctrl.getAttribute("aria-pressed")).toBe("false");

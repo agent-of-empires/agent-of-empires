@@ -3,10 +3,7 @@ import { useEffect, useState } from "react";
 import { fetchTelemetryStatus, setTelemetryConsent, type TelemetryStatus } from "../../lib/api";
 import { ToggleField } from "./FormFields";
 
-/// Telemetry opt-in toggle. Unlike the other settings panels this does not go
-/// through the generic settings PATCH: the daemon owns the anonymous install
-/// id (the browser never posts to the telemetry backend), so the toggle calls
-/// the dedicated consent endpoint, which also generates / deletes the id.
+/// Uses the dedicated consent endpoint, which also creates or deletes the install id.
 export function TelemetrySettings() {
   const [status, setStatus] = useState<TelemetryStatus | null>(null);
   const [saving, setSaving] = useState(false);
@@ -18,8 +15,7 @@ export function TelemetrySettings() {
         const s = await fetchTelemetryStatus();
         if (active) setStatus(s);
       } catch {
-        // fetchTelemetryStatus already swallows network errors and returns
-        // null, but guard here too so a throw can never leave the panel blank.
+        // Keep the panel rendered even if the fetch throws.
       }
     })();
     return () => {
@@ -33,7 +29,6 @@ export function TelemetrySettings() {
       const next = await setTelemetryConsent(enabled);
       if (next) setStatus(next);
     } finally {
-      // Always clear the saving flag so the toggle can't get stuck disabled.
       setSaving(false);
     }
   };

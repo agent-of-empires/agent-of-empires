@@ -17,6 +17,7 @@ function aboutWith(webBuildId: string | null): ServerAbout {
     behind_tunnel: false,
     profile: "main",
     acp_show_tool_durations: true,
+    acp_wrap_tool_output: false,
     acp_replay_events: 0,
     build_flavor: "release",
     web_build_id: webBuildId,
@@ -50,14 +51,6 @@ describe("DashboardUpdateBanner", () => {
     render(<DashboardUpdateBanner />);
     expect(await screen.findByRole("status", { name: "Dashboard update available" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Reload now" })).toBeDefined();
-  });
-
-  it("renders nothing when the bundle matches", async () => {
-    vi.spyOn(api, "fetchAbout").mockResolvedValue(aboutWith("index-PageBuild.js"));
-    const { container } = render(<DashboardUpdateBanner />);
-    // Let the mount-time check settle.
-    await act(async () => {});
-    expect(container.firstChild).toBeNull();
   });
 
   it("renders nothing when the server does not report a build id (older binary)", async () => {

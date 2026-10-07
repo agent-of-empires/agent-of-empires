@@ -1,19 +1,4 @@
-//! Host-owned store of UI state that plugin workers push over the `ui.state.*`
-//! and `ui.notify` RPCs (#2366).
-//!
-//! The honest model: a worker pushes *typed display state* into a slot it
-//! declared; the host stores it here and the web dashboard renders it. No
-//! plugin code runs in the dashboard and the render path never awaits a worker,
-//! so this store is read synchronously via [`UiStore::snapshot`].
-//!
-//! State is ephemeral, like the rest of the Tier 1 host: it lives in memory and
-//! dies with the daemon. A plugin's entries are cleared when its worker exits
-//! (a fresh worker repopulates them), guarded by a per-spawn *generation* so a
-//! late write from an exited worker, or an instant respawn, cannot resurrect or
-//! clobber stale state. Notifications are point-in-time events on a separate
-//! bounded ring: they survive a worker exit (a plugin that posts a notification
-//! and immediately crashes should still reach the browser) and the client
-//! toasts each one once by tracking the monotonic `seq`.
+//! Host-owned store for state pushed through plugin UI RPCs.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,35 +8,16 @@ use aoe_plugin_api::UiSlot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Most entries one plugin may hold in a single revision scope (one session id,
-/// or "" for global slots). Sized well above any real per-session slot count so
-/// one session's panes are never starved by another session's entries. The old
-/// flat per-plugin cap did exactly that: once a plugin touched enough sessions,
-/// early-created entries filled the bucket and later sessions' new keys were
-/// rejected forever.
 const MAX_ENTRIES_PER_SCOPE: usize = 32;
-/// Absolute backstop across all of one plugin's scopes. `session_id` is not
-/// validated against real sessions in `ui.state.set`, so without a global cap a
-/// buggy plugin could fabricate unbounded session ids and stay under the
-/// per-scope cap forever. A cooperative bound (the model is honest, not
-/// adversarial), sized to keep worst-case pane-payload memory bounded (1024
-/// entries against the 64 KiB pane ceiling is roughly 64 MiB per plugin).
 const MAX_ENTRIES_PER_PLUGIN: usize = 1024;
-/// Largest normalized payload accepted for one entry, in bytes of JSON. The
-/// pane slot gets a much larger budget than the small badge/column slots: a
-/// pane can carry a full PR comment list, where a badge is a few words.
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 const MAX_PANE_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_COMPOSER_DRAFT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_COMPOSER_ACTION_PAYLOAD_BYTES: usize = 20 * 1024;
-/// Notifications kept on the shared ring before the oldest are dropped.
 const NOTIFICATION_RING: usize = 200;
-/// Caps on notification text, so one notify cannot post an unbounded blob.
 const MAX_TITLE_LEN: usize = 256;
 const MAX_BODY_LEN: usize = 4096;
 
-/// A display tone, mapped to a color by each rendering surface. A closed set so
-/// a plugin cannot inject an arbitrary class or color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tone {
@@ -62,7 +28,6 @@ pub enum Tone {
     Danger,
 }
 
-/// Sort direction for a [`UiSlot::SortKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SortDirection {
@@ -70,9 +35,6 @@ pub enum SortDirection {
     Desc,
 }
 
-/// A scalar a `RowColumn` exposes for client-side sorting. Kept to comparable
-/// scalars (no objects/arrays) so the dashboard can order rows deterministically
-/// without running plugin code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SortValue {
@@ -80,7 +42,6 @@ pub enum SortValue {
     String(String),
 }
 
-/// One option in a [`UiSlot::FilterFacet`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FacetOption {
     pub value: String,
@@ -90,31 +51,24 @@ pub struct FacetOption {
     pub tone: Option<Tone>,
 }
 
-// Per-slot payloads. Each is the typed shape a worker must send for that slot;
-// `ui.state.set` validates the incoming JSON against the slot's payload before
-// storing, so a malformed push is rejected at the host boundary rather than
-// crashing the dashboard. They carry no `session_id`: that is an RPC-level
-// param and becomes part of the entry key, never duplicated in the body.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TextPayload {
-    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tone: Option<Tone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tooltip: Option<String>,
-    /// Lucide icon name, e.g. "git-pull-request-arrow". The client maps it
-    /// through a small allowlist; an unknown name renders no icon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
-    /// URL to open (e.g. the PR). When set, the client renders the badge as a
-    /// link instead of static text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     href: Option<String>,
+    /// `Some([])` is an explicit clear and stays distinct from an absent list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    items: Option<Vec<BadgeItem>>,
 }
 
-/// One icon/text badge inside a `row-badge` `items` list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BadgeItem {
@@ -128,13 +82,11 @@ struct BadgeItem {
     href: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tooltip: Option<String>,
+    /// Items sharing a group collapse into one chip that cycles on click.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
 }
 
-/// `row-badge` payload: the single-badge fields (back-compat with any plugin
-/// pushing `{ text, tone, tooltip, icon, href }`) plus an optional `items` list
-/// so one entry can carry several icon badges. `text` is optional here: an
-/// items-only badge has no top-level text. Empty `items: []` is valid (clears
-/// the row).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RowBadgePayload {
@@ -148,55 +100,8 @@ struct RowBadgePayload {
     icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     href: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    items: Vec<BadgeItem>,
-}
-
-/// Which tool-call card a `tool-card-badge` attaches to. MCP servers and skills
-/// share no namespace guarantee (both can be named "github"), so the card kind
-/// is part of the match key, not just the raw name. The host does not
-/// canonicalize the name: it is an external identifier the plugin resolves,
-/// matched by exact string equality against the card's target.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-enum ToolCardTarget {
-    Mcp { name: String },
-    Skill { name: String },
-}
-
-impl ToolCardTarget {
-    fn name(&self) -> &str {
-        match self {
-            ToolCardTarget::Mcp { name } | ToolCardTarget::Skill { name } => name,
-        }
-    }
-}
-
-/// One badge inside a `tool-card-badge` `items` list, keyed to a specific
-/// tool-call target. A badge with neither `text` nor `icon` renders nothing, so
-/// at least one is required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolCardBadge {
-    target: ToolCardTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tone: Option<Tone>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tooltip: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    icon: Option<String>,
-}
-
-/// `tool-card-badge` payload: a target-keyed `items` list so one declared entry
-/// can badge every MCP server or skill the plugin knows about. Empty `items: []`
-/// is valid and clears the plugin's badges (matching `row-badge`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolCardBadgePayload {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    items: Vec<ToolCardBadge>,
+    items: Option<Vec<BadgeItem>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,11 +112,8 @@ struct RowColumnPayload {
     tone: Option<Tone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tooltip: Option<String>,
-    /// Scalar driving client-side sorting (referenced by a `SortKey`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sort_value: Option<SortValue>,
-    /// Tokens this row matches for client-side filtering (referenced by a
-    /// `FilterFacet`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     filter_values: Vec<String>,
 }
@@ -220,7 +122,6 @@ struct RowColumnPayload {
 #[serde(deny_unknown_fields)]
 struct SortKeyPayload {
     label: String,
-    /// The `RowColumn` id whose `sort_value` this orders by.
     column: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     direction: Option<SortDirection>,
@@ -230,7 +131,6 @@ struct SortKeyPayload {
 #[serde(deny_unknown_fields)]
 struct FilterFacetPayload {
     label: String,
-    /// The `RowColumn` id whose `filter_values` this filters over.
     column: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     options: Vec<FacetOption>,
@@ -246,8 +146,6 @@ struct CardPayload {
     tone: Option<Tone>,
 }
 
-/// Which dock a [`UiSlot::Pane`] opens in by default. A closed set so a plugin
-/// cannot name an arbitrary location; the user can still move the pane after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PaneLocation {
@@ -255,11 +153,6 @@ pub enum PaneLocation {
     Bottom,
 }
 
-/// A pane's pinned status line, rendered below the scrolling block list so it
-/// stays visible while the body scrolls. `text` reads on the left, `value` on
-/// the right; both are optional, and a footer with neither renders nothing.
-/// Unlike the blocks this is a typed envelope field, since the surfaces need to
-/// know it is chrome rather than content in order to pin it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PaneFooter {
@@ -267,22 +160,12 @@ struct PaneFooter {
     text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     value: Option<String>,
-    /// Lucide icon name, resolved web-side against its allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
-    /// Tones `value`, which is the status half of the line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tone: Option<Tone>,
 }
 
-/// `pane` payload (the dockable tool-window slot). Either the simple
-/// `{ title, body }` form or an ordered `blocks` list, plus an optional
-/// `default_location` picking the dock it first opens in (defaults to the
-/// right dock host-side when omitted). The blocks are kept as opaque JSON on
-/// purpose: the host validates only the envelope (an array of objects) and the
-/// web renders the block kinds it knows, dropping the rest. This is the
-/// forward-compat contract: a plugin can add fields to a known kind, or a whole
-/// new kind, and never need a host change; only the web renderer grows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PanePayload {
@@ -294,35 +177,10 @@ struct PanePayload {
     blocks: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_location: Option<PaneLocation>,
-    /// Lucide icon name for the pane's activity-bar/tool-window icon. Opaque to
-    /// the host (the web resolves it against its allowlist, falling back to a
-    /// generic icon); kept only so `deny_unknown_fields` accepts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     footer: Option<PaneFooter>,
-}
-
-/// `settings-page` payload (the routed full-page slot). Mirrors `PanePayload`'s
-/// content shape, the simple `{ title, body }` form or an ordered forward-
-/// compatible `blocks` list, so the web renders it through the same block
-/// vocabulary. It drops `default_location`: a full page is not docked, so a
-/// dock hint would be meaningless, and `deny_unknown_fields` rejects it rather
-/// than silently accepting a no-op field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SettingsPagePayload {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    body: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    blocks: Option<Vec<Value>>,
-    /// Lucide icon name for the page's nav entry. Opaque to the host (the web
-    /// resolves it against its allowlist); kept only so `deny_unknown_fields`
-    /// accepts it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,26 +220,13 @@ impl ComposerDraftOperation {
     }
 }
 
-/// Why a `ui.state.set`/`ui.state.remove` was rejected. The host API maps each
-/// to a JSON-RPC error code.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UiError {
-    /// The calling worker's generation is no longer active (it exited, or a
-    /// newer worker replaced it). The write is dropped rather than resurrecting
-    /// stale state.
     StaleWorker,
-    /// Adding this key would exceed either the per-scope cap
-    /// (`MAX_ENTRIES_PER_SCOPE`) or the per-plugin backstop
-    /// (`MAX_ENTRIES_PER_PLUGIN`). Updating an existing key is never blocked.
     QuotaExceeded,
-    /// The payload did not match the slot's typed shape, or a scope rule
-    /// (per-session slot needs a `session_id`; a global slot must not have one).
     BadRequest(String),
 }
 
-/// Identifies one stored entry. A per-session slot keys on `session_id`; a
-/// global slot leaves it `None`. `id` is the plugin-chosen address within the
-/// slot, gated against the manifest `ui` declarations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EntryKey {
     plugin_id: String,
@@ -390,9 +235,6 @@ struct EntryKey {
     session_id: Option<String>,
 }
 
-/// A notification as rendered: the seq lets the client toast each one once.
-/// `Deserialize` so daemon-connected clients (the native TUI structured view,
-/// #2402) can decode the same wire shape the web frontend consumes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub seq: u64,
@@ -403,15 +245,10 @@ pub struct Notification {
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// A URL a worker asked the surface to open (`ui.open_url`). When set, the
-    /// web renders the toast as click-to-open (an async push cannot
-    /// `window.open` without tripping the popup blocker) and the native TUI
-    /// opens it directly on first display. Always `http`/`https`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
 }
 
-/// One entry in the snapshot the web renders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiEntry {
     pub plugin_id: String,
@@ -419,39 +256,17 @@ pub struct UiEntry {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Normalized, slot-validated payload. The `slot` tells the client its
-    /// shape.
     pub payload: Value,
 }
 
-/// The full UI state the dashboard polls each tick. Bounded and small, so it is
-/// sent whole rather than incrementally (verdict: no since_seq/tombstones).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiSnapshot {
     pub entries: Vec<UiEntry>,
     pub notifications: Vec<Notification>,
-    /// Monotonic mutation counter per `(plugin_id, scope)`, where `scope` is a
-    /// session id, or `""` for a global (session-less) slot. The dashboard reads
-    /// a baseline from the action POST and holds a manual-action spinner until
-    /// the matching scope's counter moves off it, so the spinner tracks the
-    /// worker's re-pushed state for that pane instead of the fire-and-forget
-    /// POST, and an unrelated session's push never clears it. Outer key is the
-    /// plugin id, inner key the scope. `BTreeMap` for a deterministic serialized
-    /// order; `serde(default)` so an older daemon's snapshot still decodes.
     #[serde(default)]
     pub revisions: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
-/// Only `http`/`https` URLs may be opened from a plugin's UI state; a plugin
-/// must not smuggle `javascript:`/`file:`/`data:` through an href. Mirrors the
-/// web `isExternalHttpUrl`.
-fn is_http_url(u: &str) -> bool {
-    let u = u.to_ascii_lowercase();
-    u.starts_with("http://") || u.starts_with("https://")
-}
-
-/// Append one `(href, label)` link to `out` when `href` is a fresh, safe
-/// http/https URL. Label is the badge's tooltip or text, else the href.
 fn push_link(
     out: &mut Vec<(String, String)>,
     seen: &mut HashSet<String>,
@@ -461,7 +276,7 @@ fn push_link(
     let Some(href) = href.and_then(Value::as_str) else {
         return;
     };
-    if !is_http_url(href) || !seen.insert(href.to_string()) {
+    if !crate::util::is_allowed_href(href) || !seen.insert(href.to_string()) {
         return;
     }
     let label = label
@@ -473,12 +288,6 @@ fn push_link(
 }
 
 impl UiSnapshot {
-    /// The openable links a plugin command's `(slot, id)` entry exposes for
-    /// `session_id`, mirroring the web `resolveCommandLinks`: each `items[]`
-    /// href (deduped, in order), falling back to the entry's top-level `href`
-    /// when the badge has no per-item hrefs. Only `http`/`https` URLs are
-    /// returned. Each link's label is the badge's `tooltip` or `text`, else the
-    /// href itself. Empty when no entry matches or nothing safe resolves.
     pub fn links_for(
         &self,
         plugin_id: &str,
@@ -524,26 +333,12 @@ impl UiSnapshot {
 #[derive(Default)]
 struct Inner {
     entries: HashMap<EntryKey, Value>,
-    /// Per-plugin currently-active worker generation. Absent once a worker has
-    /// exited and its state cleared; a respawn re-registers via
-    /// [`UiStore::begin_generation`].
     active: HashMap<String, u64>,
     notifications: VecDeque<Notification>,
     notify_seq: u64,
-    /// Mutation counter keyed by `(plugin_id, scope)`, bumped on every accepted
-    /// entry change to that scope. `scope` is the entry's session id, or `""`
-    /// for a global slot. Daemon-local: it resets when the daemon restarts, so
-    /// the client treats any change off its baseline (including a reset to a
-    /// lower value) as "state moved". Not covered by the entry quota: a scope's
-    /// counter is retained after its entries are removed (the client must still
-    /// observe the bump that cleared them), so a plugin that churns many
-    /// fabricated session ids leaves revision keys behind. Acceptable under the
-    /// cooperative model; bounded revision retention is a separate follow-up.
     revisions: HashMap<(String, String), u64>,
 }
 
-/// The revision scope an entry belongs to: its session id, or `""` for a global
-/// (session-less) slot. Shared by writes and the snapshot so they key alike.
 fn scope_of(session_id: Option<&str>) -> String {
     session_id.unwrap_or("").to_string()
 }
@@ -557,8 +352,6 @@ impl Inner {
         *rev = rev.saturating_add(1);
     }
 
-    /// The distinct scopes a plugin currently has entries in. Used to bump every
-    /// affected pane's counter when a bulk clear drops a plugin's entries.
     fn plugin_scopes(&self, plugin_id: &str) -> HashSet<String> {
         self.entries
             .keys()
@@ -568,9 +361,6 @@ impl Inner {
     }
 }
 
-/// The shared store. A `std::sync::RwLock` (not `tokio::Mutex`): writes happen
-/// in the host's `spawn_blocking` dispatch and the web read just clones a small
-/// snapshot, so neither side holds the lock across an `.await`.
 pub struct UiStore {
     inner: RwLock<Inner>,
     next_generation: AtomicU64,
@@ -590,18 +380,9 @@ impl UiStore {
         }
     }
 
-    /// Register a freshly spawned worker for `plugin_id` and return its
-    /// generation. The supervisor threads this into the worker's RPC context;
-    /// every `ui.state.*` write carries it so a stale worker's writes are
-    /// rejected.
     pub fn begin_generation(&self, plugin_id: &str) -> u64 {
         let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.write();
-        // A fresh worker starts from a clean slate: drop any entries the
-        // previous generation left behind. This makes eviction robust against a
-        // fast respawn (begin running before the exited worker's clear_plugin),
-        // where clearing by the old generation would otherwise no-op and leave
-        // its entries visible until the new worker happened to overwrite them.
         let scopes = inner.plugin_scopes(plugin_id);
         inner.entries.retain(|k, _| k.plugin_id != plugin_id);
         for scope in scopes {
@@ -611,10 +392,6 @@ impl UiStore {
         gen
     }
 
-    /// The mutation counter for one `(plugin_id, session)` scope, or 0 if it has
-    /// none yet. The action endpoint reads this for the clicked pane's session
-    /// before forwarding, so the client waits only for that pane's re-pushed
-    /// state, not any update from the same plugin in another session.
     pub fn revision(&self, plugin_id: &str, session_id: Option<&str>) -> u64 {
         self.read()
             .revisions
@@ -623,8 +400,6 @@ impl UiStore {
             .unwrap_or(0)
     }
 
-    /// Validate and store one entry. Rejects a stale generation, a payload that
-    /// does not match the slot, a scope mismatch, or a plugin over quota.
     pub fn set(
         &self,
         plugin_id: &str,
@@ -659,9 +434,6 @@ impl UiStore {
                     scope_entries += 1;
                 }
             }
-            // Per-scope cap stops one session (or the global scope) from starving
-            // the others; the per-plugin backstop still bounds total memory when
-            // session ids are fabricated.
             if scope_entries >= MAX_ENTRIES_PER_SCOPE || plugin_entries >= MAX_ENTRIES_PER_PLUGIN {
                 return Err(UiError::QuotaExceeded);
             }
@@ -671,10 +443,6 @@ impl UiStore {
         Ok(())
     }
 
-    /// Remove one entry. A remove of an absent entry is a no-op success, but a
-    /// scope mismatch (a per-session slot without a `session_id`, or vice versa)
-    /// is rejected, same as `set`, so a bad call is an error rather than a silent
-    /// no-op that leaves the real entry standing.
     pub fn remove(
         &self,
         plugin_id: &str,
@@ -700,8 +468,6 @@ impl UiStore {
         Ok(())
     }
 
-    /// Push a notification onto the shared ring and return its seq. No
-    /// generation check: notifications outlive the worker that posted them.
     pub fn notify(
         &self,
         plugin_id: &str,
@@ -721,9 +487,9 @@ impl UiStore {
             return Err(UiError::BadRequest("notification body too long".into()));
         }
         if let Some(href) = &href {
-            if !is_http_url(href) {
+            if !crate::util::is_allowed_href(href) {
                 return Err(UiError::BadRequest(
-                    "notification href must be http/https".into(),
+                    "notification href must be http/https or a relative path".into(),
                 ));
             }
         }
@@ -745,11 +511,6 @@ impl UiStore {
         Ok(seq)
     }
 
-    /// Clear a plugin's entries when its worker exits, but only if `generation`
-    /// is still the active one. An instant respawn (which already called
-    /// [`UiStore::begin_generation`]) leaves the new generation in place, so the
-    /// old worker's exit does not wipe the new worker's state. Notifications are
-    /// left untouched. Returns whether anything was cleared.
     pub fn clear_plugin(&self, plugin_id: &str, generation: u64) -> bool {
         let mut inner = self.write();
         if inner.active.get(plugin_id) != Some(&generation) {
@@ -765,7 +526,6 @@ impl UiStore {
         changed
     }
 
-    /// Clone the full state for the web to render.
     pub fn snapshot(&self) -> UiSnapshot {
         let inner = self.read();
         let mut entries: Vec<UiEntry> = inner
@@ -779,10 +539,6 @@ impl UiStore {
                 payload: payload.clone(),
             })
             .collect();
-        // Deterministic order so the snapshot does not jitter between polls.
-        // `slot` is part of the key (a plugin may reuse one id across two slots),
-        // so it is part of the sort key too, or those entries would compare equal
-        // and fall back to HashMap iteration order.
         entries.sort_by(|a, b| {
             (&a.plugin_id, a.slot, &a.id, &a.session_id).cmp(&(
                 &b.plugin_id,
@@ -813,18 +569,14 @@ impl UiStore {
     }
 }
 
-/// Per-slot payload ceiling. The pane carries lists (a full PR comment set), so
-/// it gets a larger budget than the small single-value slots.
 fn max_payload_bytes(slot: UiSlot) -> usize {
     match slot {
-        UiSlot::Pane | UiSlot::SettingsPage => MAX_PANE_PAYLOAD_BYTES,
+        UiSlot::Pane | UiSlot::HomePane => MAX_PANE_PAYLOAD_BYTES,
         UiSlot::ComposerAction => MAX_COMPOSER_ACTION_PAYLOAD_BYTES,
         _ => MAX_PAYLOAD_BYTES,
     }
 }
 
-/// A per-session slot needs a `session_id`; a global slot must not carry one.
-/// `Notification` is not a `ui.state.set` target (use `ui.notify`).
 fn check_scope(slot: UiSlot, session_id: Option<&str>) -> Result<(), UiError> {
     if slot == UiSlot::Notification {
         return Err(UiError::BadRequest(
@@ -842,22 +594,8 @@ fn check_scope(slot: UiSlot, session_id: Option<&str>) -> Result<(), UiError> {
     }
 }
 
-/// Validate `raw` against the slot's typed payload and return the normalized
-/// JSON (re-serialized from the parsed struct, so unknown fields are rejected
-/// and the stored shape is canonical).
-/// How deeply a pane's `blocks` may nest through the recursive kinds
-/// (`section.children`, `columns.children`). Generous against any real pane: the
-/// GitHub plugin's deepest chain is a `section` holding a `section` holding rows,
-/// so three. The cap exists because the size limit alone is not one: a 64 KiB
-/// payload still fits a chain around 1,800 links long, and the surfaces recurse
-/// per level, so an accidental cycle in a plugin's block builder would blow the
-/// web renderer's stack. The host is the right place to draw that line, not the
-/// renderer, so every surface inherits the same bound.
 const MAX_BLOCK_DEPTH: usize = 16;
 
-/// Reject a `blocks` list that nests past [`MAX_BLOCK_DEPTH`]. Only arrays under
-/// the `children` key count as a level, matching what the renderers actually
-/// recurse through; any other nested JSON a block carries is inert data.
 fn check_block_depth(blocks: Option<&[Value]>) -> Result<(), String> {
     fn depth_ok(blocks: &[Value], remaining: usize) -> bool {
         if remaining == 0 {
@@ -878,26 +616,40 @@ fn check_block_depth(blocks: Option<&[Value]>) -> Result<(), String> {
     }
 }
 
+fn check_badge_groups(items: &[BadgeItem]) -> Result<(), String> {
+    if items.iter().any(|i| i.group.as_deref() == Some("")) {
+        return Err("badge item group must not be empty".into());
+    }
+    Ok(())
+}
+
 fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
     fn normalize<T: serde::de::DeserializeOwned + Serialize>(raw: &Value) -> Result<Value, String> {
         let parsed: T = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
         serde_json::to_value(parsed).map_err(|e| e.to_string())
     }
     match slot {
-        UiSlot::StatusBar | UiSlot::DetailBadge => normalize::<TextPayload>(raw),
-        UiSlot::RowBadge => normalize::<RowBadgePayload>(raw),
+        UiSlot::StatusBar | UiSlot::DetailBadge => {
+            let parsed: TextPayload =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            if parsed.text.is_none() && parsed.items.is_none() {
+                return Err("badge requires text or items".into());
+            }
+            check_badge_groups(parsed.items.as_deref().unwrap_or_default())?;
+            serde_json::to_value(parsed).map_err(|e| e.to_string())
+        }
+        UiSlot::RowBadge => {
+            let parsed: RowBadgePayload =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            check_badge_groups(parsed.items.as_deref().unwrap_or_default())?;
+            serde_json::to_value(parsed).map_err(|e| e.to_string())
+        }
         UiSlot::RowColumn => normalize::<RowColumnPayload>(raw),
         UiSlot::SortKey => normalize::<SortKeyPayload>(raw),
         UiSlot::FilterFacet => normalize::<FilterFacetPayload>(raw),
         UiSlot::Card => normalize::<CardPayload>(raw),
-        UiSlot::Pane => {
+        UiSlot::Pane | UiSlot::HomePane => {
             let parsed: PanePayload =
-                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
-            check_block_depth(parsed.blocks.as_deref())?;
-            serde_json::to_value(parsed).map_err(|e| e.to_string())
-        }
-        UiSlot::SettingsPage => {
-            let parsed: SettingsPagePayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
             check_block_depth(parsed.blocks.as_deref())?;
             serde_json::to_value(parsed).map_err(|e| e.to_string())
@@ -920,24 +672,6 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             }
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
-        UiSlot::ToolCardBadge => {
-            let parsed: ToolCardBadgePayload =
-                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
-            for badge in &parsed.items {
-                if badge.target.name().is_empty() {
-                    return Err("tool-card badge target name is required".into());
-                }
-                // An empty or whitespace-only string is absent as far as the
-                // web BadgeChip is concerned (it renders nothing), so treat it
-                // the same as a missing field rather than storing a blank pill.
-                let has_text = badge.text.as_deref().is_some_and(|t| !t.trim().is_empty());
-                let has_icon = badge.icon.as_deref().is_some_and(|i| !i.trim().is_empty());
-                if !has_text && !has_icon {
-                    return Err("tool-card badge requires text or icon".into());
-                }
-            }
-            serde_json::to_value(parsed).map_err(|e| e.to_string())
-        }
         UiSlot::Notification => Err("notification is pushed via ui.notify".into()),
     }
 }
@@ -949,6 +683,17 @@ mod tests {
 
     fn store() -> UiStore {
         UiStore::new()
+    }
+
+    fn set(
+        store: &UiStore,
+        generation: u64,
+        slot: UiSlot,
+        id: &str,
+        session_id: Option<&str>,
+        payload: Value,
+    ) -> Result<(), UiError> {
+        store.set("acme.kit", generation, slot, id, session_id, &payload)
     }
 
     fn entry(session_id: &str, payload: Value) -> UiEntry {
@@ -963,7 +708,6 @@ mod tests {
 
     #[test]
     fn links_for_reads_items_then_falls_back_to_top_level_href() {
-        // Multi-link: one link per item, deduped, http/https only, tooltip label.
         let snap = UiSnapshot {
             entries: vec![entry(
                 "s1",
@@ -973,6 +717,8 @@ mod tests {
                         {"href": "https://example.com/pr/1", "text": "dup"},
                         {"href": "javascript:alert(1)", "text": "evil"},
                         {"href": "https://example.com/pr/2", "text": "PR 2"},
+                        {"href": "/session/xyz", "text": "Session"},
+                        {"href": "//evil.com", "text": "scheme-relative"},
                     ]
                 }),
             )],
@@ -984,11 +730,10 @@ mod tests {
             vec![
                 ("https://example.com/pr/1".to_string(), "PR 1".to_string()),
                 ("https://example.com/pr/2".to_string(), "PR 2".to_string()),
+                ("/session/xyz".to_string(), "Session".to_string()),
             ]
         );
 
-        // Single-link: no items, falls back to the top-level href; label is href
-        // when no tooltip/text.
         let snap = UiSnapshot {
             entries: vec![entry("s1", json!({"href": "https://example.com/pr/9"}))],
             notifications: vec![],
@@ -1002,8 +747,6 @@ mod tests {
             )]
         );
 
-        // Wrong session, missing entry, and a non-http top-level href all yield
-        // nothing.
         assert!(snap
             .links_for("acme.gh", UiSlot::DetailBadge, "pr", "other")
             .is_empty());
@@ -1018,113 +761,292 @@ mod tests {
     }
 
     #[test]
-    fn set_get_and_remove_global_entry() {
+    fn set_enforces_scope_rules_and_payload_shape() {
         let s = store();
         let g = s.begin_generation("acme.kit");
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::StatusBar,
-            "build",
-            None,
-            &json!({"text": "ok", "tone": "success"}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(snap.entries.len(), 1);
-        assert_eq!(snap.entries[0].slot, UiSlot::StatusBar);
-        assert_eq!(snap.entries[0].payload["text"], json!("ok"));
-
-        s.remove("acme.kit", g, UiSlot::StatusBar, "build", None)
-            .unwrap();
-        assert_eq!(s.snapshot().entries.len(), 0);
-    }
-
-    #[test]
-    fn settings_page_accepts_blocks_and_rejects_unknown_field() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // Global page with a block list is accepted and stored.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::SettingsPage,
-            "main",
-            None,
-            &json!({"title": "MCP", "blocks": [{"kind": "heading", "text": "Servers"}]}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(snap.entries.len(), 1);
-        assert_eq!(snap.entries[0].slot, UiSlot::SettingsPage);
-        // `default_location` is a pane-only field; the dedicated payload rejects
-        // it via deny_unknown_fields.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::SettingsPage,
-                "main",
-                None,
-                &json!({"title": "MCP", "default_location": "right"}),
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn scope_rules_enforced() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // Global slot must not carry a session_id.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
+        let composer = |draft: Value| json!({"label": "Voice", "method": "voice.start", "draft_operation": draft});
+        let nested_blocks = |depth: usize| {
+            let mut block = json!({"kind": "row", "label": "leaf"});
+            for _ in 0..depth {
+                block = json!({"kind": "section", "children": [block]});
+            }
+            json!({"blocks": [block]})
+        };
+        let mut inert = json!("leaf");
+        for _ in 0..64 {
+            inert = json!({"nested": inert});
+        }
+        let cases: Vec<(&str, UiSlot, Option<&str>, Value, bool)> = vec![
+            (
+                "status bar is global only",
                 UiSlot::StatusBar,
-                "x",
                 Some("s1"),
-                &json!({"text": "hi"})
+                json!({"text": "hi"}),
+                false,
             ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Per-session slot requires a session_id.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
+            (
+                "row badge is session scoped",
                 UiSlot::RowBadge,
-                "x",
                 None,
-                &json!({"text": "hi"})
+                json!({"text": "hi"}),
+                false,
             ),
-            Err(UiError::BadRequest(_))
-        ));
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
+            (
+                "composer action is session scoped",
                 UiSlot::ComposerAction,
-                "voice",
                 None,
-                &json!({"label": "Voice", "method": "voice.start"})
+                json!({"label": "Voice", "method": "voice.start"}),
+                false,
             ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Notification is not a ui.state.set target.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
+            (
+                "home pane is global only",
+                UiSlot::HomePane,
+                Some("s1"),
+                json!({"title": "memory"}),
+                false,
+            ),
+            (
+                "home pane accepts blocks",
+                UiSlot::HomePane,
+                None,
+                json!({"title": "memory", "blocks": [{"kind": "sparkline", "values": [1, 2]}]}),
+                true,
+            ),
+            (
+                "notification is not a stored slot",
                 UiSlot::Notification,
-                "x",
                 None,
-                &json!({"text": "hi"})
+                json!({"text": "hi"}),
+                false,
             ),
-            Err(UiError::BadRequest(_))
-        ));
-        // remove enforces the same scope rules, so a wrong-scope remove is a
-        // rejection rather than a silent no-op that leaves the entry standing.
+            (
+                "status bar requires text",
+                UiSlot::StatusBar,
+                None,
+                json!({"tone": "info"}),
+                false,
+            ),
+            (
+                "unknown field rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"text": "x", "bogus": 1}),
+                false,
+            ),
+            (
+                "unknown tone rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"text": "x", "tone": "rainbow"}),
+                false,
+            ),
+            (
+                "draft operation needs an id",
+                UiSlot::ComposerAction,
+                Some("s1"),
+                composer(json!({"kind": "insert-text", "id": "", "text": "hello"})),
+                false,
+            ),
+            (
+                "insert-text draft accepted",
+                UiSlot::ComposerAction,
+                Some("s1"),
+                json!({
+                    "label": "Voice",
+                    "method": "voice.start",
+                    "icon": "mic",
+                    "draft_operation": {"kind": "insert-text", "id": "op-1", "text": "hello"}
+                }),
+                true,
+            ),
+            (
+                "set-text draft may be empty",
+                UiSlot::ComposerAction,
+                Some("s1"),
+                composer(json!({"kind": "set-text", "id": "op-2", "text": ""})),
+                true,
+            ),
+            (
+                "draft text may exceed the slot payload cap",
+                UiSlot::ComposerAction,
+                Some("s1"),
+                composer(json!({
+                    "kind": "insert-text",
+                    "id": "op-3",
+                    "text": "x".repeat(MAX_PAYLOAD_BYTES + 512)
+                })),
+                true,
+            ),
+            (
+                "draft text beyond its own cap rejected",
+                UiSlot::ComposerAction,
+                Some("s1"),
+                composer(json!({
+                    "kind": "insert-text",
+                    "id": "op-4",
+                    "text": "x".repeat(MAX_COMPOSER_DRAFT_TEXT_BYTES + 1)
+                })),
+                false,
+            ),
+            (
+                "row badge accepts an items list",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": [
+                    {"icon": "git-pull-request-arrow", "tone": "success", "href": "https://x/pr/1", "tooltip": "PR #1"},
+                    {"icon": "git-pull-request-draft", "tone": "warn"}
+                ]}),
+                true,
+            ),
+            (
+                "row badge accepts an empty items list",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": []}),
+                true,
+            ),
+            (
+                "row badge item with unknown tone rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": [{"tone": "rainbow"}]}),
+                false,
+            ),
+            (
+                "row badge items accept a cycle group",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": [{"text": "5h 40%", "group": "usage"}, {"text": "7d 12%", "group": "usage"}]}),
+                true,
+            ),
+            (
+                "status bar accepts a grouped items list without text",
+                UiSlot::StatusBar,
+                None,
+                json!({"items": [{"text": "5h 40%", "group": "usage"}, {"text": "7d 12%", "group": "usage"}]}),
+                true,
+            ),
+            (
+                "detail badge accepts items",
+                UiSlot::DetailBadge,
+                Some("s1"),
+                json!({"items": [{"text": "a"}]}),
+                true,
+            ),
+            (
+                "status bar accepts an explicitly empty items list",
+                UiSlot::StatusBar,
+                None,
+                json!({"items": []}),
+                true,
+            ),
+            (
+                "detail badge accepts text with an explicitly empty items list",
+                UiSlot::DetailBadge,
+                Some("s1"),
+                json!({"text": "fallback", "items": []}),
+                true,
+            ),
+            (
+                "status bar with neither text nor items rejected",
+                UiSlot::StatusBar,
+                None,
+                json!({"tone": "info"}),
+                false,
+            ),
+            (
+                "empty cycle group rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": [{"text": "a", "group": ""}]}),
+                false,
+            ),
+            (
+                "pane accepts unknown future block kinds",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"title": "GitHub", "default_location": "bottom", "blocks": [
+                    {"kind": "heading", "text": "GitHub"},
+                    {"kind": "divider"},
+                    {"kind": "some-future-kind", "whatever": {"nested": true}}
+                ]}),
+                true,
+            ),
+            (
+                "pane accepts title and body",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"title": "T", "body": "B"}),
+                true,
+            ),
+            (
+                "pane rejects unknown default location",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"default_location": "sideways"}),
+                false,
+            ),
+            (
+                "pane footer accepted",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"footer": {"text": "refreshed", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}}),
+                true,
+            ),
+            (
+                "pane footer unknown field rejected",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"footer": {"txt": "oops"}}),
+                false,
+            ),
+            (
+                "pane nesting under the depth cap accepted",
+                UiSlot::Pane,
+                Some("s1"),
+                nested_blocks(MAX_BLOCK_DEPTH - 1),
+                true,
+            ),
+            (
+                "pane nesting past the depth cap rejected",
+                UiSlot::Pane,
+                Some("s1"),
+                nested_blocks(MAX_BLOCK_DEPTH + 1),
+                false,
+            ),
+            (
+                "deep inert payload inside an unknown block does not count",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "some-future-kind", "payload": inert}]}),
+                true,
+            ),
+            (
+                "pane payload cap is larger than other slots",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "note", "text": "x".repeat(40 * 1024)}]}),
+                true,
+            ),
+            (
+                "pane payload past its cap rejected",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "note", "text": "x".repeat(64 * 1024)}]}),
+                false,
+            ),
+            (
+                "row badge payload past the slot cap rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"text": "x".repeat(9 * 1024)}),
+                false,
+            ),
+        ];
+        for (name, slot, session, payload, ok) in cases {
+            let result = set(&s, g, slot, "x", session, payload);
+            assert_eq!(result.is_ok(), ok, "{name}: {result:?}");
+        }
         assert!(matches!(
             s.remove("acme.kit", g, UiSlot::RowBadge, "x", None),
             Err(UiError::BadRequest(_))
@@ -1132,267 +1054,66 @@ mod tests {
     }
 
     #[test]
-    fn malformed_payload_rejected() {
+    fn badges_keep_an_explicitly_empty_items_list() {
         let s = store();
         let g = s.begin_generation("acme.kit");
-        // Missing required `text` on a text slot (status-bar still requires it).
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::StatusBar,
-                "b",
-                None,
-                &json!({"tone": "info"})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Unknown field rejected (deny_unknown_fields).
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                "b",
-                Some("s1"),
-                &json!({"text": "x", "bogus": 1})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Bad tone value rejected.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                "b",
-                Some("s1"),
-                &json!({"text": "x", "tone": "rainbow"})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Composer draft operations need a stable operation id and bounded text.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ComposerAction,
-                "voice",
-                Some("s1"),
-                &json!({
-                    "label": "Voice",
-                    "method": "voice.start",
-                    "draft_operation": {"kind": "insert-text", "id": "", "text": "hello"}
-                })
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        s.set(
-            "acme.kit",
+        set(&s, g, UiSlot::StatusBar, "u", None, json!({"text": "old"})).unwrap();
+        set(&s, g, UiSlot::StatusBar, "u", None, json!({"items": []})).unwrap();
+        set(
+            &s,
             g,
-            UiSlot::ComposerAction,
-            "voice",
+            UiSlot::DetailBadge,
+            "d",
             Some("s1"),
-            &json!({
-                "label": "Voice",
-                "method": "voice.start",
-                "icon": "mic",
-                "draft_operation": {"kind": "insert-text", "id": "op-1", "text": "hello"}
-            }),
+            json!({"text": "t", "items": []}),
         )
         .unwrap();
-        s.set(
-            "acme.kit",
+        set(
+            &s,
             g,
-            UiSlot::ComposerAction,
-            "voice",
+            UiSlot::DetailBadge,
+            "e",
             Some("s1"),
-            &json!({
-                "label": "Voice",
-                "method": "voice.start",
-                "draft_operation": {"kind": "set-text", "id": "op-2", "text": ""}
-            }),
+            json!({"text": "t"}),
         )
         .unwrap();
-        s.set(
-            "acme.kit",
+        set(
+            &s,
             g,
-            UiSlot::ComposerAction,
-            "voice",
+            UiSlot::RowBadge,
+            "r",
             Some("s1"),
-            &json!({
-                "label": "Voice",
-                "method": "voice.start",
-                "draft_operation": {
-                    "kind": "insert-text",
-                    "id": "op-3",
-                    "text": "x".repeat(MAX_PAYLOAD_BYTES + 512)
-                }
-            }),
-        )
-        .unwrap();
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ComposerAction,
-                "voice",
-                Some("s1"),
-                &json!({
-                    "label": "Voice",
-                    "method": "voice.start",
-                    "draft_operation": {
-                        "kind": "insert-text",
-                        "id": "op-4",
-                        "text": "x".repeat(MAX_COMPOSER_DRAFT_TEXT_BYTES + 1)
-                    }
-                })
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn tool_card_badge_payload_validated() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // A valid target-keyed list normalizes and stores.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::ToolCardBadge,
-            "provenance",
-            Some("s1"),
-            &json!({"items": [
-                {"target": {"kind": "mcp", "name": "github"}, "text": "MCP", "tone": "info"},
-                {"target": {"kind": "skill", "name": "deploy"}, "icon": "sparkles"}
-            ]}),
+            json!({"text": "t", "items": []}),
         )
         .unwrap();
         let snap = s.snapshot();
-        assert_eq!(snap.entries.len(), 1);
-        assert_eq!(
-            snap.entries[0].payload["items"][0]["target"]["kind"],
-            json!("mcp")
-        );
-
-        // Empty items is a valid clear.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::ToolCardBadge,
-            "provenance",
-            Some("s1"),
-            &json!({"items": []}),
-        )
-        .unwrap();
-
-        // Per-session slot needs a session_id.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                None,
-                &json!({"items": [{"target": {"kind": "mcp", "name": "x"}, "text": "y"}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Empty target name rejected.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                Some("s1"),
-                &json!({"items": [{"target": {"kind": "mcp", "name": ""}, "text": "y"}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // A badge with neither text nor icon renders nothing, so it is rejected.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                Some("s1"),
-                &json!({"items": [{"target": {"kind": "skill", "name": "deploy"}}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Empty or whitespace-only text/icon is absent to the web renderer, so
-        // it is rejected just like an omitted field.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                Some("s1"),
-                &json!({"items": [{"target": {"kind": "mcp", "name": "github"}, "text": "", "icon": "  "}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Unknown target kind rejected (closed tagged enum).
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                Some("s1"),
-                &json!({"items": [{"target": {"kind": "tool", "name": "x"}, "text": "y"}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
+        let payload = |id: &str| {
+            snap.entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.payload.clone())
+                .unwrap()
+        };
+        assert_eq!(payload("u"), json!({"items": []}));
+        assert_eq!(payload("d"), json!({"text": "t", "items": []}));
+        assert_eq!(payload("e"), json!({"text": "t"}));
+        assert_eq!(payload("r"), json!({"text": "t", "items": []}));
     }
 
     #[test]
     fn stale_generation_rejected_and_clear_is_generation_guarded() {
         let s = store();
         let g1 = s.begin_generation("acme.kit");
-        s.set(
-            "acme.kit",
-            g1,
-            UiSlot::Card,
-            "c",
-            None,
-            &json!({"title": "Hi"}),
-        )
-        .unwrap();
+        set(&s, g1, UiSlot::Card, "c", None, json!({"title": "Hi"})).unwrap();
         assert_eq!(s.snapshot().entries.len(), 1);
-        // Worker respawns: starting the new generation evicts the old
-        // generation's entries up front, so no stale state survives even when
-        // begin runs before the exited worker's clear_plugin.
         let g2 = s.begin_generation("acme.kit");
         assert_eq!(s.snapshot().entries.len(), 0);
-        // A late write from the old generation is rejected, not applied.
         assert_eq!(
-            s.set(
-                "acme.kit",
-                g1,
-                UiSlot::Card,
-                "c2",
-                None,
-                &json!({"title": "stale"})
-            ),
+            set(&s, g1, UiSlot::Card, "c2", None, json!({"title": "stale"})),
             Err(UiError::StaleWorker)
         );
-        // The old worker's exit must NOT wipe the live g2 state.
         assert!(!s.clear_plugin("acme.kit", g1));
-        // The current generation can write and be cleared.
-        s.set(
-            "acme.kit",
-            g2,
-            UiSlot::Card,
-            "c3",
-            None,
-            &json!({"title": "new"}),
-        )
-        .unwrap();
+        set(&s, g2, UiSlot::Card, "c3", None, json!({"title": "new"})).unwrap();
         assert!(s.clear_plugin("acme.kit", g2));
         assert_eq!(s.snapshot().entries.len(), 0);
     }
@@ -1401,15 +1122,7 @@ mod tests {
     fn notifications_survive_clear_and_carry_monotonic_seq() {
         let s = store();
         let g = s.begin_generation("acme.kit");
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::StatusBar,
-            "x",
-            None,
-            &json!({"text": "hi"}),
-        )
-        .unwrap();
+        set(&s, g, UiSlot::StatusBar, "x", None, json!({"text": "hi"})).unwrap();
         let seq1 = s
             .notify(
                 "acme.kit",
@@ -1431,7 +1144,6 @@ mod tests {
             )
             .unwrap();
         assert!(seq2 > seq1);
-        // Clearing entries on worker exit leaves notifications in place.
         s.clear_plugin("acme.kit", g);
         let snap = s.snapshot();
         assert_eq!(snap.entries.len(), 0);
@@ -1440,488 +1152,113 @@ mod tests {
     }
 
     #[test]
-    fn empty_notification_title_rejected() {
+    fn notify_requires_a_title_and_a_safe_href() {
         let s = store();
         assert!(matches!(
             s.notify("acme.kit", Tone::Info, String::new(), None, None, None),
             Err(UiError::BadRequest(_))
         ));
-    }
-
-    #[test]
-    fn notify_rejects_non_http_href() {
-        let s = store();
-        assert!(matches!(
-            s.notify(
+        for (href, ok) in [
+            ("javascript:alert(1)", false),
+            ("//evil.com", false),
+            ("https://example.com", true),
+            ("/session/xyz", true),
+        ] {
+            let result = s.notify(
                 "acme.kit",
                 Tone::Info,
                 "Open".into(),
                 None,
                 None,
-                Some("javascript:alert(1)".into()),
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        let seq = s
-            .notify(
-                "acme.kit",
-                Tone::Info,
-                "Open".into(),
-                None,
-                None,
-                Some("https://example.com".into()),
-            )
-            .unwrap();
-        assert_eq!(
-            s.snapshot().notifications[0].href.as_deref(),
-            Some("https://example.com")
-        );
-        assert_eq!(seq, 1);
-    }
-
-    #[test]
-    fn row_badge_accepts_items_list() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::RowBadge,
-            "repos",
-            Some("s1"),
-            &json!({"items": [
-                {"icon": "git-pull-request-arrow", "tone": "success", "href": "https://x/pr/1", "tooltip": "PR #1"},
-                {"icon": "git-pull-request-draft", "tone": "warn"}
-            ]}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(
-            snap.entries[0].payload["items"].as_array().unwrap().len(),
-            2
-        );
-        // Empty items is valid (clears the row).
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::RowBadge,
-            "repos",
-            Some("s1"),
-            &json!({"items": []}),
-        )
-        .unwrap();
-        // A bad tone inside an item is still rejected.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                "repos",
-                Some("s1"),
-                &json!({"items": [{"tone": "rainbow"}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn pane_blocks_are_forward_compatible() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // A mix of known kinds and an unknown kind: the unknown one is accepted
-        // and stored verbatim, not rejected, so an old host renders what it knows.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            &json!({"title": "GitHub", "default_location": "bottom", "blocks": [
-                {"kind": "heading", "text": "GitHub"},
-                {"kind": "row", "label": "nexus", "value": "PR #12", "href": "https://x/pr/12"},
-                {"kind": "divider"},
-                {"kind": "some-future-kind", "whatever": {"nested": true}}
-            ]}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        let blocks = snap.entries[0].payload["blocks"].as_array().unwrap();
-        assert_eq!(blocks.len(), 4);
-        assert_eq!(blocks[3]["kind"], json!("some-future-kind"));
-        assert_eq!(snap.entries[0].payload["default_location"], json!("bottom"));
-        // The simple title/body form still works, and default_location is optional.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            &json!({"title": "T", "body": "B"}),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn pane_rejects_blocks_nested_past_the_depth_cap() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // `children` chains are what the renderers recurse through, so they are
-        // what the cap counts. The size limit is not a depth limit: a 64KB payload
-        // fits a chain thousands of links long, and every surface recurses per
-        // level, so the host draws the line once for all of them.
-        let chain = |depth: usize| {
-            let mut block = json!({"kind": "row", "label": "leaf"});
-            for _ in 0..depth {
-                block = json!({"kind": "section", "children": [block]});
+                Some(href.into()),
+            );
+            assert_eq!(result.is_ok(), ok, "{href}: {result:?}");
+            if ok {
+                let snap = s.snapshot();
+                assert_eq!(
+                    snap.notifications.last().unwrap().href.as_deref(),
+                    Some(href)
+                );
+            } else {
+                assert!(matches!(result, Err(UiError::BadRequest(_))), "{href}");
             }
-            json!({"blocks": [block]})
+        }
+    }
+
+    #[test]
+    fn quotas_bound_each_scope_and_each_plugin() {
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        let badge = |id: &str, session: &str| {
+            set(
+                &s,
+                g,
+                UiSlot::RowBadge,
+                id,
+                Some(session),
+                json!({"text": "x"}),
+            )
         };
-        // At the cap it stores; one level past it is a hard error, not a silent
-        // truncation, so a plugin author sees the mistake.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            &chain(MAX_BLOCK_DEPTH - 1),
-        )
-        .unwrap();
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::Pane,
-                "gh",
-                Some("s1"),
-                &chain(MAX_BLOCK_DEPTH + 1)
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // The same bound covers `settings-page`, which shares the vocabulary.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::SettingsPage,
-                "page",
-                None,
-                &chain(MAX_BLOCK_DEPTH + 1)
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Deep JSON that is not a `children` array is inert data the renderers
-        // never walk, so it must not trip the cap.
-        let mut inert = json!("leaf");
-        for _ in 0..64 {
-            inert = json!({"nested": inert});
-        }
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            &json!({"blocks": [{"kind": "some-future-kind", "payload": inert}]}),
-        )
-        .unwrap();
-    }
 
-    #[test]
-    fn pane_footer_round_trips_and_rejects_unknown_fields() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // The footer is a typed envelope field (unlike the opaque blocks), so the
-        // surfaces can tell pinned chrome from scrolling content.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            &json!({"blocks": [{"kind": "heading", "text": "GitHub"}],
-                    "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(snap.entries[0].payload["footer"]["value"], json!("blocked"));
-        assert_eq!(snap.entries[0].payload["footer"]["tone"], json!("danger"));
-        // A typo in the footer is a hard error rather than a silently ignored
-        // field, which is the point of typing it instead of leaving it opaque.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::Pane,
-                "gh",
-                Some("s1"),
-                &json!({"footer": {"txt": "oops"}})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // `settings-page` has no footer: a full page is not docked, so a pinned
-        // status line would have nothing to pin against.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::SettingsPage,
-                "page",
-                None,
-                &json!({"footer": {"text": "x"}})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn pane_rejects_unknown_default_location() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::Pane,
-                "gh",
-                Some("s1"),
-                &json!({"default_location": "sideways"})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn pane_payload_cap_is_larger_than_other_slots() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // A pane body that would blow the 8KB badge cap but fits the 64KB pane
-        // cap: a long comment list. ~40KB of note text well over MAX_PAYLOAD_BYTES.
-        let big = "x".repeat(40 * 1024);
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            &json!({"blocks": [{"kind": "note", "text": big}]}),
-        )
-        .unwrap();
-        // Past the pane cap is still rejected.
-        let too_big = "x".repeat(64 * 1024);
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::Pane,
-                "gh",
-                Some("s1"),
-                &json!({"blocks": [{"kind": "note", "text": too_big}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // A non-pane slot keeps the small 8KB cap.
-        let over_badge = "x".repeat(9 * 1024);
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                "b",
-                Some("s1"),
-                &json!({"text": over_badge})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn per_scope_quota_blocks_only_that_scope() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // Fill session s1's scope to the per-scope cap.
         for i in 0..MAX_ENTRIES_PER_SCOPE {
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                &format!("b{i}"),
-                Some("s1"),
-                &json!({"text": "x"}),
-            )
-            .unwrap();
+            badge(&format!("b{i}"), "s1").unwrap();
         }
-        // A new key in s1 is now rejected.
-        assert_eq!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                "overflow",
-                Some("s1"),
-                &json!({"text": "x"})
-            ),
-            Err(UiError::QuotaExceeded)
-        );
-        // A different session's scope still has room: no cross-session starving.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::RowBadge,
-            "b0",
-            Some("s2"),
-            &json!({"text": "x"}),
-        )
-        .unwrap();
-        // Updating an existing key in the full scope is never blocked.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::RowBadge,
-            "b0",
-            Some("s1"),
-            &json!({"text": "y"}),
-        )
-        .unwrap();
-    }
+        assert_eq!(badge("overflow", "s1"), Err(UiError::QuotaExceeded));
+        badge("b0", "s2").expect("another scope has its own budget");
+        badge("b0", "s1").expect("rewriting an existing key is not a new entry");
 
-    #[test]
-    fn per_plugin_backstop_bounds_fabricated_scopes() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // One entry per distinct session scope, so the per-scope cap never trips;
-        // only the global backstop can stop this.
-        for i in 0..MAX_ENTRIES_PER_PLUGIN {
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                "b",
-                Some(&format!("s{i}")),
-                &json!({"text": "x"}),
-            )
-            .unwrap();
-        }
-        assert_eq!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                "b",
-                Some("overflow"),
-                &json!({"text": "x"})
-            ),
-            Err(UiError::QuotaExceeded)
-        );
-    }
-
-    #[test]
-    fn removing_entry_frees_scope_capacity() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        for i in 0..MAX_ENTRIES_PER_SCOPE {
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::RowBadge,
-                &format!("b{i}"),
-                Some("s1"),
-                &json!({"text": "x"}),
-            )
-            .unwrap();
-        }
         s.remove("acme.kit", g, UiSlot::RowBadge, "b0", Some("s1"))
             .unwrap();
-        // The freed slot lets a new key in.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::RowBadge,
-            "replacement",
-            Some("s1"),
-            &json!({"text": "x"}),
-        )
-        .unwrap();
+        badge("replacement", "s1").expect("removing an entry frees its scope slot");
+
+        // The per-plugin backstop bounds fabricated scopes.
+        let s = store();
+        let g = s.begin_generation("acme.kit");
+        let badge = |session: &str| {
+            set(
+                &s,
+                g,
+                UiSlot::RowBadge,
+                "b",
+                Some(session),
+                json!({"text": "x"}),
+            )
+        };
+        for i in 0..MAX_ENTRIES_PER_PLUGIN {
+            badge(&format!("s{i}")).unwrap();
+        }
+        assert_eq!(badge("overflow"), Err(UiError::QuotaExceeded));
     }
 
     #[test]
-    fn revision_bumps_on_mutation_and_surfaces_in_snapshot() {
+    fn revision_bumps_per_scope_on_mutation_and_surfaces_in_snapshot() {
         let s = store();
-        // Absent until the plugin first mutates state (global scope here).
         assert_eq!(s.revision("acme.kit", None), 0);
         let g = s.begin_generation("acme.kit");
 
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Card,
-            "c0",
-            None,
-            &json!({"title": "x"}),
-        )
-        .unwrap();
+        set(&s, g, UiSlot::Card, "c0", None, json!({"title": "x"})).unwrap();
         assert_eq!(s.revision("acme.kit", None), 1);
 
-        // An identical re-push still bumps: a refresh that returns unchanged
-        // data must still move the counter, or a waiting spinner would hang.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Card,
-            "c0",
-            None,
-            &json!({"title": "x"}),
-        )
-        .unwrap();
+        set(&s, g, UiSlot::Card, "c0", None, json!({"title": "x"})).unwrap();
         assert_eq!(s.revision("acme.kit", None), 2);
 
-        // Removing a present entry bumps; removing an absent one does not.
         s.remove("acme.kit", g, UiSlot::Card, "c0", None).unwrap();
         assert_eq!(s.revision("acme.kit", None), 3);
         s.remove("acme.kit", g, UiSlot::Card, "gone", None).unwrap();
         assert_eq!(s.revision("acme.kit", None), 3);
 
-        // The counter is exposed in the polled snapshot, keyed plugin -> scope.
         let snap = s.snapshot();
         assert_eq!(
             snap.revisions.get("acme.kit").and_then(|m| m.get("")),
             Some(&3)
         );
         assert_eq!(snap.revisions.get("other.kit"), None);
-    }
 
-    #[test]
-    fn revision_is_scoped_per_session() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // A pane push for session s1 bumps only s1's scope.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Pane,
-            "p",
-            Some("s1"),
-            &json!({"title": "a"}),
-        )
-        .unwrap();
+        set(&s, g, UiSlot::Pane, "p", Some("s1"), json!({"title": "a"})).unwrap();
         assert_eq!(s.revision("acme.kit", Some("s1")), 1);
         assert_eq!(s.revision("acme.kit", Some("s2")), 0);
-
-        // A push for an unrelated session must not move s1's counter, so s1's
-        // refresh spinner cannot be cleared by s2's activity.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::Pane,
-            "p",
-            Some("s2"),
-            &json!({"title": "b"}),
-        )
-        .unwrap();
+        set(&s, g, UiSlot::Pane, "p", Some("s2"), json!({"title": "b"})).unwrap();
         assert_eq!(s.revision("acme.kit", Some("s1")), 1);
-        assert_eq!(s.revision("acme.kit", Some("s2")), 1);
-
-        // A bulk clear bumps every scope the plugin had entries in.
         s.clear_plugin("acme.kit", g);
         assert_eq!(s.revision("acme.kit", Some("s1")), 2);
         assert_eq!(s.revision("acme.kit", Some("s2")), 2);

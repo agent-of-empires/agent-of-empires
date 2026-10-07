@@ -1,15 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { isIOS, isStandalone } from "../lib/platform";
-
-// Minimal end-to-end push hook. Returns the current state and primitives
-// for the NotificationSettings UI: enable(), disable(), sendTest(),
-// refresh(). Works with the server endpoints /api/push/{status,
-// vapid-public-key, subscribe, unsubscribe, test}.
-//
-// iOS note: Push requires the PWA to have been installed via "Add to
-// Home Screen" AND opened standalone. In Safari tabs, `PushManager` is
-// present but permission requests silently fail. Detection is in the
-// `state.kind === 'unsupported'` path.
+import {
+  classifyPushHealth,
+  readPushWanted,
+  writePushWanted,
+  type PushHealth,
+  type ServerSubscriptionStatus,
+} from "../lib/pushHealth";
 
 export type PushState =
   | { kind: "loading" }
@@ -30,18 +27,79 @@ export type PushState =
 const supportsPush = (): boolean =>
   typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 
-/** Web Push requires a secure context. Localhost and 127.0.0.1 are
- *  allowed over http for dev, but any LAN IP or hostname must be
- *  served over https. This is especially relevant on mobile where
- *  users hit the dashboard at `http://<laptop-ip>:<port>` and are
- *  surprised push doesn't work. Tunnel mode (aoe serve --remote)
- *  provides https out of the box via Cloudflare. */
+// Push needs a secure context; plain http is allowed only on loopback.
 const isSecureOrigin = (): boolean => {
   if (typeof window === "undefined") return false;
   if (window.isSecureContext) return true;
   const host = window.location.hostname;
   return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
 };
+
+const iosTab = () => isIOS() && !isStandalone();
+
+/** Null when push can be used; otherwise the reason it can't. */
+function unsupportedState(): PushState | null {
+  if (!isSecureOrigin()) return { kind: "unsupported", reason: "insecure-origin" };
+  if (supportsPush()) return null;
+  return { kind: "unsupported", reason: iosTab() ? "ios-not-standalone" : "no-api" };
+}
+
+const errorState = (e: unknown): PushState => ({ kind: "error", message: e instanceof Error ? e.message : String(e) });
+
+function postPush(path: string, body: unknown): Promise<Response> {
+  return fetch(`/api/push/${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+function subscribeBody(sub: PushSubscription) {
+  const json = sub.toJSON();
+  return { endpoint: json.endpoint, keys: json.keys };
+}
+
+async function currentSubscription(): Promise<PushSubscription | null> {
+  const reg = await navigator.serviceWorker.ready;
+  return reg.pushManager.getSubscription();
+}
+
+interface PushStatus {
+  enabled: boolean;
+  public_key?: string;
+  subscription?: ServerSubscriptionStatus;
+}
+
+/** Null when the status endpoint is unreachable; callers then assume push is on. */
+async function fetchStatus(endpoint: string | undefined): Promise<PushStatus | null> {
+  const query = endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : "";
+  const resp = await fetch(`/api/push/status${query}`);
+  return resp.ok ? ((await resp.json()) as PushStatus) : null;
+}
+
+/** Null when the browser does not expose the key the subscription was made with. */
+function keyMatches(sub: PushSubscription, publicKey: string): boolean | null {
+  const key = sub.options?.applicationServerKey;
+  if (!key) return null;
+  const have = new Uint8Array(key);
+  const want = base64UrlToUint8Array(publicKey);
+  return have.length === want.length && have.every((b, i) => b === want[i]);
+}
+
+async function testFailureMessage(resp: Response): Promise<string | null> {
+  const result = (await resp.json().catch(() => ({}))) as { reason?: string | null };
+  switch (result.reason) {
+    case null:
+    case undefined:
+      return null;
+    case "key-mismatch":
+      return "The push service rejected this device's key. Enable notifications again.";
+    case "gone":
+      return "This device's subscription has expired. Enable notifications again.";
+    default:
+      return `The push service did not deliver the test (${result.reason}).`;
+  }
+}
 
 function base64UrlToUint8Array(b64: string): Uint8Array<ArrayBuffer> {
   const padding = "=".repeat((4 - (b64.length % 4)) % 4);
@@ -54,46 +112,45 @@ function base64UrlToUint8Array(b64: string): Uint8Array<ArrayBuffer> {
 
 export function usePushSubscription() {
   const [state, setState] = useState<PushState>({ kind: "loading" });
+  const [health, setHealth] = useState<PushHealth>("unknown");
+  // A visibility refresh must not overwrite the state of an action in flight.
+  const busy = useRef(false);
 
   const refresh = useCallback(async () => {
-    if (!isSecureOrigin()) {
-      setState({ kind: "unsupported", reason: "insecure-origin" });
-      return;
-    }
-    if (!supportsPush()) {
-      if (isIOS() && !isStandalone()) {
-        setState({ kind: "unsupported", reason: "ios-not-standalone" });
-      } else {
-        setState({ kind: "unsupported", reason: "no-api" });
-      }
-      return;
+    const unsupported = unsupportedState();
+    if (unsupported) {
+      setHealth("unknown");
+      return setState(unsupported);
     }
     try {
-      const resp = await fetch("/api/push/status");
-      if (resp.ok) {
-        const data = (await resp.json()) as { enabled: boolean };
-        if (!data.enabled) {
-          setState({ kind: "disabled-by-server" });
-          return;
-        }
-      }
       const perm = Notification.permission;
-      if (perm === "denied") {
-        setState({ kind: "denied" });
-        return;
+      const sub = await currentSubscription();
+      const status = await fetchStatus(sub?.endpoint);
+      if (status && !status.enabled) {
+        setHealth("unknown");
+        return setState({ kind: "disabled-by-server" });
       }
-      const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.getSubscription();
-      if (perm === "granted" && sub) {
-        setState({ kind: "enabled" });
-      } else {
-        setState({ kind: "off" });
-      }
-    } catch (e) {
-      setState({
-        kind: "error",
-        message: e instanceof Error ? e.message : String(e),
+      // Subscriptions made before intent was recorded count as wanted.
+      const wanted = readPushWanted() || (perm === "granted" && !!sub);
+      if (wanted) writePushWanted(true);
+      let next = classifyPushHealth({
+        wanted,
+        permission: perm,
+        subscribed: !!sub,
+        keyMatches: sub && status?.public_key ? keyMatches(sub, status.public_key) : null,
+        server: status?.subscription ?? null,
       });
+      // Re-binds the sub to the current token (#3386) or restores one the server dropped.
+      if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status?.subscription))) {
+        const resp = await postPush("subscribe", subscribeBody(sub)).catch(() => null);
+        if (resp?.ok) next = "healthy";
+      }
+      if (busy.current) return;
+      setHealth(next);
+      if (perm === "denied") setState({ kind: "denied" });
+      else setState(perm === "granted" && sub ? { kind: "enabled" } : { kind: "off" });
+    } catch (e) {
+      if (!busy.current) setState(errorState(e));
     }
   }, []);
 
@@ -101,141 +158,103 @@ export function usePushSubscription() {
     const timer = setTimeout(() => {
       void refresh();
     }, 0);
-    return () => clearTimeout(timer);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && !busy.current) void refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [refresh]);
 
+  // Also the repair path: iOS only allows requestPermission and a first subscribe inside a
+  // user gesture, so the permission request stays the first await of a click handler.
   const enable = useCallback(async () => {
-    if (!isSecureOrigin()) {
-      setState({ kind: "unsupported", reason: "insecure-origin" });
-      return;
-    }
-    if (!supportsPush()) {
-      if (isIOS() && !isStandalone()) {
-        setState({ kind: "unsupported", reason: "ios-not-standalone" });
-      } else {
-        setState({ kind: "unsupported", reason: "no-api" });
-      }
-      return;
-    }
+    const unsupported = unsupportedState();
+    if (unsupported) return setState(unsupported);
+    busy.current = true;
     setState({ kind: "asking" });
     try {
-      const perm = await Notification.requestPermission();
-      if (perm !== "granted") {
-        if (isIOS() && !isStandalone()) {
-          setState({ kind: "unsupported", reason: "ios-not-standalone" });
-        } else {
-          setState({ kind: "denied" });
-        }
-        return;
+      // WebKit resolves "denied" for a gestureless request even when already granted.
+      if (Notification.permission !== "granted" && (await Notification.requestPermission()) !== "granted") {
+        return setState(iosTab() ? { kind: "unsupported", reason: "ios-not-standalone" } : { kind: "denied" });
       }
       setState({ kind: "subscribing" });
       const vapidResp = await fetch("/api/push/vapid-public-key");
       if (!vapidResp.ok) {
-        setState({
-          kind: "error",
-          message: `Server returned ${vapidResp.status} for VAPID key`,
-        });
-        return;
+        return setState({ kind: "error", message: `Server returned ${vapidResp.status} for VAPID key` });
       }
-      const { public_key } = (await vapidResp.json()) as {
-        public_key: string;
-      };
+      const { public_key } = (await vapidResp.json()) as { public_key: string };
       const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.subscribe({
+      let sub = await reg.pushManager.getSubscription();
+      if (sub && keyMatches(sub, public_key) !== true) {
+        const stale = sub.endpoint;
+        await sub.unsubscribe().catch(() => {});
+        await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
+        sub = null;
+      }
+      sub ??= await reg.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: base64UrlToUint8Array(public_key),
       });
-      const json = sub.toJSON();
-      const subscribeResp = await fetch("/api/push/subscribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          endpoint: json.endpoint,
-          keys: json.keys,
-        }),
-      });
+      // Also refreshes the server-side origin after the dashboard moved (#1188).
+      const subscribeResp = await postPush("subscribe", subscribeBody(sub));
       if (!subscribeResp.ok) {
-        // Roll back the browser-side subscription so we don't end up with
-        // a subscription the server has no record of.
+        // Don't keep a browser subscription the server has no record of.
         await sub.unsubscribe().catch(() => {});
-        setState({
-          kind: "error",
-          message: `Server returned ${subscribeResp.status} on subscribe`,
-        });
-        return;
+        return setState({ kind: "error", message: `Server returned ${subscribeResp.status} on subscribe` });
       }
+      writePushWanted(true);
+      setHealth("healthy");
       setState({ kind: "enabled" });
     } catch (e) {
-      setState({
-        kind: "error",
-        message: e instanceof Error ? e.message : String(e),
-      });
+      setState(errorState(e));
+    } finally {
+      busy.current = false;
     }
   }, []);
 
   const disable = useCallback(async () => {
+    busy.current = true;
+    writePushWanted(false);
+    setHealth("not-wanted");
     setState({ kind: "disabling" });
     try {
-      const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.getSubscription();
+      const sub = await currentSubscription();
       if (sub) {
         const endpoint = sub.endpoint;
         await sub.unsubscribe().catch(() => {});
-        await fetch("/api/push/unsubscribe", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint }),
-        }).catch(() => {});
+        await postPush("unsubscribe", { endpoint }).catch(() => {});
       }
       setState({ kind: "off" });
     } catch (e) {
-      setState({
-        kind: "error",
-        message: e instanceof Error ? e.message : String(e),
-      });
+      setState(errorState(e));
+    } finally {
+      busy.current = false;
     }
   }, []);
 
   const sendTest = useCallback(async () => {
+    busy.current = true;
     setState({ kind: "sending-test" });
     try {
-      const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.getSubscription();
-      if (!sub) {
-        setState({ kind: "error", message: "No active subscription" });
-        return;
-      }
-      const resp = await fetch("/api/push/test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ endpoint: sub.endpoint }),
-      });
-      if (!resp.ok) {
-        setState({
-          kind: "error",
-          message: `Test failed: server returned ${resp.status}`,
-        });
-        return;
+      const sub = await currentSubscription();
+      if (!sub) return setState({ kind: "error", message: "No active subscription" });
+      const resp = await postPush("test", { endpoint: sub.endpoint });
+      if (!resp.ok) return setState({ kind: "error", message: `Test failed: server returned ${resp.status}` });
+      const failure = await testFailureMessage(resp);
+      if (failure) {
+        setHealth("delivery-failed");
+        return setState({ kind: "error", message: failure });
       }
       setState({ kind: "enabled" });
     } catch (e) {
-      setState({
-        kind: "error",
-        message: e instanceof Error ? e.message : String(e),
-      });
+      setState(errorState(e));
+    } finally {
+      busy.current = false;
     }
   }, []);
 
-  // Re-subscribe: unsubscribe then re-subscribe in a single click. Used
-  // by the "Re-subscribe" affordance in NotificationSettings to refresh
-  // the server-side `Subscription.origin` field after the user moved
-  // the deployment to a different port or origin. Existing subs from
-  // before the origin-tracking landed have no recorded origin and get
-  // skipped on send (#1188); re-subscribing refreshes the entry.
-  const resubscribe = useCallback(async () => {
-    await disable();
-    await enable();
-  }, [disable, enable]);
-
-  return { state, enable, disable, sendTest, refresh, resubscribe };
+  return { state, health, enable, disable, sendTest, refresh };
 }

@@ -4,17 +4,16 @@ import type { SessionResponse } from "../lib/types";
 
 type ShellMode = "host" | "container";
 
-/** Host/container shell switch plus the paired terminal. Used both in the
- *  desktop right-panel split and as the promoted single full-viewport mobile
- *  pane. Renders the capture-snapshot live view on every device (same
- *  architecture as the agent pane); the xterm.js PTY relay was removed. */
+/** Host/container shell shared by desktop docks and the mobile paired view. */
 export function PairedShellPane({
   session,
   sessionId,
+  active = true,
   terminalIndex = 0,
 }: {
   session: SessionResponse | null;
   sessionId: string | null;
+  active?: boolean;
   /** Which paired-terminal instance this tab renders (#2437). 0 is the
    *  primary shell shared with the native TUI. */
   terminalIndex?: number;
@@ -53,6 +52,7 @@ export function PairedShellPane({
         <LiveTerminalView
           key={`${sessionId}-${effectiveMode}-${terminalIndex}`}
           session={session}
+          active={active}
           surface={effectiveMode === "container" ? "paired-container" : "paired-host"}
           terminalIndex={terminalIndex}
         />

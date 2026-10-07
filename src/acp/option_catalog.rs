@@ -1,18 +1,4 @@
 //! Recall cache of the ACP `config_options` each agent last advertised.
-//!
-//! The structured view composer's model / mode / thinking dropdowns are fed by
-//! the `config_options` a *live* agent advertises. The per-agent defaults
-//! settings page has no live session, so it reads this cache instead: whenever
-//! the daemon observes a full `ConfigOptionsUpdated` snapshot for a session, it
-//! records the snapshot keyed by that session's agent. New models flow in the
-//! next time the agent runs; nothing here is a hand-maintained catalog.
-//!
-//! This is disposable cache data, not user configuration: an owner-only JSON
-//! file in the app dir, written atomically (temp + rename), version-gated, and
-//! skipped when the snapshot is unchanged so a chatty session does not rewrite
-//! it on every update. `current_value` is stripped because it is per-session
-//! state, not catalog metadata; consumers resolve the live option at apply
-//! time.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,10 +11,6 @@ use crate::acp::state::ConfigOptionDescriptor;
 const CATALOG_VERSION: u32 = 1;
 const CATALOG_FILE: &str = "acp_option_catalog.json";
 
-/// Serializes the load-modify-write cycle in `record` so concurrent
-/// `ConfigOptionsUpdated` events (the daemon fires one `spawn_blocking(record)`
-/// per event, and several agents run in parallel) cannot both load the same
-/// snapshot and clobber each other's just-written entry.
 static CATALOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// The whole cache: one entry per agent name.
@@ -79,8 +61,7 @@ pub fn load() -> OptionCatalog {
     }
 }
 
-/// Options with `current_value` cleared, for storage and comparison. The live
-/// selection is session state, not catalog metadata.
+/// Options with `current_value` cleared, for storage and comparison.
 fn strip_current(options: &[ConfigOptionDescriptor]) -> Vec<ConfigOptionDescriptor> {
     options
         .iter()
@@ -92,10 +73,7 @@ fn strip_current(options: &[ConfigOptionDescriptor]) -> Vec<ConfigOptionDescript
         .collect()
 }
 
-/// Record an agent's advertised options. No-ops when the option set is
-/// unchanged (debounce), so a chatty session does not rewrite the file on every
-/// `ConfigOptionsUpdated`. `now` is an RFC 3339 timestamp supplied by the
-/// caller.
+/// Record an agent's advertised options.
 pub fn record(agent: &str, options: &[ConfigOptionDescriptor], now: String) -> anyhow::Result<()> {
     if agent.trim().is_empty() {
         return Ok(());
@@ -163,7 +141,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn record_and_load_round_trips_with_current_value_stripped() {
+    fn record_strips_current_value_debounces_and_skips_empty_agents() {
         let _tmp = isolate_app_dir();
         record(
             "opencode",
@@ -177,20 +155,8 @@ mod tests {
         // current_value is stripped; the choices survive.
         assert_eq!(entry.options[0].current_value, "");
         assert_eq!(entry.options[0].options[0].value, "gpt-5");
-    }
 
-    #[test]
-    #[serial]
-    fn record_debounces_unchanged_snapshot() {
-        let _tmp = isolate_app_dir();
-        record(
-            "opencode",
-            &[descriptor("gpt-5")],
-            "2026-07-03T00:00:00Z".into(),
-        )
-        .unwrap();
-        // Same options but a different current_value must not rewrite the
-        // timestamp: current_value is not catalog data.
+        // Only current_value differs, so the stored snapshot is unchanged.
         record(
             "opencode",
             &[descriptor("gpt-4")],
@@ -198,13 +164,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load().agents["opencode"].updated_at, "2026-07-03T00:00:00Z");
-    }
 
-    #[test]
-    #[serial]
-    fn empty_agent_name_is_ignored() {
-        let _tmp = isolate_app_dir();
         record("", &[descriptor("gpt-5")], "2026-07-03T00:00:00Z".into()).unwrap();
-        assert!(load().agents.is_empty());
+        assert_eq!(load().agents.len(), 1, "an empty agent name is ignored");
     }
 }

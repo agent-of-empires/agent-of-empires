@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import { currentWebBuildId, isWebUpdateAvailable } from "./webBuildId";
 
 function addModuleScript(src: string) {
@@ -15,36 +15,23 @@ afterEach(() => {
   document.head.querySelectorAll("script").forEach((s) => s.remove());
 });
 
-describe("currentWebBuildId", () => {
-  it("reads the hashed entry bundle off the page's own script tag", () => {
-    addModuleScript("/assets/index-DKenwdW0.js");
-    expect(currentWebBuildId()).toBe("index-DKenwdW0.js");
-  });
-
-  it("ignores non-entry module scripts and absolute origins", () => {
-    addModuleScript("/assets/StructuredView-Abc123.js");
-    addModuleScript("https://example.test/assets/index-Zz9_-x.js");
-    expect(currentWebBuildId()).toBe("index-Zz9_-x.js");
-  });
-
-  it("returns null on the Vite dev server (unhashed entry)", () => {
-    addModuleScript("/src/main.tsx");
-    expect(currentWebBuildId()).toBeNull();
-  });
+it("currentWebBuildId reads the hashed entry bundle off the page's own script tag", () => {
+  const cases: [string[], string | null][] = [
+    [["/assets/index-DKenwdW0.js"], "index-DKenwdW0.js"],
+    [["/assets/StructuredView-Abc123.js", "https://example.test/assets/index-Zz9_-x.js"], "index-Zz9_-x.js"],
+    [["/src/main.tsx"], null],
+  ];
+  for (const [srcs, expected] of cases) {
+    document.head.querySelectorAll("script").forEach((s) => s.remove());
+    srcs.forEach(addModuleScript);
+    expect(currentWebBuildId(), srcs.join(",")).toBe(expected);
+  }
 });
 
-describe("isWebUpdateAvailable", () => {
-  it("flags a mismatch between page and server bundle", () => {
-    expect(isWebUpdateAvailable("index-old.js", "index-new.js")).toBe(true);
-  });
-
-  it("stays quiet when ids match", () => {
-    expect(isWebUpdateAvailable("index-same.js", "index-same.js")).toBe(false);
-  });
-
-  it("disables the check when either side is missing", () => {
-    expect(isWebUpdateAvailable(null, "index-new.js")).toBe(false);
-    expect(isWebUpdateAvailable("index-old.js", null)).toBe(false);
-    expect(isWebUpdateAvailable("index-old.js", undefined)).toBe(false);
-  });
+it("isWebUpdateAvailable flags only a mismatch between two known ids", () => {
+  expect(isWebUpdateAvailable("index-old.js", "index-new.js")).toBe(true);
+  expect(isWebUpdateAvailable("index-same.js", "index-same.js")).toBe(false);
+  expect(isWebUpdateAvailable(null, "index-new.js")).toBe(false);
+  expect(isWebUpdateAvailable("index-old.js", null)).toBe(false);
+  expect(isWebUpdateAvailable("index-old.js", undefined)).toBe(false);
 });

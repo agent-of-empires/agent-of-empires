@@ -9,10 +9,7 @@ import {
   ThemeNameWidget,
 } from "./customWidgets";
 
-/** Registry of bespoke settings controls keyed by `widget.id`, mirroring the
- *  TUI's custom-widget map (src/tui/settings/fields.rs). SchemaSection looks a
- *  field's `widget.id` up here when `widget.kind === "custom"`. Kept in a
- *  non-component module so the widget file stays Fast-Refresh clean. */
+/** Custom settings controls by `widget.id`, mirroring src/tui/settings/fields.rs. */
 export const CUSTOM_SETTINGS_WIDGETS: Record<string, CustomSettingsWidget> = {
   "theme-name": ThemeNameWidget,
   "default-tool": DefaultToolWidget,

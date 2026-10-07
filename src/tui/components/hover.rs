@@ -90,14 +90,9 @@ mod tests {
         // The gap between the rects clears the highlight.
         assert!(hover.update(16, 8, &[a, b]));
         assert_eq!(hover.current(), None);
-    }
 
-    #[test]
-    fn zero_sized_rects_never_match() {
         // Before the first render every captured rect is the default
-        // zero-sized rect; nothing should register as hovered, not even
-        // the origin.
-        let mut hover = HoverState::default();
+        // zero-sized rect; nothing registers as hovered, not even the origin.
         assert!(!hover.update(0, 0, &[Rect::default(), Rect::default()]));
         assert_eq!(hover.current(), None);
     }

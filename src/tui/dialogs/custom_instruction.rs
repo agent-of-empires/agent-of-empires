@@ -1,4 +1,4 @@
-//! Custom instruction editor dialog with multi-line text area and Save/Cancel buttons
+//! Custom instruction editor.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -6,12 +6,19 @@ use ratatui::widgets::*;
 use ratatui_textarea::TextArea;
 
 use super::DialogResult;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 pub struct CustomInstructionDialog {
     focused_zone: usize,   // 0 = text area, 1 = button row
     focused_button: usize, // 0 = Save, 1 = Cancel
     text_area: TextArea<'static>,
+    dialog_area: Rect,
+    text_area_rect: Rect,
+    save_button_area: Rect,
+    cancel_button_area: Rect,
+    /// The hovered button. Visual only; never changes `focused_button`.
+    hover: HoverState,
 }
 
 impl CustomInstructionDialog {
@@ -30,11 +37,46 @@ impl CustomInstructionDialog {
             focused_zone: 0,
             focused_button: 0,
             text_area,
+            dialog_area: Rect::default(),
+            text_area_rect: Rect::default(),
+            save_button_area: Rect::default(),
+            cancel_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
     }
 
     fn get_text(&self) -> String {
         self.text_area.lines().join("\n")
+    }
+
+    /// What Save submits: blank text clears the instruction.
+    fn submission(&self) -> DialogResult<Option<String>> {
+        let text = self.get_text();
+        DialogResult::Submit((!text.trim().is_empty()).then_some(text))
+    }
+
+    /// Save and Cancel act like Enter on them; a text-area click only focuses
+    /// it. `None` outside the dialog.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<Option<String>>> {
+        let pos = Position::from((col, row));
+        if self.save_button_area.contains(pos) {
+            return Some(self.submission());
+        }
+        if self.cancel_button_area.contains(pos) {
+            return Some(DialogResult::Cancel);
+        }
+        if self.text_area_rect.contains(pos) {
+            self.focused_zone = 0;
+        }
+        self.dialog_area
+            .contains(pos)
+            .then_some(DialogResult::Continue)
+    }
+
+    /// Highlight the button under the cursor. True when the highlight changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover
+            .update(col, row, &[self.save_button_area, self.cancel_button_area])
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<Option<String>> {
@@ -48,16 +90,8 @@ impl CustomInstructionDialog {
 
             KeyCode::Enter if self.focused_zone == 1 => {
                 if self.focused_button == 0 {
-                    // Save
-                    let text = self.get_text();
-                    let value = if text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(text)
-                    };
-                    DialogResult::Submit(value)
+                    self.submission()
                 } else {
-                    // Cancel
                     DialogResult::Cancel
                 }
             }
@@ -86,22 +120,13 @@ impl CustomInstructionDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width = (area.width * 70 / 100).max(40).min(area.width);
         let dialog_height = (area.height * 60 / 100).max(10).min(area.height);
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Edit Custom Instruction ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::dialog_block(" Edit Custom Instruction ", theme);
+        let (dialog_area, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
+        self.dialog_area = dialog_area;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -111,8 +136,8 @@ impl CustomInstructionDialog {
                 Constraint::Length(1), // Hint bar
             ])
             .split(inner);
+        self.text_area_rect = chunks[0];
 
-        // Text area
         let textarea_border_color = if self.focused_zone == 0 {
             theme.accent
         } else {
@@ -154,7 +179,6 @@ impl CustomInstructionDialog {
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
 
-        // Button row
         let button_area = chunks[1];
         let button_layout = Layout::default()
             .direction(Direction::Horizontal)
@@ -171,6 +195,9 @@ impl CustomInstructionDialog {
                 width: button_area.width,
                 height: 1,
             });
+
+        self.save_button_area = button_layout[1];
+        self.cancel_button_area = button_layout[3];
 
         let save_style = if self.focused_zone == 1 && self.focused_button == 0 {
             Style::default()
@@ -199,8 +226,16 @@ impl CustomInstructionDialog {
                 .alignment(Alignment::Center),
             button_layout[3],
         );
+        // The focused button keeps its filled style; hover tints only the other.
+        let focused = (self.focused_zone == 1).then(|| button_layout[1 + 2 * self.focused_button]);
+        if let Some(rect) = self
+            .hover
+            .current_in(&[self.save_button_area, self.cancel_button_area])
+            .filter(|r| Some(*r) != focused)
+        {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
 
-        // Hint bar
         let hint = Line::from(vec![
             Span::styled("Tab", Style::default().fg(theme.hint)),
             Span::raw(" switch focus  "),
@@ -227,140 +262,107 @@ mod tests {
     }
 
     #[test]
-    fn test_new_with_some_text_prepopulates() {
-        let dialog = CustomInstructionDialog::new(Some("hello world".to_string()));
-        assert_eq!(dialog.get_text(), "hello world");
-        assert_eq!(dialog.focused_zone, 0);
-        assert_eq!(dialog.focused_button, 0);
-    }
-
-    #[test]
-    fn test_new_with_none_starts_empty() {
-        let dialog = CustomInstructionDialog::new(None);
-        assert_eq!(dialog.get_text(), "");
-    }
-
-    #[test]
-    fn test_new_with_multiline_text() {
-        let dialog = CustomInstructionDialog::new(Some("line1\nline2\nline3".to_string()));
-        assert_eq!(dialog.get_text(), "line1\nline2\nline3");
-    }
-
-    #[test]
-    fn test_tab_toggles_focused_zone() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        assert_eq!(dialog.focused_zone, 0);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_zone, 1);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_zone, 0);
-    }
-
-    #[test]
-    fn test_shift_tab_toggles_in_reverse() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        assert_eq!(dialog.focused_zone, 0);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_zone, 1);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_zone, 0);
-    }
-
-    #[test]
-    fn test_escape_returns_cancel_from_zone_0() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        dialog.focused_zone = 0;
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_escape_returns_cancel_from_zone_1() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        dialog.focused_zone = 1;
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_enter_in_zone_0_does_not_submit() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        dialog.focused_zone = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Continue));
-    }
-
-    #[test]
-    fn test_enter_on_save_button_returns_submit() {
-        let mut dialog = CustomInstructionDialog::new(Some("test text".to_string()));
-        dialog.focused_zone = 1;
-        dialog.focused_button = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(Some(text)) => assert_eq!(text, "test text"),
-            _ => panic!("Expected Submit(Some(...))"),
+    fn new_prepopulates_and_tab_toggles_zones() {
+        for (initial, text) in [
+            (Some("hello world"), "hello world"),
+            (None, ""),
+            (Some("line1\nline2\nline3"), "line1\nline2\nline3"),
+        ] {
+            let dialog = CustomInstructionDialog::new(initial.map(str::to_string));
+            assert_eq!(dialog.get_text(), text);
+            assert_eq!((dialog.focused_zone, dialog.focused_button), (0, 0));
         }
-    }
-
-    #[test]
-    fn test_enter_on_cancel_button_returns_cancel() {
-        let mut dialog = CustomInstructionDialog::new(Some("test text".to_string()));
-        dialog.focused_zone = 1;
-        dialog.focused_button = 1;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_left_right_in_button_row_toggles_focused_button() {
+        for tab in [key(KeyCode::Tab), shift_key(KeyCode::Tab)] {
+            let mut dialog = CustomInstructionDialog::new(None);
+            dialog.handle_key(tab);
+            assert_eq!(dialog.focused_zone, 1);
+            dialog.handle_key(tab);
+            assert_eq!(dialog.focused_zone, 0);
+        }
         let mut dialog = CustomInstructionDialog::new(None);
         dialog.focused_zone = 1;
-        assert_eq!(dialog.focused_button, 0);
-
         dialog.handle_key(key(KeyCode::Right));
         assert_eq!(dialog.focused_button, 1);
-
         dialog.handle_key(key(KeyCode::Left));
         assert_eq!(dialog.focused_button, 0);
     }
 
     #[test]
-    fn test_submit_with_empty_text_returns_none() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        dialog.focused_zone = 1;
-        dialog.focused_button = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(None) => {}
-            _ => panic!("Expected Submit(None)"),
+    fn key_outcomes() {
+        let submit = |t: &str| DialogResult::Submit(Some(t.to_string()));
+        // (initial text, zone, button, key, outcome). Blank text submits None.
+        let cases = [
+            (None, 0, 0, KeyCode::Esc, DialogResult::Cancel),
+            (None, 1, 0, KeyCode::Esc, DialogResult::Cancel),
+            (None, 0, 0, KeyCode::Enter, DialogResult::Continue),
+            (Some("test text"), 1, 0, KeyCode::Enter, submit("test text")),
+            (
+                Some("test text"),
+                1,
+                1,
+                KeyCode::Enter,
+                DialogResult::Cancel,
+            ),
+            (None, 1, 0, KeyCode::Enter, DialogResult::Submit(None)),
+            (
+                Some("   \n  "),
+                1,
+                0,
+                KeyCode::Enter,
+                DialogResult::Submit(None),
+            ),
+        ];
+        for (initial, zone, button, code, want) in cases {
+            let mut dialog = CustomInstructionDialog::new(initial.map(str::to_string));
+            dialog.focused_zone = zone;
+            dialog.focused_button = button;
+            assert_eq!(
+                dialog.handle_key(key(code)),
+                want,
+                "{initial:?} zone {zone} button {button} {code:?}"
+            );
         }
     }
 
     #[test]
-    fn test_submit_with_whitespace_only_returns_none() {
-        let mut dialog = CustomInstructionDialog::new(Some("   \n  ".to_string()));
-        dialog.focused_zone = 1;
-        dialog.focused_button = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(None) => {}
-            _ => panic!("Expected Submit(None) for whitespace-only text"),
+    fn clicks_and_hover_route_to_buttons_and_text_area() {
+        // Staged as render would capture them.
+        fn staged(text: Option<&str>) -> CustomInstructionDialog {
+            let mut dialog = CustomInstructionDialog::new(text.map(str::to_string));
+            dialog.dialog_area = Rect::new(0, 0, 60, 20);
+            dialog.text_area_rect = Rect::new(1, 1, 58, 14);
+            dialog.save_button_area = Rect::new(18, 16, 10, 1);
+            dialog.cancel_button_area = Rect::new(30, 16, 10, 1);
+            dialog.focused_zone = 1;
+            dialog
         }
-    }
+        let submit = |t: &str| Some(DialogResult::Submit(Some(t.to_string())));
+        // (text, click, outcome, focused zone after)
+        let cases = [
+            (Some("keep"), (20, 16), submit("keep"), 1),
+            (Some("  "), (20, 16), Some(DialogResult::Submit(None)), 1),
+            (Some("keep"), (35, 16), Some(DialogResult::Cancel), 1),
+            (Some("keep"), (5, 5), Some(DialogResult::Continue), 0),
+            (Some("keep"), (5, 18), Some(DialogResult::Continue), 1),
+            (Some("keep"), (70, 5), None, 1),
+        ];
+        for (text, (col, row), want, zone) in cases {
+            let mut dialog = staged(text);
+            assert_eq!(
+                dialog.handle_click(col, row),
+                want,
+                "{text:?} at {col},{row}"
+            );
+            assert_eq!(dialog.focused_zone, zone, "{text:?} at {col},{row}");
+            assert_eq!(dialog.get_text(), text.unwrap_or_default());
+        }
 
-    #[test]
-    fn test_submit_with_nonempty_text_returns_some() {
-        let mut dialog = CustomInstructionDialog::new(Some("custom instruction".to_string()));
-        dialog.focused_zone = 1;
-        dialog.focused_button = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(Some(text)) => assert_eq!(text, "custom instruction"),
-            _ => panic!("Expected Submit(Some(...))"),
-        }
+        let mut dialog = staged(None);
+        assert!(dialog.handle_hover(31, 16));
+        assert_eq!(dialog.hover.current(), Some(dialog.cancel_button_area));
+        assert_eq!(dialog.focused_button, 0, "hover must not move focus");
+        assert!(!dialog.handle_hover(32, 16));
+        assert!(dialog.handle_hover(5, 5));
+        assert_eq!(dialog.hover.current(), None);
     }
 }

@@ -1,18 +1,12 @@
 //! Pure selectors for rendering the daemon's plugin UI-state snapshot in the
-//! native TUI (#2402). Mirrors the web selectors in `web/src/lib/pluginUi.ts`,
-//! narrowed to what a terminal can render: the structured view shows
-//! `StatusBar` (global) and `DetailBadge` (per-session) text, tone-colored,
-//! plus `Notification` toasts, and `Pane` blocks in a toggleable overlay
-//! (#2467); the remote-home picker shows `RowColumn` text per session row
-//! (#2948). Icons, tooltips, hrefs, and the
-//! `Card`/`RowBadge`/`SortKey`/`FilterFacet`/`SettingsPage`/
-//! `ToolCardBadge` slots have no TUI surface here and are ignored (a terminal
-//! cannot render a routed full page). `ToolCardBadge` renders on the web
-//! tool-call cards only; the TUI would need MCP/skill target classification it
-//! does not carry today, tracked as a follow-up.
+//! native TUI (#2402), mirroring `web/src/lib/pluginUi.ts` narrowed to what a
+//! terminal can render: `StatusBar` / `DetailBadge` text, `Notification` toasts,
+//! `Pane` / `HomePane` blocks in a toggleable overlay (#2467), and `RowColumn`
+//! text on remote-home rows (#2948). Icons, tooltips, hrefs and the
+//! `Card`/`RowBadge`/`SortKey`/`FilterFacet` slots have no TUI surface.
 //!
-//! Kept side-effect-free so the render layer can borrow the snapshot and so the
-//! filtering / tone-mapping logic is unit-testable without a daemon.
+//! Side-effect-free, so the render layer can borrow the snapshot and the
+//! filtering / tone-mapping is unit-testable without a daemon.
 
 use aoe_plugin_api::UiSlot;
 use ratatui::style::{Color, Modifier, Style};
@@ -30,10 +24,9 @@ pub fn global_entries(snapshot: &UiSnapshot, slot: UiSlot) -> impl Iterator<Item
         .filter(move |e| e.slot == slot && e.session_id.is_none())
 }
 
-/// Per-session entries for `slot` whose `session_id` matches exactly. The
-/// exact match is a tearing guard: a snapshot can momentarily carry entries
-/// for a session other than the one on screen, and showing those would
-/// mislabel another session's state as this one's.
+/// Per-session entries for `slot` whose `session_id` matches exactly. Exact, as
+/// a tearing guard: a snapshot can momentarily carry another session's entries,
+/// and showing those would mislabel its state as this one's.
 pub fn session_entries<'a>(
     snapshot: &'a UiSnapshot,
     slot: UiSlot,
@@ -45,12 +38,24 @@ pub fn session_entries<'a>(
         .filter(move |e| e.slot == slot && e.session_id.as_deref() == Some(session_id))
 }
 
-/// The renderable `text` of a `StatusBar` / `DetailBadge` entry, if present
-/// and a non-empty string. Defensive: the daemon validates payloads, but a
-/// malformed or schema-skewed entry must not panic the renderer.
+/// The object a badge renders from. With `items` (web shows those instead of
+/// the top-level fields) it is the first item with text, since the TUI cannot
+/// cycle; otherwise the payload itself.
+fn badge_source(entry: &UiEntry) -> Option<&Value> {
+    match entry.payload.get("items").and_then(Value::as_array) {
+        Some(items) => items.iter().find(|i| {
+            i.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.trim().is_empty())
+        }),
+        None => Some(&entry.payload),
+    }
+}
+
+/// The renderable `text` of a `StatusBar` / `DetailBadge` entry. Defensive: the
+/// daemon validates payloads, but a skewed entry must not panic the renderer.
 pub fn entry_text(entry: &UiEntry) -> Option<&str> {
-    entry
-        .payload
+    badge_source(entry)?
         .get("text")
         .and_then(|v| v.as_str())
         .map(str::trim)
@@ -59,26 +64,22 @@ pub fn entry_text(entry: &UiEntry) -> Option<&str> {
 
 /// The entry's tone, if it carries a valid one.
 pub fn entry_tone(entry: &UiEntry) -> Option<Tone> {
-    entry
-        .payload
+    badge_source(entry)?
         .get("tone")
         .and_then(|v| serde_json::from_value::<Tone>(v.clone()).ok())
 }
 
 /// This session's `RowColumn` cells as `(text, tone)`, in snapshot order
-/// (#2948). One session can carry several, one per plugin, so the caller
-/// renders them side by side the way the web maps over every entry. Entries
-/// with no renderable text drop out; `tooltip` has no terminal surface and is
-/// ignored, as with the other slots.
+/// (#2948). One session can carry several, one per plugin, rendered side by
+/// side. Entries with no renderable text drop out; `tooltip` has no surface.
 pub fn row_column_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String, Option<Tone>)> {
     session_entries(snapshot, UiSlot::RowColumn, session_id)
         .filter_map(|e| entry_text(e).map(|t| (t.to_string(), entry_tone(e))))
         .collect()
 }
 
-/// Map a tone to a foreground style against the active theme. `None` (no tone)
-/// renders neutral. Reuses existing theme status colors rather than inventing
-/// new fields, matching how the home view tones session rows.
+/// Map a tone to a foreground style against the active theme. `None` renders
+/// neutral. Reuses the theme's status colors rather than inventing fields.
 pub fn tone_style(tone: Option<Tone>, theme: &Theme) -> Style {
     let color = tone_color(tone, theme);
     Style::default().fg(color)
@@ -94,9 +95,8 @@ fn tone_color(tone: Option<Tone>, theme: &Theme) -> Color {
     }
 }
 
-/// The highest notification seq in the snapshot, or 0 when there are none.
-/// Used to initialize the "already seen" watermark so notifications that
-/// predate opening the view do not toast on first load.
+/// The highest notification seq in the snapshot, or 0 when there are none, to
+/// seed the watermark so notifications predating the view do not toast.
 pub fn max_notification_seq(snapshot: &UiSnapshot) -> u64 {
     snapshot
         .notifications
@@ -126,24 +126,29 @@ pub fn new_notifications<'a>(
     out
 }
 
-/// Width of a `divider` block's rule. The renderer pre-wraps every line to the
-/// panel width, so a fixed width is fine: a narrow pane wraps the rule
-/// (harmless) and a wide one shows a partial rule rather than spanning the whole
-/// width. Not worth threading the render width down for a decorative line.
+/// Width of a `divider` block's rule. The renderer pre-wraps to the panel width,
+/// so a fixed width is fine for a decorative line.
 const DIVIDER_WIDTH: usize = 32;
 
-/// Render the open session's `Pane` entries to terminal lines for the
-/// toggleable pane panel (#2467). Mirrors the web renderer's block vocabulary
-/// (`web/src/components/plugin/PluginSlots.tsx`), narrowed to what a terminal
-/// shows: text and tone only, with icons / hrefs / tooltips dropped and
-/// `action` blocks rendered as inert labels (interactive firing is a #2467
-/// follow-up). Forward-compatible: an unknown block `kind` renders nothing
-/// rather than failing, so a newer plugin can push kinds this host has not
-/// heard of. Entries are blank-line separated, and an entry that renders
-/// nothing contributes no separator (so a malformed payload leaves no gap).
+/// Render the open session's `Pane` entries to terminal lines for the toggleable
+/// pane panel (#2467), mirroring the web block vocabulary narrowed to text and
+/// tone; `action` blocks render as inert labels. An unknown block `kind` renders
+/// nothing rather than failing, so a newer plugin can push kinds this host has
+/// not heard of. Entries are blank-line separated, and one that renders nothing
+/// contributes no separator.
 pub fn pane_lines(snapshot: &UiSnapshot, session_id: &str, theme: &Theme) -> Vec<Line<'static>> {
+    stack_pane_entries(session_entries(snapshot, UiSlot::Pane, session_id), theme)
+}
+
+/// Render a run of pane entries, each entry's body separated from the next by a
+/// blank line; an entry that renders nothing contributes no separator. Shared by
+/// `pane_lines` and `home_pane_lines`.
+fn stack_pane_entries<'a>(
+    entries: impl Iterator<Item = &'a UiEntry>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    for entry in session_entries(snapshot, UiSlot::Pane, session_id) {
+    for entry in entries {
         let lines = pane_entry_lines(entry, theme);
         if lines.is_empty() {
             continue;
@@ -156,26 +161,30 @@ pub fn pane_lines(snapshot: &UiSnapshot, session_id: &str, theme: &Theme) -> Vec
     out
 }
 
+/// Render global `HomePane` entries with the same block vocabulary as a session
+/// `Pane`: the host-wide docked surface a plugin targets when its panel is not
+/// tied to a session. Entries stack in snapshot order. `HomePane` reuses
+/// `PanePayload`, whose `default_location` is a session-dock concept, ignored.
+pub fn home_pane_lines(snapshot: &UiSnapshot, theme: &Theme) -> Vec<Line<'static>> {
+    stack_pane_entries(global_entries(snapshot, UiSlot::HomePane), theme)
+}
+
 /// One pane entry: a heading naming the pane, then an ordered `blocks` list when
-/// present, else the simple `{ title, body }` form (matching the web renderer's
-/// precedence). The web shows the pane's name on its dock tab and so skips
-/// `title` inside a `blocks` body; the TUI overlay has no tabs, so the heading
-/// carries the attribution, falling back to the `plugin_id` the way the web's
-/// `paneTitle` does (`web/src/lib/pluginPanes.ts`).
+/// present, else the simple `{ title, body }` form. The web puts the pane name on
+/// its dock tab; the TUI overlay has no tabs, so the heading carries the
+/// attribution, falling back to the `plugin_id` as the web's `paneTitle` does.
 fn pane_entry_lines(entry: &UiEntry, theme: &Theme) -> Vec<Line<'static>> {
     // The footer belongs to the entry, not to the `blocks` form: a payload can
-    // pair it with the simple `{ title, body }` shape, and a block list that all
-    // drops out still has a status line worth showing. Computed once, up front, so
-    // both paths below append it and neither can forget.
+    // pair it with `{ title, body }`, and a block list that all drops out still
+    // has a status line worth showing. Computed once so neither path forgets it.
     let footer = footer_lines(&entry.payload, theme);
     if let Some(blocks) = entry.payload.get("blocks").and_then(Value::as_array) {
         let body: Vec<Line<'static>> = blocks
             .iter()
             .flat_map(|b| block_lines(b, 0, theme))
             .collect();
-        // Nothing renderable at all means no heading either: an empty or malformed
-        // payload must not leave a bare plugin name on screen. A footer counts as
-        // content, so it keeps the entry (and its heading) alive on its own.
+        // Nothing renderable means no heading either: a malformed payload must
+        // not leave a bare plugin name on screen. A footer counts as content.
         if body.is_empty() && footer.is_empty() {
             return body;
         }
@@ -288,6 +297,7 @@ fn block_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>
         Some("section") => section_lines(block, indent, theme),
         Some("callout") => callout_lines(block, indent, theme),
         Some("bar") => bar_lines(block, indent, theme),
+        Some("sparkline") => sparkline_lines(block, indent, theme),
         // The terminal has no side-by-side layout, so a `columns` block degrades
         // to its children stacked at the same indent, in order.
         Some("columns") => match block.get("children").and_then(Value::as_array) {
@@ -302,9 +312,8 @@ fn block_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>
 }
 
 /// `callout`: the pane's headline verdict. A toned title line, the detail
-/// wrapped beneath it, then each of its actions as an inert `[action]` label
-/// (same read-only treatment as a top-level `action`). Renders nothing without a
-/// title or detail, matching the web guard.
+/// wrapped beneath, then each action as an inert `[action]` label. Renders
+/// nothing without a title or detail, matching the web guard.
 fn callout_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
     let title = block_str(block, "title");
     let detail = block_str(block, "detail");
@@ -336,9 +345,8 @@ fn callout_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'stati
     out
 }
 
-/// Cells in a `bar` block's text rendering. Fixed for the same reason
-/// [`DIVIDER_WIDTH`] is: the bar is a proportion, not a measurement, so it does
-/// not need the live panel width threaded down to read correctly.
+/// Cells in a `bar` block's text rendering. Fixed like [`DIVIDER_WIDTH`]: the
+/// bar is a proportion, not a measurement.
 const BAR_WIDTH: usize = 24;
 
 /// `bar`: the proportional stacked bar as a run of block glyphs per segment,
@@ -371,11 +379,94 @@ fn bar_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> 
     out
 }
 
+/// The eight block-fill glyphs, index 0 (lowest) to 7 (full).
+const SPARK_GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// `sparkline`: a history plot as block-eighths glyphs, one per value, scaled
+/// against `max`, with an optional caption. Wire shape:
+/// `{ kind: "sparkline", values: [f64], max?: f64, tone?, bands?, caption? }`.
+///
+/// `bands: [{ at: f64, tone }]` colors each glyph by the highest `at` threshold
+/// its value meets, so a series can change color as it climbs; without them the
+/// whole series takes the single `tone`. `max` defaults to the data's own max,
+/// which rescales as the window changes. An empty series renders nothing.
+fn sparkline_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let values: Vec<f64> = block
+        .get("values")
+        .and_then(Value::as_array)
+        .map(|vs| {
+            vs.iter()
+                .filter_map(Value::as_f64)
+                .filter(|v| v.is_finite())
+                .collect()
+        })
+        .unwrap_or_default();
+    if values.is_empty() {
+        return vec![];
+    }
+    let data_max = values.iter().cloned().fold(0.0_f64, f64::max);
+    let max = block
+        .get("max")
+        .and_then(Value::as_f64)
+        .filter(|m| *m > 0.0)
+        .unwrap_or(data_max)
+        .max(f64::MIN_POSITIVE);
+    let bands = parse_bands(block);
+    let base_tone = block_tone(block);
+
+    let mut spans = indent_span(indent);
+    spans.extend(values.iter().map(|&v| {
+        // frac is clamped to 0..=1, so idx lands in 0..=len-1 without a guard.
+        let frac = (v / max).clamp(0.0, 1.0);
+        let idx = (frac * (SPARK_GLYPHS.len() as f64 - 1.0)).round() as usize;
+        let tone = band_tone(&bands, v).or(base_tone);
+        Span::styled(SPARK_GLYPHS[idx].to_string(), tone_style(tone, theme))
+    }));
+
+    let mut out = vec![Line::from(spans)];
+    if let Some(caption) = block_str(block, "caption") {
+        out.push(indented_line(
+            indent,
+            caption.to_string(),
+            Style::default().fg(theme.dimmed),
+        ));
+    }
+    out
+}
+
+/// `(at, tone)` thresholds from a sparkline's `bands`, in declared order.
+/// Malformed or missing yields none, so coloring falls back to the single `tone`.
+fn parse_bands(block: &Value) -> Vec<(f64, Tone)> {
+    block
+        .get("bands")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| {
+                    let at = b
+                        .get("at")
+                        .and_then(Value::as_f64)
+                        .filter(|a| a.is_finite())?;
+                    Some((at, block_tone(b)?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tone of the highest band `value` reaches, or `None` if it clears none.
+fn band_tone(bands: &[(f64, Tone)], value: f64) -> Option<Tone> {
+    bands
+        .iter()
+        .filter(|(at, _)| value >= *at)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, tone)| *tone)
+}
+
 /// Lay the segments out over [`BAR_WIDTH`] cells. Every positive segment gets at
-/// least one cell so a tiny slice is still visible, and the rounding slack is
-/// taken off the widest segments so the run is exactly `BAR_WIDTH` wide. With
-/// more segments than cells the one-cell floor wins and the run is `segments.len()`
-/// wide instead, which is the only case where it exceeds `BAR_WIDTH`.
+/// least one cell so a tiny slice stays visible, and rounding slack comes off the
+/// widest segments. With more segments than cells the one-cell floor wins and the
+/// run is `segments.len()` wide, the only case where it exceeds `BAR_WIDTH`.
 fn bar_spans(segments: &[(f64, Option<Tone>)], indent: usize, theme: &Theme) -> Vec<Span<'static>> {
     let total: f64 = segments.iter().map(|(v, _)| v).sum();
     let mut cells: Vec<usize> = segments
@@ -634,7 +725,6 @@ fn push_sep(spans: &mut Vec<Span<'static>>, indent: usize) {
     }
 }
 
-/// A single styled line at `indent` spaces.
 fn indented_line(indent: usize, text: String, style: Style) -> Line<'static> {
     if indent == 0 {
         Line::from(Span::styled(text, style))
@@ -660,89 +750,57 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_wire_shape_with_omitted_optionals() {
+    fn entry_filters_and_payload_fields() {
         // session_id / body omitted on the wire (skip_serializing_if) must
         // still decode, not error.
         let snap = snapshot(
-            json!([{
-                "plugin_id": "p",
-                "slot": "status-bar",
-                "id": "x",
-                "payload": {"text": "ok", "tone": "success"}
-            }]),
-            json!([{"seq": 1, "plugin_id": "p", "tone": "info", "title": "hi"}]),
-        );
-        assert_eq!(snap.entries.len(), 1);
-        assert!(snap.entries[0].session_id.is_none());
-        assert!(snap.notifications[0].body.is_none());
-    }
-
-    #[test]
-    fn global_entries_exclude_per_session() {
-        let snap = snapshot(
             json!([
-                {"plugin_id": "p", "slot": "status-bar", "id": "g", "payload": {"text": "global"}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "s", "session_id": "sess-1", "payload": {"text": "scoped"}}
-            ]),
-            json!([]),
-        );
-        let got: Vec<&str> = global_entries(&snap, UiSlot::StatusBar)
-            .filter_map(entry_text)
-            .collect();
-        assert_eq!(got, vec!["global"]);
-    }
-
-    #[test]
-    fn session_entries_require_exact_match() {
-        let snap = snapshot(
-            json!([
+                {"plugin_id": "p", "slot": "status-bar", "id": "g", "payload": {"text": "global", "tone": "danger"}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "s", "session_id": "sess-1", "payload": {"text": "scoped"}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "1", "payload": {"text": "   ", "tone": "chartreuse"}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "2", "payload": {"text": 42}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "3", "payload": {}},
                 {"plugin_id": "p", "slot": "detail-badge", "id": "a", "session_id": "sess-1", "payload": {"text": "mine"}},
                 {"plugin_id": "p", "slot": "detail-badge", "id": "b", "session_id": "sess-2", "payload": {"text": "other"}},
                 {"plugin_id": "p", "slot": "detail-badge", "id": "c", "payload": {"text": "no-session"}}
             ]),
-            json!([]),
+            json!([{"seq": 1, "plugin_id": "p", "tone": "info", "title": "hi"}]),
         );
-        let got: Vec<&str> = session_entries(&snap, UiSlot::DetailBadge, "sess-1")
+        assert!(snap.notifications[0].body.is_none());
+        assert_eq!(global_entries(&snap, UiSlot::StatusBar).count(), 4);
+        let global: Vec<&str> = global_entries(&snap, UiSlot::StatusBar)
             .filter_map(entry_text)
             .collect();
-        assert_eq!(got, vec!["mine"]);
-    }
-
-    #[test]
-    fn entry_text_ignores_missing_blank_or_nonstring() {
-        let snap = snapshot(
-            json!([
-                {"plugin_id": "p", "slot": "status-bar", "id": "1", "payload": {"text": "   "}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "2", "payload": {"text": 42}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "3", "payload": {}}
-            ]),
-            json!([]),
-        );
-        assert_eq!(global_entries(&snap, UiSlot::StatusBar).count(), 3);
-        assert_eq!(
-            global_entries(&snap, UiSlot::StatusBar)
-                .filter_map(entry_text)
-                .count(),
-            0
-        );
-    }
-
-    #[test]
-    fn entry_tone_parses_valid_and_drops_invalid() {
-        let snap = snapshot(
-            json!([
-                {"plugin_id": "p", "slot": "status-bar", "id": "1", "payload": {"text": "a", "tone": "danger"}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "2", "payload": {"text": "b", "tone": "chartreuse"}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "3", "payload": {"text": "c"}}
-            ]),
-            json!([]),
-        );
-        let tones: Vec<Option<Tone>> = snap.entries.iter().map(entry_tone).collect();
+        assert_eq!(global, vec!["global"]);
+        let mine: Vec<&str> = session_entries(&snap, UiSlot::DetailBadge, "sess-1")
+            .filter_map(entry_text)
+            .collect();
+        assert_eq!(mine, vec!["mine"]);
+        let tones: Vec<Option<Tone>> = snap.entries[..3].iter().map(entry_tone).collect();
         assert_eq!(tones, vec![Some(Tone::Danger), None, None]);
     }
 
     #[test]
+    fn items_only_badge_renders_its_first_item() {
+        let snap = snapshot(
+            json!([
+                {"plugin_id": "p", "slot": "status-bar", "id": "u", "payload": {"items": [
+                    {"icon": "gauge"},
+                    {"text": "5h 40%", "tone": "warn", "group": "usage"},
+                    {"text": "7d 12%", "group": "usage"}
+                ]}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "t", "payload": {"text": "top", "items": [{"text": "item"}]}}
+            ]),
+            json!([]),
+        );
+        let texts: Vec<Option<&str>> = snap.entries.iter().map(entry_text).collect();
+        assert_eq!(texts, vec![Some("5h 40%"), Some("item")]);
+        assert_eq!(entry_tone(&snap.entries[0]), Some(Tone::Warn));
+    }
+
+    #[test]
     fn new_notifications_filters_by_seq_and_session_in_order() {
+        assert_eq!(max_notification_seq(&snapshot(json!([]), json!([]))), 0);
         let snap = snapshot(
             json!([]),
             json!([
@@ -758,12 +816,6 @@ mod tests {
             .collect();
         // seq>1, global or sess-1, ascending: seq 2 (mine) then seq 3 (global).
         assert_eq!(titles, vec!["mine", "global-new"]);
-    }
-
-    #[test]
-    fn max_seq_handles_empty() {
-        let snap = snapshot(json!([]), json!([]));
-        assert_eq!(max_notification_seq(&snap), 0);
     }
 
     fn pane_snapshot(entries: serde_json::Value) -> UiSnapshot {
@@ -853,178 +905,180 @@ mod tests {
     }
 
     #[test]
-    fn pane_simple_title_body_form() {
-        let snap = pane_snapshot(pane_entry(json!({"title": "Checks", "body": "all\ngood"})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["Checks", "all", "good"]);
-    }
-
-    #[test]
-    fn pane_footer_renders_without_blocks_and_carries_an_all_dropped_entry() {
-        // The footer belongs to the entry, so the simple title/body form gets it
-        // too rather than only the `blocks` form.
-        let simple = pane_snapshot(pane_entry(json!({
-            "title": "GitHub", "body": "no PRs",
-            "footer": {"text": "refreshed 12:07", "value": "ready"}
-        })));
-        assert_eq!(
-            texts(&pane_lines(&simple, "s1", &Theme::default())),
-            vec!["GitHub", "no PRs", "refreshed 12:07 ready"]
-        );
-        // And a block list that all drops out still has a status line worth
-        // showing, so the footer keeps the entry (and its heading) alive.
-        let dropped = pane_snapshot(pane_entry(json!({
-            "title": "GitHub", "blocks": [{"kind": "row"}],
-            "footer": {"text": "refreshed 12:07"}
-        })));
-        assert_eq!(
-            texts(&pane_lines(&dropped, "s1", &Theme::default())),
-            vec!["GitHub", "refreshed 12:07"]
-        );
-    }
-
-    #[test]
-    fn pane_filters_by_session_exactly() {
-        let snap = pane_snapshot(json!([
-            {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "mine"}},
-            {"plugin_id": "p", "slot": "pane", "id": "b", "session_id": "s2", "payload": {"title": "other"}},
-            {"plugin_id": "p", "slot": "pane", "id": "c", "payload": {"title": "global"}}
-        ]));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["mine"]);
-    }
-
-    #[test]
-    fn pane_separates_multiple_entries_with_blank_line() {
-        let snap = pane_snapshot(json!([
-            {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "one"}},
-            {"plugin_id": "p", "slot": "pane", "id": "b", "session_id": "s1", "payload": {"title": "two"}}
-        ]));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["one", "", "two"]);
-    }
-
-    #[test]
-    fn pane_renders_known_block_kinds() {
-        let snap = pane_snapshot(pane_entry(json!({"title": "GH", "blocks": [
-            {"kind": "heading", "text": "GitHub"},
-            {"kind": "row", "label": "nexus", "value": "PR #12", "sublabel": "open"},
-            {"kind": "note", "text": "heads up", "tone": "warn"},
-            {"kind": "divider"},
-            {"kind": "action", "label": "Refresh", "method": "refresh"}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert_eq!(t[0], "GH");
-        assert_eq!(t[1], "GitHub");
-        assert_eq!(t[2], "nexus PR #12 open");
-        assert_eq!(t[3], "heads up");
-        assert_eq!(t[4], "─".repeat(DIVIDER_WIDTH));
-        // Action is inert: a label, not a fired button.
-        assert_eq!(t[5], "[action] Refresh");
-    }
-
-    #[test]
-    fn pane_renders_nested_section_indented() {
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "section", "title": "Reviews", "children": [
-                {"kind": "row", "label": "approved", "value": "2"}
-            ]}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert_eq!(t[1], "REVIEWS");
-        assert_eq!(t[2], "  approved 2");
-    }
-
-    #[test]
-    fn pane_renders_comment_header_and_body() {
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "comment", "author": "octocat", "path": "src/x.rs", "line": 9,
-             "resolved": false, "body": "needs a test"}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert_eq!(t[1], "octocat  src/x.rs:9  unresolved");
-        assert_eq!(t[2], "needs a test");
-    }
-
-    #[test]
-    fn pane_ignores_unknown_kinds_and_titles_the_entry() {
-        // Unknown kind drops out; the payload title heads the entry, and a
-        // stray `body` stays ignored while `blocks` is present (web parity).
-        let snap = pane_snapshot(pane_entry(json!({
-            "title": "GitHub",
-            "body": "ignored",
-            "blocks": [
-                {"kind": "some-future-kind", "whatever": true},
-                {"kind": "heading", "text": "kept"}
-            ]
-        })));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["GitHub", "kept"]);
-    }
-
-    #[test]
-    fn pane_entry_heading_falls_back_to_plugin_id() {
-        // No payload title: the heading names the plugin, so two plugins'
-        // stacked panes stay attributable without the web's dock tabs.
-        let snap = pane_snapshot(pane_entry(
-            json!({"blocks": [{"kind": "heading", "text": "Checks"}]}),
-        ));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["p", "Checks"]);
-    }
-
-    #[test]
-    fn pane_skips_blocks_missing_required_fields_without_panicking() {
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "heading"},
-            {"kind": "row"},
-            {"kind": "comment"},
-            {"kind": "callout"},
-            {"kind": "bar", "segments": [{"value": 0}, {"tone": "info"}]},
-            {"kind": "columns", "children": []},
-            {"kind": "note", "text": "  "}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn pane_renders_the_api_12_block_kinds() {
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "callout", "tone": "danger", "icon": "circle-x",
-             "title": "2 required checks failing", "detail": "Blocked until Clippy passes.",
-             "actions": [{"kind": "action", "label": "Merge blocked", "method": "gh.merge", "disabled": true}]},
-            {"kind": "bar", "caption": "18 files", "segments": [
-                {"value": 750, "tone": "success"}, {"value": 250, "tone": "danger"}
-            ]},
-            // No side-by-side layout in a terminal: the children stack in order
-            // at the columns block's own indent.
-            {"kind": "columns", "children": [
-                {"kind": "row", "label": "DIFF", "value": "+842 -317"},
-                {"kind": "row", "prefix": "#3180", "label": "Stale daemon"}
-            ]}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        // The bar's two tone-colored spans join into one full-width run of cells.
+    fn pane_lines_cases() {
+        let divider = "─".repeat(DIVIDER_WIDTH);
         let bar = "█".repeat(BAR_WIDTH);
-        assert_eq!(
-            texts(&lines),
-            vec![
-                "p",
-                "2 required checks failing",
-                "Blocked until Clippy passes.",
-                // A callout's actions get the same inert treatment as a
-                // top-level `action`; the TUI cannot fire either yet.
-                "[action] Merge blocked",
-                &bar,
-                "18 files",
-                "DIFF +842 -317",
-                "#3180 Stale daemon",
-            ]
-        );
+        let cases: Vec<(&str, serde_json::Value, Vec<&str>)> = vec![
+            (
+                "simple title/body",
+                pane_entry(json!({"title": "Checks", "body": "all\ngood"})),
+                vec!["Checks", "all", "good"],
+            ),
+            (
+                "footer belongs to the entry, not only the blocks form",
+                pane_entry(json!({
+                    "title": "GitHub", "body": "no PRs",
+                    "footer": {"text": "refreshed 12:07", "value": "ready"}
+                })),
+                vec!["GitHub", "no PRs", "refreshed 12:07 ready"],
+            ),
+            (
+                "footer keeps an entry whose blocks all drop",
+                pane_entry(json!({
+                    "title": "GitHub", "blocks": [{"kind": "row"}],
+                    "footer": {"text": "refreshed 12:07"}
+                })),
+                vec!["GitHub", "refreshed 12:07"],
+            ),
+            (
+                "filters by session exactly",
+                json!([
+                    {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "mine"}},
+                    {"plugin_id": "p", "slot": "pane", "id": "b", "session_id": "s2", "payload": {"title": "other"}},
+                    {"plugin_id": "p", "slot": "pane", "id": "c", "payload": {"title": "global"}}
+                ]),
+                vec!["mine"],
+            ),
+            (
+                "an empty middle entry adds no heading or extra separator",
+                json!([
+                    {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "one"}},
+                    {"plugin_id": "q", "slot": "pane", "id": "b", "session_id": "s1",
+                     "payload": {"title": "empty", "blocks": [{"kind": "row"}]}},
+                    {"plugin_id": "r", "slot": "pane", "id": "c", "session_id": "s1", "payload": {"title": "two"}}
+                ]),
+                vec!["one", "", "two"],
+            ),
+            (
+                // Actions are inert labels, not fired buttons.
+                "known block kinds",
+                pane_entry(json!({"title": "GH", "blocks": [
+                    {"kind": "heading", "text": "GitHub"},
+                    {"kind": "row", "label": "nexus", "value": "PR #12", "sublabel": "open"},
+                    {"kind": "note", "text": "heads up", "tone": "warn"},
+                    {"kind": "divider"},
+                    {"kind": "action", "label": "Refresh", "method": "refresh"}
+                ]})),
+                vec![
+                    "GH",
+                    "GitHub",
+                    "nexus PR #12 open",
+                    "heads up",
+                    &divider,
+                    "[action] Refresh",
+                ],
+            ),
+            (
+                "nested section indents",
+                pane_entry(json!({"blocks": [
+                    {"kind": "section", "title": "Reviews", "children": [
+                        {"kind": "row", "label": "approved", "value": "2"}
+                    ]}
+                ]})),
+                vec!["p", "REVIEWS", "  approved 2"],
+            ),
+            (
+                "comment header and body",
+                pane_entry(json!({"blocks": [
+                    {"kind": "comment", "author": "octocat", "path": "src/x.rs", "line": 9,
+                     "resolved": false, "body": "needs a test"}
+                ]})),
+                vec!["p", "octocat  src/x.rs:9  unresolved", "needs a test"],
+            ),
+            (
+                // A stray `body` stays ignored while `blocks` is present (web parity).
+                "unknown kinds drop and the title heads the entry",
+                pane_entry(json!({
+                    "title": "GitHub",
+                    "body": "ignored",
+                    "blocks": [
+                        {"kind": "some-future-kind", "whatever": true},
+                        {"kind": "heading", "text": "kept"}
+                    ]
+                })),
+                vec!["GitHub", "kept"],
+            ),
+            (
+                "blocks missing required fields drop without panicking",
+                pane_entry(json!({"blocks": [
+                    {"kind": "heading"},
+                    {"kind": "row"},
+                    {"kind": "comment"},
+                    {"kind": "callout"},
+                    {"kind": "bar", "segments": [{"value": 0}, {"tone": "info"}]},
+                    {"kind": "columns", "children": []},
+                    {"kind": "note", "text": "  "}
+                ]})),
+                vec![],
+            ),
+            (
+                // Web parity: a row needs label or value (no icons in a
+                // terminal); a comment needs only author or body.
+                "row needs label or value, comment needs one field",
+                pane_entry(json!({"blocks": [
+                    {"kind": "row", "sublabel": "orphan"},
+                    {"kind": "comment", "body": "no author"}
+                ]})),
+                vec!["p", "  unresolved", "no author"],
+            ),
+            (
+                // Callout actions are inert; columns stack in order.
+                "api 12 block kinds",
+                pane_entry(json!({"blocks": [
+                    {"kind": "callout", "tone": "danger", "icon": "circle-x",
+                     "title": "2 required checks failing", "detail": "Blocked until Clippy passes.",
+                     "actions": [{"kind": "action", "label": "Merge blocked", "method": "gh.merge", "disabled": true}]},
+                    {"kind": "bar", "caption": "18 files", "segments": [
+                        {"value": 750, "tone": "success"}, {"value": 250, "tone": "danger"}
+                    ]},
+                    {"kind": "columns", "children": [
+                        {"kind": "row", "label": "DIFF", "value": "+842 -317"},
+                        {"kind": "row", "prefix": "#3180", "label": "Stale daemon"}
+                    ]}
+                ]})),
+                vec![
+                    "p",
+                    "2 required checks failing",
+                    "Blocked until Clippy passes.",
+                    "[action] Merge blocked",
+                    &bar,
+                    "18 files",
+                    "DIFF +842 -317",
+                    "#3180 Stale daemon",
+                ],
+            ),
+            (
+                // Header summary trails the title; icon-only badges show
+                // nothing; `selected` becomes a leading marker.
+                "api 12 row and section fields",
+                pane_entry(json!({
+                    "blocks": [
+                        {"kind": "section", "title": "checks", "value": "1 of 2 approved", "value_tone": "warn",
+                         "badges": [{"text": "2 failing", "tone": "danger"}, {"icon": "check", "tone": "success"}],
+                         "children": [
+                            {"kind": "row", "prefix": "#3231", "label": "warn when daemon is stale",
+                             "sublabel": "japanese", "selected": true, "method": "gh.select_pr",
+                             "badges": [{"text": "ci", "tone": "danger"}, {"icon": "circle-x", "tone": "danger"}]}
+                         ]}
+                    ],
+                    "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}
+                })),
+                vec![
+                    "p",
+                    "CHECKS  1 of 2 approved  2 failing",
+                    "  ▸ #3231 warn when daemon is stale japanese ci",
+                    "refreshed 12:07 blocked",
+                ],
+            ),
+        ];
+        for (name, entries, want) in cases {
+            let snap = pane_snapshot(entries);
+            assert_eq!(
+                texts(&pane_lines(&snap, "s1", &Theme::default())),
+                want,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1059,64 +1113,75 @@ mod tests {
     }
 
     #[test]
-    fn pane_row_and_section_render_the_api_12_fields() {
-        let snap = pane_snapshot(pane_entry(json!({
-            "blocks": [
-                {"kind": "section", "title": "checks", "value": "1 of 2 approved", "value_tone": "warn",
-                 "badges": [{"text": "2 failing", "tone": "danger"}, {"icon": "check", "tone": "success"}],
-                 "children": [
-                    {"kind": "row", "prefix": "#3231", "label": "warn when daemon is stale",
-                     "sublabel": "japanese", "selected": true, "method": "gh.select_pr",
-                     "badges": [{"text": "ci", "tone": "danger"}, {"icon": "circle-x", "tone": "danger"}]}
-                 ]}
-            ],
-            "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}
-        })));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(
-            texts(&lines),
-            vec![
-                "p",
-                // The header summary trails the title rather than pinning right;
-                // an icon-only badge has no text a terminal can show.
-                "CHECKS  1 of 2 approved  2 failing",
-                // `selected` becomes a leading marker (there is no ring to tint),
-                // and a `method` row is text, not a control.
-                "  ▸ #3231 warn when daemon is stale japanese ci",
-                "refreshed 12:07 blocked",
-            ]
-        );
-    }
-
-    #[test]
-    fn pane_entry_rendering_nothing_contributes_no_heading_or_separator() {
-        // A middle entry whose blocks all drop out must leave no heading and no
-        // blank-line gap: exactly one separator between the two that do render.
+    fn home_pane_renders_a_global_sparkline_entry() {
+        // A global HomePane (no session_id) carrying a sparkline block renders
+        // heading + glyph row + caption through home_pane_lines, covering the
+        // whole payload -> render path for a home-pane plugin.
         let snap = pane_snapshot(json!([
-            {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "one"}},
-            {"plugin_id": "q", "slot": "pane", "id": "b", "session_id": "s1",
-             "payload": {"title": "empty", "blocks": [{"kind": "row"}]}},
-            {"plugin_id": "r", "slot": "pane", "id": "c", "session_id": "s1", "payload": {"title": "two"}}
+            {"plugin_id": "diag", "slot": "home-pane", "id": "mem",
+             "payload": {"title": "memory", "blocks": [
+                 {"kind": "sparkline", "values": [0, 250, 500, 750, 1000], "max": 1000,
+                  "tone": "warn", "caption": "64% 22.7/32G"},
+                 {"kind": "row", "label": "agents", "value": "7"}
+             ]}}
         ]));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["one", "", "two"]);
+        let lines = home_pane_lines(&snap, &Theme::default());
+        let t = texts(&lines);
+        assert_eq!(t[0], "memory", "heading falls back to the pane title");
+        // Five values across 0..max, each frac rounded onto the 8-glyph ramp:
+        // 0, .25*7=1.75->2, .5*7=3.5->4, .75*7=5.25->5, full->7.
+        assert_eq!(t[1], "▁▃▅▆█");
+        assert_eq!(t[2], "64% 22.7/32G");
+        assert!(t.iter().any(|l| l.contains("agents") && l.contains("7")));
     }
 
     #[test]
-    fn pane_row_needs_a_label_or_value_but_a_comment_needs_only_one_field() {
-        // Web parity: `BlockRow` bails on `!label && !value && !iconComp`, and
-        // the TUI renders no icons, so a sublabel-only row is dropped. A
-        // `BlockComment` bails only on `!author && !body`, so a body-only
-        // comment still renders.
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "row", "sublabel": "orphan"},
-            {"kind": "comment", "body": "no author"}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert!(!t.iter().any(|l| l.contains("orphan")), "{t:?}");
-        assert_eq!(t[1], "  unresolved");
-        assert_eq!(t[2], "no author");
+    fn sparkline_block_maps_values_onto_the_glyph_ramp() {
+        let theme = Theme::default();
+        // Empty / missing series renders nothing.
+        assert!(sparkline_lines(&json!({"kind": "sparkline", "values": []}), 0, &theme).is_empty());
+        assert!(sparkline_lines(&json!({"kind": "sparkline"}), 0, &theme).is_empty());
+        // Without an explicit max, the data's own max pins the top glyph
+        // (4/8=.5 -> .5*7=3.5 -> round 4 -> the 5th ramp glyph).
+        let lines = sparkline_lines(
+            &json!({"kind": "sparkline", "values": [0.0, 4.0, 8.0]}),
+            0,
+            &theme,
+        );
+        assert_eq!(texts(&lines), vec!["▁▅█"]);
+        // Values above max clamp to full rather than overflowing the ramp
+        // (50/100=.5 -> 4th index; 200 clamps to full).
+        let capped = sparkline_lines(
+            &json!({"kind": "sparkline", "values": [50, 200], "max": 100}),
+            0,
+            &theme,
+        );
+        assert_eq!(texts(&capped), vec!["▅█"]);
+    }
+
+    #[test]
+    fn sparkline_bands_color_each_glyph_by_the_threshold_it_reaches() {
+        let theme = Theme::default();
+        // Values climb across two thresholds; each glyph takes the highest band
+        // it reaches (10 -> none/base, 70 -> warn, 95 -> danger).
+        let lines = sparkline_lines(
+            &json!({"kind": "sparkline", "values": [10, 70, 95], "max": 100,
+                    "bands": [{"at": 70, "tone": "warn"}, {"at": 90, "tone": "danger"}]}),
+            0,
+            &theme,
+        );
+        let spans = &lines[0].spans;
+        assert_eq!(spans.len(), 3, "one span per sample for per-glyph coloring");
+        assert_eq!(
+            spans[0].style.fg,
+            tone_style(None, &theme).fg,
+            "below all bands: base tone"
+        );
+        assert_eq!(spans[1].style.fg, tone_style(Some(Tone::Warn), &theme).fg);
+        assert_eq!(spans[2].style.fg, tone_style(Some(Tone::Danger), &theme).fg);
+        // Bands are optional; malformed/missing falls back to the single tone.
+        assert!(parse_bands(&json!({"kind": "sparkline", "values": [1]})).is_empty());
+        assert!(band_tone(&[], 5.0).is_none());
     }
 
     #[test]

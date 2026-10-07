@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for Tooltip (#2214): the popup must portal out to document.body so
-// it escapes the sidebar scroller's `overflow-x-hidden` clip, rather than
-// rendering as a nested span that gets cut off at the sidebar edge. jsdom
-// cannot measure layout, so this asserts the structural fix (portaled, fixed,
-// role=tooltip, shown/hidden on hover and focus) rather than geometry.
 
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -14,15 +8,6 @@ import { Tooltip } from "../Tooltip";
 afterEach(cleanup);
 
 describe("Tooltip", () => {
-  it("renders no tooltip until hovered", () => {
-    render(
-      <Tooltip text="New session">
-        <button type="button">+</button>
-      </Tooltip>,
-    );
-    expect(screen.queryByRole("tooltip")).toBeNull();
-  });
-
   it("portals the popup to document.body on hover and removes it on leave", () => {
     const { container } = render(
       <Tooltip text="New session">
@@ -30,6 +15,7 @@ describe("Tooltip", () => {
       </Tooltip>,
     );
     const trigger = screen.getByRole("button").parentElement!;
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     fireEvent.mouseEnter(trigger);
 
@@ -58,5 +44,39 @@ describe("Tooltip", () => {
 
     fireEvent.blur(button);
     expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  it("stays closed through the emulated hover and focus of a tap, and opens again for a mouse", () => {
+    render(
+      <Tooltip text="New session">
+        <button type="button">+</button>
+      </Tooltip>,
+    );
+    const button = screen.getByRole("button");
+    const trigger = button.parentElement!;
+
+    fireEvent.pointerDown(button, { pointerType: "touch" });
+    fireEvent.mouseEnter(trigger);
+    fireEvent.focus(button);
+    // Present at all, visible or not: a re-shown tooltip is hidden until it re-measures.
+    expect(document.querySelector("[role=tooltip]")).toBeNull();
+
+    fireEvent.blur(button);
+    fireEvent.pointerEnter(trigger, { pointerType: "mouse" });
+    fireEvent.mouseEnter(trigger);
+    expect(document.querySelector("[role=tooltip]")).not.toBeNull();
+  });
+
+  it("closes a tooltip a touch entry event opened before the tap's pointerdown", () => {
+    render(
+      <Tooltip text="New session">
+        <button type="button">+</button>
+      </Tooltip>,
+    );
+    const button = screen.getByRole("button");
+    fireEvent.mouseEnter(button.parentElement!);
+    expect(document.querySelector("[role=tooltip]")).not.toBeNull();
+    fireEvent.pointerDown(button, { pointerType: "touch" });
+    expect(document.querySelector("[role=tooltip]")).toBeNull();
   });
 });

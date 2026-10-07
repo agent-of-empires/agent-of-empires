@@ -1,7 +1,5 @@
-// Shared connection-state banners for every terminal surface (live
-// views and desktop xterm views render identical chrome here): the
-// retry countdown while the WS redials, and the manual-retry strip once
-// the budget is exhausted.
+// Shared connection-state banners for every terminal surface (live views and desktop xterm views render identical
+// chrome here): the retry countdown while the WS redials, and the manual-retry strip once the budget is exhausted.
 
 interface Props {
   connected: boolean;

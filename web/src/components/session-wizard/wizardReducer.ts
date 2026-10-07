@@ -1,14 +1,5 @@
-// Reducer + state shape for `SessionWizard`. Lives in its own file so
-// the wizard component file stays a pure component module (the
-// `react-refresh/only-export-components` rule fires when a file mixes
-// components with other exports). The mount-time profile-defaults
-// seeder added in #1142 dispatches APPLY_PROFILE_DEFAULTS the same way
-// the picker-driven path in `AgentStep.handleProfileChange` does, so
-// keeping the reducer in this file lets us unit-test the merge rules
-// without mounting React.
-
 import type { AgentInfo, GroupInfo, ProfileInfo } from "../../lib/types";
-import { applyBranchOverride, slugifyBranch } from "./sessionNames";
+import { slugifyBranch } from "./sessionNames";
 
 export interface WizardData {
   path: string;
@@ -16,13 +7,16 @@ export interface WizardData {
   worktreeBranch: string;
   worktreeBranchDirty: boolean;
   useWorktree: boolean;
-  /** When true, attach to an existing branch's worktree (`create_new_branch: false`
-   *  on the API). Mirrors the TUI new-session "Attach to existing branch"
-   *  toggle (`src/tui/dialogs/new_session/render.rs:851`). See #969. */
+  /** Profile-resolved worktree default, independent of any project override. */
+  profileWorktreeDefault: boolean;
+  /** The selected saved project's worktree override; outranks `profileWorktreeDefault`. */
+  projectWorktreeOverride: boolean | undefined;
+  /** Set only by a direct `useWorktree` edit, so an unrelated profile-field edit does not block
+   *  a project override seed. */
+  worktreeDirty: boolean;
+  /** Attach to an existing branch's worktree (`create_new_branch: false`). */
   attachExisting: boolean;
-  /** Optional base branch for the new worktree branch. Empty string =
-   *  use the project's default branch. Lives under "Advanced" in the
-   *  session step. See #948. */
+  /** Empty means the project's default branch. */
   baseBranch: string;
   group: string;
   tool: string;
@@ -31,44 +25,26 @@ export interface WizardData {
   sandboxEnabled: boolean;
   sandboxImage: string;
   extraEnv: string[];
-  /** Additional repo paths to include in the multi-repo workspace.
-   *  Free-text paths and registered project paths flow into the same list. */
   extraRepoPaths: string[];
-  advancedEnabled: boolean;
+  /** Per extra repo base branch, keyed by path; outranks `baseBranch`. */
+  repoBases: Record<string, string>;
   customInstruction: string;
   extraArgs: string;
   commandOverride: string;
-  /** Tracks whether the user has manually edited fields after a profile selection */
+  /** Set when the user edits an agent-step field after defaults were applied. */
   profileDirty: boolean;
-  /** Scratch-session mode. When true, the wizard skips the project-path
-   *  picker, hides the worktree controls, and submits `path: ""` so the
-   *  server provisions a fresh directory under `<app_dir>/scratch/<id>/`.
-   *  The reducer enforces mutual exclusion bidirectionally: enabling
-   *  `scratch` clears `path`/`useWorktree`/`extraRepoPaths`; setting any
-   *  of those back to a non-empty value clears `scratch`. */
+  /** Mutually exclusive with `path`, `extraRepoPaths` and `useWorktree` (enforced in SET_FIELD). */
   scratch: boolean;
-  /** Whether the selected `path` is a git repository. Worktrees require a
-   *  repo, so the worktree toggle is disabled when this is false. Defaults
-   *  true (optimistic) and is corrected by a probe in `SessionWizard` when
-   *  `path` changes; a non-repo path forces `useWorktree` off, mirroring the
-   *  scratch arm. Not part of the submit payload. */
+  /** Optimistically true until the wizard's probe says otherwise; false forces `useWorktree` off. */
   pathIsGitRepo: boolean;
-  /** Per-session opt-in to structured view rendering for ACP-capable tools.
-   *  Defaults true so ACP-capable tools render in the structured view by
-   *  default ("ACP tools run in structured view" behavior); the user
-   *  can turn it off in AgentStep to launch a tmux/terminal session. The
-   *  submit path sends `view: "structured"` only when the tool is
-   *  ACP-capable and this flag is set; the server re-validates
-   *  capability (src/server/api/sessions.rs). Intentionally not
-   *  tracked in `profileDirty` (see SET_FIELD) and not persisted: a
-   *  remembered opt-out would silently override the per-session default. */
+  /** Per-session structured view choice, seeded from `acp.default_new_session_view`; deliberately
+   *  not persisted or tracked in `profileDirty`. */
   useStructuredView: boolean;
+  /** Set by a direct `useStructuredView` edit so mount-time seeding keeps it. */
+  structuredViewDirty: boolean;
   agentModel: string;
   agentEffort: string;
-  /** When non-empty, this create is importing an existing Claude Code
-   *  session: the on-disk session id to resume via `session/load`. Set by
-   *  the ProjectStep import tab, which also forces `tool: "claude"`,
-   *  structured view on, and worktree off. See #2276. */
+  /** Existing Claude session id to import and resume. */
   importAcpSessionId: string;
   [key: string]: unknown;
 }
@@ -102,24 +78,25 @@ export type Action =
       extraEnv: string[];
       agentModel?: string;
       agentEffort?: string;
-      /** When true, skip the apply if the user has already edited an
-       *  agent-step field. The picker-driven path always sets this false
-       *  (the user has already confirmed the overwrite); the mount-time
-       *  seeder (#1142) sets it true so a slow /api/settings response
-       *  doesn't clobber edits the user already made. */
+      useStructuredView?: boolean;
+      /** Set by the profile picker, whose overwrite the user has confirmed. */
+      resetStructuredViewDirty?: boolean;
+      /** Mount-time seeding sets this so a late settings response cannot clobber user edits. */
       skipIfDirty?: boolean;
-    };
+    }
+  /** `path`, when set, drops the seed if the selected path has since changed. */
+  | { type: "SEED_PROJECT_WORKTREE_OVERRIDE"; override: boolean | undefined; path?: string };
 
 export const initialData: WizardData = {
   path: "",
   title: "",
   worktreeBranch: "",
   worktreeBranchDirty: false,
-  // Default off to match the backend `worktree.enabled` default
-  // (WorktreeConfig::default). SessionWizard seeds the real value from
-  // /api/settings on mount via APPLY_PROFILE_DEFAULTS; this fallback also
-  // covers the case where that fetch fails. See #2423.
+  // Matches the backend `worktree.enabled` default; seeded from settings on mount.
   useWorktree: false,
+  profileWorktreeDefault: false,
+  projectWorktreeOverride: undefined,
+  worktreeDirty: false,
   attachExisting: false,
   baseBranch: "",
   group: "",
@@ -130,7 +107,7 @@ export const initialData: WizardData = {
   sandboxImage: "",
   extraEnv: [],
   extraRepoPaths: [],
-  advancedEnabled: false,
+  repoBases: {},
   profileDirty: false,
   customInstruction: "",
   extraArgs: "",
@@ -138,78 +115,78 @@ export const initialData: WizardData = {
   scratch: false,
   pathIsGitRepo: true,
   useStructuredView: true,
+  structuredViewDirty: false,
   agentModel: "",
   agentEffort: "",
   importAcpSessionId: "",
 };
 
+// Tracked even without a profile so mount-time seeding does not stomp early edits.
+const PROFILE_FIELDS = ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "agentModel", "agentEffort"];
+
+function setField(data: WizardData, field: string, value: unknown): WizardData {
+  const next = { ...data, [field]: value };
+  if (field === "title" && !data.worktreeBranchDirty) {
+    next.worktreeBranch = slugifyBranch(String(value));
+  }
+  // Any branch edit, even clearing it, stops the title mirror.
+  if (field === "worktreeBranch") next.worktreeBranchDirty = true;
+  if (field === "scratch" && value === true) {
+    Object.assign(next, {
+      path: "",
+      extraRepoPaths: [],
+      repoBases: {},
+      useWorktree: false,
+      pathIsGitRepo: true,
+      importAcpSessionId: "",
+    });
+  }
+  if (
+    (field === "path" && typeof value === "string" && value.length > 0) ||
+    (field === "extraRepoPaths" && Array.isArray(value) && value.length > 0)
+  ) {
+    next.scratch = false;
+    // The import picker dispatches `importAcpSessionId` after `path`, so its own pick survives.
+    next.importAcpSessionId = "";
+  }
+  if (field === "path") next.pathIsGitRepo = true;
+  if (field === "pathIsGitRepo" && value === false) next.useWorktree = false;
+  if (PROFILE_FIELDS.includes(field)) next.profileDirty = true;
+  if (field === "useWorktree") next.worktreeDirty = true;
+  if (field === "useStructuredView") next.structuredViewDirty = true;
+  return next;
+}
+
+/** An import (structured on disk) and a hand-set view outrank the seeded view, except that a
+ *  confirmed profile change resets the latter. */
+function seededStructuredView(
+  data: WizardData,
+  action: { useStructuredView?: boolean; resetStructuredViewDirty?: boolean },
+): boolean {
+  if (data.importAcpSessionId) return data.useStructuredView;
+  if (data.structuredViewDirty && !action.resetStructuredViewDirty) return data.useStructuredView;
+  return action.useStructuredView ?? data.useStructuredView;
+}
+
 export function reducer(state: WizardState, action: Action): WizardState {
   switch (action.type) {
-    case "SET_FIELD": {
-      const newData = { ...state.data, [action.field]: action.value };
-      if (action.field === "title" && !state.data.worktreeBranchDirty) {
-        newData.worktreeBranch = slugifyBranch(String(action.value));
+    case "SET_FIELD":
+      return { ...state, data: setField(state.data, action.field, action.value), error: null };
+    case "SEED_PROJECT_WORKTREE_OVERRIDE": {
+      // A manual worktree toggle wins; still record the override for a later profile reset.
+      if (action.path !== undefined && action.path !== state.data.path) return state;
+      const projectWorktreeOverride = action.override;
+      if (state.data.worktreeDirty) {
+        return { ...state, data: { ...state.data, projectWorktreeOverride } };
       }
-      if (action.field === "worktreeBranch") {
-        const override = applyBranchOverride(String(newData.title), String(action.value));
-        newData.worktreeBranch = override.worktreeBranch;
-        newData.worktreeBranchDirty = override.worktreeBranchDirty;
-      }
-      // Scratch mutual exclusion. Enabling scratch clears the path-source
-      // fields so a stale "Recent" selection cannot leak into the submit
-      // payload; conversely, setting a real path or extra repos turns
-      // scratch off so the wizard can never claim both.
-      if (action.field === "scratch" && action.value === true) {
-        newData.path = "";
-        newData.extraRepoPaths = [];
-        newData.useWorktree = false;
-        // Clear a stale non-repo probe result too, so toggling scratch back
-        // off doesn't show "not a git repository" for a not-yet-chosen path.
-        // Keeps the "no path selected == optimistically a repo" invariant.
-        newData.pathIsGitRepo = true;
-        // Leaving the import flow for scratch: drop the import id so it
-        // can't ride along on the submit. See #2276.
-        newData.importAcpSessionId = "";
-      }
-      if (
-        (action.field === "path" && typeof action.value === "string" && action.value.length > 0) ||
-        (action.field === "extraRepoPaths" && Array.isArray(action.value) && action.value.length > 0)
-      ) {
-        newData.scratch = false;
-        // A path chosen from Browse / Recent / Clone is not an import; clear
-        // the stale import id so it isn't submitted with the wrong path
-        // (#2276). The import picker dispatches `importAcpSessionId` AFTER
-        // `path`, so its own selection survives this.
-        newData.importAcpSessionId = "";
-      }
-      // A new path is optimistically a repo until the SessionWizard probe
-      // says otherwise, so a stale non-repo result can't leave the worktree
-      // toggle disabled after switching to a real repo.
-      if (action.field === "path") {
-        newData.pathIsGitRepo = true;
-      }
-      // The probe reports a non-repo path: worktrees need a repo, so force
-      // the toggle off the same way the scratch arm does above.
-      if (action.field === "pathIsGitRepo" && action.value === false) {
-        newData.useWorktree = false;
-      }
-      // Mark dirty whenever the user manually edits an agent-step
-      // field. Guarded against `state.data.profile` previously, but the
-      // mount-time seeder (#1142) also needs the flag with no profile
-      // set: a user who toggles yoloMode before the late /api/settings
-      // response resolves would otherwise have their edit stomped, since
-      // APPLY_PROFILE_DEFAULTS dispatches with skipIfDirty: true and the
-      // no-profile guard would leave profileDirty false. The picker
-      // path's window.confirm() also benefits: picking a profile after
-      // unprofiled edits now prompts before overwriting.
-      if (
-        ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "agentModel", "agentEffort"].includes(
-          action.field,
-        )
-      ) {
-        newData.profileDirty = true;
-      }
-      return { ...state, data: newData, error: null };
+      const useWorktree =
+        state.data.scratch || state.data.pathIsGitRepo === false
+          ? false
+          : (projectWorktreeOverride ?? state.data.profileWorktreeDefault);
+      return {
+        ...state,
+        data: { ...state.data, projectWorktreeOverride, useWorktree },
+      };
     }
     case "SUBMIT_START":
       return { ...state, isSubmitting: true, error: null };
@@ -218,8 +195,6 @@ export function reducer(state: WizardState, action: Action): WizardState {
     case "SUBMIT_SUCCESS":
       return { ...state, isSubmitting: false };
     case "SUBMIT_CANCEL":
-      // User backed out of a pre-create confirmation (e.g. the glob
-      // volume_ignores modal); re-enable the submit button without an error.
       return { ...state, isSubmitting: false, error: null };
     case "SET_AGENTS":
       return { ...state, agents: action.agents };
@@ -229,28 +204,46 @@ export function reducer(state: WizardState, action: Action): WizardState {
       return { ...state, profiles: action.profiles };
     case "SET_DOCKER":
       return { ...state, dockerAvailable: action.available };
-    case "APPLY_PROFILE_DEFAULTS":
-      // The mount-time seeder (#1142) sets `skipIfDirty` so a slow
-      // /api/settings response doesn't clobber edits the user already
-      // made. The picker-driven path leaves it false; it has already
-      // shown a window.confirm() to the user before dispatching.
-      if (action.skipIfDirty && state.data.profileDirty) return state;
+    case "APPLY_PROFILE_DEFAULTS": {
+      // A remembered or prefilled path can resolve its repo probe before this arrives, so the
+      // seeded default must not flip a worktree back on for a scratch session or a non-repo path.
+      const resolvedUseWorktree = () =>
+        state.data.scratch || state.data.pathIsGitRepo === false
+          ? false
+          : (state.data.projectWorktreeOverride ?? action.worktreeEnabled);
+      const useStructuredView = seededStructuredView(state.data, action);
+      if (action.skipIfDirty && state.data.profileDirty) {
+        // Still record the real default, or a later project with no override falls back to `false`.
+        // The view is not a profile-tracked field, so it seeds past other edits.
+        return {
+          ...state,
+          data: {
+            ...state.data,
+            useStructuredView,
+            profileWorktreeDefault: action.worktreeEnabled,
+            useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
+          },
+        };
+      }
       return {
         ...state,
         data: {
           ...state.data,
           yoloMode: action.yoloMode,
           sandboxEnabled: action.sandboxEnabled,
-          // Scratch sessions never use a worktree; don't let the seeded
-          // default flip it back on. Mirrors the SET_FIELD scratch arm.
-          useWorktree: state.data.scratch ? false : action.worktreeEnabled,
+          useWorktree: resolvedUseWorktree(),
+          profileWorktreeDefault: action.worktreeEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
+          useStructuredView,
+          structuredViewDirty: action.resetStructuredViewDirty ? false : state.data.structuredViewDirty,
           profileDirty: false,
+          worktreeDirty: false,
         },
       };
+    }
     default:
       return state;
   }

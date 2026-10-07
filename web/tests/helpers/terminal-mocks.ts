@@ -1,16 +1,13 @@
-import type { Page } from "@playwright/test";
-
-// Shared mocks so a running `aoe serve` + tmux aren't required. We stub the
-// REST API and route the PTY WebSocket so the xterm.js terminal mounts and the
-// gesture handlers in useTerminal.ts are exercised against the real frontend.
+import { expect, type Page } from "@playwright/test";
+import { sessionResponse } from "./sessions";
 
 export interface MockHandle {
-  /** Raw bytes received from the page via WebSocket (PTY data + JSON messages). */
   wsMessages: Buffer[];
-  /** Messages the page sent on the capture-snapshot live-ws route
-   *  (mobile live view): binary input bytes + JSON control messages. */
+  /** Everything sent on the live-ws route, input bytes and JSON control. */
   liveMessages: Buffer[];
-  /** Push a live frame to every connected live-ws client. */
+  liveInput: Buffer[];
+  waitForLiveReady: () => Promise<void>;
+  /** Switch to explicit frames and await the real reducer's debug frame counter. */
   pushLiveFrame: (frame: {
     content: string;
     rows: number;
@@ -19,13 +16,11 @@ export interface MockHandle {
     altScreen?: boolean;
     mouse?: boolean;
     mouseSgr?: boolean;
-  }) => void;
-  /** Push an OSC 52 clipboard event to every connected live-ws client. */
+  }) => Promise<void>;
   pushLiveClipboard: (text: string) => void;
 }
 
-/** Build a deterministic live frame: `history` numbered scrollback lines
- *  followed by a `rows`-tall screen with a prompt on its first line. */
+/** `history` numbered scrollback lines, then a `rows`-tall screen with a prompt on its first line. */
 export function makeLiveFrame(opts: { rows?: number; history?: number; window?: number } = {}) {
   const rows = opts.rows ?? 24;
   const history = opts.history ?? 0;
@@ -47,21 +42,54 @@ export function makeLiveFrame(opts: { rows?: number; history?: number; window?: 
 
 export async function mockTerminalApis(
   page: Page,
-  opts: { liveHistory?: number; delayLiveWindowShrinkMs?: number } = {},
+  opts: {
+    liveHistory?: number;
+    delayLiveWindowShrinkMs?: number;
+    tool?: string;
+    extraSessions?: Array<{ id: string; title: string }>;
+    /** Extra SessionResponse fields merged over the primary session's defaults. */
+    sessionFields?: Record<string, unknown>;
+    pendingPaste?: boolean;
+    onLiveMessage?: (url: string, message: Buffer) => void;
+  } = {},
 ): Promise<MockHandle> {
-  const liveSockets: Array<{ send: (data: string) => void }> = [];
+  await page.addInitScript(() => {
+    const url = new URL(location.href);
+    url.searchParams.set("livedebug", "1");
+    history.replaceState(null, "", url);
+  });
+  const liveSockets: Array<{ send: (data: string) => void; frames: number }> = [];
+  let customFrames = false;
+  const consumedFrames = () =>
+    page
+      .locator("[data-live-debug]")
+      .first()
+      .textContent()
+      .then((text) => Number(text?.match(/ frames=(\d+)/)?.[1] ?? 0));
   const handle: MockHandle = {
     wsMessages: [],
     liveMessages: [],
-    pushLiveFrame: (frame) => {
+    liveInput: [],
+    waitForLiveReady: async () => {
+      await page.evaluate(() => document.fonts.ready.then(() => undefined));
+      await expect(page.locator("[data-live-content]").first()).toContainText("$ ready");
+      await expect.poll(() => handle.liveMessages.some((m) => m.toString().includes('"type":"resize"'))).toBe(true);
+      await expect.poll(async () => (await consumedFrames()) >= (liveSockets.at(-1)?.frames ?? Infinity)).toBe(true);
+    },
+    pushLiveFrame: async (frame) => {
+      customFrames = true;
       const payload = JSON.stringify({ type: "frame", cursor: null, ...frame });
       for (const ws of liveSockets) {
         try {
           ws.send(payload);
+          ws.frames++;
         } catch {
           // closed socket at test teardown; ignore
         }
       }
+      const expected = liveSockets.at(-1)?.frames;
+      expect(expected, "a live socket must be connected before publishing").toBeDefined();
+      await expect.poll(consumedFrames).toBe(expected);
     },
     pushLiveClipboard: (text) => {
       const payload = JSON.stringify({ type: "clipboard", text });
@@ -80,32 +108,33 @@ export async function mockTerminalApis(
     return r.fulfill({
       json: {
         sessions: [
-          {
+          sessionResponse({
             id: "pinch-test",
-            title: "pinch-test",
-            project_path: "/tmp/pinch-test",
             group_path: "/tmp",
-            tool: "claude",
+            tool: opts.tool ?? "claude",
             status: "Running",
-            yolo_mode: false,
-            created_at: new Date().toISOString(),
-            last_accessed_at: null,
-            last_error: null,
-            branch: null,
-            main_repo_path: null,
-            is_sandboxed: false,
-            has_terminal: true,
-            profile: "default",
-            workspace_repos: [],
-          },
+            ...opts.sessionFields,
+          }),
+          ...(opts.extraSessions ?? []).map((session) =>
+            sessionResponse({ ...session, group_path: "/tmp", tool: opts.tool ?? "claude", status: "Running" }),
+          ),
         ],
         workspace_ordering: [],
       },
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
-  // Matches the bare path plus the `?index=N` query (#2437) for POST ensure and
-  // DELETE kill, and the container-terminal variant.
+  if (opts.pendingPaste) {
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.exposeFunction("releasePasteImage", () => release?.());
+    await page.route("**/api/sessions/*/paste-image", async (r) => {
+      await gate;
+      await r.fulfill({ json: { path: "/tmp/paste/shot.png" } });
+    });
+  }
   await page.route("**/api/sessions/*/terminal*", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/container-terminal*", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/diff/files", (r) =>
@@ -127,34 +156,40 @@ export async function mockTerminalApis(
       }
     }, 50);
   });
-  // Capture-snapshot live view (mobile). Replies to resize/window control
-  // messages with a frame sized accordingly so the component always has
-  // content to render, mirroring src/server/live_ws.rs.
+  // Replies to resize and window messages with a sized frame, like src/server/live_ws.rs.
   await page.routeWebSocket(/\/sessions\/.*\/live-ws(\?.*)?$/, (ws) => {
-    liveSockets.push(ws);
+    const socket = { send: (data: string) => ws.send(data), frames: 0 };
+    liveSockets.push(socket);
     let rows = 24;
     let window = 24;
     const history = opts.liveHistory ?? 120;
     const reply = (responseRows = rows, responseWindow = window) => {
+      if (customFrames) return;
       try {
         ws.send(
           JSON.stringify({ type: "frame", ...makeLiveFrame({ rows: responseRows, history, window: responseWindow }) }),
         );
+        socket.frames++;
       } catch {
         // closed socket at test teardown; ignore
       }
     };
     ws.onMessage((msg) => {
+      const message = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+      handle.liveMessages.push(message);
+      opts.onLiveMessage?.(ws.url(), message);
       if (Buffer.isBuffer(msg)) {
-        handle.liveMessages.push(msg);
+        handle.liveInput.push(msg);
         return;
       }
-      handle.liveMessages.push(Buffer.from(msg));
       try {
         const control = JSON.parse(String(msg)) as { type?: string; rows?: number; lines?: number };
-        if (control.type === "resize" && control.rows) {
+        if (control.type === "claim_if_vacant") {
+          ws.send(JSON.stringify({ type: "size_owner", is_owner: true }));
+        } else if (control.type === "resize" && control.rows) {
           rows = control.rows;
           window = Math.max(window, rows);
+          ws.send(JSON.stringify({ type: "size_owner", is_owner: true }));
           reply();
         } else if (control.type === "window" && control.lines) {
           const shrinking = control.lines < window;
@@ -171,21 +206,17 @@ export async function mockTerminalApis(
         // non-JSON text; ignore
       }
     });
-    setTimeout(reply, 50);
+    reply();
   });
   return handle;
 }
 
-// Install a WebSocket constructor spy and a localStorage.setItem spy on
-// window. Both run before any frontend script, so the React app sees the
-// patched globals. The counts let tests prove that a setting change does
-// NOT reopen the PTY, and that a gesture that should be a no-op did not
-// write to localStorage.
+// Spy on WebSocket construction and localStorage writes before app scripts run, so tests can prove a change did
+// not reopen the PTY or write storage.
 export async function installTerminalSpies(page: Page) {
   await page.addInitScript(() => {
     const Orig = window.WebSocket;
     (window as unknown as { __WS_COUNT__: number }).__WS_COUNT__ = 0;
-    // Preserve name + prototype by extending
     window.WebSocket = class extends Orig {
       constructor(url: string | URL, protocols?: string | string[]) {
         super(url, protocols);
@@ -213,7 +244,14 @@ export function readFontSize(page: Page, which: "mobile" | "desktop") {
 
 export async function seedSettings(
   page: Page,
-  settings: { mobileFontSize?: number; desktopFontSize?: number; autoOpenKeyboard?: boolean },
+  settings: {
+    mobileFontSize?: number;
+    desktopFontSize?: number;
+    autoOpenKeyboard?: boolean;
+    persistentTerminals?: boolean;
+    mobileToolbarKeys?: string[];
+    showArrowJoystick?: boolean;
+  },
 ) {
   await page.evaluate((settings) => {
     localStorage.setItem(
@@ -228,9 +266,7 @@ export async function seedSettings(
   }, settings);
 }
 
-// Synthesize a multi-touch TouchEvent on the .xterm element.
-// Playwright's page.touchscreen is single-finger only; building raw Touch
-// objects is the only cross-browser way to dispatch two-finger gestures.
+// page.touchscreen is single-finger, so build raw Touch objects for two-finger gestures.
 export async function fireTouches(
   page: Page,
   type: "touchstart" | "touchmove" | "touchend" | "touchcancel",

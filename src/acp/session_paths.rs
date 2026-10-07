@@ -1,24 +1,21 @@
 //! Display helpers for session-scoped file paths.
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SessionPathRoots {
     pub id: String,
     pub project_path: String,
     pub main_repo_path: Option<String>,
-    #[serde(default)]
     pub workspace_repos: Vec<WorkspaceRepoRoot>,
 }
 
-/// Session metadata the native structured view needs alongside its path roots.
-/// All fields come from the existing `/api/sessions` payload, so one fetch can
-/// hydrate both the friendly header and repo-relative tool paths.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// Session metadata the native structured view needs alongside its path roots,
+/// projected from one `/api/sessions` row so a single fetch hydrates both the
+/// friendly header and repo-relative tool paths.
+#[derive(Debug, Clone)]
 pub struct SessionViewInfo {
     pub title: String,
     pub tool: String,
-    #[serde(default)]
     pub acp_agent: Option<String>,
-    #[serde(flatten)]
     pub paths: SessionPathRoots,
 }
 
@@ -28,7 +25,30 @@ impl SessionViewInfo {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+impl From<crate::daemon::SessionResponse> for SessionViewInfo {
+    fn from(session: crate::daemon::SessionResponse) -> Self {
+        Self {
+            title: session.title,
+            tool: session.tool,
+            acp_agent: session.acp_agent,
+            paths: SessionPathRoots {
+                id: session.id,
+                project_path: session.project_path,
+                main_repo_path: session.main_repo_path,
+                workspace_repos: session
+                    .workspace_repos
+                    .into_iter()
+                    .map(|repo| WorkspaceRepoRoot {
+                        name: repo.name,
+                        source_path: repo.source_path,
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkspaceRepoRoot {
     pub name: String,
     pub source_path: String,
@@ -40,9 +60,7 @@ struct ResolvedPath {
 }
 
 /// Display form of a tool-call path, matching the web structured view's
-/// `relativeDisplayPath` helper. Paths under a workspace repo are prefixed
-/// with the repo name, paths under the session worktree or main repo are shown
-/// bare relative, and paths outside every known root stay unchanged.
+/// `relativeDisplayPath` helper.
 pub fn relative_display_path(raw: &str, roots: Option<&SessionPathRoots>) -> String {
     let Some(roots) = roots else {
         return raw.to_string();
@@ -134,95 +152,64 @@ fn is_windows_absolute(path: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn roots() -> SessionPathRoots {
+    fn roots(project: &str, main_repo: Option<&str>, repos: &[(&str, &str)]) -> SessionPathRoots {
         SessionPathRoots {
             id: "s-1".into(),
-            project_path: "/Users/me/.aoe/worktrees/feat".into(),
-            main_repo_path: Some("/Users/me/repo".into()),
-            workspace_repos: Vec::new(),
+            project_path: project.into(),
+            main_repo_path: main_repo.map(Into::into),
+            workspace_repos: repos
+                .iter()
+                .map(|(name, source_path)| WorkspaceRepoRoot {
+                    name: (*name).into(),
+                    source_path: (*source_path).into(),
+                })
+                .collect(),
         }
     }
 
     #[test]
-    fn strips_worktree_root_to_relative_path() {
-        assert_eq!(
-            relative_display_path(
+    fn relative_display_path_strips_the_longest_known_root() {
+        let worktree = roots("/Users/me/.aoe/worktrees/feat", Some("/Users/me/repo"), &[]);
+        // (roots, raw path, displayed path)
+        let cases = [
+            (
+                &worktree,
                 "/Users/me/.aoe/worktrees/feat/src/hooks/mod.rs",
-                Some(&roots())
+                "src/hooks/mod.rs",
             ),
-            "src/hooks/mod.rs"
-        );
-    }
+            (&worktree, "/Users/me/repo/src/app.ts", "src/app.ts"),
+            // A sibling sharing the root's prefix is not under it.
+            (
+                &worktree,
+                "/Users/me/repo_old/src/app.ts",
+                "/Users/me/repo_old/src/app.ts",
+            ),
+            (&worktree, "src/app.ts", "src/app.ts"),
+            (&worktree, "./src/app.ts", "src/app.ts"),
+            (&worktree, "/etc/hosts", "/etc/hosts"),
+        ];
+        for (roots, raw, want) in cases {
+            assert_eq!(relative_display_path(raw, Some(roots)), want, "{raw}");
+        }
 
-    #[test]
-    fn falls_back_to_main_repo_root() {
+        let windows = roots("C:\\Users\\me\\repo", None, &[]);
         assert_eq!(
-            relative_display_path("/Users/me/repo/src/app.ts", Some(&roots())),
-            "src/app.ts"
+            relative_display_path("c:\\Users\\me\\repo\\src\\app.ts", Some(&windows)),
+            "src/app.ts",
+            "drive letters match case-insensitively"
         );
-    }
 
-    #[test]
-    fn does_not_match_sibling_with_shared_prefix() {
-        assert_eq!(
-            relative_display_path("/Users/me/repo_old/src/app.ts", Some(&roots())),
-            "/Users/me/repo_old/src/app.ts"
+        let workspace = roots(
+            "/Users/me/.aoe/worktrees/ws",
+            None,
+            &[("api", "/Users/me/api")],
         );
-    }
+        assert_eq!(
+            relative_display_path("/Users/me/api/src/h.ts", Some(&workspace)),
+            "api/src/h.ts",
+            "a workspace repo keeps its name as the prefix"
+        );
 
-    #[test]
-    fn treats_relative_path_as_already_relative() {
-        assert_eq!(
-            relative_display_path("src/app.ts", Some(&roots())),
-            "src/app.ts"
-        );
-        assert_eq!(
-            relative_display_path("./src/app.ts", Some(&roots())),
-            "src/app.ts"
-        );
-    }
-
-    #[test]
-    fn matches_windows_drive_root_case_insensitively() {
-        let roots = SessionPathRoots {
-            id: "s-1".into(),
-            project_path: "C:\\Users\\me\\repo".into(),
-            main_repo_path: None,
-            workspace_repos: Vec::new(),
-        };
-        assert_eq!(
-            relative_display_path("c:\\Users\\me\\repo\\src\\app.ts", Some(&roots)),
-            "src/app.ts"
-        );
-    }
-
-    #[test]
-    fn prefixes_workspace_repo_name() {
-        let roots = SessionPathRoots {
-            id: "s-1".into(),
-            project_path: "/Users/me/.aoe/worktrees/ws".into(),
-            main_repo_path: None,
-            workspace_repos: vec![WorkspaceRepoRoot {
-                name: "api".into(),
-                source_path: "/Users/me/api".into(),
-            }],
-        };
-        assert_eq!(
-            relative_display_path("/Users/me/api/src/h.ts", Some(&roots)),
-            "api/src/h.ts"
-        );
-    }
-
-    #[test]
-    fn returns_raw_path_outside_known_roots() {
-        assert_eq!(
-            relative_display_path("/etc/hosts", Some(&roots())),
-            "/etc/hosts"
-        );
-    }
-
-    #[test]
-    fn returns_raw_path_without_roots() {
         assert_eq!(relative_display_path("/tmp/a.rs", None), "/tmp/a.rs");
     }
 }

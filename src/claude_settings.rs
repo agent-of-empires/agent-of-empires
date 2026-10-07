@@ -42,44 +42,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_returns_false() {
+    fn read_tui_fullscreen_only_for_a_fullscreen_string() {
         let path = std::path::Path::new("/nonexistent/aoe-test/settings.json");
         assert!(!read_tui_fullscreen_at(path));
-    }
-
-    #[test]
-    fn fullscreen_returns_true() {
-        let f = write_settings(r#"{"tui": "fullscreen"}"#);
-        assert!(read_tui_fullscreen_at(f.path()));
-    }
-
-    #[test]
-    fn default_returns_false() {
-        let f = write_settings(r#"{"tui": "default"}"#);
-        assert!(!read_tui_fullscreen_at(f.path()));
-    }
-
-    #[test]
-    fn missing_key_returns_false() {
-        let f = write_settings(r#"{"theme": "dark"}"#);
-        assert!(!read_tui_fullscreen_at(f.path()));
-    }
-
-    #[test]
-    fn malformed_json_returns_false() {
-        let f = write_settings("{not valid json");
-        assert!(!read_tui_fullscreen_at(f.path()));
-    }
-
-    #[test]
-    fn fullscreen_among_other_keys_returns_true() {
-        let f = write_settings(r#"{"theme": "dark", "tui": "fullscreen", "model": "sonnet"}"#);
-        assert!(read_tui_fullscreen_at(f.path()));
-    }
-
-    #[test]
-    fn non_string_tui_returns_false() {
-        let f = write_settings(r#"{"tui": true}"#);
-        assert!(!read_tui_fullscreen_at(f.path()));
+        for (contents, expected) in [
+            (r#"{"tui": "fullscreen"}"#, true),
+            (
+                r#"{"theme": "dark", "tui": "fullscreen", "model": "sonnet"}"#,
+                true,
+            ),
+            (r#"{"tui": "default"}"#, false),
+            (r#"{"theme": "dark"}"#, false),
+            ("{not valid json", false),
+            (r#"{"tui": true}"#, false),
+        ] {
+            let f = write_settings(contents);
+            assert_eq!(read_tui_fullscreen_at(f.path()), expected, "{contents}");
+        }
     }
 }

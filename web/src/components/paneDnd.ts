@@ -2,9 +2,7 @@ import { createContext, useContext } from "react";
 
 import type { DockLocation } from "../lib/panes";
 
-/** Drag payloads. A tab carries the dock + group it lives in. The drop
- *  droppables carry their location and (for group/split targets) the group they
- *  belong to; onDragEnd branches on `type`, never on the id shape. */
+/** Drag payloads. */
 export interface PaneTabData {
   type: "pane-tab";
   dock: DockLocation;
@@ -29,11 +27,7 @@ export interface EmptyDockDropData {
 }
 export type DockDropData = GroupDropData | SplitDropData | EmptyDockDropData;
 
-/** The live insertion point while a pane tab is dragged. Either an index inside
- *  an existing group, or a fresh group spliced in at `group` (`newGroup`). The
- *  `group` index and `index` are in the destination's *visible* coordinates;
- *  the parent maps the index back to the full persisted list per group. Null
- *  when there is no valid target. */
+/** The live insertion point while a pane tab is dragged. */
 export interface DropTarget {
   dock: DockLocation;
   group: number;
@@ -66,10 +60,7 @@ export function usePaneDnd(): PaneDndState {
   return useContext(PaneDndStateContext);
 }
 
-/** One rendered group's visible tab ids, keyed by its persisted group index. A
- *  group whose tabs are all hidden (unloaded plugins) is not rendered, so its
- *  persisted index can be absent here; placement keys off the persisted index,
- *  never a compressed render index. */
+/** One rendered group's visible tab ids, keyed by its persisted group index. */
 export interface RenderGroup {
   group: number;
   tabs: string[];
@@ -89,10 +80,7 @@ export interface PlacementOver {
   after: boolean;
 }
 
-/** Where a dragged tab lands. A split half lifts it into a new group; an
- *  empty-dock zone seeds the dock's first group; a tab inserts before/after the
- *  hovered tab in its group; a group body/strip appends into that group. Pure so
- *  the drag handler stays a thin adapter over the event. */
+/** Where a dragged tab lands. */
 export function resolvePlacement(
   over: PlacementOver,
   draggedId: string,
@@ -108,9 +96,8 @@ export function resolvePlacement(
   const full = grp?.tabs ?? [];
   const base = full.filter((id) => id !== draggedId);
   if (over.type !== "pane-tab") return { dock: over.dock, group: over.group, index: base.length };
-  // Dropping a tab onto its own tab is a no-op: keep its current slot rather
-  // than appending (base has the dragged tab filtered out, so its index would
-  // otherwise resolve to the end).
+  // Dropping a tab onto its own tab is a no-op: keep its current slot rather than appending (base has the dragged
+  // tab filtered out, so its index would otherwise resolve to the end).
   if (over.tabId === draggedId) {
     const currentIndex = full.indexOf(draggedId);
     return { dock: over.dock, group: over.group, index: currentIndex >= 0 ? currentIndex : base.length };
@@ -131,18 +118,16 @@ export function centerX(rect: Rect | null | undefined): number | null {
   return rect ? rect.left + rect.width / 2 : null;
 }
 
-/** True when the dragged tab's center has passed the hovered tab's center, so
- *  the drop should insert after it rather than before. False if either rect is
- *  unknown, biasing toward inserting before. */
+/** True when the dragged tab's center has passed the hovered tab's center, so the drop should insert after it
+ *  rather than before. */
 export function pointerInsertsAfter(activeRect: Rect | null | undefined, overRect: Rect | null | undefined): boolean {
   const a = centerX(activeRect);
   const o = centerX(overRect);
   return a !== null && o !== null && a > o;
 }
 
-/** Whether a resolved drop is worth persisting: a split or a cross-group/dock
- *  move always is, but a within-group reorder onto the tab's own slot is a
- *  no-op to skip. */
+/** Whether a resolved drop is worth persisting: a split or a cross-group/dock move always is, but a within-group
+ *  reorder onto the tab's own slot is a no-op to skip. */
 export function shouldApplyPlacement(
   groupsByDock: Record<DockLocation, RenderGroup[]>,
   tabId: string,
@@ -156,11 +141,7 @@ export function shouldApplyPlacement(
   return from >= 0 && from !== target.index;
 }
 
-/** Translate an insertion index in a group's *visible* tab list to the index in
- *  its *full* persisted list. They differ when the group holds a tab that is
- *  currently hidden (an unloaded plugin pane), which still occupies a persisted
- *  slot. `fullBase` is the group's full tab list with the dragged tab already
- *  removed. An index at or past the visible end appends to the full list. */
+/** Translate an insertion index in a group's *visible* tab list to the index in its *full* persisted list. */
 export function visibleToFullIndex(
   fullBase: string[],
   visibleIndex: number,

@@ -2,11 +2,13 @@ import { lazy, Suspense } from "react";
 
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane } from "./PairedTerminal";
+import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
+import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
-import { PluginPaneBody } from "./plugin/PluginSlots";
+import { PluginPaneBody } from "./plugin/PluginPane";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
@@ -19,6 +21,7 @@ interface Props {
   view: RightPanelView;
   pluginPanes: PluginPane[];
   onBackToAgent: () => void;
+  onOpenAgentsPane: () => void;
   pairedMounted: boolean;
   activeSession: SessionResponse | null;
   activeSessionId: string | null;
@@ -38,7 +41,7 @@ interface Props {
   onDiffRefresh: () => void;
   commentsEnabled: boolean;
   commentSendEnabled: boolean;
-  commentSendDisabledReason?: string;
+  commentSendDisabledReason: string;
   diffComments: ReturnType<typeof useDiffComments>;
   commentsIsMultiRepo: boolean;
   sendDialogOpen: boolean;
@@ -52,15 +55,13 @@ function layerClass(active: boolean): string {
   return active ? base : `${base} invisible pointer-events-none`;
 }
 
-/** The single full-viewport pane shown below the `md` breakpoint (#1452).
- *  The picker promotes one of agent / diff / paired into it. The agent
- *  terminal and the paired shell (once first opened) stay mounted but
- *  hidden via `visibility` so their PTY, scrollback, and focus survive
- *  view switches; `display:none` would collapse xterm geometry to zero. */
+/** Keep terminal geometry and scrollback across switches; only the visible
+ *  surface owns keyboard input. */
 export function MobileMainPane({
   view,
   pluginPanes,
   onBackToAgent,
+  onOpenAgentsPane,
   pairedMounted,
   activeSession,
   activeSessionId,
@@ -90,7 +91,15 @@ export function MobileMainPane({
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
   const viewLabel =
-    view === "diff" ? "Diff" : view === "paired" ? "Paired terminal" : (activePluginPane?.title ?? "Plugin");
+    view === "diff"
+      ? "Diff"
+      : view === "files"
+        ? "Files"
+        : view === "paired"
+          ? "Paired terminal"
+          : view === "agents"
+            ? "Sub agents"
+            : (activePluginPane?.title ?? "Plugin");
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -114,34 +123,52 @@ export function MobileMainPane({
                 key={activeSessionId}
                 sessionId={activeSessionId!}
                 acpWorkerState={activeSession.acp_worker_state ?? "absent"}
+                rateLimitAutoResume={activeSession.rate_limit_auto_resume}
                 tool={activeSession.tool}
                 acpAgent={activeSession.acp_agent ?? null}
+                acpProvider={activeSession.acp_provider ?? null}
+                clearAliases={activeSession.clear_aliases}
                 archivedAt={activeSession.archived_at ?? null}
                 snoozedUntil={activeSession.snoozed_until ?? null}
                 trashedAt={activeSession.trashed_at ?? null}
                 onOpenFileRef={onOpenFileRef}
                 fileRefSession={activeSession}
+                onOpenAgentsPane={onOpenAgentsPane}
                 isSandboxed={activeSession.is_sandboxed}
               />
             </Suspense>
           ) : (
-            <TerminalSessionStack
-              activeSessionId={activeSessionId!}
-              sessions={sessions.filter((session) => session.view !== "structured")}
-              persistent={webSettings.persistentTerminals}
-              maxPersistentTerminals={webSettings.maxPersistentTerminals}
-            />
+            // Clear the home indicator without changing the keyboard-open lift.
+            <div className="home-indicator-clearance flex-1 flex flex-col min-h-0 overflow-hidden">
+              <TerminalSessionStack
+                active={view === "agent"}
+                activeSessionId={activeSessionId!}
+                sessions={sessions.filter((session) => session.view !== "structured")}
+                persistent={webSettings.persistentTerminals}
+                maxPersistentTerminals={webSettings.maxPersistentTerminals}
+              />
+            </div>
           )}
         </div>
 
         {pairedMounted && (
-          <div className={layerClass(view === "paired")} inert={view !== "paired"}>
-            <PairedShellPane session={activeSession} sessionId={activeSessionId} />
+          // Match the agent terminal’s home-indicator clearance.
+          <div
+            className={`home-indicator-clearance ${layerClass(view === "paired")}`}
+            inert={view !== "paired"}
+            data-testid="mobile-paired-layer"
+          >
+            <PairedShellPane session={activeSession} sessionId={activeSessionId} active={view === "paired"} />
           </div>
         )}
 
         {view === "diff" && (
-          <div className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900">
+          // Reserve the bottom home-indicator inset here (the App root no longer
+          // does; see index.css .safe-area-inset) so the last diff row clears it.
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
             {selectedFilePath && activeSessionId ? (
               <DiffFileViewer
                 sessionId={activeSessionId}
@@ -182,8 +209,32 @@ export function MobileMainPane({
           </div>
         )}
 
+        {view === "agents" && (
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
+            <BackgroundAgentsPanel sessionId={activeSessionId} />
+          </div>
+        )}
+
+        {view === "files" && (
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
+            <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />
+          </div>
+        )}
+
         {activePluginPane && (
-          <div className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900">
+          // Reserve the bottom home-indicator inset here too (see the diff and paired wrappers); the App root no
+          // longer does.
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            data-testid="mobile-plugin-layer"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
             <PluginPaneBody entry={activePluginPane.entry} />
           </div>
         )}

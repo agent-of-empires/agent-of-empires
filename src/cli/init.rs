@@ -5,7 +5,7 @@ use clap::Args;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::session::repo_config::INIT_TEMPLATE;
+use crate::session::config::repo_config::INIT_TEMPLATE;
 
 #[derive(Args)]
 pub struct InitArgs {
@@ -30,7 +30,6 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let config_dir = path.join(".agent-of-empires");
     let config_path = config_dir.join("config.toml");
 
-    // Check for both new and legacy paths
     let legacy_path = path.join(".aoe").join("config.toml");
     if config_path.exists() {
         bail!(

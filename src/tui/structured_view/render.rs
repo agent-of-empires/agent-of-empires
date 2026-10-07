@@ -1,14 +1,10 @@
-//! Render of a structured view session, stacked top to bottom: transcript,
-//! approval shelf, queue, composer, and a status line pinned at the bottom.
-//! The slash and `@` mention pickers
-//! float above the composer when open rather than taking a pane. Successful
-//! tools collapse to target-aware summaries; running and failed tools use the
-//! per-kind detail renderer. Image previews and syntax highlighting stay
-//! deferred to the web structured view; press `o` from the transcript pane to
-//! open it for full-fidelity inspection.
+//! Structured view render: transcript, approval shelf, queue, composer, and
+//! status line, with pickers floating above the composer.
+
+use std::collections::HashMap;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
@@ -18,22 +14,21 @@ use aoe_plugin_api::UiSlot;
 
 use ansi_to_tui::IntoText;
 
-use super::input::Focus;
-use super::reducer::{AcpTranscript, ActivityRow, NoteKind, ToolCallRow};
-use super::state::{FileIndex, StructuredViewState, ViewLayout};
-use crate::acp::approvals::ApprovalDecision;
+use super::input::{Focus, Intent};
+use super::reducer::{
+    AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
+};
+use super::state::{FileIndex, PickerKind, PickerTarget, StructuredViewState, ViewLayout};
+use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
-use crate::acp::state::SessionUsage;
+use crate::acp::state::{AuthStatusKind, SessionUsage, ToolOutputBlock};
+use crate::acp::transcript::{TranscriptRow, TranscriptRowKind};
+use crate::tui::components::hover::paint_hover_bg;
 use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
-/// Render the structured view into `area`. `active` is true when the
-/// view has the keyboard (full-screen attach, or an embedded view the
-/// user entered); false for an embedded preview that is merely showing
-/// the transcript of the selected session. When inactive the composer
-/// caret is not shown and its chrome reads as a prompt to enter.
-/// Returns the transcript geometry so the embedded caller can feed the
-/// home view's drag-select machinery.
+/// Render the view into `area`. `active` is false for an embedded preview,
+/// which shows no caret. Returns the transcript geometry for drag-select.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -42,113 +37,179 @@ pub fn render(
     active: bool,
 ) -> TranscriptGeometry {
     let layout = compute_layout(area, state);
+    // Keep the previous window start so hover cannot scroll rows away.
+    let prev_picker = state.mouse_targets.take().picker;
 
     let geometry = render_transcript(frame, layout.transcript, theme, state, active);
     render_status(frame, layout.status, theme, state, active);
     if layout.approval.height > 0 {
         render_approval_shelf(frame, layout.approval, theme, state, active);
     }
+    // After the approval shelf, which replaces the button list wholesale.
+    if layout.notices.height > 0 {
+        let close = render_notices(frame, layout.notices, theme, state);
+        state.mouse_targets.borrow_mut().buttons.extend(close);
+    }
     if layout.queue.height > 0 {
         render_queue(frame, layout.queue, theme, state);
     }
     render_composer(frame, layout.composer, theme, state, active);
-    // Pickers float above the composer (the composer sits at the screen
-    // bottom, so a dropdown below it would render off-screen). Drawn
-    // last so they overlay the transcript's lower rows. The choice
-    // picker (mode / answer) wins over the composer-driven pickers: it
-    // owns the navigation keys while open, so it must own the pixels
-    // too. Slash and `@` pickers are mutually exclusive; slash wins the
-    // tie defensively.
-    if let Some(picker) = &state.choice {
-        render_choice_picker(frame, layout.composer, theme, picker);
+    // Pickers float above the bottom-anchored composer. The choice picker owns
+    // the navigation keys while open, so it wins the pixels too.
+    let prev_first = |kind| {
+        prev_picker
+            .filter(|p: &PickerTarget| p.kind == kind)
+            .map_or(0, |p| p.first)
+    };
+    if state.choice.is_some() {
+        let first = prev_first(PickerKind::Choice);
+        render_choice_picker(frame, layout.composer, theme, state, first);
     } else if matches!(state.focus, Focus::Composer) && state.slash_picker_open() {
-        render_slash_picker(frame, layout.composer, theme, state);
+        let first = prev_first(PickerKind::Slash);
+        render_slash_picker(frame, layout.composer, theme, state, first);
     } else if matches!(state.focus, Focus::Composer) && state.mention.is_some() {
-        render_mention_picker(frame, layout.composer, theme, state);
+        let first = prev_first(PickerKind::Mention);
+        render_mention_picker(frame, layout.composer, theme, state, first);
     }
-    // The plugin pane panel is a modal overlay drawn over everything else when
-    // open (#2467). The returned geometry still describes the transcript
-    // underneath, which is what the caller's selection machinery expects; the
-    // overlay is transient.
-    //
-    // A choice picker outranks it, for the same reason it outranks the composer
-    // pickers: `dispatch` gives an open picker the navigation keys from any
-    // focus, so whatever owns those keys must own the pixels. An elicitation
-    // arriving while the pane is up, or a plugin link picker opened from this
-    // focus, would otherwise take j/k/Enter/Esc behind an opaque overlay, and
-    // the user's Esc would silently cancel the agent's question.
+    // The plugin pane is a modal overlay; an open choice picker still owns the
+    // navigation keys, so it must stay visible on top.
     if matches!(state.focus, Focus::Pane) && state.choice.is_none() {
         render_pane_panel(frame, area, theme, state);
     }
     geometry
 }
 
-/// Floating single-choice picker (permission mode, elicitation answer),
-/// anchored above the composer like the slash picker. Rows window around
-/// the selection on short terminals.
+/// Permission mode / elicitation answer / plugin-link picker.
 fn render_choice_picker(
     frame: &mut Frame,
     composer_area: Rect,
     theme: &Theme,
-    picker: &super::state::ChoicePicker,
+    state: &StructuredViewState,
+    prev_first: usize,
 ) {
-    const CHOICE_PICKER_MAX_ROWS: usize = 8;
-    let max_rows = (composer_area.y as usize)
-        .saturating_sub(2)
-        .min(CHOICE_PICKER_MAX_ROWS);
-    if max_rows == 0 || picker.options.is_empty() {
+    let Some(picker) = &state.choice else {
         return;
-    }
-    let total = picker.options.len();
-    let cap = max_rows.min(total).max(1);
-    let selected = picker.selected.min(total - 1);
-    let start = if selected >= cap {
-        (selected - cap + 1).min(total.saturating_sub(cap))
-    } else {
-        0
     };
-    let mut lines = Vec::with_capacity(cap);
-    for (offset, (_, label)) in picker.options[start..(start + cap).min(total)]
+    let (first, lines) = window_rows(
+        composer_area,
+        8,
+        picker.selected,
+        prev_first,
+        &picker.options,
+        |(_, label)| vec![label.clone()],
+    );
+    let rows = lines.len();
+    let drawn = render_popup_above(frame, composer_area, theme, picker.title.clone(), lines);
+    record_picker(state, PickerKind::Choice, drawn, first, rows);
+}
+
+/// Store a drawn picker as the frame's click / hover target. `rows` counts the
+/// item rows at the top of the popup body, excluding any trailing note.
+fn record_picker(
+    state: &StructuredViewState,
+    kind: PickerKind,
+    drawn: Option<(Rect, Rect)>,
+    first: usize,
+    rows: usize,
+) {
+    let Some((area, inner)) = drawn else {
+        return;
+    };
+    let height = u16::try_from(rows).unwrap_or(u16::MAX).min(inner.height);
+    state.mouse_targets.borrow_mut().picker = Some(PickerTarget {
+        kind,
+        area,
+        rows: Rect { height, ..inner },
+        first,
+    });
+}
+
+/// Up to `max_rows` picker rows (fewer on a short terminal), windowed so
+/// `selected` stays visible and marked. Returns the first shown item's index
+/// with the rows.
+fn window_rows<T, S: Into<Span<'static>>>(
+    composer_area: Rect,
+    max_rows: usize,
+    selected: usize,
+    prev_start: usize,
+    items: &[T],
+    spans: impl Fn(&T) -> Vec<S>,
+) -> (usize, Vec<Line<'static>>) {
+    // Minus the two border rows, so the selection can't paint off-screen.
+    let max_rows = (composer_area.y as usize).saturating_sub(2).min(max_rows);
+    if max_rows == 0 || items.is_empty() {
+        return (0, Vec::new());
+    }
+    let total = items.len();
+    let cap = max_rows.min(total);
+    let start = window_start(selected, cap, total, prev_start);
+    let lines = items[start..(start + cap).min(total)]
         .iter()
         .enumerate()
-    {
-        let idx = start + offset;
-        let marker = if idx == selected { "▶ " } else { "  " };
-        lines.push(Line::from(Span::styled(
-            format!("{marker}{label}"),
-            if idx == selected {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
-        )));
+        .map(|(offset, item)| {
+            let is_sel = start + offset == selected;
+            let mut row: Vec<Span<'static>> = spans(item).into_iter().map(Into::into).collect();
+            if let Some(first) = row.first_mut() {
+                first.content =
+                    format!("{}{}", if is_sel { "▶ " } else { "  " }, first.content).into();
+                if is_sel {
+                    first.style = first.style.add_modifier(Modifier::BOLD);
+                }
+            }
+            Line::from(row)
+        })
+        .collect();
+    (start, lines)
+}
+
+/// First visible index of a `cap`-row window that keeps `selected` inside it,
+/// scrolling from `prev_start` only as far as needed.
+fn window_start(selected: usize, cap: usize, total: usize, prev_start: usize) -> usize {
+    let start = prev_start.min(total.saturating_sub(cap));
+    if selected < start {
+        selected
+    } else if selected >= start + cap {
+        selected + 1 - cap
+    } else {
+        start
     }
-    let desired = lines.len() as u16 + 2;
-    let y = composer_area.y.saturating_sub(desired);
+}
+
+/// Bordered popup whose bottom edge sits on the composer's top edge. Returns
+/// the popup and its body rects, or `None` when nothing was drawn.
+fn render_popup_above(
+    frame: &mut Frame,
+    composer_area: Rect,
+    theme: &Theme,
+    title: String,
+    lines: Vec<Line<'_>>,
+) -> Option<(Rect, Rect)> {
+    if lines.is_empty() {
+        return None;
+    }
+    let y = composer_area.y.saturating_sub(lines.len() as u16 + 2);
     let area = Rect {
-        x: composer_area.x,
         y,
-        width: composer_area.width,
         height: composer_area.y - y,
+        ..composer_area
     };
     if area.height < 3 {
-        return;
+        return None;
     }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .padding(Padding::horizontal(1))
-        .title(picker.title.clone())
+        .title(title)
         .border_style(Style::default().fg(theme.title));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
+    Some((area, inner))
 }
 
-/// Split `area` into the view's vertical panes. Pure so the redraw path
-/// can stash the result on state (`state.layout`) for mouse hit-testing
-/// while `render` recomputes it per frame.
+/// Pure so the redraw path can stash it on `state.layout` for hit-testing.
 pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLayout {
     let queue_height = queued_strip_height(state);
     let approval_height = u16::from(!state.transcript.pending_approvals.is_empty()) * 3;
@@ -157,7 +218,8 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
         .constraints([
             Constraint::Min(5), // transcript
             Constraint::Length(approval_height),
-            Constraint::Length(queue_height), // queued prompts strip (0 when empty)
+            Constraint::Length(notices_strip_height(state)), // 0 when none
+            Constraint::Length(queue_height),                // queued prompts strip (0 when empty)
             Constraint::Length(composer_height(state)),
             Constraint::Length(1), // status line
         ])
@@ -165,17 +227,15 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
     ViewLayout {
         transcript: chunks[0],
         approval: chunks[1],
-        queue: chunks[2],
-        composer: chunks[3],
-        status: chunks[4],
+        notices: chunks[2],
+        queue: chunks[3],
+        composer: chunks[4],
+        status: chunks[5],
     }
 }
 
-/// The plugin pane panel (#2467): a read-only overlay showing the open session's
-/// `pane` entries. Anchored to the right half on a wide terminal, full width on
-/// a narrow one. Pre-wrapped at the panel width like the transcript, so the rows
-/// painted and the rows counted for the scroll clamp are the same rows; `G`
-/// (bottom) and overscroll land on the last screen.
+/// Plugin pane overlay: right half when wide, full width when narrow.
+/// Pre-wrapped so the painted rows and the scroll clamp agree.
 fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
     let panel = if area.width >= 100 {
         let half = area.width / 2;
@@ -193,18 +253,38 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
         .border_type(BorderType::Rounded)
         .padding(Padding::horizontal(1))
         .title(" Plugin pane ")
-        // The status-line hint for this focus is right-aligned, which this
-        // overlay covers in both geometries, so the way out has to be painted on
-        // the overlay itself or it is not visible anywhere.
-        .title_bottom(" Esc to close ")
         .border_style(Style::default().fg(theme.title));
     let inner = block.inner(panel);
     frame.render_widget(Clear, panel);
     frame.render_widget(block, panel);
+    // The status hint is covered by this overlay, so paint the way out on the
+    // bottom border as a button. The modal covers every other target.
+    let close = if panel.width > 2 && panel.height > 1 {
+        let label = " Esc to close ";
+        let rect = Rect {
+            x: panel.x + 1,
+            y: panel.bottom() - 1,
+            width: (label.len() as u16).min(panel.width - 2),
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(label), rect);
+        vec![(rect, Intent::SetFocus(Focus::Transcript))]
+    } else {
+        Vec::new()
+    };
+    paint_hovered_button(frame, theme, state, &close);
+    state.mouse_targets.borrow_mut().buttons = close;
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let lines = plugin_ui::pane_lines(&state.plugin_ui, &state.session_id, theme);
+    let mut lines = plugin_ui::pane_lines(&state.plugin_ui, &state.session_id, theme);
+    let home = plugin_ui::home_pane_lines(&state.plugin_ui, theme);
+    if !home.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.extend(home);
+    }
     if lines.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -219,23 +299,91 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
     for line in lines {
         wrap_line_into(line, inner.width, &mut wrapped);
     }
-    // Saturate like the transcript's row count: pane payloads run to 64 KB per
-    // entry across up to 32 entries, so a narrow panel can wrap past 65535 rows,
-    // and a bare `as u16` would truncate the total and pin the clamp near the
-    // top of the content.
+    // Saturate: large payloads on a narrow panel can exceed u16 rows.
     let rows = wrapped.len().min(u16::MAX as usize) as u16;
     let max_scroll = rows.saturating_sub(inner.height);
-    // Stash it so the next scroll step can resolve the bottom sentinel against
-    // a concrete row instead of clamping `u16::MAX - delta` back to the bottom.
+    // Lets the next scroll step resolve the bottom sentinel to a real row.
     state.last_pane_scroll_max.set(max_scroll);
     let offset = state.pane_scroll.min(max_scroll);
     frame.render_widget(Paragraph::new(wrapped).scroll((offset, 0)), inner);
 }
 
-/// The queue is a compact shelf rather than another boxed transcript. Recall
-/// keeps the individual messages reachable without permanently spending rows.
 fn queued_strip_height(state: &StructuredViewState) -> u16 {
     u16::from(!state.queue.is_empty())
+}
+
+/// `×` is one column wide but two bytes, so the width is stated rather than
+/// taken from the string's length.
+const CLOSE_LABEL: &str = " × ";
+const CLOSE_LABEL_WIDTH: u16 = 3;
+
+/// One line per undismissed advisory. Capped daemon-side, so this never
+/// starves the transcript.
+fn notices_strip_height(state: &StructuredViewState) -> u16 {
+    state.visible_notices().count() as u16
+}
+
+/// Agent-pushed advisories, toned by severity, each dismissable with `x` or a
+/// click on its `×`. Dismissal is local, so it never clears another client.
+fn render_notices(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &StructuredViewState,
+) -> Vec<(Rect, Intent)> {
+    let mut buttons = Vec::new();
+    for (row, notice) in state.visible_notices().enumerate() {
+        let Some(y) = area
+            .y
+            .checked_add(row as u16)
+            .filter(|y| *y < area.bottom())
+        else {
+            break;
+        };
+        let colour = match notice.severity.as_str() {
+            "error" => theme.error,
+            "warning" => theme.title,
+            // An unknown future level reads as advisory rather than alarming.
+            _ => theme.hint,
+        };
+        let mut text = format!(" {} ", notice.title);
+        if let Some(description) = notice.description.as_deref().map(str::trim) {
+            if !description.is_empty() {
+                text.push_str(description);
+                text.push(' ');
+            }
+        }
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {} ", notice.severity),
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::default().fg(theme.hint)),
+        ]);
+        // The close button keeps its columns; the text wraps short of them so a
+        // long advisory is clipped rather than painted under the `×`.
+        let close = Rect {
+            x: area.right().saturating_sub(CLOSE_LABEL_WIDTH),
+            y,
+            width: CLOSE_LABEL_WIDTH,
+            height: 1,
+        };
+        let text_area = Rect {
+            x: area.x,
+            y,
+            width: area.width.saturating_sub(CLOSE_LABEL_WIDTH),
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(line), text_area);
+        if close.x > text_area.x {
+            frame.render_widget(
+                Paragraph::new(Span::styled(CLOSE_LABEL, Style::default().fg(colour))),
+                close,
+            );
+            buttons.push((close, Intent::DismissNotice(Some(notice.id.clone()))));
+        }
+    }
+    buttons
 }
 
 fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
@@ -266,14 +414,9 @@ fn render_approval_shelf(
     };
     let Some(row) = state
         .transcript
-        .rows
+        .pending_approvals
         .iter()
-        .find_map(|activity| match activity {
-            ActivityRow::Approval(row) if row.nonce == selected && row.decision.is_none() => {
-                Some(row)
-            }
-            _ => None,
-        })
+        .find(|pending| pending.nonce == selected)
     else {
         return;
     };
@@ -307,270 +450,207 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let actions = approval_actions_line(theme, active);
+    let (actions, spans) =
+        approval_actions_line(theme, active, row.choice && !row.options.is_empty());
     frame.render_widget(Paragraph::new(actions), inner);
+    // An open choice picker owns the keyboard, so the decision buttons go
+    // inert with their keys.
+    if state.choice.is_some() {
+        return;
+    }
+    let buttons: Vec<(Rect, Intent)> = spans
+        .into_iter()
+        .filter(|(offset, _, _)| *offset < inner.width)
+        .map(|(offset, width, intent)| {
+            let rect = Rect {
+                x: inner.x + offset,
+                y: inner.y,
+                width: width.min(inner.width - offset),
+                height: 1,
+            };
+            (rect, intent)
+        })
+        .collect();
+    paint_hovered_button(frame, theme, state, &buttons);
+    state.mouse_targets.borrow_mut().buttons = buttons;
 }
 
-fn approval_actions_line(theme: &Theme, active: bool) -> Line<'static> {
+/// Highlight whichever of this frame's `buttons` the pointer is over.
+fn paint_hovered_button(
+    frame: &mut Frame,
+    theme: &Theme,
+    state: &StructuredViewState,
+    buttons: &[(Rect, Intent)],
+) {
+    let rects: Vec<Rect> = buttons.iter().map(|(rect, _)| *rect).collect();
+    if let Some(rect) = state.hover.current_in(&rects) {
+        paint_hover_bg(frame, rect, theme.selection);
+    }
+}
+
+/// The action hints, plus each clickable action as `(column offset, width,
+/// intent)` with the intent its key sends. Choice approvals ask a question, so
+/// `a` answers and "always" doesn't apply.
+fn approval_actions_line(
+    theme: &Theme,
+    active: bool,
+    choice: bool,
+) -> (Line<'static>, Vec<(u16, u16, Intent)>) {
+    use crate::acp::protocol::ApprovalDecisionWire as Decision;
+
     if !active {
-        return Line::from(Span::styled(
-            "Enter to respond",
-            Style::default().fg(theme.hint),
+        let hint = Span::styled("Enter to respond", Style::default().fg(theme.hint));
+        return (Line::from(hint), Vec::new());
+    }
+    let resolve = Intent::ResolveApproval;
+    let mut actions: Vec<(&'static str, Color, &'static str, Intent)> = vec![(
+        "a",
+        theme.running,
+        if choice { " answer" } else { " allow once" },
+        resolve(Decision::Allow),
+    )];
+    if !choice {
+        actions.push((
+            "A",
+            theme.running,
+            " always",
+            resolve(Decision::AllowAlways),
         ));
     }
-    Line::from(vec![
-        Span::styled(
-            "a",
-            Style::default()
-                .fg(theme.running)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" allow once", Style::default().fg(theme.hint)),
-        Span::styled("  ·  ", Style::default().fg(theme.border)),
-        Span::styled(
-            "A",
-            Style::default()
-                .fg(theme.running)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" always", Style::default().fg(theme.hint)),
-        Span::styled("  ·  ", Style::default().fg(theme.border)),
-        Span::styled(
-            "d",
-            Style::default()
-                .fg(theme.error)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" deny", Style::default().fg(theme.hint)),
-        Span::styled("  ·  ", Style::default().fg(theme.border)),
-        Span::styled(
-            "Esc",
-            Style::default().fg(theme.hint).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" stop", Style::default().fg(theme.hint)),
-    ])
-}
+    actions.push(("d", theme.error, " deny", resolve(Decision::Deny)));
+    actions.push(("Esc", theme.hint, " stop", Intent::CancelInFlight));
 
-fn approval_target(
-    row: &super::reducer::ApprovalRow,
-    path_roots: Option<&SessionPathRoots>,
-) -> String {
-    let args = parse_args_object(&row.args);
-    match row.kind.as_str() {
-        "edit" | "write" | "read" | "delete" | "move" => pick_str(args.as_ref(), PATH_KEYS)
-            .map(|path| relative_display_path(path, path_roots))
-            .unwrap_or_default(),
-        "execute" => pick_str(args.as_ref(), CMD_KEYS)
-            .and_then(|command| command.lines().next())
-            .unwrap_or_default()
-            .to_string(),
-        _ => String::new(),
+    let mut spans = Vec::new();
+    let mut buttons = Vec::new();
+    let mut offset = 0u16;
+    for (i, (key, color, label, intent)) in actions.into_iter().enumerate() {
+        if i > 0 {
+            let sep = Span::styled("  ·  ", Style::default().fg(theme.border));
+            offset += sep.width() as u16;
+            spans.push(sep);
+        }
+        let key = Span::styled(key, Style::default().fg(color).add_modifier(Modifier::BOLD));
+        let label = Span::styled(label, Style::default().fg(theme.hint));
+        let width = (key.width() + label.width()) as u16;
+        buttons.push((offset, width, intent));
+        offset += width;
+        spans.extend([key, label]);
     }
+    (Line::from(spans), buttons)
 }
 
-/// Most picker rows visible at once before the list windows around the
-/// selection. Keeps the popup from eating the whole transcript when the
-/// daemon advertises a long command list.
-const SLASH_PICKER_MAX_ROWS: usize = 8;
+fn approval_target(row: &PendingApproval, path_roots: Option<&SessionPathRoots>) -> String {
+    let args = parse_args_object(&row.args);
+    display_tool_target(&row.kind, args.as_ref(), path_roots).unwrap_or_default()
+}
+
+fn display_tool_target(
+    kind: &str,
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+    path_roots: Option<&SessionPathRoots>,
+) -> Option<String> {
+    Some(match tool_target(kind, args?)? {
+        ToolTarget::Path(path) => relative_display_path(path, path_roots),
+        ToolTarget::Command(command) => command.to_owned(),
+    })
+}
 
 fn render_slash_picker(
     frame: &mut Frame,
     composer_area: Rect,
     theme: &Theme,
     state: &StructuredViewState,
+    prev_first: usize,
 ) {
     let matches = state.slash_matches();
-    if matches.is_empty() {
-        return;
-    }
-    // Cap the visible rows to the space above the composer (minus the 2
-    // border rows) before windowing, so on a short terminal the window
-    // can't hand back more rows than will paint and hide the selection
-    // at the bottom. width matches the composer so the popup lines up
-    // with the input it completes.
-    let max_rows = (composer_area.y as usize)
-        .saturating_sub(2)
-        .min(SLASH_PICKER_MAX_ROWS);
-    if max_rows == 0 {
-        return;
-    }
-    let lines = picker_lines(&matches, state.slash_selected, max_rows);
-    let desired = lines.len() as u16 + 2;
-    // Anchor the popup's bottom edge to the composer's top edge, growing
-    // upward. max_rows already guarantees the list fits above the
-    // composer, so the height below won't truncate the windowed rows.
-    let y = composer_area.y.saturating_sub(desired);
-    let area = Rect {
-        x: composer_area.x,
-        y,
-        width: composer_area.width,
-        height: composer_area.y - y,
-    };
-    if area.height < 3 {
-        return;
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .padding(Padding::horizontal(1))
-        .title(" Commands (↑/↓ or Ctrl+n/p · Enter/Tab select · Esc dismiss) ")
-        .border_style(Style::default().fg(theme.title));
-    let inner = block.inner(area);
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    let (first, lines) = window_rows(
+        composer_area,
+        8,
+        state.slash_selected,
+        prev_first,
+        &matches,
+        |cmd| {
+            let mut spans = vec![Span::raw(format!("/{}", cmd.name))];
+            if !cmd.description.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", cmd.description),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            spans
+        },
+    );
+    let rows = lines.len();
+    let drawn = render_popup_above(
+        frame,
+        composer_area,
+        theme,
+        " Commands (↑/↓ or Ctrl+n/p · Enter/Tab select · Esc dismiss) ".into(),
+        lines,
+    );
+    record_picker(state, PickerKind::Slash, drawn, first, rows);
 }
 
-/// Build the picker's visible rows, windowed around `selected` so a
-/// selection past the visible cap still shows. Each row is
-/// `▶ /name  description`, with the marker only on the selected row.
-fn picker_lines<'a>(
-    matches: &[&'a crate::acp::state::AvailableCommand],
-    selected: usize,
-    max_rows: usize,
-) -> Vec<Line<'a>> {
-    let total = matches.len();
-    let cap = max_rows.min(total).max(1);
-    // Slide the window so `selected` stays inside [start, start+cap).
-    let start = if selected >= cap {
-        (selected - cap + 1).min(total.saturating_sub(cap))
-    } else {
-        0
-    };
-    let mut out = Vec::with_capacity(cap);
-    for (offset, cmd) in matches[start..(start + cap).min(total)].iter().enumerate() {
-        let idx = start + offset;
-        let is_sel = idx == selected;
-        let marker = if is_sel { "▶ " } else { "  " };
-        let mut spans = vec![Span::styled(
-            format!("{marker}/{}", cmd.name),
-            if is_sel {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
-        )];
-        if !cmd.description.is_empty() {
-            spans.push(Span::styled(
-                format!("  {}", cmd.description),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        out.push(Line::from(spans));
-    }
-    out
-}
-
-/// Most `@`-mention rows visible at once before the list windows around
-/// the selection.
-const MENTION_PICKER_MAX_ROWS: usize = 8;
-
-/// Floating `@`-mention picker, anchored above the composer like the
-/// slash picker. Shows a loading / error / empty placeholder when the
-/// file index is not ready or nothing matches, otherwise the windowed
-/// list of matching paths.
+/// `@` mention picker, with placeholders while the file index loads or fails.
 fn render_mention_picker(
     frame: &mut Frame,
     composer_area: Rect,
     theme: &Theme,
     state: &StructuredViewState,
+    prev_first: usize,
 ) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let placeholder = |text: String, style: Style| vec![Line::from(Span::styled(text, style))];
     let selected = state.mention.as_ref().map(|s| s.selected).unwrap_or(0);
-    let mut lines: Vec<Line> = Vec::new();
-    let mut truncated_note = false;
-    match &state.file_index {
-        FileIndex::Unloaded | FileIndex::Loading => {
-            lines.push(Line::from(Span::styled(
-                "  loading files…",
-                Style::default().add_modifier(Modifier::DIM),
-            )));
-        }
-        FileIndex::Failed(err) => {
-            lines.push(Line::from(Span::styled(
-                format!("  file list unavailable: {err}"),
-                Style::default().fg(theme.error),
-            )));
-        }
+    // Placeholders are not rows: the popup swallows clicks but picks nothing.
+    let mut first = 0;
+    let mut rows = 0;
+    let lines = match &state.file_index {
+        FileIndex::Unloaded | FileIndex::Loading => placeholder("  loading files…".into(), dim),
+        FileIndex::Failed(err) => placeholder(
+            format!("  file list unavailable: {err}"),
+            Style::default().fg(theme.error),
+        ),
         FileIndex::Loaded { truncated, .. } => {
             let files = super::filtered_mention_files(state);
             if files.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "  no matching files",
-                    Style::default().add_modifier(Modifier::DIM),
-                )));
+                placeholder("  no matching files".into(), dim)
             } else {
-                let max_rows = (composer_area.y as usize)
-                    .saturating_sub(2)
-                    .min(MENTION_PICKER_MAX_ROWS);
-                if max_rows == 0 {
+                let (start, mut lines) =
+                    window_rows(composer_area, 8, selected, prev_first, &files, |path| {
+                        vec![path.to_string()]
+                    });
+                if lines.is_empty() {
                     return;
                 }
-                let total = files.len();
-                let cap = max_rows.min(total).max(1);
-                let start = if selected >= cap {
-                    (selected - cap + 1).min(total.saturating_sub(cap))
-                } else {
-                    0
-                };
-                for (offset, path) in files[start..(start + cap).min(total)].iter().enumerate() {
-                    let idx = start + offset;
-                    let marker = if idx == selected { "▶ " } else { "  " };
+                first = start;
+                rows = lines.len();
+                if *truncated {
                     lines.push(Line::from(Span::styled(
-                        format!("{marker}{path}"),
-                        if idx == selected {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                        },
+                        "  (workspace over 5000 files; list capped)",
+                        dim,
                     )));
                 }
-                truncated_note = *truncated;
+                lines
             }
         }
-    }
-    if truncated_note {
-        lines.push(Line::from(Span::styled(
-            "  (workspace over 5000 files; list capped)",
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-    }
-
-    // Anchor the popup's bottom edge to the composer's top edge, growing
-    // upward, exactly like the slash picker.
-    let desired = lines.len() as u16 + 2;
-    let y = composer_area.y.saturating_sub(desired);
-    let area = Rect {
-        x: composer_area.x,
-        y,
-        width: composer_area.width,
-        height: composer_area.y - y,
     };
-    if area.height < 3 {
-        return;
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .padding(Padding::horizontal(1))
-        .title(" Files (↑/↓ or Ctrl+n/p · Enter/Tab insert · Esc close) ")
-        .border_style(Style::default().fg(theme.title));
-    let inner = block.inner(area);
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    let drawn = render_popup_above(
+        frame,
+        composer_area,
+        theme,
+        " Files (↑/↓ or Ctrl+n/p · Enter/Tab insert · Esc close) ".into(),
+        lines,
+    );
+    record_picker(state, PickerKind::Mention, drawn, first, rows);
 }
 
 /// One separator row above the terminal-native prompt rail.
 const COMPOSER_CHROME_ROWS: u16 = 1;
-/// Maximum content rows the composer is allowed to take before the
-/// transcript starts losing space. Multi-line prompts beyond this
-/// scroll inside the textarea instead of growing the pane.
+/// Content rows before multi-line prompts scroll inside the textarea.
 const COMPOSER_MAX_CONTENT_ROWS: u16 = 6;
 
 fn composer_height(state: &StructuredViewState) -> u16 {
-    // Composer is two rows tall by default: one separator and one prompt
-    // row. Multi-line prompts grow up to the content cap, then scroll
-    // inside the textarea instead of squeezing the transcript.
     let lines = state.composer.lines().len().max(1) as u16;
     lines.clamp(1, COMPOSER_MAX_CONTENT_ROWS) + COMPOSER_CHROME_ROWS
 }
@@ -640,13 +720,10 @@ fn render_transcript(
     }
 
     let text = wrapped_transcript(state, theme, text_area.width);
-    // The lines are pre-wrapped at the render width, so visual rows ARE
-    // logical rows: the scroll clamp is exact (no wrap estimation), and
-    // the same geometry serves the home view's drag-select machinery.
+    // Pre-wrapped at the render width, so visual rows are logical rows.
     let total = text.lines.len().min(u16::MAX as usize) as u16;
     let max = total.saturating_sub(text_area.height);
-    // Record the concrete max so a wheel/PageUp step can resolve the
-    // stick-to-bottom sentinel before moving (see `apply_scroll`).
+    // Lets a scroll step resolve the stick-to-bottom sentinel first.
     state.last_scroll_max.set(max);
     let first = state.scroll_offset.min(max);
     let para = Paragraph::new(text).scroll((first, 0));
@@ -667,17 +744,7 @@ fn metadata_card_width(
 ) -> u16 {
     use unicode_width::UnicodeWidthStr;
 
-    let agent = state.transcript.agent_name.as_deref().unwrap_or("agent");
-    let directory = state
-        .path_roots
-        .as_ref()
-        .map(|roots| roots.project_path.as_str())
-        .unwrap_or("loading…");
-    let mode = state
-        .transcript
-        .current_mode
-        .as_deref()
-        .unwrap_or("default");
+    let (agent, directory, mode) = metadata_fields(state);
     let widest = [
         format!(
             "❯ Agent of Empires · {agent} (v{})",
@@ -697,6 +764,22 @@ fn metadata_card_width(
         .min(available_width)
 }
 
+/// (agent, directory, permission mode) as shown on the metadata card.
+fn metadata_fields(state: &StructuredViewState) -> (&str, &str, &str) {
+    (
+        state.transcript.agent_name.as_deref().unwrap_or("agent"),
+        state
+            .path_roots
+            .as_ref()
+            .map_or("loading…", |roots| roots.project_path.as_str()),
+        state
+            .transcript
+            .current_mode
+            .as_deref()
+            .unwrap_or("default"),
+    )
+}
+
 fn render_metadata_card(
     frame: &mut Frame,
     area: Rect,
@@ -705,17 +788,7 @@ fn render_metadata_card(
     friendly_title: &str,
 ) {
     let inner_width = area.width.saturating_sub(4) as usize;
-    let agent = state.transcript.agent_name.as_deref().unwrap_or("agent");
-    let directory = state
-        .path_roots
-        .as_ref()
-        .map(|roots| roots.project_path.as_str())
-        .unwrap_or("loading…");
-    let mode = state
-        .transcript
-        .current_mode
-        .as_deref()
-        .unwrap_or("default");
+    let (agent, directory, mode) = metadata_fields(state);
     let lines = vec![
         Line::from(vec![
             Span::styled("❯ ", Style::default().fg(theme.title)),
@@ -786,11 +859,7 @@ fn fit_display(value: &str, max_width: usize) -> String {
     out
 }
 
-/// Where the transcript text landed in the last render: the inner text
-/// rect (borders stripped), the absolute index of the top visible row,
-/// and the total wrapped row count. The home view feeds this into its
-/// preview drag-select machinery so selection coordinates line up with
-/// the painted cells.
+/// Where the transcript text landed in the last render, for drag-select.
 #[derive(Debug, Clone, Copy)]
 pub struct TranscriptGeometry {
     pub text_area: Rect,
@@ -798,10 +867,8 @@ pub struct TranscriptGeometry {
     pub total_lines: usize,
 }
 
-/// Build the transcript as pre-wrapped lines at `width` columns. This is
-/// the single source of transcript geometry: the renderer paints precisely
-/// these rows (no Paragraph wrap), the scroll clamp counts them, and the
-/// home view's selection extraction slices them.
+/// The transcript pre-wrapped at `width`: the single source of transcript
+/// geometry for painting, scroll clamping, and selection.
 pub(crate) fn wrapped_transcript(
     state: &StructuredViewState,
     theme: &Theme,
@@ -852,8 +919,6 @@ fn plan_summary_line(plan: &[super::reducer::PlanLine], theme: &Theme) -> Line<'
     Line::from(spans)
 }
 
-/// Detach a line from whatever transcript strings it borrows so the
-/// wrapped text can outlive the state borrow.
 fn own_line(line: Line<'_>) -> Line<'static> {
     let spans: Vec<Span<'static>> = line
         .spans
@@ -863,11 +928,8 @@ fn own_line(line: Line<'_>) -> Line<'static> {
     Line::from(spans).style(line.style)
 }
 
-/// Word-wrap one styled line into rows of at most `width` columns,
-/// preserving span styles. Char-level flatten + regroup: simple, style
-/// exact, and O(len). Breaks at the last space when one exists in the
-/// current row, hard-breaks otherwise (long paths, hashes). Wide chars
-/// count via their display width.
+/// Word-wrap a styled line at the last space, hard-breaking long words.
+/// Unlike `markdown::wrap_line_into`, tabs are not expanded.
 fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     use unicode_width::UnicodeWidthChar;
 
@@ -876,7 +938,6 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
         out.push(line);
         return;
     }
-    // Flatten to (char, style); wrap; regroup runs of equal style.
     let chars: Vec<(char, Style)> = line
         .spans
         .iter()
@@ -899,9 +960,7 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
         let cw = c.width().unwrap_or(0);
         if row_width + cw > width && !row.is_empty() {
             if let Some(cut) = last_space {
-                // Break at the space: it ends the current row (and is
-                // dropped, like a terminal word wrap); the tail carries
-                // into the next row.
+                // The break space is dropped, like a terminal word wrap.
                 let tail: Vec<(char, Style)> = row.split_off(cut + 1);
                 row.truncate(cut);
                 flush(&mut row, out);
@@ -962,7 +1021,20 @@ fn render_status(
             Style::default().fg(theme.title),
         ));
     }
-    if state.transcript.turn_active {
+    // Label only: the payload can carry the account email, which has no place
+    // in a status bar that lives in screenshots and recordings.
+    if let Some(auth) = state.transcript.auth_status.as_ref() {
+        let color = if auth.kind == AuthStatusKind::None {
+            theme.error
+        } else {
+            theme.hint
+        };
+        spans.push(Span::styled(
+            format!("· {} ", auth.label),
+            Style::default().fg(color),
+        ));
+    }
+    if state.transcript.turn_active || state.transcript.background_agent_active {
         let banner = state.transcript.status_text.as_deref().unwrap_or("working");
         spans.push(Span::styled(
             format!("· ● {banner} "),
@@ -979,9 +1051,9 @@ fn render_status(
             Style::default().fg(theme.running),
         ));
     }
-    if state.transcript.context_primer_pending {
+    if state.transcript.context_primer_pending() {
         spans.push(Span::styled(
-            " context lost; next prompt re-primes ",
+            " context lost; include needed context ",
             Style::default().fg(theme.error),
         ));
     }
@@ -1003,9 +1075,8 @@ fn render_status(
             Style::default().fg(theme.hint),
         ));
     }
-    // Plugin host-rendered slots (#2402): global status-bar segments and this
-    // session's detail badges, tone-colored. Icons / tooltips / hrefs have no
-    // terminal surface and are dropped; malformed entries are skipped.
+    // Plugin status-bar segments and this session's badges; icons, tooltips,
+    // and links have no terminal surface.
     for entry in plugin_ui::global_entries(&state.plugin_ui, UiSlot::StatusBar).chain(
         plugin_ui::session_entries(&state.plugin_ui, UiSlot::DetailBadge, &state.session_id),
     ) {
@@ -1016,10 +1087,7 @@ fn render_status(
             ));
         }
     }
-    // Context-window token meter, mirroring the web composer's usage
-    // chip (`formatTokens` / `formatCost` in Composer.tsx). Rendered
-    // right-aligned in its own reserved slice so a long help hint or
-    // banner can't push it off-screen.
+    // Right-aligned in its own slice so a long hint can't push it off-screen.
     let mut left_area = area;
     if let Some(usage) = &state.transcript.usage {
         let text = format!(" {} ", format_usage(usage));
@@ -1045,7 +1113,11 @@ fn render_status(
         }
     }
     let hint = if active {
-        help_hint(state.focus)
+        help_hint(
+            state.focus,
+            selected_approval_is_choice(state),
+            state.visible_notices().next().is_some(),
+        )
     } else {
         " Enter reply · wheel history "
     };
@@ -1070,14 +1142,10 @@ fn render_status(
     frame.render_widget(para, left_area);
 }
 
-/// Context fill percentage at which the token meter turns alarm-colored.
 const USAGE_WARN_PERCENT: u64 = 90;
 
-/// Rounded context-fill percentage; 0 when the agent reported no window
-/// size (avoids a divide-by-zero on a malformed snapshot). Capped at
-/// 100: some agents report `used > size` transiently (e.g. before a
-/// compaction lands), and "105%" reads as a rendering bug (#2927). The
-/// web composer caps identically.
+/// Rounded context-fill percentage, capped at 100 since agents can report
+/// `used > size` transiently (#2927).
 fn usage_percent(usage: &SessionUsage) -> u64 {
     if usage.size == 0 {
         return 0;
@@ -1085,13 +1153,7 @@ fn usage_percent(usage: &SessionUsage) -> u64 {
     (((usage.used as f64 / usage.size as f64) * 100.0).round() as u64).min(100)
 }
 
-/// Whether the status line should nudge the user toward `/compact`: the
-/// daemon has the reminder on, a usage snapshot has arrived, and it is at
-/// or past the configured percentage. Suppressed while a compaction is
-/// already running, since the nudge would be telling the user to do the
-/// thing they are waiting on. Unlike the web banner this is advisory: it
-/// has no dismiss key and clears itself when the next snapshot lands
-/// under the threshold. See #3253.
+/// Nudge toward `/compact` at the configured fill, except mid-compaction.
 fn compaction_reminder_due(state: &StructuredViewState) -> bool {
     let Some(threshold) = state.compaction_reminder_percent else {
         return false;
@@ -1106,8 +1168,7 @@ fn compaction_reminder_due(state: &StructuredViewState) -> bool {
         .is_some_and(|usage| usage.size > 0 && usage_percent(usage) >= u64::from(threshold))
 }
 
-/// `12.3k/200k (6%) · $0.42`-style usage summary, matching the web
-/// composer's number formatting so the two surfaces read the same.
+/// `12.3k/200k (6%) · $0.42`, matching the web composer.
 fn format_usage(usage: &SessionUsage) -> String {
     let mut out = format!(
         "{}/{} ({}%)",
@@ -1126,8 +1187,6 @@ fn format_usage(usage: &SessionUsage) -> String {
     out
 }
 
-/// Compact token count: `842`, `12.3k`, `1.25M`. Mirrors the web
-/// `formatTokens` thresholds.
 fn format_tokens(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
@@ -1147,8 +1206,6 @@ fn render_composer(
     state: &StructuredViewState,
     active: bool,
 ) {
-    // Leave one open spacer row above the input. Recall / inactive state can
-    // use it for context without drawing a divider across the terminal.
     let context: String = if let Some(recall) = &state.recall {
         let total = state.queue.len();
         let pos = total.saturating_sub(recall.index);
@@ -1211,8 +1268,7 @@ fn render_composer(
     if input_area.width > 0 {
         frame.render_widget(&state.composer, input_area);
     }
-    // Only show the caret when the view is active: a preview must not
-    // plant a blinking cursor in a box the keyboard isn't routed to.
+    // A preview must not plant a caret where the keyboard isn't routed.
     if active
         && matches!(state.focus, Focus::Composer)
         && input_area.width > 0
@@ -1231,9 +1287,6 @@ fn render_composer(
     }
 }
 
-/// User turns use the same open chevron gutter as Codex: one marker on the
-/// first line, continuation indentation on subsequent lines, and no filled
-/// background that would turn the message into a card.
 fn user_message_lines<'a>(text: &str, theme: &Theme) -> Vec<Line<'a>> {
     text.split('\n')
         .enumerate()
@@ -1268,322 +1321,111 @@ fn agent_message_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Render an agent message as markdown-styled transcript lines.
-///
-/// We parse the message with `pulldown-cmark` and map its events to
-/// ratatui `Line`s ourselves (see [`MarkdownBuilder`]). This strips the
-/// raw `#`/`**`/backtick/fence markers and styles content with modifiers
-/// only (BOLD/ITALIC/DIM), so the output tracks the app theme rather than
-/// carrying hardcoded colors. The agent's reply is rendered as plain
-/// body text with no speaker label, the way a native agent prints its
-/// response; the user's turns are what stand out through their chevron gutter, not the
-/// agent's. Empty or marker-only input falls back to a bare `…`.
+/// Agent reply as theme-neutral markdown, or `…` when it renders empty.
 fn render_agent_message_lines(text: &str) -> Vec<Line<'static>> {
-    if text.trim().is_empty() {
-        return vec![Line::from("…".to_string())];
-    }
-    let body = MarkdownBuilder::render(text);
-    if body.is_empty() {
+    let body = crate::tui::markdown::render(text);
+    if text.trim().is_empty() || body.is_empty() {
         return vec![Line::from("…".to_string())];
     }
     body
 }
 
-/// Accumulates `pulldown-cmark` events into themed ratatui lines.
-///
-/// Inline emphasis pushes/pops modifiers on `mod_stack`; the union of the
-/// stack is the active style. Block elements (headings, paragraphs, code
-/// blocks) are separated by a single blank line at top level. Code-block
-/// content is emitted line-by-line with `DIM`, never the ``` fences.
-#[derive(Default)]
-struct MarkdownBuilder {
-    lines: Vec<Line<'static>>,
-    current: Vec<Span<'static>>,
-    mod_stack: Vec<Modifier>,
-    /// One entry per open list; `Some(n)` is the next ordinal of an
-    /// ordered list, `None` an unordered list.
-    list_stack: Vec<Option<u64>>,
-    in_code_block: bool,
-    /// Destination of the innermost open link, so the URL can be appended
-    /// (dimmed, in parens) after the link text on close. `None` when the
-    /// URL matches the visible text (autolinks), which would just repeat.
-    link_dest: Option<String>,
-    /// Visible text accumulated inside the open link, for the
-    /// autolink-repeat check.
-    link_text: String,
-    /// Open-table state: cells of the in-progress row; rows are flushed
-    /// pipe-separated (the TUI has no column layout pass).
-    table_row: Option<Vec<String>>,
-    in_table_head: bool,
-}
-
-impl MarkdownBuilder {
-    fn render(text: &str) -> Vec<Line<'static>> {
-        let mut builder = MarkdownBuilder::default();
-        let options =
-            pulldown_cmark::Options::ENABLE_STRIKETHROUGH | pulldown_cmark::Options::ENABLE_TABLES;
-        for event in pulldown_cmark::Parser::new_ext(text, options) {
-            builder.handle(event);
-        }
-        builder.finish()
-    }
-
-    fn active_modifier(&self) -> Modifier {
-        self.mod_stack
-            .iter()
-            .fold(Modifier::empty(), |acc, m| acc | *m)
-    }
-
-    fn push_span(&mut self, content: &str, extra: Modifier) {
-        let style = Style::default().add_modifier(self.active_modifier() | extra);
-        self.current.push(Span::styled(content.to_string(), style));
-    }
-
-    /// Flush the in-progress line, dropping it if it has no spans.
-    fn flush(&mut self) {
-        let spans = std::mem::take(&mut self.current);
-        if !spans.is_empty() {
-            self.lines.push(Line::from(spans));
-        }
-    }
-
-    /// Flush a code line, preserving blank lines inside the block.
-    fn flush_code_line(&mut self) {
-        let spans = std::mem::take(&mut self.current);
-        self.lines.push(Line::from(spans));
-    }
-
-    /// Insert a blank separator before a new top-level block.
-    fn block_break(&mut self) {
-        if self.list_stack.is_empty() && !self.lines.is_empty() {
-            self.lines.push(Line::default());
-        }
-    }
-
-    fn handle(&mut self, event: pulldown_cmark::Event) {
-        use pulldown_cmark::{Event, Tag, TagEnd};
-        match event {
-            Event::Start(Tag::Heading { .. }) => {
-                self.block_break();
-                self.mod_stack.push(Modifier::BOLD);
-            }
-            Event::End(TagEnd::Heading(_)) => {
-                self.flush();
-                self.mod_stack.pop();
-            }
-            Event::Start(Tag::Paragraph) => self.block_break(),
-            Event::End(TagEnd::Paragraph) => self.flush(),
-            Event::Start(Tag::Strong) => self.mod_stack.push(Modifier::BOLD),
-            Event::Start(Tag::Emphasis) => self.mod_stack.push(Modifier::ITALIC),
-            Event::Start(Tag::Strikethrough) => self.mod_stack.push(Modifier::CROSSED_OUT),
-            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
-                self.mod_stack.pop();
-            }
-            Event::Start(Tag::CodeBlock(_)) => {
-                self.block_break();
-                self.in_code_block = true;
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                self.flush();
-                self.in_code_block = false;
-            }
-            Event::Start(Tag::List(first)) => self.list_stack.push(first),
-            Event::End(TagEnd::List(_)) => {
-                self.list_stack.pop();
-            }
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                self.link_dest = Some(dest_url.to_string());
-                self.link_text.clear();
-            }
-            Event::End(TagEnd::Link) => {
-                // Append the URL (dimmed, in parens) unless it repeats the
-                // visible text, as an autolink or `[url](url)` would.
-                if let Some(dest) = self.link_dest.take() {
-                    let text = std::mem::take(&mut self.link_text);
-                    if dest != text && !dest.is_empty() {
-                        self.push_span(&format!(" ({dest})"), Modifier::DIM);
-                    }
-                }
-            }
-            Event::Start(Tag::Table(_)) => self.block_break(),
-            Event::End(TagEnd::Table) => {
-                self.table_row = None;
-            }
-            Event::Start(Tag::TableHead) => {
-                self.in_table_head = true;
-                self.table_row = Some(Vec::new());
-            }
-            Event::End(TagEnd::TableHead) => {
-                self.flush_table_row(Modifier::BOLD);
-                self.in_table_head = false;
-            }
-            Event::Start(Tag::TableRow) => {
-                self.table_row = Some(Vec::new());
-            }
-            Event::End(TagEnd::TableRow) => {
-                self.flush_table_row(Modifier::empty());
-            }
-            Event::Start(Tag::TableCell) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    row.push(String::new());
-                }
-            }
-            Event::End(TagEnd::TableCell) => {}
-            Event::Start(Tag::Item) => {
-                self.flush();
-                let depth = self.list_stack.len().saturating_sub(1);
-                let indent = "  ".repeat(depth);
-                let marker = match self.list_stack.last_mut() {
-                    Some(Some(n)) => {
-                        let m = format!("{n}. ");
-                        *n += 1;
-                        m
-                    }
-                    _ => "• ".to_string(),
-                };
-                self.current.push(Span::raw(format!("{indent}{marker}")));
-            }
-            Event::End(TagEnd::Item) => self.flush(),
-            Event::Text(text) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    if let Some(cell) = row.last_mut() {
-                        cell.push_str(&text);
-                    }
-                } else if self.in_code_block {
-                    self.push_code_text(&text);
-                } else {
-                    if self.link_dest.is_some() {
-                        self.link_text.push_str(&text);
-                    }
-                    self.push_span(&text, Modifier::empty());
-                }
-            }
-            Event::Code(text) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    if let Some(cell) = row.last_mut() {
-                        cell.push_str(&text);
-                    }
-                } else {
-                    if self.link_dest.is_some() {
-                        self.link_text.push_str(&text);
-                    }
-                    self.push_span(&text, Modifier::DIM);
-                }
-            }
-            // A soft break (single newline in the source) renders as a
-            // real line break, matching how Claude Code prints agent
-            // output: a reply formatted "one item per line" must not
-            // collapse into one wrapped paragraph, which is what the
-            // markdown-standard space treatment did.
-            Event::SoftBreak if !self.in_code_block => self.flush(),
-            Event::HardBreak => self.flush(),
-            Event::Rule => {
-                self.block_break();
-                self.lines.push(Line::from("───"));
-            }
-            _ => {}
-        }
-    }
-
-    /// Flush the in-progress table row as one pipe-separated line. The
-    /// TUI markdown pass is single-sweep, so cells are not column-aligned;
-    /// the head row is bolded and rows keep their reading order.
-    fn flush_table_row(&mut self, extra: Modifier) {
-        let Some(cells) = self.table_row.take() else {
-            return;
-        };
-        if cells.is_empty() {
-            return;
-        }
-        let style = Style::default().add_modifier(self.active_modifier() | extra);
-        self.lines
-            .push(Line::from(Span::styled(cells.join(" │ "), style)));
-    }
-
-    /// Split code-block text on newlines, flushing one styled line per
-    /// row so multi-line blocks render distinctly without fence markers.
-    fn push_code_text(&mut self, text: &str) {
-        let style = Style::default().add_modifier(Modifier::DIM);
-        let mut parts = text.split('\n').peekable();
-        while let Some(part) = parts.next() {
-            if !part.is_empty() {
-                self.current.push(Span::styled(part.to_string(), style));
-            }
-            if parts.peek().is_some() {
-                self.flush_code_line();
-            }
-        }
-    }
-
-    fn finish(mut self) -> Vec<Line<'static>> {
-        self.flush();
-        while self.lines.last().is_some_and(|l| l.spans.is_empty()) {
-            self.lines.pop();
-        }
-        self.lines
-    }
-}
-
-fn transcript_lines<'a>(
-    transcript: &'a AcpTranscript,
+/// Project the daemon's transcript rows to lines. Approvals are control state
+/// shown in the shelf, not here.
+fn transcript_lines(
+    transcript: &AcpTranscript,
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
-) -> Vec<Line<'a>> {
-    let mut out: Vec<Line<'a>> = Vec::new();
-    for row in &transcript.rows {
-        match row {
-            ActivityRow::UserPrompt(text) => {
-                out.extend(user_message_lines(text, theme));
-                out.push(Line::default());
+) -> Vec<Line<'static>> {
+    let rows = &transcript.server_rows;
+    // One card per tool call at its start row; the last terminal row wins.
+    let mut completions: HashMap<&str, &TranscriptRow> = HashMap::new();
+    for row in rows {
+        if is_tool_terminal(row.kind) {
+            if let Some(id) = row.tool_call_id.as_deref() {
+                completions.insert(id, row);
             }
-            ActivityRow::AgentMessage(text) => {
-                out.extend(agent_message_lines(text, theme));
+        }
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let row = &rows[i];
+        match row.kind {
+            TranscriptRowKind::Message => {
+                // Consecutive chunks of one group form one bubble.
+                let group = &row.group_id;
+                let mut text = String::new();
+                while i < rows.len()
+                    && rows[i].kind == TranscriptRowKind::Message
+                    && &rows[i].group_id == group
+                {
+                    text.push_str(&rows[i].text);
+                    i += 1;
+                }
+                out.extend(agent_message_lines(&text, theme));
                 out.push(Line::default());
+                continue;
             }
-            ActivityRow::ToolCall(tool) => {
-                out.extend(render_tool_lines(tool, theme, path_roots));
-                out.push(Line::default());
-            }
-            ActivityRow::Approval(row) => {
-                let (marker, label) = match row.decision {
-                    Some(ApprovalDecision::Allow) => ("✓", "Allowed once"),
-                    Some(ApprovalDecision::AllowAlways) => ("✓", "Always allowed"),
-                    Some(ApprovalDecision::Deny) => ("✕", "Denied"),
-                    Some(ApprovalDecision::Cancelled) => ("·", "Cancelled"),
-                    // Pending approvals live in the modal shelf below the
-                    // transcript, so they do not duplicate here.
-                    None => continue,
+            TranscriptRowKind::UserPrompt => {
+                // Note attachments so an image-only prompt doesn't look empty.
+                let text = if row.attachments.is_empty() {
+                    row.text.clone()
+                } else {
+                    format!("{} [{} attachment(s)]", row.text, row.attachments.len())
                 };
-                out.push(Line::from(Span::styled(
-                    format!("{marker} {label} · {}", row.title),
-                    Style::default().fg(theme.hint),
-                )));
+                out.extend(user_message_lines(&text, theme));
                 out.push(Line::default());
             }
-            ActivityRow::ElicitationAnswer(answers) => {
-                // The user's answer is one of their turns, so it reads
-                // the same as a user prompt: highlighted, no label.
-                for answer in answers {
-                    out.extend(user_message_lines(
-                        &format!("{}: {}", answer.question, answer.answer),
-                        theme,
-                    ));
+            TranscriptRowKind::UserDiffComments => {
+                // The assembled markdown the agent received reads as a prompt.
+                out.extend(user_message_lines(&row.text, theme));
+                out.push(Line::default());
+            }
+            TranscriptRowKind::ToolStart => {
+                let card = tool_card_from_rows(row, &completions);
+                out.extend(render_tool_lines(&card, theme, path_roots));
+                out.push(Line::default());
+            }
+            TranscriptRowKind::ToolComplete
+            | TranscriptRowKind::ToolError
+            | TranscriptRowKind::ToolStopped => {
+                // Rendered with their `tool_start`, which the server always provides.
+            }
+            TranscriptRowKind::ElicitationAnswered => {
+                if row.elicitation_answers.is_empty() {
+                    out.extend(user_message_lines(&row.text, theme));
+                } else {
+                    for answer in &row.elicitation_answers {
+                        out.extend(user_message_lines(
+                            &format!("{}: {}", answer.question, answer.answer),
+                            theme,
+                        ));
+                    }
                 }
                 out.push(Line::default());
             }
-            ActivityRow::Note { kind, text } => {
-                let modifier = match kind {
-                    NoteKind::Info => Modifier::DIM,
-                    NoteKind::Warning => Modifier::BOLD,
-                    NoteKind::Error => Modifier::BOLD,
+            TranscriptRowKind::EmptyOutput
+            | TranscriptRowKind::ContextReset
+            | TranscriptRowKind::SessionCleared
+            | TranscriptRowKind::Compacted
+            | TranscriptRowKind::Summary
+            | TranscriptRowKind::Notice
+            | TranscriptRowKind::Advisory => {
+                let kind = match row.kind {
+                    // Failures the user must see.
+                    TranscriptRowKind::Notice => NoteKind::Error,
+                    TranscriptRowKind::ContextReset | TranscriptRowKind::SessionCleared => {
+                        NoteKind::Warning
+                    }
+                    _ => NoteKind::Info,
                 };
-                out.push(Line::from(Span::styled(
-                    format!("· {text}"),
-                    Style::default().add_modifier(modifier),
-                )));
+                out.push(note_line(kind, &row.text));
                 out.push(Line::default());
             }
         }
+        i += 1;
     }
     if out.is_empty() {
         out.push(Line::from(Span::styled(
@@ -1594,38 +1436,104 @@ fn transcript_lines<'a>(
     out
 }
 
-/// Return the first `max_chars` characters of `s`, or `None` if `s`
-/// is already short enough. Char-safe so an LLM response that places a
-/// multi-byte codepoint at the truncation boundary doesn't panic the
-/// TUI (byte-slicing `&s[..N]` would).
-fn truncate_chars(s: &str, max_chars: usize) -> Option<String> {
-    let mut iter = s.char_indices();
-    if let Some((byte_idx, _)) = iter.nth(max_chars) {
-        Some(s[..byte_idx].to_string())
-    } else {
-        None
+fn is_tool_terminal(kind: TranscriptRowKind) -> bool {
+    matches!(
+        kind,
+        TranscriptRowKind::ToolComplete
+            | TranscriptRowKind::ToolError
+            | TranscriptRowKind::ToolStopped
+    )
+}
+
+fn note_line(kind: NoteKind, text: &str) -> Line<'static> {
+    let modifier = match kind {
+        NoteKind::Info => Modifier::DIM,
+        NoteKind::Warning | NoteKind::Error => Modifier::BOLD,
+    };
+    Line::from(Span::styled(
+        format!("· {text}"),
+        Style::default().add_modifier(modifier),
+    ))
+}
+
+fn tool_card_from_rows(
+    start: &TranscriptRow,
+    completions: &HashMap<&str, &TranscriptRow>,
+) -> ToolCallRow {
+    let tool = start.tool.as_ref();
+    let completed = start
+        .tool_call_id
+        .as_deref()
+        .and_then(|id| completions.get(id))
+        .map(|term| tool_completion_from_row(term));
+    ToolCallRow {
+        name: tool
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| start.text.clone()),
+        kind: tool.map(|t| t.kind.clone()).unwrap_or_default(),
+        args: tool.map(|t| t.args_preview.clone()).unwrap_or_default(),
+        diffs: tool.map(|t| t.diffs.clone()).unwrap_or_default(),
+        completed,
     }
 }
 
-/// Arg-name variants the agents use for a tool's primary path, command,
-/// and edit before/after text. Mirrors the web structured view's `pickStr` key
-/// lists in `web/src/components/acp/ToolCards.tsx` so the TUI and the
-/// dashboard surface the same field across agent versions.
-const PATH_KEYS: &[&str] = &["path", "file_path", "filePath", "filename"];
+/// Only `tool_complete` is ok. An async sub-agent launch hides its internal id.
+fn tool_completion_from_row(term: &TranscriptRow) -> ToolCompletion {
+    let content = if term.async_subagent {
+        "runs in background".to_string()
+    } else if term.output.is_empty() {
+        term.text.clone()
+    } else {
+        summarize_output_blocks(&term.output)
+    };
+    ToolCompletion {
+        outcome: match term.kind {
+            TranscriptRowKind::ToolComplete => ToolOutcome::Ok,
+            TranscriptRowKind::ToolStopped => ToolOutcome::Stopped,
+            _ => ToolOutcome::Error,
+        },
+        content,
+    }
+}
+
+/// Text summary of output blocks; media becomes a placeholder.
+fn summarize_output_blocks(blocks: &[ToolOutputBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ToolOutputBlock::Text { text } => text.clone(),
+            ToolOutputBlock::Image { mime_type, .. } => format!("[image {mime_type}]"),
+            ToolOutputBlock::Audio { mime_type, .. } => format!("[audio {mime_type}]"),
+            ToolOutputBlock::ResourceLink { name, uri, .. } => format!("[link {name}: {uri}]"),
+            ToolOutputBlock::Resource {
+                uri,
+                text: Some(text),
+                ..
+            } => format!("{text}\n[resource {uri}]"),
+            ToolOutputBlock::Resource {
+                uri, text: None, ..
+            } => format!("[resource {uri}]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The first `max_chars` chars, or `None` when already short enough.
+fn truncate_chars(s: &str, max_chars: usize) -> Option<String> {
+    s.char_indices()
+        .nth(max_chars)
+        .map(|(byte_idx, _)| s[..byte_idx].to_string())
+}
+
+/// Edit payload variants shared with the web tool cards.
 const OLD_KEYS: &[&str] = &["old_string", "oldString", "old_str"];
 const NEW_KEYS: &[&str] = &["new_string", "newString", "new_str", "content"];
-const CMD_KEYS: &[&str] = &["command", "cmd", "args"];
 
-/// +/- lines beyond this budget collapse into a "+N more" footer so a
-/// large Edit can't flood the transcript on a narrow terminal.
 const TOOL_DIFF_MAX_LINES: usize = 20;
-/// Read/execute output previews are capped to this many lines.
 const TOOL_PREVIEW_MAX_LINES: usize = 12;
 
-/// Render one tool call. Dispatches on `tool.kind` (the lowercased ACP
-/// `ToolKind`) to a per-kind body; any kind we don't special-case, or
-/// one whose args don't parse into the expected shape, falls back to the
-/// generic one-liner so unknown tools still render.
+/// Successful tools collapse to one line; others get a per-kind body, or the
+/// generic fallback for unknown kinds and unparsable args.
 fn render_tool_lines(
     tool: &ToolCallRow,
     theme: &Theme,
@@ -1634,7 +1542,7 @@ fn render_tool_lines(
     if tool
         .completed
         .as_ref()
-        .is_some_and(|completion| completion.ok)
+        .is_some_and(|completion| completion.outcome == ToolOutcome::Ok)
     {
         return vec![compact_tool_line(tool, theme, path_roots)];
     }
@@ -1643,8 +1551,11 @@ fn render_tool_lines(
         "tool {} · {}",
         match tool.completed.as_ref() {
             None => "▶",
-            Some(c) if c.ok => "✓",
-            Some(_) => "✗",
+            Some(c) => match c.outcome {
+                ToolOutcome::Ok => "✓",
+                ToolOutcome::Stopped => "◼",
+                ToolOutcome::Error => "✗",
+            },
         },
         tool.name
     );
@@ -1653,9 +1564,7 @@ fn render_tool_lines(
         Style::default().add_modifier(Modifier::BOLD),
     )));
 
-    // Structured per-file diffs win over the args-derived compact diff:
-    // they cover multi-file patches (Codex apply_patch) and tools whose
-    // args carry no old/new text. Any tool kind can ship them.
+    // Structured per-file diffs win over args-derived diffs.
     if !tool.diffs.is_empty() {
         lines.extend(render_structured_diffs(&tool.diffs, theme, path_roots));
         return lines;
@@ -1682,14 +1591,7 @@ fn compact_tool_line(
     let target = if let Some(diff) = tool.diffs.first() {
         Some(relative_display_path(&diff.path, path_roots))
     } else {
-        match tool.kind.as_str() {
-            "edit" | "write" | "read" | "delete" | "move" => pick_str(args.as_ref(), PATH_KEYS)
-                .map(|path| relative_display_path(path, path_roots)),
-            "execute" => pick_str(args.as_ref(), CMD_KEYS)
-                .and_then(|command| command.lines().next())
-                .map(ToString::to_string),
-            _ => None,
-        }
+        display_tool_target(&tool.kind, args.as_ref(), path_roots)
     };
     let mut spans = vec![
         Span::styled("✓ ", Style::default().fg(theme.running)),
@@ -1744,9 +1646,6 @@ fn tool_diff_counts(
     (added, removed)
 }
 
-/// Per-file compact diffs from the structured `tool_call.diffs` payload:
-/// each file's (shortened) path followed by its +/- lines, sharing the
-/// same budget as the args-derived diff so a large patch stays bounded.
 fn render_structured_diffs(
     diffs: &[crate::acp::state::DiffPreview],
     theme: &Theme,
@@ -1765,9 +1664,7 @@ fn render_structured_diffs(
     out
 }
 
-/// Parse `args_preview` as a JSON object. Mirrors the web structured view's
-/// `parseJsonObject`: returns `None` for non-object, unparsable, or
-/// truncated payloads so callers fall back to the generic renderer.
+/// `None` for non-object or truncated payloads, like the web `parseJsonObject`.
 fn parse_args_object(args: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
     match serde_json::from_str::<serde_json::Value>(args) {
         Ok(serde_json::Value::Object(map)) => Some(map),
@@ -1775,7 +1672,6 @@ fn parse_args_object(args: &str) -> Option<serde_json::Map<String, serde_json::V
     }
 }
 
-/// First string-valued key from `keys`, mirroring the web `pickStr`.
 fn pick_str<'a>(
     args: Option<&'a serde_json::Map<String, serde_json::Value>>,
     keys: &[&str],
@@ -1787,10 +1683,7 @@ fn pick_str<'a>(
     })
 }
 
-/// Edit/Write: the file path plus a compact line diff built from the
-/// `old_string`/`new_string` (or `content`) args, the same source the
-/// web Edit card uses. `None` when no after-text arg is present (the
-/// generic renderer then handles it).
+/// `None` without an after-text arg, so the generic renderer takes over.
 fn render_edit_body(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
     theme: &Theme,
@@ -1810,8 +1703,7 @@ fn render_edit_body(
     Some(lines)
 }
 
-/// Compact line diff in the style of `src/tui/diff/render.rs`: only the
-/// changed (`+`/`-`) lines, bounded to `TOOL_DIFF_MAX_LINES`.
+/// Only changed lines, capped at `TOOL_DIFF_MAX_LINES`.
 fn diff_lines(old: &str, new: &str, theme: &Theme) -> Vec<Line<'static>> {
     let diff = TextDiff::from_lines(old, new);
     let mut out = Vec::new();
@@ -1820,7 +1712,6 @@ fn diff_lines(old: &str, new: &str, theme: &Theme) -> Vec<Line<'static>> {
         let (sign, style) = match change.tag() {
             ChangeTag::Delete => ("-", Style::default().fg(theme.diff_delete)),
             ChangeTag::Insert => ("+", Style::default().fg(theme.diff_add)),
-            // Context lines carry no signal in the compact card; drop them.
             ChangeTag::Equal => continue,
         };
         if out.len() >= TOOL_DIFF_MAX_LINES {
@@ -1846,7 +1737,6 @@ fn diff_lines(old: &str, new: &str, theme: &Theme) -> Vec<Line<'static>> {
     out
 }
 
-/// Execute: the command plus a bounded preview of its output.
 fn render_execute_body(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
     tool: &ToolCallRow,
@@ -1867,7 +1757,6 @@ fn render_execute_body(
     Some(lines)
 }
 
-/// Read: the file path plus a bounded preview of the read content.
 fn render_read_body(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
     tool: &ToolCallRow,
@@ -1879,7 +1768,6 @@ fn render_read_body(
     Some(lines)
 }
 
-/// Delete: just the target path.
 fn render_delete_body(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
     path_roots: Option<&SessionPathRoots>,
@@ -1888,9 +1776,15 @@ fn render_delete_body(
     Some(vec![Line::from(format!("  {path}"))])
 }
 
-/// Bounded preview of a tool's completion content, shared by the read
-/// and execute cards. Falls back to a status word before completion or
-/// when the agent shipped no body.
+/// A stopped call was closed by the turn-end sweep, not a failure.
+fn empty_output_note(completion: &ToolCompletion) -> &'static str {
+    match completion.outcome {
+        ToolOutcome::Ok => "  (no output)",
+        ToolOutcome::Stopped => "  (stopped when the turn ended)",
+        ToolOutcome::Error => "  (tool failed; press `o` for details)",
+    }
+}
+
 fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
     let Some(completion) = &tool.completed else {
         return vec![Line::from(Span::styled(
@@ -1899,12 +1793,7 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
         ))];
     };
     if completion.content.is_empty() {
-        let msg = if completion.ok {
-            "  (no output)"
-        } else {
-            "  (tool failed; press `o` for details)"
-        };
-        return vec![Line::from(msg.to_string())];
+        return vec![Line::from(empty_output_note(completion).to_string())];
     }
     let mut out = Vec::new();
     let styled = styled_output_lines(&completion.content);
@@ -1925,11 +1814,7 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
     out
 }
 
-/// Tool output as display lines, interpreting ANSI SGR color/style
-/// sequences the way the web execute card does (a `cargo test` or
-/// `eslint` run keeps its colors instead of leaking `\x1b[31m`
-/// escapes). Plain text takes the cheap path untouched; a parse
-/// failure falls back to the raw text rather than dropping output.
+/// Tool output lines with ANSI SGR styling applied, raw text on parse failure.
 fn styled_output_lines(content: &str) -> Vec<Line<'static>> {
     if content.contains('\u{1b}') {
         if let Ok(text) = content.into_text() {
@@ -1939,9 +1824,7 @@ fn styled_output_lines(content: &str) -> Vec<Line<'static>> {
     content.lines().map(|l| Line::from(l.to_string())).collect()
 }
 
-/// Generic one-liner fallback for unknown tool kinds: the truncated args
-/// preview plus a truncated output snapshot. This is the pre-#1702
-/// rendering, preserved verbatim so unrecognized tools are unchanged.
+/// Fallback for unknown kinds: truncated args and output.
 fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if !tool.args.is_empty() {
@@ -1953,12 +1836,7 @@ fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
     }
     if let Some(completion) = &tool.completed {
         if completion.content.is_empty() {
-            let msg = if completion.ok {
-                "  (no output)"
-            } else {
-                "  (tool failed; press `o` for details)"
-            };
-            lines.push(Line::from(msg.to_string()));
+            lines.push(Line::from(empty_output_note(completion).to_string()));
         } else {
             let (body, truncated) = match truncate_chars(&completion.content, 400) {
                 Some(head) => (head, true),
@@ -1978,18 +1856,25 @@ fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
     lines
 }
 
-fn help_hint(focus: Focus) -> &'static str {
+fn selected_approval_is_choice(state: &StructuredViewState) -> bool {
+    let Some(selected) = state.selected_approval.as_deref() else {
+        return false;
+    };
+    state
+        .transcript
+        .pending_approvals
+        .iter()
+        .any(|pending| pending.nonce == selected && pending.choice && !pending.options.is_empty())
+}
+
+fn help_hint(focus: Focus, approval_is_choice: bool, has_notices: bool) -> &'static str {
     match focus {
-        // The composer is the resting state, so keep its hint to the two
-        // things that aren't obvious from the placeholder: how to send
-        // and how to leave. Scrolling is just the wheel / PageUp-Down;
-        // Ctrl+Q leaves the view (Esc interrupts the agent, like native).
         Focus::Composer => " Enter to send · Ctrl+Q to exit ",
-        // Kept to 31 chars, under the 33 this arm had before the pane key was
-        // added: `render_status` only paints the hint when the status row has
-        // `len + 24` columns to spare, so a longer string silently drops the
-        // whole hint (`Ctrl+Q`, the way out, included) on a narrow terminal.
+        // `render_status` drops the hint unless it has `len + 24` spare columns,
+        // so keep these short.
+        Focus::Transcript if has_notices => " x dismiss · scroll · p pane · Ctrl+Q exit ",
         Focus::Transcript => " scroll · p pane · Ctrl+Q exit ",
+        Focus::Approval if approval_is_choice => " a answer · d deny · Esc stop ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
         Focus::Pane => " scroll to read · Esc to close ",
     }
@@ -2000,6 +1885,9 @@ mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
     use crate::acp::client::{DaemonEndpoint, HttpClient};
+    use crate::acp::state::{AvailableCommand, Event, SessionNotice};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn test_state() -> StructuredViewState {
         let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
@@ -2007,28 +1895,136 @@ mod tests {
         StructuredViewState::new("s-1".into(), endpoint, http, None)
     }
 
+    /// #4242: the strip is the TUI's only dismissible advisory surface, and the
+    /// transcript row must outlive a dismissal so the history stays complete.
     #[test]
-    fn queued_strip_height_is_zero_when_empty() {
-        let state = test_state();
+    fn session_notices_render_in_a_strip_and_dismiss_locally() {
+        let mut state = test_state();
+        state.transcript.session_notices = vec![
+            SessionNotice {
+                id: "notice-1".into(),
+                severity: "warning".into(),
+                title: "Model fallback".into(),
+                description: Some("Switched to Sonnet.".into()),
+            },
+            SessionNotice {
+                id: "notice-2".into(),
+                severity: "info".into(),
+                title: "Fast mode turned off".into(),
+                description: None,
+            },
+        ];
+        state
+            .transcript
+            .merge_server_rows(server_rows(&[Event::SessionNotice {
+                severity: "warning".into(),
+                title: "Model fallback".into(),
+                description: Some("Switched to Sonnet.".into()),
+            }]));
+
+        // One strip row per undismissed notice, each with its own close target.
+        let strip_rows = |state: &StructuredViewState| -> Vec<String> {
+            render_rows(state, 80, 24, true)
+                .into_iter()
+                .filter(|row| row.contains('×'))
+                .collect()
+        };
+
+        let rows = strip_rows(&state);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].contains("Model fallback"), "{rows:?}");
+        assert!(rows[1].contains("Fast mode turned off"), "{rows:?}");
+        assert!(
+            help_hint(Focus::Transcript, false, true).contains("x dismiss"),
+            "the key is advertised while a notice is up"
+        );
+
+        state.dismissed_notices.insert("notice-1".into());
+        let rows = strip_rows(&state);
+        assert_eq!(rows.len(), 1, "the dismissed notice leaves the strip");
+        assert!(rows[0].contains("Fast mode turned off"), "{rows:?}");
+        let painted = render_rows(&state, 80, 24, true).join("\n");
+        assert!(
+            painted.contains("· warning: Model fallback: Switched to Sonnet."),
+            "the transcript row survives the dismissal: {painted}"
+        );
+
+        // A narrow terminal clips the text rather than painting under the `×`.
+        let narrow = render_rows(&state, 24, 24, true);
+        assert!(
+            narrow.iter().any(|row| row.contains('×')),
+            "the close target survives a narrow frame: {narrow:?}"
+        );
+
+        // The daemon retiring the notice must not leave the id behind.
+        state.transcript.session_notices.clear();
+        state.prune_dismissed_notices();
+        assert!(state.dismissed_notices.is_empty());
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn joined(lines: &[Line]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    fn render_rows(state: &StructuredViewState, w: u16, h: u16, active: bool) -> Vec<String> {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|f| {
+                render(f, f.area(), &theme, state, active);
+            })
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(w as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn render_dump(state: &StructuredViewState, w: u16, h: u16) -> String {
+        render_rows(state, w, h, true).concat()
+    }
+
+    /// Server transcript rows folded from events, as the daemon ships them.
+    fn server_rows(events: &[Event]) -> Vec<TranscriptRow> {
+        let mut m = crate::acp::transcript::TranscriptModel::new();
+        for (i, e) in events.iter().enumerate() {
+            m.apply_event(i as u64 + 1, e);
+        }
+        m.rows().to_vec()
+    }
+
+    fn cmd(name: &str, desc: &str) -> AvailableCommand {
+        AvailableCommand {
+            name: name.to_string(),
+            description: desc.to_string(),
+            accepts_input: false,
+        }
+    }
+
+    fn usage(used: u64, size: u64) -> SessionUsage {
+        SessionUsage {
+            used,
+            size,
+            cost: None,
+        }
+    }
+
+    #[test]
+    fn layout_heights() {
+        let mut state = test_state();
         assert_eq!(queued_strip_height(&state), 0);
-    }
+        for n in 1..=5 {
+            state.queue.push(format!("q{n}"));
+            assert_eq!(queued_strip_height(&state), 1);
+        }
 
-    #[test]
-    fn queued_strip_stays_one_row_with_any_number_of_entries() {
-        let mut state = test_state();
-        state.queue.push("one".into());
-        assert_eq!(queued_strip_height(&state), 1);
-        state.queue.push("two".into());
-        state.queue.push("three".into());
-        assert_eq!(queued_strip_height(&state), 1);
-        state.queue.push("four".into());
-        state.queue.push("five".into());
-        assert_eq!(queued_strip_height(&state), 1);
-    }
-
-    #[test]
-    fn composer_height_reserves_one_prompt_separator() {
-        let mut state = test_state();
         assert_eq!(composer_height(&state), 2);
         state.composer.insert_newline();
         state.composer.insert_newline();
@@ -2043,609 +2039,459 @@ mod tests {
     }
 
     #[test]
-    fn approval_actions_read_as_key_hints_not_buttons() {
-        let line = approval_actions_line(&Theme::default(), true);
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("a allow once"), "{text:?}");
-        assert!(text.contains("A always"), "{text:?}");
-        assert!(text.contains("d deny"), "{text:?}");
-        assert!(!text.contains('['), "button chrome leaked: {text:?}");
-        assert!(!text.contains(']'), "button chrome leaked: {text:?}");
-    }
+    fn approval_actions_and_hints() {
+        use crate::acp::protocol::ApprovalDecisionWire as Decision;
 
-    /// Wrap one line and return the resulting row count.
-    fn wrap_rows(line: Line<'static>, width: u16) -> usize {
-        let mut out = Vec::new();
-        wrap_line_into(line, width, &mut out);
-        out.len()
+        // Each clickable span must cover exactly its hint and fire its key's
+        // intent; a (choice, want) row per shelf variant.
+        for (choice, want) in [
+            (
+                false,
+                vec![
+                    ("a allow once", Intent::ResolveApproval(Decision::Allow)),
+                    ("A always", Intent::ResolveApproval(Decision::AllowAlways)),
+                    ("d deny", Intent::ResolveApproval(Decision::Deny)),
+                    ("Esc stop", Intent::CancelInFlight),
+                ],
+            ),
+            // A question offers answering instead of the permission vocabulary (#3741).
+            (
+                true,
+                vec![
+                    ("a answer", Intent::ResolveApproval(Decision::Allow)),
+                    ("d deny", Intent::ResolveApproval(Decision::Deny)),
+                    ("Esc stop", Intent::CancelInFlight),
+                ],
+            ),
+        ] {
+            let (line, buttons) = approval_actions_line(&Theme::default(), true, choice);
+            let text = line_text(&line);
+            assert!(
+                !text.contains('[') && !text.contains(']'),
+                "button chrome: {text:?}"
+            );
+            let got: Vec<(String, Intent)> = buttons
+                .into_iter()
+                .map(|(offset, width, intent)| {
+                    let label = text
+                        .chars()
+                        .skip(offset as usize)
+                        .take(width as usize)
+                        .collect();
+                    (label, intent)
+                })
+                .collect();
+            let want: Vec<(String, Intent)> =
+                want.into_iter().map(|(l, i)| (l.to_string(), i)).collect();
+            assert_eq!(got, want, "choice={choice}");
+        }
+        // The preview shelf has no keyboard, so nothing is clickable.
+        assert!(approval_actions_line(&Theme::default(), false, false)
+            .1
+            .is_empty());
+        assert!(help_hint(Focus::Approval, true, false).contains("a answer"));
+        assert!(!help_hint(Focus::Approval, true, false).contains("always"));
+        assert!(help_hint(Focus::Approval, false, false).contains("A always"));
     }
 
     #[test]
-    fn wrap_hard_breaks_unbreakable_text() {
-        // 40 chars, no spaces, at width 10: four hard-broken rows.
-        assert_eq!(wrap_rows(Line::from("a".repeat(40)), 10), 4);
-    }
+    fn wrap_line_rows_and_styles() {
+        let rows = |line: Line<'static>, width| {
+            let mut out = Vec::new();
+            wrap_line_into(line, width, &mut out);
+            out.len()
+        };
+        assert_eq!(rows(Line::from("a".repeat(40)), 10), 4, "hard break");
+        assert_eq!(rows(Line::default(), 10), 1);
+        assert_eq!(rows(Line::from("x"), 0), 1, "zero width floors to 1");
+        // Streaming growth must add rows so stick-to-bottom keeps tracking.
+        assert!(rows(Line::from("a".repeat(200)), 40) > rows(Line::from("a".repeat(20)), 40));
 
-    #[test]
-    fn wrap_keeps_empty_line_as_one_row() {
-        assert_eq!(wrap_rows(Line::default(), 10), 1);
-    }
-
-    #[test]
-    fn wrap_survives_zero_width() {
-        // Degenerate area (e.g. during teardown): the width floors to 1
-        // instead of dividing by zero.
-        assert_eq!(wrap_rows(Line::from("x"), 0), 1);
-    }
-
-    #[test]
-    fn wrap_streaming_growth_adds_rows() {
-        // Regression for the agent-message auto-scroll bug: as a single
-        // logical line grows, the wrapped row count must grow so
-        // `scroll_offset = u16::MAX` keeps tracking the bottom.
-        assert!(
-            wrap_rows(Line::from("a".repeat(200)), 40) > wrap_rows(Line::from("a".repeat(20)), 40)
-        );
-    }
-
-    #[test]
-    fn wrap_breaks_at_word_boundary_and_keeps_styles() {
-        let styled = Style::default().add_modifier(Modifier::BOLD);
+        let bold = Style::default().add_modifier(Modifier::BOLD);
         let line = Line::from(vec![
             Span::raw("hello brave "),
-            Span::styled("new world", styled),
+            Span::styled("new world", bold),
         ]);
         let mut out = Vec::new();
         wrap_line_into(line, 12, &mut out);
-        let texts: Vec<String> = out
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        // Breaks at the space before "new", dropping the break space.
-        assert_eq!(
-            texts,
-            vec!["hello brave".to_string(), "new world".to_string()]
-        );
-        // The bold style survives on the wrapped-away words.
+        let texts: Vec<String> = out.iter().map(line_text).collect();
+        assert_eq!(texts, ["hello brave", "new world"]);
         assert!(out[1]
             .spans
             .iter()
-            .any(|s| s.style == styled && s.content.contains("new")));
+            .any(|s| s.style == bold && s.content.contains("new")));
     }
 
     #[test]
-    fn truncate_chars_returns_none_when_already_short() {
+    fn truncate_chars_is_char_safe() {
         assert_eq!(truncate_chars("hi", 10), None);
+        // Byte slicing used to panic on a multi-byte boundary.
+        assert_eq!(truncate_chars("abc😀def😀", 4).as_deref(), Some("abc😀"));
+        assert_eq!(
+            truncate_chars("日本語のテスト", 3).as_deref(),
+            Some("日本語")
+        );
     }
 
     #[test]
-    fn truncate_chars_respects_utf8_codepoint_boundaries() {
-        // Regression for the byte-slice panic: a 4-byte codepoint
-        // straddling the requested byte boundary used to crash the
-        // TUI with `byte index N is not a char boundary`.
-        // 3 ASCII + 4-byte emoji (U+1F600) repeated; ask for 4 chars.
-        let s = "abc😀def😀ghi😀";
-        let head = truncate_chars(s, 4).expect("longer than 4 chars");
-        assert_eq!(head, "abc😀");
-        assert!(s.chars().count() > 4);
-    }
-
-    #[test]
-    fn truncate_chars_handles_pure_multibyte_input() {
-        // Pure non-ASCII (CJK ideographs are 3 bytes each in UTF-8).
-        let s = "日本語のテスト";
-        let head = truncate_chars(s, 3).expect("longer than 3 chars");
-        assert_eq!(head, "日本語");
-    }
-
-    /// Concatenated text of every span on a line, gutter included.
-    fn line_text(line: &Line) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    /// True if any span on the line carries the given modifier.
-    fn line_has_modifier(line: &Line, modifier: Modifier) -> bool {
-        line.spans
-            .iter()
-            .any(|s| s.style.add_modifier.contains(modifier))
-    }
-
-    /// No span on any rendered line should keep a foreground color, so
-    /// markdown output tracks the app theme instead of tui-markdown's
-    /// built-in palette.
-    fn no_span_has_fg(lines: &[Line]) -> bool {
-        lines
-            .iter()
-            .all(|l| l.spans.iter().all(|s| s.style.fg.is_none()))
-    }
-
-    #[test]
-    fn agent_message_styles_markdown_and_drops_raw_markers() {
+    fn message_lines_render_markdown_and_user_turns() {
         let lines = render_agent_message_lines("# Title\n\n**bold** and `code`");
-        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        // Raw markdown punctuation is consumed by the parser.
-        assert!(!joined.contains('#'), "heading marker leaked: {joined:?}");
-        assert!(!joined.contains("**"), "bold marker leaked: {joined:?}");
-        assert!(!joined.contains('`'), "code-span marker leaked: {joined:?}");
-        // Visible text survives.
-        assert!(joined.contains("Title"));
-        assert!(joined.contains("bold"));
-        assert!(joined.contains("code"));
-        // At least one line carries BOLD styling (heading and/or strong).
-        assert!(
-            lines.iter().any(|l| line_has_modifier(l, Modifier::BOLD)),
-            "expected BOLD styling somewhere: {lines:?}"
-        );
-        // Colors are stripped so the theme owns the palette.
-        assert!(no_span_has_fg(&lines), "fg color leaked: {lines:?}");
-    }
-
-    #[test]
-    fn agent_message_renders_fenced_code_without_fence_lines() {
-        let lines = render_agent_message_lines("before\n\n```\nlet x = 1;\n```\n\nafter");
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        // The ``` fence markers must not appear as literal text.
-        assert!(
-            texts.iter().all(|t| !t.contains("```")),
-            "fence markers leaked: {texts:?}"
-        );
-        // Code content and surrounding prose are present.
-        let joined = texts.join("\n");
-        assert!(joined.contains("let x = 1;"));
-        assert!(joined.contains("before"));
-        assert!(joined.contains("after"));
-    }
-
-    #[test]
-    fn agent_message_honors_single_newlines() {
-        // A reply formatted one-item-per-line must keep its line breaks
-        // (markdown soft breaks), matching how a native agent prints it,
-        // instead of collapsing into one wrapped paragraph.
-        let lines = render_agent_message_lines("1\n2\n3");
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert!(
-            texts.iter().any(|t| t.trim() == "1") && texts.iter().any(|t| t.trim() == "3"),
-            "each source line should render as its own row: {texts:?}"
-        );
-    }
-
-    #[test]
-    fn agent_message_has_no_speaker_label() {
-        // The agent's reply is plain body text: no "aoe" gutter, no
-        // speaker label. The user's turns are what stand out, not this.
-        let lines = render_agent_message_lines("line one\n\nline two");
-        for line in &lines {
-            let text = line_text(line);
-            assert!(
-                !text.trim_start().starts_with("aoe"),
-                "agent message must carry no speaker label: {text:?}"
-            );
+        let text = joined(&lines);
+        for marker in ["#", "**", "`"] {
+            assert!(!text.contains(marker), "{marker} leaked: {text:?}");
         }
-        assert!(line_text(&lines[0]).contains("line one"));
-    }
-
-    #[test]
-    fn user_message_uses_one_chevron_and_no_background() {
-        use crate::tui::styles::load_theme;
-        let theme = load_theme("empire");
-        let lines = user_message_lines("first\nsecond", &theme);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(line_text(&lines[0]), "› first");
-        assert_eq!(line_text(&lines[1]), "  second");
-        assert!(!line_text(&lines[0]).contains("you"));
+        for word in ["Title", "bold", "code"] {
+            assert!(text.contains(word), "{text:?}");
+        }
+        assert!(lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
         assert!(
             lines
                 .iter()
-                .flat_map(|line| &line.spans)
-                .all(|span| span.style.bg.is_none()),
-            "user turns must stay open, not render as filled cards: {lines:?}"
+                .flat_map(|l| &l.spans)
+                .all(|s| s.style.fg.is_none()),
+            "the theme owns colors: {lines:?}"
         );
-    }
 
-    use crate::acp::state::AvailableCommand;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+        let text = joined(&render_agent_message_lines(
+            "before\n\n```\nlet x = 1;\n```\n\nafter",
+        ));
+        assert!(!text.contains("```") && text.contains("let x = 1;") && text.contains("after"));
 
-    fn cmd(name: &str, desc: &str) -> AvailableCommand {
-        AvailableCommand {
-            name: name.to_string(),
-            description: desc.to_string(),
-            accepts_input: false,
-        }
-    }
+        let texts: Vec<String> = render_agent_message_lines("1\n2\n3")
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(texts.iter().any(|t| t.trim() == "1") && texts.iter().any(|t| t.trim() == "3"));
 
-    #[test]
-    fn agent_message_renders_list_markers_without_dashes() {
-        let lines = render_agent_message_lines("- one\n- two\n\n1. first\n2. second");
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        let joined = texts.join("\n");
-        // Bullet items get `•`, not the raw `-` marker.
-        assert!(joined.contains("• one"), "{texts:?}");
-        assert!(joined.contains("• two"), "{texts:?}");
-        // Ordered items keep their numbers.
-        assert!(joined.contains("1. first"), "{texts:?}");
-        assert!(joined.contains("2. second"), "{texts:?}");
-        // No line is just the raw `- ` source marker.
+        let lines = render_agent_message_lines("line one\n\nline two");
         assert!(
-            texts.iter().all(|t| !t.trim_start().starts_with("- ")),
-            "{texts:?}"
+            line_text(&lines[0]).contains("line one"),
+            "no speaker label"
         );
-    }
 
-    #[test]
-    fn agent_message_empty_falls_back_to_placeholder() {
+        let text = joined(&render_agent_message_lines(
+            "- one\n- two\n\n1. first\n2. second",
+        ));
+        for want in ["• one", "• two", "1. first", "2. second"] {
+            assert!(text.contains(want), "{text:?}");
+        }
+
+        let text = joined(&render_agent_message_lines(
+            "see [the docs](https://example.com/d) here <https://example.com>",
+        ));
+        assert!(text.contains("the docs") && text.contains("(https://example.com/d)"));
+        assert!(!text.contains('['));
+        assert_eq!(text.matches("https://example.com").count(), 2, "{text:?}");
+
+        let text = joined(&render_agent_message_lines(
+            "| Name | Value |\n| --- | --- |\n| alpha | 1 |",
+        ));
+        assert!(text.contains("Name │ Value") && text.contains("alpha │ 1"));
+        assert!(!text.contains("---"));
+
         for input in ["", "   ", "\n\n"] {
             let lines = render_agent_message_lines(input);
-            assert_eq!(lines.len(), 1, "input {input:?}");
-            assert_eq!(line_text(&lines[0]), "…");
+            assert_eq!(joined(&lines), "…", "input {input:?}");
         }
+
+        // A user message takes one chevron and no background.
+        let theme = crate::tui::styles::load_theme("empire");
+        let lines = user_message_lines("first\nsecond", &theme);
+        assert_eq!(joined(&lines), "› first\n  second");
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| span.style.bg.is_none()));
     }
 
     #[test]
-    fn picker_lines_window_follows_selection_past_cap() {
+    fn window_follows_selection_past_cap() {
+        // (selected, previous start) -> start: scroll only as far as needed.
+        for (selected, prev, want) in [(0, 0, 0), (9, 0, 7), (5, 4, 4), (3, 4, 3), (7, 9, 7)] {
+            assert_eq!(
+                window_start(selected, 3, 10, prev),
+                want,
+                "{selected} from {prev}"
+            );
+        }
         let cmds: Vec<AvailableCommand> = (0..10).map(|i| cmd(&format!("c{i}"), "")).collect();
-        let refs: Vec<&AvailableCommand> = cmds.iter().collect();
-        // Selecting row 9 with a 3-row cap must keep it inside the window.
-        let lines = picker_lines(&refs, 9, 3);
-        assert_eq!(lines.len(), 3);
-        // Window should be rows 7,8,9; row 9 is the last visible line.
-        let last = &lines[2];
-        let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("/c9"), "expected /c9 in {text:?}");
-        assert!(text.starts_with("▶"), "selected row marked: {text:?}");
+        let area = Rect::new(0, 5, 20, 2);
+        let (first, lines) = window_rows(area, 8, 9, 0, &cmds, |c| vec![format!("/{}", c.name)]);
+        assert_eq!(first, 7);
+        assert_eq!(lines.len(), 3, "capped by the rows above the composer");
+        assert_eq!(line_text(&lines[2]), "▶ /c9");
     }
 
     #[test]
-    fn pane_overlay_paints_its_own_close_hint() {
-        let endpoint = DaemonEndpoint::new(
-            "http://127.0.0.1:8080".to_string(),
-            None,
-            Source::LocalDaemon,
-        );
-        let http = HttpClient::new(endpoint.clone()).expect("http client");
-        let mut state = StructuredViewState::new("sess".to_string(), endpoint, http, None);
+    fn overlays_render() {
+        let mut state = test_state();
         state.focus = Focus::Pane;
         state.plugin_ui = serde_json::from_value(serde_json::json!({
             "entries": [{
-                "plugin_id": "gh", "slot": "pane", "id": "p", "session_id": "sess",
+                "plugin_id": "gh", "slot": "pane", "id": "p", "session_id": "s-1",
                 "payload": {"title": "GitHub", "blocks": [{"kind": "heading", "text": "Checks"}]}
             }],
             "notifications": [],
         }))
         .expect("snapshot");
-
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-        terminal
-            .draw(|f| {
-                render(f, f.area(), &theme, &state, true);
-            })
-            .expect("draw");
-        let dump: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-
-        assert!(dump.contains("GitHub"), "pane content missing");
-        // The status-line hint for this focus sits under the overlay in every
-        // geometry, so the overlay has to carry the way out itself.
+        let dump = render_dump(&state, 80, 24);
+        // The status hint is covered, so the overlay carries the way out.
         assert!(
-            dump.contains("Esc to close"),
-            "close hint missing: {dump:?}"
+            dump.contains("GitHub") && dump.contains("Esc to close"),
+            "{dump:?}"
         );
-    }
 
-    #[test]
-    fn render_shows_slash_picker_overlay() {
-        let endpoint = DaemonEndpoint::new(
-            "http://127.0.0.1:8080".to_string(),
-            None,
-            Source::LocalDaemon,
-        );
-        let http = HttpClient::new(endpoint.clone()).expect("http client");
-        let mut state = StructuredViewState::new("sess".to_string(), endpoint, http, None);
+        let mut state = test_state();
         state.focus = Focus::Composer;
         state.transcript.available_commands =
             vec![cmd("compact", "shrink context"), cmd("clear", "wipe")];
         state.composer.insert_str("/comp");
         assert!(state.slash_picker_open());
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("Commands") && dump.contains("/compact") && dump.contains('▶'));
 
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| {
-                render(f, f.area(), &theme, &state, true);
-            })
-            .expect("draw");
-
-        let buf = terminal.backend().buffer().clone();
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("Commands"), "picker title missing");
-        assert!(dump.contains("/compact"), "command label missing");
-        assert!(dump.contains('▶'), "selection marker missing");
-    }
-
-    #[test]
-    fn short_terminal_keeps_selected_row_visible() {
-        // Regression: on a short terminal the popup's drawable height is
-        // tiny, but the window was sized to SLASH_PICKER_MAX_ROWS, so a
-        // bottom selection painted above the fold and vanished. Render a
-        // 9-row terminal with many commands, select the last, and assert
-        // the selected label + marker actually paint.
-        let endpoint = DaemonEndpoint::new(
-            "http://127.0.0.1:8080".to_string(),
-            None,
-            Source::LocalDaemon,
-        );
-        let http = HttpClient::new(endpoint.clone()).expect("http client");
-        let mut state = StructuredViewState::new("sess".to_string(), endpoint, http, None);
+        // A short terminal must keep the selected last row on screen.
+        let mut state = test_state();
         state.focus = Focus::Composer;
         state.transcript.available_commands =
             (0..12).map(|i| cmd(&format!("cmd{i:02}"), "")).collect();
         state.composer.insert_str("/cmd");
-        assert!(state.slash_picker_open());
-        // Drive the highlight to the last match.
         let last = state.slash_matches().len() - 1;
         state.move_slash_selection(last as i32);
         let last_name = state.slash_matches()[last].name.clone();
+        let dump = render_dump(&state, 40, 9);
+        assert!(dump.contains(&format!("▶ /{last_name}")), "{dump:?}");
+    }
 
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let backend = TestBackend::new(40, 9);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| {
-                render(f, f.area(), &theme, &state, true);
-            })
-            .expect("draw");
-
-        let buf = terminal.backend().buffer().clone();
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(
-            dump.contains('▶'),
-            "selection marker missing on short terminal"
+    #[test]
+    fn mention_picker_lists_matching_files() {
+        let mention_state = |query: &str, files: &[&str]| {
+            let mut state = test_state();
+            state.focus = Focus::Composer;
+            state.composer.insert_str(format!("@{query}"));
+            state.file_index = FileIndex::Loaded {
+                files: files.iter().map(|f| f.to_string()).collect(),
+                truncated: false,
+            };
+            state.mention = Some(super::super::state::MentionSession { selected: 0 });
+            state
+        };
+        let dump = render_dump(
+            &mention_state("", &["src/main.rs", "docs/readme.md"]),
+            80,
+            24,
         );
         assert!(
-            dump.contains(&format!("/{last_name}")),
-            "selected row /{last_name} scrolled off-screen: {dump:?}"
+            dump.contains("Files")
+                && dump.contains("src/main.rs")
+                && dump.contains("docs/readme.md")
+        );
+        let dump = render_dump(
+            &mention_state("src", &["src/main.rs", "zzz/other.md"]),
+            80,
+            24,
+        );
+        assert!(dump.contains("src/main.rs") && !dump.contains("zzz/other.md"));
+    }
+
+    #[test]
+    fn transcript_projection() {
+        use crate::acp::approvals::Nonce;
+        use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome};
+
+        let mut t = AcpTranscript::new("s-1");
+        let answer = |question: &str, answer: &str| ElicitationAnswer {
+            question: question.into(),
+            answer: answer.into(),
+        };
+        // Approvals are control state: a pending one never leaks into the body.
+        t.pending_approvals.push(PendingApproval {
+            nonce: "internal-pending".into(),
+            title: "Read file".into(),
+            kind: "read".into(),
+            args: r#"{"path":"src/lib.rs"}"#.into(),
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+        });
+        t.server_rows = server_rows(&[
+            Event::AgentMessageChunk {
+                text: "working on it".into(),
+            },
+            Event::ElicitationResolved {
+                nonce: Nonce("e-1".into()),
+                outcome: ElicitationOutcome::Accepted,
+                answers: vec![answer("Proceed?", "Yes"), answer("Mode", "Fast")],
+            },
+        ]);
+        let out = joined(&transcript_lines(&t, &Theme::default(), None));
+        for want in ["working on it", "› Proceed?: Yes", "› Mode: Fast"] {
+            assert!(out.contains(want), "{out:?}");
+        }
+        assert!(
+            !out.contains("Read file") && !out.contains("internal-"),
+            "{out:?}"
         );
     }
 
     fn tool_row(kind: &str, args: &str, completion: Option<(bool, &str)>) -> ToolCallRow {
-        use super::super::reducer::ToolCompletion;
         ToolCallRow {
             name: "Tool".into(),
             kind: kind.into(),
             args: args.into(),
             diffs: Vec::new(),
             completed: completion.map(|(ok, content)| ToolCompletion {
-                ok,
+                outcome: if ok {
+                    ToolOutcome::Ok
+                } else {
+                    ToolOutcome::Error
+                },
                 content: content.into(),
             }),
         }
     }
 
+    fn tool_text(row: &ToolCallRow, roots: Option<&SessionPathRoots>) -> String {
+        joined(&render_tool_lines(row, &Theme::default(), roots))
+    }
+
     #[test]
-    fn structured_diffs_win_over_args_derived_diff() {
+    fn edit_diffs_prefer_structured_previews_and_cap_at_budget() {
         use crate::acp::state::DiffPreview;
         let mut row = tool_row(
             "edit",
             r#"{"file_path":"args.rs","old_string":"stale","new_string":"ignored"}"#,
             None,
         );
+        let diff = |path: &str, old: Option<&str>, new: &str| DiffPreview {
+            path: path.into(),
+            old_text: old.map(Into::into),
+            new_text: Some(new.into()),
+            created_at: chrono::Utc::now(),
+        };
         row.diffs = vec![
-            DiffPreview {
-                path: "src/one.rs".into(),
-                old_text: Some("let a = 1;".into()),
-                new_text: Some("let a = 2;".into()),
-                created_at: chrono::Utc::now(),
-            },
-            DiffPreview {
-                path: "src/two.rs".into(),
-                old_text: None,
-                new_text: Some("brand new".into()),
-                created_at: chrono::Utc::now(),
-            },
+            diff("src/one.rs", Some("let a = 1;"), "let a = 2;"),
+            diff("src/two.rs", None, "brand new"),
         ];
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        // Both files render with their own diff bodies.
-        assert!(out.contains("src/one.rs"), "{out:?}");
-        assert!(out.contains("- let a = 1;"), "{out:?}");
-        assert!(out.contains("+ let a = 2;"), "{out:?}");
-        assert!(out.contains("src/two.rs"), "{out:?}");
-        assert!(out.contains("+ brand new"), "{out:?}");
-        // The args-derived diff is superseded, not rendered too.
+        let out = tool_text(&row, None);
+        for want in [
+            "src/one.rs",
+            "- let a = 1;",
+            "+ let a = 2;",
+            "src/two.rs",
+            "+ brand new",
+        ] {
+            assert!(out.contains(want), "{out:?}");
+        }
         assert!(!out.contains("stale"), "{out:?}");
-    }
 
-    #[test]
-    fn markdown_links_show_text_and_dimmed_url() {
-        let lines = render_agent_message_lines("see [the docs](https://example.com/d) here");
-        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(joined.contains("the docs"), "{joined:?}");
-        assert!(joined.contains("(https://example.com/d)"), "{joined:?}");
-        // Raw markdown link punctuation is consumed.
-        assert!(!joined.contains("["), "{joined:?}");
-    }
-
-    #[test]
-    fn markdown_autolink_url_not_repeated() {
-        let lines = render_agent_message_lines("see <https://example.com> here");
-        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert_eq!(
-            joined.matches("https://example.com").count(),
-            1,
-            "autolink URL must not repeat: {joined:?}"
-        );
-    }
-
-    #[test]
-    fn markdown_tables_render_rows_without_raw_pipes_leaking() {
-        let lines = render_agent_message_lines(
-            "| Name | Value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |",
-        );
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        let joined = texts.join("\n");
-        assert!(joined.contains("Name │ Value"), "{texts:?}");
-        assert!(joined.contains("alpha │ 1"), "{texts:?}");
-        assert!(joined.contains("beta │ 2"), "{texts:?}");
-        // The separator row (---) is consumed by the parser.
-        assert!(!joined.contains("---"), "{texts:?}");
-    }
-
-    fn joined(lines: &[Line]) -> String {
-        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
-    }
-
-    #[test]
-    fn transcript_renders_elicitation_answers_as_user_rows() {
-        use crate::acp::elicitations::ElicitationAnswer;
-        let mut t = AcpTranscript::new("s-1");
-        t.rows.push(ActivityRow::ElicitationAnswer(vec![
-            ElicitationAnswer {
-                question: "Proceed?".into(),
-                answer: "Yes".into(),
-            },
-            ElicitationAnswer {
-                question: "Mode".into(),
-                answer: "Fast".into(),
-            },
-        ]));
-        let out = joined(&transcript_lines(&t, &Theme::default(), None));
-        // Rendered as user turns: chevron gutter, no "you" label.
-        assert!(out.contains("Proceed?: Yes"), "{out:?}");
-        assert!(out.contains("Mode: Fast"), "{out:?}");
-        assert!(!out.contains("you  ▸"), "{out:?}");
-    }
-
-    #[test]
-    fn transcript_hides_pending_approval_and_records_resolved_without_nonce() {
-        use super::super::reducer::ApprovalRow;
-
-        let mut t = AcpTranscript::new("s-1");
-        t.rows.push(ActivityRow::Approval(ApprovalRow {
-            nonce: "internal-pending".into(),
-            title: "Read file".into(),
-            kind: "read".into(),
-            args: r#"{"path":"src/lib.rs"}"#.into(),
-            destructive: false,
-            decision: None,
-        }));
-        t.rows.push(ActivityRow::Approval(ApprovalRow {
-            nonce: "internal-resolved".into(),
-            title: "Edit file".into(),
-            kind: "edit".into(),
-            args: r#"{"path":"src/lib.rs"}"#.into(),
-            destructive: false,
-            decision: Some(ApprovalDecision::Allow),
-        }));
-        let out = joined(&transcript_lines(&t, &Theme::default(), None));
-        assert!(
-            !out.contains("Read file"),
-            "pending request duplicated: {out:?}"
-        );
-        assert!(out.contains("Allowed once · Edit file"), "{out:?}");
-        assert!(!out.contains("internal-"), "nonce leaked: {out:?}");
-    }
-
-    #[test]
-    fn edit_kind_renders_added_and_removed_diff_lines() {
-        let row = tool_row(
-            "edit",
-            r#"{"file_path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#,
-            None,
-        );
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        assert!(out.contains("src/a.rs"), "path missing: {out:?}");
-        assert!(
-            out.contains("- let x = 1;"),
-            "removed line missing: {out:?}"
-        );
-        assert!(out.contains("+ let x = 2;"), "added line missing: {out:?}");
-    }
-
-    #[test]
-    fn write_kind_renders_all_inserts_from_content() {
-        let row = tool_row(
-            "write",
-            r#"{"file_path":"new.txt","content":"line one\nline two"}"#,
-            None,
-        );
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        assert!(out.contains("new.txt"));
-        assert!(out.contains("+ line one"), "{out:?}");
-        assert!(out.contains("+ line two"), "{out:?}");
-    }
-
-    #[test]
-    fn edit_diff_caps_at_budget_with_more_footer() {
-        // 30 changed lines exceed TOOL_DIFF_MAX_LINES (20).
+        // An args-derived edit diff caps at its budget with a "more" footer.
         let new_body: String = (0..30).map(|i| format!("line {i}\n")).collect();
         let args =
             serde_json::json!({ "file_path": "big.txt", "old_string": "", "new_string": new_body });
-        let row = tool_row("edit", &args.to_string(), None);
-        let lines = render_tool_lines(&row, &Theme::default(), None);
+        let lines = render_tool_lines(
+            &tool_row("edit", &args.to_string(), None),
+            &Theme::default(),
+            None,
+        );
         let plus = lines
             .iter()
             .filter(|l| line_text(l).trim_start().starts_with("+ "))
             .count();
-        assert_eq!(plus, TOOL_DIFF_MAX_LINES, "diff not capped: {plus}");
-        assert!(
-            joined(&lines).contains("+10 more diff lines"),
-            "missing more-footer: {:?}",
-            joined(&lines)
-        );
+        assert_eq!(plus, TOOL_DIFF_MAX_LINES);
+        assert!(joined(&lines).contains("+10 more diff lines"));
+    }
+
+    /// (kind, args, completion, must contain, must not contain)
+    type ToolCardCase<'a> = (
+        &'a str,
+        &'a str,
+        Option<(bool, &'a str)>,
+        &'a [&'a str],
+        &'a [&'a str],
+    );
+
+    #[test]
+    fn tool_card_bodies() {
+        let cases: &[ToolCardCase] = &[
+            (
+                "edit",
+                r#"{"file_path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#,
+                None,
+                &["src/a.rs", "- let x = 1;", "+ let x = 2;"],
+                &[],
+            ),
+            (
+                "write",
+                r#"{"file_path":"new.txt","content":"line one\nline two"}"#,
+                None,
+                &["new.txt", "+ line one", "+ line two"],
+                &[],
+            ),
+            (
+                "execute",
+                r#"{"command":"ls -la"}"#,
+                Some((true, "file_a\nfile_b")),
+                &["✓ Tool · ls -la"],
+                &["file_a"],
+            ),
+            (
+                "read",
+                r#"{"path":"src/lib.rs"}"#,
+                Some((true, "pub fn main() {}")),
+                &["src/lib.rs"],
+                &["pub fn main()"],
+            ),
+            (
+                "delete",
+                r#"{"path":"old.txt"}"#,
+                Some((true, "")),
+                &["old.txt"],
+                &["+ ", "- "],
+            ),
+            (
+                "fetch",
+                "https://example.com",
+                None,
+                &["$ https://example.com"],
+                &[],
+            ),
+            // Truncated JSON falls back to the generic renderer.
+            (
+                "edit",
+                r#"{"file_path":"a.rs","old_str"#,
+                None,
+                &["$ {\"file_path\""],
+                &[],
+            ),
+            (
+                "fetch",
+                "https://example.com",
+                Some((false, "\u{1b}[32m200 OK\u{1b}[0m")),
+                &["200 OK"],
+                &["\u{1b}"],
+            ),
+        ];
+        for (kind, args, completion, present, absent) in cases {
+            let out = tool_text(&tool_row(kind, args, *completion), None);
+            for want in *present {
+                assert!(out.contains(want), "{kind}: {want:?} missing in {out:?}");
+            }
+            for unwanted in *absent {
+                assert!(
+                    !out.contains(unwanted),
+                    "{kind}: {unwanted:?} leaked in {out:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn successful_execute_collapses_to_command_summary() {
-        let row = tool_row(
-            "execute",
-            r#"{"command":"ls -la"}"#,
-            Some((true, "file_a\nfile_b")),
-        );
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        assert!(out.contains("✓ Tool · ls -la"), "summary missing: {out:?}");
-        assert!(
-            !out.contains("file_a"),
-            "output should be collapsed: {out:?}"
-        );
-    }
-
-    #[test]
-    fn successful_read_collapses_to_path_summary() {
-        let row = tool_row(
-            "read",
-            r#"{"path":"src/lib.rs"}"#,
-            Some((true, "pub fn main() {}")),
-        );
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        assert!(out.contains("src/lib.rs"), "path missing: {out:?}");
-        assert!(
-            !out.contains("pub fn main()"),
-            "content should be collapsed: {out:?}"
-        );
-    }
-
-    #[test]
-    fn delete_kind_renders_only_path() {
-        let row = tool_row("delete", r#"{"path":"old.txt"}"#, Some((true, "")));
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        assert!(out.contains("old.txt"), "path missing: {out:?}");
-        // No diff gutters for a delete.
-        assert!(!out.contains("+ "), "{out:?}");
-        assert!(!out.contains("- "), "{out:?}");
-    }
-
-    fn path_roots() -> SessionPathRoots {
-        SessionPathRoots {
+    fn tool_paths_render_relative_to_session_roots() {
+        let roots = SessionPathRoots {
             id: "s-1".into(),
             project_path: "/Users/me/.aoe/worktrees/feat".into(),
             main_repo_path: Some("/Users/me/repo".into()),
@@ -2653,308 +2499,147 @@ mod tests {
                 name: "api".into(),
                 source_path: "/Users/me/api".into(),
             }],
-        }
-    }
-
-    #[test]
-    fn edit_path_under_worktree_renders_repo_relative() {
-        let row = tool_row(
-            "edit",
-            r#"{"file_path":"/Users/me/.aoe/worktrees/feat/src/a.rs","old_string":"a","new_string":"b"}"#,
-            None,
-        );
-        let roots = path_roots();
-        let out = joined(&render_tool_lines(&row, &Theme::default(), Some(&roots)));
-        assert!(out.contains("src/a.rs"), "relative path missing: {out:?}");
-        assert!(
-            !out.contains("/Users/me/.aoe/worktrees/feat/src/a.rs"),
-            "absolute path leaked: {out:?}"
-        );
-    }
-
-    #[test]
-    fn read_path_under_workspace_repo_renders_repo_prefixed() {
-        let row = tool_row(
-            "read",
-            r#"{"path":"/Users/me/api/src/h.ts"}"#,
-            Some((true, "export const h = 1;")),
-        );
-        let roots = path_roots();
-        let out = joined(&render_tool_lines(&row, &Theme::default(), Some(&roots)));
-        assert!(out.contains("api/src/h.ts"), "repo path missing: {out:?}");
-        assert!(
-            !out.contains("/Users/me/api/src/h.ts"),
-            "absolute path leaked: {out:?}"
-        );
-    }
-
-    #[test]
-    fn delete_path_outside_roots_stays_absolute() {
-        let row = tool_row("delete", r#"{"path":"/etc/hosts"}"#, Some((true, "")));
-        let roots = path_roots();
-        let out = joined(&render_tool_lines(&row, &Theme::default(), Some(&roots)));
-        assert!(
-            out.contains("/etc/hosts"),
-            "absolute fallback missing: {out:?}"
-        );
-    }
-
-    #[test]
-    fn sibling_prefix_path_stays_absolute() {
-        let row = tool_row(
-            "read",
-            r#"{"path":"/Users/me/repo_old/src/lib.rs"}"#,
-            Some((true, "pub fn main() {}")),
-        );
-        let roots = path_roots();
-        let out = joined(&render_tool_lines(&row, &Theme::default(), Some(&roots)));
-        assert!(
-            out.contains("/Users/me/repo_old/src/lib.rs"),
-            "sibling path should stay absolute: {out:?}"
-        );
-    }
-
-    #[test]
-    fn format_tokens_matches_web_thresholds() {
-        assert_eq!(format_tokens(842), "842");
-        assert_eq!(format_tokens(1_000), "1.0k");
-        assert_eq!(format_tokens(9_940), "9.9k");
-        assert_eq!(format_tokens(12_300), "12k");
-        assert_eq!(format_tokens(200_000), "200k");
-        assert_eq!(format_tokens(1_250_000), "1.25M");
-        assert_eq!(format_tokens(12_500_000), "12.5M");
-    }
-
-    #[test]
-    fn format_usage_includes_percent_and_cost() {
-        use crate::acp::state::UsageCost;
-        let usage = SessionUsage {
-            used: 12_300,
-            size: 200_000,
-            cost: Some(UsageCost {
-                amount: 0.4231,
-                currency: "USD".into(),
-            }),
         };
-        assert_eq!(format_usage(&usage), "12k/200k (6%) · $0.4231");
-        let no_cost = SessionUsage {
-            used: 100_000,
-            size: 200_000,
-            cost: None,
-        };
-        assert_eq!(format_usage(&no_cost), "100k/200k (50%)");
-        let eur = SessionUsage {
-            used: 1_000,
-            size: 200_000,
-            cost: Some(UsageCost {
-                amount: 2.5,
-                currency: "EUR".into(),
-            }),
-        };
-        assert_eq!(format_usage(&eur), "1.0k/200k (1%) · 2.50 EUR");
-    }
-
-    #[test]
-    fn usage_percent_survives_zero_size() {
-        let usage = SessionUsage {
-            used: 5,
-            size: 0,
-            cost: None,
-        };
-        assert_eq!(usage_percent(&usage), 0);
-    }
-
-    #[test]
-    fn usage_percent_caps_at_100_when_used_exceeds_size() {
-        // Some agents transiently report used > size (e.g. right before a
-        // compaction lands); "105%" reads as a rendering bug (#2927).
-        let usage = SessionUsage {
-            used: 210_000,
-            size: 200_000,
-            cost: None,
-        };
-        assert_eq!(usage_percent(&usage), 100);
-    }
-
-    #[test]
-    fn status_line_renders_usage_meter() {
-        let mut state = test_state();
-        state.transcript.usage = Some(SessionUsage {
-            used: 12_300,
-            size: 200_000,
-            cost: None,
-        });
-        let dump = render_dump(&state, 80, 24);
-        assert!(dump.contains("12k/200k (6%)"), "usage meter missing");
-    }
-
-    #[test]
-    fn compaction_reminder_gating() {
-        // (threshold, used, size, compacting, expected)
+        let read = |path: &str| format!(r#"{{"path":"{path}"}}"#);
+        // (kind, args, shown, absent)
         let cases = [
-            // Off by default: no threshold configured, never nudge.
-            (None, 190_000, 200_000, false, false),
-            // At and past the threshold both fire; equality counts.
-            (Some(75), 150_000, 200_000, false, true),
-            (Some(75), 190_000, 200_000, false, true),
-            // One point under stays quiet.
-            (Some(75), 148_000, 200_000, false, false),
-            // Suppressed mid-compaction: the nudge would name the running job.
-            (Some(75), 190_000, 200_000, true, false),
-            // A zero-size window means the agent has not reported a real
-            // window yet, so there is no percentage to compare.
-            (Some(75), 0, 0, false, false),
-            // Over-full windows are past any legal threshold.
-            (Some(99), 210_000, 200_000, false, true),
+            (
+                "edit",
+                r#"{"file_path":"/Users/me/.aoe/worktrees/feat/src/a.rs","old_string":"a","new_string":"b"}"#
+                    .to_string(),
+                "src/a.rs",
+                Some("/Users/me/.aoe/worktrees/feat/src/a.rs"),
+            ),
+            ("read", read("/Users/me/api/src/h.ts"), "api/src/h.ts", Some("/Users/me/api/src/h.ts")),
+            ("delete", read("/etc/hosts"), "/etc/hosts", None),
+            // A sibling with a shared prefix is not under the root.
+            ("read", read("/Users/me/repo_old/src/lib.rs"), "/Users/me/repo_old/src/lib.rs", None),
         ];
-        for (threshold, used, size, compacting, expected) in cases {
-            let mut state = test_state();
-            state.compaction_reminder_percent = threshold;
-            state.transcript.compacting = compacting;
-            state.transcript.usage = Some(SessionUsage {
-                used,
-                size,
-                cost: None,
-            });
-            assert_eq!(
-                compaction_reminder_due(&state),
-                expected,
-                "threshold={threshold:?} used={used} size={size} compacting={compacting}"
-            );
+        for (kind, args, shown, absent) in cases {
+            let row = tool_row(kind, &args, (kind != "edit").then_some((true, "x")));
+            let out = tool_text(&row, Some(&roots));
+            assert!(out.contains(shown), "{out:?}");
+            if let Some(absent) = absent {
+                assert!(!out.contains(absent), "{out:?}");
+            }
         }
-
-        // No snapshot at all: enabled but nothing to measure.
-        let mut state = test_state();
-        state.compaction_reminder_percent = Some(75);
-        assert!(!compaction_reminder_due(&state));
-    }
-
-    #[test]
-    fn status_line_renders_compaction_reminder() {
-        let mut state = test_state();
-        state.compaction_reminder_percent = Some(75);
-        state.transcript.usage = Some(SessionUsage {
-            used: 160_000,
-            size: 200_000,
-            cost: None,
-        });
-        let dump = render_dump(&state, 100, 24);
-        assert!(dump.contains("/compact"), "reminder missing: {dump}");
     }
 
     #[test]
     fn execute_output_interprets_ansi_colors() {
-        // Red "FAILED" via SGR: the escape bytes must not leak into the
-        // rendered text, and the color must survive onto the span.
         let row = tool_row(
             "execute",
             r#"{"command":"cargo test"}"#,
             Some((false, "test result: \u{1b}[31mFAILED\u{1b}[0m. 1 failed")),
         );
         let lines = render_tool_lines(&row, &Theme::default(), None);
-        let out = joined(&lines);
-        assert!(!out.contains('\u{1b}'), "escape bytes leaked: {out:?}");
-        assert!(out.contains("FAILED"), "text missing: {out:?}");
-        let red_span = lines.iter().flat_map(|l| &l.spans).find(|s| {
+        assert!(!joined(&lines).contains('\u{1b}'));
+        assert!(lines.iter().flat_map(|l| &l.spans).any(|s| {
             s.content.contains("FAILED") && s.style.fg == Some(ratatui::style::Color::Red)
-        });
-        assert!(red_span.is_some(), "red SGR color dropped: {lines:?}");
+        }));
+        assert_eq!(joined(&styled_output_lines("plain\ntext")), "plain\ntext");
     }
 
     #[test]
-    fn generic_output_interprets_ansi_colors() {
-        let row = tool_row(
-            "fetch",
-            "https://example.com",
-            Some((false, "\u{1b}[32m200 OK\u{1b}[0m")),
-        );
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        assert!(!out.contains('\u{1b}'), "escape bytes leaked: {out:?}");
-        assert!(out.contains("200 OK"), "{out:?}");
-    }
-
-    #[test]
-    fn plain_output_unchanged_by_ansi_path() {
-        let lines = styled_output_lines("plain\ntext");
-        assert_eq!(lines.len(), 2);
-        assert_eq!(line_text(&lines[0]), "plain");
-        assert_eq!(line_text(&lines[1]), "text");
-    }
-
-    #[test]
-    fn running_unknown_kind_falls_back_to_generic_one_liner() {
-        let row = tool_row("fetch", "https://example.com", None);
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        // Generic body shows the raw args prefixed with `$ ` while running.
-        assert!(out.contains("$ https://example.com"), "{out:?}");
-    }
-
-    #[test]
-    fn edit_with_unparsable_args_falls_back_to_generic() {
-        // Truncated JSON (16KB ingest cap can clip mid-object) must not
-        // panic or vanish; it falls through to the generic renderer.
-        let row = tool_row("edit", r#"{"file_path":"a.rs","old_str"#, None);
-        let out = joined(&render_tool_lines(&row, &Theme::default(), None));
-        assert!(out.contains("$ {\"file_path\""), "{out:?}");
-    }
-
-    fn mention_state(query: &str, files: &[&str]) -> StructuredViewState {
-        use super::super::state::MentionSession;
-        let mut state = test_state();
-        state.focus = Focus::Composer;
-        state.composer.insert_str(format!("@{query}"));
-        state.file_index = FileIndex::Loaded {
-            files: files.iter().map(|f| f.to_string()).collect(),
-            truncated: false,
-        };
-        state.mention = Some(MentionSession { selected: 0 });
-        state
-    }
-
-    fn render_rows(state: &StructuredViewState, w: u16, h: u16, active: bool) -> Vec<String> {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| {
-                render(f, f.area(), &theme, state, active);
+    fn usage_formatting() {
+        use crate::acp::state::UsageCost;
+        for (n, want) in [
+            (842, "842"),
+            (1_000, "1.0k"),
+            (9_940, "9.9k"),
+            (12_300, "12k"),
+            (200_000, "200k"),
+            (1_250_000, "1.25M"),
+            (12_500_000, "12.5M"),
+        ] {
+            assert_eq!(format_tokens(n), want);
+        }
+        let cost = |amount, currency: &str| {
+            Some(UsageCost {
+                amount,
+                currency: currency.into(),
             })
-            .expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        buf.content()
-            .chunks(w as usize)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect()
-    }
-
-    fn render_dump(state: &StructuredViewState, w: u16, h: u16) -> String {
-        render_rows(state, w, h, true).concat()
+        };
+        let with_cost = |used, size, cost| SessionUsage { used, size, cost };
+        assert_eq!(
+            format_usage(&with_cost(12_300, 200_000, cost(0.4231, "USD"))),
+            "12k/200k (6%) · $0.4231"
+        );
+        assert_eq!(format_usage(&usage(100_000, 200_000)), "100k/200k (50%)");
+        assert_eq!(
+            format_usage(&with_cost(1_000, 200_000, cost(2.5, "EUR"))),
+            "1.0k/200k (1%) · 2.50 EUR"
+        );
+        assert_eq!(usage_percent(&usage(5, 0)), 0);
+        assert_eq!(usage_percent(&usage(210_000, 200_000)), 100, "#2927");
     }
 
     #[test]
-    fn composer_renders_as_prompt_rail_without_bottom_box() {
-        let state = test_state();
-        let rows = render_rows(&state, 60, 12, true);
+    fn compaction_reminder_gating() {
+        // (threshold, used, size, compacting, expected)
+        let cases = [
+            (None, 190_000, 200_000, false, false),
+            (Some(75), 150_000, 200_000, false, true),
+            (Some(75), 190_000, 200_000, false, true),
+            (Some(75), 148_000, 200_000, false, false),
+            (Some(75), 190_000, 200_000, true, false),
+            (Some(75), 0, 0, false, false),
+            (Some(99), 210_000, 200_000, false, true),
+        ];
+        for (threshold, used, size, compacting, expected) in cases {
+            let mut state = test_state();
+            state.compaction_reminder_percent = threshold;
+            state.transcript.compacting = compacting;
+            state.transcript.usage = Some(usage(used, size));
+            assert_eq!(
+                compaction_reminder_due(&state),
+                expected,
+                "threshold={threshold:?} used={used} size={size} compacting={compacting}"
+            );
+        }
+        let mut state = test_state();
+        state.compaction_reminder_percent = Some(75);
+        assert!(!compaction_reminder_due(&state), "no snapshot yet");
+    }
+
+    #[test]
+    fn status_line_renders_usage_and_reminder() {
+        let mut state = test_state();
+        state.transcript.usage = Some(usage(12_300, 200_000));
+        assert!(render_dump(&state, 80, 24).contains("12k/200k (6%)"));
+
+        let mut state = test_state();
+        state.compaction_reminder_percent = Some(75);
+        state.transcript.usage = Some(usage(160_000, 200_000));
+        assert!(render_dump(&state, 100, 24).contains("/compact"));
+    }
+
+    /// #4001: the banner lights up for a background sub-agent even while the
+    /// main turn is idle.
+    #[test]
+    fn status_line_shows_working_banner_for_a_background_agent_alone() {
+        let mut state = test_state();
+        state.transcript.turn_active = false;
+        state.transcript.background_agent_active = true;
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("working"), "{dump}");
+    }
+
+    #[test]
+    fn full_render_layout() {
+        let rows = render_rows(&test_state(), 60, 12, true);
         let prompt = rows
             .iter()
             .find(|row| row.contains("Message the agent"))
             .expect("prompt row");
-        assert!(
-            prompt.trim_start().starts_with('›') && prompt.contains("Message the agent"),
-            "prompt rail missing: {prompt:?}"
-        );
-        assert!(
-            !prompt.contains('╰'),
-            "composer still has a box: {prompt:?}"
-        );
-        assert!(
-            !prompt.contains('╯'),
-            "composer still has a box: {prompt:?}"
-        );
-    }
+        assert!(prompt.trim_start().starts_with('›'), "{prompt:?}");
+        assert!(!prompt.contains('╰') && !prompt.contains('╯'), "{prompt:?}");
 
-    #[test]
-    fn metadata_card_is_compact_and_transcript_is_unframed() {
+        let rows = render_rows(&test_state(), 60, 12, false);
+        assert!(rows[0].contains("○ s-1"), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("Press Enter to reply")));
+
+        // The metadata card stays compact and the transcript is unframed.
         let mut state = test_state();
         state.transcript.session_title = Some("virtual-wardrobe".into());
         state.transcript.agent_name = Some("codex".into());
@@ -2965,80 +2650,40 @@ mod tests {
             main_repo_path: None,
             workspace_repos: Vec::new(),
         });
-        state
-            .transcript
-            .rows
-            .push(ActivityRow::UserPrompt("Hello.".into()));
-        state
-            .transcript
-            .rows
-            .push(ActivityRow::AgentMessage("What should we build?".into()));
+        state.transcript.server_rows = server_rows(&[
+            Event::UserPromptSent {
+                prompt_id: None,
+                text: "Hello.".into(),
+                attachments: Vec::new(),
+                synthesized: false,
+            },
+            Event::AgentMessageChunk {
+                text: "What should we build?".into(),
+            },
+        ]);
 
         let rows = render_rows(&state, 80, 20, true);
-        let card_right = rows[0]
-            .chars()
-            .position(|ch| ch == '╮')
-            .expect("metadata card right edge");
-        assert!(card_right < 79, "card still spans the viewport: {rows:?}");
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("Agent of Empires · codex")));
-        assert!(rows.iter().any(|row| row.contains("virtual-wardrobe")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("/workspace/virtual-wardrobe")));
-        assert!(rows.iter().any(|row| row.contains("permissions: yolo")));
-
+        let card_right = rows[0].chars().position(|ch| ch == '╮').expect("card edge");
+        assert!(card_right < 79, "card spans the viewport: {rows:?}");
+        for want in [
+            "Agent of Empires · codex",
+            "virtual-wardrobe",
+            "/workspace/virtual-wardrobe",
+            "permissions: yolo",
+            "• What should we build?",
+        ] {
+            assert!(
+                rows.iter().any(|row| row.contains(want)),
+                "{want}: {rows:?}"
+            );
+        }
         let prompt = rows
             .iter()
             .find(|row| row.contains("› Hello."))
             .expect("user turn");
         assert!(
-            !prompt.starts_with('│'),
-            "transcript kept a left frame: {prompt:?}"
+            !prompt.starts_with('│') && !prompt.ends_with('│'),
+            "{prompt:?}"
         );
-        assert!(
-            !prompt.ends_with('│'),
-            "transcript kept a right frame: {prompt:?}"
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("• What should we build?")),
-            "agent gutter missing: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn inactive_header_and_prompt_keep_calm_affordances() {
-        let state = test_state();
-        let rows = render_rows(&state, 60, 12, false);
-        assert!(
-            rows[0].contains("○ s-1"),
-            "preview marker missing: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|row| row.contains("Press Enter to reply")),
-            "entry hint missing: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn render_shows_mention_picker_lists_daemon_files() {
-        // Story 1: the open picker lists files from the (seeded) daemon
-        // index. Empty query lists everything.
-        let state = mention_state("", &["src/main.rs", "docs/readme.md"]);
-        let dump = render_dump(&state, 80, 24);
-        assert!(dump.contains("Files"), "picker title missing: {dump:?}");
-        assert!(dump.contains("src/main.rs"), "file missing: {dump:?}");
-        assert!(dump.contains("docs/readme.md"), "file missing: {dump:?}");
-    }
-
-    #[test]
-    fn render_mention_picker_narrows_to_query() {
-        // Story 1: as the query grows, the list narrows to matches only.
-        let state = mention_state("src", &["src/main.rs", "zzz/other.md"]);
-        let dump = render_dump(&state, 80, 24);
-        assert!(dump.contains("src/main.rs"), "match missing: {dump:?}");
-        assert!(!dump.contains("zzz/other.md"), "non-match leaked: {dump:?}");
     }
 }

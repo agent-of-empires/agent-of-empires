@@ -1,25 +1,9 @@
 import { isCompactionReminderDue, type AcpState } from "../../lib/acpTypes";
 import { useAcpPrefs } from "../../lib/acpPrefs";
 
-/**
- * Banner shown above the structured view composer once the agent's context
- * window passes the configured percentage, offering to run `/compact`. Opt
- * in through `[acp] compaction_reminder`; off by default. See #3253.
- *
- * Unlike the composer's usage chip this renders at every viewport, since
- * mobile is where the chip is hidden (`hidden sm:inline-flex`) and so where
- * a filling window is otherwise invisible.
- *
- * "Compact now" sends the command instead of prefilling the composer:
- * prefill goes through `composerRuntime.setText`, which would silently
- * destroy a draft the user had typed. Losing typed work is worse than a
- * labelled button doing what it says, and compaction leaves the transcript
- * and the event log untouched.
- *
- * Dismiss state lives on the reducer (`dismissCompactionReminder`) rather
- * than component `useState`, so dismissing once survives a session switch,
- * and re-arms on the next context boundary.
- */
+/** Opt-in `/compact` reminder past the configured context usage. Shown at every width
+ *  because mobile hides the usage chip. It sends the command rather than prefilling,
+ *  which would overwrite a typed draft. Dismissal lives in the reducer. */
 interface Props {
   state: Pick<AcpState, "sessionUsage" | "compacting" | "compactionReminderDismissed" | "availableCommands">;
   onCompact: () => void;

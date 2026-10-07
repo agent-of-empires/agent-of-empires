@@ -1,13 +1,4 @@
 //! Async worker RPC handlers for the session-driving plugin API (#2897):
-//! `acp.capabilities.get`, `sessions.create`, `sessions.turn.send`.
-//!
-//! These run on the async runtime (unlike the synchronous
-//! [`crate::plugin::host_api::dispatch`]) because they call into the shared
-//! `SessionService`. Authorization layers, in order: capability grants
-//! (connection context, never payload), host-side approval classification
-//! (`session.unattended` for unattended modes), automation policy limits,
-//! and the service's own invariants (repo trust fail-closed, plugin
-//! ownership on turn delivery, idempotency).
 
 use std::sync::Arc;
 
@@ -21,16 +12,17 @@ use aoe_plugin_api::session::{SessionsCreateRequest, SessionsCreateResponse, Tur
 
 use crate::acp::option_catalog::{AgentOptionEntry, OptionCatalog};
 use crate::acp::state::ConfigOptionCategory;
-use crate::plugin::automation_policy::{classify_mode, AutomationPolicy, ModeDecision};
+use crate::plugin::automation_policy::{
+    classify_mode, AutomationPolicy, ModeDecision, MAX_ACTIVE_PLUGIN_SESSIONS,
+};
 use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
 use crate::server::session_service::{
-    CreateIdempotencyProbe, IdempotencyConflict, SendTurnError, SessionCaller, SessionService,
+    CreateIdempotencyProbe, IdempotencyConflict, SendTurnError, SendTurnRequest, SessionCaller,
+    SessionService,
 };
 use crate::server::session_spawn::StructuredSessionSpec;
 
-/// Upper bound on `extra_project_paths` per create, so one plugin call cannot
-/// trigger an unbounded chain of blocking `canonicalize` calls.
 const MAX_EXTRA_PROJECT_PATHS: usize = 16;
 
 const CAP_ACP_CAPABILITIES_READ: &str = "acp.capabilities.read";
@@ -39,16 +31,19 @@ const CAP_SESSION_CREATE: &str = "session.create";
 const CAP_SESSION_PROMPT: &str = "session.prompt";
 const CAP_SESSION_UNATTENDED: &str = "session.unattended";
 
-/// Everything the session RPCs need, injected into the plugin host at
-/// construction (before any worker launches).
 pub struct SessionRpcDeps {
     pub session_service: Arc<SessionService>,
     pub policy: Arc<AutomationPolicy>,
-    /// The serving profile new sessions are created under.
     pub profile: String,
 }
 
-/// Whether `method` belongs to this module's async dispatch.
+async fn clear_revival_pending(session_service: &SessionService, id: &str) {
+    let mut instances = session_service.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        inst.plugin_revival_pending = false;
+    }
+}
+
 pub(crate) fn handles(method: &str) -> bool {
     matches!(
         method,
@@ -59,9 +54,6 @@ pub(crate) fn handles(method: &str) -> bool {
     )
 }
 
-/// The base capability a session method requires. Exposed so the host can
-/// authorize before consulting the session dependencies, keeping the authz
-/// result identical whether or not the service happens to be wired up.
 pub(crate) fn required_capability(method: &str) -> Option<&'static str> {
     match method {
         "acp.capabilities.get" => Some(CAP_ACP_CAPABILITIES_READ),
@@ -101,8 +93,6 @@ pub(crate) async fn dispatch(
     }
 }
 
-/// Merge the static agent registry with the last advertised option catalog
-/// into the stable public DTO. Pure reads; never launches an agent.
 async fn capabilities_get() -> Result<Value, DispatchError> {
     let catalog = load_catalog().await;
     let mut ids: Vec<String> = crate::acp::AgentRegistry::with_defaults()
@@ -144,8 +134,6 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                             display_name: choice.name.clone(),
                             approval_class: match classify_mode(&id, Some(&choice.value), entry) {
                                 ModeDecision::Class(class) => class,
-                                // Advertised modes always classify; fail
-                                // closed if that invariant ever breaks.
                                 _ => ApprovalClass::Unattended,
                             },
                         })
@@ -165,8 +153,6 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                 .unwrap_or_default();
             thinking.sort_by(|a, b| a.id.cmp(&b.id));
             AcpAgentCapability {
-                // The registry has no display metadata; the id doubles as
-                // the display name until it grows one.
                 display_name: id.clone(),
                 id,
                 catalog_status,
@@ -182,12 +168,6 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
         .map_err(|e| DispatchError::internal(format!("serialize capabilities: {e}")))
 }
 
-/// `acp.capabilities.probe`: populate the option catalog for one agent (or every
-/// currently-undiscovered registry agent when no `agent_id` is given) via a
-/// handshake-only ACP probe, then return the same shape as
-/// `acp.capabilities.get`. Each probe degrades to a no-op on failure, so a
-/// missing adapter or an agent that needs credentials the daemon lacks simply
-/// stays `Undiscovered` instead of erroring the whole call.
 async fn capabilities_probe(params: &Value) -> Result<Value, DispatchError> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -286,7 +266,6 @@ async fn admit_and_create(
     let catalog = load_catalog().await;
     let entry = catalog.agents.get(&req.agent_id);
 
-    // Agent must be a registry agent or one the catalog has observed.
     let known_agent = crate::acp::AgentRegistry::with_defaults()
         .get(&req.agent_id)
         .is_some()
@@ -299,7 +278,6 @@ async fn admit_and_create(
         ));
     }
 
-    // Host-side approval classification; the plugin cannot self-label.
     let class = match classify_mode(&req.agent_id, req.mode_id.as_deref(), entry) {
         ModeDecision::Class(class) => class,
         ModeDecision::UnknownMode => {
@@ -341,8 +319,40 @@ async fn admit_and_create(
         });
     }
 
-    // Model must be advertised when the catalog is discovered; with an
-    // undiscovered catalog it passes through and the adapter arbitrates.
+    let requested_model = req
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(model) = requested_model {
+        let profile = deps.profile.clone();
+        let agent_id = req.agent_id.clone();
+        let pinned = tokio::task::spawn_blocking(move || {
+            crate::acp::pinned_model_for_tool(
+                &crate::session::config::profile_config::resolve_config_or_warn(&profile),
+                &agent_id,
+                None,
+            )
+        })
+        .await
+        .map_err(|e| DispatchError::internal(format!("resolve profile config: {e}")))?;
+        if let Some(pinned) = pinned.filter(|pinned| pinned != model) {
+            return Err(DispatchError {
+                code: codes::INVALID_PARAMS,
+                message: format!(
+                    "model {model:?} is refused: profile {:?} pins {:?} to {pinned:?}",
+                    deps.profile, req.agent_id
+                ),
+                data: Some(serde_json::json!({
+                    "kind": "model_pinned",
+                    "agent_id": req.agent_id,
+                    "model_id": model,
+                    "pinned_model": pinned,
+                })),
+            });
+        }
+    }
+
     if let (Some(model), Some(entry)) = (req.model_id.as_deref(), entry) {
         let advertised = entry.options.iter().any(|opt| {
             opt.category == ConfigOptionCategory::Model
@@ -361,12 +371,6 @@ async fn admit_and_create(
         ctx.require(CAP_SESSION_PROMPT)?;
     }
 
-    // Resolve the project selection into (path, extra_repo_paths, scratch).
-    // No project -> a scratch session (no repo, hence no trust anchor). One or
-    // more projects -> the first is the trust-checked primary repo and the rest
-    // are extra repos. Canonicalize immediately before the trust-checked spawn;
-    // a dangling path is the caller's error. Repo trust itself is enforced
-    // inside the service, fail-closed for plugin callers.
     let primary = req
         .project_path
         .as_deref()
@@ -374,8 +378,6 @@ async fn admit_and_create(
         .filter(|p| !p.is_empty());
     let (project_path, extra_repo_paths, scratch) = match primary {
         None => {
-            // A scratch session has no repo, so extra repos are meaningless and
-            // the builder refuses the combination; reject early and clearly.
             if req.extra_project_paths.iter().any(|p| !p.trim().is_empty()) {
                 return Err(DispatchError::invalid_params(
                     "extra_project_paths requires a project_path; a scratch session takes no extra repos",
@@ -384,8 +386,6 @@ async fn admit_and_create(
             (String::new(), Vec::new(), true)
         }
         Some(primary) => {
-            // Cap the extras before any blocking work so one call cannot tie up
-            // a runtime worker with a long canonicalization chain.
             let extras_in: Vec<String> = req
                 .extra_project_paths
                 .iter()
@@ -399,8 +399,6 @@ async fn admit_and_create(
                 )));
             }
             let primary = primary.to_string();
-            // Filesystem canonicalization is blocking; run it off the async
-            // runtime rather than stalling a worker thread.
             tokio::task::spawn_blocking(move || {
                 let canon = |p: &str| -> Result<String, DispatchError> {
                     std::fs::canonicalize(p)
@@ -432,9 +430,6 @@ async fn admit_and_create(
         worktree_branch: None,
         create_new_branch: false,
         base_branch: None,
-        // The plugin opts into sandboxing; the host resolves the image from its
-        // own config (a plugin cannot pick an image). Sandboxing only contains
-        // the agent, so it rides on session.create.
         sandbox: req.sandbox,
         sandbox_image: None,
         yolo_mode: false,
@@ -442,22 +437,15 @@ async fn admit_and_create(
         extra_args: String::new(),
         command_override: String::new(),
         extra_repo_paths,
+        repo_base_branches: Vec::new(),
         scratch,
-        // The service forces this to Some(false) for plugin callers; set
-        // explicitly anyway so the intent is local.
         trust_hooks: Some(false),
         custom_instruction: None,
-        // Plugin-created sessions have no request-level dispatcher callback
-        // or idempotency key; that surface is REST-only (#3156). Plugin
-        // create-idempotency uses the separate `plugin_create_idempotency`
-        // record below.
         callback_url: None,
         idempotency_key: None,
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,
-        // Set here (not just inside the service) so the idempotency probe below
-        // hashes the same payload the create will.
         pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
@@ -466,12 +454,9 @@ async fn admit_and_create(
         agent_effort: None,
         import_acp_session_id: None,
         fork_seed: None,
+        progress: None,
     };
 
-    // Resolve an idempotent replay/conflict BEFORE charging admission, so a
-    // retry after a lost response returns the prior result without consuming
-    // rate or concurrency capacity (#2897). A brand-new key falls through to
-    // the reservation and create below.
     if let Some(key) = req.idempotency_key.as_deref() {
         match deps
             .session_service
@@ -489,20 +474,20 @@ async fn admit_and_create(
         }
     }
 
+    // Counts sessions the plugin is still actively driving, not every session it has ever
+    // created and kept around for review; a finished run left un-archived (the common case
+    // for a plugin like cron, where past runs are meant to stay inspectable) must not
+    // permanently occupy a concurrency slot.
     let active_sessions = {
         let instances = deps.session_service.instances.read().await;
         instances
             .iter()
             .filter(|i| {
                 i.created_by_plugin.as_deref() == Some(plugin_id)
-                    && !i.is_archived()
-                    && !i.is_snoozed()
-                    && !i.is_trashed()
+                    && i.counts_toward_plugin_session_cap()
             })
             .count()
     };
-    // Held until the create resolves so concurrent different-key creates
-    // cannot overshoot the cap.
     let _reservation = deps.policy.admit_create(plugin_id, active_sessions)?;
 
     let initial_turn_text = req.initial_turn.as_ref().map(|t| t.text.as_str());
@@ -554,18 +539,112 @@ async fn sessions_turn_send(
 
     let result = async {
         deps.policy.admit_turn(&plugin_id)?;
-        deps.session_service
-            .send_turn(
-                &SessionCaller::Plugin {
-                    plugin_id: plugin_id.clone(),
-                },
-                &req.session_id,
-                &req.text,
-                &[],
-                false,
-            )
+        let caller = SessionCaller::Plugin {
+            plugin_id: plugin_id.clone(),
+        };
+        let _submission = deps
+            .session_service
+            .admit_prompt_submission(&caller, &req.session_id)
             .await
-            .map_err(map_send_error)
+            .map_err(|e| map_send_error(e.into()))?;
+
+        // A target not currently counted (archived, snoozed, or not in one of the counted
+        // statuses) re-occupies a slot the instant it becomes counted. Mark it pending here,
+        // atomically with the cap check, under the one `instances` write lock: a plugin could
+        // otherwise create sessions past the cap once idle/archived/snoozed sessions stopped
+        // counting, then turn.send them all back to life at once before any of their statuses
+        // caught up. Cleared by the next real status transition this session gets (see
+        // `apply_status_intent` in `server::acp_events`), not by this RPC call returning:
+        // `send_turn` only queues the prompt, and `Instance.status` itself updates later,
+        // asynchronously, off the ACP event listener. Archived and trashed targets are exempt,
+        // since a prompt never revives them.
+        let marked_pending = {
+            let mut instances = deps.session_service.instances.write().await;
+            let needs_reservation = instances
+                .iter()
+                .find(|i| i.id == req.session_id)
+                .is_some_and(|i| i.ensure_startable().is_ok() && !i.counts_toward_plugin_session_cap());
+            if needs_reservation {
+                let active_sessions = instances
+                    .iter()
+                    .filter(|i| {
+                        i.id != req.session_id
+                            && i.created_by_plugin.as_deref() == Some(plugin_id.as_str())
+                            && i.counts_toward_plugin_session_cap()
+                    })
+                    .count();
+                if active_sessions >= MAX_ACTIVE_PLUGIN_SESSIONS {
+                    return Err(DispatchError::with_kind(
+                        codes::RATE_LIMITED,
+                        "concurrency_limited",
+                        format!(
+                            "plugin {plugin_id} already has {active_sessions} active or pending sessions (limit {MAX_ACTIVE_PLUGIN_SESSIONS})"
+                        ),
+                    ));
+                }
+                if let Some(target) = instances.iter_mut().find(|i| i.id == req.session_id) {
+                    target.plugin_revival_pending = true;
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        let woke_idle_dormant = match deps
+            .session_service
+            .touch_and_wake_on_prompt(&req.session_id, false)
+            .await
+            .idle_dormant()
+        {
+            Ok(woke) => woke,
+            Err(blocked) => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION,
+                    blocked.code(),
+                    blocked.to_string(),
+                ));
+            }
+        };
+        let dispatch = deps
+            .session_service
+            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant, false)
+            .await;
+        if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
+            if !matches!(reason, crate::acp::dispatch::QueueReason::WorkerDown) {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::SERVICE_UNAVAILABLE,
+                    "agent_busy",
+                    "the session's agent is mid-turn; retry when it finishes",
+                ));
+            }
+        }
+        let sent = deps
+            .session_service
+            .send_turn(
+                &caller,
+                &req.session_id,
+                SendTurnRequest {
+                    text: &req.text,
+                    attachments: &[],
+                    woke_idle_dormant,
+                    prompt_id: None,
+                    synthesized: false,
+                    no_revive: false,
+                },
+            )
+            .await;
+        if sent.is_err() && marked_pending {
+            clear_revival_pending(&deps.session_service, &req.session_id).await;
+        }
+        sent.map_err(map_send_error)?;
+        Ok(())
     }
     .await;
 
@@ -611,6 +690,12 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             "worker_not_ready",
             "worker not ready; retry",
         ),
+        // Unreachable: this plugin surface never sets `no_revive`.
+        SendTurnError::RevivalRefused => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "no_revive",
+            "reviving a stopped worker is required",
+        ),
         SendTurnError::Send(e) => DispatchError::internal(format!("prompt forward failed: {e}")),
     }
 }
@@ -619,7 +704,7 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
 mod tests {
     use super::*;
     use crate::plugin::automation_policy::AutomationPolicy;
-    use crate::session::Instance;
+    use crate::session::{Instance, Status};
 
     fn ctx_with(caps: &[&str]) -> PluginRpcContext {
         PluginRpcContext {
@@ -631,20 +716,37 @@ mod tests {
     }
 
     fn test_deps(prior: Vec<Instance>) -> (Arc<SessionRpcDeps>, tempfile::TempDir) {
+        let (deps, _state, dir) = test_deps_with_state(prior);
+        (deps, dir)
+    }
+
+    fn test_deps_with_state(
+        prior: Vec<Instance>,
+    ) -> (
+        Arc<SessionRpcDeps>,
+        Arc<crate::server::AppState>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let session_service = crate::server::test_support::build_test_app_state(prior)
-            .session_service
-            .clone();
+        let state = crate::server::test_support::build_test_app_state(prior);
         let policy =
             Arc::new(AutomationPolicy::open(&dir.path().join("plugin_events.db")).expect("policy"));
         (
             Arc::new(SessionRpcDeps {
-                session_service,
+                session_service: state.session_service.clone(),
                 policy,
                 profile: "test".to_string(),
             }),
+            state,
             dir,
         )
+    }
+
+    fn write_app_config(body: &str) {
+        let path = crate::session::get_app_dir()
+            .expect("isolated app dir")
+            .join("config.toml");
+        std::fs::write(&path, body).expect("write config");
     }
 
     fn kind(e: &DispatchError) -> String {
@@ -656,8 +758,6 @@ mod tests {
             .to_string()
     }
 
-    /// Every method refuses a caller missing its gating capability, before
-    /// touching any state.
     #[tokio::test]
     async fn authz_matrix_capability_gates() {
         let (deps, _dir) = test_deps(Vec::new());
@@ -674,39 +774,77 @@ mod tests {
             assert_eq!(err.code, codes::FORBIDDEN, "{method}");
             assert_eq!(kind(&err), "capability_missing", "{method}");
         }
-        // The wrong capability does not substitute for the right one.
         let wrong = ctx_with(&["session.prompt"]);
         let err = dispatch(&deps, &wrong, "sessions.create", &serde_json::json!({}))
             .await
             .expect_err("session.prompt must not grant sessions.create");
         assert_eq!(err.code, codes::FORBIDDEN);
-    }
 
-    /// An unattended-classified mode needs the distinct session.unattended
-    /// grant; session.create alone is refused with the stable policy kind.
-    /// Uses a trusted-table bypass id so the decision is catalog-independent.
-    #[tokio::test]
-    async fn unattended_mode_requires_the_distinct_grant() {
-        let (deps, _dir) = test_deps(Vec::new());
-        let params = serde_json::json!({
+        let unattended = serde_json::json!({
             "agent_id": "claude",
             "project_path": "/tmp",
             "mode_id": "bypassPermissions",
         });
-        let ctx = ctx_with(&["session.create"]);
-        let err = dispatch(&deps, &ctx, "sessions.create", &params)
-            .await
-            .expect_err("unattended without the grant must be refused");
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.create"]),
+            "sessions.create",
+            &unattended,
+        )
+        .await
+        .expect_err("unattended without the grant must be refused");
         assert_eq!(err.code, codes::POLICY_DENIED);
         assert_eq!(kind(&err), "unattended_grant_required");
     }
 
-    /// A payload smuggling an unknown field (a would-be bypass flag) is
-    /// rejected at decode, before any capability-gated work.
     #[tokio::test]
-    async fn create_rejects_unknown_payload_fields() {
+    async fn invalid_params_are_rejected() {
         let (deps, _dir) = test_deps(Vec::new());
-        let ctx = ctx_with(&["session.create"]);
+        let cases = [
+            (
+                "unknown create field",
+                "session.create",
+                "sessions.create",
+                serde_json::json!({
+                    "agent_id": "claude",
+                    "project_path": "/tmp",
+                    "allow_untrusted": true,
+                }),
+            ),
+            (
+                "scratch session with extra repos",
+                "session.create",
+                "sessions.create",
+                serde_json::json!({ "agent_id": "claude", "extra_project_paths": ["/tmp"] }),
+            ),
+            (
+                "unknown probe param",
+                "acp.capabilities.probe",
+                "acp.capabilities.probe",
+                serde_json::json!({ "bogus": 1 }),
+            ),
+        ];
+        for (label, capability, method, params) in cases {
+            let err = dispatch(&deps, &ctx_with(&[capability]), method, &params)
+                .await
+                .expect_err(label);
+            assert_eq!(err.code, codes::INVALID_PARAMS, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_refuses_a_model_off_the_profile_pin_including_through_a_wrapper() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        write_app_config(
+            "[session.agent_detect_as]\nmy-claude = \"claude\"\n\n\
+             [acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        );
+        crate::acp::option_catalog::record("my-claude", &[], "2026-01-01T00:00:00Z".into())
+            .expect("seed catalog");
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create", "session.unattended"]);
+
         let err = dispatch(
             &deps,
             &ctx,
@@ -714,75 +852,56 @@ mod tests {
             &serde_json::json!({
                 "agent_id": "claude",
                 "project_path": "/tmp",
-                "allow_untrusted": true,
+                "model_id": "claude-other",
             }),
         )
         .await
-        .expect_err("unknown fields must be rejected");
+        .expect_err("a model off the pin must be refused");
         assert_eq!(err.code, codes::INVALID_PARAMS);
-    }
+        assert_eq!(kind(&err), "model_pinned");
+        let data = err.data.expect("typed error data");
+        assert_eq!(data["agent_id"], "claude");
+        assert_eq!(data["model_id"], "claude-other");
+        assert_eq!(data["pinned_model"], "claude-pinned");
 
-    /// The probe RPC decodes params strictly: an unknown field is a client
-    /// error, refused before any spawn work.
-    #[tokio::test]
-    async fn probe_rejects_unknown_params() {
-        let (deps, _dir) = test_deps(Vec::new());
-        let ctx = ctx_with(&["acp.capabilities.probe"]);
-        let err = dispatch(
-            &deps,
-            &ctx,
-            "acp.capabilities.probe",
-            &serde_json::json!({ "bogus": 1 }),
-        )
-        .await
-        .expect_err("unknown probe param must be rejected");
-        assert_eq!(err.code, codes::INVALID_PARAMS);
-    }
+        for params in [
+            serde_json::json!({
+                "agent_id": "claude",
+                "project_path": "/nonexistent/aoe-pin-gate",
+                "model_id": "claude-pinned",
+            }),
+            serde_json::json!({
+                "agent_id": "claude",
+                "project_path": "/nonexistent/aoe-pin-gate",
+            }),
+        ] {
+            let err = dispatch(&deps, &ctx, "sessions.create", &params)
+                .await
+                .expect_err("a missing project path is refused");
+            assert_eq!(err.code, codes::INVALID_PARAMS, "{params}");
+            assert_ne!(kind(&err), "model_pinned", "{params}");
+            assert!(err.message.contains("project_path"), "{}", err.message);
+        }
 
-    /// A scratch create (no project_path) may not carry extra repos: the
-    /// session builder refuses that combination, so the RPC rejects it up front
-    /// with a clear invalid-params error, before any spawn.
-    #[tokio::test]
-    async fn scratch_with_extra_repos_is_rejected() {
-        let (deps, _dir) = test_deps(Vec::new());
-        let ctx = ctx_with(&["session.create"]);
+        // A wrapper agent is held to the pin of the agent it spawns.
         let err = dispatch(
             &deps,
             &ctx,
             "sessions.create",
             &serde_json::json!({
-                "agent_id": "claude",
-                "extra_project_paths": ["/tmp"],
+                "agent_id": "my-claude",
+                "project_path": "/tmp",
+                "model_id": "claude-other",
             }),
         )
         .await
-        .expect_err("scratch + extra repos must be refused");
-        assert_eq!(err.code, codes::INVALID_PARAMS);
+        .expect_err("a model off the base agent's pin must be refused");
+        assert_eq!(kind(&err), "model_pinned", "{}", err.message);
+        let data = err.data.expect("typed error data");
+        assert_eq!(data["agent_id"], "my-claude");
+        assert_eq!(data["pinned_model"], "claude-pinned");
     }
 
-    /// A registry-unknown `agent_id` never spawns anything (the probe bails on
-    /// an unknown agent), so this stays hermetic while still exercising the RPC
-    /// end to end and confirming it returns the capability catalog shape.
-    #[tokio::test]
-    async fn probe_unknown_agent_is_noop_and_returns_catalog() {
-        let (deps, _dir) = test_deps(Vec::new());
-        let ctx = ctx_with(&["acp.capabilities.probe"]);
-        let out = dispatch(
-            &deps,
-            &ctx,
-            "acp.capabilities.probe",
-            &serde_json::json!({ "agent_id": "definitely-not-an-agent-xyz" }),
-        )
-        .await
-        .expect("probe returns the capability catalog");
-        assert!(out.get("agents").is_some());
-    }
-
-    /// A brand-new create at the active-session limit is denied with the stable
-    /// concurrency kind. The idempotency probe runs before admission (see
-    /// `admit_and_create`), so an idempotent retry replays instead of hitting
-    /// this path; the replay/conflict/new resolution itself is unit-tested in
-    /// `server::session_service::tests::probe_resolves_replay_conflict_and_new`.
     #[tokio::test]
     async fn create_at_concurrency_limit_denies_a_new_key() {
         use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
@@ -791,13 +910,12 @@ mod tests {
                 let mut i = Instance::new("scheduled", "/tmp/aoe-2897-project");
                 i.id = format!("sess-{n}");
                 i.created_by_plugin = Some("cron".to_string());
+                i.status = Status::Running;
                 i
             })
             .collect();
         let (deps, _dir) = test_deps(prior);
         let ctx = ctx_with(&["session.create"]);
-        // "claude" with no mode classifies Interactive (reviewed adapter), so no
-        // unattended grant is needed and the request reaches the limit check.
         let err = dispatch(
             &deps,
             &ctx,
@@ -810,10 +928,42 @@ mod tests {
         assert_eq!(kind(&err), "concurrency_limited");
     }
 
-    /// turn.send maps the service's ownership and existence denials to the
-    /// stable error kinds.
     #[tokio::test]
-    async fn turn_send_maps_ownership_and_missing_session() {
+    async fn create_ignores_finished_runs_left_unarchived() {
+        use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
+        // Unlike the denied case above, this path actually persists a session to disk, so it
+        // needs its own app dir: HOME is process-global, and running the full suite races this
+        // against every other test that installs or restores it.
+        let _home = crate::session::test_support::isolate_app_dir();
+        // Past runs default to `Status::Idle` and are kept around, unarchived, for the user
+        // to review; they must not count against the concurrency limit like `sess-1` does.
+        let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)
+            .map(|n| {
+                let mut i = Instance::new("past run", "/tmp/aoe-2897-project");
+                i.id = format!("sess-idle-{n}");
+                i.created_by_plugin = Some("cron".to_string());
+                i
+            })
+            .collect();
+        let mut running = Instance::new("scheduled", "/tmp/aoe-2897-project");
+        running.id = "sess-1".to_string();
+        running.created_by_plugin = Some("cron".to_string());
+        running.status = Status::Running;
+        prior.push(running);
+        let (deps, _dir) = test_deps(prior);
+        let ctx = ctx_with(&["session.create"]);
+        dispatch(
+            &deps,
+            &ctx,
+            "sessions.create",
+            &serde_json::json!({ "agent_id": "claude", "project_path": "/tmp" }),
+        )
+        .await
+        .expect("idle, unarchived history must not occupy a concurrency slot");
+    }
+
+    #[tokio::test]
+    async fn turn_send_maps_ownership_and_missing_session_without_leaking_locks() {
         let mut user_session = Instance::new("user-owned", "/tmp/aoe-2897-project");
         user_session.id = "sess-user".to_string();
         let mut other_session = Instance::new("other-owned", "/tmp/aoe-2897-project");
@@ -837,6 +987,456 @@ mod tests {
             .expect_err("must be refused");
             assert_eq!(err.code, expected_code, "{session}");
             assert_eq!(kind(&err), expected_kind, "{session}");
+        }
+        assert_eq!(
+            deps.session_service.prompt_locks_len().await,
+            0,
+            "an id that was never admitted must not leave a lock-registry entry behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_send_refuses_a_turn_another_submission_already_started() {
+        use std::time::Duration;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("plugin-3649", "/tmp/aoe-3649-plugin");
+        inst.id = "sess-3649".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        inst.created_by_plugin = Some("cron".to_string());
+        let (deps, _dir) = test_deps(vec![inst]);
+        let cmds = deps
+            .session_service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording("sess-3649")
+            .await;
+
+        let winner = deps.session_service.prompt_submission("sess-3649").await;
+        let mut claims = deps.session_service.watch_submission_claims();
+        let context = ctx_with(&["session.prompt"]);
+        let params = serde_json::json!({ "session_id": "sess-3649", "text": "hi" });
+        let send = dispatch(&deps, &context, "sessions.turn.send", &params);
+        tokio::pin!(send);
+        assert!(
+            futures_util::poll!(&mut send).is_pending(),
+            "the contender must reach the held submission lock before deciding"
+        );
+        assert_eq!(claims.try_recv().unwrap(), "sess-3649");
+
+        deps.session_service
+            .acp_supervisor
+            .publish_user_prompt_with_attachments(
+                "sess-3649",
+                "the winning turn".into(),
+                &[],
+                None,
+                false,
+            )
+            .await;
+        drop(winner);
+
+        let err = tokio::time::timeout(Duration::from_secs(10), send)
+            .await
+            .expect("the RPC must finish once the winner releases the session")
+            .expect_err("a turn that cannot start must not report success");
+        assert_eq!(err.code, codes::SERVICE_UNAVAILABLE);
+        assert_eq!(kind(&err), "agent_busy");
+        assert_eq!(
+            *cmds.lock().expect("cmd log mutex poisoned"),
+            Vec::<&'static str>::new(),
+            "nothing may reach the agent behind the running turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_send_refuses_a_foreign_session_in_every_control_state() {
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::BroadcastSink;
+
+        let mut foreign = Instance::new("other-owned", "/tmp/aoe-3685-plugin");
+        foreign.id = "sess-3685".to_string();
+        foreign.view = crate::session::View::Structured;
+        foreign.agent_name = Some("claude".to_string());
+        foreign.created_by_plugin = Some("other-plugin".to_string());
+        let (deps, state, _dir) = test_deps_with_state(vec![foreign]);
+        deps.session_service
+            .acp_supervisor
+            .test_insert_worker("sess-3685")
+            .await;
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        let ctx = ctx_with(&["session.prompt"]);
+
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            assert!(
+                sink.publish_persisted("sess-3685", seq, &event),
+                "publish must reach the event store"
+            );
+        };
+        let prompt = || Event::UserPromptSent {
+            text: "the owner's turn".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+        };
+        for (label, events, expected) in [
+            ("idle", vec![], crate::acp::dispatch::PromptDispatch::Sent),
+            (
+                "busy",
+                vec![prompt()],
+                crate::acp::dispatch::PromptDispatch::Queued {
+                    reason: crate::acp::dispatch::QueueReason::TurnActive,
+                },
+            ),
+            (
+                "cancelling",
+                vec![Event::CancelRequested {
+                    escalates_at: chrono::Utc::now(),
+                }],
+                crate::acp::dispatch::PromptDispatch::Queued {
+                    reason: crate::acp::dispatch::QueueReason::Cancelling,
+                },
+            ),
+            (
+                "compacting",
+                vec![
+                    Event::Stopped {
+                        reason: "cancelled".into(),
+                    },
+                    prompt(),
+                    Event::ConversationCompactionStarted,
+                ],
+                crate::acp::dispatch::PromptDispatch::Queued {
+                    reason: crate::acp::dispatch::QueueReason::Compacting,
+                },
+            ),
+        ] {
+            for event in events {
+                record(event);
+            }
+            assert_eq!(
+                crate::acp::dispatch::decide(
+                    &deps.session_service.fold_control_state("sess-3685").await,
+                    crate::acp::dispatch::WorkerLiveness {
+                        running: true,
+                        idle_dormant: false,
+                        rate_limit_parked: false,
+                    },
+                ),
+                expected,
+                "{label}: the session is not in the state this row exercises"
+            );
+            let err = dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-3685", "text": "hi" }),
+            )
+            .await
+            .expect_err("a foreign session must be refused");
+            assert_eq!(kind(&err), "not_owner", "{label}");
+            assert_eq!(err.code, codes::FORBIDDEN, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_send_wakes_a_parked_session() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        type Park = (&'static str, fn(&mut Instance));
+        let parks: Vec<Park> = vec![
+            ("idle-dormant", |i| i.mark_idle_dormant()),
+            ("snoozed", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+            }),
+            ("stopped by the user, nothing to clear", |_| {}),
+        ];
+        for (label, park) in parks {
+            let mut parked = Instance::new("parked-owned", "/tmp/aoe-3686-plugin");
+            parked.id = "sess-3686".to_string();
+            parked.view = crate::session::View::Structured;
+            parked.agent_name = Some("aoe-no-such-agent-3686".to_string());
+            parked.created_by_plugin = Some("cron".to_string());
+            park(&mut parked);
+            let (deps, state, _dir) = test_deps_with_state(vec![parked]);
+            let ctx = ctx_with(&["session.prompt"]);
+
+            let result = dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-3686", "text": "wake up" }),
+            )
+            .await;
+            if let Err(err) = &result {
+                assert_ne!(
+                    kind(err),
+                    "session_not_found",
+                    "{label}: a parked session is resumed, not reported missing: {err:?}"
+                );
+            }
+            let instances = state.instances.read().await;
+            let inst = instances.iter().find(|i| i.id == "sess-3686").unwrap();
+            assert!(
+                !inst.is_idle_dormant() && !inst.is_archived() && !inst.is_snoozed(),
+                "{label}: the turn clears the park"
+            );
+            assert!(inst.last_accessed_at.is_some(), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_send_denies_reviving_a_parked_session_at_the_concurrency_cap() {
+        use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
+        let _home = crate::session::test_support::isolate_app_dir();
+
+        // A successful wake clears snoozed/idle-dormant, so neither park kind can be treated as
+        // exempt: by the time a later resumability check would see the flag, it is gone. Idle
+        // and Stopped have no such flag to clear, but are just as capable of a dead worker.
+        type Park = (&'static str, fn(&mut Instance));
+        let parks: Vec<Park> = vec![
+            ("snoozed", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+            }),
+            ("idle-dormant", |i| i.mark_idle_dormant()),
+            ("idle", |i| i.status = Status::Idle),
+            ("stopped", |i| i.status = Status::Stopped),
+        ];
+        for (label, park) in parks {
+            let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)
+                .map(|n| {
+                    let mut i = Instance::new("scheduled", "/tmp/aoe-4120-plugin");
+                    i.id = format!("sess-running-{n}");
+                    i.created_by_plugin = Some("cron".to_string());
+                    i.status = Status::Running;
+                    i
+                })
+                .collect();
+
+            let mut resting = Instance::new("parked-owned", "/tmp/aoe-4120-plugin");
+            resting.id = "sess-resting".to_string();
+            resting.view = crate::session::View::Structured;
+            resting.agent_name = Some("aoe-no-such-agent-4120".to_string());
+            resting.created_by_plugin = Some("cron".to_string());
+            park(&mut resting);
+            prior.push(resting);
+
+            let (deps, state, _dir) = test_deps_with_state(prior);
+            let ctx = ctx_with(&["session.prompt"]);
+
+            let err = match dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-resting", "text": "wake up" }),
+            )
+            .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("{label}: reviving into a full plugin quota must be denied"),
+            };
+            assert_eq!(err.code, codes::RATE_LIMITED, "{label}");
+            assert_eq!(kind(&err), "concurrency_limited", "{label}");
+
+            let instances = state.instances.read().await;
+            let inst = instances.iter().find(|i| i.id == "sess-resting").unwrap();
+            let still_parked = match label {
+                "snoozed" => inst.is_snoozed(),
+                "idle-dormant" => inst.is_idle_dormant(),
+                "idle" => inst.status == Status::Idle,
+                "stopped" => inst.status == Status::Stopped,
+                _ => unreachable!("unlisted park kind {label}"),
+            };
+            assert!(
+                still_parked,
+                "{label}: a denied revival must leave the park in place"
+            );
+        }
+    }
+
+    /// #4116: a prompt never wakes an archived or trashed target. It neither consumes nor is
+    /// denied by the cap, leaves no pending mark, and leaves the row untouched.
+    #[tokio::test]
+    async fn turn_send_refuses_a_shelved_target_without_touching_the_cap() {
+        use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
+        let _home = crate::session::test_support::isolate_app_dir();
+
+        let shelves: [(fn(&mut Instance), &str); 2] = [
+            (Instance::archive, "session_archived"),
+            (Instance::trash, "session_trashed"),
+        ];
+        for (shelve, want) in shelves {
+            let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)
+                .map(|n| {
+                    let mut i = Instance::new("scheduled", "/tmp/aoe-4120-plugin");
+                    i.id = format!("sess-running-{n}");
+                    i.created_by_plugin = Some("cron".to_string());
+                    i.status = Status::Running;
+                    i
+                })
+                .collect();
+
+            let mut shelved = Instance::new("parked-owned", "/tmp/aoe-4120-plugin");
+            shelved.id = "sess-shelved".to_string();
+            shelved.view = crate::session::View::Structured;
+            shelved.agent_name = Some("aoe-no-such-agent-4120".to_string());
+            shelved.created_by_plugin = Some("cron".to_string());
+            shelve(&mut shelved);
+            prior.push(shelved.clone());
+
+            let (deps, state, _dir) = test_deps_with_state(prior);
+            let err = dispatch(
+                &deps,
+                &ctx_with(&["session.prompt"]),
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-shelved", "text": "wake up" }),
+            )
+            .await
+            .expect_err("a shelved session must not be woken");
+            assert_eq!(kind(&err), want);
+            let instances = state.instances.read().await;
+            let inst = instances.iter().find(|i| i.id == "sess-shelved").unwrap();
+            assert!(!inst.plugin_revival_pending, "{want}");
+            assert_eq!(inst.archived_at, shelved.archived_at, "{want}");
+            assert_eq!(inst.trashed_at, shelved.trashed_at, "{want}");
+            assert_eq!(inst.last_accessed_at, shelved.last_accessed_at, "{want}");
+            assert!(!state.acp_supervisor.is_running("sess-shelved").await);
+        }
+    }
+
+    /// #4116: a peer that archived the stored row after the cap reservation still releases the
+    /// pending mark, so the refused revival does not hold a slot.
+    #[tokio::test]
+    async fn turn_send_releases_the_pending_mark_when_the_stored_row_was_archived() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut resting = Instance::new("parked-owned", "/tmp/aoe-4116-plugin");
+        resting.id = "sess-resting".to_string();
+        resting.source_profile = "default".to_string();
+        resting.view = crate::session::View::Structured;
+        resting.created_by_plugin = Some("cron".to_string());
+        resting.status = Status::Idle;
+        let mut peer = resting.clone();
+        peer.archive();
+        crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![peer];
+                Ok(())
+            })
+            .unwrap();
+        let (deps, state, _dir) = test_deps_with_state(vec![resting]);
+
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.prompt"]),
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": "sess-resting", "text": "wake up" }),
+        )
+        .await
+        .expect_err("a row archived on disk must not be woken");
+        assert_eq!(kind(&err), "session_archived");
+        let instances = state.instances.read().await;
+        assert!(!instances[0].plugin_revival_pending);
+    }
+
+    /// The atomic property the pending mark exists for: a sibling revival already admitted
+    /// (marked pending under the write lock, but not yet reflected in `status` since nothing
+    /// in this synchronous test drives a real ACP event) must still fill the cap for a second,
+    /// independent `sessions.turn.send` call, exactly as if it were already `Running`.
+    #[tokio::test]
+    async fn turn_send_denies_reviving_a_session_while_a_sibling_is_still_pending() {
+        use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
+        let _home = crate::session::test_support::isolate_app_dir();
+
+        let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS - 1)
+            .map(|n| {
+                let mut i = Instance::new("scheduled", "/tmp/aoe-4120-plugin");
+                i.id = format!("sess-running-{n}");
+                i.created_by_plugin = Some("cron".to_string());
+                i.status = Status::Running;
+                i
+            })
+            .collect();
+
+        let mut already_pending = Instance::new("already-reviving", "/tmp/aoe-4120-plugin");
+        already_pending.id = "sess-already-pending".to_string();
+        already_pending.created_by_plugin = Some("cron".to_string());
+        already_pending.status = Status::Idle;
+        already_pending.plugin_revival_pending = true;
+        prior.push(already_pending);
+
+        let mut resting = Instance::new("parked-owned", "/tmp/aoe-4120-plugin");
+        resting.id = "sess-resting".to_string();
+        resting.view = crate::session::View::Structured;
+        resting.agent_name = Some("aoe-no-such-agent-4120".to_string());
+        resting.created_by_plugin = Some("cron".to_string());
+        resting.status = Status::Idle;
+        prior.push(resting);
+
+        let (deps, state, _dir) = test_deps_with_state(prior);
+        let ctx = ctx_with(&["session.prompt"]);
+
+        let err = match dispatch(
+            &deps,
+            &ctx,
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": "sess-resting", "text": "wake up" }),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a pending-but-not-yet-counted sibling must still fill the cap"),
+        };
+        assert_eq!(err.code, codes::RATE_LIMITED);
+        assert_eq!(kind(&err), "concurrency_limited");
+
+        let instances = state.instances.read().await;
+        let resting = instances.iter().find(|i| i.id == "sess-resting").unwrap();
+        assert!(
+            !resting.plugin_revival_pending,
+            "a denied revival must not mark itself pending"
+        );
+    }
+
+    /// A revival that never reaches `Running` (its worker never comes up, its agent doesn't
+    /// exist, ...) must not hold its slot forever: with no background timer to release it,
+    /// only the explicit clear on `send_turn`'s own failure stands between this and a leak.
+    #[tokio::test]
+    async fn turn_send_clears_the_pending_mark_when_the_revival_itself_fails() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut resting = Instance::new("parked-owned", "/tmp/aoe-4120-plugin");
+        resting.id = "sess-resting".to_string();
+        resting.view = crate::session::View::Structured;
+        resting.agent_name = Some("aoe-no-such-agent-4120".to_string());
+        resting.created_by_plugin = Some("cron".to_string());
+        resting.status = Status::Idle;
+        let (deps, state, _dir) = test_deps_with_state(vec![resting]);
+        let ctx = ctx_with(&["session.prompt"]);
+
+        let result = dispatch(
+            &deps,
+            &ctx,
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": "sess-resting", "text": "wake up" }),
+        )
+        .await;
+
+        let instances = state.instances.read().await;
+        let inst = instances.iter().find(|i| i.id == "sess-resting").unwrap();
+        match result {
+            Err(_) => assert!(
+                !inst.plugin_revival_pending,
+                "a failed revival must not hold its slot forever"
+            ),
+            Ok(_) => assert!(
+                inst.plugin_revival_pending,
+                "a successful revival stays pending until a real status lands"
+            ),
         }
     }
 }

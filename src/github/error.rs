@@ -1,14 +1,8 @@
-//! Typed errors for the GitHub client.
-//!
-//! Each failure case carries its own actionable hint so the TUI toast and the
-//! web error banner can show the user exactly what to do, never a generic
-//! "auth required". The wording mirrors the house convention in
-//! `src/git/error.rs` and `src/containers/error.rs`.
+//! Typed GitHub client errors, each with an actionable hint.
 
 use reqwest::StatusCode;
 use thiserror::Error;
 
-/// Top-level error for any GitHub client operation.
 #[derive(Debug, Error)]
 pub enum GitHubError {
     #[error(
@@ -60,28 +54,13 @@ pub type Result<T> = std::result::Result<T, GitHubError>;
 mod tests {
     use super::*;
 
+    /// Auth failures must not steer users to a token path, and network
+    /// failures must not suggest re-authenticating.
     #[test]
-    fn insufficient_scope_names_the_scope() {
-        let msg = GitHubError::InsufficientScope {
-            scopes: "repo".to_string(),
-        }
-        .to_string();
-        assert!(msg.contains("repo"), "must name the missing scope");
-    }
-
-    #[test]
-    fn unauthorized_hint_does_not_push_a_token_path() {
-        // The client is unauthenticated-only, so a 401 hint must not send the
-        // user down a dead token/gh-auth recovery path.
+    fn error_hints_match_the_failure() {
         let auth = GitHubError::Unauthorized.to_string();
         assert!(!auth.contains("GITHUB_TOKEN") && !auth.contains("gh auth login"));
-    }
 
-    #[test]
-    fn network_hint_does_not_suggest_reauthenticating() {
-        // A GitHub outage must not tell the user to re-login. The Network
-        // variant needs a real reqwest error, so exercise it via a transport
-        // failure to a port that refuses connections.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

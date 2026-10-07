@@ -7,37 +7,18 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 interface Props {
   detail: IncompatibleAgentDetail;
   sessionId: string;
-  /** True when the session runs in a sandbox container. The adapter then
-   *  lives inside the container, so the host `install_command` in `detail`
-   *  is misleading: "Update & restart" installs into the container instead,
-   *  and the copy points at refreshing the image for a durable fix. */
+  /** The adapter lives in a container, so the host install command does not apply. */
   isSandboxed?: boolean;
 }
 
-/** Dedicated full-region replacement for the structured view chat layout when
- *  the per-adapter compatibility check refuses the session. Distinct
- *  from `StartupErrorBanner`, which is a smaller text-based hint
- *  layered on top of the chat for free-form handshake failures. This
- *  screen surfaces the structured detail (installed vs required
- *  version, the exact remediation command) so the user can copy-paste
- *  it into a shell without parsing prose, and offers in-UI recovery:
- *  "Restart agent" respawns the worker (re-running the handshake after a
- *  manual reinstall), and, when the agent is npm-installable and the
- *  `acp.allow_agent_install` setting is on, "Update & restart" runs the
- *  install on the host then respawns. The install is global, so it also
- *  queues every other session blocked on the same adapter for an automatic
- *  respawn (reported as `recovered_sessions`), clearing every red X from
- *  one click. When the setting is off the button is shown disabled with a
- *  hint to enable it in the TUI (it is `local_only`, so the web cannot flip
- *  it). See #2109. */
+/** Replaces the chat when the adapter compatibility check refuses the session. Shows
+ *  the exact remediation, a respawn, and (with `acp.allow_agent_install`, which only the
+ *  TUI can enable) an install that also respawns other sessions blocked on the adapter. */
 export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: Props) {
   const heading = headingFor(detail);
   const summary = summaryFor(detail);
   const installCommand = installCommandFor(detail);
   const autoInstallable = "auto_install" in detail && detail.auto_install;
-  // A host `install_command` never reaches a containerized adapter, so hide
-  // the host copy-paste block for sandboxed sessions and lead with the
-  // container-aware guidance below instead.
   const showHostCommand = installCommand && !isSandboxed;
 
   const { state: respawnState, error: respawnError, respawn } = useRespawnSession(sessionId);

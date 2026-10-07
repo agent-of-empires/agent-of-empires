@@ -18,7 +18,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Reset the safeStorage chokepoint so tests don't leak the matcher/handler.
   configureStorageSync(
     () => false,
     () => {},
@@ -26,7 +25,7 @@ afterEach(() => {
 });
 
 describe("isSyncedKey", () => {
-  it("matches the synced preference keys (exact + dynamic group prefixes)", () => {
+  it("syncs preference keys but not device-local layout, caches, or per-session keys", () => {
     for (const k of [
       "aoe-welcome-seen",
       "aoe.acp.toolDensity.v1",
@@ -42,11 +41,8 @@ describe("isSyncedKey", () => {
       "aoe-group-collapsed-feature",
       "aoe-nested-group-collapsed-x",
     ]) {
-      expect(isSyncedKey(k)).toBe(true);
+      expect(isSyncedKey(k), k).toBe(true);
     }
-  });
-
-  it("excludes device-local layout, caches, and per-session keys", () => {
     for (const k of [
       "aoe-sidebar-width",
       "aoe-split-ratio",
@@ -58,7 +54,7 @@ describe("isSyncedKey", () => {
       "aoe-acp-draft-abc",
       "unrelated",
     ]) {
-      expect(isSyncedKey(k)).toBe(false);
+      expect(isSyncedKey(k), k).toBe(false);
     }
   });
 });
@@ -91,27 +87,14 @@ describe("hydrateWebUiStateFromServer", () => {
     expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-welcome-seen": "1" });
   });
 
-  it("does NOT backfill (resurrect) local-only keys once the server is non-empty", async () => {
-    // The server has data (already synced once). A local-only key here can mean
-    // "deleted on another device", so it must not be pushed back up.
+  it("server values win and local-only keys are not resurrected once the server is non-empty", async () => {
+    localStorage.setItem("aoe-sidebar-axis", "repo");
     localStorage.setItem("aoe-welcome-seen", "1");
     getWebUiState.mockResolvedValue({ "aoe-sidebar-axis": "group" });
 
     await hydrateWebUiStateFromServer();
 
-    // Server value applied; no backfill.
     expect(localStorage.getItem("aoe-sidebar-axis")).toBe("group");
-    expect(patchWebUiState).not.toHaveBeenCalled();
-  });
-
-  it("server values win over a differing local value", async () => {
-    localStorage.setItem("aoe-sidebar-axis", "repo");
-    getWebUiState.mockResolvedValue({ "aoe-sidebar-axis": "group" });
-
-    await hydrateWebUiStateFromServer();
-
-    expect(localStorage.getItem("aoe-sidebar-axis")).toBe("group");
-    // Nothing to backfill: the only synced key is already on the server.
     expect(patchWebUiState).not.toHaveBeenCalled();
   });
 

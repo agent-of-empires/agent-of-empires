@@ -229,6 +229,16 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
         hex(readable_on(brand_ramp[5])),
     );
 
+    // Frame around the open session's sidebar row. It is a hairline over
+    // the row fill, so it has to clear the WCAG 1.4.11 non-text floor
+    // against that fill and the surrounding background. Most accents
+    // already do; the rest lift toward the background's readable pole
+    // until they clear it.
+    css.insert(
+        "--color-session-active".into(),
+        hex(active_frame(accent, bg, elevated_2)),
+    );
+
     // Accent ramp anchored on theme.terminal_border (the existing
     // teal-style anchor used by the TUI's accent surface), so secondary
     // affordances like branch chips still read as the theme's secondary
@@ -259,6 +269,16 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-status-idle".into(), hex(theme.idle));
     css.insert("--color-status-unread".into(), hex(theme.unread));
     css.insert("--color-status-error".into(), hex(theme.error));
+    // Some theme reds are a hue, not readable text, on the surfaces below.
+    css.insert(
+        "--color-status-error-text".into(),
+        hex(lift_until(
+            theme.error,
+            bg,
+            &[bg, elevated_1],
+            TEXT_CONTRAST_RATIO,
+        )),
+    );
     css.insert(
         "--color-status-starting".into(),
         hex(mix(theme.waiting, BLACK, 0.1)),
@@ -287,6 +307,7 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-terminal-active".into(), hex(theme.terminal_active));
     css.insert("--color-branch".into(), hex(theme.branch));
     css.insert("--color-sandbox".into(), hex(theme.sandbox));
+    css.insert("--color-favorite".into(), hex(theme.favorite));
 
     CssVarProjection { css_vars: css }
 }
@@ -391,6 +412,45 @@ fn rgba(c: Color, alpha: f32) -> String {
     format!("rgba({r}, {g}, {b}, {:.2})", alpha.clamp(0.0, 1.0))
 }
 
+/// WCAG 1.4.11 floor for non-text UI indicators.
+const NON_TEXT_CONTRAST_RATIO: f32 = 3.0;
+const TEXT_CONTRAST_RATIO: f32 = 4.5;
+
+/// Alpha of the multi-selection tint the sidebar lays under a row that is
+/// open and selected at once (`bg-brand-500/15` in
+/// `web/src/lib/sessionRowChrome.ts`). The tint is the accent itself, so it
+/// pulls the fill toward the frame and has to be part of the floor check.
+const SELECTION_TINT_ALPHA: f32 = 0.15;
+
+/// The accent, lifted toward `bg`'s readable pole only as far as it takes
+/// to clear [`NON_TEXT_CONTRAST_RATIO`] against every surface the frame can
+/// sit on: `bg`, `fill`, and `fill` under the selection tint. The pole is
+/// measured rather than taken from the declared appearance, so a theme whose
+/// `appearance` disagrees with its background still lifts the right way.
+fn active_frame(accent: Color, bg: Color, fill: Color) -> Color {
+    let surfaces = [bg, fill, composite(accent, fill, SELECTION_TINT_ALPHA)];
+    lift_until(accent, bg, &surfaces, NON_TEXT_CONTRAST_RATIO)
+}
+
+/// `color` mixed toward `bg`'s readable pole in 10% steps until it clears
+/// `floor` against every surface.
+fn lift_until(color: Color, bg: Color, surfaces: &[Color], floor: f32) -> Color {
+    let pole = readable_on(bg);
+    (0..=10)
+        .map(|step| mix(color, pole, step as f32 / 10.0))
+        .find(|c| surfaces.iter().all(|s| contrast_ratio(*c, *s) >= floor))
+        .unwrap_or(pole)
+}
+
+/// `fg` at `alpha` over an opaque `bg`, matching how the browser composites
+/// a Tailwind `/NN` opacity modifier.
+fn composite(fg: Color, bg: Color, alpha: f32) -> Color {
+    let (fr, fg_g, fb) = rgb_components(fg);
+    let (br, bg_g, bb) = rgb_components(bg);
+    let channel = |f: u8, b: u8| ((f as f32 * alpha) + (b as f32 * (1.0 - alpha))).round() as u8;
+    Color::Rgb(channel(fr, br), channel(fg_g, bg_g), channel(fb, bb))
+}
+
 fn readable_on(bg: Color) -> Color {
     if contrast_ratio(BLACK, bg) >= contrast_ratio(WHITE, bg) {
         BLACK
@@ -421,51 +481,14 @@ mod tests {
     use crate::tui::styles::builtin_theme_names;
 
     #[test]
-    fn resolve_all_builtins() {
+    fn resolve_builtins_and_fallback() {
         for name in builtin_theme_names() {
             let r = resolve_theme(name);
             assert_eq!(r.name, name);
             assert_eq!(r.source, ResolvedThemeSource::Builtin);
-            assert!(
-                r.web.css_vars.contains_key("--color-surface-900"),
-                "{name}: web projection missing surface-900"
-            );
-            assert!(
-                r.terminal.css_vars.contains_key("--term-bg"),
-                "{name}: terminal projection missing term-bg"
-            );
-            assert!(
-                !r.syntax.shiki_theme.is_empty(),
-                "{name}: shiki theme empty"
-            );
-        }
-    }
-
-    #[test]
-    fn catppuccin_latte_resolves_as_light() {
-        let r = resolve_theme("catppuccin-latte");
-        assert_eq!(r.appearance, ThemeAppearance::Light);
-        assert_eq!(r.syntax.shiki_theme, "catppuccin-latte");
-    }
-
-    #[test]
-    fn dracula_resolves_as_dark_with_shiki_dracula() {
-        let r = resolve_theme("dracula");
-        assert_eq!(r.appearance, ThemeAppearance::Dark);
-        assert_eq!(r.syntax.shiki_theme, "dracula");
-    }
-
-    #[test]
-    fn unknown_theme_resolves_to_fallback() {
-        let r = resolve_theme("does-not-exist");
-        assert_eq!(r.source, ResolvedThemeSource::Fallback);
-        assert_eq!(r.name, "zinc");
-    }
-
-    #[test]
-    fn css_vars_are_valid_hex() {
-        for name in builtin_theme_names() {
-            let r = resolve_theme(name);
+            assert!(r.web.css_vars.contains_key("--color-surface-900"), "{name}");
+            assert!(r.terminal.css_vars.contains_key("--term-bg"), "{name}");
+            assert!(!r.syntax.shiki_theme.is_empty(), "{name}");
             for (key, value) in r.web.css_vars.iter().chain(r.terminal.css_vars.iter()) {
                 if key == "--term-selection-bg" {
                     assert!(
@@ -475,18 +498,26 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    value.starts_with('#') && value.len() == 7,
-                    "{name}: var {key} = {value} not a #rrggbb"
-                );
-                assert!(
-                    value
-                        .chars()
-                        .skip(1)
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                    "{name}: var {key} = {value} contains non-hex or uppercase",
+                    value.len() == 7
+                        && value.starts_with('#')
+                        && value
+                            .chars()
+                            .skip(1)
+                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                    "{name}: var {key} = {value} not a lowercase #rrggbb"
                 );
             }
         }
+        let latte = resolve_theme("catppuccin-latte");
+        assert_eq!(latte.appearance, ThemeAppearance::Light);
+        assert_eq!(latte.syntax.shiki_theme, "catppuccin-latte");
+        let dracula = resolve_theme("dracula");
+        assert_eq!(dracula.appearance, ThemeAppearance::Dark);
+        assert_eq!(dracula.syntax.shiki_theme, "dracula");
+
+        let r = resolve_theme("does-not-exist");
+        assert_eq!(r.source, ResolvedThemeSource::Fallback);
+        assert_eq!(r.name, "zinc");
     }
 
     #[test]
@@ -521,47 +552,112 @@ mod tests {
         // / surface-800 lift toward white. Sanity-check the ordering by
         // luminance on Catppuccin Latte vs Empire.
         let light = resolve_theme("catppuccin-latte");
-        let bg_light = parse_hex(light.web.css_vars.get("--color-surface-900").unwrap());
-        let elevated_light = parse_hex(light.web.css_vars.get("--color-surface-850").unwrap());
+        let bg_light = light.web.css_vars.get("--color-surface-900").unwrap();
+        let elevated_light = light.web.css_vars.get("--color-surface-850").unwrap();
         assert!(
-            luminance_of_hex(&elevated_light) >= luminance_of_hex(&bg_light),
+            luminance_of_hex(elevated_light) >= luminance_of_hex(bg_light),
             "light theme: surface-850 ({elevated_light}) should be >= surface-900 ({bg_light})"
         );
 
         let dark = resolve_theme("empire");
-        let bg_dark = parse_hex(dark.web.css_vars.get("--color-surface-900").unwrap());
-        let deeper_dark = parse_hex(dark.web.css_vars.get("--color-surface-950").unwrap());
+        let bg_dark = dark.web.css_vars.get("--color-surface-900").unwrap();
+        let deeper_dark = dark.web.css_vars.get("--color-surface-950").unwrap();
         assert!(
-            luminance_of_hex(&deeper_dark) <= luminance_of_hex(&bg_dark),
+            luminance_of_hex(deeper_dark) <= luminance_of_hex(bg_dark),
             "dark theme: surface-950 ({deeper_dark}) should be <= surface-900 ({bg_dark})"
         );
     }
 
     #[test]
-    fn brand_button_pair_keeps_contrast_in_light_theme() {
-        let theme = resolve_theme("catppuccin-latte");
-        let fg = color_from_hex(theme.web.css_vars.get("--color-brand-100").unwrap());
-        let bg = color_from_hex(theme.web.css_vars.get("--color-brand-900").unwrap());
-        let surface = color_from_hex(theme.web.css_vars.get("--color-surface-900").unwrap());
-        let composited_bg = composite(bg, surface, 0.4);
-
+    fn builtins_clear_contrast_floors() {
+        let latte = resolve_theme("catppuccin-latte");
+        let fg = color_from_hex(latte.web.css_vars.get("--color-brand-100").unwrap());
+        let bg = color_from_hex(latte.web.css_vars.get("--color-brand-900").unwrap());
+        let surface = color_from_hex(latte.web.css_vars.get("--color-surface-900").unwrap());
         assert!(
-            contrast_ratio(fg, composited_bg) >= 4.5,
+            contrast_ratio(fg, composite(bg, surface, 0.4)) >= 4.5,
             "catppuccin-latte: text-brand-100 must remain readable on bg-brand-900/40"
         );
+
+        for name in builtin_theme_names() {
+            let theme = resolve_theme(name);
+            let var = |k: &str| color_from_hex(theme.web.css_vars.get(k).unwrap());
+            assert!(
+                contrast_ratio(var("--color-text-on-brand"), var("--color-brand-600")) >= 4.5,
+                "{name}: color-text-on-brand must remain readable on brand-600"
+            );
+            // Status error text, and the session notices strip's body text, sit on
+            // these solid surfaces.
+            for fg in ["--color-status-error-text", "--color-text-primary"] {
+                for surface in ["--color-surface-900", "--color-surface-850"] {
+                    let ratio = contrast_ratio(var(fg), var(surface));
+                    assert!(
+                        ratio >= TEXT_CONTRAST_RATIO,
+                        "{name}: {fg} on {surface} is {ratio:.2}, below body-text AA"
+                    );
+                }
+            }
+            let frame = var("--color-session-active");
+            let fill = var("--color-surface-800");
+            // The third surface is the fill an open row takes while it is also
+            // multi-selected: `bg-brand-500/15` over the sidebar's surface-800.
+            let surfaces = [
+                ("surface-900", var("--color-surface-900")),
+                ("surface-800", fill),
+                (
+                    "surface-800 + selection tint",
+                    composite(var("--color-brand-500"), fill, SELECTION_TINT_ALPHA),
+                ),
+            ];
+            for (label, bg) in surfaces {
+                let ratio = contrast_ratio(frame, bg);
+                assert!(
+                    ratio >= NON_TEXT_CONTRAST_RATIO,
+                    "{name}: session-active frame vs {label} is {ratio:.2}, below the non-text floor"
+                );
+            }
+        }
     }
 
     #[test]
-    fn on_brand_token_keeps_contrast_for_all_builtins() {
-        for name in builtin_theme_names() {
-            let theme = resolve_theme(name);
-            let fg = color_from_hex(theme.web.css_vars.get("--color-text-on-brand").unwrap());
-            let bg = color_from_hex(theme.web.css_vars.get("--color-brand-600").unwrap());
+    fn session_active_frame_lifts_away_from_the_real_background() {
+        // A theme whose declared appearance disagrees with its background:
+        // the frame must still separate from the surfaces it paints on
+        // rather than lifting toward the pole the metadata names.
+        let theme = Theme {
+            background: Color::Rgb(0xff, 0xff, 0xff),
+            accent: Color::Rgb(0xff, 0xff, 0xff),
+            ..Theme::default()
+        };
+
+        let projection = web_projection(&theme, ThemeAppearance::Dark);
+        let frame = color_from_hex(projection.css_vars.get("--color-session-active").unwrap());
+        for surface in ["--color-surface-900", "--color-surface-800"] {
+            let bg = color_from_hex(projection.css_vars.get(surface).unwrap());
             assert!(
-                contrast_ratio(fg, bg) >= 4.5,
-                "{name}: color-text-on-brand must remain readable on brand-600"
+                contrast_ratio(frame, bg) >= NON_TEXT_CONTRAST_RATIO,
+                "white-background theme: session-active frame vs {surface} is below the non-text floor"
             );
         }
+    }
+
+    #[test]
+    fn session_active_frame_keeps_the_accent_when_it_already_separates() {
+        // Only accents that cannot clear the floor on their own move, so a
+        // theme's active row stays recognisably its own accent color.
+        let empire = resolve_theme("empire");
+        assert_eq!(
+            empire.web.css_vars.get("--color-session-active").unwrap(),
+            empire.web.css_vars.get("--color-brand-500").unwrap()
+        );
+
+        // Latte's orange accent lands at 2.64:1 on its near-white
+        // background, so the light projection has to darken it.
+        let latte = resolve_theme("catppuccin-latte");
+        assert_ne!(
+            latte.web.css_vars.get("--color-session-active").unwrap(),
+            latte.web.css_vars.get("--color-brand-500").unwrap()
+        );
     }
 
     #[test]
@@ -586,9 +682,6 @@ mod tests {
         );
     }
 
-    fn parse_hex(s: &str) -> String {
-        s.to_string()
-    }
     fn luminance_of_hex(hex: &str) -> f32 {
         let s = hex.trim_start_matches('#');
         let r = u8::from_str_radix(&s[0..2], 16).unwrap();
@@ -603,20 +696,6 @@ mod tests {
         let g = u8::from_str_radix(&s[2..4], 16).unwrap();
         let b = u8::from_str_radix(&s[4..6], 16).unwrap();
         Color::Rgb(r, g, b)
-    }
-
-    fn composite(fg: Color, bg: Color, alpha: f32) -> Color {
-        let (fr, fg_g, fb) = rgb_components(fg);
-        let (br, bg_g, bb) = rgb_components(bg);
-        Color::Rgb(
-            composite_channel(fr, br, alpha),
-            composite_channel(fg_g, bg_g, alpha),
-            composite_channel(fb, bb, alpha),
-        )
-    }
-
-    fn composite_channel(fg: u8, bg: u8, alpha: f32) -> u8 {
-        ((fg as f32 * alpha) + (bg as f32 * (1.0 - alpha))).round() as u8
     }
 
     fn web_semantic_color_vars_used_by_dashboard() -> BTreeSet<String> {
@@ -688,7 +767,9 @@ mod tests {
             ] {
                 if let Some(color) = utility.strip_prefix(prefix) {
                     let color = color.split('/').next().unwrap_or(color);
-                    if semantic_color_name(color) {
+                    // A trailing dash is a class built by interpolation
+                    // (`bg-status-${suffix}`), not a token to look up.
+                    if !color.ends_with('-') && semantic_color_name(color) {
                         vars.insert(format!("--color-{color}"));
                     }
                 }
@@ -708,9 +789,11 @@ mod tests {
                 "text-on-brand"
                     | "selection"
                     | "session-selection"
+                    | "session-active"
                     | "terminal-active"
                     | "branch"
                     | "sandbox"
+                    | "favorite"
             )
     }
 }

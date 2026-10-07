@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Tooltip } from "../../Tooltip";
 import { CommentMarkdown } from "./CommentMarkdown";
 import { buildCommentsMarkdown, buildDiffCommentsPrompt } from "./buildPrompt";
 import type { DiffComment } from "./types";
@@ -8,12 +9,10 @@ interface Props {
   sessionId: string;
   comments: DiffComment[];
   isMultiRepo: boolean;
-  /** Same gate as the banner Send button. Reflects
-   *  `structured_view && acp_worker_state === "running"`. False
-   *  disables the Send button so prompts don't sink when the worker
-   *  isn't ready. */
+  /** False when the session cannot drain a prompt (not structured view, or trashed). */
   sendEnabled: boolean;
-  sendDisabledReason?: string;
+  /** Cause plus remedy. */
+  sendDisabledReason: string;
   introDraft: string;
   outroDraft: string;
   clearAfterSend: boolean;
@@ -24,11 +23,7 @@ interface Props {
   onSent: () => void;
 }
 
-/** Three-piece compose dialog: editable intro textarea, read-only
- *  preview of the assembled comments markdown, editable outro
- *  textarea. The final prompt is composed at send time so the user's
- *  intro/outro edits don't fall out of sync if comments change
- *  underneath. */
+/** Intro, read-only comments preview, and outro; the prompt is built at send time. */
 export function SendCommentsDialog({
   sessionId,
   comments,
@@ -57,6 +52,16 @@ export function SendCommentsDialog({
 
   const preview = useMemo(() => buildCommentsMarkdown(comments, { isMultiRepo }), [comments, isMultiRepo]);
 
+  const sendBlocked = busy || comments.length === 0 || !sendEnabled;
+  // One tooltip covers every disabled reason so it never explains the wrong one.
+  const sendTooltip = !sendEnabled
+    ? sendDisabledReason
+    : comments.length === 0
+      ? "Add at least one diff comment to send."
+      : busy
+        ? "Sending your comments to the agent..."
+        : "Send comments to agent";
+
   const send = useCallback(async () => {
     if (busy || comments.length === 0 || !sendEnabled) return;
     setBusy(true);
@@ -77,8 +82,7 @@ export function SendCommentsDialog({
         }
         return;
       }
-      // Count each successful diff-comments send (a low-frequency action, so a
-      // count is more useful than a boolean). Only on a confirmed 2xx.
+      // Counted only on a confirmed 2xx.
       reportTelemetrySeen("diff_comments");
       onSent();
     } catch (e) {
@@ -93,9 +97,7 @@ export function SendCommentsDialog({
     }
   }, [busy, comments, introDraft, outroDraft, isMultiRepo, sendEnabled, sessionId, onSent]);
 
-  // Trap Esc/Cmd+Enter at the document level so editing in the textareas
-  // doesn't intercept the dialog hotkeys. Esc is blocked while a send
-  // is in flight so the user doesn't dismiss a request mid-flight.
+  // Document-level so textareas do not swallow the hotkeys; Esc is ignored mid-send.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -187,15 +189,25 @@ export function SendCommentsDialog({
             >
               Cancel
             </button>
-            <button
-              type="button"
-              onClick={() => void send()}
-              disabled={busy || comments.length === 0 || !sendEnabled}
-              title={sendEnabled ? undefined : sendDisabledReason}
-              className="text-[12px] px-3 py-1.5 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
-            >
-              {busy ? "Sending..." : "Send"}
-            </button>
+            {/* Tooltip + `aria-disabled` rather than `title` + `disabled`, for
+                the reasons spelled out in `CommentsBanner`: the browser renders
+                neither a `title` nor a focus ring on a natively disabled
+                button, so both pointer and keyboard users were left without the
+                explanation. `send()` re-checks every condition itself. */}
+            <Tooltip text={sendTooltip} multiline>
+              <button
+                type="button"
+                onClick={() => void send()}
+                aria-disabled={sendBlocked}
+                className={`text-[12px] px-3 py-1.5 rounded-md transition-colors ${
+                  sendBlocked
+                    ? "bg-surface-700 text-text-dim cursor-not-allowed"
+                    : "bg-brand-600 text-white hover:bg-brand-500 cursor-pointer"
+                }`}
+              >
+                {busy ? "Sending..." : "Send"}
+              </button>
+            </Tooltip>
           </div>
         </div>
       </div>

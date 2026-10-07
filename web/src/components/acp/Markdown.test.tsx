@@ -1,42 +1,29 @@
 // @vitest-environment jsdom
-//
-// Markdown wrapper contract. Scope: the customisations our wrapper
-// adds on top of @assistant-ui/react-markdown's MarkdownTextPrimitive.
-// The primitive itself needs a deep assistant-ui MessagePart context
-// to render, so we mock it and verify the wrapper:
-//   - mounts the primitive with `remark-gfm` in remarkPlugins,
-//   - forwards the `smooth` prop and the `text` content,
-//   - passes a `components` map with our custom Blockquote (warning
-//     variant when text starts with the ⚠️ glyph), TableWithScroll,
-//     ShikiSyntaxHighlighter, and CodeHeader entries.
-//
-// Then we exercise the captured custom components directly against
-// jsdom to assert their per-component contracts (warning class,
-// table-wrap container, copy-button click).
+// The assistant-ui primitive needs a message context, so it is mocked; the wrapper's
+// config and each captured override component are tested directly. Line-break
+// semantics render the same remark chain through react-markdown.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+
+import type { FileRefSession } from "../../lib/fileRef";
 
 vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "vitesse-dark", appearance: "dark" }),
 }));
 
-vi.mock("../../lib/highlighter", () => ({
-  ensureThemeLoaded: vi.fn().mockResolvedValue("vitesse-dark"),
-  getHighlighter: vi.fn().mockResolvedValue({
-    codeToHtml: () => "<pre><code>highlighted</code></pre>",
-  }),
-  langKeyForExt: (s: string) => s,
-  loadLanguage: vi.fn().mockResolvedValue(undefined),
+vi.mock("../../lib/snippetHighlighter", () => ({
+  highlightSnippet: vi.fn().mockResolvedValue("<pre><code>highlighted</code></pre>"),
 }));
 
 interface PrimitiveCall {
   text: string;
   smooth: boolean;
   remarkPlugins: unknown[];
-  components: Record<string, React.ComponentType<unknown>>;
+  components: Record<string, React.ComponentType<Record<string, unknown>>>;
 }
 
 const primitiveCalls: PrimitiveCall[] = [];
@@ -47,7 +34,7 @@ vi.mock("@assistant-ui/react-markdown", () => ({
     smooth?: boolean;
     remarkPlugins?: unknown[];
     className?: string;
-    components?: Record<string, React.ComponentType<unknown>>;
+    components?: PrimitiveCall["components"];
   }) => {
     primitiveCalls.push({
       text: props.preprocess(),
@@ -59,8 +46,11 @@ vi.mock("@assistant-ui/react-markdown", () => ({
   },
 }));
 
-import { Markdown } from "./Markdown";
+import { Markdown, remarkPluginsFor } from "./Markdown";
 import { AcpFileRefContext } from "./AcpFileRefContext";
+import { highlightSnippet } from "../../lib/snippetHighlighter";
+import type { SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
+import { renderWithLateResolution } from "../../__tests__/lateResolution";
 
 beforeEach(() => {
   primitiveCalls.length = 0;
@@ -70,399 +60,257 @@ afterEach(() => {
   cleanup();
 });
 
-describe("Markdown wrapper config", () => {
-  it("renders the assistant-ui markdown primitive", () => {
-    const { getByTestId } = render(<Markdown text="hi" />);
-    expect(getByTestId("markdown-primitive")).toBeTruthy();
-  });
+/** The override the wrapper registers under `key`. */
+function override<P>(key: string): React.ComponentType<P> {
+  render(<Markdown text="x" />);
+  return primitiveCalls.at(-1)!.components[key] as unknown as React.ComponentType<P>;
+}
 
-  it("forwards the source text via preprocess", () => {
-    render(<Markdown text="hello world" />);
-    expect(primitiveCalls).toHaveLength(1);
-    expect(primitiveCalls[0]!.text).toBe("hello world");
-  });
+function renderIn(node: React.ReactNode, ctx: Parameters<typeof AcpFileRefContext.Provider>[0]["value"] = {}) {
+  return render(<AcpFileRefContext.Provider value={ctx}>{node}</AcpFileRefContext.Provider>);
+}
 
-  it("defaults smooth=false and forwards smooth=true on demand", () => {
-    render(<Markdown text="a" />);
-    render(<Markdown text="b" smooth />);
-    expect(primitiveCalls[0]!.smooth).toBe(false);
-    expect(primitiveCalls[1]!.smooth).toBe(true);
-  });
+function click(el: Element) {
+  const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+  fireEvent(el, event);
+  return event;
+}
 
-  it("registers remark-gfm in the plugin list", () => {
-    render(<Markdown text="x" />);
-    expect(primitiveCalls[0]!.remarkPlugins).toContain(remarkGfm);
+describe("Markdown wrapper", () => {
+  it("forwards text, smooth, the remark chain, overrides, and the size-variable class", () => {
+    const { container } = render(<Markdown text="hello world" />);
+    render(<Markdown text="b" smooth breaks />);
+    const [plain, user] = primitiveCalls;
+    expect(plain!.text).toBe("hello world");
+    expect(plain!.smooth).toBe(false);
+    expect(user!.smooth).toBe(true);
+    expect(plain!.remarkPlugins).toEqual([remarkGfm]);
+    expect(user!.remarkPlugins).toEqual([remarkGfm, remarkBreaks]);
+    expect(Object.keys(plain!.components)).toEqual(
+      expect.arrayContaining(["SyntaxHighlighter", "table", "blockquote", "a", "img"]),
+    );
+    // A text-size utility would outrank the conversation font-size variable.
+    const node = container.querySelector(".acp-markdown") as HTMLElement;
+    expect(node.classList.contains("acp-markdown-body")).toBe(true);
+    expect([...node.classList].some((c) => /^text-(xs|sm|base|lg|\[)/.test(c))).toBe(false);
   });
+});
 
-  // #1472: user prompts opt into hard line breaks so the sent bubble
-  // matches the plain-textarea composer; assistant text leaves it off.
-  it("adds remark-breaks only when breaks is enabled", () => {
-    render(<Markdown text="x" breaks />);
-    render(<Markdown text="y" />);
-    expect(primitiveCalls[0]!.remarkPlugins).toContain(remarkBreaks);
-    expect(primitiveCalls[0]!.remarkPlugins).toContain(remarkGfm);
-    expect(primitiveCalls[1]!.remarkPlugins).not.toContain(remarkBreaks);
-  });
+describe("remark line breaks", () => {
+  const renderMd = (text: string, breaks: boolean) =>
+    render(<ReactMarkdown remarkPlugins={remarkPluginsFor(breaks)}>{text}</ReactMarkdown>).container;
 
-  it("registers acp-specific component overrides", () => {
-    render(<Markdown text="x" />);
-    const keys = Object.keys(primitiveCalls[0]!.components);
-    expect(keys).toEqual(expect.arrayContaining(["SyntaxHighlighter", "CodeHeader", "table", "blockquote", "a"]));
-  });
-
-  it("attaches the acp-markdown class for global styling", () => {
-    const { container } = render(<Markdown text="x" />);
-    const node = container.querySelector(".acp-markdown");
-    expect(node).not.toBeNull();
+  it.each([
+    ["line a\nline b\nline c", false, 0, 1],
+    ["line a\nline b\nline c", true, 2, 1],
+    ["para one\n\npara two", true, 0, 2],
+  ])("%j breaks=%s renders %i <br> in %i paragraphs", (text, breaks, brs, paragraphs) => {
+    const container = renderMd(text, breaks);
+    expect(container.querySelectorAll("br")).toHaveLength(brs);
+    expect(container.querySelectorAll("p")).toHaveLength(paragraphs);
   });
 });
 
 describe("Blockquote override", () => {
-  function getBlockquote(): React.ComponentType<{
-    children: React.ReactNode;
-  }> {
-    render(<Markdown text="x" />);
-    const Comp = primitiveCalls.at(-1)!.components.blockquote;
-    return Comp as React.ComponentType<{ children: React.ReactNode }>;
-  }
-
-  it("applies the warning variant when the text starts with the warning glyph", () => {
-    const Blockquote = getBlockquote();
-    const { container } = render(<Blockquote>⚠️ context reset</Blockquote>);
-    const bq = container.querySelector("blockquote");
-    expect(bq).not.toBeNull();
-    expect(bq?.className).toContain("acp-callout-warn");
-  });
-
-  it("uses no warning class for plain text", () => {
-    const Blockquote = getBlockquote();
-    const { container } = render(<Blockquote>just a quote</Blockquote>);
-    const bq = container.querySelector("blockquote");
-    expect(bq).not.toBeNull();
-    expect(bq?.className ?? "").not.toContain("acp-callout-warn");
-  });
-
-  it("strips leading whitespace before checking for the warning glyph", () => {
-    const Blockquote = getBlockquote();
-    const { container } = render(<Blockquote> ⚠️ warning</Blockquote>);
-    const bq = container.querySelector("blockquote");
-    expect(bq?.className).toContain("acp-callout-warn");
-  });
-
-  it("walks nested React children when inspecting the text", () => {
-    const Blockquote = getBlockquote();
-    const { container } = render(
-      <Blockquote>
-        <span>
-          <strong>⚠️</strong> nested warning
-        </span>
-      </Blockquote>,
-    );
-    expect(container.querySelector("blockquote")?.className).toContain("acp-callout-warn");
+  it.each([
+    [<>⚠️ context reset</>, true],
+    [<> ⚠️ warning</>, true],
+    [
+      <span>
+        <strong>⚠️</strong> nested warning
+      </span>,
+      true,
+    ],
+    [<>just a quote</>, false],
+  ])("warning variant %#", (children, warn) => {
+    const Blockquote = override<{ children: React.ReactNode }>("blockquote");
+    const { container } = render(<Blockquote>{children}</Blockquote>);
+    expect(container.querySelector("blockquote")!.className.includes("acp-callout-warn")).toBe(warn);
   });
 });
 
-// #1714: transcript links must open in a new tab with a safe rel so
-// clicking a docs/CI/repo link does not replace the live structured view page.
 describe("anchor override", () => {
-  function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
-    render(<Markdown text="x" />);
-    return primitiveCalls.at(-1)!.components.a as React.ComponentType<React.ComponentPropsWithoutRef<"a">>;
-  }
-
-  it("forces transcript links to open in a new tab with a safe rel", () => {
-    const Anchor = getAnchor();
-    const { container } = render(<Anchor href="https://example.com">docs</Anchor>);
-    const a = container.querySelector("a");
-    expect(a).not.toBeNull();
-    expect(a?.getAttribute("target")).toBe("_blank");
-    expect(a?.getAttribute("rel")).toBe("noopener noreferrer");
-  });
-
-  it("preserves the original href and children", () => {
-    const Anchor = getAnchor();
-    const { container } = render(
-      <Anchor href="https://example.com/path" title="t">
-        link text
-      </Anchor>,
-    );
-    const a = container.querySelector("a");
-    expect(a?.getAttribute("href")).toBe("https://example.com/path");
-    expect(a?.getAttribute("title")).toBe("t");
-    expect(a?.textContent).toBe("link text");
-  });
-});
-
-// #1718: a local file reference (Codex `path:line` markdown link) is
-// intercepted and routed to the in-app file viewer instead of opening a
-// dead new tab. External links keep the #1714 new-tab behavior.
-describe("anchor file-ref interception", () => {
-  function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
-    render(<Markdown text="x" />);
-    return primitiveCalls.at(-1)!.components.a as React.ComponentType<React.ComponentPropsWithoutRef<"a">>;
-  }
-
-  it("intercepts a local file link and calls the file-ref handler", () => {
-    const Anchor = getAnchor();
-    const onOpenFileRef = vi.fn();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ onOpenFileRef }}>
-        <Anchor href="/Users/me/repo/src/app.ts:42">app.ts</Anchor>
-      </AcpFileRefContext.Provider>,
-    );
-    const a = container.querySelector("a")!;
-    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
-    fireEvent(a, event);
-    expect(onOpenFileRef).toHaveBeenCalledWith({
-      path: "/Users/me/repo/src/app.ts",
-      line: 42,
-    });
-    expect(event.defaultPrevented).toBe(true);
-  });
-
-  it("does not intercept an external link even with a handler present", () => {
-    const Anchor = getAnchor();
-    const onOpenFileRef = vi.fn();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ onOpenFileRef }}>
-        <Anchor href="https://example.com">docs</Anchor>
-      </AcpFileRefContext.Provider>,
-    );
-    const a = container.querySelector("a")!;
-    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
-    fireEvent(a, event);
-    expect(onOpenFileRef).not.toHaveBeenCalled();
-    expect(event.defaultPrevented).toBe(false);
-    expect(a.getAttribute("target")).toBe("_blank");
-    expect(a.getAttribute("rel")).toBe("noopener noreferrer");
-  });
-
-  it("leaves links untouched when no handler is provided", () => {
-    const Anchor = getAnchor();
-    const { container } = render(<Anchor href="/Users/me/repo/src/app.ts:42">app.ts</Anchor>);
-    const a = container.querySelector("a")!;
-    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
-    fireEvent(a, event);
-    // No handler in context, so the file link falls through to the
-    // default new-tab anchor without preventing navigation.
-    expect(event.defaultPrevented).toBe(false);
-    expect(a.getAttribute("target")).toBe("_blank");
-  });
-});
-
-// #2587: a local file path that resolves to no known repo root cannot be
-// opened from the transcript link, so it renders as inert text instead of a
-// link that dead-ends. An out-of-repo file the agent actually wrote or read is
-// reachable from its tool card instead, which opens the provenance-confined
-// viewer (#3088); see ToolCards.render.test.tsx.
-describe("anchor inert-path for unresolvable local paths (#2587)", () => {
-  function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
-    render(<Markdown text="x" />);
-    return primitiveCalls.at(-1)!.components.a as React.ComponentType<React.ComponentPropsWithoutRef<"a">>;
-  }
-
-  const session = {
+  const session: FileRefSession = {
     id: "s1",
     project_path: "/Users/me/repo",
     main_repo_path: null,
     workspace_repos: [],
   };
+  const artSession: FileRefSession = {
+    id: "sess-1",
+    project_path: "/repo",
+    main_repo_path: null,
+    workspace_repos: [],
+    artifact_dir: "/home/u/.aoe/artifacts/sess-1",
+  };
+  const IN_REPO = "/Users/me/repo/src/app.ts:42";
 
-  it("renders an outside-repo absolute path as inert text, not a link", () => {
-    const Anchor = getAnchor();
+  it("opens external links in a new tab with a safe rel, preserving props", () => {
+    const Anchor = override<React.ComponentPropsWithoutRef<"a">>("a");
     const onOpenFileRef = vi.fn();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession: session }}>
-        <Anchor href="/tmp/codex-agent-views/shot.png">shot.png</Anchor>
-      </AcpFileRefContext.Provider>,
-    );
-    expect(container.querySelector("a")).toBeNull();
-    const span = container.querySelector("span.acp-inert-path");
-    expect(span).not.toBeNull();
-    expect(span?.textContent).toBe("shot.png");
-    expect(onOpenFileRef).not.toHaveBeenCalled();
-  });
-
-  it("still intercepts an in-repo path as a clickable file link", () => {
-    const Anchor = getAnchor();
-    const onOpenFileRef = vi.fn();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession: session }}>
-        <Anchor href="/Users/me/repo/src/app.ts:42">app.ts</Anchor>
-      </AcpFileRefContext.Provider>,
+    const { container } = renderIn(
+      <Anchor href="https://example.com/path" title="t">
+        link text
+      </Anchor>,
+      { onOpenFileRef, fileRefSession: session },
     );
     const a = container.querySelector("a")!;
-    expect(a).not.toBeNull();
-    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
-    fireEvent(a, event);
-    expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/Users/me/repo/src/app.ts", line: 42 });
-    expect(event.defaultPrevented).toBe(true);
-  });
-
-  it("leaves an external link clickable even with a session present", () => {
-    const Anchor = getAnchor();
-    const onOpenFileRef = vi.fn();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession: session }}>
-        <Anchor href="https://example.com">docs</Anchor>
-      </AcpFileRefContext.Provider>,
-    );
-    const a = container.querySelector("a");
-    expect(a).not.toBeNull();
-    expect(a?.getAttribute("target")).toBe("_blank");
+    expect(a.getAttribute("href")).toBe("https://example.com/path");
+    expect(a.getAttribute("title")).toBe("t");
+    expect(a.textContent).toBe("link text");
+    expect(a.getAttribute("target")).toBe("_blank");
+    expect(a.getAttribute("rel")).toBe("noopener noreferrer");
+    expect(click(a).defaultPrevented).toBe(false);
     expect(onOpenFileRef).not.toHaveBeenCalled();
   });
-});
 
-// #2587: paths under a session artifact root map to the authenticated
-// artifact route instead of rendering inert or dead.
-describe("anchor artifact-route mapping (#2587)", () => {
-  function getAnchor(): React.ComponentType<React.ComponentPropsWithoutRef<"a">> {
-    render(<Markdown text="x" />);
-    return primitiveCalls.at(-1)!.components.a as React.ComponentType<React.ComponentPropsWithoutRef<"a">>;
-  }
-
-  const artSession = {
-    id: "sess-1",
-    project_path: "/repo",
-    main_repo_path: null,
-    workspace_repos: [],
-    artifact_dir: "/home/u/.aoe/artifacts/sess-1",
-  };
-
-  it("renders a sandbox-mount artifact path as an artifact-route link", () => {
-    const Anchor = getAnchor();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ onOpenFileRef: vi.fn(), fileRefSession: artSession }}>
-        <Anchor href="/aoe/artifacts/shot.png">shot</Anchor>
-      </AcpFileRefContext.Provider>,
-    );
-    const a = container.querySelector("a.acp-artifact-link");
-    expect(a).not.toBeNull();
-    expect(a?.getAttribute("href")).toBe("/api/sessions/sess-1/artifacts/shot.png");
+  it.each([
+    ["without a session", undefined],
+    ["inside the session repo", session],
+  ])("routes a local file link to the viewer %s", (_label, fileRefSession) => {
+    const Anchor = override<React.ComponentPropsWithoutRef<"a">>("a");
+    const onOpenFileRef = vi.fn();
+    const { container } = renderIn(<Anchor href={IN_REPO}>app.ts</Anchor>, { onOpenFileRef, fileRefSession });
+    expect(click(container.querySelector("a")!).defaultPrevented).toBe(true);
+    expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/Users/me/repo/src/app.ts", line: 42 });
   });
 
-  it("renders a host artifact-dir path as an artifact-route link", () => {
-    const Anchor = getAnchor();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ onOpenFileRef: vi.fn(), fileRefSession: artSession }}>
-        <Anchor href="/home/u/.aoe/artifacts/sess-1/sub/x.png">x</Anchor>
-      </AcpFileRefContext.Provider>,
-    );
-    expect(container.querySelector("a.acp-artifact-link")?.getAttribute("href")).toBe(
-      "/api/sessions/sess-1/artifacts/sub/x.png",
-    );
-  });
-});
-
-describe("img artifact/local override (#2587)", () => {
-  function getImg(): React.ComponentType<React.ComponentPropsWithoutRef<"img">> {
-    render(<Markdown text="x" />);
-    return primitiveCalls.at(-1)!.components.img as React.ComponentType<React.ComponentPropsWithoutRef<"img">>;
-  }
-
-  const artSession = {
-    id: "sess-1",
-    project_path: "/repo",
-    main_repo_path: null,
-    workspace_repos: [],
-    artifact_dir: "/home/u/.aoe/artifacts/sess-1",
-  };
-
-  it("does not emit a raw <img> pointing at the local artifact path", () => {
-    const Img = getImg();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ fileRefSession: artSession }}>
-        <Img src="/aoe/artifacts/shot.png" alt="a shot" />
-      </AcpFileRefContext.Provider>,
-    );
-    // Routed through ArtifactImage (authed blob fetch); the raw /aoe path
-    // must never appear as an <img src>.
-    expect(container.querySelector('img[src="/aoe/artifacts/shot.png"]')).toBeNull();
+  it("falls through to a new-tab anchor for a local link with no handler", () => {
+    const Anchor = override<React.ComponentPropsWithoutRef<"a">>("a");
+    const { container } = renderIn(<Anchor href={IN_REPO}>app.ts</Anchor>);
+    const a = container.querySelector("a")!;
+    expect(click(a).defaultPrevented).toBe(false);
+    expect(a.getAttribute("target")).toBe("_blank");
   });
 
-  it("renders an unresolvable local image path as inert text, not a broken img", () => {
-    const Img = getImg();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ fileRefSession: artSession }}>
-        <Img src="/tmp/other/x.png" alt="alt text" />
-      </AcpFileRefContext.Provider>,
-    );
-    expect(container.querySelector("img")).toBeNull();
-    expect(container.querySelector("span.acp-inert-path")?.textContent).toBe("alt text");
-  });
-
-  it("leaves an external image src as a normal <img>", () => {
-    const Img = getImg();
-    const { container } = render(
-      <AcpFileRefContext.Provider value={{ fileRefSession: artSession }}>
-        <Img src="https://example.com/x.png" alt="ext" />
-      </AcpFileRefContext.Provider>,
-    );
-    expect(container.querySelector('img[src="https://example.com/x.png"]')).not.toBeNull();
-  });
-});
-
-describe("TableWithScroll override", () => {
-  function getTable(): React.ComponentType<{
-    children: React.ReactNode;
-  }> {
-    render(<Markdown text="x" />);
-    const Comp = primitiveCalls.at(-1)!.components.table;
-    return Comp as React.ComponentType<{ children: React.ReactNode }>;
-  }
-
-  it("wraps the rendered table in a scroll container", () => {
-    const Table = getTable();
-    const { container } = render(
-      <Table>
-        <tbody>
-          <tr>
-            <td>cell</td>
-          </tr>
-        </tbody>
-      </Table>,
-    );
-    const wrap = container.querySelector(".acp-table-wrap");
-    expect(wrap).not.toBeNull();
-    expect(wrap?.querySelector("table")).not.toBeNull();
-    expect(wrap?.querySelector("td")?.textContent).toBe("cell");
-  });
-});
-
-describe("CodeHeader override", () => {
-  function getCodeHeader(): React.ComponentType<{
-    language?: string;
-    code: string;
-  }> {
-    render(<Markdown text="x" />);
-    return primitiveCalls.at(-1)!.components.CodeHeader as React.ComponentType<{
-      language?: string;
-      code: string;
-    }>;
-  }
-
-  it("renders the language label", () => {
-    const Header = getCodeHeader();
-    const { container } = render(<Header language="rust" code="fn main(){}" />);
-    expect(container.textContent).toContain("rust");
-  });
-
-  it("falls back to 'text' when no language is provided", () => {
-    const Header = getCodeHeader();
-    const { container } = render(<Header code="abc" />);
-    expect(container.textContent).toContain("text");
-  });
-
-  it("copies the raw source to the clipboard when the copy button is clicked", () => {
-    const Header = getCodeHeader();
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      value: { writeText },
-      configurable: true,
+  // An out-of-repo file the agent touched is reachable from its tool card instead.
+  it("renders an out-of-repo path as inert text", () => {
+    const Anchor = override<React.ComponentPropsWithoutRef<"a">>("a");
+    const onOpenFileRef = vi.fn();
+    const { container } = renderIn(<Anchor href="/tmp/codex-agent-views/shot.png">shot.png</Anchor>, {
+      onOpenFileRef,
+      fileRefSession: session,
     });
-    const { getByText } = render(<Header language="js" code="alert('hi')" />);
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("span.acp-inert-path")?.textContent).toBe("shot.png");
+  });
+
+  it.each([
+    ["/aoe/artifacts/shot.png", "/api/sessions/sess-1/artifacts/shot.png"],
+    ["/home/u/.aoe/artifacts/sess-1/sub/x.png", "/api/sessions/sess-1/artifacts/sub/x.png"],
+  ])("maps artifact path %s to the authenticated route", (href, route) => {
+    const Anchor = override<React.ComponentPropsWithoutRef<"a">>("a");
+    const { container } = renderIn(<Anchor href={href}>x</Anchor>, {
+      onOpenFileRef: vi.fn(),
+      fileRefSession: artSession,
+    });
+    expect(container.querySelector("a.acp-artifact-link")?.getAttribute("href")).toBe(route);
+  });
+
+  it("img never emits a raw local path as src, and leaves external images alone", () => {
+    const Img = override<React.ComponentPropsWithoutRef<"img">>("img");
+    const renderImg = (src: string, alt: string) => {
+      cleanup();
+      return renderIn(<Img src={src} alt={alt} />, { fileRefSession: artSession }).container;
+    };
+    expect(
+      renderImg("/aoe/artifacts/shot.png", "a shot").querySelector('img[src="/aoe/artifacts/shot.png"]'),
+    ).toBeNull();
+    const inert = renderImg("/tmp/other/x.png", "alt text");
+    expect(inert.querySelector("img")).toBeNull();
+    expect(inert.querySelector("span.acp-inert-path")?.textContent).toBe("alt text");
+    expect(
+      renderImg("https://example.com/x.png", "ext").querySelector('img[src="https://example.com/x.png"]'),
+    ).not.toBeNull();
+  });
+});
+
+describe("code block header", () => {
+  it.each([
+    ["rust", "rust"],
+    [undefined, "text"],
+  ])("labels language %s and copies the raw source", (language, label) => {
+    const Highlighter = override<{ language?: string; code: string }>("SyntaxHighlighter");
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const { container, getByText } = render(<Highlighter language={language} code="alert('hi')" />);
+    expect(container.textContent).toContain(label);
     fireEvent.click(getByText("copy"));
     expect(writeText).toHaveBeenCalledWith("alert('hi')");
+  });
+
+  it("wraps the code per line when the header toggle is pressed", () => {
+    const Highlighter = override<{ language?: string; code: string }>("SyntaxHighlighter");
+    const { container, getByRole } = render(<Highlighter code={"one\ntwo"} />);
+    expect(container.querySelector(".wrap-lines")).toBeNull();
+    fireEvent.click(getByRole("button", { name: /wrap/i }));
+    expect([...container.querySelectorAll(".wrap-lines .wrap-line")].map((l) => l.textContent)).toEqual(["one", "two"]);
+  });
+});
+
+describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
+  function getSyntaxHighlighter(): React.ComponentType<SyntaxHighlighterProps> {
+    render(<Markdown text="x" />);
+    return primitiveCalls.at(-1)!.components.SyntaxHighlighter as React.ComponentType<SyntaxHighlighterProps>;
+  }
+
+  afterEach(() => {
+    vi.mocked(highlightSnippet).mockReset();
+    vi.mocked(highlightSnippet).mockResolvedValue("<pre><code>highlighted</code></pre>");
+  });
+
+  it("clears highlighted output when a reused block transitions to unfenced text", async () => {
+    vi.mocked(highlightSnippet).mockResolvedValueOnce('<pre class="shiki">highlighted rust</pre>');
+    const Comp = getSyntaxHighlighter();
+
+    const { container, rerender } = render(<Comp language="rust" code="fn main() {}" />);
+    await waitFor(() => {
+      expect(container.querySelector("pre.shiki")).toBeTruthy();
+    });
+
+    rerender(<Comp language={undefined} code="plain paragraph text" />);
+
+    expect(container.querySelector("pre.shiki")).toBeNull();
+    expect(container.textContent).toContain("plain paragraph text");
+    expect(container.textContent).not.toContain("fn main");
+  });
+
+  it("clears highlighted output when a reused block's highlight rejects", async () => {
+    vi.mocked(highlightSnippet).mockResolvedValueOnce('<pre class="shiki">highlighted rust</pre>');
+    const Comp = getSyntaxHighlighter();
+
+    const { container, rerender } = render(<Comp language="rust" code="fn main() {}" />);
+    await waitFor(() => {
+      expect(container.querySelector("pre.shiki")).toBeTruthy();
+    });
+
+    vi.mocked(highlightSnippet).mockRejectedValueOnce(new Error("boom"));
+    rerender(<Comp language="unknownlang" code="fn other() {}" />);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("fn other() {}");
+    });
+    expect(container.querySelector("pre.shiki")).toBeNull();
+    expect(container.textContent).not.toContain("fn main");
+  });
+
+  it("ignores a late resolution from a superseded request (pending A → committed B → late A)", async () => {
+    let resolveA!: (v: string | null) => void;
+    vi.mocked(highlightSnippet).mockReturnValueOnce(
+      new Promise<string | null>((res) => {
+        resolveA = res;
+      }),
+    );
+    const Comp = getSyntaxHighlighter();
+
+    const { html, text } = await renderWithLateResolution({
+      a: <Comp language="rust" code="fn a() {}" />,
+      b: <Comp language={undefined} code="plain b text" />,
+      bText: "plain b text",
+      resolveStale: () => resolveA('<pre class="shiki">OLD_A</pre>'),
+    });
+
+    expect(text).toContain("plain b text");
+    expect(html).not.toContain("OLD_A");
   });
 });

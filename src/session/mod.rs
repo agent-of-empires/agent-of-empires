@@ -1,5 +1,6 @@
 //! Session management module
 
+pub(crate) mod anchored_fs;
 pub mod artifacts;
 pub mod attach_project;
 pub mod builder;
@@ -7,35 +8,29 @@ pub(crate) mod capture;
 pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
-// Discovery of on-disk Claude Code sessions. Lives here (not under the
-// serve-gated `acp` module) because terminal/tmux import via the CLI works in
-// every build; only the structured-view import path needs `serve`.
+// Discovery of on-disk Claude Code sessions. Lives here rather than under
+// `acp` because terminal/tmux import via the CLI does not involve ACP.
 pub mod claude_import;
 pub mod config;
-pub(crate) mod container_config;
-// Depends on `crate::acp` (Event / event store) and is only driven from the
-// serve daemon, both of which are serve-gated. See #2808.
-#[cfg(feature = "serve")]
+pub mod conversation_carry;
 pub mod conversation_summary;
 pub mod deletion;
 pub(crate) mod environment;
 pub mod fork;
 mod groups;
 pub mod idle_reap;
+pub mod import;
 mod instance;
-pub mod mcp_model;
-pub mod mcp_overrides;
-pub mod mcp_state;
+pub mod mcp;
+mod move_journal;
 pub mod poller;
-pub mod profile_config;
-pub mod project_mcp;
 pub mod projects;
 pub(crate) mod recovery;
-pub mod repo_config;
 pub mod restart;
+pub mod sandbox_store_reclaim;
+pub mod scope;
 pub mod scratch;
 pub(crate) mod serde_helpers;
-pub mod settings_schema;
 pub mod skills_model;
 pub mod smart_rename;
 pub mod stop;
@@ -45,48 +40,70 @@ pub(crate) mod sync;
 pub(crate) mod test_support;
 pub mod trash;
 pub mod worktree_edit;
+pub mod worktree_reconcile;
 
 pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
+pub(crate) use anchored_fs::AnchoredDir;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, update_app_state, update_config,
     validate_snooze_duration, AgentRuntimeConfig, AttachMode, CapabilityGrant, ClickAction, Config,
-    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, PluginConfig, RowTagMode,
-    SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxSettingMode, UpdatesConfig,
-    VolumeIgnoresStrategy, WorktreeConfig,
+    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionMode, PluginConfig,
+    RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxSettingMode,
+    UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
-pub use fork::{ForkDenied, ForkSeed};
+pub use fork::{ForkDenied, ForkParentRef, ForkSeed};
 /// Shared by the sorter and the row renderer so a row is decorated as a
 /// favorite exactly when it is pinned as one.
 pub(crate) use groups::is_live_favorite;
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
-    flatten_tree_all_profiles, is_archived_section_path, is_trash_section_path,
-    is_within_archived_section, is_within_trash_section, Group, GroupTree, Item,
-    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME, TRASH_SECTION_PATH,
+    flatten_tree_all_profiles, is_archived_section_path, is_synthetic_project_header,
+    is_trash_section_path, is_within_archived_section, is_within_trash_section,
+    project_group_display_name, Group, GroupTree, Item, ARCHIVED_SECTION_NAME,
+    ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
+    TRASH_SECTION_PATH,
 };
-#[cfg(feature = "serve")]
-pub(crate) use instance::ResumeAttemptPolicy;
+#[cfg(test)]
+pub(crate) use instance::install_aliases;
+#[cfg(test)]
+pub(crate) use instance::test_helpers::publish_host_pi_transcript;
+#[cfg(test)]
+pub(crate) use instance::ActiveExecution;
+pub(crate) use instance::{
+    duplicate_session_error, find_duplicate_session, is_duplicate_session,
+    persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
+    NEWER_GENERATION_BUSY_REASON,
+};
+pub(crate) use instance::{
+    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
+    host_hook_post_install_notes, resolved_agent_for, ConversationState, ResumeAttemptPolicy,
+    TerminalContextResume,
+};
 pub use instance::{
-    is_valid_session_color, ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LaunchSidOutcome, PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status,
-    TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
-    TMUX_SESSION_GONE_ERROR,
+    is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,
+    EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation, Instance,
+    LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
+    PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
+    SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
+    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
-pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
+#[cfg(test)]
+pub(crate) use move_journal::{
+    record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
+};
+pub(crate) use storage::acquire_session_identity_lock;
+#[cfg(test)]
+pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
+pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Process-wide cache of the `session.unread_indicator` toggle (default on).
-/// The TUI refreshes it via [`set_unread_enabled`] on startup and whenever
-/// config is re-applied, so a runtime settings change takes effect without a
-/// restart. Defaults to `true` so the feature is on out of the box before the
-/// first config apply. Read on the hot Attention-sort path, hence a plain
-/// atomic load rather than threading the flag through every sort helper.
 static UNREAD_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Whether the unread-session indicator feature is enabled.
@@ -100,9 +117,6 @@ pub fn set_unread_enabled(on: bool) {
 }
 
 /// Process-wide cache of the `session.favorites_first` toggle (default on).
-/// Refreshed alongside [`set_unread_enabled`] whenever config is applied.
-/// Read on every sort pass, so it is an atomic load rather than a parameter
-/// threaded through the sort helpers.
 static FAVORITES_FIRST: AtomicBool = AtomicBool::new(true);
 
 /// Whether favorited rows pin to the top of their sibling scope outside the
@@ -116,20 +130,28 @@ pub fn set_favorites_first(on: bool) {
     FAVORITES_FIRST.store(on, Ordering::Relaxed);
 }
 
-pub use profile_config::{
+pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
-    save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
-    validate_network_format, validate_port_mapping_format, validate_volume_format, ProfileConfig,
+    save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
+    validate_memory_limit, validate_network_format, validate_port_mapping_format,
+    validate_security_opt_format, validate_volume_format, ProfileConfig,
 };
-pub use projects::{Project, ProjectScope};
-pub use recovery::HookTimeoutScope;
-pub use repo_config::{
+pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
     RepoConfig, RepoTrust, TrustSurface,
 };
-pub(crate) use storage::{atomic_write, resolve_symlink_chain};
+pub use projects::{Project, ProjectOverrides, ProjectScope};
+pub use recovery::HookTimeoutScope;
+pub use scope::SessionScope;
+#[cfg(test)]
+pub(crate) use storage::migration_backups;
+pub(crate) use storage::{
+    acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
+    backup_before_migration, read_file_no_follow, replace_file_no_follow, resolve_symlink_chain,
+    try_acquire_storage_flock, GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
+};
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
     update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,
@@ -140,33 +162,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// App dir name under the XDG config base (`$XDG_CONFIG_HOME`, default
-/// `~/.config`). Always used on Linux; used on macOS when the user opts into
-/// the XDG layout (see `get_app_dir_path` and issue #1948). Debug builds use
-/// a `-dev` suffix so a `cargo run` instance shares no state with an installed
-/// release binary.
+/// App dir name under the XDG config base (`$XDG_CONFIG_HOME`, default `~/.config`).
 pub const APP_DIR_NAME_XDG: &str = if cfg!(debug_assertions) {
     "agent-of-empires-dev"
 } else {
     "agent-of-empires"
 };
 
-/// Home-dotfile app dir name (under `$HOME`). The default on macOS and the
-/// only location on Windows. Debug builds use a `-dev` suffix; see
-/// `APP_DIR_NAME_XDG`.
+/// Home-dotfile app dir name (under `$HOME`).
 pub const APP_DIR_NAME_OTHER: &str = if cfg!(debug_assertions) {
     ".agent-of-empires-dev"
 } else {
     ".agent-of-empires"
 };
 
-/// Resolve the XDG-style config base directory: `$XDG_CONFIG_HOME` when set to
-/// an absolute path, otherwise `~/.config`.
-///
-/// On Linux this matches `dirs::config_dir()`. macOS uses it for the XDG layout
-/// (rather than `dirs::config_dir()`, which there resolves to `~/Library/
-/// Application Support`) so a dotfile manager like chezmoi can share one global
-/// config path with Linux. See issue #1948.
+/// Resolve the XDG-style config base directory: `$XDG_CONFIG_HOME` when set to an absolute path,
+/// otherwise `~/.config`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn xdg_config_base() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
@@ -179,9 +190,8 @@ pub(crate) fn xdg_config_base() -> Result<PathBuf> {
         .join(".config"))
 }
 
-/// Whether `$XDG_CONFIG_HOME` is set to an absolute path, i.e. the user has
-/// meaningfully opted into the XDG layout. A relative or empty value is ignored
-/// per the XDG spec (and by [`xdg_config_base`]), so it does not count.
+/// Whether `$XDG_CONFIG_HOME` is set to an absolute path, i.e. the user has meaningfully opted into
+/// the XDG layout.
 #[cfg(target_os = "macos")]
 fn xdg_config_home_set() -> bool {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -189,20 +199,8 @@ fn xdg_config_home_set() -> bool {
         .unwrap_or(false)
 }
 
-/// macOS app-dir resolution: prefer the XDG location, fall back to the
-/// home-dotfile location, without ever moving data. See issue #1948.
-///
-/// Precedence (the first matching rule wins):
-/// 1. the XDG dir already exists -> use it (picks up a `~/.config` tree synced
-///    from Linux even when `$XDG_CONFIG_HOME` is unset);
-/// 2. the legacy dir already exists -> use it (an existing install keeps its
-///    data in place even after the user later sets `$XDG_CONFIG_HOME`);
-/// 3. `$XDG_CONFIG_HOME` is set -> use the XDG dir (a fresh XDG opt-in);
-/// 4. otherwise -> the home-dotfile dir (the historical macOS default).
-///
-/// `xdg_name` / `legacy_name` are passed in (rather than read from the
-/// constants) so the dev/release namespace warning can resolve the release
-/// pair from a debug build.
+/// macOS app-dir resolution: prefer the XDG location, fall back to the home-dotfile location,
+/// without ever moving data.
 #[cfg(target_os = "macos")]
 fn macos_app_dir(xdg_name: &str, legacy_name: &str) -> Option<PathBuf> {
     let xdg = xdg_config_base().ok()?.join(xdg_name);
@@ -237,63 +235,44 @@ pub fn get_app_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Whether the app data dir already exists, **without** creating it (unlike
-/// [`get_app_dir`], which auto-creates). Lets side-effect-sensitive callers
-/// probe install state cheaply: the per-command telemetry recorder uses it to
-/// stay a true no-op for app-data-free commands (`aoe completion`, `aoe init`,
-/// ...) on an install that is not opted in, so those commands keep working in
-/// read-only / sandboxed (e.g. Nix) environments without materializing the dir.
+/// Whether the app data dir already exists, **without** creating it (unlike [`get_app_dir`], which
+/// auto-creates).
 pub fn app_dir_exists() -> bool {
     get_app_dir_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-fn get_app_dir_path() -> Result<PathBuf> {
+/// The app dir of one build namespace, named by its XDG-layout and home-dotfile directory names.
+fn app_dir_for(xdg_name: &str, other_name: &str) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
-    let dir = xdg_config_base()?.join(APP_DIR_NAME_XDG);
-
+    {
+        let _ = other_name;
+        xdg_config_base().ok().map(|base| base.join(xdg_name))
+    }
     #[cfg(target_os = "macos")]
-    let dir = macos_app_dir(APP_DIR_NAME_XDG, APP_DIR_NAME_OTHER)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
-
+    {
+        macos_app_dir(xdg_name, other_name)
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-        .join(APP_DIR_NAME_OTHER);
-
-    Ok(dir)
+    {
+        let _ = xdg_name;
+        dirs::home_dir().map(|home| home.join(other_name))
+    }
 }
 
-/// Detect the first-launch case where a debug build is being run on a
-/// machine that has populated release-build state in `~/.agent-of-empires`
-/// but no dev-build state yet. Returns the (release_dir, dev_dir) pair so
-/// callers can surface the paths in a one-time warning.
-///
-/// Self-extinguishing by design: once `get_app_dir` creates the dev dir on
-/// any subsequent call, this returns `None` and the warning stops. No flag
-/// file, no config state, no dismissal logic — the directory topology IS
-/// the state.
-///
-/// Returns `None` on release builds (the dev/release split doesn't apply),
-/// when the release dir is absent or empty (user has no prior state to
-/// "lose visibility of"), or when the dev dir already exists.
+fn get_app_dir_path() -> Result<PathBuf> {
+    app_dir_for(APP_DIR_NAME_XDG, APP_DIR_NAME_OTHER)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))
+}
+
+/// Detect the first-launch case where a debug build is being run on a machine that has populated
+/// release-build state in `~/.agent-of-empires` but no dev-build state yet.
 pub fn debug_namespace_drift() -> Option<(PathBuf, PathBuf)> {
     if !cfg!(debug_assertions) {
         return None;
     }
 
-    #[cfg(target_os = "linux")]
-    let release_dir = xdg_config_base().ok()?.join("agent-of-empires");
-    #[cfg(target_os = "macos")]
-    let release_dir = macos_app_dir("agent-of-empires", ".agent-of-empires")?;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let release_dir = dirs::home_dir()?.join(".agent-of-empires");
-
-    #[cfg(target_os = "linux")]
-    let dev_dir = xdg_config_base().ok()?.join(APP_DIR_NAME_XDG);
-    #[cfg(target_os = "macos")]
-    let dev_dir = macos_app_dir(APP_DIR_NAME_XDG, APP_DIR_NAME_OTHER)?;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let dev_dir = dirs::home_dir()?.join(APP_DIR_NAME_OTHER);
+    let release_dir = app_dir_for("agent-of-empires", ".agent-of-empires")?;
+    let dev_dir = app_dir_for(APP_DIR_NAME_XDG, APP_DIR_NAME_OTHER)?;
 
     let release_populated = fs::read_dir(&release_dir)
         .map(|mut entries| entries.next().is_some())
@@ -306,9 +285,18 @@ pub fn debug_namespace_drift() -> Option<(PathBuf, PathBuf)> {
     }
 }
 
-/// Format the user-facing warning shown when `debug_namespace_drift()`
-/// fires. Shared between the CLI stderr print and the TUI startup popup so
-/// both surfaces say exactly the same thing.
+/// The app dir of the *other* build namespace: the release dir from a debug build, the dev dir from
+/// a release build.
+pub(crate) fn sibling_namespace_app_dir() -> Option<PathBuf> {
+    let (xdg, other) = if cfg!(debug_assertions) {
+        ("agent-of-empires", ".agent-of-empires")
+    } else {
+        ("agent-of-empires-dev", ".agent-of-empires-dev")
+    };
+    app_dir_for(xdg, other)
+}
+
+/// Format the user-facing warning shown when `debug_namespace_drift()` fires.
 pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
     format!(
         "Debug builds now use an isolated app dir:\n  \
@@ -338,26 +326,15 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     };
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
+        // Only a name about to be created runs the strict grammar; an existing directory still
+        // opens, so older malformed profiles stay listable and deletable.
+        validate_new_profile_name(profile_name)?;
         fs::create_dir_all(&dir)?;
     }
     Ok(dir)
 }
 
 /// Resolve the on-disk profile directory path WITHOUT creating it.
-///
-/// Use this for read-only operations (loading config, looking up paths)
-/// where the directory-creation side effect of [`get_profile_dir`] would
-/// pollute `profiles/` with empty stub directories. Notably, GET
-/// `/api/settings?profile=<name>` for an unknown profile used to create
-/// that profile's directory as a side effect of the read, which then
-/// made the unknown profile appear in subsequent GET /api/profiles
-/// responses. Routing those reads through this helper keeps the lookup
-/// pure.
-///
-/// Empty `profile` resolves through [`config::resolve_default_profile`]
-/// just like [`get_profile_dir`] does, including its bootstrap side
-/// effect on a genuine first run; callers that want to avoid that should
-/// pass an explicit non-empty name.
 pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     let base = get_app_dir()?;
     let resolved;
@@ -371,14 +348,6 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
 }
 
 /// Resolve the effective profile name for a read/reference operation.
-///
-/// Never creates a profile directory. An empty `profile` resolves through
-/// [`config::resolve_default_profile`], including its bootstrap side effect
-/// on a genuine first run with zero profiles (that's intentional: AoE always
-/// needs somewhere to file sessions). An explicitly named profile, or a
-/// configured default whose directory has since been deleted, is an error
-/// rather than being silently revived on disk; only [`create_profile`] and
-/// the CLI's session-creation path are allowed to birth a profile directory.
 pub fn resolve_existing_profile(profile: &str) -> Result<String> {
     let name = if profile.is_empty() {
         config::resolve_default_profile()
@@ -394,10 +363,7 @@ pub fn resolve_existing_profile(profile: &str) -> Result<String> {
 }
 
 pub fn list_profiles() -> Result<Vec<String>> {
-    // Test-only failure injection: when set, the next call returns
-    // Err and the flag clears. Used by the file-watch regression test
-    // that locks the rewire-after-mutation error-handling path
-    // without requiring a platform-fragile permission denial.
+    // Test-only failure injection: when set, the next call returns Err and the flag clears.
     #[cfg(test)]
     if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
         anyhow::bail!("list_profiles failure injected for test");
@@ -412,14 +378,48 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
+/// Picker order: alphabetical, with a profile named `default` last.
+pub fn sort_profiles_for_display(profiles: &mut [String]) {
+    profiles.sort_by(|a, b| {
+        (a == "default")
+            .cmp(&(b == "default"))
+            .then_with(|| a.cmp(b))
+    });
+}
+
+/// [`list_profiles`] in picker order, for surfaces a human chooses from.
+/// Programmatic resolution keeps [`list_profiles`].
+pub fn list_profiles_for_display() -> Result<Vec<String>> {
+    let mut profiles = list_profiles()?;
+    sort_profiles_for_display(&mut profiles);
+    Ok(profiles)
+}
+
+/// Refuse an explicit `-p`/`--profile` naming a profile that does not exist, so a typo never
+/// reaches [`get_profile_dir`] and mints a stray directory.
+pub fn require_known_profile(profile: &str) -> Result<()> {
+    if profile.is_empty() {
+        return Ok(());
+    }
+    let known = list_profiles()?;
+    if known.is_empty() || known.iter().any(|p| p == profile) {
+        return Ok(());
+    }
+    // Escaped: arbitrary input headed for stderr and the log.
+    let shown = profile.escape_debug();
+    anyhow::bail!(
+        "Profile '{shown}' does not exist. Create it explicitly with \
+         `aoe profile create {shown}`; a bare -p/--profile will not mint one \
+         (guards against stray profiles from typos or session titles). \
+         Run `aoe profile list` to see existing profiles."
+    );
+}
+
 #[cfg(test)]
 pub(crate) static FAIL_NEXT_LIST_PROFILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// RAII guard for the `FAIL_NEXT_LIST_PROFILES` test seam. `new` sets
-/// the flag; `drop` clears it unconditionally so a panic between set
-/// and the next `list_profiles` call does not leak the seam into a
-/// subsequent test that picks up the stale `true` value.
+/// RAII guard for the `FAIL_NEXT_LIST_PROFILES` test seam.
 #[cfg(test)]
 pub(crate) struct FailNextListProfilesGuard;
 
@@ -439,13 +439,7 @@ impl Drop for FailNextListProfilesGuard {
 }
 
 /// Enumerate profile directory names in `profiles_dir`, skipping symlinks.
-/// Symlinks are aliases used by the `cs`/`cxa` account-switcher (e.g.
-/// `forit-work -> default`) so multiple Claude account names share a single
-/// profile directory; without the skip, every alias renders as a duplicate
-/// profile and the session list multiplies (the original "three of every
-/// folder" symptom). Extracted from `list_profiles` so tests can drive it
-/// against a tempdir.
-fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
+pub(crate) fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
     let mut profiles = Vec::new();
     for entry in fs::read_dir(profiles_dir)? {
         let entry = entry?;
@@ -459,6 +453,8 @@ fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> 
             }
         }
     }
+    // Resolution input: `resolve_default_profile` takes the first entry, so
+    // this stays plain. Picker order lives in `sort_profiles_for_display`.
     profiles.sort();
     Ok(profiles)
 }
@@ -466,68 +462,53 @@ fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> 
 #[cfg(test)]
 mod profile_listing_tests {
     //! Regression tests for the "three of every folder" bug (2026-04-25).
-    //!
-    //! The `cs`/`cxa` account-switcher creates `~/.agent-of-empires/profiles/<name>`
-    //! as a symlink to `default` so multiple Claude account names share a
-    //! single AOE profile directory. Before the fix, `list_profiles()` used
-    //! `entry.path().is_dir()` which follows symlinks, so each alias was
-    //! enumerated as a separate profile and the all-profiles session list
-    //! rendered the same data N times.
-    //!
-    //! These tests pin the skip-symlink behavior so a future refactor that
-    //! "simplifies" the file-type check fails CI instead of silently
-    //! re-introducing the duplication.
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    fn make_temp_profiles_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aoe-profile-listing-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        fs::create_dir_all(&dir).expect("create tempdir");
-        dir
-    }
-
     #[test]
-    fn list_profile_names_skips_symlinks_to_real_profiles() {
-        let dir = make_temp_profiles_dir();
-        fs::create_dir(dir.join("default")).unwrap();
-        fs::create_dir(dir.join("personal")).unwrap();
+    fn list_profile_names_lists_real_dirs_in_plain_order() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dir = tmp.path();
+        for name in ["default", "alpha", "personal", "zeta"] {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
         // The cs/cxa pattern: aliases are symlinks pointing at `default`.
         symlink("default", dir.join("forit-work")).unwrap();
         symlink("default", dir.join("wma-work")).unwrap();
+        fs::write(dir.join("README"), "ignore me").unwrap();
 
-        let names = list_profile_names_in(&dir).expect("list");
-        assert_eq!(
-            names,
-            vec!["default".to_string(), "personal".to_string()],
-            "symlinked aliases must be invisible to list_profiles; \
-             otherwise each alias inflates the all-profiles session list \
-             with duplicates of the linked profile's data (the original \
-             three-of-every-folder bug)."
-        );
-
-        let _ = fs::remove_dir_all(&dir);
+        // Symlinked aliases would duplicate the linked profile's sessions (the
+        // three-of-every-folder bug); "default" sorts like any other name here
+        // because resolution takes the first entry.
+        let names = list_profile_names_in(dir).expect("list");
+        assert_eq!(names, ["alpha", "default", "personal", "zeta"]);
     }
 
     #[test]
-    fn list_profile_names_includes_real_dirs_only() {
-        let dir = make_temp_profiles_dir();
-        fs::create_dir(dir.join("default")).unwrap();
-        fs::create_dir(dir.join("work")).unwrap();
-        // A regular file in profiles/ should also be ignored.
-        fs::write(dir.join("README"), "ignore me").unwrap();
+    fn sort_profiles_for_display_sinks_default_to_last() {
+        let mut names: Vec<String> = ["zeta", "default", "beta", "alpha"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sort_profiles_for_display(&mut names);
+        assert_eq!(
+            names,
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "zeta".to_string(),
+                "default".to_string(),
+            ],
+            "default must sort last; all other profiles stay alphabetical"
+        );
 
-        let names = list_profile_names_in(&dir).expect("list");
-        assert_eq!(names, vec!["default".to_string(), "work".to_string()]);
-
-        let _ = fs::remove_dir_all(&dir);
+        let mut plain: Vec<String> = ["b", "a"].iter().map(|s| s.to_string()).collect();
+        sort_profiles_for_display(&mut plain);
+        assert_eq!(plain, vec!["a".to_string(), "b".to_string()]);
+        let mut lone = vec!["default".to_string()];
+        sort_profiles_for_display(&mut lone);
+        assert_eq!(lone, vec!["default".to_string()]);
     }
 }
 
@@ -550,13 +531,6 @@ pub(crate) fn validate_instance_id(id: &str) -> Result<()> {
 }
 
 /// Validate that `name` is a safe, single-component profile name.
-///
-/// Defense in depth: `get_profile_dir` and `delete_profile` ultimately
-/// `join` `name` onto `<app_dir>/profiles/`, so a name like `..`, `/etc`,
-/// or `a/b` would resolve outside the profiles directory. We require
-/// exactly one path component, and that component must be `Normal`. Also
-/// rejects empty strings and the reserved `all` (which the TUI uses as a
-/// sentinel for "all-profiles" mode in profile pickers).
 fn validate_profile_name(name: &str) -> Result<()> {
     if name.is_empty() {
         anyhow::bail!("Profile name cannot be empty");
@@ -564,9 +538,7 @@ fn validate_profile_name(name: &str) -> Result<()> {
     if name.eq_ignore_ascii_case("all") {
         anyhow::bail!("Profile name 'all' is reserved");
     }
-    // Unix Path treats `\` as a regular byte, so backslashes pass the
-    // components check below. Reject them explicitly so the validator
-    // behaves the same on every host the binary might land on.
+    // Unix Path treats `\` as a regular byte, so backslashes pass the components check below.
     if name.contains('\\') {
         anyhow::bail!("Profile name cannot contain path separators");
     }
@@ -584,8 +556,28 @@ fn validate_profile_name(name: &str) -> Result<()> {
     }
 }
 
-pub fn create_profile(name: &str) -> Result<()> {
+/// Grammar for a profile about to be created: `[A-Za-z0-9_-]`, at most 64 characters, on top of the
+/// traversal guard in `validate_profile_name`.
+fn validate_new_profile_name(name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    if name.len() > 64 {
+        anyhow::bail!("Profile name is too long ({} chars; max 64)", name.len());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        // Escaped: arbitrary input headed for stderr and the log.
+        anyhow::bail!(
+            "Profile name '{}' has disallowed characters (allowed: A-Z a-z 0-9 _ -)",
+            name.escape_debug()
+        );
+    }
+    Ok(())
+}
+
+pub fn create_profile(name: &str) -> Result<()> {
+    validate_new_profile_name(name)?;
 
     let profiles = list_profiles()?;
     if profiles.contains(&name.to_string()) {
@@ -616,13 +608,11 @@ pub fn delete_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The source keeps the permissive traversal guard so a stray minted by an older binary stays
+/// renameable; the destination is a new profile and is held to the create grammar.
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    if new_name.is_empty() {
-        anyhow::bail!("New profile name cannot be empty");
-    }
-    if new_name.contains('/') || new_name.contains('\\') {
-        anyhow::bail!("Profile name cannot contain path separators");
-    }
+    validate_profile_name(old_name)?;
+    validate_new_profile_name(new_name)?;
 
     let base = get_app_dir()?;
     let old_dir = base.join("profiles").join(old_name);
@@ -654,22 +644,94 @@ pub fn set_default_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Probe the global config and the active profile's config at startup so the
-/// TUI can show a single user-visible warning when either fails to parse.
-/// `tracing::warn!` calls inside the `_or_warn` helpers are silently dropped
-/// in default TUI mode (no subscriber), so this gives users a chance to see
-/// that their settings have been ignored without needing `AGENT_OF_EMPIRES_DEBUG=1`.
-pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
+/// One file's probe result: either the parse errored out (per-key values fall back to defaults), or
+/// it loaded but some keys were unrecognized and silently dropped.
+pub struct ConfigProbe {
+    pub load_err: Option<String>,
+    pub ignored_keys: Vec<String>,
+}
+
+/// Try to load a config file, and on success enumerate its unrecognized keys.
+fn probe<T, E: std::fmt::Display>(
+    load: impl FnOnce() -> Result<T, E>,
+    ignored: impl FnOnce(&T) -> Vec<String>,
+) -> ConfigProbe {
+    match load() {
+        Ok(cfg) => ConfigProbe {
+            load_err: None,
+            ignored_keys: ignored(&cfg),
+        },
+        Err(e) => ConfigProbe {
+            load_err: Some(e.to_string()),
+            ignored_keys: Vec::new(),
+        },
+    }
+}
+
+/// Probe the global `config.toml`: run the real `Config::load` and, if it succeeded, run
+/// `serde_ignored` to enumerate any unknown struct fields at any depth.
+pub fn probe_global_config() -> ConfigProbe {
+    probe(Config::load, |_| Config::config_ignored_keys())
+}
+
+/// Same shape as [`probe_global_config`] but for a profile's `config.toml`.
+pub fn probe_profile_config(profile: &str) -> ConfigProbe {
+    probe(
+        || config::profile_config::load_profile_config(profile),
+        config::profile_config::profile_config_ignored_keys,
+    )
+}
+
+/// Human-readable path of the global `config.toml`, with a stable fallback so
+/// the message reads sensibly when the app dir can't even be resolved.
+pub(crate) fn config_path_display() -> String {
+    config::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "config.toml".to_string())
+}
+
+/// Which classes of probe finding a caller wants surfaced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WarningClass {
+    /// Parse failures and unrecognized keys.
+    All,
+    /// Unrecognized keys only.
+    IgnoredKeysOnly,
+}
+
+/// Format one probe result as a user-visible line, or `None` when the file is clean (or failed to
+/// parse under [`WarningClass::IgnoredKeysOnly`], which carries no ignored-key information anyway).
+fn format_probe(
+    probe: &ConfigProbe,
+    scope_label: &str,
+    path_display: &str,
+    class: WarningClass,
+) -> Option<String> {
+    if let Some(e) = probe.load_err.as_deref() {
+        (class == WarningClass::All)
+            .then(|| format!("Failed to load {scope_label} ({path_display}); using defaults.\n{e}"))
+    } else if !probe.ignored_keys.is_empty() {
+        Some(format!(
+            "Unrecognized keys in {scope_label} ({path_display}) were ignored: {}",
+            probe.ignored_keys.join(", ")
+        ))
+    } else {
+        None
+    }
+}
+
+/// Probe the global config and the active profile's config, formatting the
+/// requested classes into one blank-line-separated message.
+fn collect_startup_warnings(profile: &str, class: WarningClass) -> Option<String> {
     let mut messages: Vec<String> = Vec::new();
 
-    let global_path_display = config::config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "config.toml".to_string());
-
-    if let Err(e) = Config::load() {
-        messages.push(format!(
-            "Failed to load global config ({global_path_display}); using defaults.\n{e}"
-        ));
+    if let Some(msg) = format_probe(
+        &probe_global_config(),
+        "global config",
+        &config_path_display(),
+        class,
+    ) {
+        messages.push(msg);
     }
 
     let effective = if profile.is_empty() {
@@ -677,15 +739,20 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
     } else {
         profile.to_string()
     };
-
-    let profile_path_display = profile_config::get_profile_config_path(&effective)
-        .map(|p| p.display().to_string())
+    // Non-creating resolver: `get_profile_config_path` goes through the creating `get_profile_dir`,
+    // so naming an unknown profile (`aoe list -p ghost`) would birth `profiles/ghost/` here, before
+    // the command's own `resolve_existing_profile` gets to reject it.
+    let profile_path_display = get_profile_dir_path(&effective)
+        .map(|p| p.join("config.toml").display().to_string())
         .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
-
-    if let Err(e) = profile_config::load_profile_config(&effective) {
-        messages.push(format!(
-            "Failed to load profile config '{effective}' ({profile_path_display}); using defaults.\n{e}"
-        ));
+    let profile_scope = format!("profile config '{effective}'");
+    if let Some(msg) = format_probe(
+        &probe_profile_config(&effective),
+        &profile_scope,
+        &profile_path_display,
+        class,
+    ) {
+        messages.push(msg);
     }
 
     if messages.is_empty() {
@@ -695,31 +762,42 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
     }
 }
 
+/// Probe the global config and the active profile's config at startup so the TUI can show a single
+/// user-visible warning when either fails to parse OR contains unrecognized keys.
+pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
+    collect_startup_warnings(profile, WarningClass::All)
+}
+
+/// Like [`collect_startup_config_warnings`], but only the unrecognized-keys class.
+pub fn collect_startup_ignored_key_warnings(profile: &str) -> Option<String> {
+    collect_startup_warnings(profile, WarningClass::IgnoredKeysOnly)
+}
+
 // ── TUI presence ────────────────────────────────────────────────────────────
-//
-// Each running TUI process drops a `<pid>` file under `tui-presence/` and
-// refreshes its mtime on the heartbeat tick. This lets us (a) tell the push
-// consumer whether *any* TUI is watching, and (b) count how many TUIs are
-// alive so the footer can surface "another instance is watching" when two
-// `aoe` TUIs run at once (the launcher TUI isn't tmux-backed, so there's no
-// tmux client list to read). A presence file is considered live while its
-// mtime is fresh; stale ones (crash without cleanup) are swept on read.
 
 const TUI_PRESENCE_DIR: &str = "tui-presence";
+const TUI_ACTIVITY_DIR: &str = "tui-activity";
 
-fn presence_dir() -> Option<std::path::PathBuf> {
-    get_app_dir().ok().map(|d| d.join(TUI_PRESENCE_DIR))
+fn tui_dir(name: &str) -> Option<std::path::PathBuf> {
+    get_app_dir().ok().map(|d| d.join(name))
 }
 
-fn own_presence_file() -> Option<std::path::PathBuf> {
-    presence_dir().map(|d| d.join(std::process::id().to_string()))
+fn own_tui_file(name: &str) -> Option<std::path::PathBuf> {
+    tui_dir(name).map(|d| d.join(std::process::id().to_string()))
 }
 
-/// Write (or touch) this process's presence file so the push consumer knows
-/// a TUI is running and other TUIs can count us. Called periodically from the
-/// TUI event loop.
+/// Write (or touch) this process's presence file so the push consumer knows a TUI is running and
+/// other TUIs can count us.
 pub fn write_tui_heartbeat() {
-    if let Some(dir) = presence_dir() {
+    if let Some(dir) = tui_dir(TUI_PRESENCE_DIR) {
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(dir.join(std::process::id().to_string()), b"");
+    }
+}
+
+/// Record real user input in this TUI.
+pub fn write_tui_activity() {
+    if let Some(dir) = tui_dir(TUI_ACTIVITY_DIR) {
         let _ = fs::create_dir_all(&dir);
         let _ = fs::write(dir.join(std::process::id().to_string()), b"");
     }
@@ -727,16 +805,22 @@ pub fn write_tui_heartbeat() {
 
 /// Remove this process's presence file on TUI exit.
 pub fn clear_tui_heartbeat() {
-    if let Some(file) = own_presence_file() {
+    if let Some(file) = own_tui_file(TUI_PRESENCE_DIR) {
+        let _ = fs::remove_file(file);
+    }
+    if let Some(file) = own_tui_file(TUI_ACTIVITY_DIR) {
         let _ = fs::remove_file(file);
     }
 }
 
-/// Count TUI presence files whose mtime is fresh within `threshold`, sweeping
-/// any stale entries left behind by crashed processes. Returns the number of
-/// live TUIs (including this process, if its file is fresh).
+/// Count TUI presence files whose mtime is fresh within `threshold`, sweeping any stale entries
+/// left behind by crashed processes.
 pub fn count_active_tuis(threshold: Duration) -> usize {
-    let dir = match presence_dir() {
+    count_fresh_tui_files(TUI_PRESENCE_DIR, threshold)
+}
+
+fn count_fresh_tui_files(dir_name: &str, threshold: Duration) -> usize {
+    let dir = match tui_dir(dir_name) {
         Some(d) => d,
         None => return 0,
     };
@@ -761,39 +845,15 @@ pub fn count_active_tuis(threshold: Duration) -> usize {
     live
 }
 
-/// Returns true if any TUI presence file was modified within `threshold`.
-/// Used by the push consumer to suppress notifications when the user is
-/// actively watching a TUI.
+/// Returns true if any TUI received real input within `threshold`.
 pub fn is_tui_active(threshold: Duration) -> bool {
-    count_active_tuis(threshold) > 0
+    count_fresh_tui_files(TUI_ACTIVITY_DIR, threshold) > 0
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::isolate_app_dir;
+    use super::test_support::{isolate_app_dir, AppDirGuard};
     use super::*;
-
-    /// Serial because the flag is process-wide: any test that applies config
-    /// writes it too, so a parallel run would see a foreign value.
-    #[test]
-    #[serial_test::serial]
-    fn favorites_first_flag_round_trips() {
-        let original = favorites_first();
-
-        set_favorites_first(false);
-        assert!(!favorites_first());
-        set_favorites_first(true);
-        assert!(favorites_first());
-
-        set_favorites_first(original);
-    }
-
-    /// The shipped default is on; the atomic's initial value only matters
-    /// before the first config apply, so assert the config default itself.
-    #[test]
-    fn favorites_first_defaults_on() {
-        assert!(config::SessionConfig::default().favorites_first);
-    }
 
     fn app_dir(root: impl AsRef<Path>) -> PathBuf {
         let root = root.as_ref();
@@ -808,86 +868,47 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial_test::serial]
-    fn test_xdg_config_base_prefers_absolute_xdg_config_home() {
+    fn xdg_config_base_uses_only_an_absolute_xdg_config_home() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp.path());
+        let _home = super::test_support::isolate_home(temp.path());
         let custom = temp.path().join("custom-xdg");
-        std::env::set_var("XDG_CONFIG_HOME", &custom);
+        let _xdg = super::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", &custom)]);
 
         assert_eq!(xdg_config_base().unwrap(), custom);
-        // The global config path is derived from that base on both Linux and
-        // macOS, so a dotfile manager sees a single location. See issue #1948.
         assert_eq!(get_app_dir_path().unwrap(), custom.join(APP_DIR_NAME_XDG));
-    }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    #[serial_test::serial]
-    fn test_xdg_config_base_falls_back_to_home_dot_config() {
-        let temp = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp.path());
-        // A relative (non-absolute) value is ignored per the XDG spec.
-        std::env::set_var("XDG_CONFIG_HOME", "relative/path");
-
+        let _relative = super::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", "relative/path")]);
         assert_eq!(xdg_config_base().unwrap(), temp.path().join(".config"));
-
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let _unset = super::test_support::EnvGuard::unset(&["XDG_CONFIG_HOME"]);
         assert_eq!(xdg_config_base().unwrap(), temp.path().join(".config"));
     }
 
-    // Precedence behind the macOS read-fallback resolution (issue #1948). These
-    // exercise the pure rule, so they run on every platform's CI, not just
-    // macOS where `macos_app_dir` is compiled.
     #[test]
-    fn test_fallback_prefers_existing_xdg_dir_even_over_legacy() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let xdg = tmp.path().join(".config").join("agent-of-empires");
-        let legacy = tmp.path().join(".agent-of-empires");
-        fs::create_dir_all(&xdg).unwrap();
-        fs::create_dir_all(&legacy).unwrap();
-
-        // Both present: XDG wins, so there is never a split brain.
-        assert_eq!(
-            resolve_app_dir_with_fallback(xdg.clone(), legacy.clone(), true),
-            xdg
-        );
-        assert_eq!(
-            resolve_app_dir_with_fallback(xdg.clone(), legacy, false),
-            xdg
-        );
-    }
-
-    #[test]
-    fn test_fallback_keeps_legacy_when_xdg_absent_even_if_env_set() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let xdg = tmp.path().join(".config").join("agent-of-empires");
-        let legacy = tmp.path().join(".agent-of-empires");
-        fs::create_dir_all(&legacy).unwrap();
-
-        // An existing install that later sets XDG_CONFIG_HOME keeps reading its
-        // data in place; nothing appears as a fresh install.
-        assert_eq!(
-            resolve_app_dir_with_fallback(xdg, legacy.clone(), true),
-            legacy
-        );
-    }
-
-    #[test]
-    fn test_fallback_fresh_install_follows_env() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let xdg = tmp.path().join(".config").join("agent-of-empires");
-        let legacy = tmp.path().join(".agent-of-empires");
-
-        // Neither dir exists yet: XDG_CONFIG_HOME set -> XDG opt-in; unset ->
-        // the historical macOS home-dotfile default.
-        assert_eq!(
-            resolve_app_dir_with_fallback(xdg.clone(), legacy.clone(), true),
-            xdg
-        );
-        assert_eq!(
-            resolve_app_dir_with_fallback(xdg, legacy.clone(), false),
-            legacy
-        );
+    fn app_dir_fallback_never_moves_existing_data() {
+        // (case, xdg dir exists, legacy dir exists, XDG_CONFIG_HOME set, xdg wins)
+        let cases = [
+            ("both present", true, true, true, true),
+            ("both present, env unset", true, true, false, true),
+            ("only legacy present", false, true, true, false),
+            ("fresh install, env set", false, false, true, true),
+            ("fresh install, env unset", false, false, false, false),
+        ];
+        for (case, xdg_exists, legacy_exists, env_set, xdg_wins) in cases {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let xdg = tmp.path().join(".config").join("agent-of-empires");
+            let legacy = tmp.path().join(".agent-of-empires");
+            for (dir, exists) in [(&xdg, xdg_exists), (&legacy, legacy_exists)] {
+                if exists {
+                    fs::create_dir_all(dir).unwrap();
+                }
+            }
+            let want = if xdg_wins { &xdg } else { &legacy };
+            assert_eq!(
+                &resolve_app_dir_with_fallback(xdg.clone(), legacy.clone(), env_set),
+                want,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -896,67 +917,148 @@ mod tests {
         let temp = isolate_app_dir();
         let pdir = app_dir(&temp).join(TUI_PRESENCE_DIR);
 
-        // Our own heartbeat counts as one live TUI.
         write_tui_heartbeat();
         assert_eq!(count_active_tuis(Duration::from_secs(30)), 1);
+        assert!(
+            !is_tui_active(Duration::from_secs(30)),
+            "a live but untouched TUI must not suppress phone notifications"
+        );
+
+        write_tui_activity();
         assert!(is_tui_active(Duration::from_secs(30)));
 
-        // A second instance's presence file bumps the count to two.
         fs::write(pdir.join("999999"), b"").unwrap();
         assert_eq!(count_active_tuis(Duration::from_secs(30)), 2);
 
-        // A zero threshold makes every file stale; they're swept and the
-        // directory is left empty.
         assert_eq!(count_active_tuis(Duration::ZERO), 0);
+        assert_eq!(count_fresh_tui_files(TUI_ACTIVITY_DIR, Duration::ZERO), 0);
         assert!(!is_tui_active(Duration::from_secs(30)));
         assert_eq!(fs::read_dir(&pdir).unwrap().count(), 0);
 
-        // Exit cleanup removes only our own file.
         write_tui_heartbeat();
         fs::write(pdir.join("999999"), b"").unwrap();
         clear_tui_heartbeat();
         assert_eq!(count_active_tuis(Duration::from_secs(30)), 1);
     }
 
+    /// Write `global` and/or `profile` config into an isolated app dir and return the guard.
+    fn seed_configs(global: Option<&str>, profile: Option<&str>) -> AppDirGuard {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        if let Some(body) = global {
+            fs::write(dir.join("config.toml"), body).unwrap();
+        }
+        if let Some(body) = profile {
+            let profile_dir = dir.join("profiles").join("default");
+            fs::create_dir_all(&profile_dir).unwrap();
+            fs::write(profile_dir.join("config.toml"), body).unwrap();
+        }
+        temp
+    }
+
+    const BAD_TYPE: &str = "[sandbox]\nenabled_by_default = \"not-a-bool\"\n";
+    const UNKNOWN_KEY: &str = "[sandbox]\nenabled_by_default = true\nprivildged = true\n";
+
     #[test]
     #[serial_test::serial]
-    fn test_collect_startup_config_warnings_clean() {
-        let _temp = isolate_app_dir();
-        // No config files written = defaults everywhere = no warning.
-        assert!(collect_startup_config_warnings("").is_none());
+    fn startup_config_warnings_report_parse_failures_and_unknown_keys() {
+        let default_config = toml::to_string_pretty(&config::Config::default()).unwrap();
+        // (case, global, profile, profile argument, fragments the warning must contain; none
+        // means no warning)
+        type Case<'a> = (
+            &'static str,
+            Option<&'a str>,
+            Option<&'static str>,
+            &'static str,
+            &'static [&'static str],
+        );
+        let cases: &[Case] = &[
+            ("no config", None, None, "", &[]),
+            (
+                "round-tripped defaults",
+                Some(&default_config),
+                Some("description = \"work\"\n[sandbox]\nenabled_by_default = true\n"),
+                "default",
+                &[],
+            ),
+            (
+                "documented map keys",
+                Some(
+                    "[session]\n\
+                     custom_agents = { myagent = \"true\" }\n\
+                     [agents.claude.status_map]\n\
+                     SessionStart = \"running\"\n\
+                     [tools.lazygit]\n\
+                     command = \"lazygit\"\n\
+                     [plugins.\"aoe.web\"]\n\
+                     enabled = true\n",
+                ),
+                None,
+                "",
+                &[],
+            ),
+            (
+                "unparseable global",
+                Some(BAD_TYPE),
+                None,
+                "",
+                &["Failed to load global config", "config.toml"],
+            ),
+            (
+                "unparseable profile",
+                None,
+                Some("[worktree]\nenabled = \"not-a-bool\"\n"),
+                "default",
+                &["Failed to load profile config 'default'"],
+            ),
+            (
+                "unknown nested global key",
+                Some(UNKNOWN_KEY),
+                None,
+                "",
+                &["Unrecognized keys in global config", "sandbox.privildged"],
+            ),
+            (
+                "unknown profile key",
+                None,
+                Some("[sandbox]\nprivildged = true\n"),
+                "default",
+                &[
+                    "Unrecognized keys in profile config 'default'",
+                    "sandbox.privildged",
+                ],
+            ),
+            (
+                "typo inside a documented map section",
+                Some("[agents.claude]\nstatus_maap = { foo = \"bar\" }\n"),
+                None,
+                "",
+                &["agents.claude.status_maap"],
+            ),
+        ];
+        for (case, global, profile, arg, fragments) in cases {
+            let _temp = seed_configs(*global, *profile);
+            let warning = collect_startup_config_warnings(arg);
+            if fragments.is_empty() {
+                assert!(warning.is_none(), "{case}: got {warning:?}");
+            }
+            for fragment in *fragments {
+                let warning = warning.as_deref().unwrap_or_default();
+                assert!(warning.contains(fragment), "{case}: got {warning:?}");
+            }
+        }
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_collect_startup_config_warnings_bad_global() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::write(
-            dir.join("config.toml"),
-            "[sandbox]\nenabled_by_default = \"not-a-bool\"\n",
-        )
-        .unwrap();
+    fn ignored_key_warnings_name_the_key_but_stay_silent_on_a_parse_failure() {
+        let _temp = seed_configs(Some(UNKNOWN_KEY), None);
+        let warning = collect_startup_ignored_key_warnings("").expect("ignored key is reported");
+        assert!(warning.contains("sandbox.privildged"));
+        assert!(!warning.contains("Failed to load"));
 
-        let warning = collect_startup_config_warnings("").expect("expected a warning");
-        assert!(warning.contains("Failed to load global config"));
-        assert!(warning.contains("config.toml"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_collect_startup_config_warnings_bad_profile() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        let profile_dir = dir.join("profiles").join("default");
-        fs::create_dir_all(&profile_dir).unwrap();
-        fs::write(
-            profile_dir.join("config.toml"),
-            "[worktree]\nenabled = \"not-a-bool\"\n",
-        )
-        .unwrap();
-
-        let warning = collect_startup_config_warnings("default").expect("expected a warning");
-        assert!(warning.contains("Failed to load profile config 'default'"));
+        let _temp = seed_configs(Some(BAD_TYPE), None);
+        assert!(collect_startup_ignored_key_warnings("").is_none());
     }
 
     fn release_dir_in(root: impl AsRef<Path>) -> PathBuf {
@@ -970,148 +1072,63 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_drift_none_when_no_release_dir() {
-        let _temp = isolate_app_dir();
-        // Neither dir exists → no drift to flag.
-        assert!(debug_namespace_drift().is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_drift_none_when_release_empty() {
+    fn drift_fires_only_for_a_populated_release_dir_with_no_dev_dir() {
         let temp = isolate_app_dir();
+        assert!(debug_namespace_drift().is_none(), "no release dir at all");
+
         let release = release_dir_in(&temp);
         fs::create_dir_all(&release).unwrap();
-        // Release dir exists but has no content — user has no prior state
-        // to lose visibility of, so don't nag them.
-        assert!(debug_namespace_drift().is_none());
-    }
+        assert!(debug_namespace_drift().is_none(), "release dir is empty");
 
-    #[test]
-    #[serial_test::serial]
-    fn test_drift_fires_when_release_populated_and_dev_absent() {
-        let temp = isolate_app_dir();
-        let release = release_dir_in(&temp);
         fs::create_dir_all(release.join("profiles")).unwrap();
-
         let drift = debug_namespace_drift();
-        // Only assert presence on debug builds — release builds compile this
-        // function to `None`.
         if cfg!(debug_assertions) {
-            let (r, d) = drift.expect("expected drift on debug build");
+            let (r, d) = drift.expect("expected drift on a debug build");
             assert_eq!(r, release);
             assert!(d.to_string_lossy().contains("-dev"));
         } else {
             assert!(drift.is_none());
         }
-    }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_drift_silent_once_dev_dir_exists() {
-        let temp = isolate_app_dir();
-        let release = release_dir_in(&temp);
-        fs::create_dir_all(release.join("profiles")).unwrap();
-        // Simulate "user has already run aoe once after the namespace
-        // change" by creating the dev dir.
         let _dev = app_dir(&temp);
-        assert!(debug_namespace_drift().is_none());
-    }
-
-    #[test]
-    fn test_format_warning_mentions_both_paths_and_migration_command() {
-        let release = PathBuf::from("/home/u/.config/agent-of-empires");
-        let dev = PathBuf::from("/home/u/.config/agent-of-empires-dev");
-        let msg = format_debug_namespace_warning(&release, &dev);
-        assert!(msg.contains("/home/u/.config/agent-of-empires"));
-        assert!(msg.contains("/home/u/.config/agent-of-empires-dev"));
-        assert!(msg.contains("cp -r"));
-        assert!(msg.contains("not repeat"));
+        assert!(debug_namespace_drift().is_none(), "dev dir now exists");
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_fresh_install_bootstraps_main_profile() {
-        // Genuine first run: no profiles/ entries. Resolution must create a
-        // single profile named "main", never the magic "default".
-        let _temp = isolate_app_dir();
-        assert!(list_profiles().unwrap().is_empty());
-
-        let resolved = config::resolve_default_profile();
-        assert_eq!(resolved, "main");
-        assert_eq!(list_profiles().unwrap(), vec!["main".to_string()]);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_existing_default_profile_is_untouched_and_usable() {
-        // An install that already has profiles/default/ keeps it; "default"
-        // is now an ordinary profile, resolved like any other first entry.
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
-
-        let resolved = config::resolve_default_profile();
-        assert_eq!(resolved, "default");
-        assert!(dir.join("profiles").join("default").exists());
-
-        let storage = Storage::new_unwatched("default").unwrap();
-        assert_eq!(storage.profile(), "default");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_get_profile_dir_empty_resolves_without_default_literal() {
-        // An empty profile argument resolves through resolve_default_profile,
-        // landing on the first existing profile rather than a "default" name.
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("alpha")).unwrap();
-        fs::create_dir_all(dir.join("profiles").join("beta")).unwrap();
-
-        let resolved = get_profile_dir("").unwrap();
-        assert_eq!(resolved, dir.join("profiles").join("alpha"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_delete_profile_refuses_last_remaining() {
-        // The invariant is a count, not a name: deleting the only profile is
-        // refused so AoE always has somewhere to file sessions.
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("solo")).unwrap();
-
-        let err = delete_profile("solo").expect_err("deleting the last profile must fail");
-        assert!(err.to_string().contains("at least one profile must exist"));
-        assert!(dir.join("profiles").join("solo").exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_delete_profile_named_default_allowed_when_others_exist() {
-        // A profile literally named "default" carries no protection once
-        // other profiles exist; only the count invariant applies.
+    fn test_implicit_resolution_ignores_picker_order_on_mixed_registry() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
         fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
         fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
 
-        delete_profile("default").expect("a non-last profile named default is deletable");
-        assert!(!dir.join("profiles").join("default").exists());
-        assert!(dir.join("profiles").join("work").exists());
+        assert_eq!(
+            list_profiles().unwrap(),
+            vec!["default".to_string(), "work".to_string()],
+            "list_profiles is the resolution input and stays plainly sorted"
+        );
+        assert_eq!(config::resolve_default_profile(), "default");
+        assert_eq!(
+            get_profile_dir("").unwrap(),
+            dir.join("profiles").join("default")
+        );
+        assert_eq!(
+            list_profiles_for_display().unwrap(),
+            vec!["work".to_string(), "default".to_string()],
+            "only the picker order sinks default"
+        );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial_test::serial]
-    fn test_delete_profile_rejects_path_traversal() {
-        // Without name validation, delete_profile("../foo") would resolve
-        // to <app_dir>/profiles/../foo and remove an arbitrary sibling
-        // directory. The validator must catch this before any FS work.
+    fn delete_profile_validates_names_but_removes_strays_and_keeps_the_last() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
-        // A directory that must NOT be touched by the call below.
+        let profiles = dir.join("profiles");
+        let stray = "work 0123456789abcdef Some Title";
+        fs::create_dir_all(profiles.join(stray)).unwrap();
+        fs::create_dir_all(profiles.join("real")).unwrap();
         let bystander = dir.join("bystander");
         fs::create_dir_all(&bystander).unwrap();
 
@@ -1128,21 +1145,22 @@ mod tests {
                 "unexpected error for {malicious:?}: {msg}"
             );
         }
-
         assert!(bystander.exists(), "bystander directory must survive");
-        assert!(dir.join("profiles").join("real").exists());
+
+        delete_profile(stray).expect("a pre-existing spaced stray must be deletable");
+        assert!(!profiles.join(stray).exists());
+
+        let err = delete_profile("real").expect_err("deleting the last profile must fail");
+        assert!(err.to_string().contains("at least one profile must exist"));
+        assert!(profiles.join("real").exists());
     }
 
     #[test]
-    fn test_validate_profile_name_accepts_normal_names() {
+    fn validate_profile_name_accepts_existing_dirs_and_rejects_traversal() {
         for name in ["work", "personal", "client-a", ".hidden", "1", "main"] {
             validate_profile_name(name)
                 .unwrap_or_else(|e| panic!("expected {name:?} to validate: {e}"));
         }
-    }
-
-    #[test]
-    fn test_validate_profile_name_rejects_traversal_and_separators() {
         for bad in ["", "..", ".", "/etc", "a/b", "a\\b", "all", "ALL"] {
             validate_profile_name(bad)
                 .err()
@@ -1151,26 +1169,160 @@ mod tests {
     }
 
     #[test]
+    fn validate_new_profile_name_gates_creation_more_tightly() {
+        for name in [
+            "default",
+            "work",
+            "personal-main",
+            "team_b",
+            "main",
+            "client-a",
+            "1",
+        ] {
+            validate_new_profile_name(name)
+                .unwrap_or_else(|e| panic!("expected {name:?} to pass create gate: {e}"));
+        }
+        for bad in [
+            "work 0123456789abcdef Some Title",
+            "ZZTEST spaced name",
+            "has space",
+            "tab\tname",
+            "emoji\u{1f600}",
+            "all",
+            "..",
+            "a/b",
+            ".hidden",
+            "a.b",
+        ] {
+            validate_new_profile_name(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected create gate to reject {bad:?}"));
+        }
+        validate_new_profile_name(&"a".repeat(65)).expect_err("65 chars is too long");
+
+        let text = validate_new_profile_name("bad\u{1b}[31mname")
+            .expect_err("control char must be rejected")
+            .to_string();
+        assert!(
+            !text.contains('\u{1b}') && text.contains("\\u{1b}"),
+            "expected only the escaped ESC in the error: {text:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_get_profile_dir_refuses_to_vivify_stray() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+
+        let stray = "work 0123456789abcdef Some Title";
+        let err = get_profile_dir(stray).expect_err("stray name must be refused");
+        assert!(
+            err.to_string().contains("disallowed characters")
+                || err.to_string().contains("path separators"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.join("profiles").join(stray).exists(),
+            "stray profile dir must NOT have been created"
+        );
+        let good = get_profile_dir("personal").expect("valid name must create dir");
+        assert!(good.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_require_known_profile_rejects_unknown_when_registry_nonempty() {
+        let temp = isolate_app_dir();
+        require_known_profile("main")
+            .expect("first-run profile must be allowed when registry empty");
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+
+        let err =
+            require_known_profile("ghost-profile").expect_err("unknown profile must be refused");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.join("profiles").join("ghost-profile").exists(),
+            "guard must not vivify the unknown profile"
+        );
+
+        require_known_profile("work").expect("existing profile must be allowed");
+        require_known_profile("").expect("empty/default profile must be allowed");
+
+        let err = require_known_profile("nope\u{1b}[31m")
+            .expect_err("unknown profile with control chars must be refused");
+        let text = err.to_string();
+        assert!(
+            !text.contains('\u{1b}') && text.contains("\\u{1b}"),
+            "expected escaped ESC in the error: {text:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn rename_profile_gates_the_destination_but_repairs_a_stray_source() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
+
+        let too_long = "a".repeat(65);
+        for bad in [
+            "has space",
+            "emoji\u{1f600}",
+            "all",
+            "a.b",
+            too_long.as_str(),
+        ] {
+            let err = rename_profile("real", bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected rename to refuse destination {bad:?}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("disallowed characters")
+                    || msg.contains("reserved")
+                    || msg.contains("too long"),
+                "unexpected error for {bad:?}: {msg}"
+            );
+            assert!(
+                dir.join("profiles").join("real").exists(),
+                "source must be untouched after refusing {bad:?}"
+            );
+            assert!(!dir.join("profiles").join(bad).exists());
+        }
+
+        let stray = "work 0123456789abcdef Some Title";
+        fs::create_dir_all(dir.join("profiles").join(stray)).unwrap();
+        rename_profile(stray, "work").expect("a spaced stray must be renameable");
+        assert!(!dir.join("profiles").join(stray).exists());
+        assert!(dir.join("profiles").join("work").exists());
+
+        fs::create_dir_all(dir.join("bystander")).unwrap();
+        let err = rename_profile("../bystander", "escaped").expect_err("traversal source");
+        assert!(err.to_string().contains("path separators"), "{err}");
+        assert!(dir.join("bystander").exists());
+        assert!(!dir.join("profiles").join("escaped").exists());
+    }
+
+    #[test]
     #[serial_test::serial]
     fn test_load_profile_config_does_not_create_dir_for_unknown_profile() {
-        // Regression: previously `load_profile_config` flowed through
-        // `get_profile_dir` which `create_dir_all`'d the profile dir as a
-        // side effect of the read. That meant any GET against a profile
-        // name that did not yet exist (the dashboard's mount-time settings
-        // fetch fires before the profile list resolves) polluted
-        // `profiles/` with a stub directory, and the stub then showed up
-        // in subsequent GET /api/profiles responses. The read must stay
-        // pure.
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
         fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
         let unknown_dir = dir.join("profiles").join("does-not-exist");
         assert!(!unknown_dir.exists());
 
-        let cfg = crate::session::profile_config::load_profile_config("does-not-exist")
+        let cfg = crate::session::config::profile_config::load_profile_config("does-not-exist")
             .expect("loading config for an unknown profile must succeed with defaults");
         assert!(
-            !crate::session::profile_config::profile_has_overrides(&cfg),
+            !crate::session::config::profile_config::profile_has_overrides(&cfg),
             "unknown profile must load to defaults",
         );
         assert!(
@@ -1181,15 +1333,16 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_resolve_existing_profile_errors_on_unknown_name_without_creating_dir() {
-        // Core regression for the lazy-profile-creation bug: merely naming
-        // an unknown profile via -p must never leave a stub directory
-        // behind, whether the lookup succeeds or fails.
+    fn resolve_existing_profile_never_creates_a_profile_it_was_not_asked_to_bootstrap() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
-        let unknown_dir = dir.join("profiles").join("ghost");
-        assert!(!unknown_dir.exists());
+        assert!(list_profiles().unwrap().is_empty());
+        assert_eq!(
+            resolve_existing_profile("").unwrap(),
+            "main",
+            "fresh install"
+        );
+        assert_eq!(list_profiles().unwrap(), vec!["main".to_string()]);
 
         let err = resolve_existing_profile("ghost").expect_err("unknown profile must error");
         let msg = err.to_string();
@@ -1198,128 +1351,60 @@ mod tests {
             msg.contains("aoe profile create"),
             "unexpected message: {msg}"
         );
-        assert!(
-            !unknown_dir.exists(),
-            "resolve_existing_profile must not create profiles/<unknown>/ as a side effect",
-        );
-    }
+        assert!(!dir.join("profiles").join("ghost").exists());
 
-    #[test]
-    #[serial_test::serial]
-    fn test_resolve_existing_profile_succeeds_for_created_profile() {
-        let _temp = isolate_app_dir();
         create_profile("newly-created").unwrap();
+        assert_eq!(
+            resolve_existing_profile("newly-created").unwrap(),
+            "newly-created"
+        );
 
-        let resolved = resolve_existing_profile("newly-created").unwrap();
-        assert_eq!(resolved, "newly-created");
-    }
+        fs::create_dir_all(dir.join("etc")).unwrap();
+        let err =
+            resolve_existing_profile("../etc").expect_err("path traversal name must be rejected");
+        assert!(err.to_string().contains("path separators"), "{err}");
 
-    #[test]
-    #[serial_test::serial]
-    fn test_resolve_existing_profile_empty_bootstraps_main_on_fresh_install() {
-        let _temp = isolate_app_dir();
-        assert!(list_profiles().unwrap().is_empty());
-
-        let resolved = resolve_existing_profile("").unwrap();
-        assert_eq!(resolved, "main");
-        assert_eq!(list_profiles().unwrap(), vec!["main".to_string()]);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_resolve_existing_profile_empty_errors_on_stale_configured_default() {
-        // config.default_profile points at a name whose directory was
-        // deleted (or never existed). Resolving "" must not silently
-        // revive it on disk; it must error like any other unknown name.
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("other")).unwrap();
         fs::write(
             dir.join("config.toml"),
             r#"default_profile = "deleted-profile""#,
         )
         .unwrap();
-        let stale_dir = dir.join("profiles").join("deleted-profile");
-        assert!(!stale_dir.exists());
-
         let err = resolve_existing_profile("").expect_err("stale default must error");
         assert!(err.to_string().contains("does not exist"));
         assert!(
-            !stale_dir.exists(),
+            !dir.join("profiles").join("deleted-profile").exists(),
             "stale default_profile must not be silently revived on disk",
         );
     }
 
     #[test]
-    #[serial_test::serial]
-    fn test_resolve_existing_profile_rejects_path_traversal_name() {
-        // Security regression: an unvalidated name like "../etc" must not
-        // reach get_profile_dir_path and resolve to a path-traversal
-        // sibling directory that happens to exist.
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
-        // Sibling directory that a path-traversal name could resolve to:
-        // <app_dir>/profiles/../etc collapses to <app_dir>/etc.
-        fs::create_dir_all(dir.join("etc")).unwrap();
+    fn validate_instance_id_allowlists_one_path_component() {
+        for (id, ok) in [
+            ("a3f7c2d1e4b89012", true),
+            ("compact", true),
+            ("nested_first", true),
+            ("a-b-c", true),
+            ("", false),
+            ("..", false),
+            (".", false),
+            ("/etc", false),
+            ("foo/bar", false),
+            ("foo\\bar", false),
+            ("foo\0bar", false),
+            ("foo bar", false),
+            ("x".repeat(65).as_str(), false),
+        ] {
+            assert_eq!(validate_instance_id(id).is_ok(), ok, "{id:?}");
+        }
 
-        let err =
-            resolve_existing_profile("../etc").expect_err("path traversal name must be rejected");
-        assert!(
-            err.to_string().contains("path separators"),
-            "unexpected message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_instance_id_rejects_unsafe() {
-        assert!(validate_instance_id("").is_err(), "empty");
-        assert!(validate_instance_id("..").is_err(), "parent ref");
-        assert!(validate_instance_id(".").is_err(), "current ref");
-        assert!(validate_instance_id("/etc").is_err(), "absolute path");
-        assert!(validate_instance_id("foo/bar").is_err(), "subdir traversal");
-        assert!(validate_instance_id("foo\\bar").is_err(), "backslash");
-        assert!(validate_instance_id("foo\0bar").is_err(), "NUL byte");
-        assert!(validate_instance_id("foo bar").is_err(), "whitespace");
-        assert!(
-            validate_instance_id(&"x".repeat(65)).is_err(),
-            "over length cap"
-        );
-    }
-
-    #[test]
-    fn validate_instance_id_accepts_production_and_test() {
-        assert!(
-            validate_instance_id("a3f7c2d1e4b89012").is_ok(),
-            "production hex"
-        );
-        assert!(
-            validate_instance_id("0123456789abcdef").is_ok(),
-            "production hex lower"
-        );
-        assert!(validate_instance_id("compact").is_ok(), "test label");
-        assert!(validate_instance_id("nested_first").is_ok(), "underscore");
-        assert!(validate_instance_id("a-b-c").is_ok(), "hyphen");
-    }
-
-    #[test]
-    fn validate_instance_id_error_messages_do_not_echo_input() {
+        // Errors must not echo input bytes (log injection).
         const SENTINEL: &str = "ZZ_unique_sentinel_aabbcc";
-
-        let bad = format!("{SENTINEL}/x");
-        let e = validate_instance_id(&bad).unwrap_err().to_string();
-        assert!(e.contains("disallowed"));
-        assert!(
-            !e.contains(SENTINEL),
-            "must not echo input bytes; risk of log injection"
-        );
-
-        let bad = format!("{SENTINEL}{}", "x".repeat(70));
-        let e = validate_instance_id(&bad).unwrap_err().to_string();
-        assert!(e.contains("too long"));
-        assert!(
-            !e.contains(SENTINEL),
-            "must not echo input bytes from oversize branch"
-        );
+        for (bad, reason) in [
+            (format!("{SENTINEL}/x"), "disallowed"),
+            (format!("{SENTINEL}{}", "x".repeat(70)), "too long"),
+        ] {
+            let e = validate_instance_id(&bad).unwrap_err().to_string();
+            assert!(e.contains(reason) && !e.contains(SENTINEL), "{e}");
+        }
     }
 }

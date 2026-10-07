@@ -32,32 +32,19 @@ describe("usePluginPanes", () => {
     expect(isPluginPaneId(result.current[0]!.id)).toBe(true);
   });
 
-  it("defaults the dock to right and the title to the plugin id", () => {
+  it("defaults the dock to right and the title to the plugin id, and is empty without a session", () => {
     set([{ plugin_id: "gh", slot: "pane", id: "main", session_id: "s1", payload: {} }]);
-    const { result } = renderHook(() => usePluginPanes("s1"));
-    expect(result.current[0]).toMatchObject({ title: "gh", defaultDock: "right" });
-  });
-
-  it("returns nothing without a session", () => {
-    set([{ plugin_id: "gh", slot: "pane", id: "main", session_id: "s1", payload: {} }]);
+    expect(renderHook(() => usePluginPanes("s1")).result.current[0]).toMatchObject({
+      title: "gh",
+      defaultDock: "right",
+    });
     expect(renderHook(() => usePluginPanes(null)).result.current).toEqual([]);
   });
 });
 
-describe("resolvePaneIcon", () => {
-  it("prefers the pane's own runtime icon over the manifest icon", () => {
-    expect(resolvePaneIcon(GitBranch, "puzzle")).toBe(GitBranch);
-  });
-
-  it("falls back to the manifest identity icon when the pane sets none", () => {
-    expect(resolvePaneIcon(undefined, "git-branch")).toBeDefined();
-  });
-
-  it("falls through to undefined for an unknown manifest icon name", () => {
-    expect(resolvePaneIcon(undefined, "not-a-real-lucide-icon-name")).toBeUndefined();
-  });
-
-  it("falls through to undefined when neither is set", () => {
-    expect(resolvePaneIcon(undefined, undefined)).toBeUndefined();
-  });
+it("resolvePaneIcon prefers the runtime icon, then a known manifest icon", () => {
+  expect(resolvePaneIcon(GitBranch, "puzzle")).toBe(GitBranch);
+  expect(resolvePaneIcon(undefined, "git-branch")).toBeDefined();
+  expect(resolvePaneIcon(undefined, "not-a-real-lucide-icon-name")).toBeUndefined();
+  expect(resolvePaneIcon(undefined, undefined)).toBeUndefined();
 });

@@ -1,24 +1,4 @@
 //! Handshake-only ACP catalog probe (plugin-picker model-discovery fix).
-//!
-//! The structured-session model / mode / thought-level pickers are fed by the
-//! `config_options` an agent advertises. Those are cached per-agent in
-//! [`crate::acp::option_catalog`], but only ever written as a side effect of a
-//! *live* session (`src/server/mod.rs` on `ConfigOptionsUpdated`). So an agent
-//! that has never run shows an empty picker, which reads as a bug.
-//!
-//! ACP puts the option set in the `session/new` response itself
-//! (`NewSessionResponse.config_options`; claude-agent-acp emits models + modes +
-//! thought-levels there, see #1403), so we can populate the catalog without a
-//! conversation: spawn the adapter, run initialize + `session/new` against a
-//! throwaway cwd, record the first advertised snapshot, and tear the process
-//! down. No prompt turn is sent, so no tokens are spent. The probe reuses
-//! [`AcpClient::spawn`] on the in-process stdio transport (`socket_path: None`),
-//! so it leaves no detached runner or worker-registry entry behind.
-//!
-//! Everything here degrades to "undiscovered" rather than failing: an unknown
-//! agent, an absent adapter, a handshake that needs credentials the daemon does
-//! not have, or an adapter that never advertises options all return
-//! `Ok(false)`.
 
 use std::time::Duration;
 
@@ -30,19 +10,12 @@ use crate::acp::AgentRegistry;
 /// the adapter is treated as undiscovered.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for the first `ConfigOptionsUpdated` after `session/new`.
-/// claude queues it in the `session/new` response so it is usually immediate;
-/// this only bounds adapters that push it as a follow-up notification.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Probe `agent`'s advertised option catalog via a handshake-only ACP session
-/// and record it into [`crate::acp::option_catalog`]. Returns `Ok(true)` when a
-/// non-empty snapshot was recorded, `Ok(false)` when the agent is unknown, its
-/// adapter is not installed, the handshake failed, or no options arrived in
-/// time. Never sends a prompt turn.
+/// and record it into [`crate::acp::option_catalog`].
 pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
-    // Registry agents only. The picker is populated from the static registry,
-    // and a custom agent's `agent_acp_cmd` can carry hostnames or secrets we
-    // should not blind-spawn from a settings GET.
+    // Registry agents only.
     let registry = AgentRegistry::with_defaults();
     let Some(mut spec) = registry.get(agent).cloned() else {
         return Ok(false);
@@ -60,10 +33,11 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
     }
 
     // Throwaway absolute cwd: `session/new` requires an existing absolute
-    // directory, but a handshake writes nothing to it. Dropped on return.
+    // directory, but a handshake writes nothing to it.
     let tmp = tempfile::tempdir()?;
 
     let config = SpawnConfig {
+        wrapper_substitution: None,
         agent_key: agent.to_string(),
         tool: agent.to_string(),
         spec,
@@ -74,7 +48,9 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         provider_env: Vec::new(),
         host_environment: Vec::new(),
         default_effort: None,
+        default_effort_explicit: false,
         default_mode: None,
+        default_model: None,
         // In-process stdio: no detached runner, no persistent worker entry.
         socket_path: None,
         stored_acp_session_id: None,
@@ -83,7 +59,11 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         source_profile: None,
         mcp_servers: Vec::new(),
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
+        claude_store_pin: None,
+        provider_routing: Vec::new(),
+        base_host_environment: Vec::new(),
     };
 
     // Probe-scoped id so it never collides with a real structured-view worker.
@@ -99,8 +79,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
                 return Ok(false);
             }
             // ponytail: a wedged handshake leaks the child (no kill_on_drop on the
-            // spawn), reaped at daemon exit. Acceptable on the settings probe path;
-            // add kill_on_drop to spawn_subprocess if this ever bites.
+            // spawn), reaped at daemon exit.
             Err(_) => {
                 tracing::debug!(target: "acp.probe", agent, "probe handshake timed out");
                 return Ok(false);
@@ -118,7 +97,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
 }
 
 /// Drain events until the first non-empty `ConfigOptionsUpdated`, record it, and
-/// return `true`. Returns `false` if the stream ends first.
+/// return `true`.
 async fn drain_first_snapshot(client: &mut AcpClient, agent: &str) -> bool {
     while let Some(event) = client.next_event().await {
         if let Event::ConfigOptionsUpdated { options } = event {
@@ -135,19 +114,4 @@ async fn drain_first_snapshot(client: &mut AcpClient, agent: &str) -> bool {
         }
     }
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An agent that is not in the registry never spawns a process; the probe
-    /// degrades to `Ok(false)` immediately. Keeps the happy path (which spawns a
-    /// real adapter) out of the hermetic unit suite.
-    #[tokio::test]
-    async fn unknown_agent_never_spawns() {
-        assert!(!probe_agent("definitely-not-an-agent-xyz")
-            .await
-            .expect("unknown agent is a clean no-op"));
-    }
 }

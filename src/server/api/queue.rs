@@ -1,0 +1,396 @@
+//! Server-owned prompt-queue HTTP handlers.
+//!
+//! The daemon persists and drains the queue, so follow-ups survive client
+//! reloads. Attachments ride with a queued prompt: the enqueue POST carries the
+//! same `PromptAttachmentUpload` shape as `/acp/prompt`, the bytes are buffered
+//! in the event store's pending-attachment table (keyed by prompt id, outside
+//! the seq-keyed retention prune), and the drain reloads and forwards them. A
+//! per-session byte cap bounds how much a client can buffer.
+
+use std::sync::Arc;
+
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+use serde::Deserialize;
+
+use super::acp::validate_attachments;
+use super::read_only_block;
+use crate::acp::protocol::PromptAttachmentUpload;
+use crate::daemon::PromptAttachmentRef;
+use crate::server::session_service::EditQueuedOutcome;
+use crate::server::AppState;
+
+/// Cap on total queued-attachment bytes buffered per session: enough for
+/// several image follow-ups while bounding what an undrained queue holds.
+const MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
+
+/// Cap on queue depth per session. The queue lives on the `Instance` and every
+/// mutation rewrites the whole profile session file, so depth costs disk I/O on
+/// each enqueue rather than just memory.
+const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
+
+/// Cap on a single queued prompt's text. Unlike `/acp/prompt`, which streams
+/// straight to the agent, this text is persisted and rewritten on every
+/// subsequent queue mutation, so 256 KiB bounds that rewrite.
+const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct EnqueueRequest {
+    /// Client-minted stable id, so an optimistic UI row reconciles against the
+    /// server row and a retry does not double-queue.
+    pub id: String,
+    pub text: String,
+    /// Optional provenance: which device queued it.
+    #[serde(default)]
+    pub origin_device: Option<String>,
+    /// Attachments to deliver when the prompt drains. Same untrusted wire shape
+    /// as `/acp/prompt`; `#[serde(default)]` keeps text-only enqueues working.
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachmentUpload>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EditRequest {
+    pub text: String,
+}
+
+async fn session_exists(state: &AppState, id: &str) -> bool {
+    state.instances.read().await.iter().any(|i| i.id == id)
+}
+
+/// `POST /api/sessions/{id}/queue`: append a prompt to the server queue.
+pub async fn queue_enqueue(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<EnqueueRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    if !session_exists(&state, &id).await {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+    // A prompt may be empty only if it carries attachments (an image-only
+    // follow-up). A truly empty enqueue is rejected.
+    if req.text.trim().is_empty() && req.attachments.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty prompt").into_response();
+    }
+    if req.text.len() > MAX_QUEUED_TEXT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "queued prompt text exceeds the {} KiB limit",
+                MAX_QUEUED_TEXT_BYTES / 1024
+            ),
+        )
+            .into_response();
+    }
+    // Re-enqueuing an existing id rewrites that row's text and replaces its
+    // blobs, so it is the same kind of mutation `edit_queued_prompt` and
+    // `remove_queued_prompt` serialize against: landing inside a drain's
+    // snapshot-to-send window sends the old text and then retires the row along
+    // with the freshly buffered bytes (#3621). Claimed here rather than in
+    // `buffer_and_enqueue`, which the prompt endpoint reaches already holding
+    // the guard and which is not reentrant.
+    let _submission = state.session_service.prompt_submission(&id).await;
+    // Depth cap. Re-enqueuing an existing id replaces that row, so it must not
+    // count against a full queue.
+    {
+        let queue = state.session_service.queued_prompts_snapshot(&id).await;
+        if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|q| q.id == req.id) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("queue is full ({MAX_QUEUED_PROMPTS_PER_SESSION} prompts)"),
+            )
+                .into_response();
+        }
+    }
+
+    // Decode, validate and capability-gate the attachments exactly as the live
+    // prompt path does.
+    let blobs = match validate_attachments(&state, &id, &req.attachments) {
+        Ok(b) => b,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    match buffer_and_enqueue(&state, &id, &req.id, req.text, &blobs, req.origin_device).await {
+        Ok(entry) => (StatusCode::OK, Json(entry)).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+/// Buffer already-validated attachment blobs under `prompt_id` and append the
+/// prompt to the session's server-owned queue.
+///
+/// Shared by `queue_enqueue` and the prompt endpoint's `Queued` disposition, so
+/// a prompt the daemon parks is byte-for-byte the queue row a client would have
+/// created itself.
+pub(super) async fn buffer_and_enqueue(
+    state: &Arc<AppState>,
+    id: &str,
+    prompt_id: &str,
+    text: String,
+    blobs: &[crate::acp::event_store::AttachmentBlob],
+    origin_device: Option<String>,
+) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
+    // Per-session buffer cap, so an undrained queue cannot grow without bound.
+    // Re-enqueuing the same id replaces its blobs, so subtract what this prompt
+    // already holds before checking headroom.
+    if !blobs.is_empty() {
+        let incoming: u64 = blobs.iter().map(|b| b.data.len() as u64).sum();
+        let existing_for_prompt: u64 = state
+            .acp_event_store
+            .load_pending_attachments_for_ref(id, prompt_id)
+            .iter()
+            .map(|b| b.data.len() as u64)
+            .sum();
+        let session_total = state.acp_event_store.pending_attachment_bytes(id);
+        let projected = session_total.saturating_sub(existing_for_prompt) + incoming;
+        if projected > MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "queued attachments exceed the {} MiB per-session limit",
+                    MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION / (1024 * 1024)
+                ),
+            ));
+        }
+    }
+
+    // Buffer the bytes keyed by the prompt id, then hand metadata-only refs to
+    // the store. Re-enqueue is idempotent: clear any prior blobs for this id so
+    // a re-post with a different attachment set replaces cleanly.
+    let refs: Vec<PromptAttachmentRef> = blobs
+        .iter()
+        .map(|b| PromptAttachmentRef {
+            id: b.id.clone(),
+            kind: b.kind,
+            mime_type: b.mime_type.clone(),
+            name: b.name.clone(),
+            size: b.data.len() as u64,
+        })
+        .collect();
+    // Unconditional, not gated on this request carrying attachments:
+    // `enqueue_prompt` replaces the row's refs with whatever came in, so a
+    // re-enqueue that drops them would orphan the prior blobs against the
+    // per-session cap until the 24h sweep.
+    state
+        .acp_event_store
+        .delete_pending_attachments_for_ref(id, prompt_id);
+    for blob in blobs {
+        state
+            .acp_event_store
+            .record_pending_attachment(id, prompt_id, blob);
+    }
+
+    match state
+        .session_service
+        .enqueue_prompt(id, prompt_id.to_string(), text, refs, origin_device)
+        .await
+    {
+        Some(entry) => Ok(entry),
+        None => {
+            // Session vanished between the existence check and the enqueue;
+            // drop the blobs just buffered so they do not leak.
+            state
+                .acp_event_store
+                .delete_pending_attachments_for_ref(id, prompt_id);
+            Err((StatusCode::NOT_FOUND, "session not found".to_string()))
+        }
+    }
+}
+
+/// `GET /api/sessions/{id}/queue`: the queue ordered by `seq`.
+pub async fn queue_list(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    Json(state.session_service.queued_prompts_snapshot(&id).await).into_response()
+}
+
+/// `PATCH /api/sessions/{id}/queue/{promptId}`: replace a queued prompt's text.
+pub async fn queue_edit(
+    State(state): State<Arc<AppState>>,
+    Path((id, prompt_id)): Path<(String, String)>,
+    req: Result<Json<EditRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    // Same bound as enqueue: an edit is another write of this text into the
+    // session file, so it cannot be a way around the cap.
+    if req.text.len() > MAX_QUEUED_TEXT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "queued prompt text exceeds the {} KiB limit",
+                MAX_QUEUED_TEXT_BYTES / 1024
+            ),
+        )
+            .into_response();
+    }
+    match state
+        .session_service
+        .edit_queued_prompt(&id, prompt_id, req.text)
+        .await
+    {
+        EditQueuedOutcome::Updated => StatusCode::NO_CONTENT.into_response(),
+        EditQueuedOutcome::NotFound => {
+            (StatusCode::NOT_FOUND, "queued prompt not found").into_response()
+        }
+        // Same rule as enqueue: a row with neither text nor attachments cannot
+        // be delivered, and silently discarding what the user typed is worse
+        // than a 400.
+        EditQueuedOutcome::WouldEmpty => (StatusCode::BAD_REQUEST, "empty prompt").into_response(),
+    }
+}
+
+/// `DELETE /api/sessions/{id}/queue/{promptId}`: remove one queued prompt.
+pub async fn queue_remove(
+    State(state): State<Arc<AppState>>,
+    Path((id, prompt_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    if state
+        .session_service
+        .remove_queued_prompt(&id, prompt_id)
+        .await
+    {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "queued prompt not found").into_response()
+    }
+}
+
+/// `DELETE /api/sessions/{id}/queue`: drop every queued prompt.
+pub async fn queue_clear(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    state.session_service.clear_queued_prompts(&id).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Instance;
+    use std::time::Duration;
+
+    /// #3621: `POST /queue` rewrites an existing row's text and blobs when the
+    /// client re-posts its id, so it must wait for an in-flight delivery the way
+    /// an edit does; otherwise the drain sends the pre-rewrite text and then
+    /// retires the row.
+    #[tokio::test]
+    async fn a_re_enqueue_waits_for_an_in_flight_delivery() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue-enq", "/tmp/aoe-3621-enqueue");
+        inst.id = "sess-3621-enq".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Stand in for a drain holding the session across snapshot -> send.
+        let delivering = state.session_service.prompt_submission(&id).await;
+        let mut claims = state.session_service.watch_submission_claims();
+        let enqueue = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                queue_enqueue(
+                    State(state),
+                    Path(id),
+                    Ok(Json(EnqueueRequest {
+                        id: "q1".to_string(),
+                        text: "rewritten".to_string(),
+                        origin_device: None,
+                        attachments: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        };
+        tokio::pin!(enqueue);
+        assert!(
+            futures_util::poll!(&mut enqueue).is_pending(),
+            "an enqueue must not rewrite a row a delivery has already snapshotted"
+        );
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("contender reached submission claim"),
+            id
+        );
+        drop(delivering);
+        let response = tokio::time::timeout(Duration::from_secs(10), enqueue)
+            .await
+            .expect("the enqueue lands once the delivery releases the session");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// #4092: the resume admission orders queue rows against the rate-limit
+    /// park, so the enqueue time is the server's. A client clock, however far
+    /// ahead, must not reach the row.
+    #[tokio::test]
+    async fn a_client_clock_never_dates_a_queued_row() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue-stamp", "/tmp/aoe-4092-stamp");
+        inst.id = "sess-4092-stamp".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let response = queue_enqueue(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(
+                serde_json::from_value(serde_json::json!({
+                    "id": "q1",
+                    "text": "queued by a client with a fast clock",
+                    "created_at": "2999-01-01T00:00:00Z",
+                }))
+                .expect("the hostile body deserialises"),
+            )),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an unknown key must not reject an older client's body"
+        );
+        let row = state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .into_iter()
+            .next()
+            .expect("the row must land");
+        let stamped = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+            .expect("the server stamps a readable instant")
+            .with_timezone(&chrono::Utc);
+        let skew = (stamped - chrono::Utc::now()).num_seconds().abs();
+        assert!(
+            skew < 60,
+            "the row carries the client's 2999 clock, {skew}s from now"
+        );
+    }
+}

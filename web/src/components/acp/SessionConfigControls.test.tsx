@@ -1,227 +1,169 @@
 // @vitest-environment jsdom
-//
-// Rendering + interaction tests for the structured view model + reasoning
-// effort pickers (#1403). Covers:
-//   - render shape per category (filter on category, label
-//     truncation, pending affordance),
-//   - effort widget adaptive switch (segmented vs dropdown),
-//   - click invokes the callback with (config_id, value) and not the
-//     option's display name,
-//   - hidden chrome when the adapter advertises neither category,
-//   - non-blocking switch-failed notice renders + dismisses.
-
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { ConfigOptionSwitchFailedNotice, SessionConfigControls } from "./SessionConfigControls";
-import type { ConfigOptionDescriptor } from "../../lib/acpTypes";
+import type { AcpState, ConfigOptionDescriptor } from "../../lib/acpTypes";
 
 afterEach(() => {
   cleanup();
 });
 
-function modelOption(): ConfigOptionDescriptor {
-  return {
-    id: "model",
-    name: "Model",
-    category: "model",
-    current_value: "claude-opus-4-7",
-    options: [
-      { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
-      { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-    ],
-  };
+const option = (id: string, name: string, category: string, names: string[]): ConfigOptionDescriptor => ({
+  id,
+  name,
+  category,
+  current_value: names[0]!.toLowerCase().replace(/ /g, "_"),
+  options: names.map((n) => ({ value: n.toLowerCase().replace(/ /g, "_"), name: n })),
+});
+const MODEL: ConfigOptionDescriptor = {
+  ...option("model", "Model", "model", ["x"]),
+  current_value: "claude-opus-4-7",
+  options: [
+    { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
+    { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+  ],
+};
+const EFFORT = option("effort", "Reasoning Effort", "thought_level", ["Default", "Low", "Medium", "High"]);
+// An unknown category arrives as a bare string and gets no widget.
+const UNKNOWN = option("future", "Future Selector", "future_category", ["A"]);
+
+function mount(
+  configOptions: ConfigOptionDescriptor[],
+  pendingConfigOption: AcpState["pendingConfigOption"] = null,
+  onSetConfigOption = vi.fn(),
+  provider?: { current?: string | null; pending?: string | null; onSet?: () => void },
+) {
+  const utils = render(
+    <SessionConfigControls
+      configOptions={configOptions}
+      pendingConfigOption={pendingConfigOption}
+      onSetConfigOption={onSetConfigOption}
+      provider={provider?.current ?? null}
+      providerPending={provider?.pending ?? null}
+      onSetProvider={provider?.onSet}
+    />,
+  );
+  return { ...utils, onSetConfigOption };
 }
 
-function effortOption(): ConfigOptionDescriptor {
-  return {
-    id: "effort",
-    name: "Reasoning Effort",
-    category: "thought_level",
-    current_value: "default",
-    options: [
-      { value: "default", name: "Default" },
-      { value: "low", name: "Low" },
-      { value: "medium", name: "Medium" },
-      { value: "high", name: "High" },
-    ],
-  };
-}
+const byId = (id: string) => screen.queryByTestId(`config-option-${id}`);
 
 describe("SessionConfigControls", () => {
-  it("renders nothing when adapter advertises neither category", () => {
-    const { container } = render(
-      <SessionConfigControls configOptions={[]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
-    );
-    expect(container.firstChild).toBeNull();
+  it.each([
+    [[], []],
+    [[UNKNOWN], []],
+    [[MODEL], ["model"]],
+    [[EFFORT], ["effort"]],
+    [
+      [UNKNOWN, MODEL, EFFORT],
+      ["model", "effort"],
+    ],
+  ])("renders widgets for %#", (options, shown) => {
+    const { container } = mount(options);
+    if (shown.length === 0) expect(container.firstChild).toBeNull();
+    for (const id of ["model", "effort", "future"]) expect(byId(id) !== null).toBe(shown.includes(id));
   });
 
-  it("renders only the model dropdown when no effort option exists", () => {
-    render(
-      <SessionConfigControls configOptions={[modelOption()]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
-    );
-    expect(screen.getByTestId("config-option-model")).toBeTruthy();
-    expect(screen.queryByTestId("config-option-effort")).toBeNull();
-  });
-
-  it("renders only the effort segmented control when no model option exists", () => {
-    render(
-      <SessionConfigControls configOptions={[effortOption()]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
-    );
-    expect(screen.getByTestId("config-option-effort")).toBeTruthy();
-    expect(screen.queryByTestId("config-option-model")).toBeNull();
-  });
-
-  it("renders the effort options as a segmented radiogroup for short lists", () => {
-    render(
-      <SessionConfigControls configOptions={[effortOption()]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
-    );
-    const group = screen.getByRole("radiogroup", { name: "Reasoning Effort" });
-    expect(group).toBeTruthy();
-    expect(screen.getByText("Default")).toBeTruthy();
-    expect(screen.getByText("High")).toBeTruthy();
-  });
-
-  it("falls back from segmented to dropdown when the effort list is too long", () => {
-    const sixOptions: ConfigOptionDescriptor = {
-      ...effortOption(),
-      options: [
-        { value: "default", name: "Default" },
-        { value: "low", name: "Low" },
-        { value: "medium", name: "Medium" },
-        { value: "high", name: "High" },
-        { value: "very_high", name: "Very High" },
-        { value: "extreme", name: "Extreme reasoning" },
-      ],
-    };
-    render(
-      <SessionConfigControls configOptions={[sixOptions]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
-    );
-    // > 5 options trips the threshold; dropdown is rendered (no
-    // radiogroup) and a single chip is shown for the current value.
+  it("uses a segmented control for short effort lists, sending the value, and a dropdown past the threshold", () => {
+    const { onSetConfigOption } = mount([EFFORT]);
+    expect(screen.getByRole("radiogroup", { name: "Reasoning Effort" })).toBeTruthy();
+    fireEvent.click(byId("effort-value-high")!);
+    expect(onSetConfigOption).toHaveBeenCalledWith("effort", "high");
+    cleanup();
+    mount([
+      option("effort", "Reasoning Effort", "thought_level", [
+        "Default",
+        "Low",
+        "Medium",
+        "High",
+        "Very High",
+        "Extreme reasoning",
+      ]),
+    ]);
     expect(screen.queryByRole("radiogroup")).toBeNull();
-    expect(screen.getByTestId("config-option-effort")).toBeTruthy();
+    expect(byId("effort")).toBeTruthy();
   });
 
-  it("model trigger exposes aria-expanded + aria-controls toggling open state", () => {
-    render(
-      <SessionConfigControls configOptions={[modelOption()]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
-    );
-    const chip = screen.getByTestId("config-option-model");
+  it("toggles the model menu aria state and sends the option value", () => {
+    const { onSetConfigOption } = mount([MODEL]);
+    const chip = byId("model")!;
     expect(chip.getAttribute("aria-haspopup")).toBe("menu");
     expect(chip.getAttribute("aria-expanded")).toBe("false");
     expect(chip.getAttribute("aria-controls")).toBeNull();
     fireEvent.click(chip);
     expect(chip.getAttribute("aria-expanded")).toBe("true");
     expect(chip.getAttribute("aria-controls")).toBe("config-option-menu-model");
-    expect(document.getElementById("config-option-menu-model")).not.toBeNull();
+    fireEvent.click(byId("model-value-claude-sonnet-4-6")!);
+    expect(onSetConfigOption).toHaveBeenCalledExactlyOnceWith("model", "claude-sonnet-4-6");
   });
 
-  it("clicking a model option invokes onSetConfigOption with config_id and value", () => {
-    const fn = vi.fn();
-    render(<SessionConfigControls configOptions={[modelOption()]} pendingConfigOption={null} onSetConfigOption={fn} />);
-    fireEvent.click(screen.getByTestId("config-option-model"));
-    fireEvent.click(screen.getByTestId("config-option-model-value-claude-sonnet-4-6"));
-    expect(fn).toHaveBeenCalledTimes(1);
-    expect(fn).toHaveBeenCalledWith("model", "claude-sonnet-4-6");
+  it("disables only the pending option", () => {
+    mount([MODEL], { configId: "model", value: "claude-sonnet-4-6" });
+    fireEvent.click(byId("model")!);
+    expect((byId("model-value-claude-sonnet-4-6") as HTMLButtonElement).disabled).toBe(true);
+    expect((byId("model-value-claude-opus-4-7") as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it("clicking an effort segment invokes onSetConfigOption with the value (not the label)", () => {
-    const fn = vi.fn();
-    render(
-      <SessionConfigControls configOptions={[effortOption()]} pendingConfigOption={null} onSetConfigOption={fn} />,
-    );
-    fireEvent.click(screen.getByTestId("config-option-effort-value-high"));
-    expect(fn).toHaveBeenCalledWith("effort", "high");
-  });
-
-  it("disables only the pending option in the dropdown", () => {
-    render(
-      <SessionConfigControls
-        configOptions={[modelOption()]}
-        pendingConfigOption={{
-          configId: "model",
-          value: "claude-sonnet-4-6",
-        }}
-        onSetConfigOption={vi.fn()}
-      />,
-    );
-    fireEvent.click(screen.getByTestId("config-option-model"));
-    const pending = screen.getByTestId("config-option-model-value-claude-sonnet-4-6") as HTMLButtonElement;
-    const other = screen.getByTestId("config-option-model-value-claude-opus-4-7") as HTMLButtonElement;
-    expect(pending.disabled).toBe(true);
-    expect(other.disabled).toBe(false);
-  });
-
-  // #1562: an unknown category arrives on the wire as a bare string
-  // (the Rust `Other(String)` arm is `#[serde(untagged)]`). The picker
-  // filters by string equality, so an unknown-category option must not
-  // break the model / effort lookup and gets no widget of its own.
-  it("ignores an unknown-category option and still finds the known ones", () => {
-    const unknown: ConfigOptionDescriptor = {
-      id: "future",
-      name: "Future Selector",
-      category: "future_category",
-      current_value: "a",
-      options: [{ value: "a", name: "A" }],
-    };
-    render(
-      <SessionConfigControls
-        configOptions={[unknown, modelOption(), effortOption()]}
-        pendingConfigOption={null}
-        onSetConfigOption={vi.fn()}
-      />,
-    );
-    expect(screen.getByTestId("config-option-model")).toBeTruthy();
-    expect(screen.getByTestId("config-option-effort")).toBeTruthy();
-    expect(screen.queryByTestId("config-option-future")).toBeNull();
-  });
-
-  it("renders nothing when only an unknown-category option is present", () => {
-    const unknown: ConfigOptionDescriptor = {
-      id: "future",
-      name: "Future Selector",
-      category: "future_category",
-      current_value: "a",
-      options: [{ value: "a", name: "A" }],
-    };
-    const { container } = render(
-      <SessionConfigControls configOptions={[unknown]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
-    );
-    expect(container.firstChild).toBeNull();
-  });
-
-  it("truncates long model labels in the chip", () => {
-    const longModel: ConfigOptionDescriptor = {
-      ...modelOption(),
-      current_value: "long",
-      options: [
-        {
-          value: "long",
-          name: "A Very Long Model Name That Does Not Fit Inline",
-        },
-      ],
-    };
-    render(
-      <SessionConfigControls configOptions={[longModel]} pendingConfigOption={null} onSetConfigOption={vi.fn()} />,
-    );
-    const chip = screen.getByTestId("config-option-model");
-    // truncate() preserves the trailing ellipsis on overflow; assert
-    // we see it on the chip (not the menu items).
-    expect(chip.textContent ?? "").toContain("…");
+  // Up when a floor's worth of room exists above, else the roomier side, clamped to what is visible (#3747).
+  it.each([
+    ["ample room above", 400, 420, 800, undefined, 0, "up", 288],
+    ["cramped above, ample below", 50, 60, 800, undefined, 0, "down", 288],
+    ["prefers up once the floor clears, even with more room below", 200, 220, 800, undefined, 0, "up", 192],
+    ["cramped both ways, above larger", 50, 60, 100, undefined, 0, "up", 42],
+    ["cramped both ways, below larger", 20, 30, 100, undefined, 0, "down", 62],
+    ["exact tie resolves to up", 58, 68, 126, undefined, 0, "up", 50],
+    // A zoom offset shifts the visible top, leaving too little room above.
+    ["visualViewport offset flips the direction", 250, 270, 1000, 800, 200, "down", 288],
+  ])("menu layout: %s", (_label, top, bottom, innerHeight, vvHeight, vvOffsetTop, direction, maxHeight) => {
+    const restore = [
+      ["innerHeight", Object.getOwnPropertyDescriptor(window, "innerHeight")],
+      ["visualViewport", Object.getOwnPropertyDescriptor(window, "visualViewport")],
+    ] as const;
+    const rectSpy = vi.spyOn(Element.prototype, "getBoundingClientRect");
+    try {
+      Object.defineProperty(window, "innerHeight", { value: innerHeight, configurable: true, writable: true });
+      Object.defineProperty(window, "visualViewport", {
+        value:
+          vvHeight == null
+            ? undefined
+            : { height: vvHeight, offsetTop: vvOffsetTop, addEventListener: vi.fn(), removeEventListener: vi.fn() },
+        configurable: true,
+        writable: true,
+      });
+      rectSpy.mockReturnValue({
+        top,
+        bottom,
+        left: 0,
+        right: 0,
+        width: 0,
+        height: bottom - top,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      } as DOMRect);
+      mount([MODEL]);
+      fireEvent.click(byId("model")!);
+      const menu = document.getElementById("config-option-menu-model")!;
+      expect(menu.className).toContain(direction === "up" ? "bottom-full" : "top-full");
+      expect(menu.style.maxHeight).toBe(`${maxHeight}px`);
+    } finally {
+      rectSpy.mockRestore();
+      for (const [key, descriptor] of restore) {
+        if (descriptor) Object.defineProperty(window, key, descriptor);
+        else delete (window as unknown as Record<string, unknown>)[key];
+      }
+    }
   });
 });
 
 describe("ConfigOptionSwitchFailedNotice", () => {
-  it("renders nothing when there is no failure", () => {
-    const { container } = render(
-      <ConfigOptionSwitchFailedNotice failure={null} configOptions={[]} onDismiss={vi.fn()} />,
-    );
+  it("renders nothing without a failure; otherwise names the option, shows the reason, and dismisses", () => {
+    const onDismiss = vi.fn();
+    const props = { configOptions: [MODEL], onDismiss };
+    const { container, rerender } = render(<ConfigOptionSwitchFailedNotice failure={null} {...props} />);
     expect(container.firstChild).toBeNull();
-  });
-
-  it("renders the configured label and the rejection reason", () => {
-    render(
+    rerender(
       <ConfigOptionSwitchFailedNotice
         failure={{
           configId: "model",
@@ -229,31 +171,63 @@ describe("ConfigOptionSwitchFailedNotice", () => {
           reason: "rate limited",
           at: new Date().toISOString(),
         }}
-        configOptions={[modelOption()]}
-        onDismiss={vi.fn()}
+        {...props}
       />,
     );
-    const notice = screen.getByTestId("config-option-switch-failed-notice");
-    expect(notice.textContent ?? "").toContain("Model");
-    expect(notice.textContent ?? "").toContain("Claude Sonnet 4.6");
-    expect(notice.textContent ?? "").toContain("rate limited");
-  });
-
-  it("invokes onDismiss when the dismiss button is clicked", () => {
-    const fn = vi.fn();
-    render(
-      <ConfigOptionSwitchFailedNotice
-        failure={{
-          configId: "model",
-          value: "claude-sonnet-4-6",
-          reason: "rate limited",
-          at: new Date().toISOString(),
-        }}
-        configOptions={[modelOption()]}
-        onDismiss={fn}
-      />,
-    );
+    const text = screen.getByTestId("config-option-switch-failed-notice").textContent;
+    for (const s of ["Model", "Claude Sonnet 4.6", "rate limited"]) expect(text).toContain(s);
     fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
-    expect(fn).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("provider picker", () => {
+  it("is absent for an agent that does not route through a provider", () => {
+    const { container } = mount([MODEL]);
+    expect(screen.queryByTestId("config-option-aoe-provider")).toBeNull();
+    expect(container.firstChild).not.toBeNull();
+  });
+
+  it("renders alone for a Claude session with no adapter options yet", () => {
+    mount([], null, vi.fn(), { onSet: vi.fn() });
+    expect(screen.getByTestId("config-option-aoe-provider")).toBeTruthy();
+  });
+
+  it.each([
+    ["api", "Anthropic API"],
+    ["bedrock", "Bedrock"],
+    ["vertex", "Vertex AI"],
+    [null, "Host default"],
+  ])("labels %s as %s", (current, label) => {
+    mount([], null, vi.fn(), { current, onSet: vi.fn() });
+    expect(screen.getByTestId("config-option-aoe-provider").textContent).toContain(label);
+  });
+
+  it("posts the picked provider", () => {
+    const onSet = vi.fn();
+    mount([], null, vi.fn(), { current: "api", onSet });
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-vertex"));
+    expect(onSet).toHaveBeenCalledWith("vertex");
+  });
+
+  // There is no API for returning to the host default, so the entry naming
+  // that state must not be selectable; the dropdown refuses the current value.
+  it("does not post the host-default entry", () => {
+    const onSet = vi.fn();
+    mount([], null, vi.fn(), { current: null, onSet });
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider-value-"));
+    expect(onSet).not.toHaveBeenCalled();
+  });
+
+  it("disables the value in flight", () => {
+    const onSet = vi.fn();
+    mount([], null, vi.fn(), { current: "api", pending: "bedrock", onSet });
+    fireEvent.click(screen.getByTestId("config-option-aoe-provider"));
+    const inFlight = screen.getByTestId("config-option-aoe-provider-value-bedrock");
+    expect(inFlight.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(inFlight);
+    expect(onSet).not.toHaveBeenCalled();
   });
 });

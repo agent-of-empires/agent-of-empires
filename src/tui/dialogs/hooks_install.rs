@@ -1,73 +1,48 @@
-//! Acknowledgment dialog for first-time agent status hook installation
+//! Approval dialog for the first agent hook install.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use std::path::PathBuf;
 
 use super::DialogResult;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 pub struct HooksInstallDialog {
+    status_hooks_enabled: bool,
     settings_paths: Vec<String>,
     hook_commands: Vec<(String, String)>,
     needs_codex_trust_note: bool,
+    disabled_by_agent: Option<PathBuf>,
+    extra_settings_paths: Vec<(String, String)>,
+    post_install_notes: Vec<(String, &'static str)>,
     selected: bool, // true = Accept, false = Cancel
     scroll_offset: u16,
     accept_button_area: Rect,
     cancel_button_area: Rect,
-    /// Which button the mouse is over, for the hover highlight. Visual
-    /// only; never changes `selected`.
+    /// The hovered button. Visual only; never changes `selected`.
     hover: HoverState,
 }
 
 impl HooksInstallDialog {
-    pub fn new(tool_name: &str) -> Self {
-        Self::new_for_profile(tool_name, None)
-    }
-
-    pub fn new_for_profile(tool_name: &str, profile: Option<&str>) -> Self {
-        let mut settings_paths = Vec::new();
-        let mut hook_commands = Vec::new();
-        let mut needs_codex_trust_note = false;
-
-        if let Some(agent) = crate::agents::get_agent(tool_name) {
-            if let Some(hook_cfg) = &agent.hook_config {
-                let host_env = profile
-                    .map(crate::session::profile_config::resolve_config_or_warn)
-                    .map(|config| config.environment)
-                    .unwrap_or_default();
-                match hook_cfg.format {
-                    crate::agents::HookFormat::CodexJson => {
-                        needs_codex_trust_note = true;
-                        settings_paths.push(
-                            crate::hooks::codex_hooks_json_path_display_for_host_environment(
-                                &host_env,
-                            ),
-                        );
-                    }
-                    crate::agents::HookFormat::JsonSettings => {
-                        settings_paths.push(
-                            crate::hooks::agent_settings_path_display_for_host_environment(
-                                hook_cfg, &host_env,
-                            ),
-                        );
-                    }
-                }
-                for event in hook_cfg.events {
-                    let label = match event.status {
-                        Some(s) => format!("writes \"{}\"", s),
-                        None => "session lifecycle".to_string(),
-                    };
-                    hook_commands.push((event.name.to_string(), label));
-                }
-            }
-        }
-
+    /// `agent` is the one the gate resolved for this session, and `config` the
+    /// one the gate read, so the dialog describes the same install the launch
+    /// would install rather than a second derivation of it.
+    pub fn new(
+        tool_name: &str,
+        agent: &'static crate::agents::AgentDef,
+        config: &crate::session::config::Config,
+    ) -> Self {
+        let disclosure = crate::session::host_hook_disclosure(tool_name, agent, config);
         Self {
-            settings_paths,
-            hook_commands,
-            needs_codex_trust_note,
+            settings_paths: disclosure.settings_paths,
+            hook_commands: disclosure.hook_commands,
+            needs_codex_trust_note: disclosure.needs_codex_trust_note,
+            disabled_by_agent: disclosure.disabled_by_agent,
+            status_hooks_enabled: disclosure.status_hooks_enabled,
+            extra_settings_paths: disclosure.extra_settings_paths,
+            post_install_notes: crate::session::host_hook_post_install_notes(),
             selected: true,
             scroll_offset: 0,
             accept_button_area: Rect::default(),
@@ -87,9 +62,8 @@ impl HooksInstallDialog {
         None
     }
 
-    /// Highlight the button under the cursor without changing the
-    /// Accept / Cancel selection. See `ConfirmDialog::handle_hover` for
-    /// the rationale. Returns `true` when the highlighted button changed.
+    /// Highlight the button under the cursor without changing the selection.
+    /// True when the highlight changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         self.hover.update(
             col,
@@ -141,50 +115,108 @@ impl HooksInstallDialog {
         let mut lines = Vec::new();
 
         lines.push(Line::from(Span::styled(
-            "Modified files:",
+            "Files AoE targets:",
             Style::default().bold(),
         )));
         for path in &self.settings_paths {
-            lines.push(Line::from(format!("  {}", path)));
+            lines.push(Line::from(format!("  {path}")));
+        }
+        for (label, path) in &self.extra_settings_paths {
+            lines.push(Line::from(format!("  {path}")));
+            lines.push(Line::from(format!("    ({label})")));
+        }
+        if let Some(config) = &self.disabled_by_agent {
+            lines.push(Line::from(format!(
+                "  (this agent's own config turns its hooks off: {})",
+                config.display()
+            )));
+        }
+
+        if !self.post_install_notes.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "This approval covers every agent and profile.",
+                Style::default().bold(),
+            )));
+            lines.push(Line::from(
+                "Besides the files above, installing hooks for these agents",
+            ));
+            lines.push(Line::from("also changes launcher state:"));
+            for (agent, note) in &self.post_install_notes {
+                // The note ends in a period, so the last segment already has one.
+                for line in note.split(". ") {
+                    let line = line.trim_end_matches('.');
+                    lines.push(Line::from(format!("  {agent}: {line}.")));
+                }
+            }
+        }
+
+        if !self.hook_commands.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Hook events a launch would install:",
+                Style::default().bold(),
+            )));
+            for (event, effect) in &self.hook_commands {
+                lines.push(Line::from(format!("  {event} -> {effect}")));
+            }
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Hook events added:",
-            Style::default().bold(),
-        )));
-        for (event, status) in &self.hook_commands {
-            lines.push(Line::from(format!("  {} -> {}", event, status)));
+        if self.status_hooks_enabled {
+            lines.push(Line::from(Span::styled(
+                "A status event runs:",
+                Style::default().bold(),
+            )));
+            // The path is the runtime one baked into the hook command,
+            // and a placeholder would mislead.
+            lines.push(Line::from(format!(
+                "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
+                crate::hooks::hook_base_path().display()
+            )));
+        } else if self.hook_commands.is_empty() {
+            lines.push(Line::from(
+                "No status hook survives here, and none is listed:",
+            ));
+        } else {
+            lines.push(Line::from(
+                "No status hook survives here, so these only publish the id",
+            ));
+            lines.push(Line::from(
+                "AoE resumes from. Each event's command is above.",
+            ));
         }
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Each hook runs:",
-            Style::default().bold(),
-        )));
-        // The euid in the displayed path matches the runtime path baked into
-        // the hook command and is already exposed via `id -u` and `ps`. The
-        // alternative (a placeholder) would mislead users about what is
-        // actually installed.
-        lines.push(Line::from(format!(
-            "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
-            crate::hooks::hook_base_path().display()
-        )));
 
         lines.push(Line::from(""));
         lines.push(Line::from(
             "Hooks are guarded by $AOE_INSTANCE_ID and are a",
         ));
         lines.push(Line::from("no-op outside of AoE sessions."));
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "This is what the effective config resolves, not a manifest of",
+        ));
+        lines.push(Line::from(
+            "every write a launch can make. A launch that routes through a",
+        ));
+        lines.push(Line::from(
+            "native store, merges into a selected agent, or targets a",
+        ));
+        lines.push(Line::from(
+            "selected or recorded Claude conversation store resolves that",
+        ));
+        lines.push(Line::from("target at launch time."));
 
-        if self.needs_codex_trust_note {
+        if self.needs_codex_trust_note && self.disabled_by_agent.is_none() {
             lines.push(Line::from(""));
             lines.push(Line::from(
                 "Codex may ask you to review and trust these hooks in /hooks.",
             ));
-            lines.push(Line::from(
-                "Until then, AoE falls back to pane-based status detection.",
-            ));
+            if self.status_hooks_enabled {
+                lines.push(Line::from(
+                    "Until then, AoE falls back to pane-based status detection.",
+                ));
+            }
         }
 
         lines
@@ -192,23 +224,19 @@ impl HooksInstallDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let content_lines = self.build_content_lines();
-        let content_height = content_lines.len() as u16 + 6; // header + spacing + buttons
+        // 8 rows of chrome: 2 block borders, 3 header, 2 buttons, 1 content top border.
+        let content_height = content_lines.len() as u16 + 8;
 
         let dialog_width = 64.min(area.width.saturating_sub(4));
         let dialog_height = (content_height + 6).min(area.height.saturating_sub(4));
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Agent Status Hooks ")
-            .title_style(Style::default().fg(theme.accent).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let title = if self.status_hooks_enabled {
+            " Agent Hooks "
+        } else {
+            " Agent Identity Hooks "
+        };
+        let block = super::toned_dialog_block(title, theme.accent, theme.accent);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -219,21 +247,28 @@ impl HooksInstallDialog {
             ])
             .split(inner);
 
-        // Header
-        let header = Paragraph::new(
-            "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle).",
-        )
+        // Three cases, not two: an agent that turned its own hooks off installs
+        // nothing, and promising an install there contradicts the body below.
+        let header = Paragraph::new(if self.disabled_by_agent.is_some() {
+            "This agent's own config turns its hooks off,\nso AoE installs nothing for it."
+        } else if self.status_hooks_enabled {
+            "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle)."
+        } else {
+            "AoE needs to install identity hooks into your agent's settings\nfor native resume. No status hook survives for this config."
+        })
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: true });
         frame.render_widget(header, chunks[0]);
 
-        // Scrollable content
         let visible_lines: Vec<Line> = content_lines
             .into_iter()
             .skip(self.scroll_offset as usize)
             .collect();
         let content_paragraph = Paragraph::new(visible_lines)
             .style(Style::default().fg(theme.dimmed))
+            // A disclosed command is longer than the content width, so without
+            // this the tail of every identity event is cut off.
+            .wrap(Wrap { trim: true })
             .block(
                 Block::default()
                     .borders(Borders::TOP)
@@ -241,7 +276,6 @@ impl HooksInstallDialog {
             );
         frame.render_widget(content_paragraph, chunks[1]);
 
-        // Buttons
         let accept_style = if self.selected {
             Style::default().fg(theme.running).bold()
         } else {
@@ -297,12 +331,8 @@ impl HooksInstallDialog {
 mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
-    use crossterm::event::KeyModifiers;
+    use crate::tui::dialogs::test_keys::key;
     use tempfile::TempDir;
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
 
     fn content_text(dialog: &HooksInstallDialog) -> String {
         dialog
@@ -313,210 +343,215 @@ mod tests {
             .join("\n")
     }
 
+    /// Build the dialog the way the gate does: resolve the agent from the
+    /// config, then describe it, so the tests stay on the production path
+    /// instead of a second resolution.
+    fn hook_dialog(tool_name: &str, profile: Option<&str>) -> HooksInstallDialog {
+        let config = profile
+            .map(crate::session::config::profile_config::resolve_config_or_warn)
+            .unwrap_or_default();
+        let agent = crate::session::host_hook_agent(
+            tool_name,
+            &config.session.launch_command_for(tool_name),
+            &config.session,
+        )
+        .or_else(|| crate::agents::get_agent(tool_name))
+        .unwrap_or_else(|| panic!("{tool_name} must name a known agent"));
+        HooksInstallDialog::new(tool_name, agent, &config)
+    }
     #[test]
-    fn test_default_selection_is_accept() {
-        let dialog = HooksInstallDialog::new("claude");
-        assert!(dialog.selected);
+    fn the_accept_and_cancel_keys_decide_the_dialog() {
+        assert!(
+            hook_dialog("claude", None).selected,
+            "Accept is focused by default"
+        );
+        assert!(matches!(
+            hook_dialog("claude", None).handle_key(key(KeyCode::Char('y'))),
+            DialogResult::Submit(true)
+        ));
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert!(
+                matches!(
+                    hook_dialog("claude", None).handle_key(key(code)),
+                    DialogResult::Cancel
+                ),
+                "{code:?}"
+            );
+        }
+
+        // Tab flips which button Enter takes.
+        let mut dialog = hook_dialog("claude", None);
+        for (selected, submits) in [(false, false), (true, true)] {
+            dialog.handle_key(key(KeyCode::Tab));
+            assert_eq!(dialog.selected, selected);
+            let mut probe = hook_dialog("claude", None);
+            probe.selected = selected;
+            assert_eq!(
+                matches!(
+                    probe.handle_key(key(KeyCode::Enter)),
+                    DialogResult::Submit(true)
+                ),
+                submits
+            );
+        }
     }
 
     #[test]
-    fn test_y_accepts() {
-        let mut dialog = HooksInstallDialog::new("claude");
-        let result = dialog.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(result, DialogResult::Submit(true)));
-    }
-
-    #[test]
-    fn test_n_cancels() {
-        let mut dialog = HooksInstallDialog::new("claude");
-        let result = dialog.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_esc_cancels() {
-        let mut dialog = HooksInstallDialog::new("claude");
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_enter_with_accept_selected() {
-        let mut dialog = HooksInstallDialog::new("claude");
-        dialog.selected = true;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Submit(true)));
-    }
-
-    #[test]
-    fn test_enter_with_cancel_selected() {
-        let mut dialog = HooksInstallDialog::new("claude");
-        dialog.selected = false;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_tab_toggles() {
-        let mut dialog = HooksInstallDialog::new("claude");
-        assert!(dialog.selected);
-        dialog.handle_key(key(KeyCode::Tab));
-        assert!(!dialog.selected);
-        dialog.handle_key(key(KeyCode::Tab));
-        assert!(dialog.selected);
-    }
-
-    #[test]
-    fn hover_highlights_button_without_changing_selection() {
-        let mut dialog = HooksInstallDialog::new("claude");
+    fn hover_highlights_a_button_without_changing_the_selection() {
+        let mut dialog = hook_dialog("claude", None);
         dialog.accept_button_area = Rect::new(2, 5, 12, 1);
         dialog.cancel_button_area = Rect::new(20, 5, 14, 1);
-        assert!(dialog.selected);
-
-        // Over Accept: highlight it, selection unchanged.
-        assert!(dialog.handle_hover(3, 5));
-        assert_eq!(dialog.hover.current(), Some(dialog.accept_button_area));
-        assert!(dialog.selected, "hover must not flip the selection");
-
-        // Over Cancel.
-        assert!(dialog.handle_hover(21, 5));
-        assert_eq!(dialog.hover.current(), Some(dialog.cancel_button_area));
-
-        // Off the buttons clears.
+        for (col, want) in [
+            (3, dialog.accept_button_area),
+            (21, dialog.cancel_button_area),
+        ] {
+            assert!(dialog.handle_hover(col, 5));
+            assert_eq!(dialog.hover.current(), Some(want));
+            assert!(dialog.selected, "hover must not flip the selection");
+        }
         assert!(dialog.handle_hover(0, 0));
         assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]
-    fn test_content_shows_settings_path() {
-        let dialog = HooksInstallDialog::new("claude");
-        let lines = dialog.build_content_lines();
-        let text: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains(".claude/settings.json"));
-    }
+    #[serial_test::serial]
+    fn the_disclosure_names_the_files_and_events_it_will_touch() {
+        // The dialog follows the resolved config root and the disclosure reads
+        // the agent's own config beside it, so both the environment and HOME
+        // must be this test's own or the assertions see the developer's.
+        let temp = tempfile::TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _overrides = EnvGuard::unset(&["CLAUDE_CONFIG_DIR", "CODEX_HOME"]);
 
-    #[test]
-    fn test_content_shows_hook_events() {
-        let dialog = HooksInstallDialog::new("claude");
-        let lines = dialog.build_content_lines();
-        let text: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("PreToolUse"));
-        assert!(text.contains("Stop"));
-        assert!(text.contains("Notification"));
-    }
+        let claude = content_text(&hook_dialog("claude", None));
+        assert!(claude.contains(".claude/settings.json"));
+        for event in ["PreToolUse", "Stop", "Notification"] {
+            assert!(claude.contains(event), "{event} missing from {claude}");
+        }
+        // The example command must use the per-user path, not the legacy
+        // multi-tenant one or a bogus placeholder.
+        assert!(claude.contains(&format!(
+            "{}/$AOE_INSTANCE_ID/status",
+            crate::hooks::hook_base_path().display()
+        )));
+        for legacy in [
+            "/tmp/aoe-hooks/$ID/",
+            "/tmp/aoe-hooks/$AOE_INSTANCE_ID/status",
+        ] {
+            assert!(!claude.contains(legacy), "{legacy} still referenced");
+        }
+        // The codex trust note belongs to codex alone.
+        assert!(!claude.contains("trust these hooks in /hooks"));
+        assert!(!claude.contains("pane-based status detection"));
 
-    #[test]
-    fn test_content_uses_aoe_instance_id_in_example() {
-        let dialog = HooksInstallDialog::new("claude");
-        let lines = dialog.build_content_lines();
-        let text: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            text.contains(&format!(
-                "{}/$AOE_INSTANCE_ID/status",
-                crate::hooks::hook_base_path().display()
-            )),
-            "example command must reference the per-user (issue #1844) path: {text}"
-        );
-        assert!(
-            !text.contains("/tmp/aoe-hooks/$ID/"),
-            "example command must not use the bogus $ID placeholder: {text}"
-        );
-        assert!(
-            !text.contains("/tmp/aoe-hooks/$AOE_INSTANCE_ID/status"),
-            "example must not use the legacy multi-tenant-vulnerable path: {text}"
-        );
-    }
+        assert!(content_text(&hook_dialog("cursor", None)).contains(".cursor/hooks.json"));
 
-    #[test]
-    fn test_cursor_agent_shows_cursor_path() {
-        let dialog = HooksInstallDialog::new("cursor");
-        let lines = dialog.build_content_lines();
-        let text: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains(".cursor/settings.json"));
+        let codex = content_text(&hook_dialog("codex", None));
+        assert!(codex.contains(".codex/hooks.json"));
+        assert!(!codex.contains(".codex/config.toml"));
+        assert!(codex.contains("trust these hooks in /hooks"));
+        assert!(codex.contains("pane-based status detection"));
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_codex_agent_shows_hooks_and_config_paths() {
-        let _guard = EnvGuard::unset(&["CODEX_HOME"]);
-        let dialog = HooksInstallDialog::new("codex");
-        let lines = dialog.build_content_lines();
-        let text: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains(".codex/hooks.json"));
-        assert!(!text.contains(".codex/config.toml"));
-        assert!(text.contains("trust these hooks in /hooks"));
-        assert!(text.contains("pane-based status detection"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_codex_agent_shows_codex_home_config_path() {
+    fn codex_home_moves_the_hooks_file_without_dragging_the_config_along() {
         let tmp = TempDir::new().unwrap();
         let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
-
-        let dialog = HooksInstallDialog::new("codex");
-        let text = content_text(&dialog);
-
+        let text = content_text(&hook_dialog("codex", None));
         assert!(text.contains(&tmp.path().join("hooks.json").display().to_string()));
         assert!(!text.contains(&tmp.path().join("config.toml").display().to_string()));
     }
 
+    /// Write `contents` as the profile's `config.toml` and return its dir.
+    fn write_profile(profile: &str, contents: String) {
+        let dir = crate::session::get_profile_dir(profile).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), contents).unwrap();
+    }
+
     #[test]
     #[serial_test::serial]
-    fn test_codex_agent_shows_profile_codex_home_config_path() {
-        let tmp = TempDir::new().unwrap();
-        // Both guards route through the shared env lock; the second is a
-        // same-thread re-entrant acquisition. `isolate_home` restores
-        // HOME/XDG on Drop (the old bare `set_var` leaked them).
-        let _guard = EnvGuard::unset(&["CODEX_HOME"]);
-        let _home = crate::session::test_support::isolate_home(tmp.path());
+    fn a_profile_s_environment_and_declared_roots_move_the_disclosed_paths() {
+        // `isolate_home` restores HOME/XDG on Drop and holds the shared env
+        // lock; the `EnvGuard`s are same-thread re-entrant acquisitions.
+        let temp = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _overrides = EnvGuard::unset(&["CODEX_HOME", "CLAUDE_CONFIG_DIR"]);
 
-        let codex_home = tmp.path().join("profile-codex-home");
-        let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();
-        std::fs::write(
-            profile_dir.join("config.toml"),
+        // A profile that redirects HOME moves both agents' files with it.
+        let profile_home = temp.path().join("profile-home");
+        let _environment = EnvGuard::set(&[("AOE_TEST_DIALOG_HOME", profile_home.as_os_str())]);
+        write_profile(
+            "profile-home",
+            "environment = [\"HOME=$AOE_TEST_DIALOG_HOME\"]\n".to_string(),
+        );
+        for (agent, relative) in [
+            ("claude", ".claude/settings.json"),
+            ("codex", ".codex/hooks.json"),
+        ] {
+            let dialog = hook_dialog(agent, Some("profile-home"));
+            assert_eq!(
+                dialog.settings_paths,
+                vec![profile_home.join(relative).to_string_lossy()],
+                "{agent}"
+            );
+        }
+
+        // A declared `agent_config_dir` wins outright.
+        let claude_root = temp.path().join("claude-custom");
+        let codex_root = temp.path().join("codex-custom");
+        write_profile(
+            "declared-hook-roots",
+            format!(
+                "[session.agent_config_dir]\nclaude = \"{}\"\ncodex = \"{}\"\n",
+                claude_root.display(),
+                codex_root.display()
+            ),
+        );
+        for (agent, root, file) in [
+            ("claude", &claude_root, "settings.json"),
+            ("codex", &codex_root, "hooks.json"),
+        ] {
+            let dialog = hook_dialog(agent, Some("declared-hook-roots"));
+            assert_eq!(
+                dialog.settings_paths,
+                vec![root.join(file).to_string_lossy()],
+                "{agent}"
+            );
+        }
+
+        // A CODEX_HOME set by the profile's own environment reaches the
+        // hooks file but not the config.
+        let codex_home = temp.path().join("profile-codex-home");
+        write_profile(
+            "codex-profile",
             format!("environment = [\"CODEX_HOME={}\"]\n", codex_home.display()),
-        )
-        .unwrap();
-
-        let dialog = HooksInstallDialog::new_for_profile("codex", Some("codex-profile"));
-        let text = content_text(&dialog);
-
+        );
+        let text = content_text(&hook_dialog("codex", Some("codex-profile")));
         assert!(text.contains(&codex_home.join("hooks.json").display().to_string()));
         assert!(!text.contains(&codex_home.join("config.toml").display().to_string()));
     }
 
     #[test]
-    fn test_non_codex_agents_do_not_show_codex_trust_note() {
-        let dialog = HooksInstallDialog::new("claude");
-        let lines = dialog.build_content_lines();
-        let text: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+    #[serial_test::serial]
+    fn an_aliased_agent_resolves_through_the_shared_inherited_path_resolver() {
+        let temp = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let custom = temp.path().join("cursor-custom");
+        let _cursor = EnvGuard::set(&[("CURSOR_CONFIG_DIR", custom.as_os_str())]);
+        write_profile(
+            "work",
+            "environment = [\"CURSOR_CONFIG_DIR\"]\n\n[session.agent_detect_as]\ncorp-cursor = \"cursor\"\n"
+                .to_string(),
+        );
 
-        assert!(!text.contains("trust these hooks in /hooks"));
-        assert!(!text.contains("pane-based status detection"));
+        let dialog = hook_dialog("corp-cursor", Some("work"));
+        assert_eq!(
+            dialog.settings_paths,
+            vec![custom.join("hooks.json").to_string_lossy()]
+        );
+        assert!(!dialog.hook_commands.is_empty());
     }
 }

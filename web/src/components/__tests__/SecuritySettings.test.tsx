@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the SecuritySettings panel. SecuritySettings is
-// purely a read-only view over the /api/about response; this suite
-// mocks fetchAbout and asserts the rendered badges match each
-// permutation of auth_mode, passphrase_enabled, read_only, behind_tunnel,
-// and version. Part of #1217.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, waitFor } from "@testing-library/react";
@@ -31,62 +25,34 @@ function makeAbout(overrides: Partial<ServerAbout> = {}): ServerAbout {
   } as ServerAbout;
 }
 
+function renderWith(about: ServerAbout | null) {
+  fetchAbout.mockResolvedValue(about);
+  return render(<SecuritySettings />).container;
+}
+
 afterEach(() => {
   fetchAbout.mockReset();
 });
 
 describe("SecuritySettings", () => {
-  it("shows the token auth badge when auth_mode='token'", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ auth_mode: "token" }));
-    const { container } = render(<SecuritySettings />);
+  it.each([
+    ["token auth badge", { auth_mode: "token" }, "--auth=token"],
+    ["passphrase auth badge", { auth_mode: "passphrase" }, "--auth=passphrase"],
+    ["no-auth warning badge", { auth_mode: "none" }, "--auth=none"],
+    ["passphrase 'required' badge", { passphrase_enabled: true }, "required"],
+    ["passphrase 'not set' badge", { passphrase_enabled: false }, "not set"],
+    ["read-only badge", { read_only: true }, "terminal input blocked"],
+    ["cloudflared badge", { behind_tunnel: true }, "cloudflared"],
+    ["version with a leading 'v'", { version: "9.9.9" }, "v9.9.9"],
+  ] as [string, Partial<ServerAbout>, string][])("shows the %s", async (_name, about, text) => {
+    const container = renderWith(makeAbout(about));
     await waitFor(() => {
-      expect(container.textContent).toContain("--auth=token");
-    });
-  });
-
-  it("shows the passphrase auth badge when auth_mode='passphrase'", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ auth_mode: "passphrase" }));
-    const { container } = render(<SecuritySettings />);
-    await waitFor(() => {
-      expect(container.textContent).toContain("--auth=passphrase");
-    });
-  });
-
-  it("shows the no-auth warning badge when auth_mode='none'", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ auth_mode: "none" }));
-    const { container } = render(<SecuritySettings />);
-    await waitFor(() => {
-      expect(container.textContent).toContain("--auth=none");
-    });
-  });
-
-  it("shows passphrase 'required' badge when passphrase_enabled=true", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ passphrase_enabled: true }));
-    const { container } = render(<SecuritySettings />);
-    await waitFor(() => {
-      expect(container.textContent).toContain("required");
-    });
-  });
-
-  it("shows passphrase 'not set' badge when passphrase_enabled=false", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ passphrase_enabled: false }));
-    const { container } = render(<SecuritySettings />);
-    await waitFor(() => {
-      expect(container.textContent).toContain("not set");
-    });
-  });
-
-  it("shows the read-only badge when read_only=true", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ read_only: true }));
-    const { container } = render(<SecuritySettings />);
-    await waitFor(() => {
-      expect(container.textContent).toContain("terminal input blocked");
+      expect(container.textContent).toContain(text);
     });
   });
 
   it("shows 'off' for read_only=false", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ read_only: false }));
-    const { container } = render(<SecuritySettings />);
+    const container = renderWith(makeAbout({ read_only: false }));
     await waitFor(() => {
       // The Read-only Row renders the literal text 'off'.
       const cells = container.querySelectorAll("span");
@@ -95,25 +61,8 @@ describe("SecuritySettings", () => {
     });
   });
 
-  it("shows the cloudflared badge when behind_tunnel=true", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ behind_tunnel: true }));
-    const { container } = render(<SecuritySettings />);
-    await waitFor(() => {
-      expect(container.textContent).toContain("cloudflared");
-    });
-  });
-
-  it("renders the version with a leading 'v'", async () => {
-    fetchAbout.mockResolvedValue(makeAbout({ version: "9.9.9" }));
-    const { container } = render(<SecuritySettings />);
-    await waitFor(() => {
-      expect(container.textContent).toContain("v9.9.9");
-    });
-  });
-
   it("renders the load-error message when fetchAbout returns null", async () => {
-    fetchAbout.mockResolvedValue(null);
-    const { container } = render(<SecuritySettings />);
+    const container = renderWith(null);
     await waitFor(() => {
       expect(container.textContent).toContain("Could not load server status");
     });

@@ -5,10 +5,7 @@ import { useThemeMutation } from "../../hooks/useThemeMutation";
 const PANEL = "hidden lg:flex lg:w-64 lg:flex-col gap-2 bg-surface-900/40 p-4";
 const PANEL_LABEL = "text-[10px] font-medium uppercase tracking-wide text-text-muted";
 
-/** Static acp-style preview: a couple of turns plus the composer. Built
- *  from the same theme tokens the real surfaces use, so it repaints with the
- *  selected theme and shows the user what a session looks like. Decorative and
- *  aria-hidden; the live theme grid is the only interactive control. */
+/** Decorative session preview built from theme tokens. */
 function ComposerPreview() {
   return (
     <div className={`${PANEL} border-r border-surface-700`} aria-hidden="true">
@@ -29,13 +26,10 @@ function ComposerPreview() {
   );
 }
 
+const DIFF_KIND = { add: "bg-status-running/5 text-status-running", del: "bg-status-error/5 text-status-error" };
+
 function DiffRow({ num, text, kind }: { num: string; text: string; kind?: "add" | "del" }) {
-  const body =
-    kind === "add"
-      ? "bg-status-running/5 text-status-running"
-      : kind === "del"
-        ? "bg-status-error/5 text-status-error"
-        : "text-text-secondary";
+  const body = kind ? DIFF_KIND[kind] : "text-text-secondary";
   return (
     <div className="flex">
       <span className="w-7 shrink-0 border-r border-surface-700/30 px-1 text-right text-text-dim">{num}</span>
@@ -44,8 +38,7 @@ function DiffRow({ num, text, kind }: { num: string; text: string; kind?: "add" 
   );
 }
 
-/** Static diff-viewer preview, mirroring DiffFileViewer's tokens so the user
- *  sees what review will look like in the chosen theme. Decorative. */
+/** Decorative diff-viewer preview. */
 function DiffPreview() {
   return (
     <div className={`${PANEL} border-l border-surface-700`} aria-hidden="true">
@@ -62,18 +55,11 @@ function DiffPreview() {
 }
 
 interface Props {
-  /** Dismiss the welcome modal and hand off to the tour. Called for both the
-   *  Continue button and Escape; the seen flag is owned by the caller. */
+  /** Continue or Escape; the caller owns the seen flag. */
   onDone: () => void;
 }
 
-/**
- * First-run "Choose your theme" modal, phase one of onboarding. Selecting a
- * theme persists it to the default profile and repaints the whole dashboard
- * live (persist-then-paint via useThemeMutation), so the grid doubles as the
- * preview; the user can re-pick freely before continuing. Shown on any pointer
- * type, unlike the desktop-only tour. Dismissing hands off to the tour.
- */
+/** First-run theme picker. Picking persists and repaints live, so the grid is the preview. */
 export function ThemeIntro({ onDone }: Props) {
   const [themes, setThemes] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(
@@ -84,9 +70,7 @@ export function ThemeIntro({ onDone }: Props) {
   const continueRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
-  // Capture the previously focused element on mount and restore it on unmount
-  // so keyboard users return to where they were instead of losing focus to
-  // document.body, matching DeleteSessionDialog and CommandPalette.
+  // Restore focus to the prior element on unmount.
   useEffect(() => {
     previousFocusRef.current = document.activeElement as HTMLElement | null;
     fetchThemes().then(setThemes);
@@ -111,8 +95,7 @@ export function ThemeIntro({ onDone }: Props) {
       setSelected(name);
       setError(null);
       const result = await select(name);
-      // Persist-then-paint already repainted on success; on failure restore the
-      // prior highlight so the grid never claims an unsaved theme is active.
+      // Revert the highlight so the grid never shows an unsaved theme as active.
       if (!result.ok) {
         setSelected(prev);
         setError(result.error);

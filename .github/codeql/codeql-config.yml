@@ -1,0 +1,12 @@
+name: "agent-of-empires"
+
+# Test code is not shipped code, and CodeQL findings in it bury the production
+# ones. `#[cfg(test)]` modules inside src/ are not covered here; the Rust
+# extractor drops them via the cfg override in .github/workflows/codeql.yml.
+paths-ignore:
+  - tests/**
+  - aoe-plugin-api/tests/**
+  - web/tests/**
+  - "**/__tests__/**"
+  - "**/*.test.ts"
+  - "**/*.test.tsx"

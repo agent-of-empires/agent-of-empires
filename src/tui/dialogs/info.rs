@@ -1,4 +1,4 @@
-//! Info dialog for displaying informational messages
+//! Info dialog.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -8,9 +8,8 @@ use super::DialogResult;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
-/// Which end of an overflowing message stays visible. Most dialogs read
-/// top-down, so `Top` is the default; error output (hook failures, panics)
-/// puts the payload last and overrides to `Tail`.
+/// Which end of an overflowing message stays visible. `Top` by default; error
+/// output puts its payload last and overrides to `Tail`.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollMode {
     #[default]
@@ -25,11 +24,9 @@ pub struct InfoDialog {
     height: u16,
     scroll_mode: ScrollMode,
     dialog_area: Rect,
-    /// Rect of the `[OK]` button, captured during `render`. A click
-    /// anywhere dismisses, but the button is the call to action, so it
-    /// picks up the hover highlight to read as clickable.
+    /// The `[OK]` button. A click anywhere dismisses, but the button takes
+    /// the hover highlight so it reads as clickable.
     ok_button_area: Rect,
-    /// Whether the cursor is over `[OK]`, for the hover highlight.
     hover: HoverState,
 }
 
@@ -47,28 +44,19 @@ impl InfoDialog {
         }
     }
 
-    /// Build a dialog sized to fit `message` after wrapping, for long
-    /// multi-line content that would clip at the default 50x9.
+    /// A dialog sized to fit `message` after wrapping, for content that would
+    /// clip at the default 50x9. Wrapping happens here so the row count is
+    /// exact, and an over-tall message loses its *head* behind a `… N earlier
+    /// lines hidden` marker: error payloads sit in the last lines.
     ///
-    /// The message is pre-wrapped to the inner width here (so the row count
-    /// is exact, not a byte-length estimate), and when it still exceeds the
-    /// max dialog height the *head* is dropped behind a `… N earlier lines
-    /// hidden` marker. Paragraph clips the bottom, and for error output the
-    /// last lines are the payload (the panic message, the npm error
-    /// summary), so overflow must eat the top, not the tail.
-    ///
-    /// 96, not 80: at the typical ~35-col sidebar width, a centered 80-wide
-    /// dialog on a 150-col terminal lands its left border exactly at the
-    /// sidebar's right border, which makes the modal visually blend into
-    /// the layout. 96 shifts the coincidence point off the common
-    /// laptop-fullscreen width and gives long path lines (e.g.
-    /// `~/.config/agent-of-empires-dev`) more breathing room.
+    /// 96 wide, not 80: at a typical sidebar width a centered 80-wide dialog
+    /// on a 150-column terminal lands its border exactly on the sidebar's, and
+    /// the modal blends into the layout.
     pub fn sized_to_fit(title: &str, message: &str) -> Self {
         const WIDTH: u16 = 96;
         const MAX_HEIGHT: u16 = 35;
-        // Rows available to the message at MAX_HEIGHT: borders, margin, and
-        // the button row consume 6, and the height formula below keeps one
-        // spare.
+        // Borders, margin and the button row consume 6 rows, and the height
+        // formula below keeps one spare.
         const MAX_ROWS: usize = MAX_HEIGHT as usize - 7;
         let inner_width = WIDTH.saturating_sub(4) as usize;
 
@@ -84,31 +72,25 @@ impl InfoDialog {
             .with_scroll_mode(ScrollMode::Tail)
     }
 
-    /// Choose which end of an overflowing message stays visible. Defaults to
-    /// `ScrollMode::Top`; error dialogs override to `ScrollMode::Tail` so
-    /// the trailing payload (panic message, hook output) isn't scrolled off.
+    /// Which end of an overflowing message stays visible.
     pub fn with_scroll_mode(mut self, mode: ScrollMode) -> Self {
         self.scroll_mode = mode;
         self
     }
 
-    /// The dialog title; the tick loop reads this to decide which
-    /// auto-dismiss path applies on recovery edges.
+    /// Read by the tick loop to pick an auto-dismiss path on a recovery edge.
     pub fn title(&self) -> &str {
         &self.title
     }
 
-    /// The dialog body. The tick loop compares this against the
-    /// current `reload_failure_state` body so a `Reload Failed`
-    /// dialog already on screen refreshes only when the failing
-    /// source set changes (partial recovery or a newly recorded
-    /// source).
+    /// Compared by the tick loop against the current `reload_failure_state`,
+    /// so an open `Reload Failed` dialog refreshes only when the failing
+    /// source set changes.
     pub fn message(&self) -> &str {
         &self.message
     }
 
-    /// A left-click anywhere inside the info dialog dismisses it,
-    /// matching the keyboard's "any of Esc/Enter/Space closes" model.
+    /// A click anywhere inside dismisses, as any of Esc/Enter/Space does.
     /// `None` when the click landed outside the dialog area, so the
     /// caller can decide whether to swallow it anyway.
     pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<()>> {
@@ -146,20 +128,11 @@ impl InfoDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, self.width, self.height);
+        let block =
+            super::toned_dialog_block(format!(" {} ", self.title), theme.border, theme.title);
+        let (dialog_area, inner) =
+            super::render_dialog_frame(frame, area, self.width, self.height, block);
         self.dialog_area = dialog_area;
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .title(format!(" {} ", self.title))
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -250,85 +223,91 @@ fn wrap_to_width(message: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::tui::dialogs::test_keys::key;
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+    /// Render `dialog` into a short terminal and return the buffer's debug
+    /// form, which is enough to look for line markers.
+    fn rendered(dialog: &mut InfoDialog) -> String {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                dialog.render(frame, area, &Theme::default());
+            })
+            .unwrap();
+        format!("{:?}", terminal.backend().buffer())
+    }
+
+    fn numbered(lines: usize) -> String {
+        (1..=lines)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn test_esc_closes() {
+    fn any_dismiss_key_closes_and_others_do_not() {
+        for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char(' ')] {
+            assert!(
+                matches!(
+                    InfoDialog::new("Test", "Message").handle_key(key(code)),
+                    DialogResult::Cancel
+                ),
+                "{code:?}"
+            );
+        }
+        assert!(matches!(
+            InfoDialog::new("Test", "Message").handle_key(key(KeyCode::Char('x'))),
+            DialogResult::Continue
+        ));
+
+        // Staged manually; the real rect comes from render().
         let mut dialog = InfoDialog::new("Test", "Message");
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
+        dialog.ok_button_area = Rect::new(10, 8, 4, 1);
+        assert!(dialog.handle_hover(11, 8));
+        assert_eq!(dialog.hover.current(), Some(dialog.ok_button_area));
+        assert!(dialog.handle_hover(0, 0));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]
-    fn test_enter_closes() {
-        let mut dialog = InfoDialog::new("Test", "Message");
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
+    fn wrapping_counts_display_columns_and_prefers_word_boundaries() {
+        assert_eq!(wrap_to_width("aaa bbb ccc", 7), vec!["aaa ", "bbb ccc"]);
+        assert_eq!(
+            wrap_to_width("short\n\n  indented", 92),
+            vec!["short", "", "  indented"]
+        );
 
-    #[test]
-    fn test_space_closes() {
-        let mut dialog = InfoDialog::new("Test", "Message");
-        let result = dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_other_keys_continue() {
-        let mut dialog = InfoDialog::new("Test", "Message");
-        let result = dialog.handle_key(key(KeyCode::Char('x')));
-        assert!(matches!(result, DialogResult::Continue));
-    }
-
-    #[test]
-    fn wrap_breaks_long_lines_at_display_width() {
         let rows = wrap_to_width(&"x".repeat(25), 10);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].len(), 10);
         assert_eq!(rows[2].len(), 5);
+
+        // Six CJK chars are twelve columns, so only five fit in a row of ten.
+        assert_eq!(
+            wrap_to_width(&"漢".repeat(6), 10),
+            vec!["漢".repeat(5), "漢".to_string()]
+        );
     }
 
     #[test]
-    fn wrap_breaks_at_word_boundary_when_possible() {
-        let rows = wrap_to_width("aaa bbb ccc", 7);
-        assert_eq!(rows, vec!["aaa ", "bbb ccc"]);
-    }
-
-    #[test]
-    fn wrap_preserves_short_and_empty_lines() {
-        let rows = wrap_to_width("short\n\n  indented", 92);
-        assert_eq!(rows, vec!["short", "", "  indented"]);
-    }
-
-    #[test]
-    fn wrap_counts_wide_chars_by_columns() {
-        // 6 CJK chars = 12 columns; at width 10 only 5 fit per row.
-        let rows = wrap_to_width(&"漢".repeat(6), 10);
-        assert_eq!(rows, vec!["漢".repeat(5), "漢".to_string()]);
-    }
-
-    #[test]
-    fn sized_to_fit_short_message_keeps_min_height() {
+    fn sized_to_fit_measures_wrapped_rows_and_drops_the_head_when_over_budget() {
         let dialog = InfoDialog::sized_to_fit("T", "one line");
-        assert_eq!(dialog.height, 9);
+        assert_eq!(dialog.height, 9, "a short message keeps the minimum height");
         assert_eq!(dialog.message, "one line");
-    }
 
-    #[test]
-    fn sized_to_fit_overflow_keeps_tail_and_marks_hidden_head() {
-        // 60 numbered lines: far more than the 28-row budget at max height.
-        let message: String = (1..=60)
-            .map(|i| format!("line {}", i))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let dialog = InfoDialog::sized_to_fit("T", &message);
+        // One logical line that wraps to three rows at inner width 92.
+        let dialog = InfoDialog::sized_to_fit("T", &"x".repeat(92 * 2 + 1));
+        assert_eq!(dialog.message.lines().count(), 3);
+        assert_eq!(dialog.height, 10);
+
+        // Far past the 28-row budget: the tail carries the actual error, so
+        // the head goes behind the hidden-lines marker.
+        let dialog = InfoDialog::sized_to_fit("T", &numbered(60));
         assert_eq!(dialog.height, 35);
-        // The tail (the actual error in hook output) must survive; the head
-        // is replaced by the hidden-lines marker.
+        assert_eq!(dialog.message.lines().count(), 28, "marker + 27 tail lines");
         assert!(dialog.message.ends_with("line 60"), "{}", dialog.message);
         assert!(
             dialog.message.starts_with("… 33 earlier lines hidden"),
@@ -337,81 +316,21 @@ mod tests {
         );
         assert!(!dialog.message.contains("line 33\n"), "{}", dialog.message);
         assert!(dialog.message.contains("line 34\n"), "{}", dialog.message);
-        // Exactly MAX_ROWS rows: marker + 27 tail lines.
-        assert_eq!(dialog.message.lines().count(), 28);
     }
 
     #[test]
-    fn sized_to_fit_counts_wrapped_rows_not_logical_lines() {
-        // One logical line that wraps to 3 visual rows at inner width 92.
-        let dialog = InfoDialog::sized_to_fit("T", &"x".repeat(92 * 2 + 1));
-        assert_eq!(dialog.message.lines().count(), 3);
-        assert_eq!(dialog.height, 10); // 3 rows + 7
-    }
+    fn overflow_anchors_the_head_by_default_and_the_tail_for_errors() {
+        // A terminal shorter than the dialog must not clip away the end of a
+        // `sized_to_fit` error, where the payload lives.
+        let mut error = InfoDialog::sized_to_fit("T", &numbered(28));
+        let screen = rendered(&mut error);
+        assert!(screen.contains("line 28"), "the tail must be visible");
+        assert!(!screen.contains("line 1 "), "the head should scroll away");
 
-    /// On a terminal shorter than the dialog, the message must scroll so
-    /// its tail (the actual error in hook output) stays visible instead of
-    /// clipping at the bottom.
-    #[test]
-    fn short_terminal_shows_message_tail() {
-        use ratatui::backend::TestBackend;
-
-        let message: String = (1..=28)
-            .map(|i| format!("line {}", i))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut dialog = InfoDialog::sized_to_fit("T", &message);
-        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                dialog.render(frame, area, &Theme::default());
-            })
-            .unwrap();
-
-        let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("line 28"), "tail must be visible");
-        assert!(!rendered.contains("line 1 "), "head should scroll away");
-    }
-
-    /// Default (`Top`) dialogs keep the head anchored when content overflows,
-    /// so the first lines of a top-down message (e.g. a warning list) stay
-    /// visible and the bottom clips instead. Guards against the error-dialog
-    /// tail-scroll leaking onto every `InfoDialog::new` caller.
-    #[test]
-    fn default_dialog_anchors_head_on_overflow() {
-        use ratatui::backend::TestBackend;
-
-        let message: String = (1..=30)
-            .map(|i| format!("line {}", i))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut dialog = InfoDialog::new("T", &message);
-        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                dialog.render(frame, area, &Theme::default());
-            })
-            .unwrap();
-
-        let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("line 1 "), "head must stay visible");
-        assert!(!rendered.contains("line 30"), "tail should clip away");
-    }
-
-    #[test]
-    fn hover_highlights_ok_button() {
-        // Stage the button rect manually; the real one comes from render().
-        let mut dialog = InfoDialog::new("Test", "Message");
-        dialog.ok_button_area = Rect::new(10, 8, 4, 1);
-
-        // Over [OK]: highlight it.
-        assert!(dialog.handle_hover(11, 8));
-        assert_eq!(dialog.hover.current(), Some(dialog.ok_button_area));
-
-        // Off the button clears the highlight.
-        assert!(dialog.handle_hover(0, 0));
-        assert_eq!(dialog.hover.current(), None);
+        // A plain dialog reads top-down, so it keeps its head instead.
+        let mut plain = InfoDialog::new("T", &numbered(30));
+        let screen = rendered(&mut plain);
+        assert!(screen.contains("line 1 "), "the head must stay visible");
+        assert!(!screen.contains("line 30"), "the tail should clip away");
     }
 }

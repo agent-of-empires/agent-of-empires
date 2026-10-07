@@ -1,19 +1,15 @@
-// Small, side-effect-free platform probes shared across the dashboard.
-// Kept here (rather than duplicated per hook) so iOS / installed-PWA
-// detection reads the same way everywhere it matters (push support,
-// keyboard layout quirks, etc.).
+// Shared side-effect-free platform probes.
 
-/** True on iPhone / iPad / iPod Safari or an installed iOS PWA. iPadOS 13+
- *  reports a Mac userAgent, so this misses iPad-in-desktop-mode; every caller
- *  today only needs the iPhone case, which always carries "iPhone". */
+/** Misses iPadOS in desktop mode, which reports a Mac userAgent; callers only need iPhone. */
 export const isIOS = (): boolean => typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent);
 
-/** True when running as an installed PWA (Add to Home Screen / standalone
- *  display mode) rather than inside a browser tab. iOS exposes
- *  `navigator.standalone`; other platforms use the display-mode media query. */
 export const isStandalone = (): boolean => {
   if (typeof window === "undefined") return false;
   const ios = (window.navigator as unknown as { standalone?: boolean }).standalone === true;
   const displayMode = window.matchMedia?.("(display-mode: standalone)").matches;
   return ios || !!displayMode;
 };
+
+/** A precise hovering pointer, taken as a sign of a physical keyboard. */
+export const hasFinePointer = (): boolean =>
+  typeof window !== "undefined" && !!window.matchMedia?.("(hover: hover) and (pointer: fine)").matches;

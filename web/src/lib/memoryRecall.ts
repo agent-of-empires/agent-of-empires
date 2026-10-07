@@ -1,16 +1,8 @@
-// Read and validate the `_aoe_memory_recall` payload AcpRuntime smuggles
-// through an assistant-ui tool-call part's args, so the structured view can
-// rebuild it onto the reconstructed ToolCall and dispatch to
-// MemoryRecallCard. Kept out of the React component so the parsing /
-// validation logic is unit-testable in isolation. See #2142.
+// Parse the `_aoe_memory_recall` payload AcpRuntime passes through tool-call args.
 
 import type { MemoryRecall } from "./acpTypes";
 
-/** Validate and normalize a smuggled `_aoe_memory_recall` value before it
- *  reaches MemoryRecallCard. A malformed payload (e.g. non-string
- *  `synthesized_text`) would otherwise trigger runtime type errors in the
- *  card. Returns undefined for anything that isn't shaped like a
- *  MemoryRecall. */
+/** Undefined for anything not shaped like a MemoryRecall, so the card never sees bad types. */
 export function asMemoryRecall(value: unknown): MemoryRecall | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const obj = value as Record<string, unknown>;
@@ -25,10 +17,7 @@ export function asMemoryRecall(value: unknown): MemoryRecall | undefined {
   };
 }
 
-/** Read the smuggled `_aoe_memory_recall` payload off the tool-call args
- *  (parsed object first, raw `argsText` JSON as fallback). Returns
- *  undefined when absent or malformed; the card then renders as a generic
- *  read. */
+/** Parsed args first, raw `argsText` JSON as fallback. */
 export function pickMemoryRecall(
   args: Record<string, unknown> | undefined,
   argsText: string | undefined,

@@ -1,24 +1,16 @@
-//! Background status polling for TUI performance
+//! Background status polling so tmux subprocess calls stay off the UI thread.
 //!
-//! This module provides non-blocking status updates for sessions by running
-//! tmux subprocess calls in a background thread. Two optimizations reduce
-//! per-cycle overhead:
-//!
-//! 1. **Batched metadata**: A single `tmux list-panes -a` call fetches pane
-//!    metadata (dead flag, current command) for all sessions at once, replacing
-//!    O(3N) per-instance `display-message` subprocesses with O(1).
-//!
-//! 2. **Adaptive polling tiers**: Sessions are polled at different frequencies
-//!    based on their status. Hot (Running/Waiting/Starting) every cycle, Warm
-//!    (Idle/Unknown) every 5 cycles, Cold (Error) every 60 cycles, Frozen
-//!    (Stopped/Deleting) never.
+//! One `tmux list-panes -a` call fetches pane metadata for every session at
+//! once, and sessions are polled on adaptive tiers: hot (Running/Waiting/
+//! Starting) every cycle, warm (Idle/Unknown) every 5, cold (Error) every 60,
+//! frozen (Stopped/Deleting) never.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::session::{Instance, Status};
+use crate::session::{DetectionState, Instance, Status};
 use crate::tui::worker::Worker;
 
 /// Adaptive polling intervals (in cycles). 0 = never poll.
@@ -35,25 +27,11 @@ fn polling_tier(status: Status) -> u64 {
     }
 }
 
-/// A producer's report of what to do with an `Instance`'s
-/// `idle_entered_at` field. Encodes three distinct intents that
-/// `Option<DateTime<Utc>>` conflates:
-///
-/// * `Set(ts)`: producer observed a transition into `Idle` at `ts`.
-/// * `Clear`: producer observed a transition out of `Idle`; the disk
-///   value must be reset to `None`. Also emitted by the sandbox-dead
-///   branch of [`poll_statuses_once`] as a synthesized transition
-///   (container health flipped false without a user action).
-/// * `Keep`: producer did not observe a transition (e.g. an
-///   `attached_status_hooks` snapshot from a watcher clone that never
-///   polled its own session); the disk value must not be touched, or a
-///   real transition observed on a different path can be silently
-///   clobbered by an unseeded snapshot.
-///
-/// Locked by `apply_status_update_preserves_idle_entered_at_on_keep`
-/// in `src/tui/home/tests.rs` (a `#[cfg(test)]` item, so the reference
-/// is kept as a code-span rather than an intra-doc link that would
-/// silently degrade to literal text under `cargo doc`).
+/// A producer's report of what to do with an `Instance`'s `idle_entered_at`,
+/// distinguishing the three intents `Option<DateTime<Utc>>` conflates: a
+/// transition into `Idle` at a timestamp, a transition out of it (the disk value
+/// resets), and no observation at all (the disk value must not be touched, or a
+/// transition seen on another path is silently clobbered).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum IdleIntent {
     /// Producer observed `Idle` at the carried timestamp; consumer sets
@@ -67,40 +45,32 @@ pub(crate) enum IdleIntent {
     Keep,
 }
 
-/// Result of a status check for a single session.
-///
-/// `Default` is derived so test fixtures can construct `StatusUpdate` with
-/// `..Default::default()` and only set the fields under test, instead of
-/// re-spelling every field at every call site. All field defaults resolve
-/// through the standard chain: `Status` defaults to `Idle`, `IdleIntent` to
-/// `Keep`, `Option::None`, `bool::false`, and `String::new`.
+/// Result of a status check for a single session. `Default` is derived so test
+/// fixtures can set only the fields under test.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct StatusUpdate {
     pub id: String,
     pub status: Status,
     pub last_error: Option<String>,
-    /// Producer's intent for the real `Instance`'s `idle_entered_at`.
-    /// See [`IdleIntent`] for the three-variant contract that replaces the
-    /// original `Option<DateTime<Utc>>` (which conflated "clear this on a
-    /// transition out of Idle" with "I have no observation, preserve").
+    /// Producer's intent for the real `Instance`'s `idle_entered_at`; see
+    /// [`IdleIntent`].
     pub idle_entered_at: IdleIntent,
-    /// Pulled from tmux `#{session_activity}` via
-    /// `update_status_with_metadata`. Carried back so the main thread can
-    /// persist it to the real Instance; the poller mutates a clone, so any
-    /// fields not plumbed through here are dropped on the floor.
+    /// Pulled from tmux `#{session_activity}`. Carried back so the main thread
+    /// can persist it: the poller only mutates a clone.
     pub last_accessed_at: Option<DateTime<Utc>>,
-    /// Cached pane-dead reading from `tmux::PaneMetadata.pane_dead`. The
-    /// main thread writes this onto `Instance.pane_dead_observed` so the
-    /// Attention sort can treat dead panes as tier 99 without re-querying
-    /// tmux per sort.
+    /// Cached `tmux::PaneMetadata.pane_dead`, written onto
+    /// `Instance.pane_dead_observed` so the Attention sort can treat dead panes
+    /// as tier 99 without re-querying tmux.
     pub pane_dead: bool,
-    /// Snapshot of the polled clone's `live_status_baseline` after
-    /// `update_status_with_metadata` ran. `None` from a producer that has
-    /// no baseline yet (e.g. an `attached_status_hooks` snapshot whose
-    /// watcher clone never polled) must not clear an already-established
-    /// baseline, so the consumer applies this conditionally. `Some(_)` is
-    /// unambiguous: apply it. See #2690.
+    /// Snapshot of the polled clone's `live_status_baseline`. `None` from a
+    /// producer that has none yet must not clear an established baseline, so the
+    /// consumer applies this conditionally (#2690).
     pub live_status_baseline: Option<Status>,
+    /// The polled clone's [`DetectionState`]. `None` means no detection was
+    /// reached, so the consumer keeps what the real `Instance` holds; dropping it
+    /// left a proposed `Running -> Idle` waiting on a poll that could never see
+    /// it (#3642).
+    pub detection: Option<DetectionState>,
 }
 
 pub(super) struct StatusPollState {
@@ -143,9 +113,19 @@ pub(super) fn poll_statuses_once(
 
     let pane_metadata = if any_pollable {
         crate::tmux::refresh_session_cache();
-        crate::tmux::batch_pane_metadata().unwrap_or_default()
+        match crate::tmux::refresh_pane_meta_cache() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.status",
+                    %error,
+                    "skipping status refresh because tmux pane metadata is unavailable",
+                );
+                return Vec::new();
+            }
+        }
     } else {
-        HashMap::new()
+        std::sync::Arc::new(HashMap::new())
     };
 
     // Refresh container health if any sandboxed session exists and interval elapsed
@@ -160,55 +140,89 @@ pub(super) fn poll_statuses_once(
         false
     };
 
-    // Periodically re-sync sandbox credentials from the macOS Keychain
-    // so long-lived sessions don't lose auth mid-run.
+    // Periodically seed a shared credential file that holds no
+    // credential, and refresh the rest of each store. A file holding one
+    // is left to the containers' own rotation.
     if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
     {
         state.last_credential_refresh = Instant::now();
-        let profiles: BTreeSet<String> = instances
-            .iter()
-            .filter(|inst| inst.is_sandboxed())
-            .map(|inst| inst.effective_profile())
-            .collect();
-        for profile in profiles {
-            crate::session::container_config::refresh_agent_configs_for_profile(&profile);
+        for instance in instances.iter().filter(|inst| {
+            inst.is_sandboxed()
+                && inst.sandbox_store_generation
+                    >= crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        }) {
+            // A running container built before its agent shared a credential
+            // file is still rotating the copy in its store; folding that in
+            // would log every sandbox on the shared file out.
+            let container = crate::containers::DockerContainer::from_session_id(&instance.id);
+            // An absent name is unknown, not stopped: the map is empty for a
+            // runtime that cannot list states and for a failed list. Only a
+            // container known to be stopped skips the check.
+            let stopped = state
+                .container_states
+                .get(&crate::containers::DockerContainer::generate_name(
+                    &instance.id,
+                ))
+                .copied()
+                == Some(false);
+            if !stopped {
+                match instance.predates_shared_credential(&container, instance.get_tool_command()) {
+                    Ok(false) => {}
+                    Ok(true) => continue,
+                    Err(error) => {
+                        tracing::warn!(target: "session.profile",
+                            "Skipping credential refresh for {}: {error:#}", instance.id);
+                        continue;
+                    }
+                }
+            }
+            crate::session::config::container_config::refresh_agent_configs_for_instance(
+                &instance.effective_profile(),
+                &instance.id,
+                &instance.tool,
+                instance.get_tool_command().into(),
+                crate::session::config::container_config::CredentialFold::SeedOnly,
+                std::path::Path::new(&instance.container_workdir()),
+            );
         }
     }
 
+    project_status_updates(
+        instances,
+        state.cycle_count,
+        &pane_metadata,
+        &state.container_states,
+    )
+}
+
+fn project_status_updates(
+    instances: Vec<Instance>,
+    cycle_count: u64,
+    pane_metadata: &HashMap<String, crate::tmux::PaneMetadata>,
+    container_states: &HashMap<String, bool>,
+) -> Vec<StatusUpdate> {
     instances
         .into_iter()
         .filter_map(|mut inst| {
             // Adaptive polling: skip instances whose tier interval hasn't elapsed
             let tier = polling_tier(inst.status);
-            if tier == 0 || state.cycle_count % tier != 0 {
+            if tier == 0 || cycle_count % tier != 0 {
                 return None;
             }
 
             // Structured (ACP) rows have no tmux pane, and their sandbox
-            // container is owned by the worker rather than by a tmux pane, so
-            // neither probe below can say anything true about them. The
-            // `aoe serve` daemon derives their status from ACP events
-            // (`derive_acp_status`) and `DaemonStatusPoller` is the only
-            // producer that carries it into the TUI; emitting anything here
-            // would fight that overlay on alternating cycles.
+            // container belongs to the worker rather than a pane, so neither
+            // probe below can say anything true about them: the daemon derives
+            // their status from ACP events and `SessionFeed` carries it in.
             //
-            // This bails before the sandbox-dead branch on purpose. That
-            // branch used to be the one tmux/docker-derived write that landed
-            // on a structured row, pinning sandboxed structured sessions to a
-            // red `Error` with a `"Container is not running"` message that the
-            // heal path (`update_status_with_metadata_inner`) then left behind
-            // as a stale `last_error` while flipping the status back to Idle.
-            // Rows already poisoned by a pre-fix build are cleaned up once by
-            // the v023 migration.
-            //
-            // Returning early also gives up the `Error -> Idle` heal in
-            // `update_status_with_metadata_inner`, deliberately. That heal
+            // Bailing before the sandbox-dead branch is deliberate. That branch
+            // used to pin sandboxed structured rows to a red `Error` with a
+            // stale "Container is not running" message (cleaned up once by the
+            // v023 migration). It also gives up the `Error -> Idle` heal, which
             // existed to undo tmux-derived errors this branch no longer
-            // produces; the only remaining source of `Error` on a structured
-            // row is the daemon reporting `AgentStartupError`, which is a real
-            // failure the user should keep seeing rather than have silently
-            // downgraded to Idle a cycle later. It clears on the next daemon
-            // reading, or on an explicit stop/start.
+            // produces; the remaining source of `Error` here is the daemon
+            // reporting `AgentStartupError`, a real failure that should stay
+            // visible until the next daemon reading or an explicit stop/start.
             if inst.is_structured() {
                 return None;
             }
@@ -222,7 +236,7 @@ pub(super) fn poll_statuses_once(
                 )
             {
                 if let Some(sandbox) = &inst.sandbox_info {
-                    if let Some(&running) = state.container_states.get(&sandbox.container_name) {
+                    if let Some(&running) = container_states.get(&sandbox.container_name) {
                         if !running {
                             return Some(StatusUpdate {
                                 id: inst.id,
@@ -234,6 +248,8 @@ pub(super) fn poll_statuses_once(
                                 // usual sense; the Error tier itself sinks the row.
                                 pane_dead: false,
                                 live_status_baseline: Some(Status::Error),
+                                // No detection ran on this branch.
+                                detection: None,
                             });
                         }
                     }
@@ -245,7 +261,7 @@ pub(super) fn poll_statuses_once(
             // title moved without its tmux session being renamed is still
             // found (and not reported as Error for a live pane).
             let session_name = crate::tmux::resolve_agent_session_name_in(
-                &pane_metadata,
+                pane_metadata,
                 &inst.id,
                 &crate::tmux::Session::generate_name(&inst.id, &inst.title),
             );
@@ -265,15 +281,10 @@ pub(super) fn poll_statuses_once(
                 id: inst.id,
                 status: inst.status,
                 last_error: inst.last_error,
-                // This producer is authoritative on `idle_entered_at`
-                // for both the sandbox-dead branch above and the tmux
-                // branch reached via `update_status_with_metadata`, and
-                // never emits `IdleIntent::Keep`:
-                // `attached_status_hooks::snapshot` is the sole
-                // `Keep`-emitter (see its docstring). The asymmetry is
-                // load-bearing: a future consolidation that adds `Keep`
-                // to this producer would erase the baseline seed that
-                // `update_status_with_metadata` writes.
+                // This producer is authoritative on `idle_entered_at` and never
+                // emits `IdleIntent::Keep`; `attached_status_hooks::snapshot` is
+                // the sole `Keep`-emitter. Adding `Keep` here would erase the
+                // baseline seed `update_status_with_metadata` writes.
                 idle_entered_at: match inst.idle_entered_at {
                     Some(ts) => IdleIntent::Set(ts),
                     None => IdleIntent::Clear,
@@ -281,12 +292,12 @@ pub(super) fn poll_statuses_once(
                 last_accessed_at: inst.last_accessed_at,
                 pane_dead,
                 live_status_baseline: inst.live_status_baseline,
+                detection: Some(inst.detection),
             })
         })
         .collect()
 }
 
-/// Background thread that polls session status without blocking the UI
 pub struct StatusPoller {
     worker: Worker<Vec<Instance>, Vec<StatusUpdate>>,
 }
@@ -308,10 +319,9 @@ impl StatusPoller {
         self.worker.request(instances);
     }
 
-    /// Try to receive status updates without blocking. Surfaces
-    /// `Disconnected` (see `Worker::try_recv`) so the caller can respawn the
-    /// worker: swallowing it would leave `pending_status_refresh` set
-    /// forever, silently freezing every session's live status.
+    /// Try to receive status updates without blocking. Surfaces `Disconnected`
+    /// so the caller can respawn the worker; swallowing it would freeze every
+    /// session's live status.
     pub fn try_recv_updates(&self) -> Result<Vec<StatusUpdate>, std::sync::mpsc::TryRecvError> {
         self.worker.try_recv()
     }
@@ -327,33 +337,9 @@ impl Default for StatusPoller {
 mod tests {
     use super::*;
 
-    #[test]
-    fn status_update_carries_idle_entered_at() {
-        // Regression: the polling loop runs `update_status_with_metadata`
-        // on a clone, then projects the result into a `StatusUpdate`. If
-        // `idle_entered_at` falls off the projection (the original bug),
-        // the breathe rattle + fresh-idle color never fire in the TUI
-        // even though the wrapper sets the timestamp on the clone
-        // correctly.
-        let ts = Utc::now();
-        let update = StatusUpdate {
-            id: "abc".into(),
-            status: Status::Idle,
-            last_error: None,
-            idle_entered_at: IdleIntent::Set(ts),
-            last_accessed_at: None,
-            pane_dead: false,
-            live_status_baseline: None,
-        };
-        assert_eq!(update.idle_entered_at, IdleIntent::Set(ts));
-    }
-
-    /// #2690 follow-up. `StatusUpdate::default()` must be a semantic
-    /// no-op so test fixtures can use `..Default::default()` and only
-    /// override the fields under test. A future field with a non-trivial
-    /// default (e.g. an id defaulting to empty string that a consumer
-    /// treats as "match all") would silently corrupt fixture-based
-    /// tests. This lock catches such a field addition at review time.
+    /// #2690 follow-up: `StatusUpdate::default()` must be a semantic no-op so
+    /// fixtures can override only the fields under test. A future field with a
+    /// non-trivial default would silently corrupt them.
     #[test]
     fn test_status_update_default_is_no_op() {
         let default = StatusUpdate::default();
@@ -380,53 +366,30 @@ mod tests {
             default.live_status_baseline, None,
             "live_status_baseline defaults to None (no baseline observed yet)"
         );
+        assert_eq!(
+            default.detection, None,
+            "detection defaults to None (producer never detected)"
+        );
     }
 
     #[test]
-    fn test_polling_tier_hot() {
-        assert_eq!(polling_tier(Status::Running), TIER_HOT);
-        assert_eq!(polling_tier(Status::Waiting), TIER_HOT);
-        assert_eq!(polling_tier(Status::Starting), TIER_HOT);
-    }
-
-    #[test]
-    fn test_polling_tier_warm() {
-        assert_eq!(polling_tier(Status::Idle), TIER_WARM);
-        assert_eq!(polling_tier(Status::Unknown), TIER_WARM);
-    }
-
-    #[test]
-    fn test_polling_tier_cold() {
-        assert_eq!(polling_tier(Status::Error), TIER_COLD);
-    }
-
-    #[test]
-    fn test_polling_tier_frozen() {
-        assert_eq!(polling_tier(Status::Stopped), 0);
-        assert_eq!(polling_tier(Status::Deleting), 0);
-    }
-
-    #[test]
-    fn test_tier_cycle_alignment() {
-        // Hot sessions are polled every cycle: TIER_HOT must stay at 1.
+    fn polling_tiers_and_first_cycle_alignment() {
+        for (status, tier) in [
+            (Status::Running, TIER_HOT),
+            (Status::Waiting, TIER_HOT),
+            (Status::Starting, TIER_HOT),
+            (Status::Idle, TIER_WARM),
+            (Status::Unknown, TIER_WARM),
+            (Status::Error, TIER_COLD),
+            (Status::Stopped, 0),
+            (Status::Deleting, 0),
+        ] {
+            assert_eq!(polling_tier(status), tier, "{status:?}");
+        }
+        // Hot sessions poll every cycle.
         assert_eq!(TIER_HOT, 1);
-        // Warm sessions are polled every 5 cycles
-        assert_ne!(1u64 % TIER_WARM, 0);
-        assert_ne!(2u64 % TIER_WARM, 0);
-        assert_eq!(5u64 % TIER_WARM, 0);
-        assert_eq!(10u64 % TIER_WARM, 0);
-        // Cold sessions are polled every 60 cycles
-        assert_ne!(1u64 % TIER_COLD, 0);
-        assert_eq!(60u64 % TIER_COLD, 0);
-        assert_eq!(120u64 % TIER_COLD, 0);
-    }
-
-    #[test]
-    fn test_first_cycle_polls_all_tiers() {
-        // cycle_count starts at TIER_COLD - 1, first cycle wraps to TIER_COLD
+        // cycle_count starts at TIER_COLD - 1, so the first cycle polls every tier.
         let first_cycle = (TIER_COLD - 1).wrapping_add(1);
-        // TIER_HOT == 1 (see test_tier_cycle_alignment), so any cycle trivially
-        // polls hot; just verify the warm and cold alignments here.
         assert_eq!(first_cycle % TIER_WARM, 0, "first cycle must poll warm");
         assert_eq!(first_cycle % TIER_COLD, 0, "first cycle must poll cold");
     }
@@ -434,18 +397,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn poll_statuses_once_never_emits_idle_intent_keep() {
-        // Regression guard for #2690: the asymmetry that only
-        // `attached_status_hooks::snapshot` produces `IdleIntent::Keep`
-        // and `poll_statuses_once` never does is load-bearing (see the
-        // comment above the `idle_entered_at` projection). A future
-        // consolidation that adds `Keep` to this producer would erase
-        // the baseline seed that `update_status_with_metadata` writes
-        // on its first observation, silently reintroducing the #2690
-        // restamp bug.
-        //
-        // Structural today (both emit sites hardcode Set/Clear), so
-        // this test tightens against a refactor that would relax the
-        // projection into a match arm capable of returning Keep.
+        let _home = crate::session::test_support::isolate_app_dir();
+        // This is the projection shared by the native poller, after acquisition.
         let mut running = Instance::new("running", "/tmp/running");
         running.status = Status::Running;
         let mut idle = Instance::new("idle", "/tmp/idle");
@@ -454,12 +407,19 @@ mod tests {
         let mut error = Instance::new("error", "/tmp/error");
         error.status = Status::Error;
 
-        let mut state = StatusPollState::new();
-        let updates = poll_statuses_once(vec![running, idle, error], &mut state);
-
-        assert!(
-            !updates.is_empty(),
-            "hot/warm/cold instances all align on the first cycle; at least one update expected"
+        let expected_ids = vec![running.id.clone(), idle.id.clone(), error.id.clone()];
+        let updates = project_status_updates(
+            vec![running, idle, error],
+            TIER_COLD,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| update.id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids
         );
         for update in updates {
             assert!(
@@ -473,6 +433,7 @@ mod tests {
 
     fn dead_container_sandbox(name: &str) -> crate::session::SandboxInfo {
         crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ubuntu:latest".to_string(),
@@ -484,35 +445,28 @@ mod tests {
         }
     }
 
-    /// Pin `container_states` for the per-instance decision: the live
-    /// `batch_container_health()` refresh would otherwise overwrite the seeded
-    /// map with an empty one (no docker in the test environment), and an
-    /// absent entry skips the sandbox-dead branch for the wrong reason.
-    fn state_with_dead_container(name: &str) -> StatusPollState {
-        let mut state = StatusPollState::new();
-        state.last_container_check = Instant::now();
-        state.container_states.insert(name.to_string(), false);
-        state
+    fn dead_container_states(name: &str) -> HashMap<String, bool> {
+        HashMap::from([(name.to_string(), false)])
     }
 
     #[test]
     #[serial_test::serial]
     fn structured_rows_never_get_a_container_error() {
-        // The sandbox-dead branch used to run before the `is_structured()`
-        // bail, making it the one tmux/docker-derived write that landed on a
-        // structured row: a red `Error` with "Container is not running" that
-        // `home::apply_status_update` then persisted, and that the heal in
-        // `update_status_with_metadata_inner` only half-cleared (status back
-        // to Idle, message left behind). A structured session's container
-        // belongs to its ACP worker, not to a tmux pane, so this reading says
-        // nothing about the session; the daemon overlay owns its status.
+        // The sandbox-dead branch used to run before the `is_structured()` bail,
+        // landing a red `Error` with "Container is not running" on structured
+        // rows. A structured session's container belongs to its ACP worker, not
+        // a tmux pane, so that reading says nothing about the session.
         let mut inst = Instance::new("structured-sandboxed", "/tmp/structured");
         inst.view = crate::session::View::Structured;
         inst.status = Status::Idle;
         inst.sandbox_info = Some(dead_container_sandbox("aoe-sandbox-structured"));
 
-        let mut state = state_with_dead_container("aoe-sandbox-structured");
-        let updates = poll_statuses_once(vec![inst], &mut state);
+        let updates = project_status_updates(
+            vec![inst],
+            TIER_COLD,
+            &HashMap::new(),
+            &dead_container_states("aoe-sandbox-structured"),
+        );
 
         assert!(
             updates.is_empty(),
@@ -530,8 +484,12 @@ mod tests {
         inst.status = Status::Idle;
         inst.sandbox_info = Some(dead_container_sandbox("aoe-sandbox-terminal"));
 
-        let mut state = state_with_dead_container("aoe-sandbox-terminal");
-        let updates = poll_statuses_once(vec![inst], &mut state);
+        let updates = project_status_updates(
+            vec![inst],
+            TIER_COLD,
+            &HashMap::new(),
+            &dead_container_states("aoe-sandbox-terminal"),
+        );
 
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, Status::Error);

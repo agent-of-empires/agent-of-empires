@@ -1,37 +1,37 @@
-// Structured view per-session config picker (#1403).
-//
-// Renders the model dropdown + reasoning-effort selector by filtering
-// the unified `configOptions` snapshot the daemon publishes from
-// ACP `SessionUpdate::ConfigOptionUpdate`. The mode picker lives in the
-// composer (`ModePicker`); it reads a `category:"mode"` config option
-// from this same `configOptions` snapshot when the agent advertises one
-// (OpenCode, claude-agent-acp v0.37.0+), and only falls back to the ACP
-// SessionModeState channel otherwise. See lib/modeChannel.ts (#1764).
-//
-// Behavior:
-// - Pessimistic UI. Current value stays put until the adapter pushes a
-//   confirming `ConfigOptionsUpdated`. The clicked option is dimmed
-//   and disabled while `pendingConfigOption?.configId === id`.
-// - Effort is adaptive: segmented control when the option count and
-//   total label width comfortably fit, dropdown fallback otherwise.
-//   The threshold is intentionally simple (count + label-length); a
-//   container query is YAGNI until adapters actually emit long lists.
-// - Hidden entirely when neither category appears.
-// - `ConfigOptionSwitchFailedNotice` lives in this file because it
-//   shares the dismiss callback's home.
+// Model and reasoning-effort pickers from the agent's config options. Pessimistic:
+// the current value changes only when the adapter confirms; the pending choice is disabled.
 
 import { ChevronUp } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import type { ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
+import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
 
 interface Props {
   configOptions: AcpState["configOptions"];
   pendingConfigOption: AcpState["pendingConfigOption"];
   onSetConfigOption: (configId: string, value: string) => void | Promise<void>;
+  /** Pinned LLM backend, or null when the host environment decides. */
+  provider?: string | null;
+  /** The provider value in flight, if any. */
+  providerPending?: string | null;
+  /** Absent for a session whose agent does not route through a provider. */
+  onSetProvider?: (provider: string) => void | Promise<void>;
+  /** Why the provider cannot change right now, if it cannot. */
+  providerLockedReason?: string | null;
 }
 
 const MODEL_LABEL_MAX = 24;
+/** Synthetic id; aoe owns this pick, so it is not an agent config option. */
+const PROVIDER_OPTION_ID = "aoe-provider";
+const PROVIDERS: ConfigOptionChoice[] = [
+  { value: "api", name: "Anthropic API", description: "Direct api.anthropic.com" },
+  { value: "bedrock", name: "Bedrock", description: "AWS credentials from the host" },
+  { value: "vertex", name: "Vertex AI", description: "GCP credentials from the host" },
+];
+// The floor only picks the open direction; height always clamps to the available space.
+const MENU_MAX_HEIGHT_CAP = 288;
+const MENU_MAX_HEIGHT_FLOOR = 120;
+const MENU_VIEWPORT_MARGIN = 8;
 const EFFORT_SEGMENTED_MAX_COUNT = 5;
 const EFFORT_SEGMENTED_MAX_TOTAL_LABEL_LEN = 40;
 
@@ -47,13 +47,36 @@ function findByCategory(
   return options.find((o) => o.category === category);
 }
 
-export function SessionConfigControls({ configOptions, pendingConfigOption, onSetConfigOption }: Props) {
+/** Reuses the config-option dropdown so the provider pick gets its placement,
+ *  keyboard handling and pending state for free. While unpinned the list leads
+ *  with a non-selectable entry naming that state: the dropdown already refuses
+ *  to re-pick the current value, and there is no way back to unpinned once a
+ *  provider is chosen. */
+function providerDescriptor(provider: string | null | undefined): ConfigOptionDescriptor {
+  return {
+    id: PROVIDER_OPTION_ID,
+    name: "Provider",
+    category: "provider",
+    current_value: provider ?? "",
+    options: provider
+      ? PROVIDERS
+      : [{ value: "", name: "Host default", description: "Set by the host environment" }, ...PROVIDERS],
+  };
+}
+
+export function SessionConfigControls({
+  configOptions,
+  pendingConfigOption,
+  onSetConfigOption,
+  provider,
+  providerPending,
+  onSetProvider,
+  providerLockedReason,
+}: Props) {
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
 
-  // Hidden entirely when neither selector exists; avoids empty chrome
-  // on adapters that don't advertise either category.
-  if (!model && !effort) return null;
+  if (!model && !effort && !onSetProvider) return null;
 
   return (
     <div data-testid="session-config-controls" className="flex flex-wrap items-center gap-1.5">
@@ -71,20 +94,58 @@ export function SessionConfigControls({ configOptions, pendingConfigOption, onSe
           onSelect={(value) => onSetConfigOption(effort.id, value)}
         />
       )}
+      {onSetProvider && (
+        <ModelDropdown
+          option={providerDescriptor(provider)}
+          pending={providerPending ?? null}
+          onSelect={(value) => onSetProvider(value)}
+          lockedReason={providerLockedReason}
+        />
+      )}
     </div>
   );
 }
 
 interface SubProps {
   option: ConfigOptionDescriptor;
-  /** The value currently in flight for this option (rendered with a
-   *  pending affordance), or null when nothing is pending. */
+  /** The value in flight for this option, if any. */
   pending: string | null;
   onSelect: (value: string) => void | Promise<void>;
+  /** Disables the trigger and explains why. */
+  lockedReason?: string | null;
 }
 
-function ModelDropdown({ option, pending, onSelect }: SubProps) {
+interface MenuLayout {
+  direction: "up" | "down";
+  maxHeight: number;
+}
+
+const DEFAULT_MENU_LAYOUT: MenuLayout = { direction: "up", maxHeight: MENU_MAX_HEIGHT_CAP };
+
+/** Open upward when a floor's worth of room exists, else toward the roomier side.
+ *  Uses the visual viewport: iOS `innerHeight` ignores the keyboard, and a zoom offset
+ *  shifts both visible edges. */
+function computeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 0): MenuLayout {
+  const spaceAbove = rect.top - viewportTop - MENU_VIEWPORT_MARGIN;
+  const spaceBelow = viewportTop + viewportHeight - rect.bottom - MENU_VIEWPORT_MARGIN;
+  let direction: "up" | "down";
+  let available: number;
+  if (spaceAbove >= MENU_MAX_HEIGHT_FLOOR) {
+    direction = "up";
+    available = spaceAbove;
+  } else if (spaceBelow >= MENU_MAX_HEIGHT_FLOOR || spaceBelow > spaceAbove) {
+    direction = "down";
+    available = spaceBelow;
+  } else {
+    direction = "up";
+    available = spaceAbove;
+  }
+  return { direction, maxHeight: Math.max(0, Math.min(MENU_MAX_HEIGHT_CAP, available)) };
+}
+
+function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
   const [open, setOpen] = useState(false);
+  const [menuLayout, setMenuLayout] = useState<MenuLayout>(DEFAULT_MENU_LAYOUT);
   const ref = useRef<HTMLDivElement | null>(null);
   const menuId = `config-option-menu-${option.id}`;
   const current = option.options.find((o) => o.value === option.current_value) ?? option.options[0];
@@ -106,21 +167,45 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
     };
   }, [open]);
 
+  // visualViewport events catch the soft keyboard, which fires no window resize.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const vv = typeof window !== "undefined" ? window.visualViewport : null;
+    const recompute = () => {
+      const rect = ref.current?.getBoundingClientRect();
+      if (!rect) return;
+      setMenuLayout(computeMenuLayout(rect, vv?.height ?? window.innerHeight, vv?.offsetTop ?? 0));
+    };
+    recompute();
+    window.addEventListener("resize", recompute);
+    window.addEventListener("scroll", recompute, true);
+    vv?.addEventListener("resize", recompute);
+    vv?.addEventListener("scroll", recompute);
+    return () => {
+      window.removeEventListener("resize", recompute);
+      window.removeEventListener("scroll", recompute, true);
+      vv?.removeEventListener("resize", recompute);
+      vv?.removeEventListener("scroll", recompute);
+    };
+  }, [open]);
+
   return (
     <div ref={ref} className="relative">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
+        disabled={!!lockedReason}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        title={`${option.name}: ${label}`}
+        title={lockedReason ?? `${option.name}: ${label}`}
         aria-label={`${option.name}: ${label}`}
         data-testid={`config-option-${option.id}`}
         className={[
           "inline-flex items-center gap-1 rounded-md border border-surface-700 bg-surface-800/60 px-2 py-1 text-[11px] font-medium",
           "text-text-secondary",
           "transition-colors hover:border-brand-600/60 hover:text-text-primary",
+          "disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-surface-700 disabled:hover:text-text-secondary",
         ].join(" ")}
       >
         <span>{truncate(label, MODEL_LABEL_MAX)}</span>
@@ -129,47 +214,53 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
       {open && (
         <div
           id={menuId}
-          className="absolute bottom-full left-0 z-30 mb-1 w-64 overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
+          className={[
+            "absolute left-0 z-30 flex w-64 flex-col overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl",
+            menuLayout.direction === "up" ? "bottom-full mb-1" : "top-full mt-1",
+          ].join(" ")}
+          style={{ maxHeight: menuLayout.maxHeight }}
           role="menu"
         >
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
             {option.name}
           </div>
-          {option.options.map((opt) => {
-            const isCurrent = opt.value === option.current_value;
-            const isPending = pending === opt.value;
-            return (
-              <button
-                key={opt.value}
-                type="button"
-                role="menuitem"
-                disabled={isPending}
-                onClick={() => {
-                  if (isPending || isCurrent) {
+          <div className="overflow-y-auto">
+            {option.options.map((opt) => {
+              const isCurrent = opt.value === option.current_value;
+              const isPending = pending === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  role="menuitem"
+                  disabled={isPending}
+                  onClick={() => {
+                    if (isPending || isCurrent) {
+                      setOpen(false);
+                      return;
+                    }
                     setOpen(false);
-                    return;
-                  }
-                  setOpen(false);
-                  void onSelect(opt.value);
-                }}
-                data-testid={`config-option-${option.id}-value-${opt.value}`}
-                className={[
-                  "flex w-full items-start gap-2 px-3 py-1.5 text-left text-[12px]",
-                  isCurrent
-                    ? "bg-surface-800 text-text-primary"
-                    : "text-text-secondary hover:bg-surface-800 hover:text-text-primary",
-                  isPending ? "cursor-not-allowed opacity-50" : "",
-                ].join(" ")}
-              >
-                <span className="flex-1">
-                  <span className="block font-medium">{opt.name}</span>
-                  {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
-                </span>
-                {isCurrent && !isPending && <span className="text-[10px] uppercase text-brand-500">Active</span>}
-                {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
-              </button>
-            );
-          })}
+                    void onSelect(opt.value);
+                  }}
+                  data-testid={`config-option-${option.id}-value-${opt.value}`}
+                  className={[
+                    "flex w-full items-start gap-2 px-3 py-1.5 text-left text-[12px]",
+                    isCurrent
+                      ? "bg-surface-800 text-text-primary"
+                      : "text-text-secondary hover:bg-surface-800 hover:text-text-primary",
+                    isPending ? "cursor-not-allowed opacity-50" : "",
+                  ].join(" ")}
+                >
+                  <span className="flex-1">
+                    <span className="block font-medium">{opt.name}</span>
+                    {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
+                  </span>
+                  {isCurrent && !isPending && <span className="text-[10px] uppercase text-brand-500">Active</span>}
+                  {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>
@@ -230,10 +321,7 @@ interface NoticeProps {
   onDismiss: () => void;
 }
 
-/** Non-blocking notice rendered near the picker when the adapter
- *  rejects a `session/set_config_option`. Auto-dismisses via the
- *  reducer when a later snapshot confirms the requested value; the
- *  manual dismiss button is the user-visible escape hatch. */
+/** The adapter rejected a config change; the reducer clears this once a snapshot confirms the value. */
 export function ConfigOptionSwitchFailedNotice({ failure, configOptions, onDismiss }: NoticeProps) {
   if (!failure) return null;
   const config = configOptions.find((c) => c.id === failure.configId);

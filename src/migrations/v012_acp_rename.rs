@@ -1,20 +1,11 @@
-//! Migration v012: retire the "cockpit" terminology for the structured view / acp.
+//! Migration v012: retire the "cockpit" terminology.
 //!
-//! The cockpit concept was retired: the ACP-based structured rendering is now
-//! the web dashboard's default "structured view", and the tmux rendering is the
-//! opt-in "terminal view". The persisted shapes changed accordingly:
-//!
-//! - Config: the `[cockpit]` section becomes `[acp]`, and the removed master
-//!   switch (`enabled`) and `default_for_claude` keys are dropped.
-//! - Sessions: the per-instance `cockpit_mode` boolean becomes the `view` enum
-//!   (`"structured"` when it was true; dropped when false so the session falls
-//!   back to the default `terminal`). The related `cockpit_agent`,
-//!   `cockpit_model`, and `cockpit_acp_session_id` fields are renamed to
-//!   `agent_name`, `agent_model`, and `acp_session_id`.
-//! - Runtime: the detached-worker directory `cockpit-workers/` becomes
-//!   `acp-workers/`.
-//!
-//! Idempotent: re-running on already-migrated data is a no-op.
+//! Config: `[cockpit]` becomes `[acp]`, dropping the removed `enabled` and
+//! `default_for_claude` keys. Sessions: `cockpit_mode` becomes the `view` enum
+//! (`"structured"` when true, dropped when false), and `cockpit_agent`,
+//! `cockpit_model`, `cockpit_acp_session_id` become `agent_name`,
+//! `agent_model`, `acp_session_id`. Runtime: `cockpit-workers/` becomes
+//! `acp-workers/`. Idempotent.
 
 use anyhow::{Context, Result};
 use std::fs;

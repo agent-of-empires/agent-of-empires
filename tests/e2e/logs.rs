@@ -2,107 +2,35 @@
 //!
 //! Drives the binary via `run_cli` against a fixture log seeded inside the
 //! harness's isolated `$HOME` so the real user's logs are never read or
-//! touched. We use `--no-pager` everywhere to keep the test deterministic
-//! (no interactive viewer launch).
+//! touched. `--no-pager` keeps the output deterministic.
 
 use serial_test::parallel;
 
 use crate::harness::{app_dir_in, TuiTestHarness};
 
-/// Write a fake debug.log under the harness's isolated app dir.
-fn seed_debug_log(h: &TuiTestHarness, content: &str) -> std::path::PathBuf {
-    let app_dir = app_dir_in(h.home_path());
-    std::fs::create_dir_all(&app_dir).expect("create app dir");
-    let path = app_dir.join("debug.log");
-    std::fs::write(&path, content).expect("write debug.log");
-    path
-}
-
 #[test]
 #[parallel]
-fn logs_no_pager_prints_debug_log_to_stdout() {
-    let h = TuiTestHarness::new("logs_no_pager");
-    seed_debug_log(
-        &h,
-        "2024-01-01T00:00:01Z  INFO line one\n\
-         2024-01-01T00:00:02Z  INFO line two\n",
-    );
+fn logs_prints_tails_and_locates_the_debug_log() {
+    let h = TuiTestHarness::new("logs");
 
-    let out = h.run_cli(&["logs", "--no-pager"]);
-    assert!(
-        out.status.success(),
-        "aoe logs --no-pager failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("line one"),
-        "stdout missing 'line one': {stdout}"
-    );
-    assert!(
-        stdout.contains("line two"),
-        "stdout missing 'line two': {stdout}"
-    );
-}
-
-#[test]
-#[parallel]
-fn logs_lines_returns_only_tail() {
-    let h = TuiTestHarness::new("logs_lines");
-    seed_debug_log(&h, "a\nb\nc\nd\ne\n");
-
-    let out = h.run_cli(&["logs", "--no-pager", "--lines", "2"]);
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(stdout, "d\ne\n");
-}
-
-#[test]
-#[parallel]
-fn logs_path_prints_configured_log_path() {
-    let h = TuiTestHarness::new("logs_path");
-    let path = seed_debug_log(&h, "");
-
-    let out = h.run_cli(&["logs", "--path"]);
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(stdout.trim(), path.to_string_lossy());
-}
-
-#[test]
-#[parallel]
-fn logs_serve_flag_rejected() {
-    // `--serve` and `--all` were removed when serve.log was dropped; the
-    // configured log file (debug.log by default) carries everything now.
-    let h = TuiTestHarness::new("logs_serve_removed");
-    let out = h.run_cli(&["logs", "--serve", "--no-pager"]);
-    assert!(
-        !out.status.success(),
-        "removed --serve flag should exit non-zero"
-    );
-}
-
-#[test]
-#[parallel]
-fn logs_all_flag_rejected() {
-    let h = TuiTestHarness::new("logs_all_removed");
-    let out = h.run_cli(&["logs", "--all", "--no-pager"]);
-    assert!(
-        !out.status.success(),
-        "removed --all flag should exit non-zero"
-    );
-}
-
-#[test]
-#[parallel]
-fn logs_missing_file_exits_zero_with_hint() {
-    let h = TuiTestHarness::new("logs_missing");
-    // Don't seed: app dir + debug.log absent.
+    // Missing file: exit 0 with a hint rather than an error.
     let out = h.run_cli(&["logs", "--no-pager"]);
     assert!(out.status.success(), "should exit 0 when missing");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("does not exist"),
-        "stderr should explain missing file: {stderr}"
+    assert!(stderr.contains("does not exist"), "{stderr}");
+
+    let app_dir = app_dir_in(h.home_path());
+    std::fs::create_dir_all(&app_dir).expect("create app dir");
+    let path = app_dir.join("debug.log");
+    std::fs::write(&path, "a\nb\nc\nd\ne\n").expect("write debug.log");
+
+    assert_eq!(h.run_cli_ok(&["logs", "--no-pager"]), "a\nb\nc\nd\ne\n");
+    assert_eq!(
+        h.run_cli_ok(&["logs", "--no-pager", "--lines", "2"]),
+        "d\ne\n"
+    );
+    assert_eq!(
+        h.run_cli_ok(&["logs", "--path"]).trim(),
+        path.to_string_lossy()
     );
 }

@@ -75,8 +75,6 @@ pub fn run_export(name: &str, output: Option<&str>) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Cannot determine themes directory"))?;
             std::fs::create_dir_all(&dir)?;
 
-            // Use a "custom-" prefix when exporting a builtin so the file is
-            // recognized as a custom theme (builtin names are filtered out).
             let filename = if is_builtin_theme(name) {
                 format!("custom-{}.toml", name)
             } else {

@@ -1,6 +1,4 @@
-// React error boundary that reports caught render errors to the
-// client logger. Class component because function components cannot
-// catch render errors.
+// React error boundary that reports caught render errors to the client logger.
 import { Component } from "react";
 import type { ErrorInfo, ReactNode } from "react";
 import { reportError } from "../lib/logger";

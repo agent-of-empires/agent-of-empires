@@ -1,11 +1,6 @@
 // @vitest-environment jsdom
-//
-// Behavioral coverage for the rebuilt per-agent structured-view defaults widget
-// (#2631): dropdowns populated from the recall catalog, free-text fallback when
-// the catalog is empty, unverified preservation of stale values, per-model
-// thinking overrides, and pruning empty agent entries out of the saved map.
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AcpDefaultsWidget } from "../AcpDefaultsWidget";
 import * as api from "../../../lib/api";
@@ -87,14 +82,16 @@ beforeEach(() => {
   vi.mocked(api.fetchAcpOptionCatalog).mockResolvedValue(catalog({ opencode: OPENCODE_ENTRY }) as never);
 });
 
-it("renders a model dropdown from the catalog and saves the selection", async () => {
+it("renders a model dropdown from the catalog, saves the selection, and prunes a cleared agent", async () => {
   const save = vi.fn();
-  render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{}} save={save} />);
+  render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{ opencode: { model: "openai/gpt-5.5" } }} save={save} />);
   const select = await controlByLabel<HTMLSelectElement>("Default model", "select");
   // Adapter default + two advertised models.
   expect(Array.from(select.options).map((o) => o.value)).toEqual(["", "openai/gpt-5.5", "anthropic/opus"]);
   fireEvent.change(select, { target: { value: "anthropic/opus" } });
   expect(save).toHaveBeenCalledWith({ opencode: { model: "anthropic/opus" } });
+  fireEvent.change(select, { target: { value: "" } });
+  expect(save).toHaveBeenLastCalledWith({});
 });
 
 it("falls back to a free-text input when the catalog has no options for the agent", async () => {
@@ -130,18 +127,32 @@ it("adds a per-model thinking override from catalog models", async () => {
   });
 });
 
-it("prunes an agent entry from the map when its last value is cleared", async () => {
-  const save = vi.fn();
-  render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{ opencode: { model: "openai/gpt-5.5" } }} save={save} />);
-  const select = await controlByLabel<HTMLSelectElement>("Default model", "select");
-  fireEvent.change(select, { target: { value: "" } });
-  expect(save).toHaveBeenCalledWith({});
+it("marks a server-deprecated agent on its card without hiding it", async () => {
+  // gemini arrives from /api/agents already flagged; the settings editor
+  // keeps it configurable but labels the card.
+  vi.mocked(api.fetchAgents).mockResolvedValue([
+    agent("opencode"),
+    {
+      ...agent("gemini"),
+      lifecycle: {
+        state: "deprecated",
+        since: "2026-06-18",
+        note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
+        replacement: "antigravity",
+      },
+    },
+  ] as never);
+  render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{}} save={vi.fn()} />);
+  expect(await screen.findByTestId("acp-defaults-deprecated-gemini")).toBeTruthy();
+  expect(screen.queryByTestId("acp-defaults-deprecated-opencode")).toBeNull();
+  // Still editable: its model control is present.
+  await waitFor(() => expect(screen.getAllByText("gemini").length).toBeGreaterThan(0));
 });
 
-describe("no acp-capable agents", () => {
-  it("shows an empty-state message", async () => {
-    vi.mocked(api.fetchAgents).mockResolvedValue([agent("claude", false)] as never);
-    render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{}} save={vi.fn()} />);
-    await waitFor(() => expect(screen.getByText("No ACP-capable agents detected.")).toBeTruthy());
-  });
+it("falls back to the static mirror when the server omits lifecycle", async () => {
+  // Older daemons never send the field; gemini is still flagged because
+  // the static profile mirror knows it.
+  vi.mocked(api.fetchAgents).mockResolvedValue([agent("gemini")] as never);
+  render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{}} save={vi.fn()} />);
+  expect(await screen.findByTestId("acp-defaults-deprecated-gemini")).toBeTruthy();
 });

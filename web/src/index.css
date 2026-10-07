@@ -110,6 +110,9 @@
      from `theme.unread` (see resolved.rs); this default matches `zinc`. */
   --color-status-unread: #38bdf8;
   --color-status-error: #ef4444;
+  /* Error as body text: projected as the theme error lifted until it clears
+     4.5:1 on surface-900 and -850 (see resolved.rs). This default is zinc's. */
+  --color-status-error-text: #f26969;
   --color-status-starting: #f59e0b;
   --color-status-stopped: #52525b;
   /* Dormant: a structured-view worker auto-stopped for inactivity
@@ -126,9 +129,15 @@
      matches the post-fetch paint when no localStorage cache exists. */
   --color-selection: #3f3f46;
   --color-session-selection: #52525b;
+  /* Frame around the open session's sidebar row. Projected as the theme
+     accent lifted until it clears 3:1 against every surface it can sit on
+     (see resolved.rs); zinc's accent already does, so this matches
+     --color-brand-500. */
+  --color-session-active: #f59e0b;
   --color-terminal-active: #0d9488;
   --color-branch: #0d9488;
   --color-sandbox: #94a3b8;
+  --color-favorite: #a78bfa;
   --color-diff-add: #22c55e;
   --color-diff-delete: #ef4444;
   --color-diff-modified: #fbbf24;
@@ -176,9 +185,16 @@
 }
 
 html {
-  height: 100dvh;
+  --app-height: 100dvh;
+  height: var(--app-height);
   overflow: hidden;
   overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  /* Claim horizontal edge drags for the app. On iOS this prevents a swipe
+     from beginning the browser-history gesture while an overlay sidebar is
+     handling the same touch. Terminal forward mode opts into `none` on its
+     own scroller, so its custom vertical gesture remains unaffected. */
+  touch-action: pan-y pinch-zoom;
   /* safe-area insets are handled by the App root, not html, to avoid
      making the document taller than the viewport (which lets iOS scroll
      the page when the keyboard opens, breaking keyboard-height math). */
@@ -199,14 +215,60 @@ body {
   background: var(--color-surface-900);
   color: var(--color-text-primary);
   overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  touch-action: pan-y pinch-zoom;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100%;
+}
+
+/* iOS 26 installed apps report `100dvh` short by the top safe-area inset; lib/editingFocus.ts sets these attributes
+   only there, so `100lvh` spans the screen with no keyboard and `100dvh` keeps the keyboard shrink. */
+html[data-ios-standalone]:not([data-editing]) {
+  --app-height: 100lvh;
+}
+
+@media (pointer: coarse) {
+  #root {
+    position: fixed;
+    inset: 0;
+    height: var(--app-height);
+    width: 100%;
+    overflow: hidden;
+  }
 }
 
 /* Structured view markdown — assistant-ui's MarkdownTextPrimitive renders
    raw <p>/<ul>/<ol>/<h*>/<blockquote>/<code> elements (no class
    names). Style them via descendant selectors so the prose looks
    right inside the structured-view conversation. */
+/* The structured-view root publishes both conversation font-size preferences as
+   custom properties; CSS picks the active one, so a resize or an orientation
+   change switches sizes without a reload. Desktop is the default and mobile is
+   the override, keyed on the same classifier `clientFormFactor()` uses: coarse
+   primary pointer AND a viewport below the 768px `md` breakpoint. A touch
+   laptop and a narrow desktop window both stay on the desktop size, matching
+   how the rest of the dashboard decides what "mobile" means. */
+.acp-conversation-scope {
+  --acp-conversation-font-size: var(--acp-conversation-font-size-desktop, 0.875rem);
+}
+@media (pointer: coarse) and (max-width: 767.98px) {
+  .acp-conversation-scope {
+    --acp-conversation-font-size: var(--acp-conversation-font-size-mobile, 0.875rem);
+  }
+}
+/* Only the conversation renderer (Markdown.tsx) opts in. The other
+   `.acp-markdown` consumers (tool-card bodies, the diff pane's file viewer)
+   keep their own explicit sizes, so the child typography below stays in `rem`
+   for them and is re-expressed in `em` under `.acp-markdown-body` only. */
+.acp-markdown-body {
+  /* Fallback matches the previous fixed `text-sm` for transcript markdown
+     rendered outside the structured-view root (e.g. the skills manager). */
+  font-size: var(--acp-conversation-font-size, 0.875rem);
+}
 .acp-markdown p {
   margin: 0.5rem 0;
 }
@@ -368,6 +430,28 @@ body {
 }
 .acp-markdown tbody tr:last-child td {
   border-bottom: none;
+}
+
+/* Child typography for the opted-in conversation renderer only, in `em` so the
+   whole hierarchy scales with the user's base size. The doubled class outranks
+   the single-class `.acp-markdown <type>` rules above regardless of where they
+   sit in the file. Ratios reproduce the `rem` values at the 14px default; the
+   other `.acp-markdown` consumers set their own base (tool cards render at
+   11px) and keep the fixed `rem` sizes. */
+.acp-markdown.acp-markdown-body h1 {
+  font-size: 1.43em; /* 20px at the 14px default */
+}
+.acp-markdown.acp-markdown-body h2 {
+  font-size: 1.29em; /* 18px at the 14px default */
+}
+.acp-markdown.acp-markdown-body h3 {
+  font-size: 1.14em; /* 16px at the 14px default */
+}
+.acp-markdown.acp-markdown-body th {
+  font-size: 0.79em; /* 11px at the 14px default */
+}
+.acp-markdown.acp-markdown-body td {
+  font-size: 0.86em; /* 12px at the 14px default */
 }
 
 /* Subtle scrollbar styling */
@@ -570,6 +654,52 @@ select:focus-visible,
   outline-offset: 2px;
 }
 
+/* Terminal layers clear the home indicator, except around the mobile key row, which runs to the screen edge and
+   holds its own smaller clearance. */
+.home-indicator-clearance {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.home-indicator-clearance:has([data-terminal-toolbar]) {
+  padding-bottom: 0;
+}
+
 .safe-area-inset {
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  /* Top/right/left only. The BOTTOM inset is intentionally NOT reserved here:
+     the App root is `overflow-hidden`, so a bottom-anchored child (the ACP
+     composer, the terminal toolbar) that tried to reach the physical edge got
+     clipped at the padding edge on iOS. Instead each bottom-anchored surface
+     owns its own `env(safe-area-inset-bottom)` clearance, and the composer
+     hugs the bottom with no reservation. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+
+/* Line-wrapped code: each source line hangs 2ch, and a corner arrow in that
+   gutter marks every wrapped row after the first. Needs `.wrap-line` or
+   shiki's `.line` per source line. */
+.wrap-lines,
+.wrap-lines :is(pre, code) {
+  white-space: normal;
+}
+.wrap-lines :is(.line, .wrap-line) {
+  display: block;
+  position: relative;
+  min-height: 1lh;
+  padding-left: 2ch;
+  text-indent: -2ch;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.wrap-lines :is(.line, .wrap-line)::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 1lh;
+  bottom: 0;
+  width: 2ch;
+  background-color: var(--color-text-dim);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 3v5h8M9 5l3 3-3 3' fill='none' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E")
+    0 0 / 2ch 1lh repeat-y;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 3v5h8M9 5l3 3-3 3' fill='none' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E")
+    0 0 / 2ch 1lh repeat-y;
+  pointer-events: none;
 }

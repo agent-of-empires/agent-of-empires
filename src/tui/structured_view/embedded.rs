@@ -1,20 +1,15 @@
 //! Embedded (preview-pane) variant of the structured view.
 //!
-//! The full-screen loop in the parent module owns the terminal and the
-//! event stream for the duration of the view. The embedded variant
-//! instead lives inside the home screen's `App` loop, rendering into
-//! the preview pane while the session list stays visible, mirroring
-//! how live-send drives a terminal agent without leaving the home view.
+//! Unlike the full-screen loop in the parent module, this lives inside the home
+//! screen's `App` loop, rendering into the preview pane while the session list
+//! stays visible, the way live-send drives a terminal agent.
 //!
-//! Split of responsibilities with the `App` loop:
-//! - [`EmbeddedView::next_event`] is the cancel-safe await the App's
-//!   `tokio::select!` races against its other arms. It only ever awaits
-//!   channel receives, so dropping the future mid-poll loses nothing.
-//! - [`EmbeddedView::apply_event`] runs in the winning arm's body
-//!   (never cancelled) and may perform HTTP work: replay rehydration,
-//!   queue drains, the bounded-backoff reconnect.
-//! - Terminal input routes through [`EmbeddedView::handle_event`],
-//!   which shares the parent module's intent dispatcher, so keybindings
+//! [`EmbeddedView::next_event`] is the cancel-safe await the App's `select!`
+//! races: it only awaits channel receives, so dropping the future loses nothing.
+//! [`EmbeddedView::apply_event`] runs in the winning arm's body and may do HTTP
+//! work (replay rehydration, queue drains, reconnect). Terminal input routes
+//! through [`EmbeddedView::handle_event`], sharing the parent module's intent
+//! dispatcher so keybindings cannot drift.
 //!   cannot drift from the full-screen view.
 
 use anyhow::Result;
@@ -46,19 +41,16 @@ pub struct EmbeddedView {
     toast_deadline: Option<Instant>,
     plugin_rx: tokio::sync::mpsc::Receiver<PluginPoll>,
     session_info_rx: tokio::sync::mpsc::Receiver<super::ViewSideInfo>,
-    /// Preview vs. interactive. A view is mounted (streaming, rendered
-    /// in the preview pane) as soon as its session is selected, but the
-    /// keyboard only routes to it once activated (Enter), the same
-    /// preview-then-enter model terminal sessions use for live-send.
+    /// Preview vs. interactive. A view streams into the preview pane as soon as
+    /// its session is selected, but the keyboard routes to it only once activated
+    /// (Enter), the preview-then-enter model terminal sessions use.
     active: bool,
 }
 
 impl EmbeddedView {
-    /// Connect to `session_id` on an already-located daemon: hydrate
-    /// the transcript, open the WebSocket, spawn the side-channel
-    /// tasks. Startup errors (replay/ws) surface as a toast rather
-    /// than a hard failure, matching the full-screen view. Starts in
-    /// preview (inactive) state.
+    /// Connect to `session_id` on an already-located daemon: hydrate the
+    /// transcript, open the WebSocket, spawn the side-channel tasks. Startup
+    /// errors surface as a toast. Starts in preview (inactive) state.
     pub async fn connect(endpoint: DaemonEndpoint, session_id: &str) -> Result<Self> {
         let ViewSetup {
             state,
@@ -86,6 +78,39 @@ impl EmbeddedView {
         Ok(view)
     }
 
+    /// Test constructor: a mounted, non-activated view over a state that
+    /// never talks to a daemon. Lets App-level tests drive the paste-drain
+    /// handoff without a live connection.
+    #[cfg(test)]
+    pub(crate) fn for_test(session_id: &str) -> Self {
+        let endpoint = crate::acp::client::DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let http =
+            crate::acp::client::HttpClient::new(endpoint.clone()).expect("fake endpoint client");
+        Self {
+            state: crate::tui::structured_view::StructuredViewState::new(
+                session_id.into(),
+                endpoint,
+                http,
+                None,
+            ),
+            toast_deadline: None,
+            plugin_rx: tokio::sync::mpsc::channel(1).1,
+            session_info_rx: tokio::sync::mpsc::channel(1).1,
+            active: false,
+        }
+    }
+
+    /// Composer content, joined on newlines: test read for the paste-drain
+    /// handoff.
+    #[cfg(test)]
+    pub(crate) fn composer_text(&self) -> String {
+        self.state.composer.lines().join("\n")
+    }
+
     /// The session this view is streaming.
     pub fn session_id(&self) -> &str {
         &self.state.session_id
@@ -97,9 +122,8 @@ impl EmbeddedView {
         self.active
     }
 
-    /// Enter interactive mode: the composer takes the keyboard and the
-    /// caret shows. Focus returns to the composer so typing works at
-    /// once (a pending approval re-grabs it on the next reconcile).
+    /// Enter interactive mode: the composer takes the keyboard and the caret
+    /// shows. A pending approval re-grabs focus on the next reconcile.
     pub fn activate(&mut self) {
         self.active = true;
         if matches!(self.state.focus, super::input::Focus::Transcript) {
@@ -110,20 +134,16 @@ impl EmbeddedView {
     /// Leave interactive mode back to a read-only preview (Ctrl+Q). The
     /// view stays mounted and streaming.
     ///
-    /// Drops the plugin pane overlay on the way out (#2467): it is modal and
-    /// keyed off focus alone, so leaving it up would paint an unclosable panel
-    /// over the home preview, with the keyboard already back on the home list.
+    /// Drops the plugin pane overlay (#2467): it is modal and keyed off focus, so
+    /// leaving it up would paint an unclosable panel over the home preview.
     pub fn deactivate(&mut self) {
         self.active = false;
         self.state.close_plugin_pane();
     }
 
-    /// Await the next daemon-side event. Cancel-safe: only channel
-    /// receives are awaited, so the App loop may freely race this
-    /// against terminal input and drop the losing future. With no live
-    /// WebSocket the ws arm pends forever and only the side channels
-    /// can wake us, mirroring the full-screen loop's do-not-spin
-    /// behavior after a failed reconnect.
+    /// Await the next daemon-side event. Cancel-safe: only channel receives are
+    /// awaited. With no live WebSocket that arm pends forever and only the side
+    /// channels wake us, mirroring the full-screen loop.
     pub async fn next_event(&mut self) -> EmbeddedEvent {
         let ws = self.state.ws.as_mut();
         tokio::select! {
@@ -138,18 +158,16 @@ impl EmbeddedView {
         }
     }
 
-    /// Apply one event from [`next_event`]. May perform HTTP work
-    /// (replay, drain, reconnect); the caller must not race this
-    /// against other futures.
+    /// Apply an event from [`Self::next_event`]. May perform HTTP work
+    /// (replay, drain, reconnect); do not race this against other futures.
     pub async fn apply_event(&mut self, event: EmbeddedEvent) {
         match event {
             EmbeddedEvent::Ws(Some(msg)) => {
                 apply_ws_message(&mut self.state, &mut self.toast_deadline, msg).await;
             }
             EmbeddedEvent::Ws(None) => {
-                // Channel closed without an error frame: treat as a
-                // disconnect so `next_event` stops polling the dead
-                // handle and is_busy() queues new prompts.
+                // Channel closed without an error frame: treat as a disconnect so
+                // `next_event` stops polling the dead handle.
                 self.state.ws = None;
                 self.state.in_flight = false;
                 set_toast(
@@ -177,6 +195,12 @@ impl EmbeddedView {
         handle_terminal_event(&mut self.state, evt, &mut self.toast_deadline).await
     }
 
+    /// Route pointer motion to the view's popups. Only an active view takes the
+    /// mouse, as with clicks. True when a redraw is needed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.active && super::handle_hover(&mut self.state, col, row)
+    }
+
     /// Periodic housekeeping driven by the App's refresh ticker:
     /// expire the toast and surface the next queued plugin
     /// notification. Returns `true` when something visible changed.
@@ -194,11 +218,9 @@ impl EmbeddedView {
         changed || (self.state.toast.is_some() != had_toast)
     }
 
-    /// Render into `area` (the home view's preview body). Also stashes
-    /// the computed layout, in real frame coordinates, so subsequent
-    /// mouse events hit-test against what is actually on screen.
-    /// Returns the transcript geometry so the home view can point its
-    /// drag-select machinery at the painted rows.
+    /// Render into `area` (the home view's preview body), stashing the computed
+    /// layout in real frame coordinates so later mouse events hit-test against
+    /// what is on screen. Returns the transcript geometry for drag-select.
     pub fn render(
         &mut self,
         frame: &mut Frame,
@@ -208,22 +230,26 @@ impl EmbeddedView {
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        // The home view may have painted placeholder content under us
-        // this frame; the structured renderer assumes an empty buffer
-        // (it grew up full-screen) and skips cells with no content, so
-        // reset the area first or stale text shows through.
+        // The home view may have painted placeholder content this frame; the
+        // structured renderer assumes an empty buffer and skips empty cells, so
+        // reset the area or stale text shows through.
         frame.render_widget(ratatui::widgets::Clear, area);
         self.state.layout = Some(render::compute_layout(area, &self.state));
         Some(render::render(frame, area, theme, &self.state, self.active))
     }
 
-    /// The transcript as the exact pre-wrapped rows the last render
-    /// painted at `width` columns. The home view's selection extraction
-    /// slices these by (row, column), so they must match the on-screen
-    /// geometry; sharing `wrapped_transcript` with the renderer
-    /// guarantees it. Styles are irrelevant to extraction, so a default
-    /// theme keeps this callable without one.
+    /// The transcript as the exact pre-wrapped rows the last render painted at
+    /// `width` columns, so the home view's selection extraction slices match the
+    /// on-screen geometry. Styles are irrelevant to extraction.
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
         render::wrapped_transcript(&self.state, &crate::tui::styles::Theme::default(), width)
+    }
+
+    /// Paste text into the composer, focusing it if needed, then load the file
+    /// index when the paste leaves an open `@`-mention, so a paste forwarded from
+    /// the home view lands in the same state a direct one would.
+    pub async fn paste_text_with_file_load(&mut self, text: &str) {
+        super::paste_into_composer(&mut self.state, text);
+        super::ensure_files_loaded(&mut self.state, &mut self.toast_deadline).await;
     }
 }

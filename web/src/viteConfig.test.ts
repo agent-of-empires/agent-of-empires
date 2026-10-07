@@ -1,11 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SESSION_WS_PROXY } from "../vite.config";
 
-// Guards the dev-server proxy contract that `cargo xtask dev` relies on: when
-// VITE_PROXY points at a running `aoe serve`, the Vite dev server must forward
-// REST (/api) and every AoE session WebSocket relay there, with the WS target
-// switched to the ws:// scheme. See vite.config.ts.
-
 type ProxyEntry = { target: string; ws?: boolean };
 
 async function loadProxy(env: Record<string, string | undefined>): Promise<Record<string, ProxyEntry> | undefined> {
@@ -36,7 +31,7 @@ describe("vite dev server proxy", () => {
     expect(proxy).toBeUndefined();
   });
 
-  it("forwards /api and the /sessions WebSockets to VITE_PROXY", async () => {
+  it("forwards /api and the /sessions WebSockets to VITE_PROXY, defaulting a bare host to http", async () => {
     const proxy = await loadProxy({ VITE_PROXY: "http://127.0.0.1:8081" });
     expect(proxy?.["/api"].target).toBe("http://127.0.0.1:8081");
     const ws = proxy?.[SESSION_WS_PROXY];
@@ -48,11 +43,9 @@ describe("vite dev server proxy", () => {
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/live-ws")).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/terminal/live-ws")).toBe(true);
     expect(new RegExp(SESSION_WS_PROXY).test("/sessions/s1/container-terminal/live-ws")).toBe(true);
-  });
 
-  it("defaults a bare host:port to http and derives the ws target", async () => {
-    const proxy = await loadProxy({ VITE_PROXY: "localhost:50106" });
-    expect(proxy?.["/api"].target).toBe("http://localhost:50106");
-    expect(proxy?.[SESSION_WS_PROXY].target).toBe("ws://localhost:50106");
+    const bare = await loadProxy({ VITE_PROXY: "localhost:50106" });
+    expect(bare?.["/api"].target).toBe("http://localhost:50106");
+    expect(bare?.[SESSION_WS_PROXY].target).toBe("ws://localhost:50106");
   });
 });

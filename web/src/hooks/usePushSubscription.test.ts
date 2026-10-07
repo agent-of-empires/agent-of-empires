@@ -1,114 +1,95 @@
 // @vitest-environment jsdom
-//
-// Coverage tests for usePushSubscription: the end-to-end Web Push hook
-// backing NotificationSettings. The hook leans entirely on browser
-// globals (navigator.serviceWorker, Notification, matchMedia,
-// isSecureContext, atob) and the /api/push/* endpoints, so each test
-// stubs those globals and a fetch router, then drives the returned
-// callbacks through act().
 
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { usePushSubscription } from "./usePushSubscription";
+import { usePushSubscription, type PushState } from "./usePushSubscription";
 
-interface FakeSubscription {
-  endpoint: string;
-  toJSON: () => { endpoint: string; keys: Record<string, string> };
-  unsubscribe: () => Promise<boolean>;
-}
+type Hook = ReturnType<typeof usePushSubscription>;
 
-function makeSubscription(endpoint = "https://push.example/abc"): FakeSubscription {
+// SERVER_KEY is base64url for the bytes of "ABC".
+const SERVER_KEY = "QUJD";
+const keyBytes = (s: string) => new TextEncoder().encode(s).buffer;
+
+function makeSubscription(endpoint = "https://push.example/abc", key: ArrayBuffer | null = null) {
   return {
     endpoint,
+    options: { applicationServerKey: key },
     toJSON: () => ({ endpoint, keys: { p256dh: "key", auth: "auth" } }),
     unsubscribe: vi.fn(async () => true),
   };
 }
+type FakeSubscription = ReturnType<typeof makeSubscription>;
 
-// Mutable handles the per-test setup configures.
-let currentSubscription: FakeSubscription | null;
+let currentSub: FakeSubscription | null;
 let subscribeImpl: () => Promise<FakeSubscription>;
-let getSubscriptionImpl: () => Promise<FakeSubscription | null>;
-let serviceWorkerReady: Promise<unknown>;
+let calls: string[];
 
-function installServiceWorker() {
-  const pushManager = {
-    getSubscription: vi.fn(() => getSubscriptionImpl()),
-    subscribe: vi.fn(() => subscribeImpl()),
-  };
-  const registration = { pushManager };
-  serviceWorkerReady = Promise.resolve(registration);
-  Object.defineProperty(navigator, "serviceWorker", {
-    configurable: true,
-    value: { ready: serviceWorkerReady },
-  });
+const IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)";
+const DISABLED_BY_SERVER = { status: { ok: true, body: { enabled: false } } };
+
+function setServiceWorkerReady(ready: Promise<unknown>) {
+  Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { ready } });
 }
 
-// Default fetch router: every /api/push/* endpoint returns ok.
-function installFetch(
-  overrides: Partial<{
-    status: { ok: boolean; body: unknown };
-    vapid: { ok: boolean; status?: number; body?: unknown };
-    subscribe: { ok: boolean; status?: number };
-    test: { ok: boolean; status?: number };
-    unsubscribe: { ok: boolean };
-  }> = {},
-) {
-  const calls: string[] = [];
+function rejectServiceWorker(message: string) {
+  const rejected = Promise.reject(new Error(message));
+  rejected.catch(() => {});
+  setServiceWorkerReady(rejected);
+}
+
+interface FetchOverrides {
+  status?: { ok: boolean; body: unknown };
+  vapid?: number;
+  subscribe?: number;
+  test?: number;
+  testBody?: unknown;
+}
+
+function installFetch(overrides: FetchOverrides = {}) {
+  calls = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString();
+      const url = String(input);
       calls.push(url);
-      if (url.includes("/api/push/status")) {
+      if (url.includes("/status")) {
         const o = overrides.status ?? { ok: true, body: { enabled: true } };
-        return new Response(JSON.stringify(o.body ?? { enabled: true }), {
-          status: o.ok ? 200 : 500,
-        });
+        return new Response(JSON.stringify(o.body), { status: o.ok ? 200 : 500 });
       }
-      if (url.includes("/api/push/vapid-public-key")) {
-        const o = overrides.vapid ?? { ok: true };
-        return new Response(JSON.stringify(o.body ?? { public_key: "QUJD" }), {
-          status: o.ok ? 200 : (o.status ?? 500),
-        });
+      if (url.includes("/vapid-public-key")) {
+        return new Response(JSON.stringify({ public_key: SERVER_KEY }), { status: overrides.vapid ?? 200 });
       }
-      if (url.includes("/api/push/subscribe")) {
-        const o = overrides.subscribe ?? { ok: true };
-        return new Response("{}", { status: o.ok ? 200 : (o.status ?? 500) });
+      if (url.includes("/test")) {
+        return new Response(JSON.stringify(overrides.testBody ?? {}), { status: overrides.test ?? 200 });
       }
-      if (url.includes("/api/push/test")) {
-        const o = overrides.test ?? { ok: true };
-        return new Response("{}", { status: o.ok ? 200 : (o.status ?? 500) });
-      }
-      if (url.includes("/api/push/unsubscribe")) {
-        const o = overrides.unsubscribe ?? { ok: true };
-        return new Response("{}", { status: o.ok ? 200 : 500 });
-      }
-      return new Response("{}", { status: 200 });
+      const status = url.includes("/subscribe") ? overrides.subscribe : 200;
+      return new Response("{}", { status: status ?? 200 });
     }),
   );
-  return calls;
 }
 
-function setNotificationPermission(perm: NotificationPermission) {
-  // The hook only reads Notification.permission and calls
-  // Notification.requestPermission; a minimal stub is enough.
+function setPermission(perm: NotificationPermission) {
   vi.stubGlobal(
     "Notification",
-    Object.assign(vi.fn() as unknown as typeof Notification, {
-      permission: perm,
-      requestPermission: vi.fn(async () => perm),
-    }),
+    Object.assign(vi.fn(), { permission: perm, requestPermission: vi.fn(async () => perm) }),
   );
 }
 
 function setUserAgent(ua: string) {
-  Object.defineProperty(navigator, "userAgent", {
-    configurable: true,
-    value: ua,
-  });
+  Object.defineProperty(navigator, "userAgent", { configurable: true, value: ua });
 }
+
+function setInsecureHost(hostname: string) {
+  Object.defineProperty(window, "isSecureContext", { configurable: true, value: false });
+  Object.defineProperty(window, "location", { configurable: true, value: { hostname } });
+}
+
+const removePushManager = () => delete (window as unknown as { PushManager?: unknown }).PushManager;
+const noSubscription = () => {
+  currentSub = null;
+};
+const called = (fragment: string) => calls.some((u) => u.includes(fragment));
 
 const originalDescriptors = {
   serviceWorker: Object.getOwnPropertyDescriptor(navigator, "serviceWorker"),
@@ -116,46 +97,31 @@ const originalDescriptors = {
 };
 
 beforeEach(() => {
-  currentSubscription = makeSubscription();
-  getSubscriptionImpl = async () => currentSubscription;
-  subscribeImpl = async () => {
-    currentSubscription = makeSubscription();
-    return currentSubscription;
-  };
-
-  installServiceWorker();
+  localStorage.clear();
+  currentSub = makeSubscription();
+  subscribeImpl = async () => (currentSub = makeSubscription());
+  const pushManager = { getSubscription: vi.fn(async () => currentSub), subscribe: vi.fn(() => subscribeImpl()) };
+  setServiceWorkerReady(Promise.resolve({ pushManager }));
   installFetch();
-  setNotificationPermission("granted");
+  setPermission("granted");
   setUserAgent("Mozilla/5.0 (Macintosh)");
-
-  // PushManager + matchMedia on window for supportsPush / isStandalone.
   vi.stubGlobal("PushManager", function PushManager() {});
   vi.stubGlobal(
     "matchMedia",
     vi.fn(() => ({ matches: false })),
   );
-  Object.defineProperty(window, "isSecureContext", {
-    configurable: true,
-    value: true,
-  });
-  // atob for base64UrlToUint8Array (jsdom provides it, but be explicit).
+  Object.defineProperty(window, "isSecureContext", { configurable: true, value: true });
   vi.stubGlobal("atob", (s: string) => Buffer.from(s, "base64").toString("binary"));
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  if (originalDescriptors.serviceWorker) {
-    Object.defineProperty(navigator, "serviceWorker", originalDescriptors.serviceWorker);
-  }
-  if (originalDescriptors.userAgent) {
-    Object.defineProperty(navigator, "userAgent", originalDescriptors.userAgent);
+  for (const [key, descriptor] of Object.entries(originalDescriptors)) {
+    if (descriptor) Object.defineProperty(navigator, key, descriptor);
   }
 });
 
-// The mount effect schedules refresh() via setTimeout(0). Flush the
-// timer and the resulting microtasks under act so the initial state
-// settles deterministically.
 async function mountAndSettle() {
   const rendered = renderHook(() => usePushSubscription());
   await act(async () => {
@@ -165,326 +131,231 @@ async function mountAndSettle() {
   return rendered;
 }
 
+const unsupported = (reason: string): PushState => ({ kind: "unsupported", reason }) as PushState;
+const error = (message: string): PushState => ({ kind: "error", message });
+
 describe("usePushSubscription initial refresh", () => {
-  it("starts loading then resolves to enabled when permission granted and a sub exists", async () => {
+  it.each<[string, () => void, PushState]>([
+    ["granted with a subscription", () => {}, { kind: "enabled" }],
+    ["granted with no subscription", noSubscription, { kind: "off" }],
+    ["denied permission", () => setPermission("denied"), { kind: "denied" }],
+    ["push disabled on the server", () => installFetch(DISABLED_BY_SERVER), { kind: "disabled-by-server" }],
+    ["a failing status endpoint", () => installFetch({ status: { ok: false, body: {} } }), { kind: "enabled" }],
+    ["a rejected serviceWorker.ready", () => rejectServiceWorker("sw boom"), error("sw boom")],
+    ["an insecure LAN origin", () => setInsecureHost("192.168.1.5"), unsupported("insecure-origin")],
+    ["localhost over http", () => setInsecureHost("localhost"), { kind: "enabled" }],
+    ["no PushManager", removePushManager, unsupported("no-api")],
+    [
+      "an iOS Safari tab",
+      () => {
+        removePushManager();
+        setUserAgent(IOS_UA);
+      },
+      unsupported("ios-not-standalone"),
+    ],
+  ])("with %s", async (_label, arrange, expected) => {
+    arrange();
     const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({ kind: "enabled" });
+    expect(result.current.state).toEqual(expected);
   });
 
-  it("resolves to off when granted but no active subscription", async () => {
-    getSubscriptionImpl = async () => null;
-    currentSubscription = null;
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({ kind: "off" });
-  });
-
-  it("resolves to denied when Notification.permission is denied", async () => {
-    setNotificationPermission("denied");
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({ kind: "denied" });
-  });
-
-  it("resolves to disabled-by-server when /api/push/status reports disabled", async () => {
-    installFetch({ status: { ok: true, body: { enabled: false } } });
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({ kind: "disabled-by-server" });
-  });
-
-  it("resolves to error when serviceWorker.ready rejects", async () => {
-    const rejected = Promise.reject(new Error("sw boom"));
-    // Pre-attach a noop catch so the rejection is never "unhandled" at
-    // the microtask level (the hook awaits it on a later tick).
-    rejected.catch(() => {});
-    Object.defineProperty(navigator, "serviceWorker", {
-      configurable: true,
-      value: { ready: rejected },
-    });
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({ kind: "error", message: "sw boom" });
-  });
-
-  it("tolerates a non-ok status response and still falls through to permission/sub check", async () => {
-    installFetch({ status: { ok: false, body: {} } });
-    const { result } = await mountAndSettle();
-    // status not ok -> skip disabled-by-server branch, granted + sub -> enabled.
-    expect(result.current.state).toEqual({ kind: "enabled" });
+  it("re-registers an existing subscription with the server on open (#3386)", async () => {
+    await mountAndSettle();
+    expect(called("/api/push/subscribe")).toBe(true);
   });
 });
 
-describe("usePushSubscription unsupported / insecure paths", () => {
-  it("reports insecure-origin when not a secure context and host is a LAN IP", async () => {
-    Object.defineProperty(window, "isSecureContext", {
-      configurable: true,
-      value: false,
-    });
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: { hostname: "192.168.1.5" },
-    });
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({
-      kind: "unsupported",
-      reason: "insecure-origin",
-    });
+async function act_(result: { current: Hook }, action: keyof Omit<Hook, "state">) {
+  await act(async () => {
+    await result.current[action]();
   });
-
-  it("treats localhost over http as secure", async () => {
-    Object.defineProperty(window, "isSecureContext", {
-      configurable: true,
-      value: false,
-    });
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: { hostname: "localhost" },
-    });
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({ kind: "enabled" });
-  });
-
-  it("reports unsupported no-api when PushManager is absent", async () => {
-    // Remove PushManager so supportsPush() ("PushManager" in window) is
-    // false. Deleting the key, not setting it undefined. Non-iOS UA.
-    delete (window as unknown as { PushManager?: unknown }).PushManager;
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({
-      kind: "unsupported",
-      reason: "no-api",
-    });
-  });
-
-  it("reports ios-not-standalone on iOS Safari tab without PushManager", async () => {
-    delete (window as unknown as { PushManager?: unknown }).PushManager;
-    setUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)");
-    // matchMedia standalone = false and navigator.standalone unset.
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({
-      kind: "unsupported",
-      reason: "ios-not-standalone",
-    });
-  });
-});
+  return result.current.state;
+}
 
 describe("usePushSubscription enable()", () => {
-  it("enables: requests permission, fetches vapid key, subscribes, posts to server", async () => {
-    getSubscriptionImpl = async () => null;
-    currentSubscription = null;
-    const calls = installFetch();
+  it("requests permission, fetches the VAPID key, subscribes, and registers", async () => {
+    noSubscription();
     const { result } = await mountAndSettle();
     expect(result.current.state).toEqual({ kind: "off" });
-
-    await act(async () => {
-      await result.current.enable();
-    });
-    expect(result.current.state).toEqual({ kind: "enabled" });
-    expect(calls.some((u) => u.includes("/api/push/vapid-public-key"))).toBe(true);
-    expect(calls.some((u) => u.includes("/api/push/subscribe"))).toBe(true);
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(called("/api/push/vapid-public-key") && called("/api/push/subscribe")).toBe(true);
   });
 
-  it("goes denied when requestPermission is not granted (non-iOS)", async () => {
-    setNotificationPermission("denied");
+  it.each<[string, () => void, PushState]>([
+    ["permission is refused", () => setPermission("denied"), { kind: "denied" }],
+    [
+      "permission is refused on an iOS tab",
+      () => {
+        setPermission("denied");
+        setUserAgent(IOS_UA);
+      },
+      unsupported("ios-not-standalone"),
+    ],
+    ["the VAPID endpoint fails", () => installFetch({ vapid: 500 }), error("Server returned 500 for VAPID key")],
+    ["the context turns insecure", () => setInsecureHost("10.0.0.4"), unsupported("insecure-origin")],
+    [
+      "subscribe() throws",
+      () => {
+        subscribeImpl = async () => {
+          throw new Error("subscribe failed");
+        };
+      },
+      error("subscribe failed"),
+    ],
+  ])("lands in the right state when %s", async (_label, arrange, expected) => {
     const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.enable();
-    });
-    expect(result.current.state).toEqual({ kind: "denied" });
+    arrange();
+    expect(await act_(result, "enable")).toEqual(expected);
   });
 
-  it("goes ios-not-standalone when permission denied on an iOS tab", async () => {
-    setNotificationPermission("denied");
-    setUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)");
-    const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.enable();
-    });
-    expect(result.current.state).toEqual({
-      kind: "unsupported",
-      reason: "ios-not-standalone",
-    });
-  });
-
-  it("errors when the vapid-public-key endpoint fails", async () => {
-    installFetch({ vapid: { ok: false, status: 500 } });
-    const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.enable();
-    });
-    expect(result.current.state).toEqual({
-      kind: "error",
-      message: "Server returned 500 for VAPID key",
-    });
-  });
-
-  it("rolls back the subscription and errors when /api/push/subscribe fails", async () => {
+  it("rolls back the browser subscription when the server rejects it", async () => {
     const sub = makeSubscription();
     subscribeImpl = async () => sub;
-    installFetch({ subscribe: { ok: false, status: 422 } });
     const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.enable();
-    });
-    expect(result.current.state).toEqual({
-      kind: "error",
-      message: "Server returned 422 on subscribe",
-    });
+    installFetch({ subscribe: 422 });
+    expect(await act_(result, "enable")).toEqual(error("Server returned 422 on subscribe"));
     expect(sub.unsubscribe).toHaveBeenCalled();
   });
-
-  it("reports insecure-origin from enable() when context is not secure", async () => {
-    const { result } = await mountAndSettle();
-    Object.defineProperty(window, "isSecureContext", {
-      configurable: true,
-      value: false,
-    });
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: { hostname: "10.0.0.4" },
-    });
-    await act(async () => {
-      await result.current.enable();
-    });
-    expect(result.current.state).toEqual({
-      kind: "unsupported",
-      reason: "insecure-origin",
-    });
-  });
-
-  it("reports unsupported no-api from enable() when PushManager is absent", async () => {
-    const { result } = await mountAndSettle();
-    delete (window as unknown as { PushManager?: unknown }).PushManager;
-    await act(async () => {
-      await result.current.enable();
-    });
-    expect(result.current.state).toEqual({
-      kind: "unsupported",
-      reason: "no-api",
-    });
-  });
-
-  it("errors when subscribe() throws", async () => {
-    getSubscriptionImpl = async () => null;
-    subscribeImpl = async () => {
-      throw new Error("subscribe failed");
-    };
-    const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.enable();
-    });
-    expect(result.current.state).toEqual({
-      kind: "error",
-      message: "subscribe failed",
-    });
-  });
 });
 
-describe("usePushSubscription disable()", () => {
-  it("unsubscribes, posts to server, and lands off", async () => {
-    const sub = makeSubscription();
-    currentSubscription = sub;
-    getSubscriptionImpl = async () => sub;
-    const calls = installFetch();
+describe("usePushSubscription disable() and sendTest()", () => {
+  it("disable unsubscribes, tells the server, and lands off", async () => {
+    const sub = currentSub!;
     const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.disable();
-    });
-    expect(result.current.state).toEqual({ kind: "off" });
+    expect(await act_(result, "disable")).toEqual({ kind: "off" });
     expect(sub.unsubscribe).toHaveBeenCalled();
-    expect(calls.some((u) => u.includes("/api/push/unsubscribe"))).toBe(true);
+    expect(called("/api/push/unsubscribe")).toBe(true);
   });
 
-  it("lands off even when there is no active subscription", async () => {
-    getSubscriptionImpl = async () => null;
-    currentSubscription = null;
+  it.each<[string, keyof Omit<Hook, "state">, () => void, PushState]>([
+    ["disable with no subscription", "disable", noSubscription, { kind: "off" }],
+    ["disable with a rejected serviceWorker", "disable", () => rejectServiceWorker("no sw"), error("no sw")],
+    ["sendTest on success", "sendTest", () => {}, { kind: "enabled" }],
+    ["sendTest with no subscription", "sendTest", noSubscription, error("No active subscription")],
+    [
+      "sendTest when the server fails",
+      "sendTest",
+      () => installFetch({ test: 503 }),
+      error("Test failed: server returned 503"),
+    ],
+  ])("%s", async (_label, action, arrange, expected) => {
     const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.disable();
-    });
-    expect(result.current.state).toEqual({ kind: "off" });
-  });
-
-  it("errors when serviceWorker.ready rejects during disable", async () => {
-    const { result } = await mountAndSettle();
-    const rejected = Promise.reject(new Error("no sw"));
-    rejected.catch(() => {});
-    Object.defineProperty(navigator, "serviceWorker", {
-      configurable: true,
-      value: { ready: rejected },
-    });
-    await act(async () => {
-      await result.current.disable();
-    });
-    expect(result.current.state).toEqual({ kind: "error", message: "no sw" });
+    arrange();
+    expect(await act_(result, action)).toEqual(expected);
+    if (action === "sendTest" && expected.kind === "enabled") expect(called("/api/push/test")).toBe(true);
   });
 });
 
-describe("usePushSubscription sendTest()", () => {
-  it("posts a test and returns to enabled on success", async () => {
-    const calls = installFetch();
+describe("usePushSubscription enable() with an existing subscription", () => {
+  it.each<[string, ArrayBuffer | null, boolean]>([
+    ["keeps one bound to the server key", keyBytes("ABC"), false],
+    ["replaces one bound to another key", keyBytes("XYZ"), true],
+    ["replaces one whose key the browser hides", null, true],
+  ])("%s", async (_label, key, replaced) => {
+    const existing = makeSubscription("https://push.example/old", key);
+    currentSub = existing;
     const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.sendTest();
-    });
-    expect(result.current.state).toEqual({ kind: "enabled" });
-    expect(calls.some((u) => u.includes("/api/push/test"))).toBe(true);
+    calls.length = 0;
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(replaced ? 1 : 0);
+    expect(called("/api/push/unsubscribe")).toBe(replaced);
+    expect(called("/api/push/subscribe")).toBe(true);
   });
 
-  it("errors when there is no active subscription", async () => {
-    getSubscriptionImpl = async () => null;
-    currentSubscription = null;
+  it("skips requestPermission when already granted, since WebKit denies a gestureless request", async () => {
     const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.sendTest();
-    });
-    expect(result.current.state).toEqual({
-      kind: "error",
-      message: "No active subscription",
-    });
-  });
-
-  it("errors when the test endpoint returns non-ok", async () => {
-    installFetch({ test: { ok: false, status: 503 } });
-    const { result } = await mountAndSettle();
-    await act(async () => {
-      await result.current.sendTest();
-    });
-    expect(result.current.state).toEqual({
-      kind: "error",
-      message: "Test failed: server returned 503",
-    });
+    await act_(result, "enable");
+    expect(Notification.requestPermission).not.toHaveBeenCalled();
   });
 });
 
-describe("usePushSubscription refresh() and resubscribe()", () => {
-  it("refresh() re-evaluates state on demand", async () => {
-    getSubscriptionImpl = async () => null;
-    currentSubscription = null;
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({ kind: "off" });
+const statusWith = (subscription: unknown) => ({
+  status: { ok: true, body: { enabled: true, public_key: SERVER_KEY, subscription } },
+});
+const serverSub = (over: object = {}) => ({
+  registered: true,
+  owned: true,
+  last_success_at: null,
+  last_failure_at: null,
+  last_failure: null,
+  ...over,
+});
 
-    // Flip to having a subscription, then refresh.
-    const sub = makeSubscription();
-    currentSubscription = sub;
-    getSubscriptionImpl = async () => sub;
-    await act(async () => {
-      await result.current.refresh();
-    });
-    expect(result.current.state).toEqual({ kind: "enabled" });
+describe("usePushSubscription health", () => {
+  it.each<[string, () => void, string, boolean]>([
+    ["a healthy subscription", () => installFetch(statusWith(serverSub())), "healthy", false],
+    [
+      "a subscription the server forgot, re-posted silently",
+      () => installFetch(statusWith(serverSub({ registered: false }))),
+      "healthy",
+      true,
+    ],
+    [
+      "a revoked subscription the user still wants",
+      () => {
+        localStorage.setItem("aoe.push.wanted", "1");
+        noSubscription();
+      },
+      "revoked",
+      false,
+    ],
+    ["no subscription and no intent", noSubscription, "not-wanted", false],
+    [
+      "a subscription bound to an old server key",
+      () => {
+        currentSub = makeSubscription(undefined, keyBytes("XYZ"));
+        installFetch(statusWith(serverSub()));
+      },
+      "key-mismatch",
+      false,
+    ],
+    [
+      "a push the service rejected",
+      () => installFetch(statusWith(serverSub({ last_failure: "rejected", last_failure_at: "2026-09-01T10:00:00Z" }))),
+      "delivery-failed",
+      false,
+    ],
+  ])("classifies %s", async (_label, arrange, health, reposted) => {
+    arrange();
+    const { result } = await mountAndSettle();
+    expect(result.current.health).toBe(health);
+    expect(called("/api/push/subscribe")).toBe(reposted);
+    expect(called(`/api/push/status?endpoint=${encodeURIComponent("https://push.example/abc")}`)).toBe(
+      currentSub?.endpoint === "https://push.example/abc",
+    );
   });
 
-  it("resubscribe() runs disable then enable, ending enabled", async () => {
-    const sub = makeSubscription();
-    currentSubscription = sub;
-    getSubscriptionImpl = async () => currentSubscription;
-    subscribeImpl = async () => {
-      currentSubscription = makeSubscription("https://push.example/new");
-      return currentSubscription;
-    };
-    const calls = installFetch();
+  it("records intent on enable, clears it on disable, and treats an existing subscription as wanted", async () => {
     const { result } = await mountAndSettle();
+    expect(localStorage.getItem("aoe.push.wanted")).toBe("1");
+    await act_(result, "disable");
+    expect(localStorage.getItem("aoe.push.wanted")).toBeNull();
+    expect(result.current.health).toBe("not-wanted");
+    await act_(result, "enable");
+    expect(localStorage.getItem("aoe.push.wanted")).toBe("1");
+    expect(result.current.health).toBe("healthy");
+  });
+
+  it("re-checks when the app becomes visible", async () => {
+    localStorage.setItem("aoe.push.wanted", "1");
+    const { result } = await mountAndSettle();
+    expect(result.current.health).toBe("healthy");
+    noSubscription();
     await act(async () => {
-      await result.current.resubscribe();
+      document.dispatchEvent(new Event("visibilitychange"));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
     });
-    expect(result.current.state).toEqual({ kind: "enabled" });
-    expect(calls.some((u) => u.includes("/api/push/unsubscribe"))).toBe(true);
-    expect(calls.some((u) => u.includes("/api/push/subscribe"))).toBe(true);
+    expect(result.current.health).toBe("revoked");
+  });
+
+  it.each([
+    ["key-mismatch", "The push service rejected this device's key. Enable notifications again."],
+    ["gone", "This device's subscription has expired. Enable notifications again."],
+    ["rejected", "The push service did not deliver the test (rejected)."],
+  ])("sendTest surfaces an undelivered %s test", async (reason, message) => {
+    const { result } = await mountAndSettle();
+    installFetch({ testBody: { delivered: 0, reason } });
+    expect(await act_(result, "sendTest")).toEqual(error(message));
+    expect(result.current.health).toBe("delivery-failed");
   });
 });

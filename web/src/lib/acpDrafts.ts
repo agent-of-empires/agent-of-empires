@@ -1,7 +1,4 @@
-// Structured view composer drafts live in localStorage under one key per session
-// (`acp:draft:<session_id>`). This module centralises the storage
-// shape and exposes a tiny pub/sub so non-composer UI (e.g. the sidebar
-// "unsent draft" dot) can react to writes from any tab.
+// Structured view composer drafts in localStorage (`acp:draft:<session_id>`) with pub/sub for UI such as the sidebar draft dot.
 
 import { useMemo, useSyncExternalStore } from "react";
 
@@ -10,21 +7,10 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 import { toastBus } from "./toastBus";
 
 const DRAFT_KEY_PREFIX = "acp:draft:";
-// Staged composer attachments persist beside the text draft under their own
-// key (JSON array of PromptAttachmentInput) so an unsent multimodal prompt
-// survives session switches and reloads, matching the text-draft contract.
-// Kept parallel to the text key, not folded into one JSON blob: text writes
-// on a 250ms keystroke debounce while attachments write on stage/remove, and
-// a single blob would make the two write paths clobber each other. Parallel
-// keys also let text persist even when a large base64 image blows quota.
+// Attachments use their own key: text writes are debounced per keystroke while attachments write on stage/remove.
 const ATTACHMENT_KEY_PREFIX = "acp:draft-attachments:";
 
-// Sessions that have already surfaced a "storage full" toast this page
-// load. We dedupe so the composer does not toast on every keystroke once
-// storage is full. A successful write for the same session id clears the
-// flag, so a later exhaustion event after the user frees space surfaces
-// a fresh toast. Per-session granularity means two sessions failing in
-// parallel each get their own (single) toast. See #1345.
+// Sessions that already toasted "storage full"; a successful write re-arms the toast.
 const toastedSessions = new Set<string>();
 
 function notifyDraftPersistFailure(sessionId: string): void {
@@ -45,8 +31,7 @@ function attachmentKey(sessionId: string): string {
   return `${ATTACHMENT_KEY_PREFIX}${sessionId}`;
 }
 
-// Recognizes both the text and attachment key prefixes so the orphan sweep
-// and the cross-tab storage listener cover attachment drafts for free.
+// Covers both text and attachment keys.
 function sessionIdFromKey(key: string): string | null {
   if (key.startsWith(DRAFT_KEY_PREFIX)) return key.slice(DRAFT_KEY_PREFIX.length);
   if (key.startsWith(ATTACHMENT_KEY_PREFIX)) return key.slice(ATTACHMENT_KEY_PREFIX.length);
@@ -55,10 +40,7 @@ function sessionIdFromKey(key: string): string | null {
 
 type Listener = () => void;
 
-// Each listener may register an optional id filter. When present, the
-// listener only fires for changes to a draft whose session id is in the
-// set; null means "fire for any draft change" (and for cross-tab
-// `localStorage.clear()`, where we don't know which keys went away).
+// Optional session id filter per listener; null fires on any change, including a cross-tab clear.
 const localListeners = new Map<Listener, ReadonlySet<string> | null>();
 
 function notify(sessionId: string | null) {
@@ -67,8 +49,6 @@ function notify(sessionId: string | null) {
   }
 }
 
-// Test-only hook for resetting the per-session toast dedupe between
-// cases. Not part of the public API.
 export function __resetDraftPersistFailureNotifications(): void {
   toastedSessions.clear();
 }
@@ -85,20 +65,14 @@ export function setDraft(sessionId: string, text: string): void {
     ok = safeSetItem(draftKey(sessionId), text);
   }
   if (!ok) {
-    // Non-empty draft failed to persist. Surface a single toast per
-    // session so the user knows their unsent text is at risk.
+    // Surface one toast per session so the user knows unsent text is at risk.
     notifyDraftPersistFailure(sessionId);
   } else {
-    // Any successful write (including a removal that clears the draft)
-    // resets the dedupe, so a later exhaustion re-toasts.
     clearDraftPersistFailure(sessionId);
   }
   notify(sessionId);
 }
 
-// Drop the persisted draft for a single session id. Convenience over
-// `setDraft(id, "")`; intended for session-delete paths so callers
-// don't have to import an empty-string sentinel.
 export function clearDraft(sessionId: string): void {
   setDraft(sessionId, "");
 }
@@ -143,10 +117,7 @@ export function setDraftAttachments(sessionId: string, attachments: readonly Pro
       ok = false;
     }
     if (ok) ok = safeSetItem(key, json);
-    // Exact-or-none: if the current set cannot be persisted (quota, serialize
-    // failure), drop the key so a stale older draft is never restored and
-    // silently re-sent. The in-memory staged attachments stay live for the
-    // current page lifetime; the user just loses them on reload.
+    // Exact-or-none: never leave a stale older attachment set to be restored and re-sent.
     if (!ok) safeRemoveItem(key);
   }
   if (!ok) {
@@ -161,22 +132,13 @@ export function clearDraftAttachments(sessionId: string): void {
   setDraftAttachments(sessionId, []);
 }
 
-// Cheap presence check for the sidebar "unsent draft" dot: a non-empty
-// stored array serializes to more than "[]" (2 chars) and starts with "[",
-// so we avoid parsing (potentially megabytes of base64) on the sidebar
-// re-render hot path while still rejecting obviously-corrupt non-array
-// values (which would otherwise leave the dot stuck on).
+// Avoids parsing base64 on the sidebar hot path; a non-empty array is longer than "[]".
 export function hasDraftAttachments(sessionId: string): boolean {
   const v = safeGetItem(attachmentKey(sessionId));
   return v !== null && v.length > 2 && v.startsWith("[");
 }
 
-// Remove every `acp:draft:<id>` key whose session id is not in the
-// given active set. Run once on app mount to catch drafts left behind
-// by session deletions that happened in another tab or on another
-// device (the local-tab delete path calls `clearDraft` directly).
-// Fires a single wildcard notify after the batch so the sidebar's
-// "unsent draft" dot recomputes.
+// Remove drafts for sessions not in the active set (deleted in another tab or device).
 export function sweepOrphanDrafts(activeSessionIds: ReadonlySet<string>): void {
   if (typeof window === "undefined") return;
   const toRemove: string[] = [];
@@ -190,7 +152,7 @@ export function sweepOrphanDrafts(activeSessionIds: ReadonlySet<string>): void {
     }
     for (const k of toRemove) window.localStorage.removeItem(k);
   } catch {
-    /* localStorage blocked; sweep is best-effort */
+    // localStorage blocked; the sweep is best-effort.
   }
   if (toRemove.length > 0) notify(null);
 }
@@ -198,20 +160,14 @@ export function sweepOrphanDrafts(activeSessionIds: ReadonlySet<string>): void {
 export function hasDraft(sessionId: string): boolean {
   const v = safeGetItem(draftKey(sessionId));
   if (v !== null && v.length > 0) return true;
-  // An attachment-only draft (no text) is still unsent work, so the sidebar
-  // dot must light for it too. useHasDraftForSessions reads through here.
+  // Attachment-only drafts are unsent work too.
   return hasDraftAttachments(sessionId);
 }
 
-// Subscribe to draft changes. `filter` scopes the listener to a specific
-// set of session ids; pass null/undefined to receive every draft change.
-// Fires for writes in the current tab (manually emitted) and for writes
-// in other tabs (storage event). Returns an unsubscribe function.
 export function subscribeDrafts(cb: Listener, filter: ReadonlySet<string> | null = null): () => void {
   localListeners.set(cb, filter);
   const onStorage = (e: StorageEvent) => {
-    // e.key is null when localStorage.clear() is called from another
-    // tab; treat that as "everything changed" and unconditionally fire.
+    // A null key means localStorage.clear() in another tab.
     if (e.key === null) {
       cb();
       return;
@@ -227,13 +183,8 @@ export function subscribeDrafts(cb: Listener, filter: ReadonlySet<string> | null
   };
 }
 
-// Returns true when ANY of the given session ids has a non-empty draft.
-// Re-renders the calling component only when one of THESE ids changes,
-// not on every structured view draft write anywhere in the app.
 export function useHasDraftForSessions(sessionIds: readonly string[]): boolean {
-  // Stable join key so getSnapshot returns the same primitive across
-  // renders unless the relevant drafts actually change; otherwise
-  // useSyncExternalStore would tear under React 18's strict checks.
+  // A stable primitive key so getSnapshot doesn't tear.
   const ids = sessionIds.join("|");
   const subscribe = useMemo(() => {
     const filter = new Set(ids ? ids.split("|").filter(Boolean) : []);

@@ -67,6 +67,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe project list`↴](#aoe-project-list)
 * [`aoe project add`↴](#aoe-project-add)
 * [`aoe project remove`↴](#aoe-project-remove)
+* [`aoe sandbox`↴](#aoe-sandbox)
+* [`aoe sandbox reclaim`↴](#aoe-sandbox-reclaim)
 * [`aoe worktree`↴](#aoe-worktree)
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
@@ -101,6 +103,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe skill adopt`↴](#aoe-skill-adopt)
 * [`aoe skill remove`↴](#aoe-skill-remove)
 * [`aoe skill sync`↴](#aoe-skill-sync)
+* [`aoe hooks`↴](#aoe-hooks)
+* [`aoe hooks status`↴](#aoe-hooks-status)
+* [`aoe hooks approve`↴](#aoe-hooks-approve)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
 * [`aoe acp`↴](#aoe-acp)
@@ -118,8 +123,10 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp tail`↴](#aoe-acp-tail)
 * [`aoe acp attach`↴](#aoe-acp-attach)
 * [`aoe acp switch-agent`↴](#aoe-acp-switch-agent)
+* [`aoe acp switch-provider`↴](#aoe-acp-switch-provider)
 * [`aoe uninstall`↴](#aoe-uninstall)
 * [`aoe update`↴](#aoe-update)
+* [`aoe migrate`↴](#aoe-migrate)
 * [`aoe completion`↴](#aoe-completion)
 
 ## `aoe`
@@ -148,6 +155,7 @@ Run without arguments to launch the TUI dashboard.
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
+* `sandbox` — Inspect and reclaim per-session sandbox agent stores
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
@@ -157,17 +165,19 @@ Run without arguments to launch the TUI dashboard.
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `skill` — Query and manage agent skills
-* `serve` — Start a web dashboard for remote session access
-* `url` — Print the current dashboard URL of a running `aoe serve` daemon
+* `hooks` — Let AoE write agent hooks into each agent's own config, for every agent and every profile
+* `serve` — Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that embed it
+* `url` — Print the URL of a running `aoe serve` daemon
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `uninstall` — Uninstall Agent of Empires
 * `update` — Update aoe to the latest release
+* `migrate` — Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again
 * `completion` — Generate shell completions
 
 ###### **Options:**
 
-* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions)
-* `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
+* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it
+* `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. The session list goes through a bearer-only client, so `AOE_DAEMON_PASSPHRASE` does not work here yet; it works for `aoe acp <verb>` against the same `AOE_DAEMON_URL`. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
 
 
 
@@ -188,12 +198,13 @@ Add a new session
 * `-g`, `--group <GROUP>` — Group path (defaults to parent folder)
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
 * `--tool <TOOL>` — Named built-in or configured custom agent to run
-* `-P`, `--parent <PARENT>` — Parent session (creates sub-session, inherits group)
-* `--fork-from <FORK_FROM>` — Fork an existing session: resume its conversation context in a new, independent session that then diverges. Give the source session's id or title. Terminal fork; available for agents that support forking (claude, codex, opencode)
+* `-P`, `--parent <PARENT>` — Parent session (creates sub-session, inherits group). The sub-session does not inherit the parent's worktree or path: without `--worktree` it opens at `<path>` (default: the current directory) on whatever branch is checked out there
+* `--fork-from <FORK_FROM>` — Fork an existing session: resume its conversation context in a new, independent session that then diverges. Give the source session's id or title. Terminal fork; available for agents that support forking (claude, codex, opencode, pi)
 * `-l`, `--launch` — Launch the session immediately after creating
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
 * `-b`, `--new-branch` — Create a new branch (use with --worktree)
 * `--base-branch <BASE_BRANCH>` — Branch to base the new worktree branch on (use with --new-branch). Defaults to the repository's default branch. Useful for stacking work on top of an in-flight PR branch, hot-fixing a release branch, or branching off a teammate's branch
+* `--repo-base <REPO_BASES>` — Base branch for one repo of a multi-repo workspace, as `<repo>=<branch>` (repeatable). `<repo>` is the repo's directory name or the path you passed to `--repo`. Outranks `--base-branch`, which stays the base for every repo this does not name. Example: `--base-branch develop --repo-base api=epic/checkout`
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
 * `--project <PROJECTS>` — Names of registered projects to include as extra repos (use with --worktree). Resolves against the union of global + profile project registries
 * `--no-submodules` — Skip `git submodule update --init --recursive` after creating the worktree, overriding the `worktree.init_submodules` config (default true). Useful for repos with large or deeply nested submodule trees that you don't need inside the agent session
@@ -204,8 +215,8 @@ Add a new session
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
-* `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., aoe-agent, claude-code)
-* `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
+* `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., claude-code, codex)
+* `--model <MODEL>` — Override the model used by the ACP agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
 * `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
 
 
@@ -242,6 +253,18 @@ List all sessions
 
 * `--json` — Output as JSON
 * `--all` — List sessions from all profiles
+* `--state <STATE>` — Filter by session state. Defaults to `all`, every persisted session, which is what `aoe list` has always shown. Pass `--state=live` to skip trashed and archived rows; the vocabulary matches the REST API's `GET /api/sessions?state=`
+
+  Default value: `all`
+
+  Possible values:
+  - `live`:
+    Only sessions that are neither archived nor trashed
+  - `trashed`:
+    Only sessions currently in the trash
+  - `all`:
+    Every persisted session in the profile (default)
+
 
 
 
@@ -309,7 +332,9 @@ Remove a session
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
 * `--keep-scratch` — For scratch sessions, keep the scratch directory on disk instead of removing it. The session record is still deleted; the kept path is logged so you can find the files later. No effect on non-scratch sessions
-* `--purge` — Permanently delete instead of moving to trash. By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags, plus transcript removal)
+* `--purge` — Permanently delete instead of moving to trash.
+
+   By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags) and removes the session's structured-view transcript. Removing the sandbox container also attempts to remove its private agent stores, including its config home; keeping the container keeps those stores. Host agent conversation history outside these stores is not removed.
 
 
 
@@ -376,12 +401,12 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
-* `add-project` — Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
-* `set-session-id` — Set the resume target for a session (pin a conversation or force a one-shot fresh start)
+* `add-project` — Attach another repo to an existing session, creating a worktree for it and restarting the agent. Moving the session's working directory is refused while its resume target is a known conversation bound to that directory. Explicitly clear the resume target to start a new conversation after attaching. An implicitly preallocated ID is re-linked. See #3103
+* `set-session-id` — Set the resume target for a session; an agent whose exact native resume AoE cannot resolve is refused
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row renders with a leading `*` marker plus bold and underline wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
+* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
 * `unfavorite` — Clear the favorite flag on a session
 * `color` — Set (or clear) a per-session color label, rendered as a colored dot in the web sidebar for at-a-glance status signaling. Intended for a running agent to flag its own state, e.g. `aoe session color $(aoe session current -q) red`. Colors: `red` (needs attention), `amber` (working), `green` (done); `none` clears it
 * `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
@@ -479,6 +504,7 @@ Rename a session
 * `-t`, `--title <TITLE>` — New title for the session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
 * `--rename-branch` — When the session is tied (session.tie_workdir_to_name) and an aoe-managed worktree, also rename the underlying git branch to match. Off by default; ignored for untied / non-worktree sessions
+* `--branch <BRANCH>` — Rename the Git branch without moving the worktree directory
 
 
 
@@ -534,7 +560,7 @@ Auto-detect current session
 
 ## `aoe session add-project`
 
-Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
+Attach another repo to an existing session, creating a worktree for it and restarting the agent. Moving the session's working directory is refused while its resume target is a known conversation bound to that directory. Explicitly clear the resume target to start a new conversation after attaching. An implicitly preallocated ID is re-linked. See #3103
 
 **Usage:** `aoe session add-project [OPTIONS] <IDENTIFIER> <PROJECT>`
 
@@ -551,14 +577,18 @@ Attach another repo to an existing session, so an agent that turns out to need a
 
 ## `aoe session set-session-id`
 
-Set the resume target for a session (pin a conversation or force a one-shot fresh start)
+Set the resume target for a session; an agent whose exact native resume AoE cannot resolve is refused
 
-**Usage:** `aoe session set-session-id <IDENTIFIER> <SESSION_ID>`
+**Usage:** `aoe session set-session-id [OPTIONS] <IDENTIFIER> <SESSION_ID>`
 
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
-* `<SESSION_ID>` — Resume target: a UUID/sid pins the next launches to that conversation; an empty string forces a one-shot fresh start (after which the system reverts to auto-resume)
+* `<SESSION_ID>` — Conversation to resume. An empty string requests a one-shot fresh start, which only a terminal session can take: a structured session keeps its ACP conversation and needs the native ID plus an explicit `--store` and a bound Claude conversation
+
+###### **Options:**
+
+* `--store <STORE>` — Assert the native store: a Claude store directory, or a Pi/OMP transcript file
 
 
 
@@ -575,7 +605,8 @@ Set or clear the per-session diff base branch. The diff view compares the worktr
 
 ###### **Options:**
 
-* `--clear` — Clear the override and fall back to the profile default / auto-detected base
+* `--clear` — Clear the override and fall back to the recorded creation base, then the profile default, then the auto-detected base
+* `--repo <REPO>` — Workspace repo to set the base for, by directory name (as shown in the diff panel and `aoe list --json`). Required on a multi-repo workspace session, where each repo has its own base; omit it on a single-repo session
 
 
 
@@ -609,7 +640,7 @@ Wake a snoozed session immediately
 
 ## `aoe session favorite`
 
-Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row renders with a leading `*` marker plus bold and underline wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
+Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
 
 **Usage:** `aoe session favorite <IDENTIFIER>`
 
@@ -806,7 +837,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
-* `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
+* `update` — Update an installed external plugin from its recorded source and restart its worker in a running daemon. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
 * `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
@@ -876,13 +907,17 @@ Install an external plugin from a `gh:owner/repo[@ref]` slug or a local director
 
 ## `aoe plugin update`
 
-Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
+Update an installed external plugin from its recorded source and restart its worker in a running daemon. Prompts to re-approve capabilities if the update changes the capability set
 
-**Usage:** `aoe plugin update <ID>`
+**Usage:** `aoe plugin update [OPTIONS] <ID>`
 
 ###### **Arguments:**
 
 * `<ID>` — Plugin id
+
+###### **Options:**
+
+* `--yes` — Re-approve a changed capability set without prompting
 
 
 
@@ -963,7 +998,7 @@ Create a new profile
 
 ###### **Arguments:**
 
-* `<NAME>` — Profile name
+* `<NAME>` — Profile name: letters, digits, `_` and `-` only, at most 64 characters; `all` is reserved
 
 
 
@@ -988,7 +1023,7 @@ Rename a profile
 ###### **Arguments:**
 
 * `<OLD_NAME>` — Current profile name
-* `<NEW_NAME>` — New profile name
+* `<NEW_NAME>` — New profile name (same rules as `aoe profile create`)
 
 
 
@@ -1087,6 +1122,30 @@ Remove a project from the registry
 
   Possible values: `global`, `profile`
 
+
+
+
+## `aoe sandbox`
+
+Inspect and reclaim per-session sandbox agent stores
+
+**Usage:** `aoe sandbox <COMMAND>`
+
+###### **Subcommands:**
+
+* `reclaim` — Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: a store can hold a copy of that agent's credentials
+
+
+
+## `aoe sandbox reclaim`
+
+Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: a store can hold a copy of that agent's credentials
+
+**Usage:** `aoe sandbox reclaim [OPTIONS]`
+
+###### **Options:**
+
+* `--delete` — Remove the reported stores instead of only naming them
 
 
 
@@ -1510,9 +1569,38 @@ Copy AoE-managed skills into the agents' own skills directories
 
 
 
+## `aoe hooks`
+
+Let AoE write agent hooks into each agent's own config, for every agent and every profile
+
+**Usage:** `aoe hooks <COMMAND>`
+
+###### **Subcommands:**
+
+* `status` — Show whether AoE may write agent hooks, and what they resolve for a profile
+* `approve` — Let AoE write agent hooks for every agent, on every profile
+
+
+
+## `aoe hooks status`
+
+Show whether AoE may write agent hooks, and what they resolve for a profile
+
+**Usage:** `aoe hooks status`
+
+
+
+## `aoe hooks approve`
+
+Let AoE write agent hooks for every agent, on every profile
+
+**Usage:** `aoe hooks approve`
+
+
+
 ## `aoe serve`
 
-Start a web dashboard for remote session access
+Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that embed it
 
 **Usage:** `aoe serve [OPTIONS]`
 
@@ -1532,7 +1620,7 @@ Start a web dashboard for remote session access
 * `--allowed-origin <ORIGIN>` — Extra browser `Origin` to accept (repeatable, full origin `scheme://host[:port]`, e.g. `https://aoe.example.com:8443`). Needed only for a reverse proxy on a nonstandard port; standard 80/443 origins for `--allowed-host` entries are derived automatically
 * `--read-only` — Read-only mode: view terminals but cannot send keystrokes
 * `--cityhall` — CityHall client mode: a locked-down, composer-first dashboard for non-technical users (structured view only; no terminal/diff/project management). Equivalent to `AOE_CITYHALL_MODE=1`; the flag is what the daemon replays to its restart child so the mode survives `aoe update` and `aoe serve --restart`. See #7
-* `--remote` — Expose the dashboard over a public HTTPS tunnel. Prefers Tailscale Funnel when `tailscale` is installed and logged in (stable `.ts.net` URL, installable PWAs survive restarts). Falls back to a Cloudflare quick tunnel otherwise (fresh URL on every restart)
+* `--remote` — Expose the daemon over a public HTTPS tunnel. Prefers Tailscale Funnel when `tailscale` is installed and logged in (stable `.ts.net` URL, installable PWAs survive restarts). Falls back to a Cloudflare quick tunnel otherwise (fresh URL on every restart)
 * `--tunnel-name <TUNNEL_NAME>` — Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`). Takes precedence over Tailscale auto-detection
 * `--no-tailscale` — Skip Tailscale Funnel auto-detection and go straight to Cloudflare. Useful if you have Tailscale installed for unrelated reasons
 * `--tunnel-url <TUNNEL_URL>` — Hostname for a named tunnel (e.g., aoe.example.com)
@@ -1542,14 +1630,14 @@ Start a web dashboard for remote session access
 
    `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
-* `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored under --daemon, --remote, SSH (SSH_CONNECTION/SSH_TTY), or when no display server is reachable on Linux/BSD
+* `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
 * `--restart` — Restart a running `aoe serve` daemon, replaying the host, port, mode, and auth it was launched with (read from `serve.launch`). The passphrase is recalled from `serve.passphrase` or `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a passphrase-protected daemon is never left down. Incompatible with the flags that would change the daemon's bind config: that config comes from the persisted launch state
 
 
 
 ## `aoe url`
 
-Print the current dashboard URL of a running `aoe serve` daemon
+Print the URL of a running `aoe serve` daemon
 
 **Usage:** `aoe url [OPTIONS]`
 
@@ -1577,11 +1665,12 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
-* `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
+* `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 * `cancel` — Cancel the in-flight prompt for an agent session
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
-* `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
-* `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe acp agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+* `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`, or `AOE_DAEMON_PASSPHRASE` against a `--auth=passphrase` daemon) to attach across machines without going through the home session list
+* `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
+* `switch-provider` — Re-route a Claude session to a different LLM provider, keeping the transcript. Refused mid-turn; once idle the worker restarts and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The model resets to the new provider's default, because model ids differ between providers
 
 
 
@@ -1595,9 +1684,9 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 
 * `--json` — Emit machine-readable JSON instead of a human report
 * `--fix` — Attempt safe remediations: download the bundled Node runtime if none is present, then install the pinned npm ACP adapter into the data dir with that Node's own npm (no global install, no sudo). Installs claude-agent-acp by default; each adapter is a separate several-hundred-MB tree, so pick others with --adapter
-* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp
+* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp
 
-  Possible values: `claude-agent-acp`, `codex-acp`, `pi-acp`
+  Possible values: `claude-agent-acp`, `codex-acp`, `pi-acp`, `aoe-agent`
 
 * `--all-adapters` — Install every pinned adapter with --fix instead of just the default one
 
@@ -1717,7 +1806,7 @@ Send a prompt to an agent session's agent
 
 ## `aoe acp approve`
 
-Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
+Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 
 **Usage:** `aoe acp approve [OPTIONS] <SESSION> <NONCE>`
 
@@ -1730,6 +1819,7 @@ Resolve a pending approval (default: allow). Use --always for a session-scoped a
 
 * `--always` — Allow this kind of operation for the rest of the session
 * `--deny` — Refuse the request
+* `--option <ID>` — Answer with this option id, from the request's option list. An id the request never offered cancels it instead
 
 
 
@@ -1765,7 +1855,7 @@ Stream the agent broadcast for a session to stdout as JSON lines (one frame per 
 
 ## `aoe acp attach`
 
-Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
+Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`, or `AOE_DAEMON_PASSPHRASE` against a `--auth=passphrase` daemon) to attach across machines without going through the home session list
 
 **Usage:** `aoe acp attach <SESSION>`
 
@@ -1777,18 +1867,34 @@ Open the TUI structured view directly for a known session id. Combine with `AOE_
 
 ## `aoe acp switch-agent`
 
-Switch an agent session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe acp agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
 
 **Usage:** `aoe acp switch-agent [OPTIONS] <SESSION> <TARGET>`
 
 ###### **Arguments:**
 
 * `<SESSION>` — Acp session id
-* `<TARGET>` — Registry key of the target agent (e.g. `claude`, `codex`)
+* `<TARGET>` — Registry key or configured custom ACP agent name (e.g. `claude`, `codex`, `my-custom-bridge`)
 
 ###### **Options:**
 
 * `--model <MODEL>` — Optional model override forwarded to the new agent
+
+
+
+## `aoe acp switch-provider`
+
+Re-route a Claude session to a different LLM provider, keeping the transcript. Refused mid-turn; once idle the worker restarts and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The model resets to the new provider's default, because model ids differ between providers
+
+**Usage:** `aoe acp switch-provider <SESSION> <PROVIDER>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Acp session id
+* `<PROVIDER>` — Provider to route through
+
+  Possible values: `api`, `bedrock`, `vertex`
+
 
 
 
@@ -1818,6 +1924,14 @@ Update aoe to the latest release
 * `-y`, `--yes` — Skip confirmation prompt
 * `--check` — Print update status and exit (no install)
 * `--dry-run` — Detect install method and print what would happen, no download
+
+
+
+## `aoe migrate`
+
+Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again
+
+**Usage:** `aoe migrate`
 
 
 
