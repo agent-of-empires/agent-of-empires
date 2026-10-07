@@ -355,11 +355,14 @@ impl TranscriptModel {
                 severity,
                 title,
                 description,
-            } => vec![self.push(
-                format!("notice-{seq}"),
-                TranscriptRowKind::Advisory,
-                session_notice_text(severity, title, description),
-            )],
+            } => {
+                self.turn_has_output = true;
+                vec![self.push(
+                    format!("notice-{seq}"),
+                    TranscriptRowKind::Advisory,
+                    session_notice_text(severity, title, description),
+                )]
+            }
             Event::RateLimitAutoResumed { resets_at, manual } => {
                 let how = if *manual { "resumed" } else { "auto-resumed" };
                 vec![self.notice(seq, format!("{how} at {resets_at} after rate-limit park"))]
@@ -1381,6 +1384,14 @@ mod tests {
             (vec![runtime_error], false),
             // A typed `/compact` streams no text; its divider is the output.
             (vec![Event::ConversationCompacted], false),
+            (
+                vec![Event::SessionNotice {
+                    severity: "error".into(),
+                    title: "Compaction failed".into(),
+                    description: None,
+                }],
+                false,
+            ),
         ];
         for (i, (mid, notice)) in cases.into_iter().enumerate() {
             let mut events = vec![prompt("/usage")];
