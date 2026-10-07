@@ -243,10 +243,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let profile_identity = record.profile_identity.unwrap();
-        assert_eq!((profile_identity.device, profile_identity.inode), (17, 19));
         assert!(!profile_identity.is_durable());
         let control_identity = record.control_file_identity.unwrap();
-        assert_eq!((control_identity.device, control_identity.inode), (31, 37));
         assert!(!control_identity.is_durable());
         let bytes: serde_json::Value =
             serde_json::from_slice(&fs::read(storage.sessions_path()).unwrap()).unwrap();

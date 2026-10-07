@@ -19,6 +19,31 @@ pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_i
 /// be authenticated and proven quiescent before its replacement starts.
 pub const RUNNER_VERSION: u32 = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SocketEndpointIdentity(crate::session::DirectoryIdentity);
+
+impl SocketEndpointIdentity {
+    pub fn is_durable(&self) -> bool {
+        self.0.is_durable()
+    }
+
+    pub(crate) fn observe(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::FileTypeExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(metadata.file_type().is_socket(), "endpoint is not a socket");
+        Ok(Self(crate::session::DirectoryIdentity::from_metadata(
+            &metadata,
+        )))
+    }
+
+    pub(crate) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        metadata.file_type().is_socket()
+            && crate::session::DirectoryIdentity::from_metadata(metadata) == self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub runner_version: u32,
@@ -55,7 +80,7 @@ pub struct WorkerRecord {
     pub profile_identity: Option<crate::session::DirectoryIdentity>,
     /// Control socket born with this published execution; legacy absence stays unknown.
     #[serde(default)]
-    pub control_file_identity: Option<crate::session::runner_journal::StopEndpointIdentity>,
+    pub control_file_identity: Option<SocketEndpointIdentity>,
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
     pub detached_at: Option<u64>,
@@ -203,27 +228,86 @@ pub fn save(record: &WorkerRecord) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn capture_endpoint(
+pub(crate) struct BoundEndpoint {
+    session_id: String,
+    path: PathBuf,
+    identity: Option<SocketEndpointIdentity>,
+    listener: std::sync::Arc<tokio::net::UnixListener>,
+}
+
+#[cfg(unix)]
+impl BoundEndpoint {
+    pub(crate) fn bind(session_id: &str, path: &Path) -> Result<Self> {
+        with_registry_lock(session_id, || Self::bind_unlocked(session_id, path))
+    }
+
+    fn bind_unlocked(session_id: &str, path: &Path) -> Result<Self> {
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(path)
+            .with_context(|| format!("binding {} without replacing an endpoint", path.display()))?;
+        listener.set_nonblocking(true)?;
+        let identity = SocketEndpointIdentity::observe(path)?;
+        let listener = tokio::net::UnixListener::from_std(listener)?;
+        Ok(Self {
+            session_id: session_id.to_owned(),
+            path: path.to_owned(),
+            identity: Some(identity),
+            listener: std::sync::Arc::new(listener),
+        })
+    }
+
+    pub(crate) fn identity(&self) -> SocketEndpointIdentity {
+        self.identity.expect("live endpoint custody")
+    }
+
+    pub(crate) fn listener(&self) -> std::sync::Arc<tokio::net::UnixListener> {
+        std::sync::Arc::clone(&self.listener)
+    }
+
+    pub(crate) fn cleanup(&mut self) {
+        let Some(identity) = self.identity.take() else {
+            return;
+        };
+        if let Err(error) = with_registry_lock(&self.session_id, || {
+            remove_endpoint_unlocked(&self.path, &identity)
+        }) {
+            warn!(session_id = %self.session_id, %error, "retaining endpoint after failed cleanup");
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BoundEndpoint {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+#[cfg(unix)]
+fn remove_endpoint_unlocked(path: &Path, identity: &SocketEndpointIdentity) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if identity.matches_metadata(&metadata) => {
+            std::fs::remove_file(path)?;
+            crate::session::sync_parent_directory(path)?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn retire_endpoint(
+    session_id: &str,
     path: &Path,
-) -> Result<(
-    crate::session::DirectoryIdentity,
-    std::sync::Arc<std::fs::File>,
-)> {
-    use std::os::unix::fs::FileTypeExt;
-    let pin = crate::process::pin_filesystem_node(path)
-        .context("pinning the actual bound endpoint inode")?;
-    let opened = pin.metadata()?;
-    let current = std::fs::symlink_metadata(path)?;
+    identity: &SocketEndpointIdentity,
+) -> Result<()> {
     anyhow::ensure!(
-        opened.file_type().is_socket()
-            && current.file_type().is_socket()
-            && crate::session::same_filesystem_identity(&opened, &current),
-        "bound endpoint was replaced before acquiring its inode pin"
+        identity.is_durable(),
+        "endpoint retirement lacks durable birth evidence"
     );
-    Ok((
-        crate::session::DirectoryIdentity::from_metadata(&opened),
-        std::sync::Arc::new(pin),
-    ))
+    with_registry_lock(session_id, || remove_endpoint_unlocked(path, identity))
 }
 
 /// Publishes the listener and record under the same fence as owned cleanup.
@@ -231,10 +315,11 @@ pub(crate) fn capture_endpoint(
 pub(crate) fn publish_control_listener(
     record: &mut WorkerRecord,
     socket: &Path,
-) -> Result<(tokio::net::UnixListener, std::sync::Arc<std::fs::File>)> {
+) -> Result<BoundEndpoint> {
     let lock = acquire_registry_lock(&record.session_id)?;
+    let mut endpoint = None;
     let publish = (|| {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         anyhow::ensure!(
             record.launch_nonce.is_some()
                 && record.boot.is_some()
@@ -248,27 +333,14 @@ pub(crate) fn publish_control_listener(
             load_strict_unlocked(&record.session_id)?.is_none(),
             "a registry record appeared before native publication"
         );
-        let listener = tokio::net::UnixListener::bind(socket).with_context(|| {
-            format!(
-                "binding {} without replacing an unknown endpoint",
-                socket.display()
-            )
-        })?;
-        let (identity, pin) = capture_endpoint(socket)?;
-        if !identity.is_durable() {
-            let metadata = std::fs::symlink_metadata(socket)?;
-            if metadata.file_type().is_socket()
-                && metadata.dev() == identity.device
-                && metadata.ino() == identity.inode
-            {
-                std::fs::remove_file(socket)?;
-            }
-            anyhow::bail!(
-                "native control endpoint birth time is unavailable; fresh publication is unproven"
-            );
-        }
+        endpoint = Some(BoundEndpoint::bind_unlocked(&record.session_id, socket)?);
+        let identity = endpoint.as_ref().unwrap().identity();
+        anyhow::ensure!(
+            identity.is_durable(),
+            "native control endpoint birth time is unavailable; fresh publication is unproven"
+        );
         record.control_file_identity = Some(identity);
-        let published = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
             .context("securing runner control socket")
             .and_then(|()| {
                 let bytes =
@@ -277,20 +349,10 @@ pub(crate) fn publish_control_listener(
                 record.record_file_identity = Some(pin.identity);
                 record.record_file_pin = Some(std::sync::Arc::new(pin));
                 Ok(())
-            });
-        if let Err(error) = published {
-            let metadata = std::fs::symlink_metadata(socket)?;
-            if metadata.file_type().is_socket()
-                && metadata.dev() == identity.device
-                && metadata.ino() == identity.inode
-            {
-                std::fs::remove_file(socket)?;
-            }
-            return Err(error);
-        }
-        Ok((listener, pin))
+            })
     })();
-    finish_registry_operation(lock, &record.session_id, publish)
+    finish_registry_operation(lock, &record.session_id, publish)?;
+    Ok(endpoint.expect("published endpoint custody"))
 }
 
 fn save_unlocked(record: &WorkerRecord) -> Result<()> {
@@ -347,6 +409,7 @@ fn finish_registry_operation<T>(
 ) -> Result<T> {
     let unlock = fs2::FileExt::unlock(&lock_file)
         .with_context(|| format!("unlocking worker registry entry {session_id}"));
+    drop(lock_file);
     match (result, unlock) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), _) => Err(error),
@@ -625,29 +688,13 @@ fn expected_socket(rec: &WorkerRecord) -> std::path::PathBuf {
 
 #[cfg(unix)]
 fn retire_owned_control(record: &WorkerRecord) -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
     let Some(identity) = record
         .control_file_identity
         .filter(|identity| identity.is_durable())
     else {
         return Ok(());
     };
-    let path = expected_socket(record);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("verifying owned control endpoint"),
-    };
-    if metadata.file_type().is_socket()
-        && crate::session::DirectoryIdentity::from_metadata(&metadata) == identity
-    {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("retiring owned control endpoint"),
-        }
-    }
-    Ok(())
+    remove_endpoint_unlocked(&expected_socket(record), &identity)
 }
 
 #[cfg(test)]
@@ -760,6 +807,34 @@ mod tests {
         )
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn bound_endpoint_retains_its_listener_and_preserves_replacement() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = TempDir::with_prefix_in("aoe-endpoint-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let path =
+            crate::process::worker::control_socket_sibling(&socket_path_for("custody").unwrap());
+        let mut endpoint = BoundEndpoint::bind("custody", &path).unwrap();
+        let identity = endpoint.identity();
+        let listener = endpoint.listener();
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (mut original, _) = listener.accept().await.unwrap();
+        drop(listener);
+        assert!(BoundEndpoint::bind("custody", &path).is_err());
+        assert_eq!(SocketEndpointIdentity::observe(&path).unwrap(), identity);
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_ne!(SocketEndpointIdentity::observe(&path).unwrap(), identity);
+        endpoint.cleanup();
+        drop(endpoint);
+        original.write_all(b"owned").await.unwrap();
+        let mut reply = [0; 5];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"owned");
+        assert!(path.exists(), "cleanup must preserve the peer endpoint");
+        drop(replacement);
+    }
     #[test]
     #[serial]
     fn roundtrip_save_load() {

@@ -17,45 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-
-struct OwnedEndpoint {
-    path: PathBuf,
-    identity: Option<crate::session::DirectoryIdentity>,
-    _inode_pin: std::sync::Arc<std::fs::File>,
-}
-
-impl OwnedEndpoint {
-    fn capture(path: PathBuf) -> Result<Self> {
-        let (identity, pin) = worker_registry::capture_endpoint(&path)?;
-        Ok(Self {
-            path,
-            identity: Some(identity),
-            _inode_pin: pin,
-        })
-    }
-
-    fn cleanup(&mut self) {
-        use std::os::unix::fs::MetadataExt;
-        let Some(identity) = self.identity.take() else {
-            return;
-        };
-        if std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
-            metadata.dev() == identity.device && metadata.ino() == identity.inode
-        }) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-impl Drop for OwnedEndpoint {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
-}
 
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -183,17 +147,13 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     let our_pid = std::process::id();
     let stop_socket = crate::session::runner_journal::stop_socket(&args.session_id, our_pid)?;
-    // An existing endpoint is not ours merely because its name contains our PID.
-    let stop_listener = UnixListener::bind(&stop_socket)
-        .with_context(|| format!("bind {}", stop_socket.display()))?;
-    let mut stop_endpoint = OwnedEndpoint::capture(stop_socket.clone())?;
+    let mut stop_endpoint = worker_registry::BoundEndpoint::bind(&args.session_id, &stop_socket)?;
+    let stop_listener = stop_endpoint.listener();
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&stop_socket, std::fs::Permissions::from_mode(0o600))?;
     }
-    let endpoint_identity = stop_endpoint
-        .identity
-        .context("stop endpoint custody is unavailable")?;
+    let endpoint_identity = stop_endpoint.identity();
     anyhow::ensure!(
         endpoint_identity.is_durable(),
         "native stop endpoint birth time is unavailable; fresh publication is unproven"
@@ -241,17 +201,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                     &owner_storage,
                     &mut record,
                     |record| {
-                        let (listener, pin) =
+                        let endpoint =
                             worker_registry::publish_control_listener(record, &control_socket)
                                 .context(
                                     "publishing runner control listener and registry record",
                                 )?;
-                        let endpoint = OwnedEndpoint {
-                            path: control_socket,
-                            identity: record.control_file_identity,
-                            _inode_pin: pin,
-                        };
-                        Ok((listener, endpoint))
+                        Ok((endpoint.listener(), endpoint))
                     },
                 )?;
             anyhow::Ok((record, listener, endpoint, owner_storage))

@@ -91,7 +91,7 @@ pub(crate) fn peer_pid_from_connected_socket(_stream: &impl std::os::fd::AsFd) -
     None
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
 fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::UnixStream> {
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream;

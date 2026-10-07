@@ -404,14 +404,6 @@ pub(super) fn process_namespace() -> std::io::Result<[u64; 2]> {
     Ok([0, 0])
 }
 
-pub(super) fn pin_filesystem_node(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-}
-
 /// The session UUID is independent of clock steps.
 pub(super) fn boot_id() -> Option<String> {
     let out = Command::new("/usr/sbin/sysctl")

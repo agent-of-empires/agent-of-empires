@@ -428,8 +428,9 @@ pub(super) async fn run_execution_fixture_child() -> bool {
         .validate()
         .unwrap();
     let stop_path = crate::session::runner_journal::stop_socket(&id, born.pid).unwrap();
-    let stop_listener = tokio::net::UnixListener::bind(&stop_path).unwrap();
-    let (stop_identity, _stop_pin) = worker_registry::capture_endpoint(&stop_path).unwrap();
+    let stop_endpoint = worker_registry::BoundEndpoint::bind(&id, &stop_path).unwrap();
+    let stop_listener = stop_endpoint.listener();
+    let stop_identity = stop_endpoint.identity();
     crate::session::runner_journal::record_stop_endpoint(
         &storage,
         &id,
@@ -446,7 +447,7 @@ pub(super) async fn run_execution_fixture_child() -> bool {
     record.boot = born.boot;
     record.incarnation = born.incarnation;
     record.profile_identity = born.profile_identity;
-    let (_control_listener, _control_pin) = {
+    let _control_endpoint = {
         let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
         let _identity = crate::session::acquire_session_identity_lock().unwrap();
         crate::session::runner_journal::publish_registry_under_locks(

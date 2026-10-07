@@ -1,5 +1,6 @@
 //! Execution coverage survives registry cleanup and daemon replacement.
 
+use crate::process::worker_registry::SocketEndpointIdentity;
 use crate::process::ProcessIncarnation;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,7 @@ struct RunnerLaunch {
     generation: u64,
     incarnation: Option<crate::process::ProcessIncarnation>,
     profile_identity: Option<super::storage::DirectoryIdentity>,
-    stop_endpoint: Option<StopEndpointIdentity>,
+    stop_endpoint: Option<SocketEndpointIdentity>,
     #[serde(default)]
     registry: Option<RegistryWitness>,
 }
@@ -63,7 +64,7 @@ impl RunnerLaunch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RegistryWitness {
     record_file_identity: super::DirectoryIdentity,
-    control_file_identity: super::DirectoryIdentity,
+    control_file_identity: SocketEndpointIdentity,
     socket_path: PathBuf,
 }
 
@@ -76,8 +77,6 @@ impl RegistryWitness {
             && record.socket_path == self.socket_path
     }
 }
-
-pub(crate) type StopEndpointIdentity = super::storage::DirectoryIdentity;
 
 impl RunnerLaunch {
     fn matches_birth(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
@@ -254,17 +253,7 @@ impl RunnerExecutionJournal {
                         .incarnation
                         .context("owned endpoint lacks native birth evidence")?;
                     let path = stop_socket(id, incarnation.pid)?;
-                    match std::fs::symlink_metadata(&path) {
-                        Ok(metadata)
-                            if super::DirectoryIdentity::from_metadata(&metadata) == endpoint =>
-                        {
-                            std::fs::remove_file(&path)?;
-                            sync_parent_directory(&path)?;
-                        }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
+                    crate::process::worker_registry::retire_endpoint(id, &path, &endpoint)?;
                 }
                 launch.stop_endpoint = None;
                 changed = true;
@@ -1704,7 +1693,7 @@ pub(crate) fn record_stop_endpoint(
     id: &str,
     nonce: Uuid,
     generation: u64,
-    endpoint: StopEndpointIdentity,
+    endpoint: SocketEndpointIdentity,
 ) -> Result<()> {
     let boot = current_boot().context("verified boot identity is unavailable")?;
     let incarnation = crate::process::process_incarnation(std::process::id())?
@@ -1872,7 +1861,8 @@ fn retire_published_registry(launch: &RunnerLaunch, id: &str) -> Result<bool> {
         }
         return Ok(crate::process::worker_registry::delete_if_owned_by(&record));
     }
-    cleanup_authenticated_stop_endpoint(
+    crate::process::worker_registry::retire_endpoint(
+        id,
         &crate::process::worker::control_socket_sibling(&witness.socket_path),
         &witness.control_file_identity,
     )?;
@@ -1928,7 +1918,7 @@ pub(crate) fn stop_socket(id: &str, pid: u32) -> Result<PathBuf> {
 }
 
 pub(crate) async fn wait_for_stop<F: std::future::Future<Output = bool>>(
-    listener: tokio::net::UnixListener,
+    listener: std::sync::Arc<tokio::net::UnixListener>,
     nonce: Uuid,
     admit: impl Fn(bool) -> F,
 ) -> Result<bool> {
@@ -2470,23 +2460,19 @@ async fn settle_selected_owned(
             let captured = tokio::task::spawn_blocking(move || {
                 let path = stop_socket(current_scope.session_id(), incarnation.pid)?;
                 snapshot(&current_scope, nonce)?;
-                let (identity, pin) = crate::process::worker_registry::capture_endpoint(&path)?;
+                let identity = SocketEndpointIdentity::observe(&path)?;
                 anyhow::ensure!(
                     identity.is_durable() && identity == endpoint,
                     "runner stop endpoint differs from its original natal socket"
                 );
                 anyhow::ensure!(
-                    crate::process::worker::peer_pid_from_socket(&path) == Some(incarnation.pid),
-                    "runner stop endpoint has no matching kernel peer"
-                );
-                anyhow::ensure!(
                     crate::process::process_incarnation(incarnation.pid)? == Some(incarnation),
                     "runner incarnation changed before stop"
                 );
-                Ok::<_, anyhow::Error>((path, identity, pin))
+                Ok::<_, anyhow::Error>((path, identity))
             })
             .await?;
-            let Ok((path, identity, pin)) = captured else {
+            let Ok((path, identity)) = captured else {
                 continue;
             };
             let mut frame = [0; 17];
@@ -2504,12 +2490,10 @@ async fn settle_selected_owned(
                 let checked_path = path.clone();
                 let connected_scope = scope.clone();
                 let original_endpoint = tokio::task::spawn_blocking(move || {
-                    use std::os::unix::fs::FileTypeExt;
                     snapshot(&connected_scope, nonce)?;
                     let metadata = std::fs::symlink_metadata(checked_path)?;
                     anyhow::ensure!(
-                        metadata.file_type().is_socket()
-                            && super::DirectoryIdentity::from_metadata(&metadata) == endpoint
+                        endpoint.matches_metadata(&metadata)
                             && crate::process::process_incarnation(incarnation.pid)?
                                 == Some(incarnation),
                         "connected stop endpoint lost its natal identity or incarnation"
@@ -2527,21 +2511,25 @@ async fn settle_selected_owned(
                         "runner execution ticket was not authenticated",
                     ));
                 }
-                Ok::<_, std::io::Error>(receipt[16] == 1)
+                Ok::<_, std::io::Error>((receipt[16] == 1, socket))
             })
             .await;
+            let accepted = match requested {
+                Ok(Ok((true, connection))) => {
+                    authenticated_endpoints.push((path, identity, connection));
+                    true
+                }
+                Ok(Ok((false, _))) => {
+                    anyhow::bail!("stop the session before moving its checkout; runner is busy")
+                }
+                _ => false,
+            };
             anyhow::ensure!(
-                !matches!(requested, Ok(Ok(false))),
-                "stop the session before moving its checkout; runner is busy"
-            );
-            anyhow::ensure!(
-                mode != 2 || matches!(requested, Ok(Ok(true))),
+                mode != 2 || accepted,
                 "cannot prove the original runner idle before moving its checkout"
             );
-            if !matches!(requested, Ok(Ok(true))) {
+            if !accepted {
                 tracing::debug!(session = %scope.session_id(), pid = incarnation.pid, "runner stop endpoint unavailable");
-            } else {
-                authenticated_endpoints.push((path, identity, pin));
             }
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -2560,35 +2548,15 @@ async fn settle_selected_owned(
     let quiescent = tokio::task::spawn_blocking(move || {
         let journal = snapshot(&scope, nonce)?;
         anyhow::ensure!(journal.proves_for(nonce), "runner execution is not proven quiescent; retain the session and checkout. Legacy unknown history requires a verified boot change");
-        for (path, identity, _pin) in authenticated_endpoints { cleanup_authenticated_stop_endpoint(&path, &identity)?; }
+        for (path, identity, _connection) in authenticated_endpoints {
+            crate::process::worker_registry::retire_endpoint(scope.session_id(), &path, &identity)?;
+        }
         anyhow::Ok(())
     }).await.context("original all-history settlement proof job")?;
     quiescent?;
     Ok(())
 }
 
-// The actual socket inode was pinned before authenticating its peer; durable equality
-// also prevents a later actor from accepting a recycled filesystem inode.
-fn cleanup_authenticated_stop_endpoint(
-    path: &std::path::Path,
-    identity: &super::DirectoryIdentity,
-) -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata)
-            if identity.is_durable()
-                && metadata.file_type().is_socket()
-                && super::DirectoryIdentity::from_metadata(&metadata) == *identity =>
-        {
-            std::fs::remove_file(path)?;
-            sync_parent_directory(path)?;
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(())
-}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -3042,23 +3010,23 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn authenticated_endpoint_cleanup_preserves_replacement() {
         let temporary = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temporary.path());
         let path = temporary.path().join("owned.stop");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let metadata = super::super::DirectoryIdentity::from_metadata(
-            &std::fs::symlink_metadata(&path).unwrap(),
-        );
-        cleanup_authenticated_stop_endpoint(&path, &metadata).unwrap();
+        let metadata = SocketEndpointIdentity::observe(&path).unwrap();
+        crate::process::worker_registry::retire_endpoint("cleanup-original", &path, &metadata)
+            .unwrap();
         assert!(!path.exists());
         drop(listener);
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let metadata = super::super::DirectoryIdentity::from_metadata(
-            &std::fs::symlink_metadata(&path).unwrap(),
-        );
+        let metadata = SocketEndpointIdentity::observe(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        cleanup_authenticated_stop_endpoint(&path, &metadata).unwrap();
+        crate::process::worker_registry::retire_endpoint("cleanup-original", &path, &metadata)
+            .unwrap();
         assert!(
             path.exists(),
             "a replacement socket must retain its pathname"
