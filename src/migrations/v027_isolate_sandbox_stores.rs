@@ -2629,9 +2629,7 @@ mod tests {
         assert!(!app.join(JOURNAL).exists());
     }
 
-    /// The documented recipe end to end: `AOE_DEFER_SANDBOX_MIGRATION=1` on a
-    /// pre-v27 install commits the schema version (so the next start reaches
-    /// the reconcile path) while the store stays put and the row stays pending.
+    /// Deferral advances the schema without moving a legacy sandbox store.
     #[test]
     #[serial_test::serial]
     fn deferring_through_the_runner_advances_the_schema_and_keeps_the_store() {
@@ -2639,7 +2637,10 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
         fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"one","title":"Legacy sandbox","project_path":"/tmp/legacy-sandbox","created_at":"2020-01-01T00:00:00Z","tool":"gemini","sandbox_info":{"enabled":true,"image":"fixture-image","container_name":"aoe-fixture-one"}}]"#,
+        ).unwrap();
         fs::write(app.join(".schema_version"), b"26").unwrap();
 
         assert!(!defer_requested_by(None));
@@ -2650,8 +2651,6 @@ mod tests {
         let result = super::super::run_migrations_announced(None);
         result.unwrap();
 
-        // The runner commits the build's target version, not v27 in
-        // particular: a later migration in the chain must not fail this test.
         assert_eq!(
             fs::read_to_string(app.join(".schema_version"))
                 .unwrap()

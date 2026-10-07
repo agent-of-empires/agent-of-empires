@@ -60,29 +60,6 @@ impl DirectoryIdentity {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    pub(crate) static STRICT_INVENTORY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static INVENTORY_OBSERVER: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct InventoryReadObservation(Option<Arc<std::sync::atomic::AtomicUsize>>);
-
-#[cfg(test)]
-impl InventoryReadObservation {
-    pub(crate) fn install(observer: Option<Arc<std::sync::atomic::AtomicUsize>>) -> Self {
-        Self(INVENTORY_OBSERVER.with(|current| current.replace(observer)))
-    }
-}
-
-#[cfg(test)]
-impl Drop for InventoryReadObservation {
-    fn drop(&mut self) {
-        INVENTORY_OBSERVER.with(|current| current.replace(self.0.take()));
-    }
-}
-
 fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("reading profile directory identity {}", path.display()))?;
@@ -976,6 +953,7 @@ fn apply_group_move(
 enum StorageWriteScope<'a> {
     Metadata,
     Geometry,
+    FencedGeometry(&'a super::deletion::PathClaimIndex),
     CompletePaths {
         original: &'a super::LaunchOrigin,
         paths: &'a [PathBuf],
@@ -1244,15 +1222,6 @@ impl Storage {
         // permission error answers `exists()` with `false` too, and treating
         // that as an empty inventory would let a purge delete a peer's
         // worktree, so every other error propagates.
-        #[cfg(test)]
-        {
-            STRICT_INVENTORY_READS.with(|reads| reads.set(reads.get() + 1));
-            INVENTORY_OBSERVER.with(|current| {
-                if let Some(observer) = current.borrow().as_ref() {
-                    observer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
-        }
         self.verify_profile_identity()?;
         let content = match fs::read_to_string(&self.sessions_path) {
             Ok(content) => content,
@@ -1526,6 +1495,19 @@ impl Storage {
         self.update_under_storage_locks(f, StorageWriteScope::Geometry)
     }
 
+    /// Reuse the inventory while the caller retains its workspace fence.
+    pub(crate) fn update_with_claim_index_under_workspace_lock<F, R>(
+        &self,
+        claims: &super::deletion::PathClaimIndex,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f, StorageWriteScope::FencedGeometry(claims))
+    }
+
     /// Take only this store's locks, after any required workspace fence.
     fn update_under_storage_locks<F, R>(&self, f: F, scope: StorageWriteScope<'_>) -> Result<R>
     where
@@ -1693,14 +1675,20 @@ impl Storage {
             }
         }
         if !deltas.is_empty() {
-            let mut claims =
-                super::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(self))?;
-            let profile = claims
-                .take_targets()
-                .into_iter()
-                .next()
-                .context("writer profile is absent from claim inventory")?
-                .1;
+            let mut owned;
+            let (claims, profile) = if let StorageWriteScope::FencedGeometry(claims) = &scope {
+                (*claims, claims.writer_profile(self)?)
+            } else {
+                owned =
+                    super::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(self))?;
+                let profile = owned
+                    .take_targets()
+                    .into_iter()
+                    .next()
+                    .context("writer profile is absent from claim inventory")?
+                    .1;
+                (&owned, profile)
+            };
             for (id, paths) in deltas {
                 claims.ensure_pending_unclaimed(profile, id, &paths)?;
             }

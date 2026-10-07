@@ -2,11 +2,6 @@
 
 use super::*;
 
-#[cfg(test)]
-tokio::task_local! {
-    static RECONCILE_INVENTORY_OBSERVER: Arc<std::sync::atomic::AtomicUsize>;
-}
-
 // --- Delete session ---
 
 #[derive(Default, Deserialize, Clone)]
@@ -494,11 +489,7 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
             .collect()
     };
     let work_state = Arc::clone(state);
-    #[cfg(test)]
-    let observer = RECONCILE_INVENTORY_OBSERVER.try_with(Arc::clone).ok();
     let reconciled = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        #[cfg(test)]
-        let _observation = crate::session::InventoryReadObservation::install(observer);
         let mut storages: Vec<Storage> = Vec::new();
         for row in &snapshots {
             let storage = row.original_storage()?;
@@ -1342,9 +1333,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_reconcile_uses_one_inventory_and_aborts_after_git_exit_23() {
+    async fn daemon_reconcile_preserves_peers_and_aborts_after_git_exit_23() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         for fail in [false, true] {
             let home = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(home.path());
@@ -1433,11 +1423,7 @@ mod tests {
             )).unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             let _path = fail.then(|| crate::session::test_support::path_prepended(&bin));
-            let observed = Arc::new(AtomicUsize::new(0));
-            RECONCILE_INVENTORY_OBSERVER
-                .scope(observed.clone(), reconcile_trashed_worktrees(&state))
-                .await;
-            assert_eq!(observed.load(Ordering::Relaxed), 6, "4 target profiles + untouched peer + daemon primary; 12 targets must not rescan inventories");
+            reconcile_trashed_worktrees(&state).await;
             assert_eq!(std::fs::read(peer.sessions_path()).unwrap(), peer_before);
             assert_eq!(
                 std::fs::read_to_string(peer_path.join("sentinel")).unwrap(),

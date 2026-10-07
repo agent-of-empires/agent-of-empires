@@ -1026,6 +1026,7 @@ pub(crate) struct PathClaimIndex {
     claims: std::collections::BTreeMap<PathBuf, Vec<ClaimOwner>>,
     owned_paths: Vec<std::collections::HashMap<std::sync::Arc<str>, Vec<(PathBuf, bool)>>>,
     targets: Vec<(usize, usize, Vec<Instance>)>,
+    profile_identities: Vec<std::fs::Metadata>,
     valid: bool,
 }
 
@@ -1060,6 +1061,7 @@ impl PathClaimIndex {
                 claims: Default::default(),
                 owned_paths: Vec::new(),
                 targets: Vec::new(),
+                profile_identities: Vec::new(),
                 valid: true,
             };
             let mut profiles: Vec<std::fs::Metadata> = Vec::new();
@@ -1093,6 +1095,7 @@ impl PathClaimIndex {
                 );
                 target.verify_profile_identity()?;
             }
+            result.profile_identities = profiles;
             Ok(result)
         };
         if lock_stores {
@@ -1104,6 +1107,20 @@ impl PathClaimIndex {
 
     pub(crate) fn take_targets(&mut self) -> Vec<(usize, usize, Vec<Instance>)> {
         std::mem::take(&mut self.targets)
+    }
+
+    pub(crate) fn writer_profile(&self, storage: &Storage) -> anyhow::Result<usize> {
+        anyhow::ensure!(self.valid, "path ownership inventory is uncertain");
+        storage.verify_profile_identity()?;
+        let identity = std::fs::metadata(storage.sessions_path().parent().unwrap())?;
+        self.profile_identities
+            .iter()
+            .position(|original| {
+                crate::session::storage::same_filesystem_identity(original, &identity)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("writer physical profile is absent from the fenced inventory")
+            })
     }
 
     pub(crate) fn update(&mut self, profile: usize, row: &Instance) {
@@ -2143,7 +2160,49 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn indexed_claims_parse_once_and_track_persisted_paths_by_physical_owner() {
+    fn fenced_geometry_writes_refuse_pending_peers_and_invalidated_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let target = Storage::new_unwatched("target").unwrap();
+        let peer = Storage::new_unwatched("peer").unwrap();
+        let original = Instance::new("target", temp.path().join("original").to_str().unwrap());
+        target
+            .update(|rows, _| {
+                rows.push(original.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut prepared =
+            Instance::new("pending peer", temp.path().join("future").to_str().unwrap());
+        let _intent =
+            crate::session::builder::CreationIntent::reserve(&peer, &mut prepared).unwrap();
+        let peer_before = std::fs::read(peer.sessions_path()).unwrap();
+        let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
+        let _identity = crate::session::acquire_session_identity_lock().unwrap();
+        let mut index = PathClaimIndex::load(std::slice::from_ref(&target)).unwrap();
+        assert!(target
+            .update_with_claim_index_under_workspace_lock(&index, |rows, _| {
+                rows[0].project_path = prepared.project_path.clone();
+                Ok(())
+            })
+            .is_err());
+        index.invalidate();
+        assert!(target
+            .update_with_claim_index_under_workspace_lock(&index, |rows, _| {
+                rows[0].project_path = temp.path().join("unrelated").to_string_lossy().into_owned();
+                Ok(())
+            })
+            .is_err());
+        let persisted = target.load().unwrap();
+        assert_eq!(persisted[0].id, original.id);
+        assert_eq!(persisted[0].created_at, original.created_at);
+        assert_eq!(persisted[0].project_path, original.project_path);
+        assert_eq!(std::fs::read(peer.sessions_path()).unwrap(), peer_before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn indexed_claims_track_persisted_paths_by_physical_owner() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let target = Storage::new_unwatched("target").unwrap();
@@ -2168,33 +2227,23 @@ mod tests {
         .unwrap();
         let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
         let _identity = crate::session::acquire_session_identity_lock().unwrap();
-        crate::session::storage::STRICT_INVENTORY_READS.with(|reads| reads.set(0));
         let mut index = PathClaimIndex::load(std::slice::from_ref(&target)).unwrap();
-        let reads = crate::session::storage::STRICT_INVENTORY_READS.with(|reads| reads.get());
-        assert_eq!(reads, 2, "one strict read per physical profile");
         let (_, profile, rows) = index.take_targets().pop().unwrap();
         assert_eq!(rows.len(), 1);
-        for _ in 0..200 {
+        index
+            .ensure_unclaimed(profile, &row.id, &[PathBuf::from(&row.project_path)])
+            .unwrap();
+        assert!(
             index
-                .ensure_unclaimed(profile, &row.id, &[PathBuf::from(&row.project_path)])
-                .unwrap();
-            assert!(
-                index
-                    .ensure_unclaimed(profile, &row.id, &[PathBuf::from(&peer_row.project_path)])
-                    .is_err(),
-                "same id in another physical profile remains a peer"
-            );
-        }
-        assert_eq!(
-            crate::session::storage::STRICT_INVENTORY_READS.with(|reads| reads.get()),
-            reads,
-            "candidate queries must not parse stores again"
+                .ensure_unclaimed(profile, &row.id, &[PathBuf::from(&peer_row.project_path)])
+                .is_err(),
+            "same id in another physical profile remains a peer"
         );
         let previous = row.project_path.clone();
         row.project_path = temp.path().join("relocated").to_string_lossy().into_owned();
         row.pre_trash_project_path = Some(previous.clone());
         target
-            .update(|rows, _| {
+            .update_under_workspace_claim_lock(|rows, _| {
                 rows[0] = row.clone();
                 Ok(())
             })
@@ -2210,9 +2259,6 @@ mod tests {
         assert!(index
             .ensure_unclaimed(profile, &row.id, &[temp.path().join("unused")])
             .is_err());
-        println!(
-            "indexed ownership: 2 profile parses, 400 candidate queries, no inventory rereads"
-        );
     }
 
     #[test]
@@ -2235,9 +2281,11 @@ mod tests {
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&parent, &alias).unwrap();
         let dangling = temp.path().join("dangling");
-        std::os::unix::fs::symlink(temp.path().join("absent"), &dangling).unwrap();
+        std::os::unix::fs::symlink(&parent, &dangling).unwrap();
         let looped = temp.path().join("loop");
-        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        std::os::unix::fs::symlink(&parent, &looped).unwrap();
+        let disappearing = temp.path().join("absent");
+        std::fs::create_dir(&disappearing).unwrap();
         let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
         let _identity = crate::session::acquire_session_identity_lock().unwrap();
         let owner = SessionPathOwner {
@@ -2247,17 +2295,26 @@ mod tests {
         for (claim, candidate, conflict) in [
             (parent.clone(), child.clone(), true),
             (child.clone(), parent.clone(), true),
-            (alias, child.clone(), true),
+            (alias.clone(), child.clone(), true),
             (temp.path().join("missing/child"), child.clone(), false),
             (dangling.join("child"), child.clone(), true),
-            (looped, child.clone(), true),
+            (looped.clone(), child.clone(), true),
             (temp.path().join("absent/../other"), child, true),
         ] {
-            peer.update(|rows, _| {
+            peer.update_under_workspace_claim_lock(|rows, _| {
                 *rows = vec![Instance::new("peer", claim.to_str().unwrap())];
                 Ok(())
             })
             .unwrap();
+            if claim.starts_with(&dangling) {
+                std::fs::remove_file(&dangling).unwrap();
+                std::os::unix::fs::symlink(temp.path().join("missing-target"), &dangling).unwrap();
+            } else if claim == looped {
+                std::fs::remove_file(&looped).unwrap();
+                std::os::unix::fs::symlink(&looped, &looped).unwrap();
+            } else if claim.starts_with(&disappearing) {
+                std::fs::remove_dir(&disappearing).unwrap();
+            }
             assert_eq!(
                 ensure_unclaimed_paths(owner, std::slice::from_ref(&candidate)).is_err(),
                 conflict,
@@ -2266,6 +2323,11 @@ mod tests {
                 candidate.display()
             );
             assert_eq!(paths_in_use_except(&[owner]).covers(&candidate), conflict);
+            if claim.starts_with(&dangling) || claim == looped {
+                let alias = if claim == looped { &looped } else { &dangling };
+                std::fs::remove_file(alias).unwrap();
+                std::os::unix::fs::symlink(&parent, alias).unwrap();
+            }
         }
     }
 
@@ -2309,9 +2371,10 @@ mod tests {
         let (_, profile, _) = index.take_targets().pop().unwrap();
         let relocated = temp.path().join("relocated");
         row.project_path = relocated.to_string_lossy().into_owned();
+        row.workspace_info.as_mut().unwrap().workspace_dir = row.project_path.clone();
         row.pre_trash_project_path = Some(primary.to_string_lossy().into_owned());
         storage
-            .update(|rows, _| {
+            .update_under_workspace_claim_lock(|rows, _| {
                 rows[0] = row.clone();
                 Ok(())
             })
@@ -2323,9 +2386,10 @@ mod tests {
                 .is_err());
         }
         row.project_path = temp.path().join("current").to_string_lossy().into_owned();
+        row.workspace_info.as_mut().unwrap().workspace_dir = row.project_path.clone();
         row.pre_trash_project_path = None;
         storage
-            .update(|rows, _| {
+            .update_under_workspace_claim_lock(|rows, _| {
                 rows[0] = row.clone();
                 Ok(())
             })

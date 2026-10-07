@@ -103,9 +103,7 @@ pub(crate) use storage::{
     acquire_profile_namespace_lock, acquire_session_identity_lock, sync_parent_directory,
 };
 #[cfg(test)]
-pub(crate) use storage::{
-    observe_lock_contention_for_test, observe_updates_for_test, InventoryReadObservation,
-};
+pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 /// Check that every path a non-scratch session will use is present and inspectable.

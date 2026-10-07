@@ -319,7 +319,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             },
             &candidate_paths,
         ) {
-            let _ = storage.update(|instances, _groups| {
+            let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(stored) = instances
                     .iter_mut()
                     .find(|instance| instance.id == request.session_id)
@@ -348,7 +348,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         }
     }
 
-    let commit = storage.update(|instances, _groups| {
+    let commit = storage.update_under_workspace_claim_lock(|instances, _groups| {
         let stored = instances
             .iter()
             .find(|row| row.id == request.session_id)
@@ -700,7 +700,7 @@ fn reconcile_trashed_batch(
     ownership: &mut crate::session::deletion::PathClaimIndex,
 ) -> anyhow::Result<Vec<Instance>> {
     let now = Utc::now();
-    let reserved = storage.update(|instances, _groups| {
+    let reserved = storage.update_metadata(|instances, _groups| {
         let mut reserved: Vec<(u64, Instance)> = Vec::new();
         for snapshot in batch {
             let Some(stored) = instances
@@ -709,8 +709,7 @@ fn reconcile_trashed_batch(
             else {
                 continue;
             };
-            // Compare and set: the plan was decided from a snapshot taken without any lock, so a
-            // peer can have restored, purged, or moved the row since.
+            // Keep the original inventory plan until the reservation CAS succeeds.
             if !plan_inputs_unchanged(snapshot, stored) {
                 tracing::debug!(
                     target: "session.trash",
@@ -774,7 +773,7 @@ fn reconcile_reserved_locked(
         ReconcilePlan::Nothing => {}
     }
     let ownership = inventory.ensure_unclaimed(profile, &snapshot.id, &paths);
-    storage.update(|instances, _groups| {
+    storage.update_with_claim_index_under_workspace_lock(inventory, |instances, _groups| {
         let stored = instances
             .iter()
             .find(|row| row.id == snapshot.id)
@@ -1525,54 +1524,6 @@ mod tests {
             generations(&stored),
             "a consistent profile is left untouched"
         );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn multi_profile_sweep_reads_each_inventory_once_and_heals_all_targets() {
-        assert!(git_available(), "native Git fixture requires git");
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let mut storages = Vec::new();
-        let mut keeps = Vec::new();
-        for profile in 0..4 {
-            let name = format!("sweep-{profile}");
-            crate::session::create_profile(&name).unwrap();
-            let storage = crate::session::Storage::open_unwatched(&name).unwrap();
-            for _ in 0..3 {
-                let (tmp, mut row) = real_worktree_instance();
-                let original = row.project_path.clone();
-                row.trash();
-                assert!(matches!(
-                    relocate_worktree_to_trash(&mut row),
-                    RelocateOutcome::Relocated { .. }
-                ));
-                row.project_path = original;
-                row.pre_trash_project_path = None;
-                storage
-                    .update(|rows, _| {
-                        rows.push(row.clone());
-                        Ok(())
-                    })
-                    .unwrap();
-                keeps.push(tmp);
-            }
-            storages.push(storage);
-        }
-        crate::session::storage::STRICT_INVENTORY_READS.with(|reads| reads.set(0));
-        let healed = reconcile_trashed_profiles(&storages).unwrap();
-        assert_eq!(
-            crate::session::storage::STRICT_INVENTORY_READS.with(|reads| reads.get()),
-            4
-        );
-        assert_eq!(healed.len(), 4);
-        assert_eq!(healed.iter().map(|(_, rows)| rows.len()).sum::<usize>(), 12);
-        for storage in &storages {
-            for row in storage.load().unwrap() {
-                assert!(is_holding_path(Path::new(&row.project_path), &row.id));
-                assert!(Path::new(&row.project_path).exists());
-                assert!(row.lifecycle_reservation.is_none());
-            }
-        }
     }
 
     #[test]

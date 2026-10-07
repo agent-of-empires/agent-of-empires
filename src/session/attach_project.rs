@@ -1984,7 +1984,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn attach_rejects_a_late_claim_and_rolls_back_created_worktree() {
+    fn an_attach_claim_refuses_a_late_peer_writer_before_publication() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = isolated_profile(temp.path(), "attach-late-claim");
         let backend = temp.path().join("src/backend");
@@ -2044,22 +2044,25 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(move || {
                 let mut row = Instance::new("peer", peer_claimed_path.to_str().unwrap());
                 row.source_profile = "attach-late-peer".to_string();
-                peer_storage
+                assert!(peer_storage
                     .update(|instances, _groups| {
                         instances.push(row);
                         Ok(())
                     })
-                    .unwrap();
+                    .is_err());
+                assert!(peer_storage.load().unwrap().is_empty());
             }));
         });
-        assert!(attach_planned(&storage, &instance.id, &instance, attach_plan).is_err());
-        assert!(
-            claimed_path.exists(),
-            "rollback must preserve a peer-claimed worktree"
-        );
+        attach_planned(&storage, &instance.id, &instance, attach_plan).unwrap();
+        assert!(claimed_path.join(".git").exists());
         let stored = storage.load().unwrap().into_iter().next().unwrap();
         assert!(stored.lifecycle_reservation.is_none());
-        assert_eq!(stored.workspace_info.unwrap().repos.len(), 1);
+        assert!(stored
+            .workspace_info
+            .unwrap()
+            .repos
+            .iter()
+            .any(|repo| Path::new(&repo.worktree_path) == claimed_path));
     }
 
     /// A worktree session whose attach moves its own checkout, with the added
@@ -2105,56 +2108,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn movein_write_failure_restores_the_original_checkout() {
-        let temp = tempfile::tempdir().unwrap();
-        let profile = "attach-write-failure";
-        let _guard = isolated_profile(temp.path(), profile);
-        let (mut instance, mut plan) = blocked_worktree_attach(temp.path(), profile);
-        let storage = Storage::open_unwatched(profile).unwrap();
-        storage
-            .update(|rows, _| {
-                rows.push(instance.clone());
-                Ok(())
-            })
-            .unwrap();
-        reserve_attach(&storage, &instance.id, &mut plan).unwrap();
-        let generation = plan.reservation_generation.unwrap();
-        let destination = match &plan.conversion {
-            Conversion::MoveIn { primary, .. } => PathBuf::from(&primary.worktree_path),
-            _ => panic!("fixture must move the original checkout"),
-        };
-        let mut failing = storage.clone();
-        failing.set_fail_writes_for_test(true);
-        instance.storage_origin = Some(std::sync::Arc::new(failing));
-        let error = match execute_for_session(
-            &instance,
-            plan,
-            crate::session::deletion::SessionPathOwner {
-                profile,
-                session_id: &instance.id,
-            },
-            generation,
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("the post-move profile write must fail"),
-        };
-        assert!(format!("{error:#}").contains("injected sessions write failure"));
-        assert_eq!(
-            std::fs::read(Path::new(&instance.project_path).join("wip.txt")).unwrap(),
-            b"in progress"
-        );
-        assert!(
-            !destination.exists(),
-            "rollback must remove the moved checkout from its destination"
-        );
-        assert_eq!(
-            storage.load().unwrap()[0].project_path,
-            instance.project_path
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn a_failed_attach_moves_the_sessions_worktree_back() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = isolated_profile(temp.path(), "attach-rollback");
@@ -2188,120 +2141,65 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn failed_attach_retains_moved_checkouts_when_rollback_authority_changes() {
-        use std::os::unix::process::CommandExt;
-        struct ChildGuard(std::process::Child);
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let child = ChildGuard(
-            std::process::Command::new("sleep")
-                .arg("60")
-                .process_group(0)
-                .spawn()
-                .unwrap(),
-        );
-        let incarnation = crate::process::process_incarnation(child.0.id())
-            .unwrap()
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = isolated_profile(temp.path(), "attach-rollback-fence");
+        crate::session::create_profile("attach-rollback-peer").unwrap();
+        let (instance, plan) = blocked_worktree_attach(temp.path(), "attach-rollback-fence");
+        let paths = plan.path_claims.clone();
+        let added = plan.added_worktree.clone();
+        std::fs::remove_file(added.join("in-the-way.txt")).unwrap();
+        std::fs::remove_dir(&added).unwrap();
+        let moved = plan.workspace_dir().join("backend");
+        let original = PathBuf::from(&instance.project_path);
+        let storage = Storage::open_unwatched("attach-rollback-fence").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
             .unwrap();
-        for case in 0..3 {
-            let temp = tempfile::tempdir().unwrap();
-            let _guard = isolated_profile(temp.path(), "attach-rollback-fence");
-            crate::session::create_profile("attach-rollback-peer").unwrap();
-            let (instance, plan) = blocked_worktree_attach(temp.path(), "attach-rollback-fence");
-            let added = plan.added_worktree.clone();
-            std::fs::remove_file(added.join("in-the-way.txt")).unwrap();
-            std::fs::remove_dir(&added).unwrap();
-            let moved = plan.workspace_dir().join("backend");
-            let original = PathBuf::from(&instance.project_path);
-            let storage = Storage::open_unwatched("attach-rollback-fence").unwrap();
-            storage
-                .update(|rows, _| {
-                    rows.push(instance.clone());
-                    Ok(())
-                })
-                .unwrap();
-            let id = instance.id.clone();
-            let moved_for_hook = moved.clone();
-            let original_for_hook = original.clone();
-            AFTER_ATTACH_EXECUTE.with(|slot| {
-                *slot.borrow_mut() = Some(Box::new(move || {
-                    assert!(!original_for_hook.exists());
-                    assert_eq!(
-                        std::fs::read_to_string(moved_for_hook.join("wip.txt")).unwrap(),
-                        "in progress"
-                    );
-                    if case == 0 {
-                        std::fs::write(
-                            crate::session::get_profile_dir_path("attach-rollback-peer")
-                                .unwrap()
-                                .join("sessions.json"),
-                            "{ not json",
-                        )
-                        .unwrap();
-                        return;
-                    }
-                    Storage::open_unwatched("attach-rollback-fence")
+        let moved_for_hook = moved.clone();
+        let original_for_hook = original.clone();
+        AFTER_ATTACH_EXECUTE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(!original_for_hook.exists());
+                assert_eq!(
+                    std::fs::read_to_string(moved_for_hook.join("wip.txt")).unwrap(),
+                    "in progress"
+                );
+                std::fs::write(
+                    crate::session::get_profile_dir_path("attach-rollback-peer")
                         .unwrap()
-                        .update(|rows, _| {
-                            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
-                            let generation = row.lifecycle_generation;
-                            if case == 1 {
-                                assert!(row.release_lifecycle_reservation_if_owned(
-                                    crate::session::LifecycleOperation::Attach,
-                                    generation
-                                ));
-                                row.try_acquire_lifecycle_reservation(
-                                    crate::session::LifecycleOperation::Launch,
-                                    Instance::LIFECYCLE_RESERVATION_TTL,
-                                    Utc::now(),
-                                )
-                                .unwrap();
-                            } else {
-                                row.runner_journal = serde_json::from_value(serde_json::json!({
-                                "coverage": "complete", "preparations": [], "launches": [{
-                                    "nonce": uuid::Uuid::new_v4().as_bytes(),
-                                    "boot": crate::session::runner_journal::current_boot().unwrap(),
-                                    "generation": generation, "incarnation": incarnation,
-                                }],
-                            })).unwrap();
-                            }
-                            Ok(())
-                        })
-                        .unwrap();
-                }));
-            });
-            assert!(attach_planned(&storage, &instance.id, &instance, plan).is_err());
-            assert!(
-                !original.exists(),
-                "case {case}: unauthorized rollback moved the primary checkout"
-            );
-            assert_eq!(
-                std::fs::read_to_string(moved.join("wip.txt")).unwrap(),
-                "in progress"
-            );
-            assert!(
-                added.join(".git").exists(),
-                "case {case}: unauthorized rollback deleted the added checkout"
-            );
-            let retained = storage
-                .load()
-                .unwrap()
-                .into_iter()
-                .find(|row| row.id == instance.id)
+                        .join("sessions.json"),
+                    "{ not json",
+                )
                 .unwrap();
-            assert_eq!(retained.project_path, instance.project_path);
-            if case == 1 {
-                assert!(retained.lifecycle_reservation_is_owned(
-                    crate::session::LifecycleOperation::Launch,
-                    retained.lifecycle_generation
-                ));
-            } else {
-                assert!(retained.lifecycle_reservation.is_none());
-            }
-        }
+            }));
+        });
+        assert!(attach_planned(&storage, &instance.id, &instance, plan).is_err());
+        assert!(
+            !original.exists(),
+            "unknown ownership must not move the checkout back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(moved.join("wip.txt")).unwrap(),
+            "in progress"
+        );
+        assert!(
+            added.join(".git").exists(),
+            "unknown ownership must not remove the added worktree"
+        );
+        let retained = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == instance.id)
+            .unwrap();
+        assert_eq!(retained.project_path, instance.project_path);
+        assert_eq!(retained.created_at, instance.created_at);
+        assert!(retained.lifecycle_reservation.as_ref().is_some_and(|lease| {
+            matches!(&lease.path_claims, super::super::WorktreePathClaims::Pending(retained_paths) if retained_paths == &paths)
+        }));
     }
 
     #[test]

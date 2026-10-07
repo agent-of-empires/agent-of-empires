@@ -445,7 +445,7 @@ mod tests {
         fs::write(app.join(VERSION_FILE), "31").unwrap();
         fs::write(
             app.join("sessions.json"),
-            r#"[{"agent_session_id":"old","resume_intent":{"kind":"Use","value":"target"},"retroactive_capture_excludes":["old"]}]"#,
+            r#"[{"id":"legacy-content","title":"Legacy content","project_path":"/tmp/legacy-content","created_at":"2020-01-01T00:00:00Z","agent_session_id":"old","resume_intent":{"kind":"Use","value":"target"},"retroactive_capture_excludes":["old"]}]"#,
         )
         .unwrap();
 
@@ -482,7 +482,7 @@ mod tests {
         fs::write(app.join(VERSION_FILE), "28").unwrap();
         fs::write(
             app.join("sessions.json"),
-            r#"[{"retroactive_capture_excludes":["legacy-sid"],"pending_initial_turn":"go"}]"#,
+            r#"[{"id":"legacy-backup","title":"Legacy backup","project_path":"/tmp/legacy-backup","created_at":"2020-01-01T00:00:00Z","retroactive_capture_excludes":["legacy-sid"],"pending_initial_turn":"go"}]"#,
         )
         .unwrap();
 

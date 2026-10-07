@@ -4804,8 +4804,7 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
     assert_eq!(hook_runs(), 1, "neither retry may run the create again");
 }
 
-/// A daemon restart empties the in-memory replay record. A same-key retry that names the
-/// earlier run must then be refused as unknown, not run again with its hooks.
+/// An old boot cannot replay an effecting failed creation after restart.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
@@ -4846,59 +4845,51 @@ async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1, "the retry must not run the hooks again");
-
-    // A retry that names this run is not fenced: this run would know the key if it ran.
-    let own = after.create_progress.boot_id().to_string();
-    let (status, _) = post_create(&after, body(Some(&own))).await;
-    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-    assert_eq!(effects(), 2);
 }
 
-/// Validation that reads mutable state must not answer a retry the restart fence owns:
-/// with the first attempt's profile deleted after the restart, the retry is still an
-/// unknown outcome, not a definitive `profile_not_found`, and no hook runs again.
+/// Restart fencing precedes validation of a profile removed after a pre-admission failure.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     use crate::server::test_support as support;
-    let _home = crate::session::test_support::isolate_app_dir();
-    let marker = tempfile::tempdir().unwrap();
-    let side_effects = marker.path().join("side-effects");
-    let effect = format!("echo effect >> '{}'", side_effects.display());
-    let project = project_with_on_create_hooks(&[effect.as_str(), "exit 1"]);
-    // A second profile, since the last one cannot be deleted.
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+    let missing_project = home.path().join("missing-project");
     crate::session::create_profile("keep").unwrap();
     crate::session::create_profile("work").unwrap();
     support::seed_instances_on_disk_for_test("work", Vec::new());
-    let effects = || {
-        std::fs::read_to_string(&side_effects)
-            .unwrap_or_default()
-            .lines()
-            .count()
-    };
     let body = |origin: Option<&str>| {
         serde_json::json!({
-            "title": "gone-profile", "path": project.path(), "tool": "claude",
-            "view": "structured", "profile": "work", "trust_hooks": true,
+            "title": "gone-profile", "path": missing_project, "tool": "claude",
+            "view": "structured", "profile": "work",
             "idempotency_key": "profile-then-restart", "retry_origin": origin,
         })
     };
-
     let (launcher, _) = support::counting_failing_launcher();
     let before = support::build_test_app_state_with_launcher(Vec::new(), launcher);
     let first_run = before.create_progress.boot_id().to_string();
-    let (status, _) = post_create(&before, body(None)).await;
-    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-    assert_eq!(effects(), 1);
-
-    // The response was lost, the daemon restarted, and the profile was deleted.
+    let (status, failed) = post_create(&before, body(None)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(failed["error"], "create_failed");
+    assert!(Storage::open_unwatched("work")
+        .unwrap()
+        .load()
+        .unwrap()
+        .is_empty());
+    drop(before);
     crate::session::delete_profile("work").unwrap();
     let (launcher, _) = support::counting_failing_launcher();
     let after = support::build_test_app_state_with_launcher(Vec::new(), launcher);
     let (status, refused) = post_create(&after, body(Some(&first_run))).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["error"], "create_outcome_unknown");
-    assert_eq!(effects(), 1);
+    let own = after.create_progress.boot_id().to_string();
+    let (status, refused) = post_create(&after, body(Some(&own))).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "profile_not_found");
+    assert!(!crate::session::get_profile_dir_path("work")
+        .unwrap()
+        .exists());
 }
 
 #[tokio::test]
