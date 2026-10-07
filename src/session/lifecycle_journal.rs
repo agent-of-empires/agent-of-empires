@@ -12,7 +12,7 @@ use super::{Instance, Status};
 
 /// Bump when the record shape changes. Unsupported records stay on disk so a newer
 /// binary cannot silently discard recovery evidence written by an older one.
-pub(crate) const LIFECYCLE_JOURNAL_VERSION: u32 = 2;
+pub(crate) const LIFECYCLE_JOURNAL_VERSION: u32 = 3;
 const EARLIEST_SUPPORTED_LIFECYCLE_JOURNAL_VERSION: u32 = 1;
 
 const JOURNAL_DIR_NAME: &str = ".lifecycle-journal";
@@ -24,16 +24,33 @@ pub(crate) enum LifecyclePhase {
     HooksStarted,
     HooksComplete,
     TeardownStarted,
+    TeardownComplete,
     RowRemoved,
     Kept,
+    Abandoned,
 }
 
 impl LifecyclePhase {
     pub(crate) fn hooks_are_complete(self) -> bool {
         matches!(
             self,
-            Self::HooksComplete | Self::TeardownStarted | Self::RowRemoved | Self::Kept
+            Self::HooksComplete
+                | Self::TeardownStarted
+                | Self::TeardownComplete
+                | Self::RowRemoved
+                | Self::Kept
         )
+    }
+
+    pub(crate) fn teardown_started(self) -> bool {
+        matches!(
+            self,
+            Self::TeardownStarted | Self::TeardownComplete | Self::RowRemoved | Self::Kept
+        )
+    }
+
+    pub(crate) fn teardown_complete(self) -> bool {
+        matches!(self, Self::TeardownComplete | Self::RowRemoved | Self::Kept)
     }
 }
 
@@ -393,6 +410,18 @@ fn read_record(path: &Path) -> Result<LifecycleJournalRecord> {
                 .map_err(|_| record_error)
         })
         .context("malformed lifecycle journal entry")
+}
+
+pub(crate) fn read_deletion(path: &Path) -> Result<Option<LifecycleJournalEntry>> {
+    match read_record(path)? {
+        LifecycleJournalRecord::Deleting(entry) if entry.is_current() => Ok(Some(*entry)),
+        LifecycleJournalRecord::Deleting(entry) => anyhow::bail!(
+            "lifecycle journal version {} is not supported (current: {})",
+            entry.version,
+            LIFECYCLE_JOURNAL_VERSION
+        ),
+        LifecycleJournalRecord::Moving(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]

@@ -47,6 +47,12 @@ pub struct WorkerRecord {
     pub detached_at: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PurgeFence {
+    source_profile: String,
+    lifecycle_generation: u64,
+}
+
 impl WorkerRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -101,6 +107,81 @@ pub fn record_path(session_id: &str) -> Result<PathBuf> {
 
 pub fn socket_path_for(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::socket_path(&workers_dir()?, session_id)
+}
+
+fn purge_fence_path(session_id: &str) -> Result<PathBuf> {
+    validate_session_id(session_id)?;
+    Ok(workers_dir()?.join(format!("{session_id}.purge-fence")))
+}
+
+fn load_purge_fence_unlocked(session_id: &str) -> Result<Option<PurgeFence>> {
+    let path = purge_fence_path(session_id)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing purge fence {}", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading purge fence {}", path.display())),
+    }
+}
+
+/// Fence runner publication and readoption before a purge can remove session resources.
+pub fn fence_for_purge(
+    session_id: &str,
+    source_profile: &str,
+    lifecycle_generation: u64,
+) -> Result<()> {
+    with_registry_lock(session_id, || {
+        let current = load_purge_fence_unlocked(session_id)?;
+        if let Some(current) = current.as_ref() {
+            anyhow::ensure!(
+                current.source_profile == source_profile,
+                "ACP session id is already fenced by profile {}",
+                current.source_profile
+            );
+            anyhow::ensure!(
+                current.lifecycle_generation <= lifecycle_generation,
+                "a newer ACP purge fence is already present"
+            );
+        }
+        let fence = PurgeFence {
+            source_profile: source_profile.to_string(),
+            lifecycle_generation,
+        };
+        let bytes = serde_json::to_vec(&fence).context("serializing ACP purge fence")?;
+        crate::session::atomic_write_verified(&purge_fence_path(session_id)?, &bytes)
+    })
+}
+
+pub fn clear_purge_fence_if_owned(
+    session_id: &str,
+    source_profile: &str,
+    lifecycle_generation: u64,
+) -> Result<bool> {
+    with_registry_lock(session_id, || {
+        let Some(current) = load_purge_fence_unlocked(session_id)? else {
+            return Ok(false);
+        };
+        if current.source_profile != source_profile
+            || current.lifecycle_generation != lifecycle_generation
+        {
+            return Ok(false);
+        }
+        let path = purge_fence_path(session_id)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+        }
+        crate::session::sync_parent_directory(&path)?;
+        Ok(true)
+    })
+}
+
+pub fn is_purge_fenced(session_id: &str) -> Result<bool> {
+    Ok(load_purge_fence_unlocked(session_id)?.is_some())
 }
 
 pub fn log_path_for(session_id: &str) -> Result<PathBuf> {
@@ -160,7 +241,16 @@ pub fn clear_restart_marker(session_id: &str) {
 }
 
 pub fn save(record: &WorkerRecord) -> Result<()> {
-    with_registry_lock(&record.session_id, || save_unlocked(record))
+    with_registry_lock(&record.session_id, || {
+        if let Some(fence) = load_purge_fence_unlocked(&record.session_id)? {
+            anyhow::bail!(
+                "ACP runner publication is fenced by purge generation {} in profile {}",
+                fence.lifecycle_generation,
+                fence.source_profile
+            );
+        }
+        save_unlocked(record)
+    })
 }
 
 fn save_unlocked(record: &WorkerRecord) -> Result<()> {
@@ -313,6 +403,9 @@ fn update_if_owned(
     update: impl FnOnce(&mut WorkerRecord),
 ) -> Result<bool> {
     with_registry_lock(session_id, || {
+        if load_purge_fence_unlocked(session_id)?.is_some() {
+            return Ok(false);
+        }
         let Some(mut record) = load_strict_unlocked(session_id)? else {
             return Ok(false);
         };
@@ -325,6 +418,7 @@ fn update_if_owned(
     })
 }
 
+#[cfg(not(unix))]
 fn delete_if_absent(session_id: &str) -> Result<bool> {
     with_registry_lock(session_id, || {
         if load_strict_unlocked(session_id)?.is_some() {
@@ -471,33 +565,238 @@ pub fn pid_source_for(session_id: &str) -> Option<u32> {
     }
 }
 
-/// Signals the whole process group, since it can outlive its leader.
+#[cfg(unix)]
+fn signal_registered_runner_if_unfenced(
+    session_id: &str,
+    expected: Option<(u32, u64)>,
+) -> Result<Option<WorkerRecord>> {
+    with_registry_lock(session_id, || {
+        if load_purge_fence_unlocked(session_id)?.is_some() {
+            return Ok(None);
+        }
+        let Some(record) = load_strict_unlocked(session_id)? else {
+            return Ok(None);
+        };
+        if expected.is_some_and(|identity| identity != (record.pid, record.generation)) {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            record.pid > 0 && record.pid <= i32::MAX as u32,
+            "ACP runner PID {} is invalid",
+            record.pid
+        );
+        crate::process::worker::terminate_process_group(record.pid);
+        Ok(Some(record))
+    })
+}
+
+#[cfg(unix)]
+async fn wait_for_runner_group_exit(pid: u32) -> Result<()> {
+    use std::time::Duration;
+
+    let term_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while runner_group_alive(pid) && tokio::time::Instant::now() < term_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if runner_group_alive(pid) {
+        crate::process::worker::kill_process_group(pid);
+        let kill_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while runner_group_alive(pid) && tokio::time::Instant::now() < kill_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    anyhow::ensure!(
+        !runner_group_alive(pid),
+        "ACP runner process group {pid} is still alive after SIGKILL"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_runner_group_exit_sync(pid: u32) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let term_deadline = Instant::now() + Duration::from_secs(2);
+    while runner_group_alive(pid) && Instant::now() < term_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if runner_group_alive(pid) {
+        crate::process::worker::kill_process_group(pid);
+        let kill_deadline = Instant::now() + Duration::from_secs(2);
+        while runner_group_alive(pid) && Instant::now() < kill_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    anyhow::ensure!(
+        !runner_group_alive(pid),
+        "ACP runner process group {pid} is still alive after SIGKILL"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn delete_record_if_same(record: &WorkerRecord) -> Result<()> {
+    with_registry_lock(&record.session_id, || {
+        if let Some(current) = load_strict_unlocked(&record.session_id)? {
+            if current.pid == record.pid && current.generation == record.generation {
+                delete_unlocked(&record.session_id)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Signals only the process group currently registered for an unfenced session.
 pub fn terminate(session_id: &str) {
-    let terminated_pid = pid_source_for(session_id);
-    if let Some(pid) = terminated_pid {
-        crate::process::worker::terminate_process_group(pid);
-        delete_if_owned(session_id, pid).ok();
-    } else {
-        delete_if_absent(session_id).ok();
+    #[cfg(unix)]
+    {
+        let record = match signal_registered_runner_if_unfenced(session_id, None) {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(target: "acp.registry", session = %session_id, error = %error, "could not start runner termination");
+                return;
+            }
+        };
+        if let Err(error) = delete_record_if_same(&record) {
+            warn!(target: "acp.registry", session = %session_id, error = %error, "terminated runner record could not be cleared");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if is_purge_fenced(session_id).unwrap_or(true) {
+            return;
+        }
+        let terminated_pid = pid_source_for(session_id);
+        if let Some(pid) = terminated_pid {
+            crate::process::worker::terminate_process_group(pid);
+            delete_if_owned(session_id, pid).ok();
+        } else {
+            delete_if_absent(session_id).ok();
+        }
     }
 }
-/// Waits through escalation so the old process cannot clean up after the new one publishes.
+
+/// Waits for the old runner leader to exit before releasing its registry identity.
 pub async fn terminate_and_wait(session_id: &str) {
-    let terminated_pid = pid_source_for(session_id);
-    if let Some(pid) = terminated_pid {
-        crate::process::worker::terminate_process_group(pid);
-        #[cfg(unix)]
-        {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-            while is_pid_alive(pid) && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    #[cfg(unix)]
+    {
+        let record = match signal_registered_runner_if_unfenced(session_id, None) {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(target: "acp.registry", session = %session_id, error = %error, "could not start runner termination");
+                return;
             }
-            crate::process::worker::kill_process_group(pid);
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::process::worker::is_pid_alive(record.pid)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        delete_if_owned(session_id, pid).ok();
-    } else {
-        delete_if_absent(session_id).ok();
+        if crate::process::worker::is_pid_alive(record.pid) {
+            crate::process::worker::kill_process_group(record.pid);
+        }
+        if let Err(error) = delete_record_if_same(&record) {
+            warn!(target: "acp.registry", session = %session_id, error = %error, "terminated runner record could not be cleared");
+        }
     }
+    #[cfg(not(unix))]
+    {
+        if is_purge_fenced(session_id).unwrap_or(true) {
+            return;
+        }
+        let terminated_pid = pid_source_for(session_id);
+        if let Some(pid) = terminated_pid {
+            crate::process::worker::terminate_process_group(pid);
+            delete_if_owned(session_id, pid).ok();
+        } else {
+            delete_if_absent(session_id).ok();
+        }
+    }
+}
+
+/// Stop a fenced detached runner and prove its whole process group has exited.
+pub fn terminate_and_confirm_stopped(session_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        is_purge_fenced(session_id)?,
+        "ACP runner termination requires an active purge fence"
+    );
+
+    let record = load_strict_unlocked(session_id)?;
+    let recorded_identity = record
+        .as_ref()
+        .map(|record| (record.pid, record.generation));
+    let pid = record
+        .as_ref()
+        .map(|record| record.pid)
+        .or_else(|| pid_source_for(session_id));
+    let Some(pid) = pid else {
+        let registry_exists = record_path(session_id)?.exists();
+        let socket = socket_path_for(session_id)?;
+        let control_socket = crate::process::worker::control_socket_sibling(&socket);
+        anyhow::ensure!(
+            !registry_exists && !socket_exists(&socket) && !socket_exists(&control_socket),
+            "ACP runner artifacts exist but no process identity can be confirmed"
+        );
+        return Ok(());
+    };
+    anyhow::ensure!(
+        pid > 0 && pid <= i32::MAX as u32,
+        "ACP runner PID {pid} is invalid"
+    );
+
+    #[cfg(unix)]
+    wait_for_runner_group_exit_sync(pid)?;
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("cannot prove ACP runner process exit on this platform");
+    }
+
+    with_registry_lock(session_id, || {
+        if let Some(current) = load_strict_unlocked(session_id)? {
+            if let Some((recorded_pid, recorded_generation)) = recorded_identity {
+                anyhow::ensure!(
+                    current.pid == recorded_pid && current.generation == recorded_generation,
+                    "ACP registry changed while terminating the fenced runner"
+                );
+            } else {
+                anyhow::ensure!(
+                    current.pid == pid,
+                    "ACP registry changed while terminating the fenced runner"
+                );
+            }
+        }
+        delete_unlocked(session_id)?;
+        let registry_exists = record_path(session_id)?.exists();
+        let socket = socket_path_for(session_id)?;
+        let control_socket = crate::process::worker::control_socket_sibling(&socket);
+        anyhow::ensure!(
+            !registry_exists && !socket_exists(&socket) && !socket_exists(&control_socket),
+            "ACP runner registry or socket remains after confirmed process exit"
+        );
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+pub async fn terminate_orphan_and_confirm_stopped(record: WorkerRecord) -> Result<bool> {
+    let Some(current) = signal_registered_runner_if_unfenced(
+        &record.session_id,
+        Some((record.pid, record.generation)),
+    )?
+    else {
+        return Ok(false);
+    };
+    wait_for_runner_group_exit(current.pid).await?;
+    delete_record_if_same(&current)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn runner_group_alive(pid: u32) -> bool {
+    crate::process::worker::is_pid_alive(pid) || crate::process::worker::is_process_group_alive(pid)
 }
 
 pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
@@ -529,6 +828,14 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+        }
+    }
+
+    struct KillGroupOnDrop(u32);
+
+    impl Drop for KillGroupOnDrop {
+        fn drop(&mut self) {
+            crate::process::worker::kill_process_group(self.0);
         }
     }
 
@@ -719,6 +1026,43 @@ mod tests {
             terminate("term-dead");
             assert!(!record_path("term-dead").unwrap().exists());
         });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn orphan_reaper_leaves_fenced_runner_for_purge_owner() {
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn runner stand-in");
+        let pid = child.id();
+        let _kill_group = KillGroupOnDrop(pid);
+        let waiter = std::thread::spawn(move || child.wait().expect("wait for runner"));
+        let record = new_record(
+            "fenced-orphan",
+            pid,
+            socket_path_for("fenced-orphan").unwrap(),
+        )
+        .with_generation(9);
+        save(&record).unwrap();
+        fence_for_purge("fenced-orphan", "profile", 12).unwrap();
+
+        assert!(!terminate_orphan_and_confirm_stopped(record.clone())
+            .await
+            .unwrap());
+        assert!(is_pid_alive(pid));
+        assert_eq!(load("fenced-orphan").unwrap().unwrap().pid, pid);
+
+        terminate_and_confirm_stopped("fenced-orphan").unwrap();
+        assert!(!waiter.join().unwrap().success());
+        assert!(load("fenced-orphan").unwrap().is_none());
+        assert!(clear_purge_fence_if_owned("fenced-orphan", "profile", 12).unwrap());
     }
 
     #[test]

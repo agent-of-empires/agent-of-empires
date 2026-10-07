@@ -136,6 +136,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     let id = target.id.clone();
     let in_flight_turn = target.in_flight_turn;
 
+    if worker_registry::is_purge_fenced(&id).unwrap_or(true) {
+        return ResumeOutcome::SpawnFinished;
+    }
+
     // Take the lease before any preparation so a stop landing from here on is honored.
     let record = worker_registry::load(&id).ok().flatten();
     let decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
@@ -158,6 +162,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     if resume_target_for_session(&state.session_service, &id)
         .await
         .is_none()
+        || worker_registry::is_purge_fenced(&id).unwrap_or(true)
     {
         tracing::debug!(target: "acp.supervisor", session = %id, "session left the resume set after the snapshot; not resuming");
         return ResumeOutcome::SpawnFinished;

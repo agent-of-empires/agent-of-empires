@@ -38,7 +38,7 @@ pub mod update;
 pub mod url;
 pub mod worktree;
 
-pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
+pub use definition::{command_name, should_recover_lifecycle, Cli, Commands, CLI_COMMAND_NAMES};
 
 pub(crate) fn color_enabled() -> bool {
     use std::io::IsTerminal;

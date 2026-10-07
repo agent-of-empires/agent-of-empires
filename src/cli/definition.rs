@@ -345,6 +345,71 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
     })
 }
 
+pub fn should_recover_lifecycle(command: Option<&Commands>) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    if command_name(command).is_none() {
+        return false;
+    }
+
+    match command {
+        Commands::Add(_) | Commands::Remove(_) | Commands::Send(_) | Commands::Killall(_) => true,
+        Commands::Session { command } => match command {
+            SessionCommands::Import(args) => !args.dry_run,
+            command => matches!(
+                command,
+                SessionCommands::Start(_)
+                    | SessionCommands::Stop(_)
+                    | SessionCommands::Restart(_)
+                    | SessionCommands::Rename(_)
+                    | SessionCommands::SetWorktreeName(_)
+                    | SessionCommands::AddProject(_)
+                    | SessionCommands::SetSessionId(_)
+                    | SessionCommands::SetBase(_)
+                    | SessionCommands::Snooze(_)
+                    | SessionCommands::Unsnooze(_)
+                    | SessionCommands::Favorite(_)
+                    | SessionCommands::Unfavorite(_)
+                    | SessionCommands::Color(_)
+                    | SessionCommands::Archive(_)
+                    | SessionCommands::Unarchive(_)
+                    | SessionCommands::Restore(_)
+                    | SessionCommands::EmptyTrash
+            ),
+        },
+        Commands::Group { command } => !matches!(command, GroupCommands::List(_)),
+        Commands::Profile { command } => matches!(
+            command,
+            Some(
+                ProfileCommands::Create { .. }
+                    | ProfileCommands::Delete { .. }
+                    | ProfileCommands::Rename { .. }
+                    | ProfileCommands::Default { name: Some(_) }
+            )
+        ),
+        Commands::Sandbox { command } => matches!(
+            command,
+            SandboxCommands::Reclaim(args) if args.delete
+        ),
+        Commands::Worktree { command } => {
+            matches!(command, WorktreeCommands::Cleanup { force: true })
+        }
+        Commands::Acp { command } => matches!(
+            command,
+            AcpCommands::Stop { .. }
+                | AcpCommands::Kill { .. }
+                | AcpCommands::Restart { .. }
+                | AcpCommands::Prompt { .. }
+                | AcpCommands::Approve { .. }
+                | AcpCommands::Cancel { .. }
+                | AcpCommands::Attach { .. }
+                | AcpCommands::SwitchAgent { .. }
+        ),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +443,37 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["aoe", "__extract-session-id"]).expect("parse");
         assert_eq!(command_name(cli.command.as_ref().expect("command")), None);
+    }
+
+    #[test]
+    fn lifecycle_recovery_runs_only_for_mutating_session_commands() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["aoe", "list"], false),
+            (&["aoe", "status"], false),
+            (&["aoe", "ps"], false),
+            (&["aoe", "session", "show", "demo"], false),
+            (&["aoe", "session", "import", "--dry-run"], false),
+            (&["aoe", "acp", "history", "demo"], false),
+            (&["aoe", "profile", "list"], false),
+            (&["aoe", "serve"], false),
+            (&["aoe", "stop"], false),
+            (&["aoe", "__extract-session-id"], false),
+            (&["aoe", "remove", "demo"], true),
+            (&["aoe", "session", "restore", "demo"], true),
+            (&["aoe", "session", "empty-trash"], true),
+            (&["aoe", "profile", "create", "demo"], true),
+            (&["aoe", "acp", "stop", "demo"], true),
+        ];
+
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(*argv).expect("parse");
+            assert_eq!(
+                should_recover_lifecycle(cli.command.as_ref()),
+                *expected,
+                "argv {argv:?}"
+            );
+        }
+        assert!(!should_recover_lifecycle(None));
     }
 
     #[test]

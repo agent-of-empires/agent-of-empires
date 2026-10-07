@@ -99,6 +99,7 @@ pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
 pub(crate) use storage::acquire_session_identity_lock;
+pub(crate) use storage::{atomic_write_verified, sync_parent_directory};
 #[cfg(test)]
 pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};

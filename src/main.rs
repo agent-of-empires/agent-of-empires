@@ -313,7 +313,7 @@ async fn run(
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );
-        if !matches!(&cli.command, Some(Commands::Serve(_))) {
+        if cli::should_recover_lifecycle(cli.command.as_ref()) {
             match tokio::task::spawn_blocking(
                 agent_of_empires::session::deletion::recover_lifecycle_journals_once,
             )
