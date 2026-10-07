@@ -2112,6 +2112,11 @@ impl App {
     async fn perform_smart_rename(&mut self, session_id: &str) {
         use crate::acp::client::{require_daemon, HttpClient, ManagerError};
 
+        // A second request would replace the receiver and lose the first one's result.
+        if self.smart_rename_rx.is_some() {
+            self.set_status("auto-name already in progress");
+            return;
+        }
         let title = self
             .home
             .get_instance(session_id)
