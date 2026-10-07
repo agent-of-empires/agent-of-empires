@@ -279,6 +279,23 @@ fn opencode_store_fork_opens_the_child_the_store_minted() {
         launch.contains(CHILD_ID),
         "the launch must open the child the store minted; launch argv: {launch:?}"
     );
+    // The one-shot fork intent must be resolved on the row, or the session
+    // reports a fork pending for the rest of its life and never opens the child
+    // as a normal conversation.
+    let child = h
+        .read_sessions()
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["title"] == CHILD))
+        .cloned()
+        .expect("the child row");
+    assert_eq!(
+        child["agent_session_id"], CHILD_ID,
+        "the row must carry the child the store minted: {child}"
+    );
+    assert!(
+        child.get("resume_intent").is_none(),
+        "the fork intent must be resolved once the child is adopted: {child}"
+    );
 }
 
 /// With no store reachable the fork must be refused rather than started

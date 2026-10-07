@@ -249,6 +249,13 @@ impl Instance {
                 return Ok(SidWrite::Skipped);
             }
             instances[index].set_agent_conversation(Some(sid), binding, pi_session_path);
+            // The launch that follows resolves the one-shot Fork into an open
+            // conversation, so the row must record the same promotion. Leaving
+            // it as Fork would make the row report a pending fork forever, and
+            // the later finalize write cannot do it: this write already moved
+            // the row past the state that write compares against.
+            instances[index].resume_intent = ResumeIntent::Default;
+            instances[index].resume_binding = None;
             Ok(SidWrite::Applied)
         });
         match outcome {
