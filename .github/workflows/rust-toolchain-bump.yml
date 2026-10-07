@@ -71,7 +71,7 @@ jobs:
           BASE_REPO: ${{ github.repository }}
           CURRENT: ${{ steps.ver.outputs.current }}
           LATEST: ${{ steps.ver.outputs.latest }}
-          HEAD_BRANCH: chore/rust-toolchain-bump
+          HEAD_BRANCH: fix/rust-toolchain-bump
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/toolchain-editor/bin/python" .github/scripts/update-rust-toolchain.py "$LATEST"

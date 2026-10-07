@@ -2,19 +2,25 @@
 """Supply-chain checks a Dependabot PR must pass before auto-merge.
 
 Reads the PR through git only (`git diff` / `git show` on fetched commits),
-so nothing from the PR is executed. Fails closed on anything it does not
-recognise:
+so nothing from the PR is executed. Rejects unsupported file changes and
+enforces these constraints:
 
 - Only existing manifests, lockfiles and workflow/action YAML may be
   modified, plus the `npmDepsHash` line in flake.nix that
   nix-npm-hash-fix-pr.yml pushes. No file is added, deleted or renamed.
 - Manifests: only registry dependency requirements change (versions, ranges
   or npm tags), never local directories or archives.
-- npm: registry entries keep their package identity, canonical tarball and
-  integrity. New aliases require matching base dependency declarations;
-  genuinely new declarations need manual review. Links remain unchanged
-  and existing bundles change versions only. No entry gains an install script.
-- cargo: every new or changed Cargo.lock package comes from crates.io.
+- npm: new or changed non-root registry entries retain existing package
+  identity and require canonical tarball URLs and truthy integrity fields.
+  Registry integrity values are not validated or compared with the base.
+  New aliases require matching base dependency declarations. Retained links
+  must be unchanged; retained bundles may change only package and dependency
+  versions. No new or changed non-root entry gains an install script.
+  The root packages[""] entry is not directly validated.
+- cargo: existing (name, version, source) identities are not rechecked.
+  New identities require crates.io and a truthy checksum, except source-less
+  packages with a workspace name present in the base. Checksum validity or
+  preservation is not checked.
 - GitHub Actions: only uses lines change, preserving their action and placement;
   new refs pin a 40-hex SHA whose tag resolves upstream to the same commit.
 

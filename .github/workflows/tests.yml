@@ -3,16 +3,15 @@ name: Tests
 on:
   push:
     branches: [main]
-  # No branch filter: a stacked PR targets its parent branch rather than main,
-  # and a base filter would leave every PR but the bottom of the stack with no
-  # checks at all.
-  #
-  # `labeled` is listed so adding `ci-macos` starts a run that can see the
-  # label; the default types alone would leave the macOS job waiting for the
-  # next push. It re-runs the workflow on any label, which is rare enough to
-  # cost less than a macOS regression reaching main.
+  # No branch filter: stacked PRs also need checks.
+  # `labeled` starts coverage after automatic ci-macos labeling.
+  # PR concurrency replaces in-flight runs; completed work still reruns.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -232,69 +231,29 @@ jobs:
           fi
 
   cargo-macos:
-    # macOS runs on pushes to main and on demand, NOT on pull requests.
-    #
-    # Why: this workflow is concurrency-bound, not test-bound. A PR fires ~24
-    # jobs across CI + Tests for ~70 runner-minutes against a contended runner
-    # pool (measured peak concurrency 9-20), so the last job does not start
-    # until +7 to +15 min and wall clock is runner-minutes / available
-    # concurrency. This job was the single largest contributor at ~12 min and
-    # ~22 runner-minutes across its two former halves, and it is also the
-    # longest job, which floors the wall clock even when nothing queues.
-    # Moving it to the post-merge path takes it off both constraints.
-    #
-    # The tradeoff, stated plainly: a macOS-only regression is now caught on
-    # main within ~15 min of merge rather than on the PR. Every merge to main
-    # runs this, so nothing reaches a release tag unverified on macOS.
-    #
-    # The job still RUNS on pull_request (reporting success in well under a
-    # minute) because "Cargo Test (macos)" is a required status check in the
-    # main branch ruleset. A job-level `if:` would report "skipped", which the
-    # ruleset does not accept as a pass, and the merge box would wait forever.
-    # Once the context is removed from the ruleset's required-check list this
-    # job can move to its own workflow with a `push` + `schedule` trigger and
-    # drop the per-step conditions.
-    #
-    # To run it on a pull request, add the `ci-macos` label; labeler.yml adds
-    # it for macOS-sensitive paths and `target_os = "macos"` diffs. Every
-    # step below is gated on `not a PR, or that label`, so labelling runs this
-    # job for real and the required context reports a pass either way. Add it
-    # by hand for anything else filesystem-shaped:
-    # macOS resolves `/tmp` and the per-user temp root through symlinks and its
-    # `mode_t` is 16 bits, and both have already reached main unnoticed because
-    # this suite does not run here by default.
-    #
-    # Both cargo invocations share one feature set so the crate compiles once.
-    # `e2e-tests` is an empty feature whose only consumer is `required-features`
-    # on the `[[test]] name = "e2e"` target, so adding it to the --lib --bins
-    # run changes the cargo fingerprint and not one line of compiled behavior.
-    # Default features otherwise: the `web`-gated code is OS-portable and the
-    # Linux web-e2e leg runs it, so skipping it here spares the npm and Vite
-    # build on the slowest runner.
-    #
-    # The two halves of the macOS surface:
-    #  1. --lib --bins: macOS-specific code lives in src/process/macos.rs plus
-    #     `target_os = "macos"` cfgs spread across ~8 subtrees, so this is the
-    #     macOS compile gate as much as a test run. The integration crate
-    #     exercises OS-portable code the Linux legs already cover.
-    #  2. the acp live-daemon e2e modules: the structured-view
-    #     daemon -> runner -> ACP-handshake -> prompt path has genuinely
-    #     OS-divergent behavior (unix-socket sun_path limits, 104 on macOS vs
-    #     108 on Linux; /tmp vs /private/tmp resolution; setsid /
-    #     detached-spawn plus node cold-start timing). A macOS-only failure
-    #     living in the e2e crate (e.g. #1890) is outside the reach of
-    #     --lib --bins. The fake ACP agent is self-contained
-    #     (web/tests/helpers/fakeAcpAgent.mjs uses only `node:` builtins), so
-    #     no npm install is needed.
+    # Keep the required context on all PRs; unlabeled PRs emit a skip notice.
+    # Queued event payloads can predate ci-macos, so read current labels.
+    # Both Cargo steps share e2e-tests; no frontend build is needed on macOS.
     name: Cargo Test (macos)
     runs-on: macos-latest
-    # Backstop against a hung test wedging a runner for GitHub's 6h cap (#2863).
-    # A normal run finishes well inside this; a timeout turns a hang into a
-    # fast, legible failure instead of a 6h slot burn.
+    # Bound a hung test without consuming GitHub's six-hour job limit.
     timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      - name: Read current macOS coverage
+        id: macos
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: context.payload.pull_request.number,
+            });
+            core.setOutput('run', pr.labels.some(label => label.name === 'ci-macos'));
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
@@ -302,31 +261,31 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         with:
           cache-bin: "true"
           save-if: true
       - name: Install tmux
-        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         run: brew install tmux
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
-        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         with:
           tool: cargo-nextest
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         with:
           node-version: '22'
       - name: Cargo test (macOS, lib + bins)
-        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, acp live-daemon e2e)
-        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         run: cargo test --features e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
       - name: Skipped on pull requests
-        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        if: github.event_name == 'pull_request' && steps.macos.outputs.run != 'true'
         run: echo "macOS runs post-merge on main. Add the 'ci-macos' label to run it here."
 
   vitest:
