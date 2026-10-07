@@ -4,18 +4,7 @@
 // Failed teardown retains HOME and registry evidence rather than reporting success.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import {
-  existsSync,
-  mkdtempSync,
-  writeFileSync,
-  chmodSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  rmSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, chmodSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -253,98 +242,29 @@ function processSnapshot(env: NodeJS.ProcessEnv): ProcessSnapshot[] {
   });
 }
 
-/** Revoke the private lease; the runner watchdog terminates its own process group. */
 async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.ProcessEnv): Promise<void> {
   const workersDir = join(appDir, "acp-workers");
-  if (!existsSync(workersDir)) return;
   const executable = realpathSync(binary);
   const socketPrefix = `${executable} __acp-runner --socket ${workersDir}/`;
-  // A runner can unlink its record before exiting. Keep its observed group even
-  // when enumeration, reading, or lease revocation races that normal transition.
   const groups = new Set(
     processSnapshot(env)
       .filter((p) => p.pid === p.group && p.command.startsWith(socketPrefix))
       .map((p) => p.group),
   );
-  const records = readdirSync(workersDir).filter((name) => name.endsWith(".json") || name.endsWith(".json.stopping"));
-  // A runner that read its record just before the rename can save it back.
-  const revoked = new Map<string, { pid: number; generation: string }>();
-  for (const name of records) {
-    const path = join(workersDir, name);
-    let raw: string;
-    try {
-      raw = readFileSync(path, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
-    }
-    const { pid, session_id: sessionId, socket_path: socketPath } = JSON.parse(raw);
-    // JSON.parse rounds u64 epochs; preserve the decimal argument exactly.
-    const generation = raw.match(/"generation"\s*:\s*(\d+)/)?.[1];
-    const recordName = name.replace(/\.stopping$/, "");
-    if (
-      !Number.isSafeInteger(pid) ||
-      pid <= 1 ||
-      typeof sessionId !== "string" ||
-      !generation ||
-      recordName !== `${sessionId}.json` ||
-      socketPath !== join(workersDir, `${sessionId}.sock`)
-    ) {
-      throw new Error(`invalid runner identity in ${name}; retaining ${appDir}`);
-    }
-    const processes = processSnapshot(env);
-    const runner = processes.find((p) => p.pid === pid);
-    if (!runner) {
-      if (processes.some((p) => p.group === pid)) groups.add(pid);
-      continue;
-    }
-    const prefix = `${executable} __acp-runner --socket ${socketPath} --session-id ${sessionId} `;
-    if (
-      runner.group !== pid ||
-      !runner.command.startsWith(prefix) ||
-      !runner.command.split(" -- ")[0].endsWith(` --generation ${generation}`)
-    ) {
-      throw new Error(`runner ${pid} no longer matches ${name}; retaining ${appDir}`);
-    }
-    revoked.set(recordName, { pid, generation });
-    // Preserve recovery evidence until exit is observed. Never signal this numeric PID.
-    if (name === recordName) {
-      try {
-        renameSync(path, `${path}.stopping`);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-    }
-    groups.add(pid);
+  const stopped = spawnSync(binary, ["acp", "stop", "--all"], {
+    env,
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  if (stopped.status !== 0) {
+    throw new Error(`authenticated runner Stop failed; retaining ${appDir}: ${stopped.stderr}`, {
+      cause: stopped.error,
+    });
   }
-  for (const process of processSnapshot(env)) {
-    if (process.pid === process.group && process.command.startsWith(socketPrefix)) groups.add(process.group);
-  }
-  if (groups.size === 0) return;
-  // Older binaries use two 10s watchdog polls, then a bounded 2s agent shutdown.
-  const deadline = performance.now() + 25_000;
+  const deadline = performance.now() + 5_000;
   while (processSnapshot(env).some((p) => groups.has(p.group))) {
-    if (performance.now() >= deadline) throw new Error(`runner groups did not exit; retaining ${appDir}`);
-    for (const [recordName, owner] of revoked) revokeAgain(join(workersDir, recordName), owner);
+    if (performance.now() >= deadline) throw new Error(`runner groups did not exit after Stop; retaining ${appDir}`);
     await delay(50);
-  }
-}
-
-/** Rename a record the runner saved back after revocation, if it still names that runner. */
-function revokeAgain(path: string, owner: { pid: number; generation: string }): void {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
-  }
-  const { pid } = JSON.parse(raw);
-  if (pid !== owner.pid || raw.match(/"generation"\s*:\s*(\d+)/)?.[1] !== owner.generation) return;
-  try {
-    renameSync(path, `${path}.stopping`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
@@ -579,7 +499,6 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     PATH: `${shimBin}:${process.env.PATH ?? ""}`,
     // Debug-only: a contended runner under coverage can take over 10s to bind its socket.
     AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS: "60000",
-    // Teardown revokes the registry lease and waits for this runner-owned watchdog.
     AOE_ACP_WATCHDOG_POLL_MS: "100",
     FAKE_ACP_DEBUG_LOG: fakeAcpDebugLog,
     // trace adds enough I/O to cause unrelated REST flakes on CI.

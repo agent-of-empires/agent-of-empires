@@ -7,25 +7,11 @@ use serial_test::parallel;
 
 use crate::harness::{app_dir_in, require_tmux, write_executable, TuiTestHarness};
 
-/// Seed `(id, title)` rows into the default profile, pointing at a real project
-/// so recovery and restore can launch their agent. A non-empty `group` renders
-/// one selectable group row (manual grouping is the default).
-fn seed_sessions(h: &TuiTestHarness, project: &str, group: &str, rows: &[(&str, &str)]) {
-    let profile_dir = app_dir_in(h.home_path()).join("profiles").join("default");
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
-    let rows: Vec<String> = rows
+fn seed_sessions(h: &TuiTestHarness, project: &str, group: &str, titles: &[&str]) -> Vec<String> {
+    titles
         .iter()
-        .map(|(id, title)| {
-            format!(
-                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"{group}","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}}"#,
-            )
-        })
-        .collect();
-    std::fs::write(
-        profile_dir.join("sessions.json"),
-        format!("[{}]", rows.join(",")),
-    )
-    .expect("write sessions.json");
+        .map(|title| h.add_session(&[project, "-t", title, "-g", group]))
+        .collect()
 }
 
 /// The four tmux session kinds archive tears down for `session_id`.
@@ -56,19 +42,12 @@ fn test_archive_then_unarchive_cycle() {
 
     let project = h.project_path();
     // Two sessions so "cursor advances to the neighbour" is meaningful.
-    seed_sessions(
-        &h,
-        project.to_str().unwrap(),
-        "",
-        &[("arch_a", "Archivo"), ("arch_b", "Neighbor")],
-    );
+    let _ = seed_sessions(&h, project.to_str().unwrap(), "", &["Neighbor", "Archivo"]);
 
     h.spawn_tui();
     h.wait_for_ready();
     h.wait_for("Archivo");
     h.wait_for("Neighbor");
-    // Cursor starts on the top row (Archivo); give startup recovery a beat.
-    std::thread::sleep(Duration::from_millis(1200));
 
     h.send_keys("z");
     h.wait_for("Archived (");
@@ -157,16 +136,12 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     require_tmux!();
     let mut h = TuiTestHarness::new("tui_bulk_archive_group");
     let project = h.project_path();
-    // Ids distinct within 8 chars, so the truncated tmux names cannot collide.
-    let sessions = [
-        ("barch1id", "BulkAlpha"),
-        ("barch2id", "BulkBeta"),
-        ("barch3id", "BulkGamma"),
-    ];
-    seed_sessions(&h, project.to_str().unwrap(), "bulkarch", &sessions);
+    let titles = ["BulkAlpha", "BulkBeta", "BulkGamma"];
+    let sessions = seed_sessions(&h, project.to_str().unwrap(), "bulkarch", &titles);
 
     let names: Vec<String> = sessions
         .iter()
+        .zip(titles)
         .map(|(id, title)| agent_of_empires::tmux::Session::generate_name(id, title))
         .collect();
     // Pre-created under the name the instance computes, so TUI startup sees
@@ -195,9 +170,20 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     h.wait_for("Archive all 3 sessions");
     h.send_keys("y");
 
-    // Teardown is fire-and-forget, so poll for the end state.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && names.iter().any(|n| h.tmux_has_session(n)) {
+    loop {
+        let persisted = h.read_sessions();
+        let all_archived = sessions.iter().all(|id| {
+            persisted.iter().any(|row| {
+                row["id"].as_str() == Some(id.as_str())
+                    && row["archived_at"].as_str().is_some()
+                    && row["lifecycle_reservation"].is_null()
+            })
+        });
+        if all_archived && names.iter().all(|name| !h.tmux_has_session(name)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "bulk archive must persist every original row, release its Stop and terminate its panes");
         std::thread::sleep(Duration::from_millis(100));
     }
     for name in &names {

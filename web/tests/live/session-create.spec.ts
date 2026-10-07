@@ -100,7 +100,7 @@ test.describe("wizard", () => {
 // #1324
 test.describe("scratch sessions", () => {
   test("deleting a scratch session removes its scratch dir", async ({ page, spawnServe }) => {
-    const serve = await spawnServe();
+    const serve = await spawnServe({ acp: true });
     const wizard = await openWizard(page, serve);
     await pickScratch(wizard);
     await wizard.getByRole("button", { name: /Launch session/ }).click();
