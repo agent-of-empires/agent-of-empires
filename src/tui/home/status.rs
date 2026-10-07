@@ -361,6 +361,7 @@ impl HomeView {
         // worker epoch rather than a trailing post-stop event.
         if update.status != Status::Stopped && was_stopped {
             self.mutate_instance(&update.id, |inst| inst.status = Status::Idle);
+            self.rows_after_stopped_change(&update.id);
         }
         self.apply_status_update(
             StatusUpdate {

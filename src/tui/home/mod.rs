@@ -83,6 +83,13 @@ pub(super) enum DragKind {
     SettingsScrollbar,
 }
 
+/// A deletion's force level and the trash lifecycle it ran in.
+#[derive(Clone, Copy)]
+pub(super) struct DeleteAttempt {
+    pub(super) forced: bool,
+    pub(super) trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 pub(super) struct GroupRenameContext {
     pub(super) old_path: String,
     pub(super) old_profile: String,
@@ -270,6 +277,8 @@ pub struct HomeView {
     pub(super) pending_stop_terminal: Option<(String, TerminalMode)>,
     pub(super) pending_stop_tool: Option<(String, String)>,
     pub(super) pending_image_pull: Option<String>,
+    /// Checkbox keys the last submitted confirm dialog had checked.
+    pub(super) confirm_checked: Vec<&'static str>,
     pub(super) pending_switch_view_session: Option<String>,
     pub(super) pending_daemon_start_session: Option<String>,
     pub(in crate::tui) structured_preview:
@@ -311,6 +320,10 @@ pub struct HomeView {
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 
     pub(super) deletion_poller: DeletionPoller,
+    pub(super) deletes_in_flight: HashMap<String, DeleteAttempt>,
+    /// Each session's last failed deletion, so Empty Trash can escalate: a failed delete
+    /// is offered a forced retry, a failed forced delete removal from aoe without cleanup.
+    pub(super) failed_deletes: HashMap<String, DeleteAttempt>,
 
     pub(super) stop_poller: StopPoller,
     pub(super) settlement_poller: super::stop_poller::SettlementPoller,
@@ -420,6 +433,12 @@ pub struct HomeView {
     pub(super) show_preview_info: bool,
 
     pub(super) archived_section_collapsed: bool,
+
+    /// Stopped sessions inside groups are left out of the sidebar, for this run only.
+    pub(super) hide_stopped_in_groups: bool,
+    /// While stopped sessions are hidden, each group header's full count, keyed by path and
+    /// profile, so the header can show `visible/total`.
+    pub(super) group_totals: HashMap<(String, Option<String>), usize>,
 
     pub(super) trashed_section_collapsed: bool,
 

@@ -35,6 +35,7 @@ mod force_remove_tmux_teardown_e2e;
 mod fork_cli;
 mod fork_structured_e2e;
 mod hermes_shared_project_correlation_e2e;
+mod hide_stopped;
 mod intro;
 mod kiro_launch;
 mod live_send_paste_e2e;

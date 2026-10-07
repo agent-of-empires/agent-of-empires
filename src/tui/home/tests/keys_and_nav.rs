@@ -861,7 +861,8 @@ fn test_quit_confirm_dont_ask_again_persists_opt_out() {
     env.view.show_quit_confirm();
     assert!(env.view.confirm_dialog.is_some());
 
-    // Tick "don't warn me again", then confirm.
+    // Focus and tick "don't warn me again", then confirm.
+    env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Char(' ')), None);
     let action = env.view.handle_key(key(KeyCode::Char('y')), None);
 

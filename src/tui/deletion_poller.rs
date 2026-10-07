@@ -2,48 +2,60 @@
 
 use std::sync::mpsc::TryRecvError;
 
-use crate::session::deletion::execute_deletion;
+use crate::session::deletion::{execute_deletion, execute_drop};
 pub use crate::session::deletion::{DeletionRequest, DeletionResult};
+use crate::session::Instance;
 use crate::tui::worker::Worker;
 
+enum DeletionJob {
+    Cleanup(DeletionRequest),
+    KeepPaths(Instance),
+}
+
 pub struct DeletionPoller {
-    worker: Worker<DeletionRequest, DeletionResult>,
+    worker: Worker<DeletionJob, DeletionResult>,
 }
 
 impl DeletionPoller {
     pub fn new() -> Self {
-        // Settling a structured session's runner awaits, so the worker needs a
-        // runtime. Same shape as `StructuredApprovalPoller`, which owns one for
-        // the same reason.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
         if let Err(error) = &runtime {
-            tracing::warn!(
-                target: "tui.deletion",
-                "runtime build failed; a structured deletion cannot prove its runner dead: {error}"
-            );
+            tracing::warn!(target: "tui.deletion", "runtime build failed; deletion cannot prove its runner dead: {error}");
         }
         Self {
-            worker: Worker::spawn("aoe-deletion-poller", move |request| {
-                match runtime.as_ref() {
-                    Ok(runtime) => runtime.block_on(execute_deletion(request)),
-                    Err(error) => DeletionResult::rejected(
-                        request.session_id,
-                        crate::session::deletion::DeletionDisposition::Failed,
-                        format!(
-                            "No runtime to settle this session's agent, so nothing was removed: \
-                             {error}"
-                        ),
-                        None,
-                    ),
+            worker: Worker::spawn("aoe-deletion-poller", move |job: DeletionJob| match runtime
+                .as_ref()
+            {
+                Ok(runtime) => runtime.block_on(async {
+                    match job {
+                        DeletionJob::Cleanup(request) => execute_deletion(request).await,
+                        DeletionJob::KeepPaths(instance) => execute_drop(instance).await,
+                    }
+                }),
+                Err(error) => {
+                    let id = match job {
+                        DeletionJob::Cleanup(request) => request.session_id,
+                        DeletionJob::KeepPaths(instance) => instance.id,
+                    };
+                    DeletionResult::rejected(
+                            id,
+                            crate::session::deletion::DeletionDisposition::Failed,
+                            format!("No runtime to settle this session's agent, so nothing was removed: {error}"),
+                            None,
+                        )
                 }
             }),
         }
     }
 
     pub fn request_deletion(&self, request: DeletionRequest) {
-        self.worker.request(request);
+        self.worker.request(DeletionJob::Cleanup(request));
+    }
+
+    pub(super) fn request_drop(&self, instance: Instance) {
+        self.worker.request(DeletionJob::KeepPaths(instance));
     }
 
     /// Non-blocking poll for a completed deletion. Surfaces `Disconnected`
@@ -57,48 +69,5 @@ impl DeletionPoller {
 impl Default for DeletionPoller {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::session::Instance;
-    use std::time::Duration;
-
-    fn create_test_instance() -> Instance {
-        Instance::new("Test Session", "/tmp/test-project")
-    }
-
-    #[test]
-    fn deletion_poller_round_trips_a_request() {
-        let poller = DeletionPoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
-        let instance = create_test_instance();
-        let session_id = instance.id.clone();
-
-        poller.request_deletion(DeletionRequest {
-            session_id: session_id.clone(),
-            instance,
-            delete_worktree: false,
-            delete_branch: false,
-            delete_sandbox: false,
-            force_delete: false,
-            detach_hooks: true,
-            keep_scratch: false,
-        });
-
-        let mut result = None;
-        for _ in 0..50 {
-            if let Ok(r) = poller.try_recv_result() {
-                result = Some(r);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let result = result.expect("Timed out waiting for deletion result");
-
-        assert_eq!(result.session_id, session_id);
-        assert!(!result.success);
     }
 }

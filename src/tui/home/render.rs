@@ -1607,6 +1607,7 @@ impl HomeView {
                 collapsed,
                 session_count,
                 archived_at,
+                profile,
                 ..
             } => {
                 let icon = if *collapsed {
@@ -1628,6 +1629,14 @@ impl HomeView {
                     Some(ICON_ARCHIVED_SECTION)
                 } else {
                     None
+                };
+                // While stopped sessions are hidden, a header that lost some reads `shown/total`.
+                let total = (!self.group_totals.is_empty())
+                    .then(|| self.group_totals.get(&(path.clone(), profile.clone())))
+                    .flatten();
+                let session_count = match total {
+                    Some(total) if total > session_count => format!("{session_count}/{total}"),
+                    _ => session_count.to_string(),
                 };
                 let text = if let Some(glyph) = section_glyph {
                     Cow::Owned(format!("{} {} ({})", glyph, name, session_count))

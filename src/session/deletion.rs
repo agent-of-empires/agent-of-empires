@@ -71,11 +71,18 @@ pub enum PurgeReservation {
     Rejected(DeletionResult),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PurgeCleanup {
+    All,
+    SidecarsOnly,
+}
+
 /// Owned purge transition.
 pub struct PurgeTransaction {
     storage: Storage,
     original: std::sync::Arc<crate::session::LaunchOrigin>,
     request: DeletionRequest,
+    cleanup: PurgeCleanup,
     was_trashed: bool,
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
@@ -93,6 +100,7 @@ pub struct PurgeTransaction {
 #[must_use = "committed purge sidecars must be finished"]
 pub struct CommittedPurge {
     request: DeletionRequest,
+    cleanup: PurgeCleanup,
     _lifecycle_lock: StorageFlock,
     _identity_lock: Option<StorageFlock>,
     _workspace_claim_lock: StorageFlock,
@@ -128,7 +136,15 @@ impl PurgeTransaction {
         Self::reserve(storage.as_ref().clone(), request)
     }
 
-    pub fn reserve(storage: Storage, mut request: DeletionRequest) -> Result<PurgeReservation> {
+    pub fn reserve(storage: Storage, request: DeletionRequest) -> Result<PurgeReservation> {
+        Self::reserve_with_cleanup(storage, request, PurgeCleanup::All)
+    }
+
+    fn reserve_with_cleanup(
+        storage: Storage,
+        mut request: DeletionRequest,
+        cleanup: PurgeCleanup,
+    ) -> Result<PurgeReservation> {
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
         let workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
@@ -141,6 +157,8 @@ impl PurgeTransaction {
         origin.verify_profile_identity()?;
         let original = crate::session::LaunchOrigin::capture(&request.instance)?;
         storage.verify_profile_identity()?;
+        let expected_trashed_at = request.instance.trashed_at;
+        let mut lifecycle_changed = false;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
@@ -149,6 +167,16 @@ impl PurgeTransaction {
         let mut rejected = None;
         storage.update_under_workspace_claim_lock(|instances, _groups| {
             if let Some(stored) = instances.iter().find(|instance| instance.id == id) {
+                if cleanup == PurgeCleanup::SidecarsOnly
+                    && (expected_trashed_at.is_none() || stored.trashed_at != expected_trashed_at)
+                {
+                    rejected = Some((
+                        DeletionDisposition::KeptRestored,
+                        "The original trash lifecycle changed, so the session was kept".to_owned(),
+                        Some(stored.clone()),
+                    ));
+                    return Ok(());
+                }
                 if original
                     .validate_baseline_at(stored, original.generation())
                     .is_err()
@@ -200,6 +228,7 @@ impl PurgeTransaction {
                 .iter_mut()
                 .find(|instance| instance.id == id)
                 .expect("reserved purge row must still exist");
+            lifecycle_changed = was_trashed && stored.trashed_at != expected_trashed_at;
             let mut snapshot = stored.clone();
             snapshot.source_profile = storage.profile().to_string();
             reserved = Some((generation, snapshot));
@@ -217,10 +246,16 @@ impl PurgeTransaction {
         let (generation, snapshot) =
             reserved.ok_or_else(|| anyhow::anyhow!("purge reservation produced no outcome"))?;
         request.instance = snapshot;
+        // A force chosen against an earlier trash lifecycle (a peer restored and re-trashed
+        // the row since) must not skip the dirty-worktree guard for the new one.
+        if lifecycle_changed {
+            request.force_delete = false;
+        }
         Ok(PurgeReservation::Reserved(Self {
             storage,
             original,
             request,
+            cleanup,
             was_trashed,
             workspace_claim_lock: Some(workspace_claim_lock),
             generation,
@@ -260,7 +295,7 @@ impl PurgeTransaction {
     }
 
     fn ownership_error(&mut self) -> Option<String> {
-        if !self.request.needs_path_inventory() {
+        if self.cleanup == PurgeCleanup::SidecarsOnly || !self.request.needs_path_inventory() {
             return None;
         }
         if let Some(verdict) = &self.ownership_verdict {
@@ -390,7 +425,8 @@ impl PurgeTransaction {
                 let restored = crate::session::claim::purge_restored_row_must_be_kept(
                     was_trashed,
                     stored.is_trashed(),
-                );
+                ) || (self.cleanup == PurgeCleanup::SidecarsOnly
+                    && stored.trashed_at != self.request.instance.trashed_at);
                 let owns =
                     stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
                 let gate = if restored {
@@ -481,10 +517,23 @@ impl PurgeTransaction {
                     commit = Some((CompletionGate::AlreadyGone, None));
                     return Ok(());
                 };
+                if self
+                    .original
+                    .validate_baseline_at(&instances[index], generation)
+                    .is_err()
+                    && self
+                        .original
+                        .validate_restored_at(&instances[index], generation)
+                        .is_err()
+                {
+                    commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
+                    return Ok(());
+                }
                 let restored = crate::session::claim::purge_restored_row_must_be_kept(
                     was_trashed,
                     instances[index].is_trashed(),
-                );
+                ) || (self.cleanup == PurgeCleanup::SidecarsOnly
+                    && instances[index].trashed_at != self.request.instance.trashed_at);
                 let owns = instances[index]
                     .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
                 if restored {
@@ -539,6 +588,7 @@ impl PurgeTransaction {
                 detach_hooks: self.request.detach_hooks,
                 keep_scratch: self.request.keep_scratch,
             },
+            cleanup: self.cleanup,
             _workspace_claim_lock: self
                 .workspace_claim_lock
                 .take()
@@ -692,7 +742,10 @@ impl CommittedPurge {
     /// Clean up resources while retaining the lifecycle flock that covered the
     /// irreversible durable-row removal.
     pub fn finish(self) -> DeletionResult {
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request, true);
+        let mut result = match self.cleanup {
+            PurgeCleanup::All => perform_deletion_teardown_lifecycle_locked(&self.request, true),
+            PurgeCleanup::SidecarsOnly => perform_deletion_sidecars(&self.request),
+        };
         result.disposition = DeletionDisposition::Removed;
         result
     }
@@ -781,37 +834,89 @@ async fn settle_runner_of_owned(
 }
 
 pub async fn execute_deletion(request: DeletionRequest) -> DeletionResult {
+    execute_deletion_with_cleanup(request, PurgeCleanup::All).await
+}
+
+pub(crate) async fn execute_drop(instance: Instance) -> DeletionResult {
+    let request = DeletionRequest {
+        session_id: instance.id.clone(),
+        instance,
+        delete_worktree: false,
+        delete_branch: false,
+        delete_sandbox: true,
+        force_delete: true,
+        detach_hooks: true,
+        keep_scratch: true,
+    };
+    execute_deletion_with_cleanup(request, PurgeCleanup::SidecarsOnly).await
+}
+
+async fn execute_deletion_with_cleanup(
+    request: DeletionRequest,
+    cleanup: PurgeCleanup,
+) -> DeletionResult {
     let id = request.session_id.clone();
     let recent_entry = crate::session::recent_project_entry_for(&request.instance);
-    // A structured session's runner has to be proven dead before the hooks run
-    // and before anything removes its checkout, on this surface as on the daemon
-    // one. `on_destroy` scripts are the user's and are not idempotent, so the
-    // refusal has to arrive before they play.
-    let settled = match PurgeTransaction::reserve_unwatched(request) {
+    let reserved = (|| {
+        let storage = request.instance.original_storage()?;
+        PurgeTransaction::reserve_with_cleanup(storage.as_ref().clone(), request, cleanup)
+    })();
+    let settled = match reserved {
         Ok(PurgeReservation::Reserved(transaction)) => settle_runner_of(transaction).await,
         Ok(PurgeReservation::Rejected(result)) => Err(Box::new(result)),
         Err(error) => Err(Box::new(DeletionResult::rejected(
-            id.clone(),
+            id,
             DeletionDisposition::Failed,
             format!("Could not reserve session deletion: {error}"),
             None,
         ))),
     };
     let result = match settled {
+        Ok(transaction) if cleanup == PurgeCleanup::SidecarsOnly => {
+            match transaction.begin_irreversible() {
+                Ok(committed) => committed.finish(),
+                Err(result) => *result,
+            }
+        }
         Ok(transaction) => transaction.run_hooks().complete(),
         Err(result) => *result,
     };
     if result.disposition == DeletionDisposition::Removed {
         if let Some(entry) = recent_entry {
             if let Err(error) = crate::session::record_recent_project(entry) {
-                tracing::warn!(
-                    target: "session.delete",
-                    "recording recent project after delete failed: {error}"
-                );
+                tracing::warn!(target: "session.delete", "recording recent project after delete failed: {error}");
             }
         }
     }
     result
+}
+
+fn perform_deletion_sidecars(request: &DeletionRequest) -> DeletionResult {
+    request.instance.kill_all_tmux_sessions_locked();
+    let mut messages = Vec::new();
+    let mut errors = Vec::new();
+    if request.delete_sandbox
+        && request
+            .instance
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|s| s.enabled)
+    {
+        deletion_messages_for(
+            default_teardown(&request.session_id),
+            &mut messages,
+            &mut errors,
+        );
+    }
+    DeletionResult {
+        session_id: request.session_id.clone(),
+        success: errors.is_empty(),
+        messages,
+        errors,
+        disposition: DeletionDisposition::Removed,
+        teardown_started: true,
+        retained_instance: None,
+    }
 }
 
 /// Whether `workspace_dir` has the workspace layout AoE creates and may therefore be removed once
@@ -2822,18 +2927,92 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn drop_retains_unknown_history_and_changed_trash_lifecycles() {
+        let _guard = isolate_app_dir();
+        let artifact = tempfile::TempDir::new().unwrap();
+        let sentinel = artifact.path().join("retained");
+        std::fs::write(&sentinel, b"original artifact").unwrap();
+        for (profile, change, expected) in [
+            ("drop-unknown", 0, DeletionDisposition::Failed),
+            ("drop-restored", 1, DeletionDisposition::KeptRestored),
+            ("drop-retrashed", 2, DeletionDisposition::KeptRestored),
+        ] {
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let original = stored_instance(&storage, profile, artifact.path().to_str().unwrap());
+            storage
+                .update(|instances, _| {
+                    instances[0].trash();
+                    instances[0].runner_journal = Default::default();
+                    Ok(())
+                })
+                .unwrap();
+            let requested = storage.load().unwrap().remove(0);
+            storage
+                .update(|instances, _| {
+                    match change {
+                        1 => instances[0].trashed_at = None,
+                        2 => {
+                            instances[0].trashed_at = requested
+                                .trashed_at
+                                .map(|at| at + chrono::Duration::microseconds(1))
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let before = storage.load().unwrap().remove(0);
+            let result = execute_drop(requested).await;
+            assert_eq!(result.disposition, expected, "{profile}");
+            let retained = storage.load().unwrap().remove(0);
+            assert_eq!(
+                (retained.id, retained.created_at),
+                (original.id, original.created_at)
+            );
+            assert_eq!(retained.trashed_at, before.trashed_at);
+            assert!(retained.lifecycle_reservation.is_none());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"original artifact");
+        }
+    }
+
+    /// A force chosen against an earlier trash lifecycle is dropped at the claim, so a row
+    /// a peer restored and re-trashed keeps its dirty-worktree guard.
     #[test]
-    fn deletion_without_artifacts_succeeds_and_keeps_session_id() {
-        let _app_guard = isolate_app_dir();
-        for delete_worktree in [false, true] {
-            let request = DeletionRequest {
-                session_id: "custom-session-id-123".to_string(),
-                delete_worktree,
-                ..request(Instance::new("Test Session", "/tmp/test-project"))
+    #[serial]
+    fn purge_claim_drops_force_from_a_stale_trash_lifecycle() {
+        let _guard = isolate_app_dir();
+        let earlier = chrono::Utc::now() - chrono::Duration::minutes(5);
+        // (profile, lifecycle the request was chosen against matches the stored one)
+        for (profile, same_lifecycle) in [("purge-stale-force", false), ("purge-same-force", true)]
+        {
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut requested = stored_instance(&storage, profile, "/tmp/test-project");
+            let trashed_at = chrono::Utc::now();
+            storage
+                .update(|instances, _groups| {
+                    instances[0].trashed_at = Some(trashed_at);
+                    Ok(())
+                })
+                .unwrap();
+            requested.trashed_at = Some(if same_lifecycle { trashed_at } else { earlier });
+            let transaction = match PurgeTransaction::reserve(
+                storage,
+                DeletionRequest {
+                    force_delete: true,
+                    ..request(requested)
+                },
+            )
+            .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
             };
-            let result = perform_deletion(&request);
-            assert!(result.success && result.errors.is_empty());
-            assert_eq!(result.session_id, "custom-session-id-123");
+            assert_eq!(
+                transaction.request.force_delete, same_lifecycle,
+                "{profile}"
+            );
         }
     }
 

@@ -29,6 +29,10 @@ use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
 
+/// Empty Trash checkbox keys.
+const EMPTY_TRASH_FORCE_FAILED: &str = "force_failed";
+const EMPTY_TRASH_DROP_FAILED: &str = "drop_failed";
+
 /// Longest gap between two left-clicks on one row that still counts as a double-click;
 /// 400ms matches most desktop environments.
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
@@ -1046,7 +1050,11 @@ impl HomeView {
                 None
             }
             "empty_trash" => {
-                self.empty_trash_all();
+                let checked = std::mem::take(&mut self.confirm_checked);
+                self.empty_trash_all(
+                    checked.contains(&EMPTY_TRASH_FORCE_FAILED),
+                    checked.contains(&EMPTY_TRASH_DROP_FAILED),
+                );
                 None
             }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
@@ -1086,9 +1094,20 @@ impl HomeView {
 
     /// Confirm before permanently purging every trashed session. The purge is
     /// irreversible, so it keeps the destructive red tone; an already-empty trash gets an
-    /// info dialog instead of a confirm that would delete nothing.
+    /// info dialog instead of a confirm that would delete nothing. Rows whose last delete
+    /// failed get an opt-in escalation: forced delete, then removal from aoe.
     pub(super) fn prompt_empty_trash(&mut self) {
-        let count = self.instances.values().filter(|i| i.is_trashed()).count();
+        let mut count = 0;
+        let mut failed = 0;
+        let mut failed_forced = 0;
+        for inst in self.instances.values().filter(|i| i.is_trashed()) {
+            count += 1;
+            match self.failed_delete_forced(inst) {
+                Some(false) => failed += 1,
+                Some(true) => failed_forced += 1,
+                None => {}
+            }
+        }
         if count == 0 {
             self.info_dialog = Some(InfoDialog::new(
                 "Trash is empty",
@@ -1097,11 +1116,27 @@ impl HomeView {
             return;
         }
         let noun = if count == 1 { "session" } else { "sessions" };
-        self.confirm_dialog = Some(ConfirmDialog::new(
-            "Empty Trash",
-            &format!("Permanently delete {count} trashed {noun}? This cannot be undone."),
-            "empty_trash",
-        ));
+        let mut message =
+            format!("Permanently delete {count} trashed {noun}? This cannot be undone.");
+        if failed_forced > 0 {
+            message.push_str(
+                "\n\nRemoving from aoe skips cleanup: worktrees and branches stay on disk.",
+            );
+        }
+        let mut dialog = ConfirmDialog::new("Empty Trash", &message, "empty_trash");
+        if failed > 0 {
+            dialog = dialog.checkbox(
+                EMPTY_TRASH_FORCE_FAILED,
+                &format!("Force delete {failed} that failed before"),
+            );
+        }
+        if failed_forced > 0 {
+            dialog = dialog.checkbox(
+                EMPTY_TRASH_DROP_FAILED,
+                &format!("Remove {failed_forced} from aoe that failed a forced delete"),
+            );
+        }
+        self.confirm_dialog = Some(dialog);
     }
 
     /// Confirm before archiving every active session under the focused group: a whole
@@ -1350,6 +1385,7 @@ impl HomeView {
                     }
                     DialogResult::Submit(()) => {
                         let dont_ask_again = dialog.dont_ask_again();
+                        self.confirm_checked = dialog.checked_keys();
                         self.confirm_dialog = None;
                         if self.settings_close_confirm {
                             // Discard runs the keyboard path's exact sequence, theme
@@ -2138,6 +2174,7 @@ impl HomeView {
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
                     let dont_ask_again = dialog.dont_ask_again();
+                    self.confirm_checked = dialog.checked_keys();
                     self.confirm_dialog = None;
                     if dont_ask_again {
                         self.apply_confirm_dont_ask_again(&action);
@@ -2833,6 +2870,7 @@ impl HomeView {
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
+            ActionId::ToggleHideStopped => self.toggle_hide_stopped_in_groups(),
             ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
             ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
@@ -2841,6 +2879,7 @@ impl HomeView {
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
+            ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
         }
         None
@@ -3934,6 +3973,7 @@ impl HomeView {
                 if visible_sessions.contains(&inst.id)
                     || current_session.as_deref() == Some(inst.id.as_str())
                     || inst.is_dismissed()
+                    || self.hidden_by_filter(inst)
                 {
                     return false;
                 }
@@ -4179,6 +4219,12 @@ impl HomeView {
                     }
                 }
             }
+            if let Some(header) = self.header_row_for_hidden_session(&sid) {
+                self.cursor = header;
+                self.update_selected();
+                self.context_menu = None;
+                return;
+            }
         }
         if self.flat_items.is_empty() {
             self.cursor = 0;
@@ -4194,7 +4240,7 @@ impl HomeView {
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
-            self.flat_items = self.build_flat_items();
+            self.refresh_flat_items();
             self.update_search();
         } else {
             self.rebuild_flat_items();
@@ -4208,7 +4254,7 @@ impl HomeView {
         }
     }
 
-    fn apply_group_by(&mut self, new_mode: GroupByMode) {
+    pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
@@ -5196,8 +5242,9 @@ impl HomeView {
     /// Open the delete dialog (or a force-remove confirm, or the group delete-options
     /// dialog) for the current selection, mirroring the `'d'` / `'D'` gating: Terminal
     /// view rejects deletion with an info dialog, Creating sessions are inert,
-    /// stuck-Deleting sessions get a force-remove confirm, and Project and organization
-    /// groups can't be deleted. Shared by the keys and the context menu.
+    /// stuck-Deleting sessions get a force-remove confirm, Project and organization
+    /// groups can't be deleted, and the Trash header offers to empty the trash. Shared by
+    /// the keys and the context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
         // Deletion only allowed in Structured View.
         if self.view_mode == ViewMode::Terminal {
@@ -5336,6 +5383,8 @@ impl HomeView {
                 self.confirm_dialog =
                     Some(ConfirmDialog::new("Delete Group", &message, "delete_group"));
             }
+        } else if matches!(self.section_at_cursor(), Some(SidebarSection::Trash)) {
+            self.prompt_empty_trash();
         }
     }
 
@@ -6076,6 +6125,36 @@ impl HomeView {
         }
     }
 
+    /// End live-send when a rebuild has left its target hidden by the `y` filter, whatever
+    /// changed (its status, the sort, the grouping, its group): a stopped session's terminal
+    /// can outlive its agent, and keys must not reach a pane the list no longer shows. The
+    /// selection is left for the caller's rebuild to settle.
+    pub(super) fn end_live_send_if_hidden(&mut self) {
+        let Some(state) = self.live_send.as_ref() else {
+            return;
+        };
+        if !self
+            .get_instance(&state.session_id)
+            .is_some_and(|inst| self.hidden_by_filter(inst))
+        {
+            return;
+        }
+        let selection = (
+            self.cursor,
+            self.selected_session.clone(),
+            self.selected_group.clone(),
+            self.selected_group_profile.clone(),
+        );
+        self.teardown_live_send();
+        (
+            self.cursor,
+            self.selected_session,
+            self.selected_group,
+            self.selected_group_profile,
+        ) = selection;
+        self.flash_status("Live send ended: its session is hidden (y to show)");
+    }
+
     pub(super) fn teardown_live_send(&mut self) {
         let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
@@ -6407,7 +6486,7 @@ impl HomeView {
     /// `search_matches` keeps stale indices, and `n`/`N` jumps to the wrong sessions
     /// (#2676).
     pub(super) fn rebuild_flat_items(&mut self) {
-        self.flat_items = self.build_flat_items();
+        self.refresh_flat_items();
         if !self.search_matches.is_empty() {
             self.refresh_search_matches();
         }

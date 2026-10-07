@@ -331,6 +331,7 @@ impl HomeView {
             pending_stop_terminal: None,
             pending_stop_tool: None,
             pending_image_pull: None,
+            confirm_checked: Vec::new(),
             pending_switch_view_session: None,
             pending_daemon_start_session: None,
             structured_preview: None,
@@ -369,6 +370,8 @@ impl HomeView {
             daemon_sidebar: resolved.session.daemon_sidebar,
             sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
             deletion_poller: DeletionPoller::new(),
+            deletes_in_flight: HashMap::new(),
+            failed_deletes: HashMap::new(),
             stop_poller: StopPoller::new(),
             settlement_poller: crate::tui::stop_poller::SettlementPoller::new()?,
             settlement_in_flight: std::collections::HashMap::new(),
@@ -449,6 +452,8 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
+            hide_stopped_in_groups: false,
+            group_totals: HashMap::new(),
             recovery_rx: None,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
@@ -562,7 +567,7 @@ impl HomeView {
         }
 
         view.refresh_registered_projects();
-        view.flat_items = view.build_flat_items();
+        view.refresh_flat_items();
         view.update_selected();
         // Disk subscriptions stay scoped to the loaded storages: in single-profile mode
         // the user opted into that profile's instance state only. Sorted so the

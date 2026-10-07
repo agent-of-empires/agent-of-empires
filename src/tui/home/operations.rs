@@ -732,7 +732,7 @@ impl HomeView {
                     detach_hooks: true,
                     keep_scratch: options.keep_scratch,
                 };
-                self.deletion_poller.request_deletion(request);
+                self.request_deletion(request);
             }
         }
         Ok(())
@@ -915,7 +915,7 @@ impl HomeView {
                         .sandbox_info
                         .as_ref()
                         .is_some_and(|sandbox| sandbox.enabled);
-                self.deletion_poller.request_deletion(DeletionRequest {
+                self.request_deletion(DeletionRequest {
                     session_id,
                     instance,
                     delete_worktree,
@@ -937,7 +937,7 @@ impl HomeView {
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
         self.set_instance_status(session_id, Status::Deleting);
         if let Some(instance) = self.instances.get(session_id).cloned() {
-            self.deletion_poller.request_deletion(DeletionRequest {
+            self.request_deletion(DeletionRequest {
                 session_id: session_id.to_owned(),
                 instance,
                 delete_worktree: false,
@@ -949,6 +949,42 @@ impl HomeView {
             });
         }
         Ok(())
+    }
+
+    pub(super) fn request_deletion(&mut self, request: DeletionRequest) {
+        self.deletes_in_flight.insert(
+            request.session_id.clone(),
+            super::DeleteAttempt {
+                forced: request.force_delete,
+                trashed_at: request.instance.trashed_at,
+            },
+        );
+        self.deletion_poller.request_deletion(request);
+    }
+
+    /// Whether a trashed row's last delete was forced, when it failed in the row's current
+    /// trash lifecycle and no other delete for it is in flight.
+    pub(super) fn failed_delete_forced(&self, inst: &Instance) -> Option<bool> {
+        if self.deletes_in_flight.contains_key(&inst.id) {
+            return None;
+        }
+        self.failed_deletes
+            .get(&inst.id)
+            .filter(|attempt| inst.trashed_at.is_some() && attempt.trashed_at == inst.trashed_at)
+            .map(|attempt| attempt.forced)
+    }
+
+    /// Retain filesystem artifacts while the canonical Purge worker settles the original.
+    fn drop_failed_trashed_session(&mut self, inst: &Instance) {
+        self.deletes_in_flight.insert(
+            inst.id.clone(),
+            super::DeleteAttempt {
+                forced: true,
+                trashed_at: inst.trashed_at,
+            },
+        );
+        self.set_instance_status(&inst.id, Status::Deleting);
+        self.deletion_poller.request_drop(inst.clone());
     }
 
     pub(super) fn group_has_managed_worktrees(
@@ -2171,10 +2207,14 @@ impl HomeView {
                     )
                     .map_err(anyhow::Error::new)?;
                 stored.trash();
-                Ok((generation, stored.lifecycle_reservation.clone()))
+                Ok((
+                    generation,
+                    stored.lifecycle_reservation.clone(),
+                    stored.trashed_at,
+                ))
             })
         })();
-        let (generation, reservation) = match acquisition {
+        let (generation, reservation, trashed_at) = match acquisition {
             Ok(acquired) => acquired,
             Err(error) => {
                 tracing::warn!(target: "tui.session", session = %id, "trash failed: {error}");
@@ -2182,11 +2222,12 @@ impl HomeView {
             }
         };
 
-        request_instance.trash();
+        // Copy the durable stamp so later lifecycle checks match the stored row.
+        request_instance.trashed_at = trashed_at;
         request_instance.lifecycle_generation = generation;
         request_instance.lifecycle_reservation = reservation.clone();
         if let Some(instance) = self.instances.get_mut(id) {
-            instance.trash();
+            instance.trashed_at = trashed_at;
             instance.lifecycle_generation = generation;
             instance.lifecycle_reservation = reservation;
         }
@@ -2320,8 +2361,10 @@ impl HomeView {
     /// Permanently purge every trashed session, reached only after the confirm dialog.
     /// Each row runs the same off-thread deletion path as a single permanent delete, with
     /// cleanup options resolved per row from its repo config (mirroring the CLI
-    /// `empty-trash`) and force removal so a dirty worktree cannot pin a row.
-    pub(super) fn empty_trash_all(&mut self) {
+    /// `empty-trash`). A row whose last delete failed is forced when `force_failed`, and
+    /// one whose forced delete failed is removed from aoe without cleanup when
+    /// `drop_failed`; otherwise each retries at its previous level.
+    pub(super) fn empty_trash_all(&mut self, force_failed: bool, drop_failed: bool) {
         let mut trashed: Vec<Instance> = self
             .instances
             .values()
@@ -2335,10 +2378,21 @@ impl HomeView {
         for inst in trashed {
             let id = inst.id.clone();
             // A restart cascade still on the worker would race the teardown against the
-            // container it is creating; skip the row, as `delete_selected` does.
-            if self.restart_in_flight.contains_key(&id) {
+            // container it is creating; skip the row, as `delete_selected` does. A second
+            // delete would also overwrite the force level tracked for the first.
+            if self.restart_in_flight.contains_key(&id) || self.deletes_in_flight.contains_key(&id)
+            {
                 continue;
             }
+            let force_delete = match self.failed_delete_forced(&inst) {
+                None => false,
+                Some(false) => force_failed,
+                Some(true) if drop_failed => {
+                    self.drop_failed_trashed_session(&inst);
+                    continue;
+                }
+                Some(true) => true,
+            };
 
             self.set_instance_status(&id, Status::Deleting);
 
@@ -2352,13 +2406,13 @@ impl HomeView {
             let delete_sandbox = inst.sandbox_info.as_ref().is_some_and(|s| s.enabled)
                 && config.sandbox.auto_cleanup;
 
-            self.deletion_poller.request_deletion(DeletionRequest {
+            self.request_deletion(DeletionRequest {
                 session_id: id.clone(),
                 instance: inst.clone(),
                 delete_worktree,
                 delete_branch,
                 delete_sandbox,
-                force_delete: true,
+                force_delete,
                 detach_hooks: true,
                 keep_scratch: false,
             });
