@@ -15,7 +15,7 @@ import type {
   DockerStatusResponse,
   CreateProgress,
   CreateSessionRequest,
-  ClaudeSessionSummary,
+  ImportableSession,
   SettingsFieldDescriptor,
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
@@ -1325,9 +1325,29 @@ export async function fetchProjects(scope?: "global" | "profile"): Promise<Proje
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];
 }
 
-/** Claude Code sessions on disk, newest first, for the import picker. */
-export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
-  return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
+export type ImportableSessionsResult =
+  | { ok: true; sessions: ImportableSession[]; truncated: boolean }
+  | { ok: false; error: string; message: string };
+
+/** Native sessions `agent` can import under `profile`, newest first, for the import picker. */
+export async function listImportableSessions(agent: string, profile?: string): Promise<ImportableSessionsResult> {
+  const params = new URLSearchParams({ agent });
+  if (profile) params.set("profile", profile);
+  const reply = await send(`/api/importable-sessions?${params}`).catch(() => null);
+  if (!reply) return { ok: false, error: "network", message: "Network error" };
+  const payload = reply.payload ?? {};
+  if (!reply.ok) {
+    return {
+      ok: false,
+      error: typeof payload.error === "string" ? payload.error : "server_error",
+      message: typeof payload.message === "string" ? payload.message : `Server error (${reply.status})`,
+    };
+  }
+  return {
+    ok: true,
+    sessions: (payload.sessions as ImportableSession[] | undefined) ?? [],
+    truncated: payload.truncated === true,
+  };
 }
 
 /** Error bodies may be JSON `{message}` or plain text. */

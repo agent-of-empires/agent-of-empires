@@ -43,6 +43,7 @@ mod logs;
 mod new_session;
 mod opencode_preassign_no_runtime_panic;
 mod permission_response_e2e;
+mod pi_fork_e2e;
 mod pinned_session_id_e2e;
 mod plugin_command_executor_e2e;
 mod plugins;

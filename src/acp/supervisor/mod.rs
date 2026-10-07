@@ -31,6 +31,7 @@ use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
 
 pub(crate) use agents::apply_agent_command_override;
+pub(crate) use launch::host_spawn_environment;
 pub use sink::{BroadcastSink, ChannelSink};
 
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.

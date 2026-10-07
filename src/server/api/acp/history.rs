@@ -1,5 +1,5 @@
 //! Read endpoints: transcript replay, context primer, workspace files, worker
-//! log, and importable Claude sessions.
+//! log, and importable native sessions.
 
 use serde::{Deserialize, Serialize};
 
@@ -281,50 +281,77 @@ pub async fn acp_replay(
     .into_response()
 }
 
-/// Claude Code sessions on disk for the import picker, newest first. Blocked in
-/// read-only mode: it exposes titles and paths outside AoE state (#2276).
-pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[derive(Debug, Deserialize)]
+pub struct ImportableSessionsQuery {
+    pub agent: String,
+    /// The wizard's selected profile, so the list reads the store create will re-list from.
+    pub profile: Option<String>,
+}
+
+/// Native sessions `agent` can import, newest first, minus the ones AoE owns. Claude reads its
+/// disk store; any other built-in agent answers ACP `session/list`.
+pub(crate) async fn importable_sessions(
+    state: &AppState,
+    agent: &str,
+    profile: &str,
+) -> Result<crate::session::import::ImportableList, crate::acp::acp_client::ListSessionsError> {
+    use crate::acp::acp_client::ListSessionsError;
+    use crate::session::import::{retain_importable, worktree_dir_markers, Owned};
+    if !crate::server::api::agent_policy().await.allows(agent) {
+        return Err(ListSessionsError::NotAllowed);
+    }
+    let join_failed = |e: tokio::task::JoinError| ListSessionsError::Failed(e.to_string());
+    let markers = tokio::task::spawn_blocking(worktree_dir_markers)
+        .await
+        .map_err(join_failed)?;
+    let owned = {
+        let instances = state.instances.read().await;
+        Owned::new(&instances, markers)
+    }
+    .map_err(|error| ListSessionsError::Failed(error.to_string()))?;
+    if !matches!(agent, "claude" | "claude-code") {
+        let listed =
+            crate::acp::session_listing::list_agent_sessions(agent, profile, &owned).await?;
+        return Ok(retain_importable(listed.sessions, &owned, listed.truncated));
+    }
+    let scanned = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
+        .await
+        .map_err(join_failed)?;
+    Ok(retain_importable(
+        scanned.into_iter().map(Into::into).collect(),
+        &owned,
+        false,
+    ))
+}
+
+pub(crate) fn list_error_response(e: crate::acp::acp_client::ListSessionsError) -> Response {
+    use crate::acp::acp_client::ListSessionsError as E;
+    let (status, code) = match &e {
+        E::UnknownAgent => (StatusCode::BAD_REQUEST, "unknown_agent"),
+        E::NotInstalled => (StatusCode::BAD_REQUEST, "agent_not_installed"),
+        E::NotAllowed => (StatusCode::FORBIDDEN, "agent_not_allowed"),
+        E::Unsupported => (StatusCode::UNPROCESSABLE_ENTITY, "list_unsupported"),
+        E::Timeout(_) | E::Failed(_) => (StatusCode::BAD_GATEWAY, "list_failed"),
+    };
+    crate::server::api::api_error(status, code, e.to_string())
+}
+
+/// Blocked in read-only mode: it exposes titles and paths outside AoE state (#2276).
+pub async fn list_importable_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<ImportableSessionsQuery>,
+) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    let mut sessions = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
-        .await
-        .unwrap_or_default();
-    // Drop sessions AoE owns: by stored session id, or by cwd inside an
-    // AoE-provisioned dir (scratch, managed worktree, workspace). A plain
-    // project path is not enough: a user's own `claude` run there is importable.
-    let (managed_ids, managed_dirs): (std::collections::HashSet<String>, Vec<PathBuf>) = {
-        let instances = state.instances.read().await;
-        let ids = instances
-            .iter()
-            .flat_map(|i| {
-                i.acp_session_id
-                    .iter()
-                    .chain(i.agent_session_id.iter())
-                    .cloned()
-            })
-            .collect();
-        let dirs = instances
-            .iter()
-            .filter(|i| {
-                i.scratch
-                    || i.worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe)
-                    || i.workspace_info.is_some()
-            })
-            .map(|i| PathBuf::from(&i.project_path))
-            .filter(|p| !p.as_os_str().is_empty())
-            .collect();
-        (ids, dirs)
-    };
-    sessions.retain(|s| {
-        !managed_ids.contains(&s.session_id)
-            && !managed_dirs
-                .iter()
-                .any(|d| std::path::Path::new(&s.cwd).starts_with(d))
-    });
-    // Capped after filtering so managed sessions cannot crowd out real ones.
-    sessions.truncate(crate::session::claude_import::MAX_SESSIONS);
-    Json(sessions).into_response()
+    let profile = q.profile.as_deref().filter(|p| !p.is_empty());
+    if let Some(resp) = profile.and_then(crate::server::api::unknown_profile_response) {
+        return resp;
+    }
+    match importable_sessions(&state, &q.agent, profile.unwrap_or(&state.profile)).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => list_error_response(e),
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +428,133 @@ mod tests {
             list_files(root, 2).unwrap(),
             (vec!["a.rs".into(), "b.rs".into()], true)
         );
+    }
+
+    #[tokio::test]
+    async fn importable_sessions_maps_list_errors() {
+        use crate::acp::acp_client::ListSessionsError as E;
+        for (err, status, code) in [
+            (E::UnknownAgent, StatusCode::BAD_REQUEST, "unknown_agent"),
+            (
+                E::NotInstalled,
+                StatusCode::BAD_REQUEST,
+                "agent_not_installed",
+            ),
+            (E::NotAllowed, StatusCode::FORBIDDEN, "agent_not_allowed"),
+            (
+                E::Unsupported,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "list_unsupported",
+            ),
+            (
+                E::Timeout("initialize"),
+                StatusCode::BAD_GATEWAY,
+                "list_failed",
+            ),
+        ] {
+            let resp = list_error_response(err);
+            assert_eq!(resp.status(), status);
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], code);
+        }
+
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let q = ImportableSessionsQuery {
+            agent: "not-an-agent".into(),
+            profile: None,
+        };
+        let resp = list_importable_sessions(State(state), axum::extract::Query(q))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn importable_sessions_lists_the_selected_profile_and_never_launches_a_denied_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ran = tmp.path().join("ran");
+        let pi_acp = bin.join("pi-acp");
+        std::fs::write(
+            &pi_acp,
+            format!(
+                r#"#!/bin/sh
+touch '{}'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true,"sessionCapabilities":{{"list":{{}}}}}}}}}}\n' "$id" ;;
+    *'"method":"session/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessions":[{{"sessionId":"s","cwd":"%s"}}]}}}}\n' "$id" "$PI_CODING_AGENT_DIR" ;;
+  esac
+done
+"#,
+                ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &pi_acp,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let _env = crate::session::test_support::isolate_home(tmp.path()).and_set("PATH", path);
+        for name in ["a", "b"] {
+            let profile: crate::session::config::profile_config::ProfileConfig = toml::from_str(
+                &format!(r#"environment = ["PI_CODING_AGENT_DIR=/stores/{name}"]"#),
+            )
+            .unwrap();
+            crate::session::config::profile_config::save_profile_config(name, &profile).unwrap();
+        }
+
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let get = |profile: &str| {
+            let q = ImportableSessionsQuery {
+                agent: "pi".into(),
+                profile: Some(profile.into()),
+            };
+            let state = state.clone();
+            async move {
+                let resp = list_importable_sessions(State(state), axum::extract::Query(q))
+                    .await
+                    .into_response();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                (status, body)
+            }
+        };
+        for name in ["a", "b"] {
+            let (status, body) = get(name).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["sessions"][0]["cwd"], format!("/stores/{name}"));
+        }
+        let (status, body) = get("missing").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "profile_not_found");
+
+        crate::session::config::update_config(|c| {
+            c.acp.restrict_agents = true;
+            c.acp.allowed_agents = vec!["claude".to_string()];
+        })
+        .unwrap();
+        std::fs::remove_file(&ran).unwrap();
+        let (status, body) = get("a").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "agent_not_allowed");
+        assert!(!ran.exists(), "a denied adapter must not be spawned");
     }
 
     #[tokio::test]

@@ -4900,3 +4900,116 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1);
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn import_requires_a_listed_id_in_its_cwd_on_a_plain_host_session() {
+    use crate::session::test_support::isolate_home;
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = tmp.path().join("claude");
+    let project = tmp.path().join("proj");
+    let other = tmp.path().join("other");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let pi_acp = bin.join("pi-acp");
+    std::fs::write(
+        &pi_acp,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true,"sessionCapabilities":{{"list":{{}}}}}}}}}}\n' "$id" ;;
+    *'"method":"session/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessions":[{{"sessionId":"listed","cwd":"{}"}}]}}}}\n' "$id" ;;
+  esac
+done
+"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &pi_acp,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let _env = isolate_home(tmp.path())
+        .and_set("CLAUDE_CONFIG_DIR", &claude)
+        .and_set("PATH", path);
+    let store = claude.join("projects").join("-proj");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("listed.jsonl"),
+        format!(
+            r#"{{"type":"user","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let other = other.to_string_lossy().into_owned();
+    for (extra, message) in [
+        (
+            serde_json::json!({ "agent_name": "wrapper" }),
+            "requires a built-in ACP agent",
+        ),
+        (
+            serde_json::json!({ "scratch": true, "path": "" }),
+            "cannot use scratch",
+        ),
+        (
+            serde_json::json!({ "extra_repo_paths": ["/x"] }),
+            "cannot use scratch",
+        ),
+        (serde_json::json!({ "sandbox": true }), "cannot use scratch"),
+        (
+            serde_json::json!({ "worktree_branch": "feat/x" }),
+            "cannot use scratch",
+        ),
+        (serde_json::json!({ "path": other }), "Unknown session"),
+        (
+            serde_json::json!({ "import_acp_session_id": "unlisted" }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "pi", "path": other }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "pi", "import_acp_session_id": "unlisted" }),
+            "Unknown session",
+        ),
+    ] {
+        let mut body = serde_json::json!({
+            "path": project.to_string_lossy(),
+            "tool": "claude",
+            "title": "imported",
+            "import_acp_session_id": "listed",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, json) = post_create(&state, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{extra}: {json}"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(message),
+            "{extra}: {json}"
+        );
+    }
+}

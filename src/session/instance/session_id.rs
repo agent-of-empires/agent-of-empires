@@ -607,6 +607,23 @@ impl Instance {
                 !fork_part.is_empty(),
                 "native agent cannot execute this fork"
             );
+            let fork_part = if matches!(agent.fork_strategy, crate::agents::ForkStrategy::PiFork) {
+                anyhow::ensure!(
+                    execution.is_some_and(|execution| execution.pi_pinnable)
+                        && crate::agents::pi_supports_pinned_fork(),
+                    "Pi fork needs a host pi on PATH that supports --fork and --session-id"
+                );
+                let parent_path = execution
+                    .and_then(|execution| execution.pi_transcript_path.as_deref())
+                    .context("Pi fork requires its exact parent transcript path")?;
+                // Use the qualified transcript, not a partial-UUID search.
+                format!(
+                    "--fork {} --session-id {child_id}",
+                    shell_escape(parent_path)
+                )
+            } else {
+                fork_part
+            };
             let is_subcommand =
                 matches!(agent.fork_strategy, crate::agents::ForkStrategy::CodexFork);
             splice_subcommand_or_append(

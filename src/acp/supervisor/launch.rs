@@ -398,37 +398,22 @@ impl<S: BroadcastSink> Supervisor<S> {
             req.effort.clone(),
         );
 
-        let mut base_host_environment = Vec::new();
-        let mut host_environment = Vec::new();
-        if req.sandbox_info.is_none() {
-            // Trusted global/profile configuration; repo overrides cannot contribute it.
-            base_host_environment = crate::session::environment::resolve_host_environment_pairs(
-                &resolved_cfg.environment,
-            );
-            host_environment = base_host_environment.clone();
-            if !resolved_cfg.host_hooks.before_session.is_empty() {
-                let minted = before_session_env(
-                    &req.session_id,
-                    &req.tool,
-                    req.origin
-                        .as_ref()
-                        .map(|origin| origin.profile().to_owned())
-                        .unwrap_or_default(),
-                    req.cwd.clone(),
-                    admission.cloned(),
-                )
-                .await
-                .map_err(|e| {
-                    SupervisorError::InvalidAgentCommand(format!(
-                        "before_session hook task failed: {e}"
-                    ))
-                })?
-                .map_err(|e| {
-                    SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
-                })?;
-                overlay_env(&mut host_environment, minted);
-            }
-        }
+        let (base_host_environment, mut host_environment) = if req.sandbox_info.is_none() {
+            host_spawn_environment(
+                &resolved_cfg,
+                &req.session_id,
+                &req.tool,
+                req.origin
+                    .as_ref()
+                    .map(|origin| origin.profile().to_owned())
+                    .unwrap_or_default(),
+                req.cwd.clone(),
+                admission.cloned(),
+            )
+            .await?
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
             req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
@@ -1076,6 +1061,33 @@ pub(super) async fn validate_launch_origin(
     .await
     .map_err(|error| SupervisorError::Acp(AcpError::Spawn(format!("launch origin task: {error}"))))?
     .map_err(launch_origin_error)
+}
+
+/// Resolve trusted host environment and overlay the before_session hook output.
+pub(crate) async fn host_spawn_environment(
+    cfg: &crate::session::Config,
+    session_id: &str,
+    tool: &str,
+    profile: String,
+    cwd: PathBuf,
+    admission: Option<crate::acp::runner_lifecycle::ExecutionAdmission>,
+) -> Result<(Vec<(String, String)>, Vec<(String, String)>), SupervisorError> {
+    let base = crate::session::environment::resolve_host_environment_pairs(&cfg.environment);
+    let mut host = base.clone();
+    if !cfg.host_hooks.before_session.is_empty() {
+        let minted = before_session_env(session_id, tool, profile, cwd, admission)
+            .await
+            .map_err(|e| {
+                SupervisorError::InvalidAgentCommand(format!(
+                    "before_session hook task failed: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+            })?;
+        overlay_env(&mut host, minted);
+    }
+    Ok((base, host))
 }
 
 /// Run the profile's `before_session` host hooks and return the env they mint.
