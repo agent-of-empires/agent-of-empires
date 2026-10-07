@@ -1,5 +1,7 @@
 import { useState } from "react";
 import type { AttachProjectResult } from "../../lib/api";
+import { ProjectSearchList } from "../session-wizard/steps/ProjectSearchList";
+import { useProjectPicker } from "../session-wizard/steps/projectPicker";
 import { SidebarModal } from "./SidebarModal";
 import { MODAL_CANCEL, MODAL_INPUT, MODAL_PRIMARY } from "./styles";
 
@@ -20,18 +22,17 @@ function workerSummary(res: AttachProjectResult): string {
  *  closing on success, since a 200 can still mean the agent did not restart. */
 export function AddProjectModal({
   title,
-  projects,
   onCancel,
   onSubmit,
   onDone,
 }: {
   title: string;
-  projects: { name: string; path: string }[];
   onCancel: () => void;
   onSubmit: (project: string, attachExistingBranch: boolean) => Promise<AttachProjectResult>;
   onDone: () => void;
 }) {
   const [project, setProject] = useState("");
+  const { loading, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker();
   const [attachExistingBranch, setAttachExistingBranch] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -69,11 +70,25 @@ export function AddProjectModal({
         <AttachResult result={result} />
       ) : (
         <div className="px-4 py-3 flex flex-col gap-3">
+          {!loading && hasPicks && (
+            <div className="max-h-72 overflow-y-auto">
+              <ProjectSearchList
+                query={query}
+                onQueryChange={setQuery}
+                filteredSaved={filteredSaved}
+                filteredRecent={filteredRecent}
+                isSelected={(path) => project === path}
+                onSelect={(path) => {
+                  setProject(path);
+                  setError(null);
+                }}
+              />
+            </div>
+          )}
           <input
             type="text"
             autoFocus
             aria-label="Project to attach"
-            list="add-project-options"
             disabled={busy}
             value={project}
             onChange={(e) => {
@@ -86,17 +101,10 @@ export function AddProjectModal({
                 void submit();
               }
             }}
-            placeholder="project name or /path/to/repo"
+            placeholder="or enter a project name or /path/to/repo"
             data-testid="add-project-modal-input"
             className={MODAL_INPUT}
           />
-          <datalist id="add-project-options">
-            {projects.map((p) => (
-              <option key={p.path} value={p.name}>
-                {p.path}
-              </option>
-            ))}
-          </datalist>
           <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
             <input
               type="checkbox"

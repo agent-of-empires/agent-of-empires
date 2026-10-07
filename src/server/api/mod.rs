@@ -23,7 +23,7 @@ pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
     acp_set_mode, acp_worker_log, get_option_catalog, install_agent, list_acp_agents,
-    list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
+    list_importable_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
     switch_acp_agent, switch_acp_provider,
 };
 
@@ -193,6 +193,32 @@ pub(crate) async fn agent_policy() -> crate::acp::agent_policy::AgentPolicy {
             tracing::error!("agent policy load task failed: {e}");
             crate::acp::agent_policy::AgentPolicy::deny_all()
         })
+}
+
+/// The error response when `name` is not an existing profile. Every profile is a real directory
+/// under profiles/; an enumeration failure is a 500, not a client 400.
+pub(crate) fn unknown_profile_response(name: &str) -> Option<Response> {
+    let known = match crate::session::list_profiles() {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::error!(
+                target: "server.sessions",
+                "failed to enumerate profiles while validating a profile: {e:#}"
+            );
+            return Some(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("Failed to enumerate profiles: {e}"),
+            ));
+        }
+    };
+    (!known.iter().any(|p| p == name)).then(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "profile_not_found",
+            format!("Profile '{name}' does not exist"),
+        )
+    })
 }
 
 /// 404 when the instance vanished between persisting a write and applying it.

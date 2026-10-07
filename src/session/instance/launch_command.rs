@@ -162,6 +162,7 @@ pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> S
         ForkStrategy::ClaudeFork => {
             format!("--resume {parent_id} --fork-session --session-id {child_id}")
         }
+        ForkStrategy::PiFork => format!("--fork {parent_id} --session-id {child_id}"),
         ForkStrategy::CodexFork => {
             // Codex mints its own forked id; child_id is unused. The subcommand
             // is inserted after the binary by apply_session_flags.
@@ -1254,6 +1255,14 @@ mod tests {
             ("cursor", "parent", "child", ""),
             ("claude", "$(rm -rf /)", "child", ""),
             ("claude", "parent", "; echo pwned", ""),
+            (
+                "pi",
+                "parent-id",
+                "child-id",
+                "--fork parent-id --session-id child-id",
+            ),
+            ("pi", "$(rm -rf /)", "child", ""),
+            ("pi", "parent", "; echo pwned", ""),
         ] {
             assert_eq!(build_fork_flags(tool, parent, child), expected, "{tool}");
         }
@@ -1283,6 +1292,21 @@ mod tests {
                 .unwrap();
             assert_eq!(cmd, expected);
         }
+    }
+
+    #[test]
+    fn pi_fork_refuses_an_unpinnable_launch() {
+        let mut inst = tool_instance("pi", "/tmp/x");
+        inst.agent_session_id = Some("child-5678".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1234".to_string(),
+        };
+        let mut cmd = "pi".to_string();
+        let error = inst
+            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .expect_err("an unpinnable Pi fork must be refused");
+        assert!(error.to_string().contains("Pi fork needs"), "{error}");
+        assert_eq!(cmd, "pi", "nothing may be appended to a refused launch");
     }
 
     #[test]

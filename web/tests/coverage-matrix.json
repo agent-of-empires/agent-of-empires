@@ -1229,17 +1229,28 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ]
     },
     {
-      "id": "wizard.import-claude-session.unit",
+      "id": "wizard.import-session",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/wizard-project.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
+      ]
+    },
+    {
+      "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/session-wizard/__tests__/ProjectStep.test.tsx"],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ]
     },
     {
@@ -3978,7 +3989,7 @@
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
-      "description": "Attach eligibility, request, and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
+      "description": "Picker lists saved and recent projects, and a clicked row or typed path posts to attach; attach eligibility and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
       "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",

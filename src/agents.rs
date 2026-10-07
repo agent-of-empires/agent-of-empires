@@ -124,8 +124,16 @@ pub struct SessionSupport {
 pub enum ForkStrategy {
     ClaudeFork,
     CodexFork,
+    PiFork,
     Flag(&'static str),
     Unsupported,
+}
+
+impl ForkStrategy {
+    /// Other strategies mint a child id that capture must discover after launch.
+    pub fn preassigns_child_id(&self) -> bool {
+        matches!(self, Self::ClaudeFork | Self::PiFork)
+    }
 }
 
 /// Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
@@ -690,6 +698,7 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::PaneScoped,
         ),
+        fork_strategy: ForkStrategy::PiFork,
         ..agent(
             "pi",
             "pi",
@@ -1066,6 +1075,10 @@ pub(crate) fn pi_supports_extension_flag() -> bool {
 
 pub(crate) fn pi_supports_session_id_flag() -> bool {
     pi_help_advertises("--session-id")
+}
+
+pub(crate) fn pi_supports_pinned_fork() -> bool {
+    pi_help_advertises("--fork") && pi_supports_session_id_flag()
 }
 
 const HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
