@@ -381,6 +381,10 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
 // the live worker for the same provider API.
 pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Total budget for a manual rename: the one-shot plus time queued for a [`MAX_CONCURRENT`] slot.
+pub(crate) const MANUAL_RENAME_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(ONESHOT_TIMEOUT.as_secs() + 15);
+
 /// Run the agent one-shot in the session's working directory, capturing stdout. The error is a
 /// user-facing reason: the agent's last error line on a non-zero exit, or the spawn/timeout cause.
 // ponytail: a hung in-container one-shot outlives its 60s timeout and is only reaped when the
@@ -986,7 +990,7 @@ pub async fn run_terminal_rename(
     Ok(())
 }
 
-pub use serve::{should_trigger_smart_rename, try_smart_rename};
+pub use serve::{force_smart_rename_bounded, should_trigger_smart_rename, try_smart_rename};
 
 mod serve {
     use super::*;
@@ -1178,6 +1182,21 @@ mod serve {
         Ok(())
     }
 
+    /// Manual "Auto-name now": a forced [`try_smart_rename`] bounded by [`MANUAL_RENAME_DEADLINE`],
+    /// queueing included. `None` when the deadline passed; dropping the future kills the one-shot.
+    pub async fn force_smart_rename_bounded(
+        state: Arc<AppState>,
+        session_id: String,
+        input: SmartRenameInput,
+    ) -> Option<Result<(), String>> {
+        tokio::time::timeout(
+            MANUAL_RENAME_DEADLINE,
+            try_smart_rename(state, session_id, input, true),
+        )
+        .await
+        .ok()
+    }
+
     /// Persist a generated title and mirror it into AppState. Without `force`, a manual rename that
     /// landed during the one-shot wins.
     pub(crate) async fn apply_auto_title(
@@ -1313,6 +1332,36 @@ mod serve {
                 assert_eq!(title_of(rows, &target_id), "Franks");
                 assert_eq!(title_of(rows, &manual_id), "Regenerated title");
             }
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial_test::serial]
+        async fn force_rename_deadline_covers_waiting_for_a_slot() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let mut inst = crate::session::Instance::new("Vikings", "/tmp/deadline-queue");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "default".to_string();
+            inst.view = crate::session::View::Structured;
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            // Both slots busy with other renames for longer than the deadline.
+            let _held = state
+                .smart_rename_semaphore
+                .acquire_many(MAX_CONCURRENT as u32)
+                .await
+                .unwrap();
+
+            let input = SmartRenameInput {
+                first_user_prompt: "fix the login bug".to_string(),
+                context: "fix the login bug".to_string(),
+            };
+            let started = tokio::time::Instant::now();
+            assert_eq!(
+                force_smart_rename_bounded(state.clone(), id, input).await,
+                None
+            );
+            assert_eq!(started.elapsed(), MANUAL_RENAME_DEADLINE);
+            assert!(state.smart_rename_inflight.lock().unwrap().is_empty());
         }
 
         #[test]

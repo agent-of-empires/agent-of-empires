@@ -701,7 +701,8 @@ pub async fn restore_session(
 /// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" for a
 /// structured session: clears the per-session attempted gate and regenerates the
 /// title from the first prompt, even over one already chosen. Waits for the
-/// one-shot so a failure reaches the caller as a `502` with the agent's reason.
+/// one-shot so a failure reaches the caller as a `502` with the agent's reason,
+/// or a `504` once the total deadline, queueing included, passes.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -817,20 +818,27 @@ pub async fn force_smart_rename(
         attempted.remove(&id);
     }
 
-    match crate::session::smart_rename::try_smart_rename(
+    // Forced past the smart_rename-disabled gate (#3039).
+    match crate::session::smart_rename::force_smart_rename_bounded(
         state.clone(),
         id.clone(),
         crate::session::smart_rename::SmartRenameInput {
             first_user_prompt,
             context,
         },
-        // Manual action forces past the smart_rename-disabled gate (#3039).
-        true,
     )
     .await
     {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(reason) => api_error(StatusCode::BAD_GATEWAY, "smart_rename_failed", reason),
+        Some(Ok(())) => StatusCode::OK.into_response(),
+        Some(Err(reason)) => api_error(StatusCode::BAD_GATEWAY, "smart_rename_failed", reason),
+        None => api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "smart_rename_timeout",
+            format!(
+                "Auto-name timed out after {}s; other sessions may be naming. Try again shortly.",
+                crate::session::smart_rename::MANUAL_RENAME_DEADLINE.as_secs()
+            ),
+        ),
     }
 }
 

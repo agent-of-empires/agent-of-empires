@@ -419,7 +419,7 @@ impl HttpClient {
     /// its failure reason on error.
     pub async fn smart_rename(&self, session_id: &str) -> Result<(), HttpError> {
         let path = format!("/api/sessions/{session_id}/smart-rename");
-        let timeout = crate::session::smart_rename::ONESHOT_TIMEOUT + DEFAULT_TIMEOUT;
+        let timeout = crate::session::smart_rename::MANUAL_RENAME_DEADLINE + DEFAULT_TIMEOUT;
         self.send(
             || self.request(Method::POST, &path).timeout(timeout),
             Scope::Session(session_id),
