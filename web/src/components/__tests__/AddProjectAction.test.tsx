@@ -87,6 +87,7 @@ describe("AddProjectModal", () => {
   it.each([
     ["frontend", false],
     ["/src/frontend", true],
+    ["/tmp/unlisted-project", false],
   ])("posts %j with attach_existing_branch=%s", async (project, reuseBranch) => {
     await submit(project, { reuseBranch });
     await waitFor(() => expect(attachCalls()).toHaveLength(1));
