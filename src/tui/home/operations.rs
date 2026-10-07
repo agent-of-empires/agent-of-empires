@@ -2056,16 +2056,15 @@ impl HomeView {
             crate::session::LifecycleOperation::Stop,
             generation,
         );
-        authoritative.stop_all_tmux_sessions_locked(&storage);
+        authoritative.kill_all_tmux_sessions_locked();
         self.instances.insert(id.clone(), authoritative);
 
-        // Decide where the cursor lands before the row sinks, against the pre-archive
-        // list. Only the non-Attention branch uses it; Attention re-picks from the top.
+        // Choose the successor before archiving moves the row.
         let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
             .then(|| self.archive_successor_session(&id))
             .flatten();
 
-        self.apply_user_action(&id, |inst| inst.archive())?;
+        self.apply_user_action_under_workspace_claim_lock(&id, |inst| inst.archive())?;
         drop(lifecycle_lock);
         if self.sort_order == crate::session::config::SortOrder::Attention {
             // Attention sort is a triage flow: the cursor advances to the next item

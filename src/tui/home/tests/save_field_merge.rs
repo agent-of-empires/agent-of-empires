@@ -1121,11 +1121,9 @@ fn archive_completion_uses_captured_id_after_selection_changes() {
     drop(held);
     finish_runner_settlements(&mut view);
     let rows = storage.load().unwrap();
-    assert!(rows
-        .iter()
-        .find(|row| row.id == original_id)
-        .unwrap()
-        .is_archived());
+    let archived = rows.iter().find(|row| row.id == original_id).unwrap();
+    assert!(archived.is_archived());
+    assert!(archived.lifecycle_reservation.is_none());
     assert!(
         !rows
             .iter()
