@@ -1314,6 +1314,185 @@ fn right_click_trash_header_shows_bulk_menu() {
     }
 }
 
+/// `d` on the Trash header and the palette's "Empty trash" both open the empty-trash
+/// confirm, which ignores `session.confirm_delete` because the purge is irreversible.
+#[test]
+#[serial]
+fn trash_header_d_and_palette_open_empty_trash_confirm() {
+    for via_palette in [false, true] {
+        let mut env = create_test_env_with_sessions(2);
+        disable_confirm_delete();
+        env.view.trashed_section_collapsed = false;
+        let id = env.view.instance_at(0).id.clone();
+        env.view.trash_session_by_id(&id);
+
+        if via_palette {
+            env.view.handle_key(
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                None,
+            );
+            for ch in "empty trash".chars() {
+                env.view.handle_key(key(KeyCode::Char(ch)), None);
+            }
+            env.view.handle_key(key(KeyCode::Enter), None);
+        } else {
+            env.view.cursor = env
+                .view
+                .flat_items
+                .iter()
+                .position(|it| {
+                    matches!(it, Item::Group { path, .. }
+                        if crate::session::is_trash_section_path(path))
+                })
+                .expect("Trash header must render");
+            env.view.update_selected();
+            env.view.handle_key(key(KeyCode::Char('d')), None);
+        }
+
+        assert_eq!(
+            env.view.confirm_dialog.as_ref().map(|d| d.action()),
+            Some("empty_trash"),
+            "via_palette={via_palette}"
+        );
+        assert!(
+            env.view.get_instance(&id).unwrap().is_trashed(),
+            "nothing is purged before the confirm, via_palette={via_palette}"
+        );
+    }
+}
+
+/// A trashed row whose repo is gone fails every delete, so Empty Trash escalates it one
+/// opt-in step per attempt: plain delete, forced delete, then removal from aoe. A peer
+/// restore between the last confirm and its submit keeps the row, and a peer holding the
+/// lifecycle lock delays the removal without blocking input.
+#[test]
+#[serial]
+fn empty_trash_escalates_a_row_that_keeps_failing() {
+    use std::time::{Duration, Instant};
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Peer {
+        Idle,
+        Restores,
+        HoldsLock,
+    }
+    for peer in [Peer::Idle, Peer::Restores, Peer::HoldsLock] {
+        let mut env = create_test_env_with_sessions(2);
+        let id = env.view.instance_at(0).id.clone();
+        let storage = Storage::new_unwatched("test").unwrap();
+        let durable = |storage: &Storage| storage.load().unwrap().into_iter().find(|i| i.id == id);
+        // The deletion worker reads the durable row, so the dead repo goes on disk.
+        storage
+            .update(|instances, _| {
+                let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
+                inst.worktree_info = Some(crate::session::WorktreeInfo {
+                    branch: "gone".to_string(),
+                    main_repo_path: "/nonexistent/aoe-test-repo".to_string(),
+                    managed_by_aoe: true,
+                    created_at: chrono::Utc::now(),
+                    base_branch: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+        env.view.reload().unwrap();
+        env.view.trash_session_by_id(&id);
+        // A held Trash reservation would turn the first purge into Busy, not Failed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while env.view.trash_poller.is_pending(&id) {
+            assert!(Instant::now() < deadline, "trash never finished");
+            env.view.apply_trash_results();
+            std::thread::yield_now();
+        }
+        let trashed = durable(&storage).unwrap();
+        assert!(trashed.is_trashed());
+        assert_eq!(
+            trashed.lifecycle_reservation, None,
+            "trash reservation released"
+        );
+
+        // (checkbox labels offered, forced delete expected in flight); each offered box is ticked.
+        let rounds: [(&[&str], bool); 3] = [
+            (&[], false),
+            (&["Force delete 1 that failed before"], true),
+            (&["Remove 1 from aoe that failed a forced delete"], false),
+        ];
+        for (round, (labels, forced)) in rounds.into_iter().enumerate() {
+            env.view.prompt_empty_trash();
+            let dialog = env
+                .view
+                .confirm_dialog
+                .as_mut()
+                .expect("empty-trash confirm");
+            assert_eq!(dialog.checkbox_labels_for_test(), labels, "round {round}");
+            if !labels.is_empty() {
+                dialog.handle_key(key(KeyCode::Down));
+                dialog.handle_key(key(KeyCode::Char(' ')));
+            }
+            let peer_lock = (round == 2 && peer == Peer::HoldsLock)
+                .then(|| storage.acquire_instance_lifecycle_lock(&id).unwrap());
+            if round == 2 && peer == Peer::Restores {
+                storage
+                    .update(|instances, _| {
+                        instances
+                            .iter_mut()
+                            .find(|i| i.id == id)
+                            .unwrap()
+                            .trashed_at = None;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            env.view.handle_key(key(KeyCode::Char('y')), None);
+
+            if round == 2 {
+                // The submit returned with the lock still held; the row leaves only when
+                // the drop worker's result lands.
+                assert!(env.view.get_instance(&id).is_some(), "{peer:?}");
+                drop(peer_lock);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !env.view.apply_drop_results() {
+                    assert!(Instant::now() < deadline, "{peer:?}: no drop result");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let kept = peer == Peer::Restores;
+                assert_eq!(durable(&storage).is_some(), kept, "{peer:?}");
+                assert_eq!(env.view.get_instance(&id).is_some(), kept, "{peer:?}");
+                break;
+            }
+            assert_eq!(
+                env.view.deletes_in_flight.get(&id).map(|a| a.forced),
+                Some(forced),
+                "round {round}"
+            );
+            // Emptying again mid-flight neither offers escalation nor re-requests the row.
+            env.view.prompt_empty_trash();
+            assert!(env
+                .view
+                .confirm_dialog
+                .as_ref()
+                .unwrap()
+                .checkbox_labels_for_test()
+                .is_empty());
+            env.view.handle_key(key(KeyCode::Char('y')), None);
+            assert_eq!(
+                env.view.deletes_in_flight.get(&id).map(|a| a.forced),
+                Some(forced),
+                "round {round}: in-flight force level kept"
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !env.view.apply_deletion_results() {
+                assert!(Instant::now() < deadline, "round {round}: no result");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                env.view.failed_deletes.get(&id).map(|a| a.forced),
+                Some(forced),
+                "round {round}"
+            );
+        }
+    }
+}
+
 /// Shelf bulk actions: "Empty Trash" routes through a destructive confirm and marks every trashed
 /// row Deleting (an empty trash shows an info dialog instead), and "Restore All" un-trashes or
 /// unarchives every row of its section.
@@ -1773,7 +1952,8 @@ fn confirm_delete_dont_ask_again_persists_the_opt_out() {
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
-    // Space ticks the checkbox, the second `d` accepts.
+    // Down focuses the checkbox, Space ticks it, the second `d` accepts.
+    env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Char(' ')), None);
     env.view.handle_key(key(KeyCode::Char('d')), None);
 

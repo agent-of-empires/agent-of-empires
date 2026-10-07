@@ -44,15 +44,42 @@ pub fn render_buttons(
     yes_focused: bool,
     hovered: Option<Rect>,
 ) -> (Rect, Rect) {
-    let yes_style = if yes_focused {
+    let focus = if yes_focused {
+        ButtonFocus::Yes
+    } else {
+        ButtonFocus::No
+    };
+    render_buttons_with_focus(frame, area, theme, labels, focus, hovered)
+}
+
+/// Which button, if either, owns keyboard focus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ButtonFocus {
+    Yes,
+    No,
+    /// Focus is elsewhere in the dialog, such as on a checkbox.
+    Neither,
+}
+
+/// [`render_buttons`] for a dialog where focus can leave the buttons.
+pub fn render_buttons_with_focus(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    labels: (&str, &str),
+    focus: ButtonFocus,
+    hovered: Option<Rect>,
+) -> (Rect, Rect) {
+    let dimmed = Style::default().fg(theme.dimmed);
+    let yes_style = if focus == ButtonFocus::Yes {
         Style::default().fg(theme.error).bold()
     } else {
-        Style::default().fg(theme.dimmed)
+        dimmed
     };
-    let no_style = if yes_focused {
-        Style::default().fg(theme.dimmed)
-    } else {
+    let no_style = if focus == ButtonFocus::No {
         Style::default().fg(theme.running).bold()
+    } else {
+        dimmed
     };
     let yes_text = format!("[{}]", labels.0);
     let no_text = format!("[{}]", labels.1);
