@@ -701,8 +701,8 @@ pub async fn restore_session(
 /// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" for a
 /// structured session: clears the per-session attempted gate and regenerates the
 /// title from the first prompt, even over one already chosen. Waits for the
-/// one-shot so a failure reaches the caller as a `502` with the agent's reason,
-/// or a `504` once the total deadline, queueing included, passes.
+/// rename: `200` once the title is saved, `409` when nothing could be applied,
+/// `502` with the agent's reason on failure, `504` past the rename deadline.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -818,28 +818,27 @@ pub async fn force_smart_rename(
         attempted.remove(&id);
     }
 
-    // Forced past the smart_rename-disabled gate (#3039).
-    match crate::session::smart_rename::force_smart_rename_bounded(
+    use crate::session::smart_rename::SmartRenameError;
+    let Err(err) = crate::session::smart_rename::try_smart_rename(
         state.clone(),
         id.clone(),
         crate::session::smart_rename::SmartRenameInput {
             first_user_prompt,
             context,
         },
+        // Manual action forces past the smart_rename-disabled gate (#3039).
+        true,
     )
     .await
-    {
-        Some(Ok(())) => StatusCode::OK.into_response(),
-        Some(Err(reason)) => api_error(StatusCode::BAD_GATEWAY, "smart_rename_failed", reason),
-        None => api_error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "smart_rename_timeout",
-            format!(
-                "Auto-name timed out after {}s; other sessions may be naming. Try again shortly.",
-                crate::session::smart_rename::MANUAL_RENAME_DEADLINE.as_secs()
-            ),
-        ),
-    }
+    else {
+        return StatusCode::OK.into_response();
+    };
+    let (status, code) = match err {
+        SmartRenameError::Skipped(_) => (StatusCode::CONFLICT, "smart_rename_skipped"),
+        SmartRenameError::Failed(_) => (StatusCode::BAD_GATEWAY, "smart_rename_failed"),
+        SmartRenameError::TimedOut => (StatusCode::GATEWAY_TIMEOUT, "smart_rename_timeout"),
+    };
+    api_error(status, code, err.to_string())
 }
 
 /// On-demand "summarize the conversation so far" for a structured-view session.

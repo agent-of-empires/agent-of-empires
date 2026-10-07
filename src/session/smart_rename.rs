@@ -381,8 +381,9 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
 // the live worker for the same provider API.
 pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Total budget for a manual rename: the one-shot plus time queued for a [`MAX_CONCURRENT`] slot.
-pub(crate) const MANUAL_RENAME_DEADLINE: std::time::Duration =
+/// Budget for a structured rename's one-shot plus its wait for a [`MAX_CONCURRENT`] slot. The title
+/// write after it is never cut short.
+pub(crate) const RENAME_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(ONESHOT_TIMEOUT.as_secs() + 15);
 
 /// Run the agent one-shot in the session's working directory, capturing stdout. The error is a
@@ -990,7 +991,7 @@ pub async fn run_terminal_rename(
     Ok(())
 }
 
-pub use serve::{force_smart_rename_bounded, should_trigger_smart_rename, try_smart_rename};
+pub use serve::{should_trigger_smart_rename, try_smart_rename, SmartRenameError};
 
 mod serve {
     use super::*;
@@ -1047,20 +1048,48 @@ mod serve {
         }
     }
 
-    /// Best-effort auto-rename of a structured-view session from its first turn. `Err` carries a
-    /// user-facing reason when the one-shot ran and produced no title; skips are `Ok`.
+    /// Why a structured rename left the title unchanged; each carries a user-facing message.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SmartRenameError {
+        /// Nothing ran or nothing could be applied.
+        Skipped(String),
+        /// The one-shot ran, or the write was attempted, and failed.
+        Failed(String),
+        /// [`RENAME_DEADLINE`] passed while queued for a slot or in the one-shot.
+        TimedOut,
+    }
+
+    impl std::fmt::Display for SmartRenameError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Skipped(m) | Self::Failed(m) => f.write_str(m),
+                Self::TimedOut => write!(
+                    f,
+                    "Auto-name timed out after {}s; other sessions may be naming. Try again shortly.",
+                    RENAME_DEADLINE.as_secs()
+                ),
+            }
+        }
+    }
+
+    fn skipped(message: &str) -> SmartRenameError {
+        SmartRenameError::Skipped(message.to_string())
+    }
+
+    /// Auto-rename a structured-view session from its first turn. `Ok` only once the title is
+    /// persisted (or already equal).
     pub async fn try_smart_rename(
         state: Arc<AppState>,
         session_id: String,
         input: SmartRenameInput,
         force: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), SmartRenameError> {
         if input.first_user_prompt.trim().is_empty() {
-            return Ok(());
+            return Err(skipped("No prompt to name this session from yet"));
         }
 
         if attempted_contains(&state, &session_id) {
-            return Ok(());
+            return Err(skipped("This session was already auto-named"));
         }
 
         let Some((
@@ -1092,7 +1121,7 @@ mod serve {
             })
         })
         else {
-            return Ok(());
+            return Err(skipped("Session not found"));
         };
 
         let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
@@ -1120,24 +1149,24 @@ mod serve {
             Ok(agent) => agent,
             Err(reason) => {
                 tracing::debug!(target: "smart_rename", session = %session_id, tool = %tool, reason = reason.as_str(), "skip");
-                return Ok(());
+                return Err(skipped(reason.user_message()));
             }
         };
 
         let Some(_guard) = InflightGuard::acquire(&state.smart_rename_inflight, &session_id) else {
-            return Ok(());
+            return Err(skipped("Auto-name is already running for this session"));
         };
 
         // Re-check attempted after taking the inflight slot: another task may have completed and
         // marked this session between the entry check and acquiring the guard.
         if attempted_contains(&state, &session_id) {
-            return Ok(());
+            return Err(skipped("This session was already auto-named"));
         }
 
         let prompt = build_prompt(&input.context);
         let model = OneshotModel::Title(resolve_title_model_args(agent, cfg.rename_model));
         let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
-            return Ok(());
+            return Err(skipped(SkipReason::NoOneshot.user_message()));
         };
 
         let Some(target) = resolve_oneshot_target(
@@ -1151,15 +1180,25 @@ mod serve {
         else {
             // Container not usable right now: transient, so leave the session
             // un-attempted for a later turn.
-            return Ok(());
+            return Err(skipped(
+                "The session's sandbox container is not usable right now",
+            ));
         };
-        let raw = {
-            let Ok(_permit) = state.smart_rename_semaphore.acquire().await else {
-                return Ok(());
-            };
-            // A failure leaves the session un-attempted so a later turn can retry.
-            run_oneshot(&session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await?
-        };
+        // Only the queue and the one-shot are bounded: the title write below must finish once
+        // started, or a late `spawn_blocking` write could land after the caller saw a timeout.
+        // A failure leaves the session un-attempted so a later turn can retry.
+        let raw = tokio::time::timeout(RENAME_DEADLINE, async {
+            let _permit = state
+                .smart_rename_semaphore
+                .acquire()
+                .await
+                .map_err(|_| skipped("Server is shutting down"))?;
+            run_oneshot(&session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT)
+                .await
+                .map_err(SmartRenameError::Failed)
+        })
+        .await
+        .map_err(|_| SmartRenameError::TimedOut)??;
 
         // The agent produced output (usable or not).
         {
@@ -1168,33 +1207,19 @@ mod serve {
                 .lock()
                 .expect("smart_rename_attempted poisoned");
             if !attempted.insert(session_id.clone()) {
-                return Ok(());
+                return Err(skipped("This session was already auto-named"));
             }
         }
         let Some(new_title) = sanitize_title(&raw, &input.first_user_prompt) else {
             tracing::debug!(target: "smart_rename", session = %session_id, "skip: agent output not a usable title");
-            return Err("The agent's reply was not a usable title".to_string());
+            return Err(SmartRenameError::Failed(
+                "The agent's reply was not a usable title".to_string(),
+            ));
         };
 
         // Serialization against manual rename / worktree edits is handled
         // inside apply_auto_title via the per-session instance lock.
-        apply_auto_title(&state, &session_id, &profile, &new_title, force).await;
-        Ok(())
-    }
-
-    /// Manual "Auto-name now": a forced [`try_smart_rename`] bounded by [`MANUAL_RENAME_DEADLINE`],
-    /// queueing included. `None` when the deadline passed; dropping the future kills the one-shot.
-    pub async fn force_smart_rename_bounded(
-        state: Arc<AppState>,
-        session_id: String,
-        input: SmartRenameInput,
-    ) -> Option<Result<(), String>> {
-        tokio::time::timeout(
-            MANUAL_RENAME_DEADLINE,
-            try_smart_rename(state, session_id, input, true),
-        )
-        .await
-        .ok()
+        apply_auto_title(&state, &session_id, &profile, &new_title, force).await
     }
 
     /// Persist a generated title and mirror it into AppState. Without `force`, a manual rename that
@@ -1205,7 +1230,7 @@ mod serve {
         profile: &str,
         new_title: &str,
         force: bool,
-    ) {
+    ) -> Result<(), SmartRenameError> {
         let lock = state.instance_lock(id).await;
         let _serialized = lock.lock().await;
 
@@ -1214,7 +1239,9 @@ mod serve {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "smart_rename", session = %id, "storage open failed: {e}");
-                return;
+                return Err(SmartRenameError::Failed(format!(
+                    "Couldn't save the title: {e}"
+                )));
             }
         };
         // Own copies for the closure below: `storage.update` runs inside `spawn_blocking`, whose
@@ -1231,51 +1258,56 @@ mod serve {
                     .iter()
                     .position(|instance| instance.id == id_owned)
                 else {
-                    return Ok(false);
+                    return Ok(Err(skipped("Session not found")));
                 };
+                if instances[index].title == title_owned {
+                    return Ok(Ok(false));
+                }
+                if !title_is_auto_overwritable(&instances[index], force) {
+                    return Ok(Err(skipped("Session was renamed in the meantime")));
+                }
                 // Manual and automatic rename paths share one domain predicate; exclude this row
                 // explicitly so a future no-op policy change cannot make the row collide with
                 // itself.
-                let should_write = title_is_auto_overwritable(&instances[index], force)
-                    && instances[index].title != title_owned;
                 let path = instances[index].project_path.clone();
-                let duplicate = should_write
-                    && crate::session::is_duplicate_session(
-                        instances.iter(),
-                        &title_owned,
-                        &path,
-                        Some(&id_owned),
-                    );
-                if duplicate {
+                if crate::session::is_duplicate_session(
+                    instances.iter(),
+                    &title_owned,
+                    &path,
+                    Some(&id_owned),
+                ) {
                     tracing::warn!(target: "smart_rename", session = %id_owned, title = %title_owned, "skipped duplicate auto-title");
-                    Ok(false)
-                } else if should_write {
-                    instances[index].title = title_owned.clone();
-                    // Last owned use of `title_owned`: move it into the field
-                    // rather than cloning a second time.
-                    instances[index].last_auto_title = Some(title_owned);
-                    Ok(true)
-                } else {
-                    Ok(false)
+                    return Ok(Err(SmartRenameError::Skipped(format!(
+                        "Another session in this folder is already titled \"{title_owned}\""
+                    ))));
                 }
+                instances[index].title = title_owned.clone();
+                // Last owned use of `title_owned`: move it into the field rather than cloning a
+                // second time.
+                instances[index].last_auto_title = Some(title_owned);
+                Ok(Ok(true))
             })?;
             drop(identity_lock);
             Ok((wrote, session_title_lock))
         })
         .await;
-        let (wrote, _session_title_lock) = match persisted {
+        let (outcome, _session_title_lock) = match persisted {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 tracing::warn!(target: "smart_rename", session = %id, "persist failed: {e}");
-                return;
+                return Err(SmartRenameError::Failed(format!(
+                    "Couldn't save the title: {e}"
+                )));
             }
             Err(e) => {
                 tracing::warn!(target: "smart_rename", session = %id, "persist join failed: {e}");
-                return;
+                return Err(SmartRenameError::Failed(format!(
+                    "Couldn't save the title: {e}"
+                )));
             }
         };
-        if !wrote {
-            return;
+        if !outcome? {
+            return Ok(());
         }
 
         let mut instances = state.instances.write().await;
@@ -1284,6 +1316,7 @@ mod serve {
             inst.title = new_title.to_string();
             inst.last_auto_title = Some(new_title.to_string());
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1315,8 +1348,13 @@ mod serve {
                 .unwrap();
             let state = crate::server::test_support::build_test_app_state(rows);
 
-            apply_auto_title(&state, &target_id, "default", "Already owned", false).await;
-            apply_auto_title(&state, &manual_id, "default", "Regenerated title", true).await;
+            assert!(matches!(
+                apply_auto_title(&state, &target_id, "default", "Already owned", false).await,
+                Err(SmartRenameError::Skipped(_))
+            ));
+            apply_auto_title(&state, &manual_id, "default", "Regenerated title", true)
+                .await
+                .unwrap();
 
             let title_of = |instances: &[crate::session::Instance], id: &str| {
                 instances
@@ -1336,7 +1374,7 @@ mod serve {
 
         #[tokio::test(start_paused = true)]
         #[serial_test::serial]
-        async fn force_rename_deadline_covers_waiting_for_a_slot() {
+        async fn rename_deadline_covers_waiting_for_a_slot() {
             let _guard = crate::session::test_support::isolate_app_dir();
             let mut inst = crate::session::Instance::new("Vikings", "/tmp/deadline-queue");
             inst.tool = "claude".to_string();
@@ -1357,10 +1395,10 @@ mod serve {
             };
             let started = tokio::time::Instant::now();
             assert_eq!(
-                force_smart_rename_bounded(state.clone(), id, input).await,
-                None
+                try_smart_rename(state.clone(), id, input, true).await,
+                Err(SmartRenameError::TimedOut)
             );
-            assert_eq!(started.elapsed(), MANUAL_RENAME_DEADLINE);
+            assert_eq!(started.elapsed(), RENAME_DEADLINE);
             assert!(state.smart_rename_inflight.lock().unwrap().is_empty());
         }
 
