@@ -488,6 +488,118 @@ fn process_state(pid: u32) -> Result<String, std::io::Error> {
         .map(str::to_string)
         .ok_or_else(|| std::io::Error::other(format!("ps -p {pid} printed no state")))
 }
+
+#[cfg(test)]
+mod termination_tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        unsafe {
+            (
+                OwnedFd::from_raw_fd(descriptors[0]),
+                OwnedFd::from_raw_fd(descriptors[1]),
+            )
+        }
+    }
+
+    struct ZombieParent {
+        pid: libc::pid_t,
+        release: Option<OwnedFd>,
+    }
+
+    impl Drop for ZombieParent {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            while unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) } < 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_zombie_observed_by_another_parent_is_terminated() {
+        use std::io::Read;
+
+        let (ready_read, ready_write) = pipe();
+        let (release_read, release_write) = pipe();
+        let parent_pid = unsafe { libc::fork() };
+        assert!(parent_pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if parent_pid == 0 {
+            // Only async-signal-safe syscalls run in either post-fork child.
+            unsafe {
+                libc::close(ready_read.as_raw_fd());
+                libc::close(release_write.as_raw_fd());
+                let zombie_pid = libc::fork();
+                if zombie_pid < 0 {
+                    libc::_exit(2);
+                }
+                if zombie_pid == 0 {
+                    libc::_exit(0);
+                }
+                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+                while libc::waitid(
+                    libc::P_PID,
+                    zombie_pid as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                ) < 0
+                {
+                    if *libc::__error() != libc::EINTR {
+                        libc::_exit(3);
+                    }
+                }
+                let bytes = zombie_pid.to_ne_bytes();
+                if libc::write(ready_write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                    != bytes.len() as libc::ssize_t
+                {
+                    libc::_exit(4);
+                }
+                let mut byte = 0_u8;
+                while libc::read(release_read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) < 0 {
+                    if *libc::__error() != libc::EINTR {
+                        break;
+                    }
+                }
+                while libc::waitpid(zombie_pid, std::ptr::null_mut(), 0) < 0 {
+                    if *libc::__error() != libc::EINTR {
+                        libc::_exit(5);
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+        let _parent = ZombieParent {
+            pid: parent_pid,
+            release: Some(release_write),
+        };
+        drop(ready_write);
+        drop(release_read);
+        let mut ready = libc::pollfd {
+            fd: ready_read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut ready, 1, 5_000) }, 1);
+        let mut bytes = [0; std::mem::size_of::<libc::pid_t>()];
+        std::fs::File::from(ready_read)
+            .read_exact(&mut bytes)
+            .unwrap();
+        let zombie_pid = libc::pid_t::from_ne_bytes(bytes);
+        assert_eq!(
+            unsafe { libc::waitpid(zombie_pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(super::is_terminated(zombie_pid as u32));
+    }
+}
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
         .args(["-o", "ppid=,args=", "-p", &pid.to_string()])
