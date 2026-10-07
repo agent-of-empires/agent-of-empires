@@ -423,6 +423,7 @@ pub fn plan(
     }
 
     Ok(AttachPlan {
+        path_claims: attach_path_claims(&conversion, &workspace_dir, &worktree_path)?,
         // Appending to an existing workspace leaves `project_path` alone; the
         // other two shapes move the session into a new workspace directory.
         moves_session: !matches!(conversion, Conversion::Append { .. }),
@@ -451,6 +452,7 @@ pub struct AttachPlan {
     added_worktree: PathBuf,
     init_submodules: bool,
     reservation_generation: Option<u64>,
+    path_claims: Vec<PathBuf>,
     original: std::sync::Arc<super::LaunchOrigin>,
     scope: Option<std::sync::Arc<super::runner_journal::OwnedStop>>,
 }
@@ -465,6 +467,31 @@ impl AttachPlan {
             .clone()
             .context("attach must retain its actual reserved native scope")
     }
+}
+
+fn attach_path_claims(
+    conversion: &Conversion,
+    workspace: &Path,
+    added: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut candidates = vec![workspace.to_path_buf(), added.to_path_buf()];
+    match conversion {
+        Conversion::MoveIn { from, primary, .. } => {
+            candidates.push(from.clone());
+            candidates.push(PathBuf::from(&primary.worktree_path));
+        }
+        Conversion::WorktreePrimary { primary, .. } => {
+            candidates.push(PathBuf::from(&primary.worktree_path));
+        }
+        Conversion::Append { .. } => {}
+    }
+    for path in &mut candidates {
+        *path = crate::session::deletion::resolve_claim_path(path)
+            .context("could not resolve the complete attach filesystem plan")?;
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    Ok(candidates)
 }
 
 pub(crate) fn preflight_move_ownership(
@@ -507,12 +534,20 @@ fn ensure_attach_destinations(
     for candidate in candidates {
         let candidate = crate::session::deletion::resolve_claim_path(candidate)
             .context("could not resolve attach destination safely")?;
-        for peer in &paths {
+        for peer in &paths.established {
             anyhow::ensure!(
                 !crate::session::deletion::resolve_claim_path(peer)
                     .context("could not resolve peer claim safely")?
                     .starts_with(&candidate),
                 "Attach path is already claimed by another session"
+            );
+        }
+        for peer in &paths.pending {
+            let peer = crate::session::deletion::resolve_claim_path(peer)
+                .context("could not resolve pending filesystem intent safely")?;
+            anyhow::ensure!(
+                !peer.starts_with(&candidate) && !candidate.starts_with(&peer),
+                "Attach path overlaps a pending filesystem operation"
             );
         }
     }
@@ -541,7 +576,7 @@ pub(crate) fn reserve_attach(
         plan,
     )?;
     let acknowledged =
-        storage.update_native_under_workspace_claim_lock(|rows, _| {
+        storage.update_under_workspace_claim_lock(|rows, _| {
             let row = rows
                 .iter_mut()
                 .find(|row| row.id == session_id)
@@ -564,40 +599,45 @@ pub(crate) fn reserve_attach(
                 super::Instance::LIFECYCLE_RESERVATION_TTL,
                 chrono::Utc::now(),
             )?;
+            row.lifecycle_reservation
+                .as_mut()
+                .context("attach did not acquire its lease")?
+                .path_claims = super::WorktreePathClaims::Pending(plan.path_claims.clone());
             super::LaunchOrigin::capture(row)
         })?;
     plan.reservation_generation = Some(acknowledged.generation());
     plan.scope = Some(super::runner_journal::OwnedStop::from_attach(
         plan.original.clone(),
-        acknowledged.generation(),
-    ));
+        acknowledged.clone(),
+    )?);
     Ok(acknowledged)
 }
 
+/// Release an attach rejected before any filesystem execution.
 pub(crate) fn release_attach(plan: &AttachPlan) {
     let Ok(scope) = plan.native_scope() else {
         return;
     };
+    release_unstarted_claims(&scope, &plan.path_claims);
+}
+
+fn release_unstarted_claims(scope: &super::runner_journal::OwnedStop, paths: &[PathBuf]) {
     let result = scope.with_scope(|_| {
-        scope
-            .storage()
-            .update_native_under_workspace_claim_lock(|rows, _| {
+        scope.storage().complete_path_claims_under_workspace_lock(
+            &scope.current_projection(),
+            paths,
+            |rows, _| {
                 let row = rows
                     .iter_mut()
                     .find(|row| row.id == scope.session_id())
                     .context("original attach row disappeared during release")?;
-                anyhow::ensure!(
-                    row.release_lifecycle_reservation_if_owned(
-                        crate::session::LifecycleOperation::Attach,
-                        scope.generation()
-                    ),
-                    "original attach reservation was superseded"
-                );
-                Ok(())
-            })
+                row.lifecycle_reservation = None;
+                super::LaunchOrigin::capture(row)
+            },
+        )
     });
     if let Err(error) = result {
-        tracing::debug!(session = %plan.original.session_id(), %error, "changed attach scope was preserved during release");
+        tracing::debug!(session = %scope.session_id(), %error, "changed attach scope was preserved during release");
     }
 }
 
@@ -639,6 +679,14 @@ fn execute_for_session(
     attach_generation: u64,
 ) -> Result<PreparedAttach> {
     preflight_move_ownership(owner, &plan)?;
+    let scope = plan.native_scope()?;
+    scope.with_scope(|row| {
+        ensure_attach_owner(row, instance, attach_generation, plan.moves_session)?;
+        anyhow::ensure!(row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+            matches!(&lease.path_claims, super::WorktreePathClaims::Pending(paths) if paths == &plan.path_claims)
+        }), "attach lost its complete filesystem intent");
+        Ok(())
+    })?;
     let AttachPlan {
         conversion,
         workspace_dir,
@@ -648,12 +696,12 @@ fn execute_for_session(
         added_worktree: worktree_path,
         init_submodules,
         original,
+        path_claims,
         ..
     } = plan;
     let git_wt = GitWorktree::new(main_repo_path.clone())?.with_init_submodules(init_submodules);
 
-    // Order matters for rollback: the workspace directory first (so there is something to clean
-    // up), then the session's own repo, then the new one.
+    // Persistent intent protects the filesystem phase without global flocks.
     let created_dir = !workspace_dir.exists();
     std::fs::create_dir_all(&workspace_dir)
         .with_context(|| format!("could not create the workspace {}", workspace_dir.display()))?;
@@ -663,9 +711,6 @@ fn execute_for_session(
         ..Undo::default()
     };
 
-    // `moved_to` is the session's new working directory, which is the workspace root, not the
-    // primary's worktree inside it: that is where a session created multi-repo starts, and it is
-    // what `attach_planned` persists as `project_path`.
     let moved_to = (!matches!(conversion, Conversion::Append { .. }))
         .then(|| workspace_dir.to_string_lossy().to_string());
 
@@ -674,31 +719,10 @@ fn execute_for_session(
         Conversion::MoveIn { primary, from, .. } => {
             let to = PathBuf::from(&primary.worktree_path);
             let primary_git = GitWorktree::new(PathBuf::from(&primary.main_repo_path))?;
-            let moved = (|| -> Result<()> {
-                let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
-                let _identity = crate::session::acquire_session_identity_lock()?;
-                let storage = instance.original_storage()?;
-                storage.verify_profile_identity()?;
-                let claimed = crate::session::deletion::paths_in_use_except(&[owner]);
-                anyhow::ensure!(
-                    !claimed.covers(from),
-                    "primary checkout is shared or its ownership is unknown"
-                );
-                ensure_attach_destinations(owner, &[workspace_dir.clone(), to.clone()])?;
-                let _lifecycle = storage.acquire_instance_lifecycle_lock(owner.session_id)?;
-                storage.update_under_workspace_claim_lock(|rows, _| {
-                    let row = rows
-                        .iter()
-                        .find(|row| row.id == owner.session_id)
-                        .context("session disappeared before checkout move")?;
-                    ensure_attach_owner(row, instance, attach_generation, true)?;
-                    primary_git.move_worktree(from, &to)?;
-                    undo.moved_primary = Some((primary.main_repo_path.clone(), to, from.clone()));
-                    Ok(())
-                })
-            })();
+            let moved = primary_git.move_worktree(from, &to);
             if let Err(e) = moved {
-                undo.run_preserving_claimed(owner, instance, attach_generation);
+                undo.uncertain = true;
+                undo.run_preserving_claimed(&scope, &path_claims);
                 return Err(e).with_context(|| {
                     format!(
                         "could not move this session's worktree into {}",
@@ -706,6 +730,7 @@ fn execute_for_session(
                     )
                 });
             }
+            undo.moved_primary = Some((primary.main_repo_path.clone(), to, from.clone()));
             Some(primary.clone())
         }
         Conversion::WorktreePrimary {
@@ -720,7 +745,8 @@ fn execute_for_session(
             if let Err(e) =
                 primary_git.create_worktree(&primary.branch, &to, *create_branch, base.as_deref())
             {
-                undo.run_preserving_claimed(owner, instance, attach_generation);
+                undo.uncertain = true;
+                undo.run_preserving_claimed(&scope, &path_claims);
                 return Err(e).with_context(|| {
                     format!(
                         "could not create a worktree for this session's own repo in {}",
@@ -745,7 +771,8 @@ fn execute_for_session(
     ) {
         Ok(w) => w,
         Err(e) => {
-            undo.run_preserving_claimed(owner, instance, attach_generation);
+            undo.uncertain = true;
+            undo.run_preserving_claimed(&scope, &path_claims);
             return Err(e)
                 .with_context(|| format!("could not create a worktree for '{repo_name}'"));
         }
@@ -802,6 +829,8 @@ fn execute_for_session(
         },
         workspace_info,
         undo,
+        scope,
+        path_claims,
     })
 }
 
@@ -816,87 +845,104 @@ struct Undo {
     created_primary: Option<(String, PathBuf, Option<String>)>,
     /// `(main_repo, worktree, branch_to_delete)`.
     added: Option<(String, PathBuf, Option<String>)>,
+    uncertain: bool,
 }
 
 impl Undo {
-    fn run_preserving_claimed(
-        &self,
-        owner: crate::session::deletion::SessionPathOwner<'_>,
-        expected: &super::Instance,
-        generation: u64,
-    ) {
+    fn run_preserving_claimed(&self, scope: &super::runner_journal::OwnedStop, paths: &[PathBuf]) {
         let rollback = (|| -> Result<()> {
-            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
-            let _identity = crate::session::acquire_session_identity_lock()?;
-            let storage = expected.original_storage()?;
-            storage.verify_profile_identity()?;
-            let _lifecycle = storage.acquire_instance_lifecycle_lock(owner.session_id)?;
-            let row = storage
-                .load_strict_for_worktree_ownership_locked()?
-                .into_iter()
-                .find(|row| row.id == owner.session_id)
-                .context("attach owner disappeared before rollback")?;
-            ensure_attach_owner(&row, expected, generation, true)?;
-            let claimed = crate::session::deletion::paths_in_use_except(&[owner]);
-            self.run_filtered(Some(&claimed));
+            let claimed = scope.with_scope(|row| {
+                anyhow::ensure!(
+                    self.moved_primary.is_none() || row.runner_journal.proves_quiescent(),
+                    "moving a checkout back requires proven native quiescence"
+                );
+                anyhow::ensure!(row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+                    matches!(&lease.path_claims, super::WorktreePathClaims::Pending(stored) if stored == paths)
+                }), "rollback lost its complete filesystem intent");
+                Ok(crate::session::deletion::paths_in_use_except(&[
+                    crate::session::deletion::SessionPathOwner {
+                        profile: scope.storage().profile(), session_id: scope.session_id(),
+                    },
+                ]))
+            })?;
+            self.run_filtered(&claimed)?;
+            anyhow::ensure!(
+                !self.uncertain,
+                "failed Git effect has no complete rollback proof"
+            );
+            scope.with_scope(|_| {
+                scope.storage().complete_path_claims_under_workspace_lock(
+                    &scope.current_projection(),
+                    paths,
+                    |rows, _| {
+                        let row = rows
+                            .iter_mut()
+                            .find(|row| row.id == scope.session_id())
+                            .context("original attach row disappeared after rollback")?;
+                        row.lifecycle_reservation = None;
+                        super::LaunchOrigin::capture(row)
+                    },
+                )
+            })?;
             Ok(())
         })();
         if let Err(error) = rollback {
-            tracing::warn!(target: "session.attach", session = owner.session_id,
-                "retaining recoverable attach artifacts because rollback authority is unproven: {error}");
+            tracing::warn!(target: "session.attach", session = scope.session_id(),
+                "retaining filesystem intent and recoverable attach artifacts: {error:#}");
         }
     }
 
-    fn run_filtered(&self, claimed: Option<&crate::session::deletion::PathsInUse>) {
-        let is_claimed = |path: &Path| claimed.is_some_and(|paths| paths.covers(path));
+    fn run_filtered(&self, claimed: &crate::session::deletion::PathsInUse) -> Result<()> {
+        let mut failure = None;
         for (main_repo, worktree, branch) in [self.added.as_ref(), self.created_primary.as_ref()]
             .into_iter()
             .flatten()
         {
-            if is_claimed(worktree) {
-                continue;
-            }
-            if let Ok(git) = GitWorktree::new(PathBuf::from(main_repo)) {
-                let _ = git.remove_worktree(worktree, true);
+            let removed = (|| -> Result<()> {
+                anyhow::ensure!(
+                    !claimed.covers(worktree),
+                    "rollback worktree is claimed or unknown"
+                );
+                let git = GitWorktree::new(PathBuf::from(main_repo))?;
+                git.remove_worktree(worktree, true)?;
                 if let Some(branch) = branch {
-                    let _ = git.delete_branch(branch);
+                    git.delete_branch(branch)?;
                 }
+                Ok(())
+            })();
+            if let Err(error) = removed {
+                failure.get_or_insert(error);
             }
         }
         if let Some((main_repo, from, back_to)) = &self.moved_primary {
-            // Moving back removes the source; an unknown inventory must retain it.
-            if is_claimed(from) {
-                tracing::warn!(
-                    target: "session.attach",
-                    "A peer claimed the primary checkout path during the conversion; leaving it \
-                     where it is rather than moving it back"
+            let moved = (|| -> Result<()> {
+                anyhow::ensure!(
+                    !claimed.covers(from) && !claimed.covers(back_to),
+                    "rollback move endpoint is claimed or unknown"
                 );
-            } else {
-                match GitWorktree::new(PathBuf::from(main_repo)) {
-                    Ok(git) => {
-                        if let Err(e) = git.move_worktree(from, back_to) {
-                            tracing::error!(
-                                target: "session.attach",
-                                from = %from.display(),
-                                to = %back_to.display(),
-                                "could not move the session's worktree back after a failed attach: {e:#}"
-                            );
-                        }
-                    }
-                    Err(e) => tracing::error!(
-                        target: "session.attach",
-                        "could not open {main_repo} to move the session's worktree back: {e:#}"
-                    ),
-                }
+                GitWorktree::new(PathBuf::from(main_repo))?.move_worktree(from, back_to)?;
+                Ok(())
+            })();
+            if let Err(error) = moved {
+                failure.get_or_insert(error);
             }
         }
         if let Some(dir) = &self.workspace_dir {
-            if is_claimed(dir) {
-                return;
+            let removed = (|| -> Result<()> {
+                anyhow::ensure!(
+                    !claimed.covers(dir),
+                    "rollback workspace is claimed or unknown"
+                );
+                std::fs::remove_dir(dir)
+                    .with_context(|| format!("removing empty workspace {}", dir.display()))
+            })();
+            if let Err(error) = removed {
+                failure.get_or_insert(error);
             }
-            // `remove_dir`, not `remove_dir_all`: if anything is still in there
-            // the removal must fail loudly rather than take it with us.
-            let _ = std::fs::remove_dir(dir);
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
@@ -907,6 +953,8 @@ pub struct PreparedAttach {
     /// The workspace the session becomes, ready for the caller to persist.
     pub workspace_info: WorkspaceInfo,
     undo: Undo,
+    scope: std::sync::Arc<super::runner_journal::OwnedStop>,
+    path_claims: Vec<PathBuf>,
 }
 
 impl PreparedAttach {
@@ -947,7 +995,11 @@ pub fn attach_planned(
     instance: &super::Instance,
     mut plan: AttachPlan,
 ) -> Result<AttachOutcome> {
-    let mut cleanup_generation = plan.reservation_generation;
+    let mut unstarted = plan
+        .scope
+        .clone()
+        .map(|scope| (scope, plan.path_claims.clone()));
+    let mut filesystem_started = false;
     let result: Result<AttachOutcome> = (|| {
         let mut workspace_claim_lock =
             Some(crate::session::acquire_session_workspace_claim_lock()?);
@@ -987,8 +1039,8 @@ pub fn attach_planned(
                 ),
             }
         }
-        let attach_generation =
-            storage.update_under_profile_namespace_lock(|instances, _groups| {
+        let acknowledged =
+            storage.update_under_workspace_claim_lock(|instances, _groups| {
                 let row = instances
                     .iter_mut()
                     .find(|candidate| candidate.id == session_id)
@@ -1004,6 +1056,11 @@ pub fn attach_planned(
                         ),
                         "attach reservation was superseded before execution"
                     );
+                    anyhow::ensure!(
+                        row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+                            matches!(&lease.path_claims, super::WorktreePathClaims::Pending(paths) if paths == &plan.path_claims)
+                        }), "attach filesystem intent differs from its complete original plan"
+                    );
                 } else {
                     plan.original
                         .validate_baseline_at(row, plan.original.generation())?;
@@ -1012,6 +1069,8 @@ pub fn attach_planned(
                         super::Instance::LIFECYCLE_RESERVATION_TTL,
                         chrono::Utc::now(),
                     )?;
+                    row.lifecycle_reservation.as_mut().context("attach did not acquire its lease")?
+                        .path_claims = super::WorktreePathClaims::Pending(plan.path_claims.clone());
                 }
                 if plan.moves_session {
                     anyhow::ensure!(
@@ -1019,16 +1078,18 @@ pub fn attach_planned(
                         "runner execution is not proven quiescent"
                     );
                 }
-                Ok(row.lifecycle_generation)
+                super::LaunchOrigin::capture(row)
             })?;
-        cleanup_generation = Some(attach_generation);
+        let attach_generation = acknowledged.generation();
+
         if plan.scope.is_none() {
             plan.reservation_generation = Some(attach_generation);
             plan.scope = Some(super::runner_journal::OwnedStop::from_attach(
                 plan.original.clone(),
-                attach_generation,
-            ));
+                acknowledged.clone(),
+            )?);
         }
+        unstarted = Some((plan.native_scope()?, plan.path_claims.clone()));
 
         if let Err(error) = preflight_move_ownership_locked(owner, &plan) {
             anyhow::bail!("Attach path is already claimed by another session: {error}");
@@ -1036,11 +1097,9 @@ pub fn attach_planned(
         drop(workspace_claim_lock.take());
         drop(identity_lock);
         drop(lifecycle_lock.take());
-        // Every failure path below rolls back through `run_preserving_claimed`,
-        // which takes the workspace-claim lock. Holding the profile namespace
-        // across the call would invert the documented order and let two
-        // concurrent attaches deadlock against each other.
+        // Rollback reacquires the same fence order; no global lock spans Git.
         drop(profile_namespace_lock);
+        filesystem_started = true;
         let mut prepared = match execute_for_session(instance, plan, owner, attach_generation) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1074,34 +1133,35 @@ pub fn attach_planned(
             ensure_attach_destinations(owner, &candidate_paths)?;
             let _lifecycle = storage.acquire_instance_lifecycle_lock(session_id)?;
             let _namespace = crate::session::storage::acquire_profile_namespace_lock()?;
-            storage.update_under_profile_namespace_lock(|instances, _groups| {
-                let row = instances
-                    .iter_mut()
-                    .find(|row| row.id == session_id)
-                    .context("session disappeared before attach publication")?;
-                ensure_attach_owner(row, instance, attach_generation, converted)?;
-                anyhow::ensure!(
+            storage.complete_path_claims_under_workspace_lock(
+                &prepared.scope.current_projection(),
+                &prepared.path_claims,
+                |instances, _groups| {
+                    let row = instances
+                        .iter_mut()
+                        .find(|row| row.id == session_id)
+                        .context("session disappeared before attach publication")?;
+                    ensure_attach_owner(row, instance, attach_generation, converted)?;
+                    anyhow::ensure!(
                     !converted || !conversation_cannot_follow(row),
                     "conversation is bound to the current checkout; conversion cannot be committed"
                 );
-                row.workspace_info = Some(workspace);
-                if converted {
-                    row.project_path = new_project_path;
-                    row.worktree_info = None;
-                }
-                row.release_lifecycle_reservation_if_owned(
-                    crate::session::LifecycleOperation::Attach,
-                    attach_generation,
-                );
-                super::LaunchOrigin::capture(row)
-            })
+                    row.workspace_info = Some(workspace);
+                    if converted {
+                        row.project_path = new_project_path;
+                        row.worktree_info = None;
+                    }
+                    row.lifecycle_reservation = None;
+                    super::LaunchOrigin::capture(row)
+                },
+            )
         })();
         let acknowledged = match persisted {
             Ok(acknowledged) => acknowledged,
             Err(error) => {
                 prepared
                     .undo
-                    .run_preserving_claimed(owner, instance, attach_generation);
+                    .run_preserving_claimed(&prepared.scope, &prepared.path_claims);
                 return Err(error).with_context(|| {
                     format!(
                         "could not record attach; recoverable worktrees may remain at {}",
@@ -1114,17 +1174,9 @@ pub fn attach_planned(
 
         Ok(prepared.outcome)
     })();
-    if result.is_err() {
-        if let Some(generation) = cleanup_generation {
-            let _ = storage.update(|rows, _| {
-                if let Some(row) = rows.iter_mut().find(|row| row.id == session_id) {
-                    row.release_lifecycle_reservation_if_owned(
-                        crate::session::LifecycleOperation::Attach,
-                        generation,
-                    );
-                }
-                Ok(())
-            });
+    if result.is_err() && !filesystem_started {
+        if let Some((scope, paths)) = unstarted {
+            release_unstarted_claims(&scope, &paths);
         }
     }
     result
@@ -1521,12 +1573,16 @@ mod tests {
         let dangling = temporary.path().join("dangling");
         symlink(temporary.path().join("absent"), &dangling).unwrap();
         assert!(ensure_attach_destinations(owner, std::slice::from_ref(&dangling)).is_err());
+        let claimed_alias = temporary.path().join("claimed-alias");
+        symlink(&root, &claimed_alias).unwrap();
         storage
             .update_under_workspace_claim_lock(|rows, _| {
-                rows[0].project_path = dangling.to_str().unwrap().to_owned();
+                rows[0].project_path = claimed_alias.to_str().unwrap().to_owned();
                 Ok(())
             })
             .unwrap();
+        std::fs::remove_file(&claimed_alias).unwrap();
+        symlink(temporary.path().join("absent"), &claimed_alias).unwrap();
         assert!(ensure_attach_destinations(owner, &[temporary.path().join("new")]).is_err());
     }
 

@@ -1,56 +1,7 @@
-//! Creating a session: the request, its pending stub, and the cleanup a
-//! cancel or a quit has to do.
+//! Session creation, canonical publication, and retained cancellation ownership.
 
 use super::*;
 use std::path::PathBuf;
-
-pub(super) fn cleanup_creation_resources(
-    instance: &Instance,
-    created_worktree: Option<&CreatedWorktreeInfo>,
-    created_workspace_worktrees: &[CreatedWorktreeInfo],
-    protected_owner: Option<&Instance>,
-) {
-    let worktree = created_worktree.map(crate::session::builder::CreatedWorktree::from);
-    let workspace_worktrees: Vec<_> = created_workspace_worktrees
-        .iter()
-        .map(crate::session::builder::CreatedWorktree::from)
-        .collect();
-    crate::session::builder::cleanup_instance_locked(
-        instance,
-        worktree.as_ref(),
-        &workspace_worktrees,
-        protected_owner,
-    );
-}
-
-/// [`cleanup_creation_resources`] for a caller that already holds the
-/// workspace-claim and identity flocks, so the ownership snapshot and the
-/// deletions run in the same window.
-pub(super) fn cleanup_creation_resources_under_locks(
-    instance: &Instance,
-    created_worktree: Option<&CreatedWorktreeInfo>,
-    created_workspace_worktrees: &[CreatedWorktreeInfo],
-    protected_owner: Option<&Instance>,
-    locks: &crate::session::builder::CleanupOwnershipLocks,
-) {
-    let worktree = created_worktree.map(crate::session::builder::CreatedWorktree::from);
-    let workspace_worktrees: Vec<_> = created_workspace_worktrees
-        .iter()
-        .map(crate::session::builder::CreatedWorktree::from)
-        .collect();
-    crate::session::builder::cleanup_instance_under_locks(
-        instance,
-        worktree.as_ref(),
-        &workspace_worktrees,
-        protected_owner,
-        locks,
-    );
-}
-
-pub(super) enum CreationCommit {
-    Inserted,
-    Duplicate(Box<Instance>),
-}
 
 /// Cross-process guards for a single-session title mutation or profile move. The source
 /// profile's lifecycle flock nests inside the per-session title flock; callers retain this
@@ -121,7 +72,8 @@ impl HomeView {
             }
         }
         let stub_title = data.title.clone();
-        let mut stub = Instance::new(&stub_title, &data.path);
+        let admitted_instance = Instance::new(&stub_title, &data.path);
+        let mut stub = admitted_instance.clone();
         stub.tool = if data.tool.is_empty() {
             "claude".to_string()
         } else {
@@ -222,6 +174,7 @@ impl HomeView {
             .collect();
         let request = CreationRequest {
             storage,
+            admitted_instance,
             data,
             existing_instances,
             hooks,
@@ -230,7 +183,14 @@ impl HomeView {
         self.creation_poller.request_creation(request);
     }
 
-    /// Cancel the current creation; the worker stops at its next step and rolls back.
+    fn remove_creation_stub(&mut self, id: &str) {
+        if let Some(instance) = self.instances.shift_remove(id) {
+            if let Some(pending) = self.pending_added.get_mut(&instance.source_profile) {
+                pending.remove(id);
+            }
+        }
+    }
+    /// Cancel at the next worker boundary; unproven ownership remains retained.
     pub fn cancel_creation(&mut self) {
         if let Some(cancel) = self.creation_cancel.take() {
             cancel.cancel();
@@ -238,7 +198,7 @@ impl HomeView {
         // Remove the stub instance
         if let Some(stub_id) = self.creating_stub_id.take() {
             self.creating_provisional_group_paths.clear();
-            self.remove_instance(&stub_id);
+            self.remove_creation_stub(&stub_id);
             self.creating_hook_progress.remove(&stub_id);
             self.rebuild_group_trees();
             self.rebuild_flat_items();
@@ -258,21 +218,13 @@ impl HomeView {
         // A cancelled request's stub is already gone; the fields below may belong to a
         // newer request, so leave them alone.
         if outcome.cancelled || matches!(result, CreationResult::Cancelled) {
-            if let CreationResult::Success {
-                ref instance,
-                ref created_worktree,
-                ref created_workspace_worktrees,
-                ..
-            } = result
-            {
-                if outcome.storage.verify_profile_identity().is_ok() {
-                    cleanup_creation_resources(
-                        instance,
-                        created_worktree.as_ref(),
-                        created_workspace_worktrees,
-                        None,
-                    );
-                }
+            if let CreationResult::Success { ref instance, .. } = result {
+                self.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Cancelled creation retained",
+                    &format!("Session {} and its resources at {} are retained because original owner quiescence is unproven.", instance.id, instance.project_path),
+                ));
+            } else if let CreationResult::Error(ref error) = result {
+                self.info_dialog = Some(InfoDialog::sized_to_fit("Cancelled creation", error));
             }
             return None;
         }
@@ -282,7 +234,7 @@ impl HomeView {
         // Taken, not borrowed, so every early return leaves the field empty: the
         // provisional group paths belong to this stub alone and must not carry into the
         // next creation.
-        let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
+        self.creating_provisional_group_paths.clear();
         if let Some(ref id) = stub_id {
             self.creating_hook_progress.remove(id);
         }
@@ -291,10 +243,9 @@ impl HomeView {
             CreationResult::Success {
                 session_id,
                 instance,
-                created_worktree,
-                created_workspace_worktrees,
+                creation_intent,
                 on_launch_hooks_ran,
-                mut warnings,
+                warnings,
             } => {
                 let mut instance = *instance;
                 // Taken here rather than carried over the channel from the
@@ -303,33 +254,26 @@ impl HomeView {
                 // them), so a guard owned by the worker would self-deadlock.
                 // Workspace claim before identity, the single order every other
                 // owner uses.
-                let ownership_locks =
-                    match crate::session::builder::CleanupOwnershipLocks::acquire() {
-                        Ok(locks) => locks,
-                        Err(error) => {
-                            cleanup_creation_resources(
-                                &instance,
-                                created_worktree.as_ref(),
-                                &created_workspace_worktrees,
-                                None,
-                            );
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
-                                "Creation Failed",
-                                &format!(
-                                    "Could not lock the session inventory to publish: {error}"
-                                ),
-                            ));
-                            self.new_dialog = None;
-                            self.rebuild_group_trees();
-                            self.rebuild_flat_items();
-                            self.update_selected();
-                            return None;
-                        }
-                    };
+                let ownership_locks = match crate::session::builder::CleanupOwnershipLocks::acquire(
+                ) {
+                    Ok(locks) => locks,
+                    Err(error) => {
+                        tracing::warn!(target: "tui.create", "Creation ownership and resources retained: original native quiescence is unproven");
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &format!("Could not lock the session inventory to publish: {error}"),
+                        ));
+                        self.new_dialog = None;
+                        self.rebuild_group_trees();
+                        self.rebuild_flat_items();
+                        self.update_selected();
+                        return None;
+                    }
+                };
 
                 // Remove the stub instance
                 if let Some(id) = &stub_id {
-                    self.remove_instance(id);
+                    self.remove_creation_stub(id);
                 }
 
                 let storage = &*outcome.storage;
@@ -354,13 +298,7 @@ impl HomeView {
                 let authoritative = match storage.load() {
                     Ok(authoritative) => authoritative,
                     Err(error) => {
-                        cleanup_creation_resources_under_locks(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                            None,
-                            &ownership_locks,
-                        );
+                        tracing::warn!(target: "tui.create", "Creation ownership and resources retained: original native quiescence is unproven");
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
                             &format!("Failed to read profile storage: {error}"),
@@ -374,13 +312,7 @@ impl HomeView {
                     }
                 };
                 if let Err(error) = crate::session::validate_managed_workspace(&instance) {
-                    cleanup_creation_resources_under_locks(
-                        &instance,
-                        created_worktree.as_ref(),
-                        &created_workspace_worktrees,
-                        None,
-                        &ownership_locks,
-                    );
+                    tracing::warn!(target: "tui.create", "Creation ownership and resources retained: original native quiescence is unproven");
                     self.info_dialog = Some(InfoDialog::sized_to_fit(
                         "Creation Failed",
                         &format!("Managed workspace validation failed: {error}"),
@@ -413,13 +345,7 @@ impl HomeView {
                         },
                         &candidate_paths,
                     ) {
-                        cleanup_creation_resources_under_locks(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                            None,
-                            &ownership_locks,
-                        );
+                        tracing::warn!(target: "tui.create", "Creation ownership and resources retained: original native quiescence is unproven");
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
                             &format!("Session path is already claimed: {error}"),
@@ -430,119 +356,39 @@ impl HomeView {
                         return None;
                     }
                 }
-                let persist_result = storage.update(|instances, groups| {
-                    // `save()` can run while the builder works and persist the
-                    // placeholder, so remove that exact row under the same storage lock used
-                    // for collision detection and insertion, or it collides with its own
-                    // result.
-                    let removed_persisted_stub = stub_id.as_deref().is_some_and(|stub_id| {
-                        let before = instances.len();
-                        instances.retain(|row| row.id != stub_id);
-                        instances.len() != before
-                    });
-                    if removed_persisted_stub && !provisional_group_paths.is_empty() {
-                        groups.retain(|group| !provisional_group_paths.contains(&group.path));
-                        // A peer may have committed another row into one of these paths,
-                        // so rebuild from the remaining rows and let its group survive the
-                        // provisional stub metadata.
-                        *groups = GroupTree::new_with_groups(instances, groups).get_all_groups();
-                    }
-                    if let Some(owner) = crate::session::find_duplicate_session(
-                        instances.iter(),
-                        &instance.title,
-                        &instance.project_path,
-                        None,
-                    ) {
-                        return Ok(CreationCommit::Duplicate(Box::new(owner.clone())));
-                    }
-                    instances.push(instance.clone());
-                    if !instance.group_path.is_empty() {
-                        let mut tree = GroupTree::new_with_groups(instances, groups);
-                        tree.create_group(&instance.group_path);
-                        *groups = tree.get_all_groups();
-                    }
-                    Ok(CreationCommit::Inserted)
-                });
+                let persist_result =
+                    crate::session::builder::publish_prepared_creation_under_workspace_claim_lock(
+                        storage,
+                        &instance,
+                        &creation_intent,
+                        |instances, groups| {
+                            if !instance.group_path.is_empty() {
+                                let mut tree = GroupTree::new_with_groups(instances, groups);
+                                tree.create_group(&instance.group_path);
+                                *groups = tree.get_all_groups();
+                            }
+                            Ok(())
+                        },
+                    );
                 match persist_result {
-                    Ok(CreationCommit::Inserted) => {}
-                    Ok(CreationCommit::Duplicate(owner)) => {
-                        cleanup_creation_resources_under_locks(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                            Some(&owner),
-                            &ownership_locks,
-                        );
+                    Ok(committed) => instance = committed,
+                    Err(error) => {
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
-                            &crate::session::duplicate_session_error(&instance.title).to_string(),
+                            &format!(
+                                "Creation publication failed; resources were retained: {error}"
+                            ),
                         ));
                         self.new_dialog = None;
                         drop(ownership_locks);
-                        if let Err(error) = self.reload() {
-                            tracing::warn!(
-                                target: "tui.home",
-                                "Failed to reload authoritative state after creation collision: {error}"
-                            );
+                        if let Err(reload_error) = self.reload() {
+                            tracing::warn!(target: "tui.home", "Could not reload failed creation: {reload_error}");
                         }
                         return None;
                     }
-                    Err(error) => match storage.load() {
-                        Ok(instances) if instances.iter().any(|row| row.id == instance.id) => {
-                            warnings.push(format!(
-                                "Session metadata was written, but finalizing profile storage reported an error: {error}"
-                            ));
-                        }
-                        Ok(instances) => {
-                            let owner = crate::session::find_duplicate_session(
-                                &instances,
-                                &instance.title,
-                                &instance.project_path,
-                                None,
-                            )
-                            .cloned();
-                            cleanup_creation_resources_under_locks(
-                                &instance,
-                                created_worktree.as_ref(),
-                                &created_workspace_worktrees,
-                                owner.as_ref(),
-                                &ownership_locks,
-                            );
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
-                                "Creation Failed",
-                                &format!("Failed to save session: {error}"),
-                            ));
-                            self.new_dialog = None;
-                            drop(ownership_locks);
-                            if let Err(reload_error) = self.reload() {
-                                tracing::warn!(
-                                    target: "tui.home",
-                                    "Failed to reload authoritative state after creation rollback: {reload_error}"
-                                );
-                            }
-                            return None;
-                        }
-                        Err(verify_error) => {
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
-                                "Creation Failed",
-                                &format!(
-                                    "Failed to save session and could not verify the result: {error}\n\
-                                     Created resources were retained to avoid deleting a persisted session: {verify_error}"
-                                ),
-                            ));
-                            self.new_dialog = None;
-                            self.rebuild_group_trees();
-                            self.rebuild_flat_items();
-                            self.update_selected();
-                            return None;
-                        }
-                    },
                 }
 
-                // `publish_persisted_instance` records the create-count and clears the id
-                // from `pending_added`, since the row is authoritative now. Its in-memory
-                // insert is superseded by the `reload()` below on success and is the
-                // fallback that keeps the row visible if that reload fails.
+                // Publish locally only after the actual canonical acknowledgement.
                 self.publish_persisted_instance(instance.clone());
                 self.rebuild_group_trees();
 
@@ -590,7 +436,7 @@ impl HomeView {
             CreationResult::Error(error) => {
                 // Remove the stub and show the error in an info dialog
                 if let Some(id) = &stub_id {
-                    self.remove_instance(id);
+                    self.remove_creation_stub(id);
                     self.rebuild_group_trees();
                     self.rebuild_flat_items();
                     self.update_selected();
@@ -697,11 +543,11 @@ impl HomeView {
             cancel.cancel();
         }
         if let Some(stub_id) = self.creating_stub_id.take() {
-            self.remove_instance(&stub_id);
+            self.remove_creation_stub(&stub_id);
             self.creating_hook_progress.remove(&stub_id);
         }
 
-        // Every request is cancelled now, so each one rolls back unless it finished first.
+        // Receive completed requests without discarding their retention decision.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while self.creation_poller.is_pending() {
             let Some(outcome) = self
@@ -710,20 +556,10 @@ impl HomeView {
             else {
                 break;
             };
-            if let crate::tui::creation_poller::CreationResult::Success {
-                ref instance,
-                ref created_worktree,
-                ref created_workspace_worktrees,
-                ..
-            } = outcome.result
+            if let crate::tui::creation_poller::CreationResult::Success { ref instance, .. } =
+                outcome.result
             {
-                cleanup_creation_resources(
-                    instance,
-                    created_worktree.as_ref(),
-                    created_workspace_worktrees,
-                    None,
-                );
-                tracing::info!(target: "tui.home", "Cleaned up cancelled session on exit");
+                tracing::warn!(target: "tui.home", session_id = %instance.id, "Cancelled creation ownership remains retained on exit");
             }
         }
     }

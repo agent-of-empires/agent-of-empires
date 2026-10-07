@@ -233,8 +233,7 @@ pub(crate) async fn spawn_structured_session(
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
         let build_warnings = build_result.warnings;
-        let created_worktree = build_result.created_worktree;
-        let created_workspace_worktrees = build_result.created_workspace_worktrees;
+        let creation_intent = build_result.creation_intent;
 
         // Apply per-session sandbox overrides from the request body.
         if let Some(ref mut sandbox) = instance.sandbox_info {
@@ -336,21 +335,16 @@ pub(crate) async fn spawn_structured_session(
 
             agent_effort
         };
+        creation_intent.refresh_prepared(&instance).context("Creation intent changed; its durable claim and resources remain retained")?;
 
-        // Run on_create hooks now that the worktree exists, before the session is persisted
-        // or started.
+        // Run creation hooks after the complete plan is durable.
         if let Err(e) = crate::server::api::sessions::run_create_hooks(
             &mut instance,
             &hook_plan,
             std::path::Path::new(&original_path),
             progress.as_deref(),
         ) {
-            builder::cleanup_instance_locked(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
-            );
+            tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
             let hint = hook_plan
                 .hooks
                 .as_ref()
@@ -367,12 +361,7 @@ pub(crate) async fn spawn_structured_session(
         let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
             Ok(lock) => lock,
             Err(error) => {
-                builder::cleanup_instance_locked(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                 return Err(error);
             }
         };
@@ -381,36 +370,17 @@ pub(crate) async fn spawn_structured_session(
                 builder::CleanupOwnershipLocks::from_held(_workspace_claim_lock, lock)
             }
             Err(error) => {
-                // Only the workspace-claim lock is held; release it so the
-                // cleanup path can take the pair itself.
                 drop(_workspace_claim_lock);
-                builder::cleanup_instance_locked(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                 return Err(error);
             }
         };
         if let Err(error) = storage.verify_profile_identity() {
-            builder::cleanup_instance_under_locks(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
-                &ownership_locks,
-            );
+            tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
             return Err(error);
         }
         if let Err(error) = crate::session::validate_managed_workspace(&instance) {
-            builder::cleanup_instance_under_locks(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
-                &ownership_locks,
-            );
+            tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
             return Err(anyhow::anyhow!(
                 "Managed workspace validation failed before the session was persisted: {error}"
             ));
@@ -432,13 +402,7 @@ pub(crate) async fn spawn_structured_session(
                 crate::session::deletion::SessionPathOwner { profile: storage.profile(), session_id: &instance.id },
                 &candidate_paths,
             ) {
-                builder::cleanup_instance_under_locks(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                    &ownership_locks,
-                );
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                 return Err(anyhow::anyhow!(
                     "Session path is already claimed by another session: {error}"
                 ));
@@ -448,11 +412,9 @@ pub(crate) async fn spawn_structured_session(
         let created = instance.clone();
         let mut published = false;
         let persist_and_start = || -> anyhow::Result<()> {
-            let to_persist = created.clone();
-            storage.update(|all, _groups| {
-                all.push(to_persist);
-                Ok(())
-            })?;
+            instance = builder::publish_prepared_creation_under_workspace_claim_lock(
+                &storage, &created, &creation_intent, |_all, _groups| Ok(()),
+            )?;
             published = true;
             drop(ownership_locks);
 
@@ -465,43 +427,10 @@ pub(crate) async fn spawn_structured_session(
             Ok(())
         };
 
-        if let Err(e) = persist_and_start() {
-            let rollback = (|| -> anyhow::Result<()> {
-                anyhow::ensure!(published, "creation commit is uncertain; retaining resources");
-                let ownership = builder::CleanupOwnershipLocks::acquire()?;
-                storage.verify_profile_identity()?;
-                let _lifecycle = storage.acquire_instance_lifecycle_lock(&created.id)?;
-                storage.update(|all, _groups| {
-                    let position = all.iter().position(|row| row.id == created.id)
-                        .ok_or_else(|| anyhow::anyhow!("creation row was removed or moved"))?;
-                    let row = &all[position];
-                    anyhow::ensure!(
-                        row.created_at == created.created_at
-                            && row.project_path == created.project_path
-                            && row.scratch == created.scratch
-                            && row.lifecycle_generation == instance.lifecycle_generation
-                            && (row.lifecycle_generation == created.lifecycle_generation
-                                || row.lifecycle_generation == created.lifecycle_generation.saturating_add(1))
-                            && !row.has_fresh_lifecycle_reservation(chrono::Utc::now())
-                            && !matches!(row.status, crate::session::Status::Running | crate::session::Status::Starting)
-                            && row.all_repos().iter().map(|repo| &repo.worktree_path)
-                                .eq(created.all_repos().iter().map(|repo| &repo.worktree_path)),
-                        "creation or launch ownership was superseded; retaining resources"
-                    );
-                    all.remove(position);
-                    Ok(())
-                })?;
-                builder::cleanup_instance_under_locks(
-                    &created, created_worktree.as_ref(), &created_workspace_worktrees,
-                    None, &ownership,
-                );
-                Ok(())
-            })();
-            if let Err(error) = rollback {
-                tracing::warn!(target: "http.api.sessions", session = %created.id,
-                    "Keeping failed-create resources: {error:#}");
-            }
-            return Err(e);
+        if let Err(error) = persist_and_start() {
+            tracing::warn!(target: "http.api.sessions", session = %created.id, metadata_published = published,
+                "Retaining failed-create metadata and resources: launch failure does not prove native quiescence: {error:#}");
+            return Err(error.context("Creation resources retained for recovery by their original owner"));
         }
 
         Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((

@@ -97,7 +97,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                     anyhow::anyhow!("Session {removed_title} disappeared before trash")
                 })?;
             ensure_trash_paths_unclaimed(&storage, &snapshot)?;
-            storage.update(|all_instances, _groups| {
+            storage.update_under_workspace_claim_lock(|all_instances, _groups| {
                 let stored = all_instances
                     .iter_mut()
                     .find(|instance| instance.id == removed_id)
@@ -149,7 +149,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             );
         } else {
             if let Err(error) = ensure_trash_paths_unclaimed(&storage, &snapshot) {
-                storage.update(|all_instances, _groups| {
+                storage.update_under_workspace_claim_lock(|all_instances, _groups| {
                     if let Some(stored) = all_instances.iter_mut().find(|row| row.id == removed_id)
                     {
                         if stored.lifecycle_reservation_is_owned(
@@ -167,7 +167,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 })?;
                 return Err(error);
             }
-            let outcome = storage.update(|all_instances, _groups| {
+            let outcome = storage.update_under_workspace_claim_lock(|all_instances, _groups| {
                 let stored = all_instances
                     .iter()
                     .find(|row| row.id == removed_id)
@@ -420,7 +420,7 @@ fn ensure_trash_paths_unclaimed(storage: &Storage, instance: &Instance) -> Resul
 }
 
 fn release_trash_reservation_best_effort(storage: &Storage, removed_id: &str, generation: u64) {
-    let _ = storage.update(|all_instances, _groups| {
+    let _ = storage.update_under_workspace_claim_lock(|all_instances, _groups| {
         crate::session::claim::release_trash_reservation(all_instances, removed_id, generation);
         Ok(())
     });

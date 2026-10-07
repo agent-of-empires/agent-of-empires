@@ -116,7 +116,7 @@ pub(super) async fn reap_idle_sessions(
                         if let Ok(storage) =
                             crate::session::Storage::open(&profile, file_watch_for_storage)
                         {
-                            let _ = storage.update(|instances, _groups| {
+                            let _ = storage.update_metadata(|instances, _groups| {
                                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                                     inst.status = crate::session::Status::Error;
                                 }

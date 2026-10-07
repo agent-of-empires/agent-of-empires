@@ -734,6 +734,7 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        path_claims: crate::session::WorktreePathClaims::None,
     };
     view.mutate_instance(&second.id, |instance| {
         instance.status = Status::Idle;
@@ -907,19 +908,18 @@ fn cancelled_creation_is_not_revived_by_a_later_request() {
     assert_eq!(view.get_instance(&session_id).unwrap().title, "Kept");
     assert!(!view.is_creation_pending());
     let persisted = storage.load().unwrap();
-    assert_eq!(
-        persisted
-            .iter()
-            .map(|row| row.title.as_str())
-            .collect::<Vec<_>>(),
-        ["Kept"]
-    );
-    let repo = git2::Repository::open(&project_dir).unwrap();
-    assert!(
-        repo.find_branch("cancelled-branch", git2::BranchType::Local)
-            .is_err(),
-        "the cancelled request's worktree branch must be rolled back"
-    );
+    assert!(persisted
+        .iter()
+        .any(|row| row.id == session_id && row.title == "Kept"));
+    if let Some(cancelled) = persisted.iter().find(|row| row.title == "Cancelled") {
+        assert!(cancelled.has_pending_worktree_path_claims());
+        assert_ne!(cancelled.id, session_id);
+    } else {
+        let repo = git2::Repository::open(&project_dir).unwrap();
+        assert!(repo
+            .find_branch("cancelled-branch", git2::BranchType::Local)
+            .is_err());
+    }
 }
 
 /// Ctrl-C while on_create runs lets that hook finish but must not start on_launch.
@@ -1239,7 +1239,7 @@ fn test_cursor_follows_session_after_deletion() {
         Item::Session { id, .. } => id.clone(),
         _ => panic!("expected session at index 1"),
     };
-    env.view.remove_instance(&victim_id);
+    super::remove_test_instance(&mut env.view, &victim_id);
     env.view.rebuild_group_trees();
     let _ = env.view.save();
     env.view.reload().unwrap();

@@ -419,7 +419,7 @@ impl Instance {
                     return false;
                 }
             };
-        let outcome = storage.update(|instances, _groups| {
+        let outcome = storage.update_metadata(|instances, _groups| {
             let Some(instance) = instances.iter_mut().find(|instance| instance.id == self.id)
             else {
                 return Ok(SidWrite::Failed);

@@ -102,7 +102,7 @@ impl HomeView {
         };
 
         let moved: Option<Vec<(String, u32, Option<String>)>> =
-            storage.update(|instances, groups| {
+            storage.update_metadata(|instances, groups| {
                 // The drawn row is a copy taken before the lock. If the store's row has since been
                 // archived, trashed, deleted or regrouped, every position computed from the list is
                 // about a layout that no longer exists.
@@ -383,7 +383,7 @@ impl HomeView {
             return Ok(());
         }
         if let Some(storage) = self.storages.get(profile) {
-            storage.update(|_instances, groups| {
+            storage.update_metadata(|_instances, groups| {
                 for group in groups.iter_mut() {
                     if collapsed_now.contains(&group.path) {
                         group.collapsed = false;
@@ -430,7 +430,7 @@ impl HomeView {
         // Build the tree from what the store actually holds, inside the lock. Moving the
         // in-memory tree and writing that back would resurrect a group a peer deleted while
         // this view was open, and drop metadata the peer changed.
-        let moved: GroupMoveOutcome = storage.update(|instances, disk_groups| {
+        let moved: GroupMoveOutcome = storage.update_metadata(|instances, disk_groups| {
             let mut tree = GroupTree::new_with_groups(instances, disk_groups);
             if !tree.get_all_groups().iter().any(|g| g.path == group_path) {
                 // The header under the cursor was drawn from an older read; a peer has since

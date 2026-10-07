@@ -53,7 +53,7 @@ pub(crate) fn persist_session_to_storage(
         return SidWrite::Skipped;
     }
     let binding = observation.conversation_binding();
-    let result = storage.update(|instances, _groups| {
+    let result = storage.update_metadata(|instances, _groups| {
         let Some(index) = instances
             .iter()
             .position(|instance| instance.id == instance_id)
@@ -170,11 +170,11 @@ impl Instance {
         }
 
         let storage =
-            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::open(profile, self.resolve_file_watch()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(target: "session.store",
-                        "Failed to create storage for finalize-launch persist for {}: {}",
+                        "Failed to open storage for finalize-launch persist for {}: {}",
                         self.id,
                         e
                     );
@@ -218,7 +218,7 @@ impl Instance {
         let new_sid_for_closure = new_sid.clone();
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
         let mut cleared_holder_ids: Vec<String> = Vec::new();
-        let outcome = storage.update(|instances, _groups| {
+        let outcome = storage.update_metadata(|instances, _groups| {
             let Some(index) = instances
                 .iter()
                 .position(|instance| instance.id == instance_id)

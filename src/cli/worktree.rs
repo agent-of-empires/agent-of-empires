@@ -275,17 +275,47 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         return Ok(());
     }
 
+    let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    storage.verify_profile_identity()?;
+    let claims =
+        crate::session::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(&storage))?;
+    claims.ensure_writes_unclaimed(&[])?;
     let mut removed_count = 0;
 
     if !orphaned_sessions.is_empty() {
-        let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
-        storage.update(|all_instances, _groups| {
-            all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
-            Ok(())
+        let orphaned: std::collections::HashMap<_, _> = orphaned_sessions
+            .iter()
+            .map(|row| (row.id.as_str(), row))
+            .collect();
+        let removed = storage.update_under_workspace_claim_lock(|all_instances, _groups| {
+            let before = all_instances.len();
+            all_instances.retain(|inst| {
+                let Some(old) = orphaned.get(inst.id.as_str()) else {
+                    return true;
+                };
+                if old.created_at != inst.created_at
+                    || old.lifecycle_reservation != inst.lifecycle_reservation
+                    || !old
+                        .durable_worktree_paths()
+                        .eq(inst.durable_worktree_paths())
+                    || inst.has_pending_worktree_path_claims()
+                {
+                    return true;
+                }
+                let still_missing = inst.workspace_info.as_ref().map_or_else(
+                    || !Path::new(&inst.project_path).exists(),
+                    |workspace| !Path::new(&workspace.workspace_dir).exists(),
+                );
+                !still_missing
+                    || !inst
+                        .durable_worktree_paths()
+                        .all(|path| claims.ensure_pending_writes_unclaimed(&[path]).is_ok())
+            });
+            Ok(before - all_instances.len())
         })?;
-
-        removed_count += orphaned_sessions.len();
-        println!("✓ Removed {} orphaned sessions", orphaned_sessions.len());
+        removed_count += removed;
+        println!("✓ Removed {} orphaned sessions", removed);
     }
 
     if !orphaned_worktrees.is_empty() {
@@ -294,6 +324,10 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         let git_wt = GitWorktree::new(main_repo)?;
 
         for wt in &orphaned_worktrees {
+            if let Err(error) = claims.ensure_writes_unclaimed(&[wt.path.as_path()]) {
+                eprintln!("Retained claimed worktree {}: {error}", wt.path.display());
+                continue;
+            }
             match git_wt.remove_worktree(&wt.path, true) {
                 Ok(_) => {
                     println!("✓ Removed worktree: {}", wt.path.display());

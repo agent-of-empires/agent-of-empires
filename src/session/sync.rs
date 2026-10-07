@@ -343,7 +343,7 @@ fn drain_and_persist_session_ids_inner(
                 let storage = update.storage.clone();
                 storage.verify_profile_identity()?;
                 let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
-                let generation = storage.update(|instances, _groups| {
+                let generation = storage.update_metadata(|instances, _groups| {
                     let Some(instance) = instances
                         .iter_mut()
                         .find(|instance| instance.id == update.id)
@@ -389,7 +389,7 @@ fn drain_and_persist_session_ids_inner(
             ),
         };
         if let Ok(Some((storage, _lifecycle_lock, Some(generation)))) = ownership {
-            let released = storage.update(|instances, _groups| {
+            let released = storage.update_metadata(|instances, _groups| {
                 let Some(instance) = instances
                     .iter_mut()
                     .find(|instance| instance.id == update.id)
@@ -1242,6 +1242,7 @@ mod tests {
             op: crate::session::LifecycleOperation::Trash,
             generation: 1,
             at: chrono::Utc::now(),
+            path_claims: crate::session::WorktreePathClaims::None,
         });
         seed_instance_on_disk(profile, &mut instance);
         attach_poller_with_update(&mut instance, sid);

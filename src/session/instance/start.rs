@@ -133,7 +133,7 @@ impl Instance {
             Some(storage) => storage.clone(),
             None => {
                 let storage = std::sync::Arc::new(
-                    crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+                    crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
                         .context("failed to open lifecycle lock storage")?,
                 );
                 self.storage_origin = Some(storage.clone());

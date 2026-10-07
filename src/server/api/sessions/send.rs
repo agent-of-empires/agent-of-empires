@@ -172,7 +172,7 @@ pub async fn send_message(
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
                 if let Ok(storage) = Storage::open(&profile, state.file_watch.clone()) {
-                    if let Err(e) = storage.update(|all, _groups| {
+                    if let Err(e) = storage.update_metadata(|all, _groups| {
                         if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
                             if !outcome_already_alive {
                                 apply_post_restart_sync(

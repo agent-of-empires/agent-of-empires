@@ -327,7 +327,7 @@ pub async fn update_session_archive(
                 }
                 row.kill_ancillary_tmux_sessions_locked();
             }
-            storage.update_native_under_workspace_claim_lock(|rows, _| {
+            storage.update_under_workspace_claim_lock(|rows, _| {
                 let row = rows
                     .iter_mut()
                     .find(|row| row.id == persist_id)
@@ -415,25 +415,26 @@ pub async fn trash_session(
                 .find(|row| row.id == reserve_id)
                 .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
             ensure_trash_paths_unclaimed(&storage, &snapshot)?;
-            let (generation, plan) = storage.update(|instances, _groups| {
-                let instance = instances
-                    .iter_mut()
-                    .find(|row| row.id == reserve_id)
-                    .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
-                anyhow::ensure!(
-                    worktree_transition_plan_unchanged(&snapshot, instance),
-                    "trash plan changed before reservation"
-                );
-                let generation = instance
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Trash,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
-                    )
-                    .map_err(anyhow::Error::new)?;
-                instance.trash();
-                Ok((generation, instance.clone()))
-            })?;
+            let (generation, plan) =
+                storage.update_under_workspace_claim_lock(|instances, _groups| {
+                    let instance = instances
+                        .iter_mut()
+                        .find(|row| row.id == reserve_id)
+                        .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
+                    anyhow::ensure!(
+                        worktree_transition_plan_unchanged(&snapshot, instance),
+                        "trash plan changed before reservation"
+                    );
+                    let generation = instance
+                        .try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Trash,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .map_err(anyhow::Error::new)?;
+                    instance.trash();
+                    Ok((generation, instance.clone()))
+                })?;
             Ok((storage, generation, plan))
         },
     )
@@ -500,7 +501,7 @@ pub async fn trash_session(
         // Scan all profile ownership before storage.update takes this profile's storage flock.
         if relocation_allowed {
             if let Err(error) = ensure_trash_paths_unclaimed(&storage, &snapshot) {
-                storage.update(|instances, _groups| {
+                storage.update_under_workspace_claim_lock(|instances, _groups| {
                     if let Some(stored) = instances.iter_mut().find(|row| row.id == work_id) {
                         if stored
                             .lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
@@ -517,7 +518,7 @@ pub async fn trash_session(
                 return Err(error);
             }
         }
-        let outcome = storage.update(|instances, _groups| {
+        let outcome = storage.update_under_workspace_claim_lock(|instances, _groups| {
             let stored = instances
                 .iter()
                 .find(|row| row.id == work_id)
@@ -679,7 +680,7 @@ pub async fn restore_session(
                     .acquire_instance_lifecycle_lock(&restore_id)
                     .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
                 let (decision, plan) = storage
-                    .update(|instances, _groups| {
+                    .update_under_workspace_claim_lock(|instances, _groups| {
                         let decision = crate::session::claim::decide_restore_claim(
                             instances,
                             &restore_id,
@@ -771,7 +772,7 @@ pub async fn restore_session(
                     )));
                 }
             }
-            let result = storage.update(|instances, _groups| {
+            let result = storage.update_under_workspace_claim_lock(|instances, _groups| {
                 let Some(stored) = instances.iter_mut().find(|row| row.id == work_id) else {
                     return Ok(Err(RestoreTransitionError::NotFound));
                 };
@@ -914,7 +915,7 @@ fn ensure_trash_paths_unclaimed(storage: &Storage, instance: &Instance) -> anyho
 
 // The caller holds workspace -> identity -> lifecycle locks.
 fn release_restore_claim(storage: &Storage, id: &str, generation: u64) {
-    let _ = storage.update(|instances, _groups| {
+    let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|row| row.id == id) {
             stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
         }

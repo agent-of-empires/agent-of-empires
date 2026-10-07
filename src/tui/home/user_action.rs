@@ -4,9 +4,32 @@
 use super::*;
 
 impl HomeView {
-    /// Atomic per-action mutate: update memory once, then merge the user-owned
-    /// diff under the storage flock. Roll memory back if persistence fails.
+    /// Persist a metadata diff, rolling memory back on failure.
     pub(in crate::tui) fn apply_user_action<F>(&mut self, id: &str, mutate: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut Instance),
+    {
+        self.apply_user_action_transaction(id, mutate, false)
+    }
+
+    /// The caller owns workspace before identity and lifecycle locks.
+    pub(super) fn apply_user_action_under_workspace_claim_lock<F>(
+        &mut self,
+        id: &str,
+        mutate: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut Instance),
+    {
+        self.apply_user_action_transaction(id, mutate, true)
+    }
+
+    fn apply_user_action_transaction<F>(
+        &mut self,
+        id: &str,
+        mutate: F,
+        workspace_held: bool,
+    ) -> anyhow::Result<()>
     where
         F: FnOnce(&mut Instance),
     {
@@ -26,7 +49,8 @@ impl HomeView {
 
         let id_owned = id.to_string();
         let result = if let Some(storage) = self.storages.get(&profile) {
-            storage.update(|instances, _groups| {
+            let merge = |instances: &mut Vec<Instance>,
+                         _groups: &mut Vec<crate::session::Group>| {
                 if let Some(disk) = instances
                     .iter_mut()
                     .find(|instance| instance.id == id_owned)
@@ -36,7 +60,12 @@ impl HomeView {
                 } else {
                     Ok(false)
                 }
-            })
+            };
+            if workspace_held {
+                storage.update_under_workspace_claim_lock(merge)
+            } else {
+                storage.update_metadata(merge)
+            }
         } else {
             tracing::warn!(
                 target: "tui.home",
@@ -169,7 +198,7 @@ impl HomeView {
                 .get(&profile)
                 .cloned()
                 .unwrap_or_default();
-            let res = storage.update(|insts, _groups| {
+            let res = storage.update_metadata(|insts, _groups| {
                 let mut missing: Vec<String> = Vec::new();
                 for (id, pre, post) in &items {
                     if let Some(disk) = insts.iter_mut().find(|i| i.id == *id) {

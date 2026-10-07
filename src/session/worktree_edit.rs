@@ -184,6 +184,8 @@ pub enum WorktreeEditError {
     TargetExists(PathBuf),
     #[error("branch '{0}' already exists")]
     BranchExists(String),
+    #[error("worktree path ownership is unavailable: {0}")]
+    PathClaim(String),
     #[error(
         "worktree move failed ({move_err}), and rolling the branch rename back to '{branch}' also failed ({rollback_err}); the repo may be left on the new branch"
     )]

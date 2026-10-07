@@ -266,9 +266,9 @@ pub(crate) fn prepare_terminal_launch_context(
         return Ok(None);
     }
     let generation = instance.lifecycle_generation;
-    let storage = crate::session::Storage::new_unwatched(&instance.source_profile)?;
+    let storage = instance.original_storage()?;
     let (resets, notice, sid, sid_binding, pi_path, intent, resume_binding, floor, omp_generation) =
-        storage.update(|instances, _| {
+        storage.update_metadata(|instances, _| {
             let row = instances
                 .iter_mut()
                 .find(|row| row.id == instance.id)
@@ -314,7 +314,7 @@ pub(crate) fn acknowledge_context_reset(
     if slots.is_empty() {
         return Ok(());
     }
-    crate::session::Storage::new_unwatched(profile)?.update(|instances, _| {
+    crate::session::Storage::open_unwatched(profile)?.update_metadata(|instances, _| {
         let instance = instances
             .iter_mut()
             .find(|instance| instance.id == id)

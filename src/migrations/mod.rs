@@ -44,6 +44,7 @@ mod v034_trash_retention_minutes;
 mod v035_custom_sort_order;
 mod v036_runner_execution_journal;
 mod v037_runner_preparation_custody;
+mod v038_worktree_path_claims;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -89,7 +90,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 37;
+const CURRENT_VERSION: u32 = 38;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -229,6 +230,7 @@ const MIGRATIONS: &[Migration] = &[
         "runner_preparation_custody",
         v037_runner_preparation_custody::run,
     ),
+    (38, "worktree_path_claims", v038_worktree_path_claims::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

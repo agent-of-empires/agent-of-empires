@@ -263,8 +263,7 @@ impl HomeView {
             &original_storage,
         )?;
         let mut instance = build_result.instance;
-        let created_worktree = build_result.created_worktree;
-        let created_workspace_worktrees = build_result.created_workspace_worktrees;
+        let creation_intent = build_result.creation_intent;
         instance.source_profile = target_profile.clone();
         if structured {
             builder::structured::apply_structured_choice(&mut instance);
@@ -278,12 +277,7 @@ impl HomeView {
         let _workspace_claim_lock = match acquire_session_workspace_claim_lock() {
             Ok(lock) => lock,
             Err(error) => {
-                builder::cleanup_instance_locked(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                 return Err(error);
             }
         };
@@ -293,23 +287,13 @@ impl HomeView {
                 // Only the workspace-claim flock is held; release it so the
                 // cleanup path can take the pair itself.
                 drop(_workspace_claim_lock);
-                builder::cleanup_instance_locked(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                 return Err(error);
             }
         };
         original_storage.verify_profile_identity()?;
         if let Err(error) = crate::session::validate_managed_workspace(&instance) {
-            builder::cleanup_instance(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
-            );
+            tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
             return Err(anyhow::anyhow!(
                 "Managed workspace validation failed before the session was persisted: {error}"
             ));
@@ -329,32 +313,30 @@ impl HomeView {
                 },
                 &candidate_paths,
             ) {
-                builder::cleanup_instance(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                 return Err(anyhow::anyhow!(
                     "Session path is already claimed by another session: {error}"
                 ));
             }
         }
 
-        let storage = original_storage;
-        self.storages.insert(target_profile.clone(), storage);
-        self.add_instance(instance.clone());
+        instance = builder::publish_prepared_creation_under_workspace_claim_lock(
+            &original_storage,
+            &instance,
+            &creation_intent,
+            |rows, groups| {
+                if !instance.group_path.is_empty() {
+                    let mut tree = super::GroupTree::new_with_groups(rows, groups);
+                    tree.create_group(&instance.group_path);
+                    *groups = tree.get_all_groups();
+                }
+                Ok(())
+            },
+        )?;
+        self.storages
+            .insert(target_profile.clone(), original_storage);
+        self.publish_persisted_instance(instance.clone());
         self.rebuild_group_trees();
-        if !instance.group_path.is_empty() {
-            if let Some(tree) = self.group_trees.get_mut(&target_profile) {
-                tree.create_group(&instance.group_path);
-            }
-        }
-        self.save_with_storage()?;
-        // `reload()` reconciles cross-profile duplicates, and a journal-driven repair
-        // re-acquires the identity flock. Releasing both here keeps the publication
-        // path inside one lock window, the same way `apply_creation_results` does
-        // for a delivered creation result.
         drop(_workspace_claim_lock);
         drop(_identity_lock);
 
@@ -474,8 +456,12 @@ impl HomeView {
             }
         }
 
-        // Identity-changing edits follow the global lock order: app-wide identity, then
-        // session title and source lifecycle. Hold both through the profile transaction.
+        // Profile moves hold workspace before identity and per-row locks.
+        let mut profile_move_workspace = if profile_move_target.is_some() {
+            Some(crate::session::acquire_session_workspace_claim_lock()?)
+        } else {
+            None
+        };
         let mut profile_move_identity = if profile_move_target.is_some() {
             Some(acquire_session_identity_lock()?)
         } else {
@@ -562,14 +548,12 @@ impl HomeView {
                     carry.retarget(conversation_carry::conversation_ids(moved));
                 }
             }
-            // `reload()` reconciles cross-profile duplicates, and a journal-driven
-            // repair re-acquires identity, then title, then lifecycle, the very
-            // flocks held here, so the reload would wait on its own lock. All three
-            // guards go first; they are reacquired in the canonical order, and the
-            // row is re-read from the committed profile before the save below.
+            // Reload can acquire ownership locks, so release them first.
             drop(profile_move_guards);
             drop(profile_move_identity);
+            drop(profile_move_workspace);
             self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
+            profile_move_workspace = Some(crate::session::acquire_session_workspace_claim_lock()?);
             profile_move_identity = Some(acquire_session_identity_lock()?);
             profile_move_guards = Some(self.lock_session_mutation_and_reload(&id)?);
         } else {
@@ -620,6 +604,7 @@ impl HomeView {
         }
         drop(profile_move_guards);
         drop(profile_move_identity);
+        drop(profile_move_workspace);
 
         // The cascade shells out to docker and runs the before_start hook, so it stays
         // off the event loop: show Starting locally, let the worker reserve and persist
@@ -690,7 +675,7 @@ impl HomeView {
         let id_owned = id.to_string();
         let new_tool = new_tool.to_string();
         let row_profile = profile.clone();
-        let observed = storage.update(|instances, _groups| {
+        let observed = storage.update_metadata(|instances, _groups| {
             let mut observed = Vec::new();
             if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
                 observed = crate::session::conversation_carry::conversation_ids(disk);
@@ -800,7 +785,7 @@ impl HomeView {
             .get(profile)
             .ok_or_else(|| anyhow::anyhow!("No storage registered for profile '{profile}'"))?;
         let restart_in_flight = &self.restart_in_flight;
-        let mut outcome = storage.update(|instances, groups| {
+        let mut outcome = storage.update_metadata(|instances, groups| {
             let mut has_creating = false;
             let mut has_restarting = false;
             for instance in instances.iter().filter(|instance| {
@@ -1057,11 +1042,12 @@ impl HomeView {
                     "Cannot move group while session {id} is being deleted"
                 );
                 anyhow::ensure!(
-                    !instance.has_fresh_lifecycle_reservation(chrono::Utc::now()),
+                    !instance.has_active_lifecycle_reservation(chrono::Utc::now()),
                     "Cannot move group while session {id} has a lifecycle operation in progress"
                 );
             }
 
+            let workspace_guard = crate::session::acquire_session_workspace_claim_lock()?;
             let identity_guard = acquire_session_identity_lock()?;
             affected_ids.sort();
             let mut mutation_guards = Vec::with_capacity(affected_ids.len());
@@ -1079,7 +1065,7 @@ impl HomeView {
                     "Cannot move group while session {id} is being deleted"
                 );
                 anyhow::ensure!(
-                    !authoritative.has_fresh_lifecycle_reservation(chrono::Utc::now()),
+                    !authoritative.has_active_lifecycle_reservation(chrono::Utc::now()),
                     "Cannot move group while session {id} has a lifecycle operation in progress"
                 );
                 anyhow::ensure!(
@@ -1163,11 +1149,10 @@ impl HomeView {
                     },
                 )?;
             }
-            // `reload()` reconciles cross-profile duplicates, and a journal-driven
-            // repair re-acquires the identity, title and lifecycle flocks these guards
-            // hold. The transaction above is already committed, so release them first.
-            drop(identity_guard);
+            // Reload can acquire ownership locks, so release them first.
             drop(mutation_guards);
+            drop(identity_guard);
+            drop(workspace_guard);
             self.reload_preserving_profile_move_runtime(&affected_ids)?;
             return Ok(());
         }
@@ -1377,6 +1362,11 @@ impl HomeView {
             );
         }
 
+        storage.ensure_worktree_edit_unclaimed_under_workspace_lock(
+            &id,
+            std::path::Path::new(&project_path),
+            new_name,
+        )?;
         let outcome = crate::session::worktree_edit::edit_worktree_workdir(
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
@@ -1396,7 +1386,7 @@ impl HomeView {
             crate::session::worktree_edit::discard_sandbox_container_after_move(&id, is_sandboxed);
         }
 
-        self.apply_user_action(&id, |inst| {
+        self.apply_user_action_under_workspace_claim_lock(&id, |inst| {
             inst.project_path = new_path.clone();
             if let Some(branch) = &new_branch {
                 if let Some(wt) = inst.worktree_info.as_mut() {
@@ -1706,6 +1696,13 @@ impl HomeView {
                         ));
                         return Ok(());
                     }
+                    current_instance
+                        .original_storage()?
+                        .ensure_worktree_edit_unclaimed_under_workspace_lock(
+                            &id,
+                            std::path::Path::new(&project_path),
+                            &leaf,
+                        )?;
                     match crate::session::worktree_edit::edit_worktree_workdir(
                         crate::session::worktree_edit::WorktreeEditRequest {
                             worktree_info: &worktree_info,
@@ -1783,6 +1780,8 @@ impl HomeView {
                                 ) {
                                     anyhow::bail!("{}", worktree_rename_block_message(&reason));
                                 }
+                                effect_instance.original_storage()?.ensure_worktree_edit_unclaimed_under_workspace_lock(
+                                    &effect_id, std::path::Path::new(&effect_instance.project_path), &leaf)?;
                                 match crate::session::worktree_edit::edit_worktree_workdir(
                                     crate::session::worktree_edit::WorktreeEditRequest {
                                         worktree_info,
@@ -1833,7 +1832,7 @@ impl HomeView {
                 return Ok(());
             }
 
-            self.apply_user_action(&id, |inst| {
+            self.apply_user_action_under_workspace_claim_lock(&id, |inst| {
                 inst.title = effective_title.clone();
                 inst.group_path = effective_group.clone();
                 if let Some(path) = &new_path {
@@ -2503,7 +2502,7 @@ fn restore_from_trash_with_storage(
             return RestoreFromTrash::PersistFailed;
         }
     };
-    let decision = match storage.update(|instances, _groups| {
+    let decision = match storage.update_under_workspace_claim_lock(|instances, _groups| {
         let decision = match owned_trash_generation {
             Some(generation) => crate::session::claim::decide_restore_claim_after_trash(
                 instances,
@@ -2535,7 +2534,7 @@ fn restore_from_trash_with_storage(
         Ok(all) => all.into_iter().find(|instance| instance.id == id),
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore load failed: {error}");
-            let _ = storage.update(|instances, _groups| {
+            let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                     stored.release_lifecycle_reservation_if_owned(
                         LifecycleOperation::Restore,
@@ -2570,7 +2569,7 @@ fn restore_from_trash_with_storage(
             },
             &paths,
         ) {
-            let _ = storage.update(|instances, _groups| {
+            let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|row| row.id == id) {
                     stored.release_lifecycle_reservation_if_owned(
                         LifecycleOperation::Restore,
@@ -2584,7 +2583,7 @@ fn restore_from_trash_with_storage(
             };
         }
     }
-    let result = storage.update(|instances, _groups| {
+    let result = storage.update_under_workspace_claim_lock(|instances, _groups| {
         let Some(stored) = instances.iter_mut().find(|row| row.id == id) else {
             return Ok(RestoreFromTrash::AlreadyGone);
         };
@@ -2625,7 +2624,7 @@ fn restore_from_trash_with_storage(
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {error}");
-            let _ = storage.update(|instances, _groups| {
+            let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|row| row.id == id) {
                     stored.release_lifecycle_reservation_if_owned(
                         LifecycleOperation::Restore,

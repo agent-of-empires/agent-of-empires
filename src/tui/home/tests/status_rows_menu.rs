@@ -1240,6 +1240,73 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     );
     assert_eq!(final_row.lifecycle_reservation, None);
 }
+#[test]
+#[serial]
+fn a_delayed_authoritative_trash_result_applies_the_durable_restore() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    let (published_tx, published_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    env.view.trash_poller =
+        crate::tui::trash_poller::TrashPoller::with_handler_for_test(move |request| {
+            let authoritative = request
+                .storage
+                .update(|rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == request.session_id)
+                        .unwrap();
+                    assert!(row.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Trash,
+                        request.generation
+                    ));
+                    Ok(row.clone())
+                })
+                .unwrap();
+            published_tx
+                .send(authoritative.lifecycle_generation)
+                .unwrap();
+            release_rx.recv().unwrap();
+            crate::session::trash::TrashResult {
+                session_id: request.session_id,
+                relocation: None,
+                relocate_warning: None,
+                authoritative: Some(authoritative),
+            }
+        });
+    env.view.trash_session_by_id(&id);
+    let published = published_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    env.view.selected_session = Some(id.clone());
+    env.view.restore_selected_from_trash();
+    let durable = env
+        .view
+        .storages
+        .get("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(!durable.is_trashed());
+    assert!(durable.lifecycle_generation > published);
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while env.view.trash_poller.is_pending(&id) {
+        assert!(
+            Instant::now() < deadline,
+            "authoritative result was not drained"
+        );
+        env.view.apply_trash_results();
+        std::thread::yield_now();
+    }
+    let local = env.view.instances.get(&id).unwrap();
+    assert!(!local.is_trashed());
+    assert_eq!(local.lifecycle_generation, durable.lifecycle_generation);
+    assert_eq!(local.lifecycle_reservation, None);
+}
 
 /// The Trash and Archived sections render in the pinned shelf. Right-clicking their synthetic
 /// headers opens bulk menus, not a real group's Rename/Delete: Trash offers Empty Trash, Archived

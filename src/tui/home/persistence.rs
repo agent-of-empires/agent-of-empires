@@ -5,10 +5,12 @@ use super::*;
 
 impl HomeView {
     pub fn save(&mut self) -> anyhow::Result<()> {
+        let _workspace_lock = crate::session::acquire_session_workspace_claim_lock()?;
         let _identity_lock = crate::session::acquire_session_identity_lock()?;
         self.save_with_storage()
     }
 
+    /// The caller owns workspace, then identity.
     pub(super) fn save_with_storage(&mut self) -> anyhow::Result<()> {
         let mut all_peer_deleted: Vec<String> = Vec::new();
         let profile_names: Vec<String> = self.storages.keys().cloned().collect();
@@ -26,7 +28,11 @@ impl HomeView {
                 .storages
                 .get(&profile_name)
                 .ok_or_else(|| anyhow::anyhow!("Profile storage no longer exists"))?;
-            let tui_rows: Vec<Instance> = self.cloned_instances_for_profile(&profile_name);
+            let tui_rows: Vec<Instance> = self
+                .cloned_instances_for_profile(&profile_name)
+                .into_iter()
+                .filter(|row| self.creating_stub_id.as_deref() != Some(&row.id))
+                .collect();
             let dels: HashSet<String> = self
                 .pending_deletions
                 .get(&profile_name)
@@ -48,39 +54,42 @@ impl HomeView {
                 .map(|t| t.get_all_groups())
                 .unwrap_or_default();
 
-            let peer_deleted: Vec<String> = storage.update(|disk_instances, disk_groups| {
-                disk_instances.retain(|d| !dels.contains(&d.id));
-                let mut peer_deleted: Vec<String> = Vec::new();
-                for tui_inst in &tui_rows {
-                    if let Some(disk_inst) = disk_instances.iter_mut().find(|d| d.id == tui_inst.id)
-                    {
-                        let durable_status = disk_inst.status;
-                        disk_inst.merge_from_tui(tui_inst);
-                        if tui_inst.status == crate::session::Status::Deleting {
-                            disk_inst.status = durable_status;
+            let peer_deleted: Vec<String> =
+                storage.update_under_workspace_claim_lock(|disk_instances, disk_groups| {
+                    disk_instances.retain(|d| !dels.contains(&d.id));
+                    let mut peer_deleted: Vec<String> = Vec::new();
+                    for tui_inst in &tui_rows {
+                        if let Some(disk_inst) =
+                            disk_instances.iter_mut().find(|d| d.id == tui_inst.id)
+                        {
+                            let durable_status = disk_inst.status;
+                            disk_inst.merge_from_tui(tui_inst);
+                            if tui_inst.status == crate::session::Status::Deleting {
+                                disk_inst.status = durable_status;
+                            }
+                        } else if added.contains(&tui_inst.id) {
+                            if tui_inst.status != crate::session::Status::Deleting {
+                                disk_instances.push(tui_inst.clone());
+                            }
+                        } else {
+                            // Disk had no row with this id and we did not add it
+                            // this session: a peer (CLI / aoe serve) removed it.
+                            peer_deleted.push(tui_inst.id.clone());
                         }
-                    } else if added.contains(&tui_inst.id) {
-                        if tui_inst.status != crate::session::Status::Deleting {
-                            disk_instances.push(tui_inst.clone());
+                    }
+                    disk_groups.retain(|g| !group_dels.contains(&g.path));
+                    for tui_g in &groups_target {
+                        if let Some(disk_g) = disk_groups.iter_mut().find(|g| g.path == tui_g.path)
+                        {
+                            disk_g.name = tui_g.name.clone();
+                            disk_g.collapsed = tui_g.collapsed;
+                            disk_g.archived_at = tui_g.archived_at;
+                        } else {
+                            disk_groups.push(tui_g.clone());
                         }
-                    } else {
-                        // Disk had no row with this id and we did not add it
-                        // this session: a peer (CLI / aoe serve) removed it.
-                        peer_deleted.push(tui_inst.id.clone());
                     }
-                }
-                disk_groups.retain(|g| !group_dels.contains(&g.path));
-                for tui_g in &groups_target {
-                    if let Some(disk_g) = disk_groups.iter_mut().find(|g| g.path == tui_g.path) {
-                        disk_g.name = tui_g.name.clone();
-                        disk_g.collapsed = tui_g.collapsed;
-                        disk_g.archived_at = tui_g.archived_at;
-                    } else {
-                        disk_groups.push(tui_g.clone());
-                    }
-                }
-                Ok(peer_deleted)
-            })?;
+                    Ok(peer_deleted)
+                })?;
 
             self.pending_deletions.remove(&profile_name);
             self.pending_group_deletions.remove(&profile_name);
@@ -215,24 +224,6 @@ impl HomeView {
         }
     }
 
-    /// Centralized instance removal: shift-removes from the ordered map (swap_remove would
-    /// silently reorder the sidebar), records the id in `pending_deletions` so the next
-    /// `save` propagates it under the flock, and clears any `pending_added` entry so an
-    /// add+remove in one save cycle is not persisted. Idempotent.
-    pub(in crate::tui) fn remove_instance(&mut self, id: &str) {
-        if let Some(inst) = self.instances.get(id) {
-            let profile = inst.source_profile.clone();
-            self.pending_deletions
-                .entry(profile.clone())
-                .or_default()
-                .insert(id.to_string());
-            if let Some(set) = self.pending_added.get_mut(&profile) {
-                set.remove(id);
-            }
-        }
-        self.instances.shift_remove(id);
-    }
-
     /// Tombstones `path` and every descendant from the per-profile tree so
     /// `save()` drops them under the flock instead of wholesale-replacing.
     pub(in crate::tui) fn delete_group_in_profile(&mut self, profile: &str, path: &str) {
@@ -355,7 +346,7 @@ impl HomeView {
         let Some(current) = self.instances.get(id).cloned() else {
             return Ok(());
         };
-        let lifecycle_reserved = current.has_fresh_lifecycle_reservation(chrono::Utc::now());
+        let lifecycle_reserved = current.has_active_lifecycle_reservation(chrono::Utc::now());
         let before = baseline.cloned().unwrap_or_else(|| current.clone());
         let old_profile = before.source_profile.clone();
         requested.source_profile = old_profile.clone();
@@ -467,7 +458,7 @@ impl HomeView {
             return;
         }
         let patch = crate::session::PassiveStatusPatch::from_instance(inst);
-        if let Err(e) = storage.update(|insts, _groups| {
+        if let Err(e) = storage.update_metadata(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
                 disk.merge_passive_status_patch(id, &patch);
                 if mark_unread {
@@ -476,14 +467,7 @@ impl HomeView {
             }
             Ok(())
         }) {
-            // Best-effort persistence (see method docstring): a write
-            // failure here does not roll back the in-memory update, but
-            // silence would obscure a persistent flock timeout or EIO
-            // loop. The daemon's sibling path in
-            // `api::persist_session_update` logs the same class of
-            // failure at `target: "http.api.sessions"`; log here so a
-            // TUI-only user has parity visibility under
-            // `AOE_LOG_LEVEL=debug`.
+            // Passive persistence failure keeps the in-memory observation.
             tracing::warn!(
                 target: "session.store",
                 session_id = %id,

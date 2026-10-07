@@ -147,11 +147,6 @@ impl Instance {
             match crate::session::storage::Storage::open(&profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
-                    // A missing profile has no lifecycle row to reserve or commit
-                    // against, so the durable stop cannot be recorded; it is still
-                    // a kill request, so tear the tmux sessions down rather than
-                    // stranding them under an owner that no longer exists.
-                    self.kill_all_tmux_sessions_without_lifecycle_row();
                     return Err(error).context("failed to open lifecycle lock storage");
                 }
             };
@@ -191,9 +186,8 @@ impl Instance {
                     target: "session.tmux_cleanup",
                     session_id = %self.id,
                     %error,
-                    "kill_all_tmux_sessions: lifecycle storage failed; tearing tmux down uncoordinated"
+                    "kill_all_tmux_sessions: lifecycle storage unavailable; retaining tmux ownership"
                 );
-                self.kill_all_tmux_sessions_without_lifecycle_row();
                 return;
             }
         };
@@ -243,11 +237,6 @@ impl Instance {
     /// Kill every tmux session owned by this instance while the caller holds the selected profile's
     /// per-instance lifecycle lock.
     pub(crate) fn kill_all_tmux_sessions_locked(&self) {
-        self.kill_all_tmux_sessions_uncoordinated();
-    }
-
-    /// Tear down tmux resources when no durable lifecycle row exists.
-    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) {
         self.kill_all_tmux_sessions_uncoordinated();
     }
 

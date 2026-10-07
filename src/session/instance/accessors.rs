@@ -167,6 +167,25 @@ impl Instance {
             .unwrap_or(&[])
     }
 
+    pub(crate) fn durable_worktree_paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        std::iter::once(std::path::Path::new(&self.project_path))
+            .chain(
+                self.pre_trash_project_path
+                    .as_deref()
+                    .map(std::path::Path::new),
+            )
+            .chain(
+                self.workspace_info
+                    .as_ref()
+                    .map(|workspace| std::path::Path::new(&workspace.workspace_dir)),
+            )
+            .chain(
+                self.all_repos()
+                    .iter()
+                    .map(|repo| std::path::Path::new(&repo.worktree_path)),
+            )
+    }
+
     /// Return the profile that should drive config resolution for this instance, falling back to
     /// the user's globally configured default when `source_profile` was never populated (e.g.
     /// legacy callers).

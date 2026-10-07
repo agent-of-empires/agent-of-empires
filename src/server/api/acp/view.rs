@@ -215,7 +215,7 @@ async fn commit_structured_view(
                 tracing::warn!(target: "acp.switch", session = %pane.id, %error, "kill tmux failed");
             }
             pane.kill_ancillary_tmux_sessions_locked();
-            storage.update_native_under_workspace_claim_lock(|all, _| {
+            storage.update_under_workspace_claim_lock(|all, _| {
                 let slot = all.iter_mut().find(|candidate| candidate.id == pane.id).ok_or_else(|| anyhow::anyhow!("original session disappeared during terminal-to-ACP transition"))?;
                 slot.view = View::Structured;
                 slot.resume_intent = ResumeIntent::Default;

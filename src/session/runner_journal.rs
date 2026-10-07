@@ -382,7 +382,7 @@ fn ensure_unique_owner(storage: &Storage, id: &str) -> Result<()> {
 fn startable(row: &Instance) -> Result<()> {
     row.ensure_startable()?;
     anyhow::ensure!(
-        !row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        !row.has_active_lifecycle_reservation(chrono::Utc::now())
             && !row
                 .lifecycle_reservation
                 .as_ref()
@@ -473,7 +473,7 @@ fn prepare_locked<'a>(
                     retirement_scope.validate_baseline_at(row, row.lifecycle_generation)
                 }
             };
-            let removed = original.update_native_under_workspace_claim_lock(|rows, _| {
+            let removed = original.update_under_workspace_claim_lock(|rows, _| {
                 if let Some(row) = rows.iter_mut().find(|row| row.id == session_id) {
                     validate(row)?;
                     row.runner_journal.preparations.retain(|ticket|
@@ -482,7 +482,7 @@ fn prepare_locked<'a>(
                 Ok(())
             }).and_then(|_| sync_parent_directory(original.sessions_path()));
             if let Err(error) = removed {
-                original.update_native_under_workspace_claim_lock(|rows, _| {
+                original.update_under_workspace_claim_lock(|rows, _| {
                     if let Some(row) = rows.iter_mut().find(|row| row.id == session_id) {
                         validate(row)?;
                         if !row.runner_journal.preparations.iter().any(|ticket| ticket.nonce == nonce) {
@@ -505,7 +505,7 @@ fn prepare_locked<'a>(
         _completion: completion,
         retired,
     };
-    let authorization = storage.update_native_under_workspace_claim_lock(|rows, _| {
+    let authorization = storage.update_under_workspace_claim_lock(|rows, _| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
@@ -1026,7 +1026,7 @@ impl LaunchOrigin {
         ensure_unique_owner(&self.plan.storage, &self.plan.session_id)?;
         self.plan
             .storage
-            .update_native_under_workspace_claim_lock(|rows, _| {
+            .update_under_workspace_claim_lock(|rows, _| {
                 let row = rows
                     .iter_mut()
                     .find(|row| row.id == self.plan.session_id)
@@ -1125,7 +1125,7 @@ impl OwnedStop {
         ensure_unique_owner(storage, self.session_id())?;
         let expected = self.current_projection();
         let mut emitted = None;
-        let result = storage.update_native_under_workspace_claim_lock(|rows, _| {
+        let result = storage.update_under_workspace_claim_lock(|rows, _| {
             let row = rows
                 .iter_mut()
                 .find(|row| row.id == self.session_id())
@@ -1176,12 +1176,25 @@ impl OwnedStop {
         Self::new(original, generation, LifecycleOperation::Purge)
     }
 
-    /// Borrow only the epoch already issued by the original Attach transaction.
+    /// Retain the actual ACK of the original Attach reservation.
     pub(crate) fn from_attach(
         original: std::sync::Arc<LaunchOrigin>,
-        generation: u64,
-    ) -> std::sync::Arc<Self> {
-        Self::new(original, generation, LifecycleOperation::Attach)
+        acknowledged: std::sync::Arc<LaunchOrigin>,
+    ) -> Result<std::sync::Arc<Self>> {
+        anyhow::ensure!(
+            original.same_scope_at(&acknowledged, acknowledged.generation),
+            "attach ACK changed its original complete native scope"
+        );
+        let scope = Self::new(
+            original,
+            acknowledged.generation,
+            LifecycleOperation::Attach,
+        );
+        *scope
+            .acknowledged
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(acknowledged);
+        Ok(scope)
     }
     pub(crate) fn original(&self) -> &LaunchOrigin {
         &self.original
@@ -1266,35 +1279,34 @@ pub(crate) fn reserve_stop_from_origin(
     storage.verify_profile_identity()?;
     let _lifecycle = storage.acquire_instance_lifecycle_lock(original.session_id())?;
     ensure_unique_owner(storage, original.session_id())?;
-    let (generation, acknowledged) =
-        storage.update_native_under_workspace_claim_lock(|rows, _| {
-            let row = rows
-                .iter_mut()
-                .find(|row| row.id == original.session_id())
-                .context("session disappeared before stop claim")?;
-            original.validate_baseline_at(row, original.generation())?;
-            anyhow::ensure!(
-                !require_idle
-                    || (!row.status.blocks_worktree_edit()
-                        && !row
-                            .runner_journal
-                            .preparations
-                            .iter()
-                            .any(|ticket| Some(ticket.boot) == current_boot())),
-                "stop the session before moving its checkout"
-            );
-            let generation = row
-                .try_acquire_lifecycle_reservation(
-                    LifecycleOperation::Stop,
-                    Instance::LIFECYCLE_RESERVATION_TTL,
-                    chrono::Utc::now(),
-                )
-                .map_err(anyhow::Error::new)?;
-            row.storage_origin = Some(original.plan.storage.clone());
-            let mut acknowledged = LaunchOrigin::capture_baseline(row)?;
-            acknowledged.births = original.births.clone();
-            Ok((generation, std::sync::Arc::new(acknowledged)))
-        })?;
+    let (generation, acknowledged) = storage.update_under_workspace_claim_lock(|rows, _| {
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == original.session_id())
+            .context("session disappeared before stop claim")?;
+        original.validate_baseline_at(row, original.generation())?;
+        anyhow::ensure!(
+            !require_idle
+                || (!row.status.blocks_worktree_edit()
+                    && !row
+                        .runner_journal
+                        .preparations
+                        .iter()
+                        .any(|ticket| Some(ticket.boot) == current_boot())),
+            "stop the session before moving its checkout"
+        );
+        let generation = row
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Stop,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .map_err(anyhow::Error::new)?;
+        row.storage_origin = Some(original.plan.storage.clone());
+        let mut acknowledged = LaunchOrigin::capture_baseline(row)?;
+        acknowledged.births = original.births.clone();
+        Ok((generation, std::sync::Arc::new(acknowledged)))
+    })?;
     let stop = OwnedStop::new(original, generation, LifecycleOperation::Stop);
     *stop
         .acknowledged
@@ -1318,7 +1330,7 @@ fn release_stop_claim(original: &LaunchOrigin, generation: u64) -> Result<()> {
         return Ok(());
     }
     original.validate_baseline_at(&row, generation)?;
-    storage.update_native_under_workspace_claim_lock(|rows, _| {
+    storage.update_under_workspace_claim_lock(|rows, _| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == original.session_id())
@@ -1368,7 +1380,7 @@ pub(crate) fn release_settled_stop_under_locks(stop: &OwnedStop) -> Result<()> {
         "Purge claim belongs to its transaction driver"
     );
     storage.verify_profile_identity()?;
-    storage.update_native_under_workspace_claim_lock(|rows, _| {
+    storage.update_under_workspace_claim_lock(|rows, _| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
@@ -1394,7 +1406,7 @@ pub(crate) fn finish_owned_stop<T>(
     storage.verify_profile_identity()?;
     let _lifecycle = storage.acquire_instance_lifecycle_lock(id)?;
     ensure_unique_owner(storage, id)?;
-    let row = storage.update_native_under_workspace_claim_lock(|rows, _| {
+    let row = storage.update_under_workspace_claim_lock(|rows, _| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
@@ -1467,7 +1479,7 @@ impl ManagedLaunch {
         ensure_unique_owner(storage, &self.session_id)?;
         let nonce = *self.nonce.as_bytes();
         let launched = (|| -> Result<u32> {
-            storage.update_native_under_workspace_claim_lock(|rows, _| {
+            storage.update_under_workspace_claim_lock(|rows, _| {
                 let row = rows
                     .iter_mut()
                     .find(|row| row.id == self.session_id)
@@ -1546,7 +1558,7 @@ impl ManagedLaunch {
                     incarnation.group == pid,
                     "runner does not lead its process group"
                 );
-                storage.update_native_under_workspace_claim_lock(|rows, _| {
+                storage.update_under_workspace_claim_lock(|rows, _| {
                     let row = rows
                         .iter_mut()
                         .find(|row| row.id == self.session_id)
@@ -1702,7 +1714,7 @@ pub(crate) fn record_stop_endpoint(
     storage.verify_profile_identity()?;
     let _lifecycle = storage.acquire_instance_lifecycle_lock(id)?;
     let profile_identity = storage.original_profile_identity()?;
-    storage.update_native_under_workspace_claim_lock(|rows, _| {
+    storage.update_under_workspace_claim_lock(|rows, _| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
@@ -1745,7 +1757,7 @@ pub(crate) fn publish_registry_under_locks<T>(
     let _lifecycle = storage.acquire_instance_lifecycle_lock(&record.session_id)?;
     ensure_unique_owner(storage, &record.session_id)?;
     let result = storage
-        .update_native_under_workspace_claim_lock(|rows, _| {
+        .update_under_workspace_claim_lock(|rows, _| {
             let row = rows
                 .iter_mut()
                 .find(|row| row.id == record.session_id)
@@ -1808,7 +1820,7 @@ pub(crate) fn update_owned_registry_record(
             && record.boot == Some(boot),
         "self update is not this original native runner"
     );
-    storage.update_native_under_workspace_claim_lock(|rows, _| {
+    storage.update_under_workspace_claim_lock(|rows, _| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == record.session_id)
@@ -2207,7 +2219,7 @@ fn snapshot(scope: &JournalScope, nonce: Option<[u8; 16]>) -> Result<RunnerExecu
     scope.validate(&row)?;
     let mut journal = row.runner_journal;
     if journal.refresh(boot, nonce, id, storage.original_profile_identity()?)? {
-        storage.update_native_under_workspace_claim_lock(|rows, _| {
+        storage.update_under_workspace_claim_lock(|rows, _| {
             let row = rows
                 .iter_mut()
                 .find(|row| row.id == id)

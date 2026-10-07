@@ -75,7 +75,7 @@ pub fn ensure_container_for_session_locked(
                         .as_ref()
                         .is_some_and(|sandbox| sandbox.provider != instance.agent_provider);
                     let rebuilt = if rebuild {
-                        storage.update_native_under_workspace_claim_lock(|rows, _| {
+                        storage.update_under_workspace_claim_lock(|rows, _| {
                             let row = rows
                                 .iter_mut()
                                 .find(|row| row.id == effect_origin.session_id())

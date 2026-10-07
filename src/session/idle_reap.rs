@@ -102,7 +102,7 @@ pub fn claim_idle_stop(
     // Strict, for the same reason as the ACP idle reconciler: a deleted
     // profile must not come back from a stale reap candidate.
     let storage = Storage::open(profile, file_watch)?;
-    storage.update(|instances, _groups| {
+    storage.update_metadata(|instances, _groups| {
         let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
             return Ok(None);
         };

@@ -86,7 +86,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     tmux_session.send_keys_with_delay(&args.message, delay)?;
 
     let id_for_save = session_id.clone();
-    if let Err(err) = storage.update(|instances, _groups| {
+    if let Err(err) = storage.update_metadata(|instances, _groups| {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
             inst.touch_after_input();
             inst.status = crate::session::Status::Running;

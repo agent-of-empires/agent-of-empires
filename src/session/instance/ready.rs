@@ -122,7 +122,7 @@ impl Instance {
     /// hold the returned guard until the send lands. `ensure_pane_ready` takes the same lock, so
     /// call this after it.
     pub(crate) fn lock_for_input(&self) -> Result<crate::session::storage::StorageFlock> {
-        let storage = crate::session::storage::Storage::new(
+        let storage = crate::session::storage::Storage::open(
             &self.effective_profile(),
             self.resolve_file_watch(),
         )?;

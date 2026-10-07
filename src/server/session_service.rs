@@ -499,7 +499,7 @@ impl SessionService {
         if let Ok(storage) = crate::session::Storage::open(&profile, self.file_watch.clone()) {
             let id_clone = id.to_string();
             let outcome = tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
+                storage.update_metadata(|instances, _groups| {
                     let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
                         return Ok(None);
                     };
@@ -729,7 +729,7 @@ impl SessionService {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
+                    storage.update_metadata(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.pending_initial_turn = None;
                         }
@@ -784,7 +784,7 @@ impl SessionService {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
+                    storage.update_metadata(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.pending_initial_turn = Some(turn);
                         }
@@ -828,7 +828,7 @@ impl SessionService {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
+                    storage.update_metadata(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.pending_initial_turn = None;
                         }
@@ -902,7 +902,7 @@ impl SessionService {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
                     let _transaction = transaction;
-                    storage.update(|instances, _groups| {
+                    storage.update_metadata(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.queued_prompts = mirrored.queued_prompts;
                             inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;

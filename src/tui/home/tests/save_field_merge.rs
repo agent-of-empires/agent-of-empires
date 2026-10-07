@@ -93,13 +93,7 @@ fn test_save_preserves_peer_writes() {
 fn test_save_drops_explicitly_deleted_row() {
     let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
 
-    view.remove_instance(&id);
-    assert!(
-        view.pending_deletions
-            .get("test")
-            .is_some_and(|s| s.contains(&id)),
-        "remove_instance must populate pending_deletions"
-    );
+    super::remove_test_instance(&mut view, &id);
     view.save().expect("save must propagate the delete");
 
     let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -245,7 +239,7 @@ fn test_save_pushes_tui_added_row_to_disk() {
     ephemeral.source_profile = "test".to_string();
     let ephemeral_id = ephemeral.id.clone();
     view.add_instance(ephemeral);
-    view.remove_instance(&ephemeral_id);
+    super::remove_test_instance(&mut view, &ephemeral_id);
 
     view.save().expect("save must persist TUI-added row");
 
@@ -509,6 +503,7 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now(),
+        path_claims: crate::session::WorktreePathClaims::None,
     };
     view.mutate_instance(&id, |row| {
         row.lifecycle_generation = 1;

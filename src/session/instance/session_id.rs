@@ -321,7 +321,7 @@ impl Instance {
             let storage = self.original_storage()?;
             storage.verify_profile_identity()?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
-            let generation = storage.update(|instances, _groups| {
+            let generation = storage.update_metadata(|instances, _groups| {
                 let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
                 else {
                     anyhow::bail!("session disappeared before capture");
@@ -353,7 +353,7 @@ impl Instance {
                 && persist_session_to_storage(&storage, &self.id, captured, &expected)
                     == SidWrite::Applied
         });
-        let released = storage.update(|instances, _groups| {
+        let released = storage.update_metadata(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(false);
             };
@@ -713,7 +713,7 @@ impl Instance {
             }
         };
 
-        let outcome = storage.update(|instances, _groups| {
+        let outcome = storage.update_metadata(|instances, _groups| {
             let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) else {
                 return Ok(SidWrite::Failed);
             };

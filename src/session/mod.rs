@@ -90,7 +90,7 @@ pub use instance::{
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
     SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
-    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    WorkspaceRepo, WorktreeInfo, WorktreePathClaims, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{
@@ -98,7 +98,9 @@ pub(crate) use move_journal::{
 };
 pub use runner_journal::LaunchOrigin;
 pub use storage::DirectoryIdentity;
-pub(crate) use storage::{acquire_session_identity_lock, sync_parent_directory};
+pub(crate) use storage::{
+    acquire_profile_namespace_lock, acquire_session_identity_lock, sync_parent_directory,
+};
 #[cfg(test)]
 pub(crate) use storage::{
     observe_lock_contention_for_test, observe_updates_for_test, InventoryReadObservation,
@@ -736,6 +738,7 @@ fn validate_new_profile_name(name: &str) -> Result<()> {
 
 pub fn create_profile(name: &str) -> Result<()> {
     validate_new_profile_name(name)?;
+    let _workspace_lock = acquire_session_workspace_claim_lock()?;
     let _identity_lock = acquire_session_identity_lock()?;
     let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
@@ -751,6 +754,7 @@ pub fn create_profile(name: &str) -> Result<()> {
 
 pub fn delete_profile(name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    let _workspace_lock = acquire_session_workspace_claim_lock()?;
     let _identity_lock = acquire_session_identity_lock()?;
     let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
@@ -764,9 +768,9 @@ pub fn delete_profile(name: &str) -> Result<()> {
         &profile_dir,
         crate::session::storage::STORAGE_LOCK_FILENAME,
     )?;
+    ensure_profile_has_no_pending_paths(name)?;
 
-    // The invariant is "at least one profile must exist", a count, not a name.
-    // Any profile is deletable as long as deleting it would not leave zero.
+    // Keep at least one profile.
     if list_profiles()?.len() <= 1 {
         anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
     }
@@ -780,6 +784,7 @@ pub fn delete_profile(name: &str) -> Result<()> {
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     validate_profile_name(old_name)?;
     validate_new_profile_name(new_name)?;
+    let _workspace_lock = acquire_session_workspace_claim_lock()?;
     let _identity_lock = acquire_session_identity_lock()?;
     let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
@@ -797,6 +802,7 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
         &old_dir,
         crate::session::storage::STORAGE_LOCK_FILENAME,
     )?;
+    ensure_profile_has_no_pending_paths(old_name)?;
 
     fs::rename(&old_dir, &new_dir)?;
 
@@ -807,6 +813,16 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn ensure_profile_has_no_pending_paths(name: &str) -> Result<()> {
+    let storage = Storage::open_unwatched(name)?;
+    let rows = storage.load_strict_for_worktree_ownership_locked()?;
+    anyhow::ensure!(
+        !rows.iter().any(Instance::has_pending_worktree_path_claims),
+        "profile has unfinished or unknown filesystem intent"
+    );
     Ok(())
 }
 

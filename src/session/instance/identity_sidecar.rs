@@ -368,7 +368,7 @@ impl Instance {
         observation: &crate::session::poller::SessionIdObservation,
         path: &str,
     ) -> Option<bool> {
-        match storage.update(|instances, _| {
+        match storage.update_metadata(|instances, _| {
             #[cfg(test)]
             anyhow::ensure!(
                 !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)

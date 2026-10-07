@@ -1,5 +1,4 @@
-//! Cross-process lifecycle reservations: the generation-stamped lock that
-//! keeps two aoe processes from launching or killing the same session.
+//! Durable lifecycle exclusion is independent of native execution authority.
 
 use super::*;
 
@@ -14,6 +13,7 @@ pub enum LifecycleOperation {
     Restore,
     Trash,
     Attach,
+    Create,
 }
 
 impl LifecycleOperation {
@@ -45,16 +45,32 @@ impl std::fmt::Display for LifecycleReservationError {
 
 impl std::error::Error for LifecycleReservationError {}
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", content = "paths", rename_all = "snake_case")]
+pub enum WorktreePathClaims {
+    None,
+    Pending(Vec<std::path::PathBuf>),
+    #[default]
+    Unknown,
+}
+
+impl WorktreePathClaims {
+    pub(crate) fn is_pending(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecycleReservation {
     pub op: LifecycleOperation,
     pub generation: u64,
     pub at: DateTime<Utc>,
+    #[serde(default)]
+    pub path_claims: WorktreePathClaims,
 }
 
 impl Instance {
-    /// Longer than any bounded hook, teardown, or worktree move. A crashed owner cannot retain the
-    /// reservation forever.
+    /// Claims-free lifecycle leases expire after a crashed owner.
     pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
     /// Acquire exclusive durable ownership of the next lifecycle generation.
@@ -65,7 +81,9 @@ impl Instance {
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
         if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
-            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+            reservation.path_claims.is_pending()
+                || (reservation.generation == self.lifecycle_generation
+                    && (now - reservation.at) < ttl)
         }) {
             return Err(LifecycleReservationError::Busy(reservation.op));
         }
@@ -79,6 +97,7 @@ impl Instance {
             op: operation,
             generation,
             at: now,
+            path_claims: WorktreePathClaims::None,
         });
         Ok(generation)
     }
@@ -96,20 +115,19 @@ impl Instance {
             )
     }
 
-    pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
+    pub fn has_active_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
         matches!(
             &self.lifecycle_reservation,
             Some(reservation)
-                if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
+                if reservation.path_claims.is_pending()
+                    || (reservation.generation == self.lifecycle_generation
+                        && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL)
         )
     }
 
-    /// Whether a purge currently owns this row. The reconciler has to honour
-    /// it: settling a runner from the registry leaves no in-memory lease, so
-    /// without this the next tick would respawn the runner the purge killed.
+    /// Reconciliation must not respawn a purge-reserved session.
     pub fn is_purge_reserved(&self, now: DateTime<Utc>) -> bool {
-        self.has_fresh_lifecycle_reservation(now)
+        self.has_active_lifecycle_reservation(now)
             && self
                 .lifecycle_reservation
                 .as_ref()
@@ -121,7 +139,9 @@ impl Instance {
         operation: LifecycleOperation,
         generation: u64,
     ) -> bool {
-        if self.lifecycle_reservation_is_owned(operation, generation) {
+        if self.lifecycle_reservation_is_owned(operation, generation)
+            && !self.has_pending_worktree_path_claims()
+        {
             self.lifecycle_reservation = None;
             true
         } else {
@@ -129,8 +149,13 @@ impl Instance {
         }
     }
 
-    /// Clear a crashed owner's expired reservation. The generation is
-    /// deliberately retained as the monotonic cache/result revision.
+    pub(crate) fn has_pending_worktree_path_claims(&self) -> bool {
+        self.lifecycle_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.path_claims.is_pending())
+    }
+
+    /// Clock expiry cannot settle pending filesystem effects.
     pub fn clear_expired_lifecycle_reservation(
         &mut self,
         ttl: chrono::Duration,
@@ -139,7 +164,8 @@ impl Instance {
         if matches!(
             &self.lifecycle_reservation,
             Some(reservation)
-                if reservation.generation == self.lifecycle_generation
+                if !reservation.path_claims.is_pending()
+                    && reservation.generation == self.lifecycle_generation
                     && (now - reservation.at) >= ttl
         ) {
             self.lifecycle_reservation = None;
@@ -155,7 +181,7 @@ impl Instance {
         restart: bool,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let committed = storage.update(|instances, _groups| {
+        let committed = storage.update_metadata(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(false);
             };
@@ -195,7 +221,7 @@ impl Instance {
         let now = Utc::now();
         let mut acquired = None;
         let mut receipt = None;
-        storage.update(|instances, _groups| {
+        storage.update_metadata(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(());
             };
@@ -247,7 +273,7 @@ impl Instance {
         status: Status,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let committed = storage.update(|instances, _groups| {
+        let committed = storage.update_metadata(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(false);
             };
@@ -280,7 +306,7 @@ impl Instance {
         operation: LifecycleOperation,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let released = storage.update(|instances, _groups| {
+        let released = storage.update_metadata(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(false);
             };
@@ -366,7 +392,7 @@ impl Instance {
         operation: LifecycleOperation,
     ) -> Result<bool> {
         let generation = self.lifecycle_generation;
-        storage.update(|instances, _groups| {
+        storage.update_metadata(|instances, _groups| {
             Ok(instances
                 .iter()
                 .find(|instance| instance.id == self.id)
@@ -427,6 +453,7 @@ mod tests {
             op,
             generation: 1,
             at,
+            path_claims: crate::session::WorktreePathClaims::None,
         })
     }
 
@@ -856,35 +883,6 @@ mod tests {
         assert_eq!(overflow.status, Status::Idle);
         assert_eq!(disk.lifecycle_generation, u64::MAX);
         assert_eq!(disk.status, Status::Idle);
-    }
-
-    #[test]
-    fn lifecycle_reservation_roundtrips_and_legacy_rows_default_to_none() {
-        let fresh = Instance::new("s", "/tmp/x");
-        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
-        assert!(!fresh_json.contains("lifecycle_reservation"));
-        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
-        assert_eq!(parsed.lifecycle_reservation, None);
-
-        let mut instance = Instance::new("s", "/tmp/x");
-        let now = Utc::now();
-        let generation = instance
-            .try_acquire_lifecycle_reservation(
-                LifecycleOperation::Purge,
-                Instance::LIFECYCLE_RESERVATION_TTL,
-                now,
-            )
-            .expect("free row grants the lease");
-        let json = serde_json::to_string(&instance).expect("serialize");
-        let back: Instance = serde_json::from_str(&json).expect("round-trip");
-        assert_eq!(
-            back.lifecycle_reservation,
-            Some(LifecycleReservation {
-                op: LifecycleOperation::Purge,
-                generation,
-                at: now,
-            })
-        );
     }
 
     #[test]

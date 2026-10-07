@@ -138,7 +138,7 @@ pub(super) fn persist_structured_row_repairs(
                     .collect();
                 let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     let storage = crate::session::Storage::open(&profile, file_watch)?;
-                    storage.update(|all, _groups| {
+                    storage.update_metadata(|all, _groups| {
                         for repair in repairs {
                             if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
                                 inst.view = crate::session::View::Structured;

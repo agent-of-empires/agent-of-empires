@@ -14,6 +14,18 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
+fn remove_test_instance(view: &mut HomeView, id: &str) {
+    if let Some(instance) = view.instances.shift_remove(id) {
+        if let Some(pending) = view.pending_added.get_mut(&instance.source_profile) {
+            pending.remove(id);
+        }
+        view.pending_deletions
+            .entry(instance.source_profile)
+            .or_default()
+            .insert(id.to_owned());
+    }
+}
+
 fn observed_fork_parent(agent: &str) -> Instance {
     let mut instance = Instance::new("parent", "/tmp/repo");
     instance.source_profile = "test".into();

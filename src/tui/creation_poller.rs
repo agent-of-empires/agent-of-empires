@@ -8,13 +8,14 @@ use std::thread;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::session::builder::{self, CreatedWorktree, InstanceParams};
+use crate::session::builder::{self, InstanceParams};
 use crate::session::config::repo_config::{self, HookProgress, ResolvedHooks};
 use crate::session::Instance;
 use crate::tui::dialogs::NewSessionData;
 
 pub struct CreationRequest {
     pub storage: std::sync::Arc<crate::session::Storage>,
+    pub admitted_instance: Instance,
     pub data: NewSessionData,
     pub existing_instances: Vec<Instance>,
     /// Trusted hooks to execute after instance creation (already approved by user).
@@ -27,52 +28,22 @@ pub enum CreationResult {
     Success {
         session_id: String,
         instance: Box<Instance>,
-        created_worktree: Option<CreatedWorktreeInfo>,
-        /// Workspace worktrees created during build, needed for rollback.
-        created_workspace_worktrees: Vec<CreatedWorktreeInfo>,
+        creation_intent: std::sync::Arc<builder::CreationIntent>,
         on_launch_hooks_ran: bool,
         /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
         /// failures). Surfaced as a transient toast in the UI.
         warnings: Vec<String>,
     },
     Error(String),
-    /// Cancelled before success; the worker already rolled back what it built.
+    /// Cancelled before publication; unproven ownership remains durable.
     Cancelled,
 }
 
 pub struct CreationOutcome {
     pub storage: std::sync::Arc<crate::session::Storage>,
     pub result: CreationResult,
-    /// Cancelled after the worker's last check: a `Success` still needs rollback.
+    /// Cancellation raced the worker result; unpublished ownership remains retained.
     pub cancelled: bool,
-}
-
-/// Serializable worktree info for passing across thread boundary
-#[derive(Debug, Clone)]
-pub struct CreatedWorktreeInfo {
-    pub path: String,
-    pub main_repo_path: String,
-    pub owned_branch: Option<String>,
-}
-
-impl From<&CreatedWorktree> for CreatedWorktreeInfo {
-    fn from(wt: &CreatedWorktree) -> Self {
-        Self {
-            path: wt.path.to_string_lossy().to_string(),
-            main_repo_path: wt.main_repo_path.to_string_lossy().to_string(),
-            owned_branch: wt.owned_branch.clone(),
-        }
-    }
-}
-
-impl From<&CreatedWorktreeInfo> for CreatedWorktree {
-    fn from(worktree: &CreatedWorktreeInfo) -> Self {
-        Self {
-            path: worktree.path.as_str().into(),
-            main_repo_path: worktree.main_repo_path.as_str().into(),
-            owned_branch: worktree.owned_branch.clone(),
-        }
-    }
 }
 
 pub struct CreationPoller {
@@ -114,7 +85,10 @@ impl CreationPoller {
                 let cancel = request.cancel.clone();
                 let storage = std::sync::Arc::clone(&request.storage);
                 let result = Self::create_instance(request, &prog_tx);
-                if result_tx.send((result, cancel, storage)).is_err() {
+                if let Err(undelivered) = result_tx.send((result, cancel, storage)) {
+                    if let CreationResult::Success { instance, .. } = &undelivered.0 .0 {
+                        tracing::warn!(target: "tui.create", session_id = %instance.id, "Creation receiver closed; durable ownership and resources remain retained");
+                    }
                     break;
                 }
             }
@@ -162,10 +136,11 @@ impl CreationPoller {
         let structured = data.structured;
         let params = InstanceParams::from(data);
 
-        let build_result = match builder::build_instance(
+        let build_result = match builder::build_instance_from_admitted(
             params,
             &existing_titles,
             &existing_branches,
+            request.admitted_instance,
             &request.storage,
         ) {
             Ok(r) => r,
@@ -173,37 +148,26 @@ impl CreationPoller {
         };
 
         let mut instance = build_result.instance;
-        // Tag the instance with its profile NOW, before container creation or any
-        // hook execution. Downstream config-resolution sites (build_container_config,
-        // on_launch hook resolution, build_docker_env_args) read source_profile to
-        // pick the right profile's overrides; if it's left blank they'd silently
-        // fall back to the global default profile.
+        // Resolve profile-specific hooks against the original admitted profile.
         instance.source_profile = profile.clone();
         if structured {
             builder::structured::apply_structured_choice(&mut instance);
         }
-        let created_worktree = build_result.created_worktree;
-        let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
-        let roll_back = |instance: &Instance| {
-            builder::cleanup_instance_locked(
-                instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
-            )
-        };
+        let creation_intent = build_result.creation_intent;
+        if let Err(error) = creation_intent.refresh_prepared(&instance) {
+            return CreationResult::Error(format!(
+                "Creation intent changed; retaining resources: {error:#}"
+            ));
+        }
         let cancelled = |instance: &Instance| {
-            roll_back(instance);
-            CreationResult::Cancelled
+            CreationResult::Error(format!("Creation cancelled; session {} and its resources at {} are retained because original owner quiescence is unproven.", instance.id, instance.project_path))
         };
-        // A step that fails because the user cancelled reports the cancel, not the error.
         let failed = |instance: &Instance, message: String| {
             if cancel.is_cancelled() {
                 return cancelled(instance);
             }
-            roll_back(instance);
-            CreationResult::Error(message)
+            CreationResult::Error(format!("{message}\nSession {} and its resources at {} are retained because original owner quiescence is unproven.", instance.id, instance.project_path))
         };
         if cancel.is_cancelled() {
             return cancelled(&instance);
@@ -324,12 +288,7 @@ impl CreationPoller {
         let workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
             Ok(lock) => lock,
             Err(error) => {
-                builder::cleanup_instance_locked(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                 return CreationResult::Error(format!("{error:#}"));
             }
         };
@@ -342,13 +301,7 @@ impl CreationPoller {
                     ));
                 }
                 if let Err(error) = crate::session::validate_managed_workspace(&instance) {
-                    builder::cleanup_instance_under_locks(
-                        &instance,
-                        created_worktree.as_ref(),
-                        &created_workspace_worktrees,
-                        None,
-                        &locks,
-                    );
+                    tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                     return CreationResult::Error(format!(
                         "Managed workspace validation failed before persistence: {error}"
                     ));
@@ -361,29 +314,16 @@ impl CreationPoller {
                 drop(locks);
             }
             Err(error) => {
-                // Only the workspace-claim lock is held; release it so the
-                // cleanup path can take the pair itself.
                 drop(workspace_claim_lock);
-                builder::cleanup_instance_locked(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
                 return CreationResult::Error(format!("{error:#}"));
             }
         }
-        let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
-        let created_workspace_worktree_info = created_workspace_worktrees
-            .iter()
-            .map(CreatedWorktreeInfo::from)
-            .collect();
 
         CreationResult::Success {
             session_id: instance.id.clone(),
             instance: Box::new(instance),
-            created_worktree: created_worktree_info,
-            created_workspace_worktrees: created_workspace_worktree_info,
+            creation_intent,
             on_launch_hooks_ran: has_on_launch,
             warnings,
         }
@@ -405,7 +345,7 @@ impl CreationPoller {
         self.received(self.result_rx.try_recv().ok())
     }
 
-    /// Blocking receive with timeout, used during shutdown cleanup.
+    /// Receive a completed request within the shutdown deadline.
     pub fn recv_result_timeout(&mut self, timeout: std::time::Duration) -> Option<CreationOutcome> {
         self.received(self.result_rx.recv_timeout(timeout).ok())
     }

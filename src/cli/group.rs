@@ -130,7 +130,7 @@ async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
         name.clone()
     };
 
-    storage.update(|instances, groups| {
+    storage.update_metadata(|instances, groups| {
         let mut group_tree = GroupTree::new_with_groups(instances, groups);
         if group_tree.group_exists(&group_path) {
             bail!("Group already exists: {}", group_path);
@@ -149,7 +149,7 @@ async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
     let name = args.name.trim().to_string();
     let force = args.force;
 
-    let session_count = storage.update(|instances, groups| {
+    let session_count = storage.update_metadata(|instances, groups| {
         let mut group_tree = GroupTree::new_with_groups(instances, groups);
         if !group_tree.group_exists(&name) {
             bail!("Group not found: {}", name);
@@ -194,7 +194,7 @@ async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {
     let identifier = args.identifier.trim().to_string();
     let group = args.group.trim().to_string();
 
-    let old_group = storage.update(|instances, groups| {
+    let old_group = storage.update_metadata(|instances, groups| {
         let old = super::patch_instance(instances, &identifier, |inst| {
             let old = inst.group_path.clone();
             inst.group_path = group.clone();

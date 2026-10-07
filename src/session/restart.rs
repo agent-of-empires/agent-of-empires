@@ -212,6 +212,7 @@ mod tests {
                     op: LifecycleOperation::Launch,
                     generation: 1,
                     at: chrono::Utc::now(),
+                    path_claims: crate::session::WorktreePathClaims::None,
                 });
             }
             storage

@@ -184,7 +184,7 @@ pub(super) fn persist_rename_metadata(
     new_path: Option<&str>,
     new_branch: Option<&str>,
 ) -> anyhow::Result<RenamePersistOutcome> {
-    storage.update(|instances, _groups| {
+    storage.update_under_workspace_claim_lock(|instances, _groups| {
         let Some(inst) = instances.iter_mut().find(|instance| instance.id == id) else {
             return Ok(RenamePersistOutcome::Missing);
         };
@@ -428,7 +428,20 @@ pub async fn rename_session(
             let wt = worktree_info.expect("tied implies worktree_info is Some");
             let cur = current_path.clone();
             let rename_branch = body.rename_branch;
+            let edit_storage = storage.clone();
+            let edit_id = id.clone();
             let edit = tokio::task::spawn_blocking(move || {
+                edit_storage
+                    .ensure_worktree_edit_unclaimed_under_workspace_lock(
+                        &edit_id,
+                        std::path::Path::new(&cur),
+                        &leaf,
+                    )
+                    .map_err(|error| {
+                        crate::session::worktree_edit::WorktreeEditError::PathClaim(
+                            error.to_string(),
+                        )
+                    })?;
                 crate::session::worktree_edit::edit_worktree_workdir(
                     crate::session::worktree_edit::WorktreeEditRequest {
                         worktree_info: &wt,
@@ -624,6 +637,7 @@ fn worktree_edit_error_response(
 ) -> (StatusCode, String) {
     use crate::session::worktree_edit::WorktreeEditError as E;
     match e {
+        E::PathClaim(_) => (StatusCode::CONFLICT, "Worktree path ownership is uncertain or reserved".to_owned()),
         E::NotManaged => (
             StatusCode::BAD_REQUEST,
             "This worktree is not managed by aoe; its workdir name cannot be edited".to_string(),
@@ -754,7 +768,7 @@ pub async fn set_worktree_name(
                             .as_ref()
                             .is_some_and(|reservation| {
                                 reservation.op == crate::session::LifecycleOperation::Attach
-                                    && instance.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                                    && instance.has_active_lifecycle_reservation(chrono::Utc::now())
                             })
                 }) {
                     // An expected lifecycle conflict, not a defect: the caller
@@ -891,7 +905,18 @@ pub async fn set_worktree_name(
         let cur = current_path.clone();
         let new_name = name.clone();
         let rename_branch = body.rename_branch;
+        let edit_storage = storage.clone();
+        let edit_id = id.clone();
         let edit = tokio::task::spawn_blocking(move || {
+            edit_storage
+                .ensure_worktree_edit_unclaimed_under_workspace_lock(
+                    &edit_id,
+                    std::path::Path::new(&cur),
+                    &new_name,
+                )
+                .map_err(|error| {
+                    crate::session::worktree_edit::WorktreeEditError::PathClaim(error.to_string())
+                })?;
             crate::session::worktree_edit::edit_worktree_workdir(
                 crate::session::worktree_edit::WorktreeEditRequest {
                     worktree_info: &wt,
@@ -952,7 +977,7 @@ pub async fn set_worktree_name(
         let new_path_clone = new_path.clone();
         let new_branch_clone = new_branch.clone();
         match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
+            storage.update_under_workspace_claim_lock(|instances, _groups| {
                 let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
                     return Ok(false);
                 };

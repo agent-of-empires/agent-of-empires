@@ -973,6 +973,47 @@ fn apply_group_move(
         super::GroupTree::new_with_groups(target_instances, target_groups).get_all_groups();
 }
 
+enum StorageWriteScope<'a> {
+    Metadata,
+    Geometry,
+    CompletePaths {
+        original: &'a super::LaunchOrigin,
+        paths: &'a [PathBuf],
+    },
+    CompleteCreation {
+        original: &'a super::builder::CreationIntent,
+    },
+}
+
+struct StoredWriteGeometry {
+    created_at: chrono::DateTime<chrono::Utc>,
+    paths: Vec<PathBuf>,
+    pending: Option<super::LifecycleReservation>,
+}
+
+impl StoredWriteGeometry {
+    fn capture(row: &Instance) -> Self {
+        Self {
+            created_at: row.created_at,
+            paths: row.durable_worktree_paths().map(PathBuf::from).collect(),
+            pending: row
+                .lifecycle_reservation
+                .as_ref()
+                .filter(|lease| lease.path_claims.is_pending())
+                .cloned(),
+        }
+    }
+
+    fn matches(&self, row: &Instance) -> bool {
+        self.created_at == row.created_at
+            && self
+                .paths
+                .iter()
+                .map(PathBuf::as_path)
+                .eq(row.durable_worktree_paths())
+    }
+}
+
 impl Storage {
     pub(crate) fn original_profile_identity(&self) -> Result<DirectoryIdentity> {
         anyhow::ensure!(
@@ -1270,6 +1311,31 @@ impl Storage {
         Ok(instances)
     }
 
+    fn load_strict_with_groups_locked(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
+        let instances = self.load_strict_for_worktree_ownership_locked()?;
+        let path = self.sessions_path.with_file_name("groups.json");
+        let groups = match fs::read_to_string(&path) {
+            Ok(content) if content.trim().is_empty() => Vec::new(),
+            Ok(content) => {
+                serde_json::from_str(&content).context("parsing canonical ownership groups")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(error) => {
+                        return Err(error).context("inspecting canonical ownership groups")
+                    }
+                    Ok(_) => {
+                        anyhow::bail!("canonical ownership groups exist but cannot be read safely")
+                    }
+                }
+            }
+            Err(error) => return Err(error).context("reading canonical ownership groups"),
+        };
+        self.verify_profile_identity()?;
+        Ok((instances, groups))
+    }
+
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
         let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
         Self::write_corrupt_rows_quarantine(&path, rows, "session");
@@ -1360,7 +1426,95 @@ impl Storage {
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         self.verify_profile_identity()?;
-        self.update_under_storage_locks(f, false)
+        let _workspace = acquire_session_workspace_claim_lock()?;
+        self.update_under_storage_locks(f, StorageWriteScope::Geometry)
+    }
+
+    /// Metadata writes cannot change row ownership, paths or filesystem intent.
+    pub(crate) fn update_metadata<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f, StorageWriteScope::Metadata)
+    }
+
+    pub(crate) fn complete_path_claims_under_workspace_lock<F, R>(
+        &self,
+        original: &super::LaunchOrigin,
+        paths: &[PathBuf],
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f, StorageWriteScope::CompletePaths { original, paths })
+    }
+
+    pub(crate) fn complete_creation_under_workspace_claim_lock<F, R>(
+        &self,
+        original: &super::builder::CreationIntent,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f, StorageWriteScope::CompleteCreation { original })
+    }
+
+    /// Inspect both endpoints before effects while the caller holds the workspace fence.
+    pub(crate) fn ensure_worktree_edit_unclaimed_under_workspace_lock(
+        &self,
+        id: &str,
+        current: &Path,
+        new_name: &str,
+    ) -> Result<()> {
+        let target = super::worktree_edit::target_worktree_path(current, new_name)
+            .context("worktree destination has no parent")?;
+        self.ensure_worktree_write_unclaimed_under_workspace_lock(
+            id,
+            current,
+            &[current, target.as_path()],
+        )
+    }
+
+    pub(crate) fn ensure_worktree_branch_unclaimed_under_workspace_lock(
+        &self,
+        id: &str,
+        current: &Path,
+    ) -> Result<()> {
+        self.ensure_worktree_write_unclaimed_under_workspace_lock(id, current, &[current])
+    }
+
+    fn ensure_worktree_write_unclaimed_under_workspace_lock(
+        &self,
+        id: &str,
+        current: &Path,
+        candidates: &[&Path],
+    ) -> Result<()> {
+        self.verify_profile_identity()?;
+        let mut claims =
+            super::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(self))?;
+        let (_, _, rows) = claims
+            .take_targets()
+            .into_iter()
+            .next()
+            .context("original profile is absent from path inventory")?;
+        let row = rows
+            .iter()
+            .find(|row| row.id == id)
+            .context("worktree owner disappeared")?;
+        anyhow::ensure!(
+            Path::new(&row.project_path) == current,
+            "worktree source plan was superseded"
+        );
+        anyhow::ensure!(
+            !row.has_pending_worktree_path_claims(),
+            "worktree owner has an unfinished filesystem intent"
+        );
+        claims.ensure_pending_writes_unclaimed(candidates)
     }
 
     /// Update while the caller already owns the workspace claim lock.
@@ -1369,33 +1523,11 @@ impl Storage {
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         self.verify_profile_identity()?;
-        self.update_under_storage_locks(f, false)
+        self.update_under_storage_locks(f, StorageWriteScope::Geometry)
     }
 
-    /// Native ownership transactions refuse malformed rows and groups rather
-    /// than quarantining them or committing a filtered store.
-    pub(crate) fn update_native_under_workspace_claim_lock<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
-    {
-        self.verify_profile_identity()?;
-        self.update_under_storage_locks(f, true)
-    }
-
-    /// Update while the caller already owns the workspace claim and profile namespace locks.
-    pub(crate) fn update_under_profile_namespace_lock<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
-    {
-        self.verify_profile_identity()?;
-        self.update_under_storage_locks(f, false)
-    }
-
-    /// Take this store's own locks in their fixed order (in-process save lock,
-    /// profile namespace transition lock, storage flock) and update under them.
-    /// No `update*` entry point takes a namespace lock on the caller's behalf;
-    /// this name says what this one actually does.
-    fn update_under_storage_locks<F, R>(&self, f: F, strict: bool) -> Result<R>
+    /// Take only this store's locks, after any required workspace fence.
+    fn update_under_storage_locks<F, R>(&self, f: F, scope: StorageWriteScope<'_>) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
@@ -1423,7 +1555,7 @@ impl Storage {
         )?;
         let _flock = acquire_existing_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
         self.verify_profile_identity()?;
-        self.update_under_lock(f, strict)
+        self.update_under_lock(f, scope)
     }
 
     pub(crate) fn verify_profile_identity(&self) -> Result<()> {
@@ -1451,28 +1583,128 @@ impl Storage {
 
     /// Apply one storage mutation while the caller already owns this profile's
     /// in-process save lock and cross-process storage flock.
-    fn update_under_lock<F, R>(&self, f: F, strict: bool) -> Result<R>
+    fn update_under_lock<F, R>(&self, f: F, scope: StorageWriteScope<'_>) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        let (mut instances, mut groups) = if strict {
-            let instances = self.load_strict_for_worktree_ownership_locked()?;
-            let path = self.sessions_path.with_file_name("groups.json");
-            let groups = match fs::read_to_string(&path) {
-                Ok(content) if content.trim().is_empty() => Vec::new(),
-                Ok(content) => serde_json::from_str(&content)
-                    .context("parsing canonical native ownership groups")?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => {
-                    return Err(error).context("reading canonical native ownership groups")
-                }
-            };
-            (instances, groups)
-        } else {
-            self.load_with_groups()?
+        let (mut instances, mut groups) = self.load_strict_with_groups_locked()?;
+        let before: HashMap<_, _> = instances
+            .iter()
+            .map(|row| (row.id.clone(), StoredWriteGeometry::capture(row)))
+            .collect();
+        let completing = match &scope {
+            StorageWriteScope::CompletePaths { original, paths } => {
+                anyhow::ensure!(
+                    self.same_origin_as(original.storage()),
+                    "filesystem intent changed its physical owner"
+                );
+                let row = instances
+                    .iter()
+                    .find(|row| row.id == original.session_id())
+                    .context("filesystem intent owner disappeared")?;
+                original.validate_baseline_at(row, original.generation())?;
+                anyhow::ensure!(row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+                    lease.generation == original.generation()
+                        && matches!(&lease.path_claims, super::WorktreePathClaims::Pending(stored) if stored.as_slice() == *paths)
+                }), "filesystem intent is unknown or differs from its complete original plan");
+                Some(original.session_id())
+            }
+            StorageWriteScope::CompleteCreation { original } => {
+                anyhow::ensure!(
+                    self.same_origin_as(original.storage()),
+                    "creation changed its physical owner"
+                );
+                let row = instances
+                    .iter()
+                    .find(|row| row.id == original.session_id())
+                    .context("creation filesystem owner disappeared")?;
+                original.validate_row(row)?;
+                Some(original.session_id())
+            }
+            _ => None,
         };
         let groups_before = groups.clone();
         let result = f(&mut instances, &mut groups)?;
+        let metadata_only = matches!(scope, StorageWriteScope::Metadata);
+        if metadata_only {
+            anyhow::ensure!(
+                instances.len() == before.len(),
+                "metadata write changed row ownership"
+            );
+        }
+        let mut seen = std::collections::HashSet::with_capacity(instances.len());
+        let mut deltas = Vec::new();
+        for row in &instances {
+            anyhow::ensure!(
+                seen.insert(row.id.as_str()),
+                "write duplicated a session owner"
+            );
+            let prior = before.get(&row.id);
+            if metadata_only
+                || prior.is_some_and(|prior| {
+                    prior.pending.is_some() && completing != Some(row.id.as_str())
+                })
+            {
+                let prior = prior.context("metadata write introduced a session owner")?;
+                anyhow::ensure!(prior.matches(row), "write changed protected row geometry");
+                if let Some(pending) = &prior.pending {
+                    anyhow::ensure!(
+                        row.lifecycle_reservation.as_ref() == Some(pending),
+                        "write changed protected filesystem intent"
+                    );
+                }
+            }
+            let changed_geometry = prior.is_none_or(|prior| !prior.matches(row));
+            let pending = row
+                .lifecycle_reservation
+                .as_ref()
+                .filter(|lease| lease.path_claims.is_pending());
+            let changed_pending = pending != prior.and_then(|prior| prior.pending.as_ref());
+            if metadata_only {
+                anyhow::ensure!(
+                    !changed_geometry && !changed_pending,
+                    "metadata write changed geometry or filesystem intent"
+                );
+            } else if changed_geometry
+                || changed_pending && (pending.is_some() || completing == Some(row.id.as_str()))
+            {
+                let mut paths = row
+                    .durable_worktree_paths()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                match pending.map(|lease| &lease.path_claims) {
+                    Some(super::WorktreePathClaims::Pending(pending)) => {
+                        paths.extend(pending.iter().cloned())
+                    }
+                    Some(super::WorktreePathClaims::Unknown) => {
+                        anyhow::bail!("cannot publish an unknown filesystem intent")
+                    }
+                    _ => {}
+                }
+                deltas.push((row.id.as_str(), paths));
+            }
+        }
+        for (id, prior) in &before {
+            if metadata_only || (prior.pending.is_some() && completing != Some(id.as_str())) {
+                anyhow::ensure!(
+                    seen.contains(id.as_str()),
+                    "write removed a filesystem intent owner"
+                );
+            }
+        }
+        if !deltas.is_empty() {
+            let mut claims =
+                super::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(self))?;
+            let profile = claims
+                .take_targets()
+                .into_iter()
+                .next()
+                .context("writer profile is absent from claim inventory")?
+                .1;
+            for (id, paths) in deltas {
+                claims.ensure_pending_unclaimed(profile, id, &paths)?;
+            }
+        }
 
         // Pre-serialise both buffers so a serde failure on either side
         // aborts before any file is touched.
@@ -1502,6 +1734,7 @@ impl Storage {
 
     /// Move one session, running `before_commit` only after the authoritative
     /// target validation succeeds while both profile locks are still held.
+    /// The caller owns workspace before identity and per-row locks.
     pub(crate) fn move_instance_to_with_effect<F, B>(
         &self,
         target: &Storage,
@@ -1533,6 +1766,7 @@ impl Storage {
     }
 
     /// Move a batch between profiles as one dual-locked transaction.
+    /// The caller owns workspace before identity and per-row locks.
     pub(crate) fn move_instances_to<F>(
         &self,
         target: &Storage,
@@ -1638,8 +1872,8 @@ impl Storage {
             ));
         }
 
-        let (mut source_instances, mut source_groups) = self.load_with_groups()?;
-        let (mut target_instances, mut target_groups) = target.load_with_groups()?;
+        let (mut source_instances, mut source_groups) = self.load_strict_with_groups_locked()?;
+        let (mut target_instances, mut target_groups) = target.load_strict_with_groups_locked()?;
         let mut ids = std::collections::HashSet::with_capacity(changes.len());
         let mut moved = Vec::with_capacity(changes.len());
         for (before, after) in changes {
@@ -1656,6 +1890,10 @@ impl Storage {
             {
                 return Err(anyhow!("Session already exists in target profile"));
             }
+            anyhow::ensure!(
+                !source.has_pending_worktree_path_claims(),
+                "cannot move a filesystem intent owner between profiles"
+            );
             let mut candidate = source.clone();
             if plan.merge_complete_post {
                 candidate.merge_profile_move_diff(before, after, plan.account_swap);
@@ -1663,7 +1901,40 @@ impl Storage {
                 candidate.merge_user_action_diff(before, after);
             }
             candidate.source_profile.clone_from(&target.profile);
+            anyhow::ensure!(
+                !candidate.has_pending_worktree_path_claims(),
+                "profile move introduced a filesystem intent"
+            );
             moved.push(candidate);
+        }
+        let mut claims =
+            super::deletion::PathClaimIndex::load_for_writer(&[self.clone(), target.clone()])?;
+        let inventories = claims.take_targets();
+        let source_profile = inventories
+            .iter()
+            .find(|(index, _, _)| *index == 0)
+            .context("source profile is absent from claim inventory")?
+            .1;
+        let target_profile = inventories
+            .iter()
+            .find(|(index, _, _)| *index == 1)
+            .context("target profile is absent from claim inventory")?
+            .1;
+        for (before, candidate) in changes.iter().map(|(before, _)| before).zip(&moved) {
+            let source = source_instances
+                .iter()
+                .find(|row| row.id == before.id)
+                .context("source owner disappeared before profile move")?;
+            let source_paths = source
+                .durable_worktree_paths()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let target_paths = candidate
+                .durable_worktree_paths()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            claims.ensure_pending_unclaimed(source_profile, &source.id, &source_paths)?;
+            claims.ensure_pending_unclaimed(target_profile, &candidate.id, &target_paths)?;
         }
         if plan.group_move.move_subtree {
             let source_prefix = format!("{}/", plan.group_move.source_path);
@@ -2674,8 +2945,15 @@ where
     source_storage.verify_profile_identity()?;
     target_storage.verify_profile_identity()?;
     with_two_storage_locks(source_storage, target_storage, || {
-        let (source_instances, _source_groups) = source_storage.load_with_groups()?;
-        let (target_instances, _) = target_storage.load_with_groups()?;
+        let source_instances = source_storage.load_strict_for_worktree_ownership_locked()?;
+        let target_instances = target_storage.load_strict_for_worktree_ownership_locked()?;
+        if source_instances
+            .iter()
+            .chain(&target_instances)
+            .any(|row| entry.ids.contains(&row.id) && row.has_pending_worktree_path_claims())
+        {
+            return Ok(false);
+        }
         let plan = crate::session::GroupMovePlan {
             source_path: entry.group_move_source_path.clone(),
             target_path: entry.group_move_target_path.clone(),
@@ -2719,7 +2997,7 @@ where
                 .collect();
             reconcile_groups_after_repair(instances, groups, &winners, &plan);
             Ok(())
-        }, false)?;
+        }, StorageWriteScope::Geometry)?;
         sync_repaired_profile_durably(source_storage, &mut sync)?;
         #[cfg(test)]
         test_crash_point("profile-repair-source-written");

@@ -765,7 +765,7 @@ fn apply_terminal_title(
     let identity_lock = crate::session::acquire_session_identity_lock()?;
     let _session_title_lock = crate::session::storage::acquire_session_title_lock(&id)?;
     let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
-    let rekey = storage.update(|instances, _groups| {
+    let rekey = storage.update_metadata(|instances, _groups| {
         let mut rekey = None;
         if let Some(index) = instances.iter().position(|instance| instance.id == id) {
             instances[index].smart_rename_attempted = true;
@@ -1190,8 +1190,10 @@ mod serve {
         let lock = state.instance_lock(id).await;
         let _serialized = lock.lock().await;
 
-        let storage = match crate::session::storage::Storage::new(profile, state.file_watch.clone())
-        {
+        let storage = match crate::session::storage::Storage::open(
+            profile,
+            state.file_watch.clone(),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "smart_rename", session = %id, "storage open failed: {e}");
@@ -1207,7 +1209,7 @@ mod serve {
             let identity_lock = crate::session::acquire_session_identity_lock()?;
             let session_title_lock =
                 crate::session::storage::acquire_session_title_lock(&id_owned)?;
-            let wrote = storage.update(|instances, _groups| {
+            let wrote = storage.update_metadata(|instances, _groups| {
                 let Some(index) = instances
                     .iter()
                     .position(|instance| instance.id == id_owned)

@@ -138,7 +138,7 @@ pub fn reconcile_and_persist(
                 if stored.project_path != stale
                     || stored.is_trashed()
                     || !stored.runner_journal.proves_quiescent()
-                    || stored.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                    || stored.has_active_lifecycle_reservation(chrono::Utc::now())
                 {
                     return Ok(false);
                 }

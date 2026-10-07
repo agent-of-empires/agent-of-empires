@@ -165,10 +165,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&vec![legacy, preparing]).unwrap()).unwrap();
 
         crate::migrations::run_migrations().unwrap();
-        assert_eq!(
-            fs::read_to_string(app.join(".schema_version")).unwrap(),
-            "37"
-        );
+
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let journal = &migrated[0]["runner_journal"];

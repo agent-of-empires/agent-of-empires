@@ -428,7 +428,7 @@ async fn mark_session(
     apply: fn(&mut Instance),
 ) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update(|instances, _groups| {
+    let title = storage.update_metadata(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             apply(inst);
             Ok(inst.title.clone())
@@ -446,7 +446,7 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
     };
 
     let storage = Storage::open_unwatched(profile)?;
-    let (title, color) = storage.update(|instances, _groups| {
+    let (title, color) = storage.update_metadata(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.set_color(new_color.clone())
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -482,7 +482,7 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
             }
             inst.kill_ancillary_tmux_sessions_locked();
         }
-        storage.update_native_under_workspace_claim_lock(|instances, _| {
+        storage.update_under_workspace_claim_lock(|instances, _| {
             let stored = instances
                 .iter_mut()
                 .find(|row| row.id == id)
@@ -512,7 +512,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&restore_id)
             .context("failed to acquire instance restore lock")?;
-        storage.update(|instances, _groups| {
+        storage.update_under_workspace_claim_lock(|instances, _groups| {
             let decision = crate::session::claim::decide_restore_claim(
                 instances,
                 &restore_id,
@@ -578,7 +578,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
             );
         }
     }
-    let restored = storage.update(|instances, _groups| {
+    let restored = storage.update_under_workspace_claim_lock(|instances, _groups| {
         let stored = instances
             .iter()
             .find(|row| row.id == restore_id)
@@ -643,7 +643,7 @@ fn restore_plan_unchanged(snapshot: &Instance, durable: &Instance) -> bool {
 }
 
 fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: u64) {
-    let _ = storage.update(|instances, _groups| {
+    let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
         if let Some(stored) = instances
             .iter_mut()
             .find(|instance| instance.id == restore_id)
@@ -821,7 +821,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     let minutes = raw_minutes as u32;
 
     let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update(|instances, _groups| {
+    let title = storage.update_metadata(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.snooze(minutes);
             Ok(inst.title.clone())
@@ -833,7 +833,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
 
 async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update(|instances, _groups| {
+    let title = storage.update_metadata(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unsnooze();
             Ok(inst.title.clone())
@@ -868,7 +868,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let _merge_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance start merge lock")?;
-    let landed = storage.update(|instances, _groups| {
+    let landed = storage.update_metadata(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.merge_post_start(&working);
             Ok(true)
@@ -1058,6 +1058,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
 
     let group = args.group.clone().unwrap_or_default();
+    let _workspace_lock = crate::session::acquire_session_workspace_claim_lock()?;
     let _identity_lock = acquire_session_identity_lock()?;
     let session_configs: Vec<_> = to_import
         .iter()
@@ -1070,7 +1071,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         })
         .collect();
     let storage = Storage::open_unwatched(profile)?;
-    let created_ids = storage.update(|all_instances, groups| {
+    let created_ids = storage.update_under_workspace_claim_lock(|all_instances, groups| {
         let mut ids = Vec::new();
         for (s, session_config) in to_import.iter().zip(&session_configs) {
             if already_imported(all_instances, &s.session_id) {
@@ -1088,6 +1089,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         Ok(ids)
     })?;
     drop(_identity_lock);
+    drop(_workspace_lock);
 
     println!("✓ Imported {} session(s).", created_ids.len());
 
@@ -1131,7 +1133,7 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
             true,
         );
         let wid = working.id.clone();
-        storage.update(|instances, _groups| {
+        storage.update_metadata(|instances, _groups| {
             if let Some(stored) = instances.iter_mut().find(|i| i.id == wid) {
                 stored.merge_post_start(&working);
             }
@@ -1289,7 +1291,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         }
     }
 
-    let orphaned: Vec<(String, String)> = storage.update(|instances, _groups| {
+    let orphaned: Vec<(String, String)> = storage.update_metadata(|instances, _groups| {
         let mut orphaned = Vec::new();
         for restarted_inst in restarted {
             if let Some(stored) = instances.iter_mut().find(|i| i.id == restarted_inst.id) {
@@ -1421,7 +1423,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let _merge_lock = storage
         .acquire_instance_lifecycle_lock(&session_id)
         .context("failed to acquire instance restart merge lock")?;
-    let landed = storage.update(|instances, _groups| {
+    let landed = storage.update_metadata(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
             stored.merge_post_restart(&working);
             if wake_succeeded {
@@ -1762,10 +1764,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     } else {
         None
     };
-    let _workspace_claim_lock = stop_generation
-        .as_ref()
-        .map(|_| crate::session::acquire_session_workspace_claim_lock())
-        .transpose()?;
+    let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
     let _identity_lock = acquire_session_identity_lock()?;
     let _session_title_lock = if session_lock_required {
         Some(
@@ -1865,6 +1864,10 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 }
             }
         }
+        storage.ensure_worktree_branch_unclaimed_under_workspace_lock(
+            &id,
+            std::path::Path::new(&inst.project_path),
+        )?;
         if crate::session::worktree_edit::rename_worktree_branch(
             info,
             std::path::Path::new(&inst.project_path),
@@ -1908,6 +1911,11 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
             }
         }
+        storage.ensure_worktree_edit_unclaimed_under_workspace_lock(
+            &id,
+            std::path::Path::new(&current_path),
+            &leaf,
+        )?;
         match crate::session::worktree_edit::edit_worktree_workdir(
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
@@ -1934,7 +1942,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     }
 
     let rekey_target = crate::tmux::capture_rekey_session(&id, &inst.title);
-    let persist = storage.update(|instances, groups| {
+    let persist = storage.update_under_workspace_claim_lock(|instances, groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
@@ -2566,6 +2574,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     ) {
         tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
     }
+    let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
     let _identity_lock = acquire_session_identity_lock()?;
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
@@ -2575,13 +2584,14 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    if inst
-        .lifecycle_reservation
-        .as_ref()
-        .is_some_and(|reservation| {
-            reservation.op == LifecycleOperation::Attach
-                && inst.has_fresh_lifecycle_reservation(chrono::Utc::now())
-        })
+    if inst.has_pending_worktree_path_claims()
+        || inst
+            .lifecycle_reservation
+            .as_ref()
+            .is_some_and(|reservation| {
+                reservation.op == LifecycleOperation::Attach
+                    && inst.has_active_lifecycle_reservation(chrono::Utc::now())
+            })
     {
         bail!("Session is attaching a project; wait for the attach to finish before renaming its worktree");
     }
@@ -2653,6 +2663,11 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         {
             return Err(duplicate_session_error(&current.title));
         }
+        storage.ensure_worktree_edit_unclaimed_under_workspace_lock(
+            &id,
+            std::path::Path::new(current_path),
+            args.name.trim(),
+        )?;
         let outcome = crate::session::worktree_edit::edit_worktree_workdir(
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info,
@@ -2668,7 +2683,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             );
         }
         let new_path = outcome.new_path.to_string_lossy().into_owned();
-        storage.update(|instances, _| {
+        storage.update_under_workspace_claim_lock(|instances, _| {
             let stored = instances.iter_mut().find(|row| row.id == id).context("session disappeared before workdir commit")?;
             anyhow::ensure!(stored.lifecycle_generation == current.lifecycle_generation && stored.project_path == *current_path,
                 "workdir plan was superseded before commit");
@@ -2683,6 +2698,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let (new_path, new_branch) = if moves_worktree {
         drop(_lifecycle_lock);
         drop(_identity_lock);
+        drop(_workspace_claim_lock);
         let generation = crate::session::runner_journal::reserve_owned_stop(&storage, inst, true)?;
         if let Err(error) = crate::session::runner_journal::settle_if_idle(generation.clone()).await
         {
@@ -2770,7 +2786,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     let lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&target_id)
         .context("failed to acquire instance resume-target lock")?;
-    let title = storage.update(|instances, _groups| {
+    let title = storage.update_metadata(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
             inst.source_profile = storage.profile().to_string();
             if inst.is_structured() {
@@ -2932,7 +2948,7 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     };
 
     let repo_name = target.repo_name.clone();
-    storage.update(|instances, _groups| {
+    storage.update_metadata(|instances, _groups| {
         let stored = instances
             .iter_mut()
             .find(|i| i.id == id)

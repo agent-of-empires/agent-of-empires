@@ -18,7 +18,7 @@ impl HomeView {
             if !self.storages.contains_key(&profile) {
                 self.storages.insert(
                     profile.clone(),
-                    Storage::new(&profile, self.file_watch.clone())?,
+                    Storage::open(&profile, self.file_watch.clone())?,
                 );
             }
             self.storages.retain(|name, _| name == &profile);

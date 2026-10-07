@@ -229,7 +229,7 @@ where
     let _lifecycle_lock = lock_id
         .map(|id| storage.acquire_instance_lifecycle_lock(id))
         .transpose()?;
-    storage.update(|instances, _groups| {
+    storage.update_metadata(|instances, _groups| {
         mutate(instances);
         Ok(())
     })

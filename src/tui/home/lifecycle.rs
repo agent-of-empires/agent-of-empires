@@ -52,7 +52,7 @@ impl HomeView {
         };
 
         for profile_name in &profile_names {
-            let storage = Storage::new(profile_name, file_watch.clone())?;
+            let storage = Storage::open(profile_name, file_watch.clone())?;
             let (mut instances, groups) = storage.load_with_groups()?;
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
@@ -67,7 +67,7 @@ impl HomeView {
                 .iter()
                 .filter(|instance| {
                     instance.lifecycle_reservation.is_some()
-                        && !instance.has_fresh_lifecycle_reservation(now)
+                        && !instance.has_active_lifecycle_reservation(now)
                 })
                 .map(|instance| instance.id.clone())
                 .collect();
@@ -84,7 +84,7 @@ impl HomeView {
                 // `retain` can empty this when every lock failed; writing then would
                 // rewrite sessions.json and notify subscribers for no change.
                 if !expired.is_empty() {
-                    let cleared = storage.update(|disk, _groups| {
+                    let cleared = storage.update_metadata(|disk, _groups| {
                         for id in &expired {
                             if let Some(stored) =
                                 disk.iter_mut().find(|candidate| &candidate.id == id)
@@ -477,20 +477,22 @@ impl HomeView {
             ));
         }
 
-        // Clean up orphaned Creating instances from a prior crash
-        let orphan_ids: Vec<String> = view
+        let unfinished = view
             .instances
             .values()
-            .filter(|i| i.status == crate::session::Status::Creating)
-            .map(|i| i.id.clone())
-            .collect();
-        for id in &orphan_ids {
-            view.remove_instance(id);
-        }
-        if !orphan_ids.is_empty() {
-            tracing::info!(target: "tui.home", "Cleaned up {} orphaned creating sessions", orphan_ids.len());
-            if let Err(e) = view.save() {
-                tracing::warn!(target: "tui.home", "Failed to save view state: {e}");
+            .filter(|instance| {
+                instance.status == crate::session::Status::Creating
+                    || instance.has_pending_worktree_path_claims()
+            })
+            .count();
+        if unfinished != 0 {
+            let message = format!("{unfinished} unfinished filesystem operations are retained. Their original ownership proof is required before releasing claims or removing resources.");
+            tracing::warn!(target: "tui.home", "{message}");
+            if view.info_dialog.is_none() {
+                view.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Unfinished operations retained",
+                    &message,
+                ));
             }
         }
 

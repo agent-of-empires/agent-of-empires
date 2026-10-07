@@ -49,7 +49,7 @@ impl TrashPoller {
                         storage.verify_profile_identity()?;
                         let _lifecycle =
                             storage.acquire_instance_lifecycle_lock(&request.session_id)?;
-                        storage.update(|instances, _groups| {
+                        storage.update_under_workspace_claim_lock(|instances, _groups| {
                             crate::session::claim::release_trash_reservation(
                                 instances,
                                 &request.session_id,

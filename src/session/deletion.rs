@@ -147,7 +147,7 @@ impl PurgeTransaction {
         let now = Utc::now();
         let mut reserved = None;
         let mut rejected = None;
-        storage.update_native_under_workspace_claim_lock(|instances, _groups| {
+        storage.update_under_workspace_claim_lock(|instances, _groups| {
             if let Some(stored) = instances.iter().find(|instance| instance.id == id) {
                 if original
                     .validate_baseline_at(stored, original.generation())
@@ -337,11 +337,8 @@ impl PurgeTransaction {
                     .context("failed to reacquire instance purge lock after hooks")?,
             );
         }
-        // The verdict was taken before the hooks ran without any flock held, so
-        // it cannot decide a row removal that now happens under the full lock
-        // set. Dropping it here makes the next ownership check rescan, which is
-        // what stands between an inventory that turned unreadable in between and
-        // a teardown with no row left to retry it from.
+        // Hooks release ownership fences; the cached verdict cannot authorize
+        // row removal after another profile inventory has changed.
         self.ownership_verdict = None;
         Ok(())
     }
@@ -352,7 +349,7 @@ impl PurgeTransaction {
         let generation = self.generation;
         let mut retained = None;
         self.storage
-            .update_native_under_workspace_claim_lock(|instances, _groups| {
+            .update_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                     self.original.validate_baseline_at(stored, generation)?;
                     stored.release_lifecycle_reservation_if_owned(
@@ -373,7 +370,7 @@ impl PurgeTransaction {
         let was_trashed = self.was_trashed;
         let mut outcome = None;
         self.storage
-            .update_native_under_workspace_claim_lock(|instances, _groups| {
+            .update_under_workspace_claim_lock(|instances, _groups| {
                 let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) else {
                     outcome = Some((CompletionGate::AlreadyGone, None));
                     return Ok(());
@@ -725,7 +722,7 @@ impl Drop for PurgeTransaction {
                 let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&id) else {
                     return;
                 };
-                let _ = storage.update_native_under_workspace_claim_lock(|instances, _groups| {
+                let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
                     if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                         original.validate_baseline_at(stored, generation)?;
                         stored.release_lifecycle_reservation_if_owned(
@@ -885,9 +882,21 @@ fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct WorktreePathInventory {
+    pub(crate) established: Vec<PathBuf>,
+    pub(crate) pending: Vec<PathBuf>,
+}
+
+impl WorktreePathInventory {
+    fn iter(&self) -> impl Iterator<Item = &PathBuf> {
+        self.established.iter().chain(&self.pending)
+    }
+}
+
 /// The paths sessions outside a deletion use, across every profile.
 pub(crate) enum PathsInUse {
-    Known(Vec<PathBuf>),
+    Known(WorktreePathInventory),
     /// Some store could not be read, so every path must be assumed in use.
     Unknown(String),
 }
@@ -923,11 +932,7 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
     Ok((profiles, storages))
 }
 
-fn scan_paths_in_use(
-    storages: &[Storage],
-    except: &[SessionPathOwner<'_>],
-    absent_id: Option<&str>,
-) -> PathsInUse {
+fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> PathsInUse {
     let mut owners = Vec::with_capacity(except.len());
     for owner in except {
         if owner.profile.is_empty() || owner.session_id.is_empty() {
@@ -942,7 +947,7 @@ fn scan_paths_in_use(
         };
         owners.push((identity, owner.session_id, false, false));
     }
-    let mut paths = Vec::new();
+    let mut paths = WorktreePathInventory::default();
     for storage in storages {
         if !owners.is_empty() {
             let identity = storage
@@ -960,31 +965,32 @@ fn scan_paths_in_use(
         }
         match storage.load_strict_for_worktree_ownership_locked() {
             Ok(instances) => {
-                if absent_id.is_some_and(|id| instances.iter().any(|instance| instance.id == id)) {
-                    return PathsInUse::Unknown(
-                        "failed creation id still has a durable owner".into(),
-                    );
-                }
-                paths.extend(
-                    instances
+                for instance in instances.iter().filter(|instance| {
+                    !owners
                         .iter()
-                        .filter(|instance| {
-                            !owners
-                                .iter()
-                                .any(|(_, id, _, matches)| *matches && *id == instance.id)
-                        })
-                        .flat_map(|instance| {
-                            std::iter::once(instance.project_path.as_str())
-                                .chain(instance.pre_trash_project_path.as_deref())
-                                .chain(
-                                    instance
-                                        .all_repos()
-                                        .iter()
-                                        .map(|repo| repo.worktree_path.as_str()),
-                                )
-                                .map(PathBuf::from)
-                        }),
-                );
+                        .any(|(_, id, _, matches)| *matches && *id == instance.id)
+                }) {
+                    paths
+                        .established
+                        .extend(instance.durable_worktree_paths().map(PathBuf::from));
+                    match instance
+                        .lifecycle_reservation
+                        .as_ref()
+                        .map(|lease| &lease.path_claims)
+                    {
+                        Some(crate::session::WorktreePathClaims::Pending(pending)) => {
+                            paths.pending.extend(pending.iter().cloned());
+                        }
+                        Some(crate::session::WorktreePathClaims::Unknown) => {
+                            return PathsInUse::Unknown(format!(
+                                "profile '{}' session '{}' has unknown filesystem intent",
+                                storage.profile(),
+                                instance.id
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
             }
             Err(error) => {
                 return PathsInUse::Unknown(format!(
@@ -1003,15 +1009,7 @@ fn scan_paths_in_use(
 /// Unlocked snapshot; destructive callers recheck under the ownership locks.
 pub(crate) fn paths_in_use_except(except: &[SessionPathOwner<'_>]) -> PathsInUse {
     match all_profile_storages() {
-        Ok((_, storages)) => scan_paths_in_use(&storages, except, None),
-        Err(reason) => PathsInUse::Unknown(reason),
-    }
-}
-
-/// Caller holds worktree and identity fences after removing its own creation row.
-pub(crate) fn paths_in_use_after_failed_create(session_id: &str) -> PathsInUse {
-    match all_profile_storages() {
-        Ok((_, storages)) => scan_paths_in_use(&storages, &[], Some(session_id)),
+        Ok((_, storages)) => scan_paths_in_use(&storages, except),
         Err(reason) => PathsInUse::Unknown(reason),
     }
 }
@@ -1020,18 +1018,27 @@ pub(crate) fn paths_in_use_after_failed_create(session_id: &str) -> PathsInUse {
 struct ClaimOwner {
     profile: usize,
     id: std::sync::Arc<str>,
+    exclusive: bool,
 }
 
 /// A strict, physically keyed ownership snapshot for one fenced reconciliation pass.
 pub(crate) struct PathClaimIndex {
     claims: std::collections::BTreeMap<PathBuf, Vec<ClaimOwner>>,
-    owned_paths: Vec<std::collections::HashMap<std::sync::Arc<str>, Vec<PathBuf>>>,
+    owned_paths: Vec<std::collections::HashMap<std::sync::Arc<str>, Vec<(PathBuf, bool)>>>,
     targets: Vec<(usize, usize, Vec<Instance>)>,
     valid: bool,
 }
 
 impl PathClaimIndex {
     pub(crate) fn load(targets: &[Storage]) -> anyhow::Result<Self> {
+        Self::load_snapshot(targets, true)
+    }
+
+    pub(crate) fn load_for_writer(targets: &[Storage]) -> anyhow::Result<Self> {
+        Self::load_snapshot(targets, false)
+    }
+
+    fn load_snapshot(targets: &[Storage], lock_stores: bool) -> anyhow::Result<Self> {
         let target_identities = targets
             .iter()
             .map(|target| {
@@ -1039,8 +1046,16 @@ impl PathClaimIndex {
                 Ok(std::fs::metadata(target.sessions_path().parent().unwrap())?)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (_, storages) = all_profile_storages().map_err(anyhow::Error::msg)?;
-        crate::session::storage::with_storages_locked(&storages, || -> anyhow::Result<Self> {
+        let (_, mut storages) = all_profile_storages().map_err(anyhow::Error::msg)?;
+        for target in targets {
+            if !storages
+                .iter()
+                .any(|candidate| candidate.same_origin_as(target))
+            {
+                storages.push(target.clone());
+            }
+        }
+        let scan = || -> anyhow::Result<Self> {
             let mut result = Self {
                 claims: Default::default(),
                 owned_paths: Vec::new(),
@@ -1079,7 +1094,12 @@ impl PathClaimIndex {
                 target.verify_profile_identity()?;
             }
             Ok(result)
-        })?
+        };
+        if lock_stores {
+            crate::session::storage::with_storages_locked(&storages, scan)?
+        } else {
+            scan()
+        }
     }
 
     pub(crate) fn take_targets(&mut self) -> Vec<(usize, usize, Vec<Instance>)> {
@@ -1094,21 +1114,32 @@ impl PathClaimIndex {
         let owner = ClaimOwner {
             profile,
             id: std::sync::Arc::clone(&id),
+            exclusive: false,
         };
         let previous = self.owned_paths[profile].entry(id).or_default();
         let mut retained = 0;
-        for path in std::iter::once(row.project_path.as_str())
-            .chain(row.pre_trash_project_path.as_deref())
-            .chain(
-                row.all_repos()
-                    .iter()
-                    .map(|repo| repo.worktree_path.as_str()),
-            )
+        let pending = match row
+            .lifecycle_reservation
+            .as_ref()
+            .map(|lease| &lease.path_claims)
         {
-            let Some(path) = resolve_claim_path(Path::new(path)) else {
+            Some(crate::session::WorktreePathClaims::Pending(paths)) => paths.as_slice(),
+            Some(crate::session::WorktreePathClaims::Unknown) => {
+                self.valid = false;
+                return;
+            }
+            _ => &[],
+        };
+        for (path, exclusive) in row
+            .durable_worktree_paths()
+            .map(|path| (path, false))
+            .chain(pending.iter().map(|path| (path.as_path(), true)))
+        {
+            let Some(path) = resolve_claim_path(path) else {
                 self.valid = false;
                 continue;
             };
+            let path = (path, exclusive);
             if previous[..retained].contains(&path) {
                 continue;
             }
@@ -1116,18 +1147,27 @@ impl PathClaimIndex {
                 previous.swap(retained, retained + offset);
             } else {
                 self.claims
-                    .entry(path.clone())
+                    .entry(path.0.clone())
                     .or_default()
-                    .push(owner.clone());
+                    .push(ClaimOwner {
+                        exclusive,
+                        ..owner.clone()
+                    });
                 previous.push(path);
                 let last = previous.len() - 1;
                 previous.swap(retained, last);
             }
             retained += 1;
         }
-        for path in previous.drain(retained..) {
+        for (path, exclusive) in previous.drain(retained..) {
             if let Some(owners) = self.claims.get_mut(&path) {
-                owners.retain(|claim| claim != &owner);
+                owners.retain(|claim| {
+                    claim
+                        != &ClaimOwner {
+                            exclusive,
+                            ..owner.clone()
+                        }
+                });
             }
             if self.claims.get(&path).is_some_and(Vec::is_empty) {
                 self.claims.remove(&path);
@@ -1141,11 +1181,51 @@ impl PathClaimIndex {
         id: &str,
         candidates: &[PathBuf],
     ) -> anyhow::Result<()> {
+        self.ensure_claims_unclaimed(
+            Some((profile, id)),
+            candidates.iter().map(PathBuf::as_path),
+            false,
+        )
+    }
+
+    pub(crate) fn ensure_pending_unclaimed(
+        &self,
+        profile: usize,
+        id: &str,
+        candidates: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        self.ensure_claims_unclaimed(
+            Some((profile, id)),
+            candidates.iter().map(PathBuf::as_path),
+            true,
+        )
+    }
+
+    pub(crate) fn ensure_pending_writes_unclaimed(
+        &self,
+        candidates: &[&Path],
+    ) -> anyhow::Result<()> {
+        self.ensure_claims_unclaimed(None, candidates.iter().copied(), true)
+    }
+
+    pub(crate) fn ensure_writes_unclaimed(&self, candidates: &[&Path]) -> anyhow::Result<()> {
+        self.ensure_claims_unclaimed(None, candidates.iter().copied(), false)
+    }
+
+    fn ensure_claims_unclaimed<'a>(
+        &self,
+        excluded_owner: Option<(usize, &str)>,
+        candidates: impl IntoIterator<Item = &'a Path>,
+        pending_only: bool,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(self.valid, "path ownership inventory is uncertain");
         let is_peer = |owners: &[ClaimOwner]| {
-            owners
-                .iter()
-                .any(|owner| owner.profile != profile || owner.id.as_ref() != id)
+            owners.iter().any(|owner| {
+                (!pending_only || owner.exclusive)
+                    && excluded_owner.is_none_or(|(profile, id)| {
+                        owner.profile != profile || owner.id.as_ref() != id
+                    })
+            })
         };
         for candidate in candidates {
             let candidate = resolve_claim_path(candidate)
@@ -1232,7 +1312,7 @@ fn with_paths_in_use_locked<R>(
     let locked = crate::session::storage::with_storages_locked(&storages, || {
         let paths_in_use = match crate::session::list_profiles_for_worktree_inventory() {
             Ok(now) if now.iter().all(|profile| profiles.contains(profile)) => {
-                scan_paths_in_use(&storages, &[owner], None)
+                scan_paths_in_use(&storages, &[owner])
             }
             Ok(_) => PathsInUse::Unknown("a profile was created during the deletion".to_string()),
             Err(error) => PathsInUse::Unknown(format!("listing profiles: {error}")),
@@ -1339,7 +1419,7 @@ fn perform_deletion_core(
         request,
         repos,
         lifecycle_locked,
-        &PathsInUse::Known(Vec::new()),
+        &PathsInUse::Known(WorktreePathInventory::default()),
         teardown,
     )
 }
@@ -2717,7 +2797,7 @@ mod tests {
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap();
         assert_eq!(retained.len(), 1);
-        assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
+        assert!(!retained[0].has_active_lifecycle_reservation(Utc::now()));
 
         let mut retry = retained.into_iter().next().unwrap();
         retry.source_profile = profile.to_string();
@@ -2772,6 +2852,62 @@ mod tests {
         assert!(acquired, "on_destroy hook held the lifecycle flock");
         assert_eq!(result.disposition, DeletionDisposition::Removed);
         assert!(storage.load().unwrap().is_empty());
+    }
+    #[test]
+    #[serial]
+    fn purge_rechecks_an_inventory_corrupted_while_hooks_are_unlocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(temp.path());
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let sentinel = checkout.join("keep");
+        std::fs::write(&sentinel, "uncommitted content").unwrap();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        let peer = Storage::new_unwatched("peer").unwrap();
+        peer.update(|_, _| Ok(())).unwrap();
+        let mut instance = Instance::new("never-launched", checkout.to_str().unwrap());
+        instance.source_profile = "owner".into();
+        instance.worktree_info = Some(worktree_info("feature/rescan", temp.path()));
+        let id = instance.id.clone();
+        storage
+            .update(|rows, _| {
+                rows.push(instance);
+                Ok(())
+            })
+            .unwrap();
+        let instance = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        let transaction = match PurgeTransaction::reserve(
+            storage.clone(),
+            DeletionRequest {
+                delete_worktree: true,
+                ..request(instance)
+            },
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction.preflight_ownership().unwrap(),
+            PurgeReservation::Rejected(_) => {
+                panic!("never-launched row was refused before preflight")
+            }
+        };
+        let transaction = transaction.run_hooks_with(|_, _| {
+            std::fs::write(peer.sessions_path(), "not valid JSON").unwrap();
+        });
+        let Err(result) = transaction.begin_irreversible() else {
+            panic!("unreadable peer inventory crossed the row-removal boundary");
+        };
+        assert_eq!(result.disposition, DeletionDisposition::Failed);
+        assert!(!result.teardown_started);
+        assert!(storage.load().unwrap().iter().any(|row| row.id == id));
+        assert_eq!(
+            std::fs::read_to_string(sentinel).unwrap(),
+            "uncommitted content"
+        );
     }
 
     #[test]

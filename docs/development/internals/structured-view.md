@@ -41,6 +41,8 @@ CLI, TUI, and REST checkout moves use the same original-scope Stop and revalidat
 
 One daemon trash-reconciliation invocation reads each physical profile inventory once, sharing its path-claim index across all targets. An uncertain Git effect invalidates that index and ends the invocation instead of acting on the next row. Web deletion keeps the row and route while teardown is pending; it removes only session IDs confirmed by the successful response, so a refused deletion remains retryable.
 
+Filesystem reservations cover the full future workspace and repository path set before effects. Creation publication carries the original opaque `CreationIntent` and the actual canonical write acknowledgement; neither is native execution authority. A replacement profile, changed plan, unreadable peer inventory, or unproven cancellation retains the reservation. See [worktree cleanup](../../guides/worktrees.md#cleanup) for the retention contract.
+
 ## Who owns the state
 
 The daemon folds the event stream once per WebSocket connection into two projections, so clients do not re-derive them:

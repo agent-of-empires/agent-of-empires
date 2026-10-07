@@ -62,7 +62,7 @@ impl HostApiState {
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
-        Storage::new_unwatched(&self.profile)
+        Storage::open_unwatched(&self.profile)
     }
 
     pub fn bump_settings_revision(&self) -> u64 {
@@ -350,7 +350,7 @@ fn session_meta_set(
         .storage()
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     let found = storage
-        .update(|instances, _groups| {
+        .update_metadata(|instances, _groups| {
             let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
                 return Ok(false);
             };
@@ -383,7 +383,7 @@ fn session_meta_cas(
         .storage()
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     let outcome = storage
-        .update(|instances, _groups| {
+        .update_metadata(|instances, _groups| {
             let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
                 return Ok(None);
             };
@@ -863,6 +863,48 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, codes::FORBIDDEN);
+    }
+    #[test]
+    #[serial_test::serial]
+    fn session_rpcs_do_not_recreate_a_removed_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        crate::session::create_profile("remaining").unwrap();
+        let caller = ctx(&[CAP_SESSION_READ, CAP_SESSION_WRITE]);
+        for renamed in [false, true] {
+            let profile = if renamed { "renamed" } else { "deleted" };
+            crate::session::create_profile(profile).unwrap();
+            let host = HostApiState::open(&tmp.path().join(format!("{profile}.db")), profile, 100)
+                .unwrap();
+            assert_eq!(
+                dispatch(&host, &caller, "sessions.list", &json!({})).unwrap(),
+                json!({"sessions": []})
+            );
+            let original = crate::session::get_profile_dir_path(profile).unwrap();
+            if renamed {
+                crate::session::rename_profile(profile, "new-name").unwrap();
+            } else {
+                crate::session::delete_profile(profile).unwrap();
+            }
+            for method in [
+                "sessions.list",
+                "session.meta.get",
+                "session.meta.set",
+                "session.meta.cas",
+            ] {
+                let result = dispatch(
+                    &host,
+                    &caller,
+                    method,
+                    &json!({"session_id": "gone", "key": "k", "value": 1, "expected": null}),
+                );
+                assert!(
+                    !original.try_exists().unwrap(),
+                    "{method} recreated {profile}"
+                );
+                assert!(result.is_err(), "{method} accepted a missing profile");
+            }
+        }
     }
 
     fn ctx_for(plugin_id: &str, caps: &[&str]) -> PluginRpcContext {

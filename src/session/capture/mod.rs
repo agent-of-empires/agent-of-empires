@@ -134,7 +134,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         &live,
         source,
     );
-    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
+    let Ok(storage) = crate::session::storage::Storage::open_unwatched(profile) else {
         return set;
     };
     let Ok(instances) = storage.load() else {

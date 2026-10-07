@@ -1,9 +1,6 @@
-//! Instance creation and cleanup utilities.
+//! Instance creation and canonical filesystem publication.
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::{bail, Result};
 use chrono::Utc;
@@ -87,34 +84,282 @@ pub struct InstanceParams {
     pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
-/// Result of building an instance, tracking what was created for cleanup purposes.
+/// A prepared instance and its original publication custody.
 pub struct BuildResult {
     pub instance: Instance,
-    /// Path to worktree if one was created and managed by aoe
-    pub created_worktree: Option<CreatedWorktree>,
-    /// Workspace worktrees created during build (for cleanup)
-    pub created_workspace_worktrees: Vec<CreatedWorktree>,
     /// Non-fatal warnings from worktree/workspace creation. Callers should
     /// surface these to the user (post-checkout hook failures etc.).
     pub warnings: Vec<String>,
-}
-
-/// A worktree provisioned during instance building and owned by this build.
-pub struct CreatedWorktree {
-    pub path: PathBuf,
-    pub main_repo_path: PathBuf,
-    /// Branch created by this build. `None` when attaching an existing branch.
-    pub owned_branch: Option<String>,
+    /// Original filesystem custody for builds that reserve paths before effects.
+    pub creation_intent: std::sync::Arc<CreationIntent>,
 }
 
 /// Result of creating a multi-repo workspace.
 pub struct WorkspaceResult {
     pub workspace_info: WorkspaceInfo,
-    pub created_worktrees: Vec<CreatedWorktree>,
     pub workspace_path: PathBuf,
     /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
     /// failures where the worktree itself was created successfully).
     pub warnings: Vec<String>,
+    pub(crate) creation_intent: std::sync::Arc<CreationIntent>,
+}
+
+/// Filesystem-only custody issued by a successful canonical write, never native authority.
+pub struct CreationIntent {
+    storage: std::sync::Arc<super::Storage>,
+    acknowledged: Instance,
+    ready_status: super::Status,
+    paths: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for CreationIntent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreationIntent")
+            .field("session_id", &self.acknowledged.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CreationIntent {
+    /// Publish the prepared build through its original physical profile.
+    pub fn publish(&self, prepared: &Instance) -> Result<Instance> {
+        let _workspace = super::acquire_session_workspace_claim_lock()?;
+        let _identity = super::acquire_session_identity_lock()?;
+        publish_prepared_creation_under_workspace_claim_lock(
+            self.storage(),
+            prepared,
+            self,
+            |rows, groups| {
+                if !prepared.group_path.is_empty() {
+                    let mut tree = super::GroupTree::new_with_groups(rows, groups);
+                    tree.create_group(&prepared.group_path);
+                    *groups = tree.get_all_groups();
+                }
+                Ok(())
+            },
+        )
+    }
+    pub(crate) fn reserve(
+        storage: &super::Storage,
+        prepared: &mut Instance,
+    ) -> Result<std::sync::Arc<Self>> {
+        let paths = prepared
+            .durable_worktree_paths()
+            .map(PathBuf::from)
+            .collect();
+        Self::reserve_paths(storage, prepared, paths)
+    }
+
+    pub(crate) fn reserve_metadata(
+        storage: &super::Storage,
+        prepared: &mut Instance,
+    ) -> Result<std::sync::Arc<Self>> {
+        Self::reserve_paths(storage, prepared, Vec::new())
+    }
+
+    fn reserve_paths(
+        storage: &super::Storage,
+        prepared: &mut Instance,
+        paths: Vec<PathBuf>,
+    ) -> Result<std::sync::Arc<Self>> {
+        if let Some(origin) = &prepared.storage_origin {
+            anyhow::ensure!(
+                storage.same_origin_as(origin),
+                "creation changed its physical profile"
+            );
+        } else {
+            prepared.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+        }
+        prepared.source_profile = storage.profile().to_owned();
+        let mut reserved = prepared.clone();
+        let ready_status = prepared.status;
+        reserved.status = super::Status::Creating;
+        reserved.try_acquire_lifecycle_reservation(
+            super::LifecycleOperation::Create,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            Utc::now(),
+        )?;
+        reserved.lifecycle_reservation.as_mut().unwrap().path_claims =
+            super::WorktreePathClaims::Pending(paths.clone());
+        let acknowledged = storage.update(|rows, _groups| {
+            if super::is_duplicate_session(
+                rows.iter(),
+                &reserved.title,
+                &reserved.project_path,
+                None,
+            ) {
+                return Err(super::duplicate_session_error(&reserved.title));
+            }
+            anyhow::ensure!(
+                !rows.iter().any(|row| row.id == reserved.id),
+                "creation identity is already owned"
+            );
+            if !paths.is_empty() {
+                let mut claims = super::deletion::PathClaimIndex::load_for_writer(
+                    std::slice::from_ref(storage),
+                )?;
+                let profile = claims
+                    .take_targets()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("creation profile is absent from claim inventory")
+                    })?
+                    .1;
+                claims.ensure_unclaimed(profile, &reserved.id, &paths)?;
+            }
+            rows.push(reserved.clone());
+            Ok(reserved)
+        })?;
+        prepared.lifecycle_generation = acknowledged.lifecycle_generation;
+        prepared.lifecycle_reservation = acknowledged.lifecycle_reservation.clone();
+        Ok(std::sync::Arc::new(Self {
+            storage: std::sync::Arc::new(storage.clone()),
+            acknowledged,
+            ready_status,
+            paths,
+        }))
+    }
+
+    pub(crate) fn storage(&self) -> &super::Storage {
+        &self.storage
+    }
+    pub(crate) fn session_id(&self) -> &str {
+        &self.acknowledged.id
+    }
+
+    pub(crate) fn validate_row(&self, row: &Instance) -> Result<()> {
+        self.storage.verify_profile_identity()?;
+        anyhow::ensure!(
+            row.id == self.acknowledged.id
+                && row.created_at == self.acknowledged.created_at
+                && row.lifecycle_reservation == self.acknowledged.lifecycle_reservation
+                && self.same_filesystem_plan(row),
+            "creation filesystem custody was superseded"
+        );
+        anyhow::ensure!(row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+            lease.op == super::LifecycleOperation::Create
+                && matches!(&lease.path_claims, super::WorktreePathClaims::Pending(paths) if paths == &self.paths)
+        }), "creation has no acknowledged complete filesystem plan");
+        Ok(())
+    }
+
+    fn same_filesystem_plan(&self, row: &Instance) -> bool {
+        let original = &self.acknowledged;
+        fn worktree(row: &Instance) -> Option<(&str, &str, bool, Option<&str>)> {
+            row.worktree_info.as_ref().map(|info| {
+                (
+                    info.branch.as_str(),
+                    info.main_repo_path.as_str(),
+                    info.managed_by_aoe,
+                    info.base_branch.as_deref(),
+                )
+            })
+        }
+        if row.project_path != original.project_path
+            || row.scratch != original.scratch
+            || worktree(row) != worktree(original)
+        {
+            return false;
+        }
+        match (&row.workspace_info, &original.workspace_info) {
+            (None, None) => true,
+            (Some(current), Some(original)) => {
+                current.workspace_dir == original.workspace_dir
+                    && current.branch == original.branch
+                    && current.cleanup_on_delete == original.cleanup_on_delete
+                    && current
+                        .repos
+                        .iter()
+                        .map(|repo| {
+                            (
+                                &repo.name,
+                                &repo.source_path,
+                                &repo.branch,
+                                &repo.worktree_path,
+                                &repo.main_repo_path,
+                                repo.managed_by_aoe,
+                                repo.branch_preexisting,
+                                &repo.base_branch,
+                            )
+                        })
+                        .eq(original.repos.iter().map(|repo| {
+                            (
+                                &repo.name,
+                                &repo.source_path,
+                                &repo.branch,
+                                &repo.worktree_path,
+                                &repo.main_repo_path,
+                                repo.managed_by_aoe,
+                                repo.branch_preexisting,
+                                &repo.base_branch,
+                            )
+                        }))
+            }
+            _ => false,
+        }
+    }
+
+    fn prepared_row(&self, canonical: &Instance, prepared: &Instance) -> Result<Instance> {
+        self.validate_row(canonical)?;
+        anyhow::ensure!(
+            prepared.id == canonical.id
+                && prepared.created_at == canonical.created_at
+                && self.same_filesystem_plan(prepared),
+            "prepared creation changed its immutable filesystem plan"
+        );
+        anyhow::ensure!(
+            prepared
+                .storage_origin
+                .as_ref()
+                .is_some_and(|origin| self.storage.same_origin_as(origin))
+                && prepared.source_profile == self.storage.profile(),
+            "prepared creation changed its original physical profile"
+        );
+        let mut row = prepared.clone();
+        row.runner_journal = canonical.runner_journal.clone();
+        row.active_execution = canonical.active_execution.clone();
+        row.lifecycle_generation = canonical.lifecycle_generation;
+        row.lifecycle_reservation = canonical.lifecycle_reservation.clone();
+        Ok(row)
+    }
+
+    pub(crate) fn refresh_prepared(&self, prepared: &Instance) -> Result<()> {
+        self.storage.update_metadata(|rows, _groups| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.session_id())
+                .ok_or_else(|| anyhow::anyhow!("creation filesystem owner disappeared"))?;
+            let mut refreshed = self.prepared_row(row, prepared)?;
+            refreshed.status = super::Status::Creating;
+            *row = refreshed;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn publish_under_workspace_claim_lock<F, R>(
+        &self,
+        prepared: &Instance,
+        publish: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<super::Group>, Instance) -> Result<R>,
+    {
+        self.storage
+            .complete_creation_under_workspace_claim_lock(self, |rows, groups| {
+                let canonical = rows
+                    .iter()
+                    .find(|row| row.id == self.session_id())
+                    .ok_or_else(|| anyhow::anyhow!("creation filesystem owner disappeared"))?;
+                let mut committed = self.prepared_row(canonical, prepared)?;
+                committed.lifecycle_reservation = None;
+                if committed.status == super::Status::Creating {
+                    committed.status = self.ready_status;
+                }
+                publish(rows, groups, committed)
+            })
+    }
 }
 
 /// Normalize a base-branch string, treating empty/whitespace as unset.
@@ -230,24 +475,28 @@ pub struct WorkspaceRepoSpec {
 }
 
 /// Create a multi-repo workspace with worktrees for each repository.
-pub fn create_workspace(
+pub(crate) fn create_workspace(
     primary: &WorkspaceRepoSpec,
     extra_repos: &[WorkspaceRepoSpec],
     branch: &str,
     create_new_branch: bool,
     workspace_template: &str,
     init_submodules: bool,
+    prepared: &mut Instance,
 ) -> Result<WorkspaceResult> {
+    let storage = prepared.original_storage()?;
     let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let session_id_short = &session_id[..8];
+    let session_id_short = &prepared.id[..8];
 
     let workspace_path =
         primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
+    anyhow::ensure!(
+        !workspace_path.try_exists()?,
+        "workspace destination already exists"
+    );
     let workspace_dir = workspace_path.to_string_lossy().to_string();
-    std::fs::create_dir_all(&workspace_path)?;
 
     // (canonicalized path, resolved base branch) for the primary repo followed by every extra repo.
     let all_repos: Vec<(PathBuf, Option<String>)> =
@@ -268,7 +517,6 @@ pub fn create_workspace(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
         if !seen_names.insert(name.clone()) {
-            let _ = std::fs::remove_dir_all(&workspace_path);
             bail!(
                 "Duplicate repository name '{}' in workspace\n\
                  Tip: Rename one of the directories to avoid the collision",
@@ -277,16 +525,7 @@ pub fn create_workspace(
         }
     }
 
-    let cleanup = |created: &[CreatedWorktree], ws_path: &std::path::Path| {
-        let protection = CleanupProtection::default();
-        for worktree in created {
-            cleanup_created_worktree(worktree, "workspace worktree", &protection);
-        }
-        let _ = std::fs::remove_dir_all(ws_path);
-    };
-
-    // Pre-validate every repo and resolve metadata sequentially. This is cheap
-    // (no network) and lets us fail fast before kicking off any worktree work.
+    // Resolve every repository before reserving or mutating a path.
     struct RepoPlan {
         repo_path: PathBuf,
         repo_name: String,
@@ -297,7 +536,6 @@ pub fn create_workspace(
     let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
     for (repo_path, base_branch) in &all_repos {
         if !GitWorktree::is_git_repo(repo_path) {
-            cleanup(&[], &workspace_path);
             bail!(
                 "Path is not in a git repository: {}\n\
                  Tip: All --repo paths must be git repositories",
@@ -325,6 +563,32 @@ pub fn create_workspace(
             base_branch: base_branch.clone(),
         });
     }
+    let workspace_info = WorkspaceInfo {
+        branch: branch.to_string(),
+        workspace_dir,
+        created_at: Utc::now(),
+        cleanup_on_delete: true,
+        repos: plans
+            .iter()
+            .map(|plan| WorkspaceRepo {
+                name: plan.repo_name.clone(),
+                source_path: plan.repo_path.to_string_lossy().into_owned(),
+                branch: branch.to_string(),
+                worktree_path: plan.worktree_subdir.to_string_lossy().into_owned(),
+                main_repo_path: plan.main_repo_path.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: create_new_branch
+                    .then(|| plan.base_branch.clone())
+                    .flatten(),
+                base_branch_override: None,
+            })
+            .collect(),
+    };
+    prepared.project_path = workspace_path.to_string_lossy().into_owned();
+    prepared.workspace_info = Some(workspace_info.clone());
+    let creation_intent = CreationIntent::reserve(&storage, prepared)?;
+    std::fs::create_dir_all(&workspace_path)?;
 
     // Run create_worktree for every repo concurrently.
     let create_start = std::time::Instant::now();
@@ -379,42 +643,18 @@ pub fn create_workspace(
 
     let mut warnings: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    let mut created_worktrees: Vec<CreatedWorktree> = Vec::new();
-    let mut repos: Vec<WorkspaceRepo> = Vec::with_capacity(plans.len());
 
-    for (plan, result) in plans.iter().zip(parallel_results) {
+    for result in parallel_results {
         match result {
             Ok(w) => {
                 warnings.extend(w);
-                created_worktrees.push(CreatedWorktree {
-                    path: plan.worktree_subdir.clone(),
-                    main_repo_path: plan.main_repo_path.clone(),
-                    owned_branch: create_new_branch.then(|| branch.to_string()),
-                });
-                repos.push(WorkspaceRepo {
-                    name: plan.repo_name.clone(),
-                    source_path: plan.repo_path.to_string_lossy().to_string(),
-                    branch: branch.to_string(),
-                    worktree_path: plan.worktree_subdir.to_string_lossy().to_string(),
-                    main_repo_path: plan.main_repo_path.to_string_lossy().to_string(),
-                    managed_by_aoe: true,
-                    // The builder always creates the branch it names, so branch and worktree
-                    // ownership coincide for a repo present at creation.
-                    branch_preexisting: false,
-                    // The ref this repo's branch was forked from, so the diff view can default to
-                    // it per repo.
-                    base_branch: create_new_branch
-                        .then(|| plan.base_branch.clone())
-                        .flatten(),
-                    base_branch_override: None,
-                });
             }
             Err(msg) => errors.push(msg),
         }
     }
 
     if !errors.is_empty() {
-        cleanup(&created_worktrees, &workspace_path);
+        tracing::warn!(target: "session.create", session = %prepared.id, "Retaining durable creation intent after an uncertain Git outcome");
         if errors.len() == 1 {
             bail!("Failed to create worktree for {}", errors.remove(0));
         } else {
@@ -427,16 +667,10 @@ pub fn create_workspace(
     }
 
     Ok(WorkspaceResult {
-        workspace_info: WorkspaceInfo {
-            branch: branch.to_string(),
-            workspace_dir,
-            repos,
-            created_at: Utc::now(),
-            cleanup_on_delete: true,
-        },
-        created_worktrees,
+        workspace_info,
         workspace_path,
         warnings,
+        creation_intent,
     })
 }
 
@@ -447,9 +681,24 @@ pub fn build_instance(
     existing_branches: &[&str],
     storage: &super::Storage,
 ) -> Result<BuildResult> {
+    build_instance_from_admitted(
+        params,
+        existing_titles,
+        existing_branches,
+        Instance::new("", ""),
+        storage,
+    )
+}
+
+pub(crate) fn build_instance_from_admitted(
+    params: InstanceParams,
+    existing_titles: &[&str],
+    existing_branches: &[&str],
+    mut instance: Instance,
+    storage: &super::Storage,
+) -> Result<BuildResult> {
     storage.verify_profile_identity()?;
     let profile = storage.profile();
-    let mut instance = Instance::new("", "");
     instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
     instance.source_profile = profile.to_owned();
 
@@ -510,10 +759,9 @@ pub fn build_instance(
     };
 
     let mut worktree_info = None;
-    let mut created_worktree = None;
     let mut workspace_info = None;
-    let mut created_workspace_worktrees: Vec<CreatedWorktree> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut creation_intent = None;
     let taken_branches = collect_taken_branches_for_derived_dedupe(
         existing_branches,
         &params.path,
@@ -547,186 +795,8 @@ pub fn build_instance(
         }
     };
 
-    if let Some(branch) = &effective_worktree_branch {
-        if !params.extra_repo_paths.is_empty() {
-            let primary_path = PathBuf::from(&params.path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&params.path));
-
-            let session_base = params.base_branch.as_deref();
-            let global_default = config.worktree.default_base_branch.as_deref();
-            let project_bases = project_base_branches(profile);
-
-            // An explicit per-repo base outranks every shared layer, which is the point: one repo
-            // forks from develop while the others fork from their own epic branches.
-            let mut all_paths = vec![primary_path.clone()];
-            all_paths.extend(params.extra_repo_paths.iter().map(PathBuf::from));
-            let per_repo = resolve_repo_base_selectors(&all_paths, &params.repo_base_branches)?;
-            let base_for = |path: &PathBuf| {
-                per_repo.get(path).cloned().or_else(|| {
-                    // Every repo, including the launch repo, otherwise forks from its own
-                    // registered per-project default when no explicit session base is given.
-                    resolve_repo_base_branch(path, session_base, &project_bases, global_default)
-                })
-            };
-
-            let primary = WorkspaceRepoSpec {
-                base_branch: base_for(&primary_path),
-                path: primary_path,
-            };
-            let extra_repos: Vec<WorkspaceRepoSpec> = params
-                .extra_repo_paths
-                .iter()
-                .map(|p| {
-                    let path = PathBuf::from(p);
-                    WorkspaceRepoSpec {
-                        base_branch: base_for(&path),
-                        path,
-                    }
-                })
-                .collect();
-
-            let ws_result = create_workspace(
-                &primary,
-                &extra_repos,
-                branch,
-                params.create_new_branch,
-                &config.worktree.workspace_path_template,
-                config.worktree.init_submodules,
-            )?;
-
-            final_path = ws_result.workspace_path.to_string_lossy().to_string();
-            workspace_info = Some(ws_result.workspace_info);
-            created_workspace_worktrees = ws_result.created_worktrees;
-            warnings.extend(ws_result.warnings);
-        } else {
-            // Single worktree mode (existing logic)
-            let path = PathBuf::from(&params.path);
-            if !GitWorktree::is_git_repo(&path) {
-                // Typed error (not a bare `bail!` string) so the web handler's whitelist forwards
-                // an actionable message instead of the opaque "Failed to create session".
-                return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
-                    "Worktree mode requires a git repository, but this path is not one: {}\n\
-                     Tip: start an in-place session (no worktree) here, or point at a git repository.",
-                    path.display()
-                )));
-            }
-            let main_repo_path_raw = GitWorktree::find_main_repo(&path)?;
-            let main_repo_path = main_repo_path_raw
-                .canonicalize()
-                .unwrap_or(main_repo_path_raw);
-            let git_wt = GitWorktree::new(main_repo_path.clone())?
-                .with_init_submodules(config.worktree.init_submodules);
-
-            // Choose appropriate template based on repo type (bare vs regular)
-            // Use main_repo_path (not path) to correctly detect bare repos when running from a worktree
-            let is_bare = GitWorktree::is_bare_repo(&main_repo_path);
-            let template = if is_bare {
-                &config.worktree.bare_repo_path_template
-            } else {
-                &config.worktree.path_template
-            };
-
-            if !params.create_new_branch {
-                let existing_worktrees = git_wt.list_worktrees()?;
-                if let Some(existing) = existing_worktrees
-                    .iter()
-                    .find(|wt| wt.branch.as_deref() == Some(branch))
-                {
-                    final_path = existing.path.to_string_lossy().to_string();
-                    worktree_info = Some(WorktreeInfo {
-                        branch: branch.clone(),
-                        main_repo_path: main_repo_path.to_string_lossy().to_string(),
-                        managed_by_aoe: false,
-                        created_at: Utc::now(),
-                        base_branch: None,
-                    });
-                } else {
-                    let session_id = uuid::Uuid::new_v4().to_string();
-                    let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
-
-                    let w = git_wt.create_worktree(branch, &worktree_path, false, None)?;
-                    warnings.extend(w);
-
-                    final_path = worktree_path.to_string_lossy().to_string();
-                    created_worktree = Some(CreatedWorktree {
-                        path: worktree_path,
-                        main_repo_path: main_repo_path.clone(),
-                        owned_branch: None,
-                    });
-                    worktree_info = Some(WorktreeInfo {
-                        branch: branch.clone(),
-                        main_repo_path: main_repo_path.to_string_lossy().to_string(),
-                        managed_by_aoe: true,
-                        created_at: Utc::now(),
-                        base_branch: None,
-                    });
-                }
-            } else {
-                let session_id = uuid::Uuid::new_v4().to_string();
-                let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
-
-                if worktree_path.exists() {
-                    return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
-                }
-
-                // One repo, so a per-repo base can only name this one.
-                let per_repo = resolve_repo_base_selectors(
-                    std::slice::from_ref(&main_repo_path),
-                    &params.repo_base_branches,
-                )?;
-                // The launch repo otherwise forks from its registered per-project default when no
-                // explicit session base is given (then global/profile, then auto-detect).
-                let project_bases = project_base_branches(profile);
-                let base = per_repo.get(&main_repo_path).cloned().or_else(|| {
-                    resolve_repo_base_branch(
-                        &main_repo_path,
-                        params.base_branch.as_deref(),
-                        &project_bases,
-                        config.worktree.default_base_branch.as_deref(),
-                    )
-                });
-
-                let w = git_wt.create_worktree(branch, &worktree_path, true, base.as_deref())?;
-                warnings.extend(w);
-
-                final_path = worktree_path.to_string_lossy().to_string();
-                created_worktree = Some(CreatedWorktree {
-                    path: worktree_path,
-                    main_repo_path: main_repo_path.clone(),
-                    owned_branch: Some(branch.clone()),
-                });
-                worktree_info = Some(WorktreeInfo {
-                    branch: branch.clone(),
-                    main_repo_path: main_repo_path.to_string_lossy().to_string(),
-                    managed_by_aoe: true,
-                    created_at: Utc::now(),
-                    base_branch: base,
-                });
-            }
-        }
-    }
-
-    // For scratch sessions, `final_path` is intentionally empty here; the scratch directory is
-    // provisioned below using the instance id allocated at admission.
-    if !params.scratch {
-        let final_path_buf = PathBuf::from(&final_path);
-        if !final_path_buf.exists() {
-            bail!("Project path does not exist: {}", final_path);
-        }
-        if !final_path_buf.is_dir() {
-            bail!("Project path is not a directory: {}", final_path);
-        }
-    }
-
     instance.title = final_title;
-    instance.project_path = final_path;
     instance.first_launch_names_agent = params.title_typed;
-    if params.scratch {
-        let dir = super::scratch::provision_scratch_dir(&instance.id)?;
-        instance.project_path = dir.to_string_lossy().to_string();
-        instance.scratch = true;
-    }
     instance.group_path = params.group;
     instance.tool = params.tool.clone();
     instance.detect_as = config
@@ -742,12 +812,8 @@ pub fn build_instance(
     if let Some(notice) =
         crate::agents::get_agent(&params.tool).and_then(crate::agents::AgentDef::lifecycle_notice)
     {
-        // Non-blocking: deprecated agents still launch; every support path
-        // is unchanged. The warning only informs.
         tracing::warn!(target: "session.builder", "agent '{}' is {notice}", params.tool);
     }
-    instance.worktree_info = worktree_info;
-    instance.workspace_info = workspace_info;
     apply_agent_launch_config(
         &mut instance,
         &config.session,
@@ -795,10 +861,7 @@ pub fn build_instance(
                 child_session_id,
                 unattributed_parent_agent,
             } => {
-                // Only an unattributed parent needs this: the launch
-                // identity-checks a qualified one itself. The parent's
-                // capability came from its own row's agent, so the child must
-                // actually launch that same agent.
+                // Unattributed forks must still launch the parent's agent.
                 if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
                     let launched = Instance::execution_agent_for(
                         &instance.tool,
@@ -821,119 +884,249 @@ pub fn build_instance(
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
             } => {
-                // Structured fork: force the structured view, seed the parent for the ACP
-                // session/fork handshake, and replay history into the (empty) event store on first
-                // connect.
+                // Seed the structured fork handshake before first connect.
                 instance.view = crate::session::View::Structured;
                 instance.fork_pending = Some(parent_acp_session_id);
                 instance.import_pending = Some(true);
             }
         }
     }
+    if let Some(branch) = &effective_worktree_branch {
+        if !params.extra_repo_paths.is_empty() {
+            let primary_path = PathBuf::from(&params.path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&params.path));
+
+            let session_base = params.base_branch.as_deref();
+            let global_default = config.worktree.default_base_branch.as_deref();
+            let project_bases = project_base_branches(profile);
+
+            // An explicit per-repo base outranks every shared layer, which is the point: one repo
+            // forks from develop while the others fork from their own epic branches.
+            let mut all_paths = vec![primary_path.clone()];
+            all_paths.extend(params.extra_repo_paths.iter().map(PathBuf::from));
+            let per_repo = resolve_repo_base_selectors(&all_paths, &params.repo_base_branches)?;
+            let base_for = |path: &PathBuf| {
+                per_repo.get(path).cloned().or_else(|| {
+                    // Every repo, including the launch repo, otherwise forks from its own
+                    // registered per-project default when no explicit session base is given.
+                    resolve_repo_base_branch(path, session_base, &project_bases, global_default)
+                })
+            };
+
+            let primary = WorkspaceRepoSpec {
+                base_branch: base_for(&primary_path),
+                path: primary_path,
+            };
+            let extra_repos: Vec<WorkspaceRepoSpec> = params
+                .extra_repo_paths
+                .iter()
+                .map(|p| {
+                    let path = PathBuf::from(p);
+                    WorkspaceRepoSpec {
+                        base_branch: base_for(&path),
+                        path,
+                    }
+                })
+                .collect();
+
+            let ws_result = create_workspace(
+                &primary,
+                &extra_repos,
+                branch,
+                params.create_new_branch,
+                &config.worktree.workspace_path_template,
+                config.worktree.init_submodules,
+                &mut instance,
+            )?;
+
+            final_path = ws_result.workspace_path.to_string_lossy().to_string();
+            workspace_info = Some(ws_result.workspace_info);
+            creation_intent = Some(ws_result.creation_intent);
+            warnings.extend(ws_result.warnings);
+        } else {
+            // Single worktree mode (existing logic)
+            let path = PathBuf::from(&params.path);
+            if !GitWorktree::is_git_repo(&path) {
+                // Typed error (not a bare `bail!` string) so the web handler's whitelist forwards
+                // an actionable message instead of the opaque "Failed to create session".
+                return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
+                    "Worktree mode requires a git repository, but this path is not one: {}\n\
+                     Tip: start an in-place session (no worktree) here, or point at a git repository.",
+                    path.display()
+                )));
+            }
+            let main_repo_path_raw = GitWorktree::find_main_repo(&path)?;
+            let main_repo_path = main_repo_path_raw
+                .canonicalize()
+                .unwrap_or(main_repo_path_raw);
+            let git_wt = GitWorktree::new(main_repo_path.clone())?
+                .with_init_submodules(config.worktree.init_submodules);
+
+            // Choose appropriate template based on repo type (bare vs regular)
+            // Use main_repo_path (not path) to correctly detect bare repos when running from a worktree
+            let is_bare = GitWorktree::is_bare_repo(&main_repo_path);
+            let template = if is_bare {
+                &config.worktree.bare_repo_path_template
+            } else {
+                &config.worktree.path_template
+            };
+
+            if !params.create_new_branch {
+                let existing_worktrees = git_wt.list_worktrees()?;
+                if let Some(existing) = existing_worktrees
+                    .iter()
+                    .find(|wt| wt.branch.as_deref() == Some(branch))
+                {
+                    final_path = existing.path.to_string_lossy().to_string();
+                    worktree_info = Some(WorktreeInfo {
+                        branch: branch.clone(),
+                        main_repo_path: main_repo_path.to_string_lossy().to_string(),
+                        managed_by_aoe: false,
+                        created_at: Utc::now(),
+                        base_branch: None,
+                    });
+                } else {
+                    let worktree_path = git_wt.compute_path(branch, template, &instance.id[..8])?;
+                    anyhow::ensure!(
+                        !worktree_path.try_exists()?,
+                        "worktree destination already exists"
+                    );
+                    final_path = worktree_path.to_string_lossy().into_owned();
+                    worktree_info = Some(WorktreeInfo {
+                        branch: branch.clone(),
+                        main_repo_path: main_repo_path.to_string_lossy().into_owned(),
+                        managed_by_aoe: true,
+                        created_at: Utc::now(),
+                        base_branch: None,
+                    });
+                    instance.project_path.clone_from(&final_path);
+                    instance.worktree_info.clone_from(&worktree_info);
+                    creation_intent = Some(CreationIntent::reserve(storage, &mut instance)?);
+                    let w = git_wt.create_worktree(branch, &worktree_path, false, None)?;
+                    warnings.extend(w);
+                }
+            } else {
+                let worktree_path = git_wt.compute_path(branch, template, &instance.id[..8])?;
+
+                if worktree_path.exists() {
+                    return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
+                }
+
+                // One repo, so a per-repo base can only name this one.
+                let per_repo = resolve_repo_base_selectors(
+                    std::slice::from_ref(&main_repo_path),
+                    &params.repo_base_branches,
+                )?;
+                // The launch repo otherwise forks from its registered per-project default when no
+                // explicit session base is given (then global/profile, then auto-detect).
+                let project_bases = project_base_branches(profile);
+                let base = per_repo.get(&main_repo_path).cloned().or_else(|| {
+                    resolve_repo_base_branch(
+                        &main_repo_path,
+                        params.base_branch.as_deref(),
+                        &project_bases,
+                        config.worktree.default_base_branch.as_deref(),
+                    )
+                });
+
+                final_path = worktree_path.to_string_lossy().into_owned();
+                worktree_info = Some(WorktreeInfo {
+                    branch: branch.clone(),
+                    main_repo_path: main_repo_path.to_string_lossy().into_owned(),
+                    managed_by_aoe: true,
+                    created_at: Utc::now(),
+                    base_branch: base,
+                });
+                instance.project_path.clone_from(&final_path);
+                instance.worktree_info.clone_from(&worktree_info);
+                creation_intent = Some(CreationIntent::reserve(storage, &mut instance)?);
+                let w = git_wt.create_worktree(
+                    branch,
+                    &worktree_path,
+                    true,
+                    worktree_info
+                        .as_ref()
+                        .and_then(|info| info.base_branch.as_deref()),
+                )?;
+                warnings.extend(w);
+            }
+        }
+    }
+
+    // For scratch sessions, `final_path` is intentionally empty here; the scratch directory is
+    // provisioned below using the instance id allocated at admission.
+    if !params.scratch {
+        let final_path_buf = PathBuf::from(&final_path);
+        if !final_path_buf.exists() {
+            bail!("Project path does not exist: {}", final_path);
+        }
+        if !final_path_buf.is_dir() {
+            bail!("Project path is not a directory: {}", final_path);
+        }
+    }
+
+    instance.project_path = final_path;
+    if params.scratch {
+        instance.project_path = super::scratch::planned_scratch_path(&instance.id)?
+            .to_string_lossy()
+            .into_owned();
+        instance.scratch = true;
+        creation_intent = Some(CreationIntent::reserve(storage, &mut instance)?);
+        super::scratch::provision_scratch_dir(&instance.id)?;
+    }
+    instance.worktree_info = worktree_info;
+    instance.workspace_info = workspace_info;
+    let creation_intent = match creation_intent {
+        Some(intent) => intent,
+        None => CreationIntent::reserve_metadata(storage, &mut instance)?,
+    };
+    creation_intent.refresh_prepared(&instance)?;
 
     Ok(BuildResult {
         instance,
-        created_worktree,
-        created_workspace_worktrees,
         warnings,
+        creation_intent,
     })
 }
 
-#[derive(Default)]
-struct CleanupProtection<'a> {
-    owner: Option<&'a Instance>,
+/// Complete the original filesystem intent and return the actual metadata publication.
+pub(crate) fn publish_prepared_creation_under_workspace_claim_lock<F>(
+    storage: &super::Storage,
+    prepared: &Instance,
+    intent: &CreationIntent,
+    update_groups: F,
+) -> Result<Instance>
+where
+    F: FnOnce(&mut Vec<Instance>, &mut Vec<super::Group>) -> Result<()>,
+{
+    anyhow::ensure!(
+        storage.same_origin_as(intent.storage()),
+        "creation changed its physical owner"
+    );
+    intent.publish_under_workspace_claim_lock(prepared, |rows, groups, committed| {
+        if super::is_duplicate_session(
+            rows.iter(),
+            &committed.title,
+            &committed.project_path,
+            Some(&committed.id),
+        ) {
+            return Err(super::duplicate_session_error(&committed.title));
+        }
+        let slot = rows
+            .iter_mut()
+            .find(|row| row.id == committed.id)
+            .ok_or_else(|| anyhow::anyhow!("original creation row disappeared"))?;
+        *slot = committed;
+        update_groups(rows, groups)?;
+        rows.iter()
+            .find(|row| row.id == prepared.id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("publication removed its original creation row"))
+    })
 }
 
-impl CleanupProtection<'_> {
-    fn paths_equal(left: &Path, right: &Path) -> bool {
-        left == right
-            || left
-                .canonicalize()
-                .ok()
-                .zip(right.canonicalize().ok())
-                .is_some_and(|(left, right)| left == right)
-    }
-
-    /// Exact matches protect a winner-owned worktree; containment protects a
-    /// winner path nested under a workspace root from recursive root cleanup.
-    fn path_references_target(reference: &Path, target: &Path) -> bool {
-        if reference == target || reference.starts_with(target) {
-            return true;
-        }
-        reference
-            .canonicalize()
-            .ok()
-            .zip(target.canonicalize().ok())
-            .is_some_and(|(reference, target)| reference == target || reference.starts_with(target))
-    }
-
-    fn references_path(&self, target: &Path) -> bool {
-        let Some(owner) = self.owner else {
-            return false;
-        };
-        if Self::path_references_target(Path::new(&owner.project_path), target) {
-            return true;
-        }
-        owner.workspace_info.as_ref().is_some_and(|workspace| {
-            Self::path_references_target(Path::new(&workspace.workspace_dir), target)
-                || workspace.repos.iter().any(|repo| {
-                    Self::path_references_target(Path::new(&repo.worktree_path), target)
-                })
-        })
-    }
-
-    fn references_branch(&self, main_repo_path: &Path, branch: &str) -> bool {
-        let Some(owner) = self.owner else {
-            return false;
-        };
-        owner.worktree_info.as_ref().is_some_and(|worktree| {
-            Self::paths_equal(Path::new(&worktree.main_repo_path), main_repo_path)
-                && worktree.branch == branch
-        }) || owner.workspace_info.as_ref().is_some_and(|workspace| {
-            workspace.repos.iter().any(|repo| {
-                Self::paths_equal(Path::new(&repo.main_repo_path), main_repo_path)
-                    && repo.branch == branch
-            })
-        })
-    }
-}
-
-/// Remove a worktree and then its build-owned branch. The branch stays intact
-/// when worktree removal fails because Git still considers it checked out.
-fn cleanup_created_worktree(
-    created: &CreatedWorktree,
-    label: &str,
-    protection: &CleanupProtection<'_>,
-) {
-    if protection.references_path(&created.path) {
-        tracing::debug!(
-            target: "session.create",
-            path = %created.path.display(),
-            "Preserving {label} referenced by the persisted uniqueness winner"
-        );
-        return;
-    }
-    let Ok(worktree) = GitWorktree::new(created.main_repo_path.clone()) else {
-        return;
-    };
-    if let Err(error) = worktree.remove_worktree(&created.path, false) {
-        tracing::warn!(target: "session.create", "Failed to clean up {label}: {error}");
-        return;
-    }
-    if let Some(branch) = created
-        .owned_branch
-        .as_deref()
-        .filter(|branch| !protection.references_branch(&created.main_repo_path, branch))
-    {
-        if let Err(error) = worktree.delete_branch(branch) {
-            tracing::warn!(target: "session.create", branch, "Failed to clean up branch: {error}");
-        }
-    }
-}
-
-/// Proof that the workspace-claim and identity flocks are held, so the
-/// ownership snapshot taken by [`cleanup_instance_under_locks`] cannot race a
-/// peer's claim.
+/// Hold the workspace and identity fences through creation publication.
 pub(crate) struct CleanupOwnershipLocks {
     _workspace_claim: crate::session::StorageFlock,
     _identity: crate::session::StorageFlock,
@@ -951,8 +1144,7 @@ impl CleanupOwnershipLocks {
             _identity: identity,
         })
     }
-    /// Adopt flocks the caller already holds for its own persistence step, so
-    /// a create path that took them can still clean up without self-deadlock.
+    /// Reuse the publisher's workspace and identity fences.
     pub(crate) fn from_held(
         workspace_claim: crate::session::StorageFlock,
         identity: crate::session::StorageFlock,
@@ -960,148 +1152,6 @@ impl CleanupOwnershipLocks {
         Self {
             _workspace_claim: workspace_claim,
             _identity: identity,
-        }
-    }
-}
-
-/// Clean up resources created during a failed or cancelled instance build,
-/// taking the ownership locks for the whole snapshot-then-delete window.
-///
-/// Fails closed: a lock that cannot be acquired leaves every resource in
-/// place rather than deleting a path a peer may have claimed in the meantime.
-pub(crate) fn cleanup_instance_locked(
-    instance: &Instance,
-    created_worktree: Option<&CreatedWorktree>,
-    created_workspace_worktrees: &[CreatedWorktree],
-    protected_owner: Option<&Instance>,
-) {
-    let locks = match CleanupOwnershipLocks::acquire() {
-        Ok(locks) => locks,
-        Err(error) => {
-            tracing::warn!(
-                target: "session.create",
-                session_id = %instance.id,
-                "Keeping failed-create resources: could not acquire the ownership locks for cleanup: {error}"
-            );
-            return;
-        }
-    };
-    cleanup_instance_under_locks(
-        instance,
-        created_worktree,
-        created_workspace_worktrees,
-        protected_owner,
-        &locks,
-    );
-}
-
-/// Clean up a failed create for a caller that already holds the workspace-claim
-/// and identity flocks. Re-acquiring them here would self-deadlock.
-pub(crate) fn cleanup_instance_under_locks(
-    instance: &Instance,
-    created_worktree: Option<&CreatedWorktree>,
-    created_workspace_worktrees: &[CreatedWorktree],
-    protected_owner: Option<&Instance>,
-    _locks: &CleanupOwnershipLocks,
-) {
-    cleanup_instance_core(
-        instance,
-        created_worktree,
-        created_workspace_worktrees,
-        protected_owner,
-    );
-}
-
-/// Clean up resources created during a failed or cancelled instance build
-/// without taking the ownership flocks.
-///
-/// Only correct for callers that already hold the workspace-claim and session
-/// identity flocks; everyone else must use `cleanup_instance_locked`, whose
-/// snapshot and deletion run under the same lock window.
-pub fn cleanup_instance(
-    instance: &Instance,
-    created_worktree: Option<&CreatedWorktree>,
-    created_workspace_worktrees: &[CreatedWorktree],
-    protected_owner: Option<&Instance>,
-) {
-    cleanup_instance_core(
-        instance,
-        created_worktree,
-        created_workspace_worktrees,
-        protected_owner,
-    );
-}
-
-fn cleanup_instance_core(
-    instance: &Instance,
-    created_worktree: Option<&CreatedWorktree>,
-    created_workspace_worktrees: &[CreatedWorktree],
-    protected_owner: Option<&Instance>,
-) {
-    let origin = instance.original_storage().and_then(|storage| {
-        storage.verify_profile_identity()?;
-        Ok(storage)
-    });
-    if let Err(error) = origin {
-        tracing::warn!(target: "session.create", id = %instance.id, %error, "Retaining failed creation resources: original profile authority is unavailable");
-        return;
-    }
-
-    // After our own row is removed, every remaining row (including the same id) is a peer.
-    // Check both logical ownership and paths before touching any id-keyed resource.
-    let paths = crate::session::deletion::paths_in_use_after_failed_create(&instance.id);
-    if let crate::session::deletion::PathsInUse::Unknown(reason) = &paths {
-        tracing::warn!(target: "session.create", id = %instance.id, %reason, "Retaining failed creation resources: ownership is unproven");
-        return;
-    }
-    if paths.covers(std::path::Path::new(&instance.project_path))
-        || instance.workspace_info.as_ref().is_some_and(|workspace| {
-            paths.covers(std::path::Path::new(&workspace.workspace_dir))
-                || workspace
-                    .repos
-                    .iter()
-                    .any(|repo| paths.covers(std::path::Path::new(&repo.worktree_path)))
-        })
-    {
-        return;
-    }
-
-    instance.kill_all_tmux_sessions_without_lifecycle_row();
-    if let Some(sandbox) = &instance.sandbox_info {
-        if sandbox.enabled {
-            let container = containers::DockerContainer::from_session_id(&instance.id);
-            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
-                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
-            }
-        }
-    }
-    let protection = CleanupProtection {
-        owner: protected_owner,
-    };
-
-    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's
-    // other cleanup targets exist), so an abort between provisioning and the caller finishing the
-    // session would otherwise leak the directory on disk.
-    if instance.scratch {
-        let scratch_path = PathBuf::from(&instance.project_path);
-        if !protection.references_path(&scratch_path)
-            && super::scratch::is_scratch_path(&scratch_path)
-        {
-            if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
-                tracing::warn!(target: "session.create", "Failed to clean up scratch dir: {}", e);
-            }
-        }
-    }
-    if let Some(worktree) = created_worktree {
-        cleanup_created_worktree(worktree, "worktree", &protection);
-    }
-    for worktree in created_workspace_worktrees {
-        cleanup_created_worktree(worktree, "workspace worktree", &protection);
-    }
-    if let Some(workspace) = &instance.workspace_info {
-        let workspace_dir = Path::new(&workspace.workspace_dir);
-        if !protection.references_path(workspace_dir) {
-            let _ = std::fs::remove_dir_all(workspace_dir);
         }
     }
 }
@@ -1663,7 +1713,86 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn a_creation_intent_blocks_peer_paths_until_its_original_publication() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = super::super::Storage::new_unwatched("default").unwrap();
+        let peer = super::super::Storage::new_unwatched("peer").unwrap();
+        std::fs::write(peer.sessions_path(), b"[]").unwrap();
+        let future = home.path().join("future/worktree");
+        let mut prepared = Instance::new("owned creation", future.to_str().unwrap());
+        let intent = CreationIntent::reserve(&storage, &mut prepared).unwrap();
+        assert!(!future.exists());
+        let mut changed_plan = prepared.clone();
+        changed_plan.project_path = home.path().join("another").to_string_lossy().into_owned();
+        assert!(intent.publish(&changed_plan).is_err());
+        assert!(storage
+            .update(|rows, _| {
+                rows[0].lifecycle_reservation = None;
+                Ok(())
+            })
+            .is_err());
+        let mut changed_origin = prepared.clone();
+        changed_origin.storage_origin = Some(std::sync::Arc::new(peer.clone()));
+        assert!(intent.publish(&changed_origin).is_err());
+        let intruder = Instance::new(
+            "overlapping peer",
+            future.parent().unwrap().to_str().unwrap(),
+        );
+        assert!(peer
+            .update(|rows, _| {
+                rows.push(intruder.clone());
+                Ok(())
+            })
+            .is_err());
+        assert!(peer.load().unwrap().is_empty());
+        assert!(storage.load().unwrap()[0].has_pending_worktree_path_claims());
+        {
+            let _workspace = super::super::acquire_session_workspace_claim_lock().unwrap();
+            let claims = super::super::deletion::PathClaimIndex::load_for_writer(
+                std::slice::from_ref(&peer),
+            )
+            .unwrap();
+            assert!(claims.ensure_writes_unclaimed(&[future.as_path()]).is_err());
+            assert!(claims
+                .ensure_pending_writes_unclaimed(&[future.parent().unwrap()])
+                .is_err());
+            assert!(claims
+                .ensure_pending_writes_unclaimed(&[future.join("child").as_path()])
+                .is_err());
+            assert!(claims
+                .ensure_writes_unclaimed(&[home.path().join("unrelated").as_path()])
+                .is_ok());
+        }
+        std::fs::create_dir_all(&future).unwrap();
+        let peer_bytes = std::fs::read(peer.sessions_path()).unwrap();
+        std::fs::write(peer.sessions_path(), b"broken ownership inventory").unwrap();
+        assert!(intent.publish(&prepared).is_err());
+        assert!(storage.load().unwrap()[0].has_pending_worktree_path_claims());
+        std::fs::write(peer.sessions_path(), peer_bytes).unwrap();
+        let committed = intent.publish(&prepared).unwrap();
+        assert!(committed.lifecycle_reservation.is_none());
+        let canonical = storage.load().unwrap().pop().unwrap();
+        assert_eq!(canonical.project_path, future.to_str().unwrap());
+        assert!(canonical.lifecycle_reservation.is_none());
+        peer.update(|rows, _| {
+            rows.push(intruder);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            peer.load().unwrap()[0].project_path,
+            future.parent().unwrap().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_create_workspace_reports_all_concurrent_failures() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = super::super::Storage::new_unwatched("default").unwrap();
         let parent_a = init_repo_with_commit("repo-a-fail");
         let parent_b = init_repo_with_commit("repo-b-fail");
         let repo_a = parent_a.path().join("repo-a-fail");
@@ -1674,6 +1803,8 @@ mod tests {
             .join("{branch}")
             .to_string_lossy()
             .into_owned();
+        let mut prepared = Instance::new("failed workspace", repo_a.to_str().unwrap());
+        prepared.storage_origin = Some(std::sync::Arc::new(storage.clone()));
 
         let result = create_workspace(
             &WorkspaceRepoSpec {
@@ -1688,6 +1819,7 @@ mod tests {
             false,
             &template,
             true,
+            &mut prepared,
         );
 
         let err = match result {
@@ -1696,11 +1828,6 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(
-            msg.contains("Failed to create worktrees"),
-            "multi-error bail! prefix missing: {msg}"
-        );
-        assert!(msg.contains("(2 repos)"), "should report repo count: {msg}");
-        assert!(
             msg.contains("repo-a-fail"),
             "first repo name missing from message: {msg}"
         );
@@ -1708,6 +1835,15 @@ mod tests {
             msg.contains("repo-b-fail"),
             "second repo name missing from message: {msg}"
         );
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == prepared.id)
+            .unwrap();
+        assert!(stored.has_pending_worktree_path_claims());
+        assert!(matches!(stored.lifecycle_reservation.unwrap().path_claims,
+            super::super::WorktreePathClaims::Pending(paths) if paths.contains(&workspaces_root.path().join("nonexistent-branch"))));
     }
 
     #[test]
@@ -1807,7 +1943,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn create_workspace_honors_per_repo_base_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = super::super::Storage::new_unwatched("default").unwrap();
         let (parent_primary, _) = init_repo_with_branch("primary", "release");
         let (parent_extra, extra_release_tip) = init_repo_with_branch("extra", "release");
         let primary = parent_primary.path().join("primary");
@@ -1819,6 +1959,8 @@ mod tests {
             .join("{branch}")
             .to_string_lossy()
             .into_owned();
+        let mut prepared = Instance::new("workspace bases", primary.to_str().unwrap());
+        prepared.storage_origin = Some(std::sync::Arc::new(storage.clone()));
 
         let result = create_workspace(
             &WorkspaceRepoSpec {
@@ -1833,6 +1975,7 @@ mod tests {
             true,
             &template,
             true,
+            &mut prepared,
         )
         .expect("workspace creation should succeed");
 
@@ -1861,21 +2004,14 @@ mod tests {
             None,
             "a repo with no configured base records none, so the diff falls through to detection"
         );
-        assert!(result
-            .created_worktrees
-            .iter()
-            .all(|worktree| worktree.owned_branch.as_deref() == Some("feature-x")));
-        for worktree in &result.created_worktrees {
-            cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
-            let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
-            assert!(repo
-                .find_branch("feature-x", git2::BranchType::Local)
-                .is_err());
-        }
     }
 
     #[test]
+    #[serial_test::serial]
     fn create_workspace_records_no_base_when_attaching_an_existing_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = super::super::Storage::new_unwatched("default").unwrap();
         let (parent_primary, _) = init_repo_with_branch("primary", "feature-x");
         let primary = parent_primary.path().join("primary");
         let workspaces_root = tempfile::TempDir::new().unwrap();
@@ -1884,6 +2020,8 @@ mod tests {
             .join("{branch}")
             .to_string_lossy()
             .into_owned();
+        let mut prepared = Instance::new("existing branch workspace", primary.to_str().unwrap());
+        prepared.storage_origin = Some(std::sync::Arc::new(storage.clone()));
 
         let result = create_workspace(
             &WorkspaceRepoSpec {
@@ -1895,102 +2033,11 @@ mod tests {
             false,
             &template,
             true,
+            &mut prepared,
         )
         .expect("workspace creation should succeed");
 
         assert_eq!(result.workspace_info.repos[0].base_branch, None);
-        assert_eq!(result.created_worktrees[0].owned_branch, None);
-        let worktree = &result.created_worktrees[0];
-        cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
-        let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
-        assert!(repo
-            .find_branch("feature-x", git2::BranchType::Local)
-            .is_ok());
-    }
-
-    #[test]
-    fn cleanup_keeps_owned_branch_when_worktree_removal_fails() {
-        let (parent, _) = init_repo_with_branch("cleanup", "release");
-        let main_repo_path = parent.path().join("cleanup");
-        let worktree_path = parent.path().join("dirty-worktree");
-        let git = GitWorktree::new(main_repo_path.clone()).unwrap();
-        git.create_worktree("rollback-branch", &worktree_path, true, None)
-            .unwrap();
-        std::fs::write(worktree_path.join("README.md"), "dirty\n").unwrap();
-
-        let created = CreatedWorktree {
-            path: worktree_path.clone(),
-            main_repo_path: main_repo_path.clone(),
-            owned_branch: Some("rollback-branch".to_string()),
-        };
-        cleanup_created_worktree(&created, "test worktree", &CleanupProtection::default());
-
-        assert!(worktree_path.exists(), "dirty worktree must survive");
-        let repo = git2::Repository::open(&main_repo_path).unwrap();
-        assert!(
-            repo.find_branch("rollback-branch", git2::BranchType::Local)
-                .is_ok(),
-            "owned branch must not be deleted while its worktree remains"
-        );
-
-        git.remove_worktree(&worktree_path, true).unwrap();
-        git.delete_branch("rollback-branch").unwrap();
-    }
-
-    /// The lock-safe cleanup must not take its ownership snapshot, or delete
-    /// anything, while a peer holds the workspace-claim/identity pair.
-    #[test]
-    #[serial_test::serial]
-    fn lock_safe_cleanup_blocks_until_the_ownership_locks_are_released() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let _app_guard = crate::session::test_support::isolate_app_dir();
-        let id = format!("cleanup-barrier-{}", uuid::Uuid::new_v4());
-        let scratch_path = crate::session::scratch::provision_scratch_dir(&id).unwrap();
-        let mut instance = Instance::new("Barrier", &scratch_path.to_string_lossy());
-        instance.id = id;
-        instance.scratch = true;
-        let storage = crate::session::Storage::new_unwatched("default").unwrap();
-        instance.source_profile = storage.profile().to_owned();
-        storage.update(|_, _| Ok(())).unwrap();
-        instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
-
-        let (peer_holds_tx, peer_holds_rx) = mpsc::channel();
-        let (peer_release_tx, peer_release_rx) = mpsc::channel::<()>();
-        let peer = std::thread::spawn(move || {
-            let _claim = crate::session::acquire_session_workspace_claim_lock().unwrap();
-            let _identity = crate::session::acquire_session_identity_lock().unwrap();
-            peer_holds_tx.send(()).unwrap();
-            peer_release_rx.recv().unwrap();
-        });
-        peer_holds_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-
-        let (contended_tx, contended_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let cleaner = std::thread::spawn(move || {
-            let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
-            cleanup_instance_locked(&instance, None, &[], None);
-            done_tx.send(()).unwrap();
-        });
-        contended_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(
-            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
-            "cleanup must not proceed while a peer holds the ownership locks"
-        );
-        assert!(
-            scratch_path.exists(),
-            "the scratch dir must survive until the ownership locks are free"
-        );
-
-        peer_release_tx.send(()).unwrap();
-        peer.join().unwrap();
-        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        cleaner.join().unwrap();
-        assert!(
-            !scratch_path.exists(),
-            "once the locks are free the failed create's scratch dir is removed"
-        );
     }
 
     #[test]
@@ -2080,7 +2127,7 @@ mod tests {
 
     fn custom_agent_params(project_path: &std::path::Path, tool: &str) -> InstanceParams {
         InstanceParams {
-            title: "custom session".to_string(),
+            title: format!("{tool} session"),
             title_typed: false,
             path: project_path.to_string_lossy().to_string(),
             group: String::new(),
@@ -2276,7 +2323,7 @@ mod tests {
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let params = InstanceParams {
-            title: "Forked".into(),
+            title: "Structured fork child".into(),
             title_typed: false,
             path: "/tmp".into(),
             group: String::new(),
@@ -2331,7 +2378,7 @@ mod tests {
             transcript_path: None,
         };
         let params = InstanceParams {
-            title: "Forked".into(),
+            title: "Terminal fork child".into(),
             title_typed: false,
             path: "/tmp".into(),
             group: String::new(),

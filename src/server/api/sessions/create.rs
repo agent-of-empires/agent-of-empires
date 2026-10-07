@@ -949,7 +949,7 @@ pub async fn create_session(
                 let profile = validation_profile.to_string();
                 let file_watch = state.file_watch.clone();
                 match tokio::task::spawn_blocking(move || {
-                    crate::session::Storage::new(&profile, file_watch)?.load()
+                    crate::session::Storage::open(&profile, file_watch)?.load()
                 })
                 .await
                 {

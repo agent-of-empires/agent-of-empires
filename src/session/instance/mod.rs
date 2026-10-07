@@ -70,7 +70,9 @@ pub use flags::{is_valid_session_color, SessionBucket, StartBlocked, SESSION_COL
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
-pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
+pub use lifecycle::{
+    LifecycleOperation, LifecycleReservation, LifecycleReservationError, WorktreePathClaims,
+};
 
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
