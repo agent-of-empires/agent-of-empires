@@ -408,6 +408,56 @@ fn cli_restart_all_refuses_to_run_when_the_calling_pane_cannot_be_resolved() {
 
 #[test]
 #[parallel]
+fn cli_restart_all_refuses_partial_tmux_context_but_allows_no_context() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_restart_all_missing_caller_pane");
+    let project = h.project_path();
+    let caller_id = add_restartable_session(&h, &project, "Caller");
+    let other_id = add_restartable_session(&h, &project, "Other");
+    let caller_name = set_cli_tmux_context(&mut h, &caller_id, "Caller");
+    let other_name = tmux_name(&other_id, "Other");
+    h.tmux_new_detached(&other_name, "sleep 600");
+    let caller_pid = tmux_pane_pid(&h, &caller_name);
+    let other_pid = tmux_pane_pid(&h, &other_name);
+    h.remove_env("TMUX_PANE");
+
+    let output = h.run_cli(&["session", "restart", "--all"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Could not determine the current tmux session"),
+        "restart should fail closed with a useful error: {stderr}"
+    );
+    assert_eq!(
+        tmux_pane_pid(&h, &caller_name),
+        caller_pid,
+        "the caller was restarted despite its incomplete tmux context"
+    );
+    assert_eq!(
+        tmux_pane_pid(&h, &other_name),
+        other_pid,
+        "another session restarted before the incomplete caller context was rejected"
+    );
+
+    h.remove_env("TMUX");
+    let output = h.run_cli_ok(&["session", "restart", "--all"]);
+
+    assert_ne!(
+        tmux_pane_pid(&h, &caller_name),
+        caller_pid,
+        "restart --all should still restart sessions when both tmux variables are absent"
+    );
+    assert_ne!(
+        tmux_pane_pid(&h, &other_name),
+        other_pid,
+        "restart --all should retain its ordinary bulk behavior outside tmux"
+    );
+    assert!(!output.contains("Could not determine the current tmux session"));
+}
+
+#[test]
+#[parallel]
 fn cli_restart_all_refuses_to_run_when_tmux_server_context_does_not_match() {
     require_tmux!();
     let mut h = TuiTestHarness::new("cli_restart_all_mismatched_tmux_server");

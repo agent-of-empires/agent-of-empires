@@ -2053,6 +2053,11 @@ pub(crate) struct CurrentTmuxSession {
 /// Resolve the caller's pane on its server and retain its kind marker if AoE manages it.
 pub(crate) fn current_session_for_current_pane() -> anyhow::Result<Option<CurrentTmuxSession>> {
     let Some(pane_id) = std::env::var_os("TMUX_PANE") else {
+        if std::env::var_os("TMUX").is_some() {
+            return Err(anyhow::anyhow!(
+                "TMUX_PANE is missing from the caller's tmux environment"
+            ));
+        }
         return Ok(None);
     };
     let pane_id = pane_id
