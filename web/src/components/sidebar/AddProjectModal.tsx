@@ -71,17 +71,19 @@ export function AddProjectModal({
       ) : (
         <div className="px-4 py-3 flex flex-col gap-3">
           {!loading && hasPicks && (
-            <ProjectSearchList
-              query={query}
-              onQueryChange={setQuery}
-              filteredSaved={filteredSaved}
-              filteredRecent={filteredRecent}
-              isSelected={(path) => project === path}
-              onSelect={(path) => {
-                setProject(path);
-                setError(null);
-              }}
-            />
+            <div className="max-h-72 overflow-y-auto">
+              <ProjectSearchList
+                query={query}
+                onQueryChange={setQuery}
+                filteredSaved={filteredSaved}
+                filteredRecent={filteredRecent}
+                isSelected={(path) => project === path}
+                onSelect={(path) => {
+                  setProject(path);
+                  setError(null);
+                }}
+              />
+            </div>
           )}
           <input
             type="text"
