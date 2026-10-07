@@ -203,16 +203,12 @@ impl Instance {
         self.persist_session_id_with_storage(&storage, expected)
     }
 
-    /// Write the child a store fork adopted to the durable row, leaving the
-    /// launch's own state untouched.
-    ///
-    /// Not `persist_session_id`: that promotes the one-shot `Fork` intent and
-    /// re-adopts the disk row, moving the conversation target the launch is
-    /// still validating against.
+    /// Publish the child without changing the Fork target still being validated.
+    /// Advance the finalization baseline only after the durable commit succeeds.
     pub(super) fn persist_fork_adoption(
         &self,
         profile: &str,
-        expected: &ConversationState,
+        expected: &mut ConversationState,
     ) -> SidPersistOutcome {
         let Some(sid) = self.agent_session_id.clone() else {
             return SidPersistOutcome::Skip;
@@ -243,24 +239,23 @@ impl Instance {
                 .iter()
                 .position(|instance| instance.id == instance_id)
             else {
-                return Ok(SidWrite::Failed);
+                return Ok(None);
             };
             if !expected.matches(&instances[index]) {
-                return Ok(SidWrite::Skipped);
+                return Ok(None);
             }
             instances[index].set_agent_conversation(Some(sid), binding, pi_session_path);
-            // The launch that follows resolves the one-shot Fork into an open
-            // conversation, so the row must record the same promotion. Leaving
-            // it as Fork would make the row report a pending fork forever, and
-            // the later finalize write cannot do it: this write already moved
-            // the row past the state that write compares against.
+            // Keep the child reusable even if the process stops before finalization.
             instances[index].resume_intent = ResumeIntent::Default;
             instances[index].resume_binding = None;
-            Ok(SidWrite::Applied)
+            Ok(Some(instances[index].conversation_state()))
         });
         match outcome {
-            Ok(SidWrite::Applied) => SidPersistOutcome::Published,
-            Ok(_) => SidPersistOutcome::Skip,
+            Ok(Some(committed)) => {
+                *expected = committed;
+                SidPersistOutcome::Published
+            }
+            Ok(None) => SidPersistOutcome::Skip,
             Err(error) => {
                 tracing::warn!(target: "session.store",
                     "Failed to persist the fork adoption of {}: {error}",
@@ -565,6 +560,95 @@ mod tests {
             .find(|i| i.id == id)
             .unwrap()
             .agent_session_id
+    }
+
+    #[test]
+    #[serial]
+    fn fork_publication_advances_finalization_without_overwriting_peer_changes() {
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+        for conflict in ["none", "before", "after"] {
+            let profile = "fork-finalization";
+            let mut inst = make_inst(profile, "fork");
+            inst.tool = "opencode".into();
+            inst.resume_intent = ResumeIntent::Fork {
+                from: "ses_parent".into(),
+            };
+            let original = inst.conversation_state();
+            let (_temp, _home, storage) = seeded(profile, &[&inst]);
+            let mut expected = original.clone();
+            let binding = ExecutionBinding {
+                agent: "opencode".into(),
+                stores: vec!["/tmp/store-a".into()],
+                configuration: Vec::new(),
+                exported_default_store: None,
+                cwd: "/tmp/x".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            };
+            inst.set_agent_conversation(
+                Some(VALID_SID.into()),
+                Some(ConversationBinding {
+                    session_id: VALID_SID.into(),
+                    execution: Some(binding.clone()),
+                    provenance: ConversationProvenance::Observed,
+                    transcript_path: None,
+                }),
+                None,
+            );
+            if conflict == "before" {
+                storage
+                    .update(|rows, _| {
+                        rows[0].resume_intent = ResumeIntent::Cleared;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let outcome = inst.persist_fork_adoption(profile, &mut expected);
+            if conflict == "before" {
+                assert_eq!(outcome, SidPersistOutcome::Skip);
+                let mut old = inst.clone();
+                old.adopt_conversation_state(original.clone());
+                assert!(expected.matches(&old));
+                assert_eq!(
+                    storage.load().unwrap()[0].resume_intent,
+                    ResumeIntent::Cleared
+                );
+                continue;
+            }
+            assert_eq!(outcome, SidPersistOutcome::Published);
+            assert!(expected.matches(&storage.load().unwrap()[0]));
+            assert!(matches!(inst.resume_intent, ResumeIntent::Fork { .. }));
+            inst.active_execution = Some(ActiveExecution {
+                launch_id: "new-launch".into(),
+                binding,
+                capture: None,
+                container: None,
+            });
+            if conflict == "after" {
+                storage
+                    .update(|rows, _| {
+                        rows[0].resume_intent = ResumeIntent::Cleared;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let _ = inst.persist_session_id_with_storage(&storage, &expected);
+            let disk = storage.load().unwrap();
+            if conflict == "after" {
+                assert_eq!(disk[0].resume_intent, ResumeIntent::Cleared);
+                assert!(disk[0].active_execution.is_none());
+            } else {
+                assert_eq!(
+                    disk[0]
+                        .active_execution
+                        .as_ref()
+                        .map(|active| active.launch_id.as_str()),
+                    Some("new-launch")
+                );
+                assert_eq!(disk[0].agent_session_id.as_deref(), Some(VALID_SID));
+                assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
+            }
+        }
     }
 
     #[test]

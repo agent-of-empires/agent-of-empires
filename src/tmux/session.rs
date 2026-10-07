@@ -1817,29 +1817,11 @@ impl EphemeralEnvFile {
             container_env_path: None,
         };
         if !container_env.is_empty() {
-            let mut file = tempfile::Builder::new()
-                .prefix(PANE_ENV_FILE_PREFIX)
-                .tempfile()?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            for (key, value) in container_env {
-                anyhow::ensure!(
-                    crate::session::environment::is_valid_env_key(key),
-                    "invalid container environment key {key:?}"
-                );
-                anyhow::ensure!(
-                    !value
-                        .bytes()
-                        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')),
-                    "container environment value for {key} cannot be represented in an env-file"
-                );
-                writeln!(file, "{key}={value}")?;
-            }
-            file.flush()?;
+            let file = crate::session::environment::container_env_file(
+                container_env
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )?;
             let (_handle, path) = file.keep().map_err(|error| error.error)?;
             channel.container_env_path = Some(path);
         }

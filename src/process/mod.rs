@@ -33,6 +33,50 @@ mod platform {
     pub(super) fn kill_process_group(_: &std::process::Child) {}
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
+    pub(super) fn close_frozen_payload() -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frozen environments require Linux or macOS",
+        ))
+    }
+    pub(super) fn exec_command(_: &mut std::process::Command) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process replacement requires Linux or macOS",
+        )
+    }
+}
+
+pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FrozenEnvironment<T> {
+    pub(crate) command: T,
+    pub(crate) cwd: T,
+    pub(crate) environment: Vec<(T, T)>,
+}
+
+#[doc(hidden)]
+pub fn exec_frozen_environment() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let file = std::fs::File::open("/dev/fd/4").context("opening frozen environment descriptor")?;
+    let payload = serde_json::from_reader::<_, FrozenEnvironment<String>>(file);
+    platform::close_frozen_payload().context("closing frozen environment descriptor")?;
+    let payload = payload.context("reading frozen environment descriptor")?;
+    let mut command = Command::new("/usr/bin/env");
+    command
+        .arg("--")
+        .args(shell_words::split(&payload.command)?)
+        .current_dir(payload.cwd)
+        .env_clear()
+        .envs(payload.environment);
+    for key in LIVE_PANE_ENV_KEYS {
+        command.env_remove(key);
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    Err(platform::exec_command(&mut command).into())
 }
 
 /// Lower the child's scheduling and I/O priority where the OS supports it.

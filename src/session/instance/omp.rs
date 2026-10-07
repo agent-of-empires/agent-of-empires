@@ -584,7 +584,7 @@ mod tests {
         ] {
             instance.extra_args = extra_args.to_string();
             let error = instance
-                .build_launch_command(None)
+                .build_launch_command(None, &mut instance.conversation_state())
                 .err()
                 .expect("inline OMP credentials must abort before launch");
             if extra_args.contains('$') {

@@ -320,6 +320,28 @@ impl RuntimeExecutionSnapshot {
         self.command(&argv[1..])
     }
 
+    pub(crate) fn exec_with_env_file(
+        &self,
+        name: &str,
+        cwd: &str,
+        args: &[String],
+        env_file: &std::path::Path,
+    ) -> std::process::Command {
+        let mut argv = self.runtime().build_exec_argv(name, cwd, args);
+        let container_index = argv
+            .iter()
+            .position(|argument| argument == name)
+            .expect("exec argv includes its container");
+        argv.splice(
+            container_index..container_index,
+            [
+                "--env-file".to_owned(),
+                env_file.to_string_lossy().into_owned(),
+            ],
+        );
+        self.command(&argv[1..])
+    }
+
     pub(crate) fn exec_shell_command(
         &self,
         name: &str,

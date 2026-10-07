@@ -486,11 +486,7 @@ impl Instance {
         } else {
             None
         };
-        // The container runs the image's build, so the host probe would describe
-        // a binary this launch never runs. A single-generation agent needs none.
-        let yolo_generation = crate::agents::get_agent(&self.tool)
-            .filter(|agent| agent.spans_agent_generations)
-            .map(|_| crate::agents::AgentGeneration::Current);
+
         container_config::build_container_config(
             &self.project_path,
             sandbox,
@@ -502,7 +498,6 @@ impl Instance {
             .with_credential_fold(fold),
             container_config::SandboxYolo {
                 enabled: self.is_yolo_mode(),
-                generation: yolo_generation,
             },
             &self.id,
             self.workspace_info.as_ref(),

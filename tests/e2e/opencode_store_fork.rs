@@ -7,9 +7,8 @@
 //! environment and reaped once the fork returns, and the id it mints has to
 //! reach the launch command line.
 //!
-//! The fake agent is a shell script because it has to answer on the port AoE
-//! chooses at spawn time, and that listener is a separate Python program so the
-//! script stays free of nested quoting.
+//! Isolated fake frontends also check that login startup cannot change the
+//! selected generation or the captured environment.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -279,9 +278,7 @@ fn opencode_store_fork_opens_the_child_the_store_minted() {
         launch.contains(CHILD_ID),
         "the launch must open the child the store minted; launch argv: {launch:?}"
     );
-    // The one-shot fork intent must be resolved on the row, or the session
-    // reports a fork pending for the rest of its life and never opens the child
-    // as a normal conversation.
+    // The committed row must retain both the reusable child and its live store route.
     let child = h
         .read_sessions()
         .as_array()
@@ -295,6 +292,18 @@ fn opencode_store_fork_opens_the_child_the_store_minted() {
     assert!(
         child.get("resume_intent").is_none(),
         "the fork intent must be resolved once the child is adopted: {child}"
+    );
+    assert_eq!(
+        child["active_execution"]["binding"]["agent"], "opencode",
+        "{child}"
+    );
+    assert!(
+        child["active_execution"]["binding"]["stores"]
+            .as_array()
+            .is_some_and(|stores| stores
+                .iter()
+                .any(|store| store.as_str() == Some(database.as_str()))),
+        "the fork lost its live database route: {child}"
     );
 }
 
@@ -343,5 +352,191 @@ fn opencode_store_fork_refuses_rather_than_starting_unforked() {
         "a fork with no reachable store must be refused, not silently unforked: \
          status={}\n{stderr}",
         add.status
+    );
+}
+
+#[test]
+#[parallel]
+fn opencode_launch_retains_frozen_environment_after_login_startup() {
+    require_tmux!();
+    require_python3!();
+    for mode in ["current", "legacy", "wrapper"] {
+        let mut h = TuiTestHarness::new("opencode_frozen_environment");
+        h.append_config(
+            "[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false",
+        );
+        let bin = h.install_path_command("opencode");
+        let wrong = h.home_path().join("wrong");
+        fs::create_dir(&wrong).unwrap();
+        let output = h.home_path().join("frontend.json");
+        let engine = if mode == "wrapper" {
+            "engine"
+        } else {
+            "opencode"
+        };
+        let added = format!("LOGIN_ADDED_{}", uuid::Uuid::new_v4().simple());
+        h.set_env("SHELL", "/bin/bash");
+        h.set_env("LOGIN_GENERATION", "captured");
+        h.set_env("LOGIN_ENGINE", bin.join("engine").to_str().unwrap());
+        h.set_env("PRIVATE_EXEC_TOKEN", "dummy-frozen-secret");
+        h.set_env("AOE.test-key", "line1\nline2 '\"$");
+        h.set_env("BASH_FUNC_aoe_probe%%", "() { :; }");
+        h.set_env("TMUX_PANE", "%parent");
+        h.set_env("OPENCODE_PERMISSION", "captured-user-policy");
+        for directory in [&bin, &wrong] {
+            let legacy = (mode == "legacy") != (directory == &wrong);
+            let help = if legacy { "--fork" } else { "--auto" };
+            let script = format!(
+                r#"#!{python}
+import json, os, sys
+if sys.argv[1:] == ['--help']:
+    print('{help}'); sys.exit(0)
+def opened(fd):
+    try: os.fstat(fd); return True
+    except OSError: return False
+record = dict(program=os.path.abspath(__file__), cwd=os.getcwd(), argv=sys.argv[1:], environment=dict(os.environ), tty=os.isatty(0), descriptors=[opened(3), opened(4)])
+with open({output:?}, 'w') as f: json.dump(record, f)
+for line in sys.stdin: pass
+"#,
+                python = interpreter(),
+                output = output.to_str().unwrap()
+            );
+            crate::harness::write_executable(&directory.join(engine), &script);
+            if mode == "wrapper" {
+                crate::harness::write_executable(&directory.join("opencode"), &format!(
+                    "#!{}\nimport os, sys\nos.execv(os.environ['LOGIN_ENGINE'], [os.environ['LOGIN_ENGINE'], *sys.argv[1:]])\n", interpreter()
+                ));
+            }
+        }
+        fs::write(h.home_path().join(".bash_profile"), format!(
+            "export PATH={}:{}\nexport LOGIN_GENERATION=wrong\nexport {added}=added\nexport PRIVATE_EXEC_TOKEN=wrong\nexport LOGIN_ENGINE={}\ncd /\n",
+            wrong.display(), std::env::var("PATH").unwrap_or_default(), wrong.join("engine").display(),
+        )).unwrap();
+        let command = if mode == "wrapper" {
+            "opencode --session external"
+        } else {
+            "opencode"
+        };
+        h.run_cli_ok(&[
+            "add",
+            h.project_path().to_str().unwrap(),
+            "--cmd",
+            command,
+            "-t",
+            "FrozenContext",
+            "--yolo",
+            "--launch",
+        ]);
+        let record: serde_json::Value =
+            crate::harness::wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
+                fs::read(&output)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+            });
+        assert_eq!(record["program"], bin.join(engine).to_str().unwrap());
+        assert_eq!(
+            record["cwd"],
+            fs::canonicalize(h.project_path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let env = &record["environment"];
+        assert_eq!(env["LOGIN_GENERATION"], "captured");
+        assert_eq!(env["PRIVATE_EXEC_TOKEN"], "dummy-frozen-secret");
+        assert_eq!(env["AOE.test-key"], "line1\nline2 '\"$");
+        assert_eq!(env["BASH_FUNC_aoe_probe%%"], "() { :; }");
+        assert!(env.get(&added).is_none());
+        assert_ne!(env["TMUX_PANE"], "%parent");
+        assert!(env["TMUX_PANE"].as_str().unwrap().starts_with('%'));
+        assert_eq!(record["tty"], true);
+        assert_eq!(record["descriptors"], serde_json::json!([false, false]));
+        let argv = record["argv"].as_array().unwrap();
+        assert_eq!(argv.iter().any(|arg| arg == "--auto"), mode != "legacy");
+        if mode == "legacy" {
+            assert_eq!(env["OPENCODE_PERMISSION"], r#"{"*":"allow"}"#);
+        } else {
+            assert_eq!(env["OPENCODE_PERMISSION"], "captured-user-policy");
+        }
+        if mode == "wrapper" {
+            assert_eq!(
+                record["argv"],
+                serde_json::json!(["--session", "external", "--auto"])
+            );
+        }
+    }
+}
+
+#[test]
+#[parallel]
+fn opencode_legacy_fork_adoption_uses_the_prepared_strategy() {
+    require_tmux!();
+    require_python3!();
+    let mut h = TuiTestHarness::new("opencode_prepared_fork");
+    h.append_config(
+        "[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false",
+    );
+    let database = seed_store(&h);
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch("ALTER TABLE session_v2 RENAME TO session")
+        .unwrap();
+    h.set_env("OPENCODE_DB", &database);
+    let bin = h.install_path_command("opencode");
+    let first = h.home_path().join("first-help");
+    let launched = h.home_path().join("launched.json");
+    let script = format!(
+        r#"#!{python}
+import json, pathlib, sys, time
+first = pathlib.Path({first:?})
+launched = pathlib.Path({launched:?})
+if sys.argv[1:] == ['--help']:
+    if not first.exists():
+        first.touch(); print('--fork'); sys.exit(0)
+    end = time.monotonic() + 10
+    while not launched.exists():
+        if time.monotonic() >= end: sys.exit(1)
+        time.sleep(.01)
+    print('--auto'); sys.exit(0)
+with launched.open('w') as f: json.dump(sys.argv[1:], f)
+for line in sys.stdin: pass
+"#,
+        python = interpreter(),
+        first = first.to_str().unwrap(),
+        launched = launched.to_str().unwrap()
+    );
+    crate::harness::write_executable(&bin.join("opencode"), &script);
+    h.run_cli_ok(&[
+        "add",
+        h.project_path().to_str().unwrap(),
+        "--tool",
+        "opencode",
+        "-t",
+        PARENT,
+    ]);
+    h.run_cli_ok(&["session", "set-session-id", PARENT, PARENT_ID]);
+    h.run_cli_ok(&[
+        "add",
+        h.project_path().to_str().unwrap(),
+        "--tool",
+        "opencode",
+        "-t",
+        CHILD,
+        "--fork-from",
+        PARENT,
+        "--launch",
+    ]);
+    let argv: serde_json::Value =
+        crate::harness::wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
+            fs::read(&launched)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+        });
+    assert!(argv.as_array().unwrap().iter().any(|arg| arg == "--fork"));
+    let sessions = h.read_sessions();
+    let child = crate::harness::session_by_title(&sessions, CHILD);
+    assert!(
+        child["agent_session_id"].is_null(),
+        "a root --fork cannot resume AoE's unused preallocated seed: {child}"
     );
 }

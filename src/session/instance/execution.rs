@@ -284,6 +284,51 @@ pub(super) struct NativeExecution {
     /// `(launch, new_session, source)`. The launch reports it once.
     pub(super) store_override: Option<(PathBuf, PathBuf, &'static str)>,
 }
+
+impl NativeExecution {
+    pub(super) fn host_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.program);
+        command
+            .current_dir(&self.inputs.cwd)
+            .env_clear()
+            .envs(&self.inputs.environment);
+        for (key, value) in &self.routing {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        command
+    }
+}
+#[derive(Clone, Copy)]
+pub(super) struct AgentLaunchContext<'a> {
+    pub(super) generation: crate::agents::AgentGeneration,
+    pub(super) host_command: Option<&'a std::process::Command>,
+}
+
+impl<'a> AgentLaunchContext<'a> {
+    pub(super) fn host(
+        agent: Option<&crate::agents::AgentDef>,
+        host_command: Option<&'a std::process::Command>,
+    ) -> Self {
+        let generation = agent.map_or(crate::agents::AgentGeneration::Current, |agent| {
+            if !agent.spans_agent_generations {
+                crate::agents::AgentGeneration::Current
+            } else {
+                host_command.map_or(crate::agents::AgentGeneration::Unknown, |command| {
+                    crate::agents::agent_generation_for(agent, command)
+                })
+            }
+        });
+        Self {
+            generation,
+            host_command,
+        }
+    }
+}
+
 pub(super) struct NativeLaunchInputs {
     pub(super) launch_id: String,
     pub(super) environment: std::collections::HashMap<String, String>,
@@ -1213,63 +1258,64 @@ fn opencode_session_row(
     Ok(None)
 }
 
-/// The generation the build this launch runs speaks.
-///
-/// `program` is what the pane actually runs, and the host can read that path
-/// unless the launch is a container's, whose program points inside the
-/// container rather than at anything here. With nothing to go on, the
-/// descriptor's own `PATH` answers, which is the last resort rather than the
-/// rule: a profile that sets `PATH` names the binary the pane runs, and reading
-/// a different install of the same agent would be answering about a program
-/// nobody launched. Every consumer reads it here, so the launch's command line,
-/// its store fork and its preassignment cannot disagree about one launch.
-pub(super) fn agent_generation(
-    agent: &'static crate::agents::AgentDef,
-    program: Option<&std::path::Path>,
-) -> crate::agents::AgentGeneration {
-    match program {
-        Some(program) => crate::agents::agent_generation_for(agent, program),
-        None => agent.detected_generation(),
-    }
-}
-
 impl Instance {
-    /// The binary this launch runs, when the host can name one. A sandboxed
-    /// session's binary lives inside the container, which the host cannot read,
-    /// so nothing is named for it.
-    pub(super) fn launch_program(
+    /// Snapshot the actual host executable and its effective environment.
+    pub(super) fn host_agent_command(
         &self,
         agent: &crate::agents::AgentDef,
         execution: Option<&NativeExecution>,
-    ) -> Option<std::path::PathBuf> {
-        // Answering from the host PATH here would describe a binary the
-        // container does not run, and every consumer would disagree with it.
+    ) -> Option<std::process::Command> {
         if self.is_sandboxed() {
             return None;
         }
         match execution {
-            Some(execution) => Some(execution.program.clone()),
+            Some(execution) => Some(execution.host_command()),
             None => {
-                // The same resolver the pane's own environment is built from,
-                // so a `$VAR` reference or a repeated key resolves to the same
-                // directory here as it does there.
+                if !self.launch_invokes_resolved_agent_directly(agent)
+                    && !self
+                        .execution_agent()
+                        .is_ok_and(|actual| actual.name == agent.name)
+                {
+                    return None;
+                }
+                let command = self.get_tool_command();
+                let extra = if self.command.is_empty() {
+                    crate::session::config::quote_model_value_in_args(&self.extra_args)
+                } else {
+                    self.extra_args.clone()
+                };
+                if Self::contains_active_shell_syntax(command)
+                    || Self::contains_active_shell_syntax(&extra)
+                {
+                    return None;
+                }
+                let parsed = super::launch_command::parse_launch_command(command)?;
+                let program = parsed.words.first()?;
                 let environment = self.resolved_host_environment();
-                let Some(path) = crate::session::environment::resolve_host_environment_value(
+                let path = crate::session::environment::resolve_host_environment_value(
                     &environment,
                     "PATH",
-                ) else {
-                    tracing::warn!(target: "session.store",
-                        agent = %agent.name,
-                        "host environment carries no PATH, so its launch program cannot be resolved");
-                    return None;
-                };
-                match which::which_in(agent.binary, Some(&path), &self.project_path) {
-                    Ok(program) => Some(program),
+                )
+                .map(std::ffi::OsString::from)
+                .or_else(|| std::env::var_os("PATH"));
+                match which::which_in(program, path.as_deref(), &self.project_path) {
+                    Ok(program) => {
+                        let mut command = std::process::Command::new(program);
+                        command
+                            .current_dir(&self.project_path)
+                            .env_clear()
+                            .envs(std::env::vars_os());
+                        command.envs(crate::session::environment::resolve_host_environment_pairs(
+                            &environment,
+                        ));
+                        Some(command)
+                    }
                     Err(error) => {
                         tracing::warn!(target: "session.store",
                             agent = %agent.name,
                             error = %error,
-                            "host PATH does not carry this agent's binary");
+                            program,
+                            "host launch executable cannot be resolved");
                         None
                     }
                 }
@@ -2357,6 +2403,7 @@ impl Instance {
         &self,
         command: String,
         execution: Option<&super::execution::NativeExecution>,
+        launch_context: AgentLaunchContext<'_>,
     ) -> Result<String> {
         let Some(execution) = execution else {
             return Ok(command);
@@ -2367,6 +2414,16 @@ impl Instance {
             .to_str()
             .context("native executable path is not UTF-8")?
             .to_owned();
+        // A shared service may have opened a different database.
+        if execution.agent.name == "opencode" {
+            match launch_context.generation {
+                crate::agents::AgentGeneration::Current => words.push("--standalone".into()),
+                crate::agents::AgentGeneration::Legacy => {},
+                crate::agents::AgentGeneration::Unknown => anyhow::bail!(
+                    "OpenCode --help did not establish a generation; the selected native database cannot be guaranteed, so the launch was refused"
+                ),
+            }
+        }
         Ok(shell_words::join(words))
     }
 }

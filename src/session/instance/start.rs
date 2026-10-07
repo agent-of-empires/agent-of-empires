@@ -340,13 +340,6 @@ impl Instance {
             self.adopt_conversation_state(canonical);
         }
         if let Some(execution) = prepared.execution.take() {
-            // Resolved before the launch record takes the inputs apart below,
-            // since the answer needs the binary this pane will run.
-            let generation = super::execution::agent_generation(
-                execution.agent,
-                self.launch_program(execution.agent, Some(&execution))
-                    .as_deref(),
-            );
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
                 launch_id: execution.inputs.launch_id,
@@ -356,19 +349,8 @@ impl Instance {
                     .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
             });
-            // A generation that could not be established cannot be claimed to
-            // mint or to keep the id, so the pinned one is dropped rather than
-            // carried on an answer the build never gave. The fork path bails
-            // before this, so the arm is unreachable for a real fork.
-            let native_mints_child = matches!(
-                prepared.expected_conversation.intent,
-                ResumeIntent::Fork { .. }
-            ) && execution
-                .agent
-                .fork_strategy
-                .resolve(generation)
-                .is_none_or(|strategy| strategy.mints_child());
-            if native_mints_child {
+
+            if prepared.fork_mints_child {
                 self.set_agent_conversation(None, None, None);
             } else if let Some(sid) = self.agent_session_id.clone() {
                 let existing = self.agent_session_binding.as_ref().filter(|binding| {

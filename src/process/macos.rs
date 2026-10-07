@@ -4,6 +4,15 @@ pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 use std::collections::HashMap;
 use std::process::Command;
 
+pub(super) fn close_frozen_payload() -> std::io::Result<()> {
+    nix::unistd::close(4).map_err(std::io::Error::from)
+}
+
+pub(super) fn exec_command(command: &mut Command) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    command.exec()
+}
+
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };

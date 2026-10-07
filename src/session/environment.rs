@@ -579,6 +579,36 @@ pub(crate) struct DockerExecEnv {
 pub(crate) const CONTAINER_EXEC_ENV_FD: u8 = 9;
 pub(crate) const CONTAINER_EXEC_ENV_PATH: &str = "/dev/fd/9";
 
+pub(crate) fn container_env_file<'a>(
+    environment: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> anyhow::Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix("aoe-container-env-")
+        .tempfile()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    for (key, value) in environment {
+        anyhow::ensure!(
+            is_valid_env_key(key),
+            "invalid container environment key {key:?}"
+        );
+        anyhow::ensure!(
+            !value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')),
+            "container environment value for {key} cannot be represented in an env-file"
+        );
+        writeln!(file, "{key}={value}")?;
+    }
+    file.flush()?;
+    Ok(file)
+}
+
 /// Build docker exec environment transport from config and optional
 /// per-session extra entries.
 #[cfg(test)]

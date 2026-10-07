@@ -1019,13 +1019,13 @@ impl AgentDef {
         }
     }
 
-    /// The session-name flag, if the `--help` of `program`, the executable the launch runs, lists it.
+    /// The launch's help must advertise a session-name flag before injection.
     pub(crate) fn supported_session_name_flag(
         &self,
-        program: &std::path::Path,
+        command: &std::process::Command,
     ) -> Option<&'static str> {
         let flag = self.session_name_flag()?;
-        agent_help_advertises(program, flag).then_some(flag)
+        agent_help_advertises(command, flag).then_some(flag)
     }
 
     pub fn launch_base_command(&self) -> String {
@@ -1036,29 +1036,20 @@ impl AgentDef {
     }
 }
 
-/// Which generation of an agent's interface `program` speaks.
-///
-/// A descriptor that declares two generations is resolved by what the
-/// executable itself advertises, not by a version threshold: a renamed flag is
-/// exactly the case where the build's own `--help` is the authority. The probe
-/// and its cached answer are bound to the resolved executable, exactly as
-/// `agent_help_advertises` binds its own.
-pub fn agent_generation_for(agent: &AgentDef, program: &std::path::Path) -> AgentGeneration {
+/// Resolve generations from help using the launch's explicit, complete environment.
+pub fn agent_generation_for(agent: &AgentDef, command: &std::process::Command) -> AgentGeneration {
     if !agent.spans_agent_generations {
         return AgentGeneration::Current;
     }
-    let help = agent_help(program);
-    // The root `--fork` is the marker: every 1.x build declares it and 2.x
-    // removed it. `--auto` cannot serve, because 1.17.12 and later declare that
-    // at their root too.
-    if help_advertises_flag(&help, LEGACY_GENERATION_MARKER) {
+    with_agent_help(command, false, agent_generation_from_help)
+}
+
+pub(crate) fn agent_generation_from_help(help: &str) -> AgentGeneration {
+    // Late 1.x builds also advertise --auto; only --fork distinguishes them.
+    if help_advertises_flag(help, LEGACY_GENERATION_MARKER) {
         return AgentGeneration::Legacy;
     }
-    if help.is_empty() {
-        // A help that never answered is not evidence of the current interface,
-        // and the probe cools down for half a minute, so guessing here would
-        // lock a 1.x install onto spellings it rejects. Refusing says what is
-        // wrong; a guessed generation silently mislabels the launch.
+    if help.trim().is_empty() {
         tracing::warn!(target: "session.create",
             "agent --help did not answer, so its generation cannot be established; \
              launch features that depend on it are refused");
@@ -1067,41 +1058,97 @@ pub fn agent_generation_for(agent: &AgentDef, program: &std::path::Path) -> Agen
     AgentGeneration::Current
 }
 
-/// The cached `--help` of a resolved program, empty when none has answered.
-fn agent_help(program: &std::path::Path) -> String {
-    let Ok(program) = std::fs::canonicalize(program) else {
-        return String::new();
+/// Inspect help under the executable's lock without copying its text.
+fn with_agent_help<R>(
+    command: &std::process::Command,
+    cache_success: bool,
+    inspect: impl FnOnce(&str) -> R,
+) -> R {
+    let Ok(program) = std::fs::canonicalize(command.get_program()) else {
+        return inspect("");
     };
     let Ok(metadata) = std::fs::metadata(&program) else {
-        return String::new();
+        return inspect("");
     };
-    let key = (program.clone(), metadata.modified().ok(), metadata.len());
-    let probe = HELP_PROBES
+    let key = (program, metadata.modified().ok(), metadata.len());
+    let cache = HELP_PROBES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry(key)
         .or_default()
         .clone();
-    let mut probe = probe
+    let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    probe
-        .help(std::time::Instant::now, |timeout| {
-            run_agent_help(&program, timeout)
-        })
-        .to_owned()
+    let probe_cwd = command.get_current_dir().is_none().then(std::env::temp_dir);
+    let launch_cwd = match command.get_current_dir() {
+        Some(cwd) if cwd.is_absolute() => std::borrow::Cow::Borrowed(cwd),
+        cwd => {
+            let Ok(current) = std::env::current_dir() else {
+                return inspect("");
+            };
+            std::borrow::Cow::Owned(match cwd {
+                Some(cwd) => current.join(cwd),
+                None => current,
+            })
+        }
+    };
+    if cache_success {
+        if let Some(answer) = cache.answers.iter().find(|cached| {
+            cached.program == command.get_program()
+                && cached.launch_cwd.as_path() == launch_cwd.as_ref()
+                && cached.probe_cwd == probe_cwd
+                && cached
+                    .environment
+                    .iter()
+                    .map(|(key, value)| (key.as_os_str(), value.as_os_str()))
+                    .eq(help_environment(command))
+        }) {
+            return inspect(&answer.help);
+        }
+    }
+    cache.probe.help(std::time::Instant::now, |timeout| {
+        run_agent_help(
+            command,
+            &launch_cwd,
+            probe_cwd.as_deref().unwrap_or(&launch_cwd),
+            timeout,
+        )
+    });
+    let Some(help) = cache
+        .probe
+        .help
+        .take()
+        .filter(|help| !help.trim().is_empty())
+    else {
+        return inspect("");
+    };
+    if !cache_success {
+        return inspect(&help);
+    }
+    cache.answers.push(CachedHelp {
+        program: command.get_program().to_owned(),
+        launch_cwd: launch_cwd.into_owned(),
+        probe_cwd,
+        environment: help_environment(command)
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect(),
+        help,
+    });
+    inspect(&cache.answers.last().expect("the answer was inserted").help)
 }
 
 /// A flag the older generation's help lists and the current one's does not.
 const LEGACY_GENERATION_MARKER: &str = "--fork";
 
 impl AgentDef {
-    /// The generation the binary this descriptor names speaks. Callers that
-    /// already hold the launch's resolved program pass it to
-    /// `agent_generation_for` instead.
+    /// Probe the executable and environment AoE itself would launch.
     pub fn detected_generation(&self) -> AgentGeneration {
+        if !self.spans_agent_generations {
+            return AgentGeneration::Current;
+        }
         let program = which::which(self.binary).unwrap_or_else(|_| self.binary.into());
-        agent_generation_for(self, &program)
+        agent_generation_for(self, &ambient_help_command(&program))
     }
 }
 
@@ -1129,10 +1176,11 @@ impl HelpProbe {
         clock: impl Fn() -> std::time::Instant,
         probe: impl FnOnce(std::time::Duration) -> Option<String>,
     ) -> &str {
-        // An empty answer is a failed one: caching it would pin the binary to
-        // "no flags" for the life of the process, so the retry the cooldown
-        // schedules below has to be able to re-enter here.
-        if self.help.as_deref().is_none_or(str::is_empty)
+        // Empty or whitespace-only help is inconclusive, not a confirmed absence of flags.
+        if self
+            .help
+            .as_deref()
+            .is_none_or(|help| help.trim().is_empty())
             && self.retry_at.is_none_or(|at| clock() >= at)
         {
             let timeout = if self.retry_at.is_some() {
@@ -1141,7 +1189,11 @@ impl HelpProbe {
                 HELP_PROBE_TIMEOUT
             };
             self.help = probe(timeout);
-            if self.help.as_deref().is_none_or(str::is_empty) {
+            if self
+                .help
+                .as_deref()
+                .is_none_or(|help| help.trim().is_empty())
+            {
                 tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
                     "agent --help did not answer; launching without the flags it gates until a retry succeeds");
                 // Timed from the answer, so a probe that ran to its deadline still cools down.
@@ -1152,21 +1204,83 @@ impl HelpProbe {
     }
 }
 
-fn run_agent_help(program: &std::path::Path, timeout: std::time::Duration) -> Option<String> {
-    let mut cmd = std::process::Command::new(program);
-    cmd.arg("--help");
-    // An agent that reads stdin would hold the pipe until the deadline, and one that writes a
-    // file would drop it wherever the caller happened to be.
-    cmd.stdin(std::process::Stdio::null());
-    cmd.current_dir(std::env::temp_dir());
+fn ambient_help_command(program: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env_clear().envs(std::env::vars_os());
+    command
+}
+
+fn help_environment(
+    command: &std::process::Command,
+) -> impl Iterator<Item = (&std::ffi::OsStr, &std::ffi::OsStr)> {
+    command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+}
+
+fn run_agent_help(
+    command: &std::process::Command,
+    launch_cwd: &std::path::Path,
+    cwd: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let mut cmd = std::process::Command::new(command.get_program());
+    cmd.arg("--help")
+        .env_clear()
+        .envs(help_environment(command));
+    if command.get_current_dir().is_none() {
+        if let Some((_, path)) = help_environment(command).find(|(key, path)| {
+            *key == "PATH" && std::env::split_paths(path).any(|entry| entry.is_relative())
+        }) {
+            let resolved = std::env::join_paths(std::env::split_paths(path).map(|entry| {
+                if entry.is_absolute() {
+                    entry
+                } else {
+                    launch_cwd.join(entry)
+                }
+            }))
+            .ok()?;
+            cmd.env("PATH", resolved);
+        }
+    }
+    cmd.stdin(std::process::Stdio::null()).current_dir(cwd);
     crate::process::run_with_timeout(&mut cmd, timeout)
         .ok()
         .flatten()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .map(|output| {
+            let bytes = if output.stdout.is_empty() {
+                output.stderr
+            } else if output.stderr.is_empty() {
+                output.stdout
+            } else {
+                let mut bytes = output.stdout;
+                bytes.reserve(output.stderr.len() + 1);
+                bytes.push(b'\n');
+                bytes.extend(output.stderr);
+                bytes
+            };
+            String::from_utf8(bytes)
+                .unwrap_or_else(|error| String::from_utf8_lossy(&error.into_bytes()).into_owned())
+        })
 }
 
-type SharedHelpProbe = std::sync::Arc<std::sync::Mutex<HelpProbe>>;
+struct CachedHelp {
+    program: std::ffi::OsString,
+    launch_cwd: std::path::PathBuf,
+    // Unbound probes relocate to temp; explicit probes use launch_cwd.
+    probe_cwd: Option<std::path::PathBuf>,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    help: String,
+}
+
+#[derive(Default)]
+struct ProgramHelpCache {
+    probe: HelpProbe,
+    answers: Vec<CachedHelp>,
+}
+
+type SharedHelpProbe = std::sync::Arc<std::sync::Mutex<ProgramHelpCache>>;
 
 /// The resolved executable plus its modification time and size, so an update that swaps the
 /// binary behind a path, or a symlink to it, is probed afresh.
@@ -1175,34 +1289,9 @@ type HelpProbeKey = (std::path::PathBuf, Option<std::time::SystemTime>, u64);
 static HELP_PROBES: std::sync::Mutex<BTreeMap<HelpProbeKey, SharedHelpProbe>> =
     std::sync::Mutex::new(BTreeMap::new());
 
-/// Whether `program --help` advertises `flag`, for a flag an older install would reject outright.
-/// The probe and its cached answer are bound to the resolved executable, so neither the probe's
-/// own working directory nor another install found on `PATH` can stand in for it.
-fn agent_help_advertises(program: &std::path::Path, flag: &str) -> bool {
-    let Ok(program) = std::fs::canonicalize(program) else {
-        return false;
-    };
-    let Ok(metadata) = std::fs::metadata(&program) else {
-        return false;
-    };
-    let key = (program.clone(), metadata.modified().ok(), metadata.len());
-    let probe = HELP_PROBES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(key)
-        .or_default()
-        .clone();
-    // Held across the probe: launches of this binary racing it wait for the answer instead of
-    // starting without the flag.
-    let mut probe = probe
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    help_advertises_flag(
-        probe.help(std::time::Instant::now, |timeout| {
-            run_agent_help(&program, timeout)
-        }),
-        flag,
-    )
+/// The explicit launch environment is part of every cached answer.
+fn agent_help_advertises(command: &std::process::Command, flag: &str) -> bool {
+    with_agent_help(command, true, |help| help_advertises_flag(help, flag))
 }
 
 #[cfg(test)]
@@ -1218,7 +1307,7 @@ pub(crate) fn forget_agent_help_for_test() {
 fn pi_help_advertises(flag: &str) -> bool {
     get_agent("pi")
         .and_then(|agent| which::which(agent.binary).ok())
-        .is_some_and(|program| agent_help_advertises(&program, flag))
+        .is_some_and(|program| agent_help_advertises(&ambient_help_command(&program), flag))
 }
 
 pub(crate) fn pi_supports_extension_flag() -> bool {
@@ -1592,7 +1681,9 @@ mod tests {
         forget_agent_help_for_test();
 
         let claude_program = temp.path().join("bin/claude");
-        let claude = std::thread::spawn(move || agent_help_advertises(&claude_program, "--name"));
+        let claude = std::thread::spawn(move || {
+            agent_help_advertises(&ambient_help_command(&claude_program), "--name")
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !started.exists() {
             assert!(
@@ -1638,18 +1729,189 @@ mod tests {
         forget_agent_help_for_test();
 
         assert!(
-            agent_help_advertises(&current, "--name"),
+            agent_help_advertises(&ambient_help_command(&current), "--name"),
             "the probe ran another claude than the one given"
         );
         assert!(
-            !agent_help_advertises(&older, "--name"),
+            !agent_help_advertises(&ambient_help_command(&older), "--name"),
             "an answer cached for one install was reused for another"
         );
         forget_agent_help_for_test();
     }
 
-    /// An update replaces the executable behind the same path, in place or by moving a symlink to
-    /// a new version, and the new one is probed rather than answered from the old one's help.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn wrapper_generation_tracks_the_complete_launch_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |directory: &str, flag: &str| {
+            let directory = temp.path().join(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let program = directory.join("opencode");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  {flag} enabled'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            program
+        };
+        let legacy = install("legacy", "--fork");
+        let current = install("current", "--auto");
+        let wrapper = temp.path().join("wrapper");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nexec \"${NATIVE_AGENT:-opencode}\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        forget_agent_help_for_test();
+        let agent = get_agent("opencode").unwrap();
+        for (path, override_program, expected) in [
+            (legacy.parent().unwrap(), None, AgentGeneration::Legacy),
+            (current.parent().unwrap(), None, AgentGeneration::Current),
+            (
+                legacy.parent().unwrap(),
+                Some(current.as_path()),
+                AgentGeneration::Current,
+            ),
+            (
+                current.parent().unwrap(),
+                Some(legacy.as_path()),
+                AgentGeneration::Legacy,
+            ),
+            (legacy.parent().unwrap(), None, AgentGeneration::Legacy),
+        ] {
+            let mut command = std::process::Command::new(&wrapper);
+            command.env_clear().env("PATH", path);
+            if let Some(program) = override_program {
+                command.env("NATIVE_AGENT", program);
+            }
+            assert_eq!(
+                agent_generation_for(agent, &command),
+                expected,
+                "PATH={path:?}, override={override_program:?}"
+            );
+        }
+        for cwd in [current.parent().unwrap(), legacy.parent().unwrap()] {
+            let mut command = std::process::Command::new(&wrapper);
+            command.env_clear().env("PATH", ".").current_dir(cwd);
+            let expected = if cwd == current.parent().unwrap() {
+                AgentGeneration::Current
+            } else {
+                AgentGeneration::Legacy
+            };
+            assert_eq!(
+                agent_generation_for(agent, &command),
+                expected,
+                "cwd={cwd:?}"
+            );
+        }
+        forget_agent_help_for_test();
+    }
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn explicit_help_cwd_preserves_shim_dispatch_and_literal_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        let current = root.path().join("current");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(legacy.join(".use-legacy"), "").unwrap();
+        let log = root.path().join("probes");
+        let wrapper = root.path().join("opencode");
+        std::fs::write(&wrapper, r#"#!/bin/sh
+printf '%s|%s\n' "$PWD" "$PATH" >> "$PROBE_LOG"
+if [ -f .use-legacy ]; then printf '%s\n' '  --fork branch'; else printf '%s\n' '  --auto approvals'; fi
+"#).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        forget_agent_help_for_test();
+        let agent = get_agent("opencode").unwrap();
+        let command = |cwd: &std::path::Path| {
+            let mut command = std::process::Command::new(&wrapper);
+            command
+                .env_clear()
+                .env("PATH", ".")
+                .env("PROBE_LOG", &log)
+                .current_dir(cwd);
+            command
+        };
+        for (cwd, expected) in [
+            (legacy.as_path(), AgentGeneration::Legacy),
+            (current.as_path(), AgentGeneration::Current),
+        ] {
+            assert_eq!(agent_generation_for(agent, &command(cwd)), expected);
+        }
+        let expected_log = format!(
+            "{}|.\n{}|.\n",
+            std::fs::canonicalize(&legacy).unwrap().display(),
+            std::fs::canonicalize(&current).unwrap().display()
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), expected_log);
+
+        std::fs::remove_file(legacy.join(".use-legacy")).unwrap();
+        assert_eq!(
+            agent_generation_for(agent, &command(&legacy)),
+            AgentGeneration::Current,
+            "a new launch must observe a changed selector in the same cwd"
+        );
+        std::fs::write(legacy.join(".use-legacy"), "").unwrap();
+        assert_eq!(
+            agent_generation_for(agent, &command(&legacy)),
+            AgentGeneration::Legacy
+        );
+        let before_missing = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            agent_generation_for(agent, &command(&root.path().join("missing"))),
+            AgentGeneration::Unknown
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before_missing,
+            "a missing explicit cwd must not fall back to a different directory"
+        );
+        forget_agent_help_for_test();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn failed_help_cools_down_across_launch_sources() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("opencode");
+        let log = temp.path().join("probes");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\n' \"$AOE_SESSION_SOURCE\" >> \"$PROBE_LOG\"\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = get_agent("opencode").unwrap();
+        forget_agent_help_for_test();
+        for source in ["first", "second"] {
+            let mut command = std::process::Command::new(&program);
+            command
+                .env_clear()
+                .env("AOE_SESSION_SOURCE", source)
+                .env("PROBE_LOG", &log);
+            assert_eq!(
+                agent_generation_for(agent, &command),
+                AgentGeneration::Unknown
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "first
+"
+        );
+        forget_agent_help_for_test();
+    }
+
+    /// Replacing an executable or symlink invalidates its help.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -1664,10 +1926,13 @@ mod tests {
 
         let in_place = temp.path().join("claude");
         write(&in_place, "  -r, --resume [value]");
-        assert!(!agent_help_advertises(&in_place, "--name"));
+        assert!(!agent_help_advertises(
+            &ambient_help_command(&in_place),
+            "--name"
+        ));
         write(&in_place, "  -n, --name <name>  Set a display name");
         assert!(
-            agent_help_advertises(&in_place, "--name"),
+            agent_help_advertises(&ambient_help_command(&in_place), "--name"),
             "an executable replaced in place kept its old answer"
         );
 
@@ -1691,11 +1956,14 @@ mod tests {
         );
         let link = temp.path().join("current");
         std::os::unix::fs::symlink(&old, &link).unwrap();
-        assert!(!agent_help_advertises(&link, "--name"));
+        assert!(!agent_help_advertises(
+            &ambient_help_command(&link),
+            "--name"
+        ));
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&new, &link).unwrap();
         assert!(
-            agent_help_advertises(&link, "--name"),
+            agent_help_advertises(&ambient_help_command(&link), "--name"),
             "a symlink moved to a new version kept the old version's answer"
         );
         forget_agent_help_for_test();
