@@ -45,7 +45,7 @@ The build checks out the requested tag and reads `[toolchain].channel` from its 
 
 ## Versioning
 
-Semver. The weekly workflow automatically picks minor when any `feat` commit landed since the last `v*` tag, otherwise patch. Override the bump for user-visible features without a `feat` prefix, new CLI subcommands, or new config sections. Choose **major** explicitly for breaking config changes, removed CLI subcommands, or on-disk breakage needing maintainer attention beyond a migration. When uncertain, take the bigger bump.
+Semver. The weekly workflow automatically picks minor when any scoped or unscoped `feat` commit landed since the last `v*` tag, otherwise patch. Override the bump for user-visible features without a `feat` prefix, new CLI subcommands, or new config sections. Choose **major** explicitly for breaking config changes, removed CLI subcommands, or on-disk breakage needing maintainer attention beyond a migration. When uncertain, take the bigger bump.
 
 ## Skill hubs
 

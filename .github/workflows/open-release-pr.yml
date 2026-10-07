@@ -78,7 +78,7 @@ jobs:
           if [ "$BUMP" = auto ]; then
             LAST_TAG="$(git describe --tags --abbrev=0 --match 'v*')"
             if git log "${LAST_TAG}..HEAD" --no-merges --format=%s \
-                 | grep -E '^feat(\([^)]*\))?!?:' >/dev/null; then
+                 | grep -E '^feat(\(.*\))?!?:' >/dev/null; then
               BUMP="minor"
             else
               BUMP="patch"
