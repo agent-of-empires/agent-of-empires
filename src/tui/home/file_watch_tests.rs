@@ -317,7 +317,7 @@ async fn reload_storage_only_ends_live_send_when_active_row_is_removed() {
 #[tokio::test]
 #[serial]
 async fn reload_failure_dialog_waits_until_live_send_exits() {
-    let mut e = env("live-failure", &[]);
+    let mut e = env("live-failure", &["live-failure"]);
     let view = &mut e.view;
     view.live_send = Some(live_send_state("active", "active", "aoe_test_live_failure"));
     view.reload_failure_state

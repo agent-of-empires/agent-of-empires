@@ -615,6 +615,7 @@ fn setup_creation_test_env() -> CreationTestEnv {
             .unwrap();
     }
 
+    let storage = Storage::new_unwatched("default").unwrap();
     let mut view = test_view(Some("default"));
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
@@ -622,7 +623,7 @@ fn setup_creation_test_env() -> CreationTestEnv {
 
     CreationTestEnv {
         view,
-        storage: Storage::new_unwatched("default").unwrap(),
+        storage,
         project_dir,
         _guard: guard,
         _temp: temp,

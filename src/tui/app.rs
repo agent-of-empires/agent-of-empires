@@ -3120,6 +3120,7 @@ mod tests {
     async fn drain_paste_forwards_to_the_mounted_view_and_keeps_other_targets() {
         let temp = tempfile::TempDir::new().unwrap();
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _profile = crate::session::Storage::new_unwatched("test").expect("test profile");
         let mut app = App::new(
             "test",
             crate::tmux::AvailableTools::with_tools(&["claude"]),
