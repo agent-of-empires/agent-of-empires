@@ -92,7 +92,7 @@ fn hermes_host_capture_fails_closed() {
 
     let mut h = TuiTestHarness::new_in_tmp("hermes_host_capture_fails_closed");
     let hermes_home = h.home_path().join(".hermes");
-    h.set_env("HERMES_HOME", &hermes_home.display().to_string());
+    h.set_env("HERMES_HOME", hermes_home.as_os_str());
     install_hermes_shim(&mut h);
 
     let proj_a = h.home_path().join("proj-a");

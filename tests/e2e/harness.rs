@@ -536,7 +536,7 @@ last_seen_version = "{}"
             write_executable(&bin.join(name), &script);
         }
         self.extra_path_dirs.push(bin);
-        self.set_env("FAKE_ACP_DEBUG_LOG", &debug_log.display().to_string());
+        self.set_env("FAKE_ACP_DEBUG_LOG", debug_log.as_os_str());
         self.set_env("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS", "60000");
     }
 
