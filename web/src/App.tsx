@@ -2546,6 +2546,11 @@ function AppContent({
         <textarea
           ref={setKeyboardProxyRef}
           data-keyboard-proxy
+          data-session-input={
+            activeSession && !showSettings && (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
+              ? ""
+              : undefined
+          }
           aria-hidden="true"
           tabIndex={-1}
           // Keep the element in the visual viewport. Focusing a zero-size

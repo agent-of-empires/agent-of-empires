@@ -455,6 +455,8 @@ mod tests {
     use crate::migrations::hook_fixtures::{setup_dirs, unset_agent_home_env, write_json};
     use serde_json::Value;
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use tempfile::TempDir;
 
     /// Pre-#1844 hardened bytes (post-v015): the form we are migrating
     /// AWAY from. Contains the `aoe-hooks` substring so `is_aoe_hook_command`

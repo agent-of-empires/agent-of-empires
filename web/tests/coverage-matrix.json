@@ -793,7 +793,7 @@
       "id": "sidebar.terminal-focus-handoff",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/terminal-focus-shortcut.spec.ts"],
+      "specs": ["tests/terminal-focus-shortcut.spec.ts", "src/hooks/useKeyboardShortcuts.test.ts"],
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
