@@ -156,8 +156,13 @@ pub async fn spawn_acp(
                     }
                 };
                 let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
-                if let Err(error) =
-                    install_rate_limit_continuation(&state, original, _submission).await
+                if let Err(error) = install_rate_limit_continuation(
+                    &state,
+                    original,
+                    [Some(origin), None],
+                    _submission,
+                )
+                .await
                 {
                     return (StatusCode::CONFLICT, error.to_string()).into_response();
                 }
@@ -206,9 +211,10 @@ pub async fn spawn_acp(
             .map(|p| (p.key, p.value))
             .collect(),
         model: req.model.or_else(|| instance.agent_model.clone()),
-        ..spawn_request_for(&instance, agent.clone(), sandbox_info, origin)
+        ..spawn_request_for(&instance, agent.clone(), sandbox_info, Arc::clone(&origin))
     };
     let launched = reservation.execution_admission();
+    let prepared_publication = launched.origin();
     if let Err(error) = state.acp_supervisor.spawn_inner(request, reservation).await {
         return supervisor_error_response("spawn failed", &error);
     }
@@ -219,7 +225,14 @@ pub async fn spawn_acp(
                 &SupervisorError::SpawnCancelled(id),
             );
         };
-        if let Err(error) = install_rate_limit_continuation(&state, original, _submission).await {
+        if let Err(error) = install_rate_limit_continuation(
+            &state,
+            original,
+            [Some(origin), prepared_publication],
+            _submission,
+        )
+        .await
+        {
             return (StatusCode::CONFLICT, error.to_string()).into_response();
         }
         state

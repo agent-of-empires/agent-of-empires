@@ -799,7 +799,10 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
                     .capture_operation_origin(&state.instances.read().await[0])
                     .unwrap();
                 let outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
-                    &state, original, submission,
+                    &state,
+                    original,
+                    [None, None],
+                    submission,
                 )
                 .await
                 .unwrap();

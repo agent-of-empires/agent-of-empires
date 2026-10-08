@@ -103,6 +103,7 @@ pub(crate) enum ContinuationOutcome {
 pub(crate) async fn install_rate_limit_continuation(
     state: &Arc<AppState>,
     original: Arc<crate::session::LaunchOrigin>,
+    cache_publications: [Option<Arc<crate::session::LaunchOrigin>>; 2],
     _submission: tokio::sync::OwnedMutexGuard<()>,
 ) -> anyhow::Result<ContinuationOutcome> {
     let id = original.session_id();
@@ -123,7 +124,11 @@ pub(crate) async fn install_rate_limit_continuation(
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("original continuation row disappeared"))?;
         anyhow::ensure!(
-            original.recognizes_published_instance(inst),
+            original.recognizes_published_instance(inst)
+                || cache_publications
+                    .iter()
+                    .flatten()
+                    .any(|ack| ack.recognizes_published_instance(inst)),
             "original continuation row was superseded"
         );
         inst.queued_prompts
@@ -165,7 +170,11 @@ pub(crate) async fn install_rate_limit_continuation(
                     .position(|row| row.id == original.session_id())
                     .ok_or_else(|| anyhow::anyhow!("original continuation view row disappeared"))?;
                 anyhow::ensure!(
-                    original.recognizes_published_instance(&rows[index]),
+                    original.recognizes_published_instance(&rows[index])
+                        || cache_publications
+                            .iter()
+                            .flatten()
+                            .any(|ack| ack.recognizes_published_instance(&rows[index])),
                     "original continuation view row was superseded"
                 );
                 if superseded || row.pending_initial_turn.is_none() {
@@ -359,7 +368,14 @@ pub(super) async fn reap_rate_limit_resumes(
                 }
             }
         };
-        let outcome = match install_rate_limit_continuation(state, original, submission).await {
+        let outcome = match install_rate_limit_continuation(
+            state,
+            original,
+            [None, None],
+            submission,
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(target: "acp.supervisor", session = %id, %error, "rate-limit continuation not saved; park retained");
@@ -884,6 +900,7 @@ mod tests {
         let outcome = install_rate_limit_continuation(
             &state,
             original,
+            [None, None],
             state.session_service.prompt_submission(id).await,
         )
         .await
@@ -898,6 +915,96 @@ mod tests {
             Some("run the nightly task"),
         );
     }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn continuation_uses_its_preparation_ack_without_accepting_a_replaced_cache() {
+        use crate::acp::runner_lifecycle::{
+            LifecycleTable, NativeResume, PreparationAuthorization, ResumeKind,
+        };
+
+        for changed in [false, true] {
+            let id = if changed {
+                "continuation-other-plan"
+            } else {
+                "continuation-own-ack"
+            };
+            let (_home, state, _project) = parked(id, 0).await;
+            let baseline = state
+                .capture_operation_origin(&state.instances.read().await[0])
+                .unwrap();
+            let lifecycle = std::sync::Mutex::new(LifecycleTable::new(0));
+            let lease = lifecycle
+                .lock()
+                .unwrap()
+                .admit(id, ResumeKind::Spawn)
+                .unwrap();
+            let issued = lifecycle.lock().unwrap().execution_admission(&lease);
+            issued.set_origin(Arc::clone(&baseline)).unwrap();
+            let custody = issued.begin_job();
+            let (prepared, preparation) = baseline
+                .prepare(&NativeResume::Spawn, &issued, |commit| {
+                    PreparationAuthorization::acquire(
+                        lifecycle.lock().unwrap(),
+                        &lease,
+                        &baseline,
+                        false,
+                        commit,
+                    )
+                })
+                .unwrap();
+            issued
+                .set_prepared_origin(Arc::clone(&prepared), preparation)
+                .unwrap();
+            let storage = baseline.storage();
+            let canonical = storage.load().unwrap().remove(0);
+            assert_ne!(
+                canonical.lifecycle_generation,
+                state.instances.read().await[0].lifecycle_generation
+            );
+            if changed {
+                state.instances.write().await[0].title = "another execution plan".into();
+            }
+            let before = std::fs::read(storage.sessions_path()).unwrap();
+            let result = install_rate_limit_continuation(
+                &state,
+                prepared,
+                [Some(Arc::clone(&baseline)), None],
+                state.session_service.prompt_submission(id).await,
+            )
+            .await;
+            if changed {
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+                assert!(state.instances.read().await[0]
+                    .pending_initial_turn
+                    .is_none());
+            } else {
+                assert!(matches!(result.unwrap(), ContinuationOutcome::Stands));
+                let persisted = storage.load().unwrap().remove(0);
+                assert_eq!(
+                    persisted.lifecycle_generation,
+                    canonical.lifecycle_generation
+                );
+                assert_eq!(
+                    persisted
+                        .pending_initial_turn
+                        .as_ref()
+                        .map(|turn| turn.text.as_str()),
+                    Some("run the nightly task")
+                );
+                assert_eq!(
+                    state.instances.read().await[0]
+                        .pending_initial_turn
+                        .as_ref()
+                        .map(|turn| turn.text.as_str()),
+                    Some("run the nightly task")
+                );
+            }
+            drop(custody);
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn a_continuation_refuses_a_replaced_profile_after_reading_its_prompt() {
@@ -944,7 +1051,8 @@ mod tests {
                 let state = Arc::clone(&state);
                 async move {
                     let submission = state.session_service.prompt_submission(id).await;
-                    install_rate_limit_continuation(&state, original, submission).await
+                    install_rate_limit_continuation(&state, original, [None, None], submission)
+                        .await
                 }
             });
             let (read_id, release) = tokio::time::timeout(Duration::from_secs(10), barrier.recv())
