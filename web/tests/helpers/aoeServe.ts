@@ -40,6 +40,8 @@ export interface SpawnOptions {
   tokenGraceSecs?: number;
   /** Install `fakeAcpAgent.mjs` as every agent shim instead of an idle stub. */
   acp?: boolean;
+  /** Use the existing @agentclientprotocol/sdk agent fixture. */
+  sdkAcp?: boolean;
   /** FAKE_ACP_SCRIPT path, or a script object written into the isolated HOME. */
   fakeAcpScript?: string | object;
   /** Extra env exported in the fake-ACP shim; a function receives the isolated HOME. */
@@ -394,10 +396,13 @@ function writeFakeAcpShim(
   fakeAcpScript: string | undefined,
   fakeAcpDebugLog: string,
   extraEnv: Record<string, string> | undefined,
+  sdkAcp: boolean,
 ): void {
   // Shim every command the supervisor can resolve (claude maps to claude-agent-acp), or it finds a
   // real adapter. Env is re-exported because the daemon to runner chain drops some variables.
-  const fakeAgentJs = resolve(__dirname, "fakeAcpAgent.mjs");
+  const fakeAgentJs = sdkAcp
+    ? resolve(__dirname, "../../../acp-worker/test-shim/shim.mjs")
+    : resolve(__dirname, "fakeAcpAgent.mjs");
   const scriptLines: string[] = [];
   if (fakeAcpScript) {
     scriptLines.push(`export FAKE_ACP_SCRIPT=${JSON.stringify(fakeAcpScript)}`);
@@ -486,6 +491,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
       script,
       fakeAcpDebugLog,
       typeof opts.extraEnv === "function" ? opts.extraEnv(home) : opts.extraEnv,
+      opts.sdkAcp ?? false,
     );
   } else {
     writeFakeClaudeShim(shimBin);

@@ -3328,6 +3328,17 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/hooks/useRespawnSession.ts"]
     },
     {
+      "id": "story.rate-limit-present-sdk-continuation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "src/server/api/acp/worker.rs",
+        "src/acp/supervisor.rs"
+      ]
+    },
+    {
       "id": "story.rate-limit-reset-across-turns",
       "kind": "live-playwright",
       "risk": "high",

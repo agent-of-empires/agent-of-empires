@@ -509,6 +509,9 @@ jobs:
           save-if: true
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install ACP SDK test shim
+        working-directory: acp-worker/test-shim
+        run: npm ci
       # Debug build instead of --release: --release with LTO and
       # codegen-units=1 cost ~6 min on the GitHub runner; debug builds
       # the same binary in ~2 min with no relevant runtime difference

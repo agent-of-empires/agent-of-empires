@@ -143,6 +143,8 @@ pub async fn spawn_acp(
                 );
             };
             drop(_guard);
+            tracing::debug!(target: "http.api.acp", session = %id,
+                "manual rate-limit spawn joined present resume after releasing instance lock");
             let operation = tokio::spawn(async move {
                 if let Err(error) = state.acp_supervisor.wait_for_present_resume(&present).await {
                     return supervisor_error_response("original worker is not ready", &error);
