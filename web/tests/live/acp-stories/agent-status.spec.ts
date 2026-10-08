@@ -157,10 +157,26 @@ test("manual rate-limit spawn joins an automatic SDK resume and continues the or
     const rows = JSON.parse(readFileSync(join(serve.appDir, "profiles", "main", "sessions.json"), "utf8")) as {
       id: string;
       lifecycle_generation: number;
-      active_execution: unknown;
+      runner_journal: {
+        launches: {
+          nonce: number[];
+          boot: number[];
+          generation: number;
+          incarnation: unknown;
+          profile_identity: unknown;
+        }[];
+      };
     }[];
     return rows.find((row) => row.id === sessionId)!;
   };
+  const births = (row: ReturnType<typeof canonical>) =>
+    row.runner_journal.launches.map(({ nonce, boot, generation, incarnation, profile_identity }) => ({
+      nonce,
+      boot,
+      generation,
+      incarnation,
+      profile_identity,
+    }));
   try {
     await expect.poll(() => existsSync(entered), { timeout: 75_000, intervals: [100, 200, 500] }).toBe(true);
     const held = JSON.parse(readFileSync(entered, "utf8")) as { pid: number; turnCursor: number };
@@ -170,7 +186,13 @@ test("manual rate-limit spawn joins an automatic SDK resume and continues the or
     expect(before.filter((frame) => frame.event?.AcpSessionAssigned !== undefined)).toHaveLength(1);
     const admitted = canonical();
     expect(admitted.lifecycle_generation).toBeGreaterThan(0);
-    expect(admitted.active_execution).not.toBeNull();
+    expect(births(admitted)).toContainEqual(
+      expect.objectContaining({
+        generation: admitted.lifecycle_generation,
+        incarnation: expect.any(Object),
+        profile_identity: expect.any(Object),
+      }),
+    );
     const manual = request(`/api/sessions/${sessionId}/acp/spawn`, {
       method: "POST",
       body: "{}",
@@ -221,7 +243,7 @@ test("manual rate-limit spawn joins an automatic SDK resume and continues the or
     expect(records[2].pid).toBe(held.pid);
     const after = canonical();
     expect(after.lifecycle_generation).toBe(admitted.lifecycle_generation);
-    expect(after.active_execution).toEqual(admitted.active_execution);
+    expect(births(after)).toEqual(births(admitted));
     expect((await replay()).filter((frame) => frame.event?.AcpSessionAssigned !== undefined)).toHaveLength(2);
     await testInfo.attach("sdk-resume-prompts", { path: prompts, contentType: "application/jsonl" });
     await testInfo.attach("sdk-held-initialize", { path: entered, contentType: "application/json" });
