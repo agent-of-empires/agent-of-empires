@@ -37,17 +37,18 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// rather than carried (and whitespace-flattened) in full every frame.
 const MAX_PROMPT_CHARS: usize = 200;
 
-/// Cached scrape for one session, with the instant it was taken so the caller
-/// can throttle refreshes and invalidate on a session switch.
+/// Cached scrape for one pane, keyed by the displayed tmux session name and
+/// stamped with when it was taken, so the caller can throttle refreshes and
+/// invalidate on a pane / view switch or a rename.
 pub(super) struct LastPromptCache {
-    pub(super) session: String,
+    pub(super) pane: String,
     pub(super) text: Option<String>,
     pub(super) at: Instant,
 }
 
 impl LastPromptCache {
-    fn is_fresh(&self, session: &str, now: Instant) -> bool {
-        self.session == session && now.duration_since(self.at) < REFRESH_INTERVAL
+    fn is_fresh(&self, pane: &str, now: Instant) -> bool {
+        self.pane == pane && now.duration_since(self.at) < REFRESH_INTERVAL
     }
 }
 
@@ -119,22 +120,19 @@ impl super::HomeView {
             self.last_prompt_cache = None;
             return;
         }
-        let Some(session_id) = self.selected_session.clone() else {
+        // Scrape the pane actually shown in the preview (honouring the view mode,
+        // live-send, and any rename), not a name rebuilt from the title.
+        let Some(tmux_name) = self.displayed_pane_tmux_name() else {
             self.last_prompt_cache = None;
             return;
         };
         let now = Instant::now();
-        if matches!(&self.last_prompt_cache, Some(c) if c.is_fresh(&session_id, now)) {
+        if matches!(&self.last_prompt_cache, Some(c) if c.is_fresh(&tmux_name, now)) {
             return;
         }
-        let Some(inst) = self.instances.get(&session_id) else {
-            self.last_prompt_cache = None;
-            return;
-        };
-        let tmux_name = Session::generate_name(&inst.id, &inst.title);
         let text = scrape(&tmux_name);
         self.last_prompt_cache = Some(LastPromptCache {
-            session: session_id,
+            pane: tmux_name,
             text,
             at: now,
         });
@@ -145,7 +143,7 @@ impl super::HomeView {
     /// last prompt scrolled past the capture window), a muted placeholder shows
     /// so the toggle is always visibly acknowledged.
     pub(super) fn last_prompt_footer_line(&self) -> Option<String> {
-        if !self.show_last_prompt || self.selected_session.is_none() {
+        if !self.show_last_prompt || self.displayed_pane_tmux_name().is_none() {
             return None;
         }
         let text = self
