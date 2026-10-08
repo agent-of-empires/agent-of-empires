@@ -1,6 +1,4 @@
-// The live daemon inherits process.env, so any variable naming config, data, or credentials would point it at
-// real agent state. Path-shaped names are dropped wholesale, a few needed ones are kept, and host state under
-// unsuffixed names is dropped or pinned by name (#3657). isolatedEnv.test.ts enforces the contract against src/.
+// Redirect owned paths and prevent the live daemon from inheriting host state or subprocess controls.
 
 import { join } from "node:path";
 
@@ -43,6 +41,8 @@ export const HOST_STATE_VARS = new Set([
   "AOE_E2E_PARTIAL_FRAME_FILE",
   "AOE_E2E_PROMPT_COMPLETED_FILE",
   "AOE_E2E_STORAGE_LOCK_CONTENDED",
+  "AOE_ISOLATED_RUNNER_TEST",
+  "AOE_TEST_STOP_RETIRE_GATE",
   "AOE_TEST_NATIVE_ISSUER",
   "AOE_TEST_RESERVATION_RUNTIME_SHUTDOWN",
   "AOE_TUI_TEST_CHILD",

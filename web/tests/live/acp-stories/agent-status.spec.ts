@@ -154,7 +154,7 @@ test("manual rate-limit spawn joins an automatic SDK resume and continues the or
     return body.frames;
   };
   const canonical = () => {
-    const rows = JSON.parse(readFileSync(join(serve.appDir, "profiles", "default", "sessions.json"), "utf8")) as {
+    const rows = JSON.parse(readFileSync(join(serve.appDir, "profiles", "main", "sessions.json"), "utf8")) as {
       id: string;
       lifecycle_generation: number;
       active_execution: unknown;
