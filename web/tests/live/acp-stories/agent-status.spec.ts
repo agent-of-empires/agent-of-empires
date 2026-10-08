@@ -146,9 +146,12 @@ test("manual rate-limit spawn joins an automatic SDK resume and continues the or
   const replay = async () => {
     const response = await request(`/api/sessions/${sessionId}/acp/replay?since=0`);
     expect(response.status).toBe(200);
-    return (await response.json()) as {
-      event?: { RateLimitAutoResumed?: { manual?: boolean }; AcpSessionAssigned?: unknown };
-    }[];
+    const body = (await response.json()) as {
+      frames: {
+        event?: { RateLimitAutoResumed?: { manual?: boolean }; AcpSessionAssigned?: unknown };
+      }[];
+    };
+    return body.frames;
   };
   const canonical = () => {
     const rows = JSON.parse(readFileSync(join(serve.appDir, "profiles", "default", "sessions.json"), "utf8")) as {
