@@ -57,7 +57,13 @@ function postPush(path: string, body: unknown): Promise<Response> {
 
 async function removeExpiredPushEndpoint(endpoint: string): Promise<void> {
   const response = await postPush("unsubscribe", { endpoint }).catch(() => null);
-  if (!response?.ok) throw new Error("Could not remove the expired notification subscription");
+  if (response?.ok) return;
+
+  // A removal may succeed server-side before its response is lost. A 403 also
+  // means another owner may hold the endpoint, so confirm absence before retrying.
+  const status = await fetchStatus(endpoint);
+  if (status.subscription?.registered === false) return;
+  throw new Error("Could not remove the expired notification subscription");
 }
 
 function subscribeBody(sub: PushSubscription) {

@@ -33,6 +33,9 @@ let calls: string[];
 const IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)";
 const DISABLED_BY_SERVER = { status: { ok: true, body: { enabled: false } } };
 
+type StubStatusResponse = { ok: boolean; body: unknown } | Error;
+type StubUnsubscribeResponse = number | Error;
+
 function setServiceWorkerReady(ready: Promise<unknown>) {
   Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { ready } });
 }
@@ -45,24 +48,31 @@ function rejectServiceWorker(message: string) {
 
 interface FetchOverrides {
   status?: { ok: boolean; body: unknown };
+  statusResponses?: StubStatusResponse[] | (() => StubStatusResponse);
   statusError?: Error;
   vapid?: number;
   subscribe?: number;
   unsubscribe?: number;
+  unsubscribeResponses?: StubUnsubscribeResponse[] | (() => StubUnsubscribeResponse);
   test?: number;
   testBody?: unknown;
 }
 
 function installFetch(overrides: FetchOverrides = {}) {
   calls = [];
+  let statusIndex = 0;
+  let unsubscribeIndex = 0;
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       calls.push(url);
       if (url.includes("/status")) {
+        const responses = overrides.statusResponses;
+        const response = typeof responses === "function" ? responses() : responses?.[statusIndex++];
+        if (response instanceof Error) throw response;
         if (overrides.statusError) throw overrides.statusError;
-        const o = overrides.status ?? { ok: true, body: { enabled: true } };
+        const o = response ?? overrides.status ?? { ok: true, body: { enabled: true } };
         return new Response(JSON.stringify(o.body), { status: o.ok ? 200 : 500 });
       }
       if (url.includes("/vapid-public-key")) {
@@ -71,11 +81,13 @@ function installFetch(overrides: FetchOverrides = {}) {
       if (url.includes("/test")) {
         return new Response(JSON.stringify(overrides.testBody ?? {}), { status: overrides.test ?? 200 });
       }
-      const status = url.includes("/unsubscribe")
-        ? overrides.unsubscribe
-        : url.includes("/subscribe")
-          ? overrides.subscribe
-          : 200;
+      if (url.includes("/unsubscribe")) {
+        const responses = overrides.unsubscribeResponses;
+        const response = typeof responses === "function" ? responses() : responses?.[unsubscribeIndex++];
+        if (response instanceof Error) throw response;
+        return new Response("{}", { status: response ?? overrides.unsubscribe ?? 200 });
+      }
+      const status = url.includes("/subscribe") ? overrides.subscribe : 200;
       return new Response("{}", { status: status ?? 200 });
     }),
   );
@@ -361,37 +373,88 @@ describe("usePushSubscription enable() with an existing subscription", () => {
     expect(subscribeImpl).not.toHaveBeenCalled();
   });
 
-  it("retries expired endpoint removal before registering after browser unsubscribe", async () => {
+  it("reconciles a lost removal response on retry before registering", async () => {
     const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
     const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
     currentSub = existing;
     const subscribe = vi.fn(async () => (currentSub = replacement));
     subscribeImpl = subscribe;
+    let serverRegistered = true;
+    let statusRequests = 0;
+    let removalRequests = 0;
+    const statusResponse = (): StubStatusResponse => {
+      statusRequests += 1;
+      if (statusRequests === 3) return new Error("status unavailable");
+      return {
+        ok: true,
+        body: {
+          enabled: true,
+          public_key: SERVER_KEY,
+          subscription: serverSub({
+            registered: serverRegistered,
+            owned: serverRegistered,
+            last_failure: "gone",
+            last_failure_at: "2026-09-02T10:00:00Z",
+          }),
+        },
+      };
+    };
+    const unsubscribeResponse = (): StubUnsubscribeResponse => {
+      removalRequests += 1;
+      if (!serverRegistered) return 403;
+      serverRegistered = false;
+      return new Error("removal response lost");
+    };
+    installFetch({
+      statusResponses: statusResponse,
+      unsubscribeResponses: unsubscribeResponse,
+    });
+    const { result } = await mountAndSettle();
+    calls.length = 0;
+
+    expect(await act_(result, "enable")).toEqual(error("status unavailable"));
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(serverRegistered).toBe(false);
+    expect(currentSub).toBeNull();
+    expect(subscribe).not.toHaveBeenCalled();
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(removalRequests).toBe(2);
+    expect(serverRegistered).toBe(false);
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(currentSub).toBe(replacement);
+    const removalIndex = calls.findLastIndex((url) => url.includes("/api/push/unsubscribe"));
+    const absenceCheckIndex = calls.findIndex(
+      (url, index) => index > removalIndex && url.includes("/api/push/status?endpoint="),
+    );
+    const registrationIndex = calls.findIndex((url) => url.includes("/api/push/subscribe"));
+    expect(removalIndex).toBeGreaterThanOrEqual(0);
+    expect(absenceCheckIndex).toBeGreaterThan(removalIndex);
+    expect(registrationIndex).toBeGreaterThan(absenceCheckIndex);
+  });
+
+  it("does not treat a forbidden removal as success while another owner has the endpoint", async () => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    currentSub = existing;
+    subscribeImpl = vi.fn(async () => makeSubscription("https://push.example/replacement", keyBytes("ABC")));
     const expiredStatus = statusWith(
       serverSub({
-        registered: true,
-        owned: true,
         last_failure: "gone",
         last_failure_at: "2026-09-02T10:00:00Z",
       }),
     );
-    installFetch({ ...expiredStatus, unsubscribe: 500 });
+    const otherOwnerStatus = statusWith(serverSub({ owned: false }));
+    installFetch({
+      statusResponses: [expiredStatus.status, expiredStatus.status, otherOwnerStatus.status],
+      unsubscribeResponses: [403],
+    });
     const { result } = await mountAndSettle();
-    calls.length = 0;
 
     expect(await act_(result, "enable")).toEqual(error("Could not remove the expired notification subscription"));
     expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
     expect(currentSub).toBeNull();
-    expect(subscribe).not.toHaveBeenCalled();
-
-    installFetch({ ...expiredStatus, unsubscribe: 200 });
-    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
-    expect(subscribe).toHaveBeenCalledTimes(1);
-    expect(currentSub).toBe(replacement);
-    const removalIndex = calls.findIndex((url) => url.includes("/api/push/unsubscribe"));
-    const registrationIndex = calls.findIndex((url) => url.includes("/api/push/subscribe"));
-    expect(removalIndex).toBeGreaterThanOrEqual(0);
-    expect(registrationIndex).toBeGreaterThan(removalIndex);
+    expect(subscribeImpl).not.toHaveBeenCalled();
   });
 
   it("does not replace an endpoint when browser unsubscribe fails", async () => {
