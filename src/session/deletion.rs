@@ -100,6 +100,7 @@ enum PurgeCleanup {
 pub struct PurgeTransaction {
     storage: Storage,
     original: std::sync::Arc<crate::session::LaunchOrigin>,
+    native_stop: std::sync::Arc<crate::session::runner_journal::OwnedStop>,
     request: DeletionRequest,
     cleanup: PurgeCleanup,
     was_trashed: bool,
@@ -270,9 +271,12 @@ impl PurgeTransaction {
         if lifecycle_changed {
             request.force_delete = false;
         }
+        let native_stop =
+            crate::session::runner_journal::OwnedStop::from_purge(original.clone(), generation);
         Ok(PurgeReservation::Reserved(Self {
             storage,
             original,
+            native_stop,
             request,
             cleanup,
             was_trashed,
@@ -292,10 +296,7 @@ impl PurgeTransaction {
     pub(crate) fn native_stop_scope(
         &self,
     ) -> std::sync::Arc<crate::session::runner_journal::OwnedStop> {
-        crate::session::runner_journal::OwnedStop::from_purge(
-            self.original.clone(),
-            self.generation,
-        )
+        self.native_stop.clone()
     }
 
     /// Validate cross-profile ownership before hooks or irreversible row removal.
