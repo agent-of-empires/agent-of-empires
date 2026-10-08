@@ -5,7 +5,7 @@
 // resolves through ArtifactImage's authenticated fetch instead (see artifactMedia.tsx).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import {
   AssistantRuntimeProvider,
   ThreadPrimitive,
@@ -14,9 +14,12 @@ import {
 } from "@assistant-ui/react";
 
 import { parseJsonObject } from "../../lib/acpArgs";
+import { writeClipboard } from "../../lib/clipboard";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { activityToThreadMessages, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME } from "./activityMessages";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
+
+vi.mock("../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
 
 vi.mock("../../lib/acpArgs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/acpArgs")>();
@@ -87,6 +90,30 @@ describe("AssistantMessage compaction summary", () => {
     expect(details!.open).toBe(false);
     expect(details!.querySelector("summary")?.textContent).toContain("Compaction summary");
     expect(details!.textContent).toContain("PINEAPPLE-42");
+  });
+});
+
+describe("AssistantMessage table copy across an interrupted turn", () => {
+  const at = "2026-05-12T00:00:00Z";
+  const CUT_OFF = "| a | b |\n|---|---|\n| 1 | 2";
+  const thread = (busy: boolean) =>
+    activityToThreadMessages(
+      [
+        { id: "u1", kind: "user_prompt", text: "go", at },
+        { id: "m1", kind: "message", text: CUT_OFF, at },
+      ],
+      busy,
+    );
+
+  it("offers no copy while the turn runs, then copies the received rows once it stops mid-row", async () => {
+    const { container, rerender, getByRole, queryByRole } = render(<Harness messages={thread(true)} />);
+    // The display has caught up with everything received, so only the running turn withholds the copy.
+    await waitFor(() => expect(container.querySelector("tbody td:last-child")?.textContent).toBe("2"));
+    expect(queryByRole("button", { name: /copy table/i })).toBeNull();
+
+    rerender(<Harness messages={thread(false)} />);
+    fireEvent.click(getByRole("button", { name: "Copy table as markdown" }));
+    await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith(CUT_OFF));
   });
 });
 

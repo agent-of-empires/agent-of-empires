@@ -4,11 +4,15 @@
 
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import type { SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
+import { Check, Copy as CopyIcon } from "lucide-react";
 import * as React from "react";
-import { useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import type { ExtraProps } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
+import { writeClipboard } from "../../lib/clipboard";
+import { tableSource } from "../../lib/tableMarkdown";
 import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseFileRef, resolveArtifactUrl, resolveToRepoRelative } from "../../lib/fileRef";
@@ -30,22 +34,29 @@ export function remarkPluginsFor(breaks: boolean) {
   return breaks ? [remarkGfm, remarkBreaks] : [remarkGfm];
 }
 
+/** The message markdown received so far, which a table slices its own source from. */
+const TableSourceContext = createContext<{ text: string; complete: boolean } | null>(null);
+
 export function Markdown({ text, smooth = false, breaks = false }: Props) {
   const remarkPlugins = useMemo(() => remarkPluginsFor(breaks), [breaks]);
+  // `smooth` is set only on the live streaming message, whose text can still grow.
+  const tableContext = useMemo(() => ({ text, complete: !smooth }), [text, smooth]);
   return (
-    <MarkdownTextPrimitive
-      preprocess={() => text}
-      smooth={smooth}
-      remarkPlugins={remarkPlugins}
-      className="acp-markdown acp-markdown-body leading-relaxed"
-      components={{
-        SyntaxHighlighter: ShikiSyntaxHighlighter,
-        table: TableWithScroll,
-        blockquote: Blockquote,
-        a: TranscriptLink,
-        img: TranscriptImage,
-      }}
-    />
+    <TableSourceContext.Provider value={tableContext}>
+      <MarkdownTextPrimitive
+        preprocess={() => text}
+        smooth={smooth}
+        remarkPlugins={remarkPlugins}
+        className="acp-markdown acp-markdown-body leading-relaxed"
+        components={{
+          SyntaxHighlighter: ShikiSyntaxHighlighter,
+          table: TableWithScroll,
+          blockquote: Blockquote,
+          a: TranscriptLink,
+          img: TranscriptImage,
+        }}
+      />
+    </TableSourceContext.Provider>
   );
 }
 
@@ -133,11 +144,44 @@ function childrenText(children: React.ReactNode): string {
 }
 
 /** Scroll wrapper, so the table keeps native column sizing (`display: block` breaks it). */
-function TableWithScroll({ children, ...rest }: React.ComponentPropsWithoutRef<"table">) {
+function TableWithScroll({ children, node, ...rest }: React.ComponentPropsWithoutRef<"table"> & ExtraProps) {
+  const received = useContext(TableSourceContext);
+  const source = received && node ? tableSource(received.text, node, received.complete) : null;
   return (
-    <div className="acp-table-wrap">
-      <table {...rest}>{children}</table>
+    <div className="acp-table-block">
+      <div className="acp-table-wrap">
+        <table {...rest}>{children}</table>
+      </div>
+      {source !== null && <CopyTableButton source={source} />}
     </div>
+  );
+}
+
+/** Sits outside the scroll area so it stays put while a wide table scrolls. */
+function CopyTableButton({ source }: { source: string }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  async function copy() {
+    if (!(await writeClipboard(source))) return;
+    setCopied(true);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setCopied(false), 1500);
+  }
+
+  const label = copied ? "Copied" : "Copy table as markdown";
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={() => void copy()}
+      className="acp-table-copy absolute right-1 top-1 z-10 rounded bg-surface-900 p-1.5 text-text-dim hover:bg-surface-800 hover:text-text-secondary"
+      data-copied={copied}
+    >
+      {copied ? <Check className="h-3 w-3" /> : <CopyIcon className="h-3 w-3" />}
+    </button>
   );
 }
 
