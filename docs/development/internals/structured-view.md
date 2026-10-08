@@ -45,6 +45,8 @@ One daemon trash-reconciliation invocation builds one path-claim index from each
 
 Filesystem reservations cover the full future workspace and repository path set before effects. Creation publication carries the original opaque `CreationIntent` and the actual canonical write acknowledgement; neither is native execution authority. A replacement profile, changed plan, unreadable peer inventory, or unproven cancellation retains the reservation. See [worktree cleanup](../../guides/worktrees.md#cleanup) for the retention contract.
 
+Live teardown retains HOME after a refused original Stop and attaches the canonical stored session rows and available daemon/runner logs to the failed Playwright result. These snapshots diagnose the refusal; they cannot replace original physical custody, publication acknowledgements or native-group quiescence.
+
 ## Who owns the state
 
 The daemon folds the event stream once per WebSocket connection into two projections, so clients do not re-derive them:

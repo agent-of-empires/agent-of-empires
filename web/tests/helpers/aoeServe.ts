@@ -59,6 +59,7 @@ export interface ServeHandle {
   baseUrl: string;
   port: number;
   home: string;
+  appDir: string;
   shimBin: string;
   /** The isolated env; pass it to any `aoe` CLI subprocess or it reads the real config. */
   env: NodeJS.ProcessEnv;
@@ -655,6 +656,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
       baseUrl,
       port,
       home,
+      appDir,
       shimBin,
       env: seedEnv,
       proc,

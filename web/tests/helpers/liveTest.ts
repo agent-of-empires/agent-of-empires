@@ -92,7 +92,13 @@ export const test = base.extend<LiveFixtures>({
       for (const { handle, acp } of handles) if (acp) await attachServeDiagnostics(testInfo, handle).catch(() => {});
     }
     const results = await Promise.allSettled(handles.map(({ handle }) => handle.stop()));
-    const errors = results.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
+    const errors: unknown[] = [];
+    for (const [index, result] of results.entries()) {
+      if (result.status === "rejected") {
+        errors.push(result.reason);
+        await attachServeDiagnostics(testInfo, handles[index].handle).catch((error) => errors.push(error));
+      }
+    }
     if (errors.length) throw new AggregateError(errors, "live server teardown failed");
   },
   serve: async ({ spawnServe }, use) => use(await spawnServe()),
