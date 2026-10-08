@@ -70,11 +70,11 @@ impl RegistryOwner {
     pub(super) async fn retire(self: &Arc<Self>) -> anyhow::Result<bool> {
         let owner = self.clone();
         tokio::task::spawn_blocking(move || {
-            owner.storage.verify_profile_identity()?;
             let record = owner
                 .record
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            owner.storage.verify_profile_identity()?;
             anyhow::Ok(worker_registry::delete_if_owned_by(&record))
         })
         .await

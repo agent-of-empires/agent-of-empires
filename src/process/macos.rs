@@ -5,6 +5,40 @@ pub(super) const BOOTSTRAP_RECV_FLAGS: i32 = 0;
 use std::collections::HashMap;
 use std::process::Command;
 
+/// # Safety
+/// `message` must point to live writable data and control buffers.
+pub(crate) unsafe fn reject_truncated_bootstrap_rights(
+    channel: &std::os::unix::net::UnixStream,
+    message: &mut libc::msghdr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let capacity = message.msg_controllen;
+    loop {
+        message.msg_controllen = capacity;
+        // XNU peeks without creating FDs, but externalizes all rights before copyout.
+        let received = unsafe { libc::recvmsg(channel.as_raw_fd(), message, libc::MSG_PEEK) };
+        if received >= 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    let truncated = message.msg_flags & libc::MSG_CTRUNC != 0 || message.msg_controllen > capacity;
+    message.msg_controllen = capacity;
+    message.msg_flags = 0;
+    if truncated {
+        channel.shutdown(std::net::Shutdown::Read)?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "original descriptor transfer was truncated",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };

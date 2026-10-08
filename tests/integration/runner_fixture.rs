@@ -147,14 +147,13 @@ pub(super) async fn spawn_runner_with_shim(
     session_id: &str,
     env: &[(&str, String)],
 ) -> (PathBuf, RunnerGuard) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
     let home = temp.path().join("home");
     let xdg = temp.path().join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
 
-    // The daemon verifies the id the runner announces, so `session_id` must
-    // match what the caller later attaches with.
+    // The control handshake verifies the announced session id.
     let socket_path = temp.path().join(format!("{session_id}.sock"));
     let control = temp.path().join(format!("{session_id}.control.sock"));
 

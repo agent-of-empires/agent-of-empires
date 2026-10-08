@@ -294,6 +294,11 @@ fn receive_descriptors(channel: &UnixStream) -> Result<[OwnedFd; 4]> {
     message.msg_iovlen = 1;
     message.msg_control = ancillary.as_mut_ptr().cast();
     message.msg_controllen = std::mem::size_of::<Ancillary>() as _;
+    #[cfg(target_os = "macos")]
+    // SAFETY: marker, payload and ancillary buffers remain live for this call.
+    unsafe {
+        crate::process::reject_truncated_bootstrap_rights(channel, &mut message)?;
+    }
     let received = loop {
         let received = unsafe {
             libc::recvmsg(

@@ -299,8 +299,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
     };
 
-    let mut preserve_registry = false;
-
     tokio::select! {
         requested = &mut stop_request => {
             stop_endpoint.cleanup();
@@ -363,18 +361,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
         reason = &mut watchdog_rx => {
             if let Ok(reason) = reason {
-                // The replacement runner owns the registry and socket now.
-                if matches!(reason, WatchdogShutdown::Superseded) {
-                    preserve_registry = true;
-                }
                 stop_endpoint.cleanup();
                 self_terminate_agent_tree(reason, &session_id, &owner, &mut agent_child).await;
             }
         }
         terminate_runner = accept_loop => {
             debug_assert!(terminate_runner);
-            // The daemon may already have spawned a replacement; never unlink it.
-            preserve_registry = true;
             let _ = agent_child.start_kill();
             let _ = agent_child.wait().await;
         }
@@ -382,9 +374,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
-    if !preserve_registry {
-        let _ = owner.retire().await;
-    }
+    let _ = owner.retire().await;
     stop_endpoint.cleanup();
     if !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
         let _ = agent_child.start_kill();

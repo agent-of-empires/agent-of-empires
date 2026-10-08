@@ -51,6 +51,8 @@ pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
     let _ = cmd;
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) use macos::reject_truncated_bootstrap_rights;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use platform::HAS_CODEX_MANAGED_PREFERENCES;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
