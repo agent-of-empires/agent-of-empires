@@ -1055,7 +1055,7 @@ mod serve {
         Skipped(String),
         /// The one-shot ran, or the write was attempted, and failed.
         Failed(String),
-        /// [`RENAME_DEADLINE`] passed while queued for a slot or in the one-shot.
+        /// `RENAME_DEADLINE` passed while queued for a slot or in the one-shot.
         TimedOut,
     }
 
