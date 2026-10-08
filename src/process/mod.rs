@@ -38,6 +38,10 @@ mod platform {
         false
     }
 
+    pub(super) fn is_process_group_alive(pgid: u32) -> bool {
+        pgid != 0 && super::worker::is_pid_alive_and_ours(pgid)
+    }
+
     pub(super) fn process_group_has_live_members(_pgrp: u32) -> std::io::Result<bool> {
         Ok(false)
     }

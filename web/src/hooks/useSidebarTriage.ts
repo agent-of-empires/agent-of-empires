@@ -15,10 +15,11 @@ export interface TriageResult {
   workspaceId: string;
   ok: boolean;
   skipped?: boolean;
+  message?: string;
 }
 
 function reportFailure(result: TriageResult, message: string): void {
-  if (!result.ok && !result.skipped) reportError(message);
+  if (!result.ok && !result.skipped) reportError(result.message ?? message);
 }
 
 export function useSidebarTriage(workspaces: readonly Workspace[]) {
@@ -47,20 +48,22 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
       ws: Workspace,
       optimistic: Partial<OptimisticTriage>,
       revert: Partial<OptimisticTriage>,
-      call: (sessionId: string) => Promise<unknown>,
+      call: (sessionId: string) => Promise<{ ok: boolean; message?: string }>,
     ): Promise<TriageResult> => {
       const sessionId = ws.sessions[0]?.id;
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
       setOverride(ws.id, optimistic);
-      if (await call(sessionId)) return { workspaceId: ws.id, ok: true };
+      const result = await call(sessionId);
+      if (result.ok) return { workspaceId: ws.id, ok: true };
       setOverride(ws.id, revert);
-      return { workspaceId: ws.id, ok: false };
+      return { workspaceId: ws.id, ok: false, message: result.message };
     },
     [setOverride],
   );
 
   const pin = useCallback(
-    (ws: Workspace, pinned: boolean) => triage(ws, { pinned }, { pinned: null }, (id) => setSessionPin(id, pinned)),
+    (ws: Workspace, pinned: boolean) =>
+      triage(ws, { pinned }, { pinned: null }, async (id) => ({ ok: (await setSessionPin(id, pinned)) !== null })),
     [triage],
   );
 
@@ -83,7 +86,9 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const unread = useCallback(
     (ws: Workspace, markUnread: boolean) =>
-      triage(ws, { unread: markUnread }, { unread: null }, (id) => setSessionUnread(id, markUnread)),
+      triage(ws, { unread: markUnread }, { unread: null }, async (id) => ({
+        ok: (await setSessionUnread(id, markUnread)) !== null,
+      })),
     [triage],
   );
 

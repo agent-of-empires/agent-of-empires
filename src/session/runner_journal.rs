@@ -489,7 +489,7 @@ fn prepare_locked<'a>(
         })();
         let _ = retired_tx.send(Some(result.is_ok()));
         if let Err(error) = result {
-            tracing::warn!(session = %session_id, %error, "preparation completion remains unproven");
+            tracing::warn!(target: "acp.supervisor", session = %session_id, %error, "preparation completion remains unproven");
         }
     })?;
     let custody = PreparationCustody {
@@ -1254,11 +1254,11 @@ impl Drop for OwnedStop {
         let generation = self.generation;
         let result = std::thread::Builder::new().name("aoe-owned-stop-retirement".into()).spawn(move || {
             if let Err(error) = release_stop_claim(&original, generation) {
-                tracing::debug!(session = %original.session_id(), %error, "original stop retirement preserved a changed scope");
+                tracing::debug!(target: "acp.supervisor", session = %original.session_id(), %error, "original stop retirement preserved a changed scope");
             }
         });
         if let Err(error) = result {
-            tracing::warn!(%error, "owned stop retirement could not start; reservation remains fenced");
+            tracing::warn!(target: "acp.supervisor", %error, "owned stop retirement could not start; reservation remains fenced");
         }
     }
 }
@@ -2518,7 +2518,7 @@ async fn settle_selected_owned(
                 "cannot prove the original runner idle before moving its checkout"
             );
             if !accepted {
-                tracing::debug!(session = %scope.session_id(), pid = incarnation.pid, "runner stop endpoint unavailable");
+                tracing::debug!(target: "acp.supervisor", session = %scope.session_id(), pid = incarnation.pid, "runner stop endpoint unavailable");
             }
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);

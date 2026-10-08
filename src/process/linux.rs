@@ -7,6 +7,16 @@ use std::fs;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+pub(super) fn is_process_group_alive(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    if super::worker::is_pid_alive_and_ours(pgid) && !is_terminated(pgid) {
+        return true;
+    }
+    process_group_has_live_members(pgid).unwrap_or(true)
+}
+
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };
@@ -397,7 +407,12 @@ pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool>
         }
         let stat = match fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue
+            }
             Err(error) => return Err(error),
         };
         let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat");

@@ -65,7 +65,6 @@ pub struct LifecycleReservation {
     pub op: LifecycleOperation,
     pub generation: u64,
     pub at: DateTime<Utc>,
-    #[serde(default)]
     pub path_claims: WorktreePathClaims,
 }
 

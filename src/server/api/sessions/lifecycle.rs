@@ -323,7 +323,7 @@ pub async fn update_session_archive(
         crate::session::runner_journal::finish_owned_stop(&generation, |row| {
             if kill_pane {
                 if let Err(error) = row.kill_locked() {
-                    tracing::debug!(session = %persist_id, %error, "archive tmux teardown failed");
+                    tracing::debug!(target: "http.api.sessions", session = %persist_id, %error, "archive tmux teardown failed");
                 }
                 row.kill_ancillary_tmux_sessions_locked();
             }
@@ -1204,11 +1204,23 @@ pub async fn stop_session(
     let native_stop = if is_structured {
         let original = match state.capture_operation_origin(&expected) {
             Ok(original) => original,
-            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "original_authority_changed",
+                    error.to_string(),
+                )
+            }
         };
         let stop = match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
             Ok(stop) => stop,
-            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "stop_not_authorized",
+                    error.to_string(),
+                )
+            }
         };
         let owner = stop.clone();
         let instances = Arc::clone(&state.instances);
@@ -1266,7 +1278,7 @@ pub async fn stop_session(
         match state.acp_supervisor.shutdown(stop.clone()).await {
             Ok(()) => {
                 if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
-                    tracing::warn!(%error, "original stop claim remains protected");
+                    tracing::warn!(target: "http.api.sessions", %error, "original stop claim remains protected");
                 }
             }
             Err(e) => tracing::warn!(
@@ -1589,11 +1601,23 @@ pub async fn update_session_snooze(
     let native_stop = if was_structured_view && minutes.is_some() {
         let original = match state.capture_operation_origin(&expected) {
             Ok(original) => original,
-            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "original_authority_changed",
+                    error.to_string(),
+                )
+            }
         };
         match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
             Ok(stop) => Some(stop),
-            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "snooze_not_authorized",
+                    error.to_string(),
+                )
+            }
         }
     } else {
         None
@@ -1679,7 +1703,7 @@ pub async fn update_session_snooze(
         match state.acp_supervisor.shutdown(stop.clone()).await {
             Ok(()) => {
                 if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
-                    tracing::warn!(%error, "original snooze claim remains protected");
+                    tracing::warn!(target: "http.api.sessions", %error, "original snooze claim remains protected");
                 }
             }
             Err(e) => tracing::warn!(

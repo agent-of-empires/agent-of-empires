@@ -12,7 +12,7 @@ impl HomeView {
         self.instances
             .values()
             .filter(|i| {
-                !self.recovery_in_flight.contains(&i.id)
+                !self.recovery_in_flight.contains_key(&i.id)
                     && !self.restart_in_flight.contains_key(&i.id)
             })
             .cloned()
@@ -249,7 +249,7 @@ impl HomeView {
     /// because `agent_row_icon` lets `Error` punch through the sunk-row mask on purpose,
     /// and unarchiving is the only way back. The tmux producer has the same property.
     fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
-        !self.recovery_in_flight.contains(&inst.id)
+        !self.recovery_in_flight.contains_key(&inst.id)
             && !self.restart_in_flight.contains_key(&inst.id)
             && !inst.is_archived()
             && !inst.is_trashed()

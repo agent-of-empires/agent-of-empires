@@ -344,23 +344,16 @@ const requestCases: RequestCase[] = [
   ],
   ["PATCH /api/sessions/s1/color", () => api.setSessionColor("s1", null), { body: { color: null } }],
   [
-    "PATCH /api/sessions/s1/archive",
-    () => api.setSessionArchive("s1", true),
-    { body: { archived: true, kill_pane: true } },
-  ],
-  [
     "POST /api/sessions/s1/trash",
     () => api.trashSession("s1"),
     { body: { kill_pane: true }, respond: json(session), result: session },
   ],
   ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
-  ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
   [
     "POST /api/sessions/s1/start",
     () => api.startSession("s1"),
     { respond: json(session), result: { ok: true, session } },
   ],
-  ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
     "DELETE /api/workspaces",
@@ -557,6 +550,42 @@ describe("request shapes", () => {
     if (body === undefined) expect(last.init?.body).toBeUndefined();
     else expect(bodyOf(last.init)).toEqual(body);
     if (result !== undefined) expect(out).toEqual(result);
+  });
+});
+
+describe("lifecycle refusals", () => {
+  it.each([
+    ["stop", () => api.stopSession("s1")],
+    ["archive", () => api.setSessionArchive("s1", true)],
+    ["snooze", () => api.setSessionSnooze("s1", 60)],
+  ])("%s preserves the server refusal instead of returning a success snapshot", async (_action, call) => {
+    fetchSpy.mockResolvedValueOnce(json({ error: "teardown_pending", message: "runner execution is still live" }, 409));
+    expect(await call()).toEqual({
+      ok: false,
+      status: 409,
+      code: "teardown_pending",
+      message: "runner execution is still live",
+    });
+  });
+
+  it.each([
+    ["server error", () => empty(500), 500],
+    ["non-JSON refusal", () => new Response("refused", { status: 409 }), 409],
+    ["empty success", () => empty(), 200],
+    ["missing session", () => json({}), 200],
+  ])("does not infer a stopped session from %s", async (_case, response, status) => {
+    fetchSpy.mockResolvedValueOnce(response());
+    expect(await api.stopSession("s1")).toEqual({
+      ok: false,
+      status,
+      code: undefined,
+      message: `Failed to stop session (HTTP ${status}).`,
+    });
+  });
+
+  it("reports network failure without a session projection", async () => {
+    offline();
+    expect(await api.stopSession("s1")).toEqual({ ok: false, message: "Network error: offline" });
   });
 });
 

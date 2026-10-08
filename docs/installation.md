@@ -30,6 +30,8 @@ aoe update
 
 If you installed shell completions as a static file, regenerate it afterwards so it picks up new commands and flags; see [Shell completions](guides/shell-completions.md) for the always-fresh setup that avoids this.
 
+Stop older writers before opening an upgraded data store. Legacy sessions without recorded execution history require [verified different-boot coverage](guides/worktrees.md#legacy-execution-coverage-after-an-upgrade) before checkout relocation or destructive cleanup; restarting the daemon is not that proof.
+
 ## Downgrading
 
 Downgrades are not supported: the older build refuses to start when `.schema_version` records a newer data schema, and that refusal is the safe outcome, because a migration that retypes a persisted field writes a shape the previous release cannot read.

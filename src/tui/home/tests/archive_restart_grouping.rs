@@ -760,6 +760,83 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
 
 #[test]
 #[serial]
+fn rejected_launch_callbacks_retire_only_their_original_request() {
+    for recovery in [false, true] {
+        for newer_request in [false, true] {
+            let mut env = create_test_env_with_sessions(1);
+            let before = env.view.instance_at(0).clone();
+            let id = before.id.clone();
+            let original = super::super::RequestOrigin::capture(&before).unwrap();
+            let profile = crate::session::get_profile_dir_path("test").unwrap();
+            std::fs::rename(&profile, profile.with_file_name("displaced-test")).unwrap();
+            let replacement = Storage::new_unwatched("test").unwrap();
+            let mut peer = Instance::new("replacement", "/tmp/replacement");
+            peer.id = id.clone();
+            peer.source_profile = "test".into();
+            replacement
+                .update(|rows, _| {
+                    rows.push(peer);
+                    Ok(())
+                })
+                .unwrap();
+            let peer = replacement.load().unwrap().remove(0);
+            let pending = if newer_request {
+                env.view.instances.insert(id.clone(), peer.clone());
+                super::super::RequestOrigin::capture(&peer).unwrap()
+            } else {
+                original
+            };
+            let memory_before = serde_json::to_value(env.view.get_instance(&id).unwrap()).unwrap();
+            let disk_before = serde_json::to_value(replacement.load().unwrap()).unwrap();
+            let mut after = before.clone();
+            after.last_error = Some("stale worker error".into());
+            let result = Err("launch could not publish".to_string());
+            if recovery {
+                env.view.recovery_in_flight.insert(id.clone(), pending);
+                let (tx, rx) = std::sync::mpsc::channel();
+                env.view.recovery_rx = Some(rx);
+                tx.send(super::super::RecoveryUpdate {
+                    instance_id: id.clone(),
+                    title: before.title.clone(),
+                    before: Box::new(before),
+                    instance: Box::new(after),
+                    result,
+                })
+                .unwrap();
+                assert_eq!(env.view.apply_recovery_updates(), !newer_request);
+                assert_eq!(env.view.recovery_in_flight.contains_key(&id), newer_request);
+            } else {
+                env.view.restart_in_flight.insert(id.clone(), pending);
+                env.view.attach_after_restart.insert(id.clone());
+                env.view.restart_poller =
+                    crate::tui::restart_poller::RestartPoller::with_result_for_test(
+                        crate::session::restart::RestartResult {
+                            session_id: id.clone(),
+                            before: Box::new(before),
+                            instance: Box::new(after),
+                            outcome: result,
+                        },
+                    );
+                assert_eq!(env.view.apply_restart_results(), !newer_request);
+                assert_eq!(env.view.restart_in_flight.contains_key(&id), newer_request);
+                assert_eq!(env.view.attach_after_restart.contains(&id), newer_request);
+                assert!(env.view.take_restarted_attaches().is_empty());
+            }
+            assert_eq!(
+                serde_json::to_value(env.view.get_instance(&id).unwrap()).unwrap(),
+                memory_before
+            );
+            assert_eq!(
+                serde_json::to_value(replacement.load().unwrap()).unwrap(),
+                disk_before
+            );
+            assert_eq!(env.view.info_dialog.is_some(), !newer_request);
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn apply_restart_results_preserves_peer_sid_and_marker() {
     use crate::session::StartOutcome;
 

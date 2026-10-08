@@ -62,13 +62,25 @@ export function bucketSelectionForBulk(
 }
 
 /** E.g. "Archived 12 workspaces. 2 failed." */
-export function summarizeBulkResults(verb: string, results: readonly { ok: boolean; skipped?: boolean }[]): string {
+export function summarizeBulkResults(
+  verb: string,
+  results: readonly { ok: boolean; skipped?: boolean; message?: string }[],
+): string {
   const ok = results.filter((r) => r.ok).length;
   const skipped = results.filter((r) => r.skipped).length;
   const failed = results.filter((r) => !r.ok && !r.skipped).length;
   const noun = ok === 1 ? "session" : "sessions";
   let msg = `${verb} ${ok} ${noun}.`;
-  if (failed > 0) msg += ` ${failed} failed.`;
+  if (failed > 0) {
+    msg += ` ${failed} failed.`;
+    const messages = new Set(
+      results
+        .filter((r) => !r.ok && !r.skipped)
+        .map((r) => r.message)
+        .filter(Boolean),
+    );
+    for (const message of messages) msg += ` ${message}`;
+  }
   if (skipped > 0) msg += ` ${skipped} skipped.`;
   return msg;
 }

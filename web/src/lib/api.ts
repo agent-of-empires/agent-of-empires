@@ -1685,6 +1685,27 @@ export function setSessionNotifications(id: string, preset: "off" | "default" | 
 const sessionUpdate = (id: string, action: string, init: RequestInit) =>
   fetchJson<SessionResponse>(`/api/sessions/${id}/${action}`, init);
 
+export type SessionLifecycleResult =
+  | { ok: true; session: SessionResponse }
+  | { ok: false; status?: number; code?: string; message: string };
+
+async function sessionLifecycle(id: string, action: string, init: RequestInit): Promise<SessionLifecycleResult> {
+  try {
+    const reply = await send(`/api/sessions/${id}/${action}`, init);
+    if (reply.ok && reply.payload && typeof reply.payload.id === "string") {
+      return { ok: true, session: reply.payload as unknown as SessionResponse };
+    }
+    return {
+      ok: false,
+      status: reply.status,
+      code: stringField(reply.payload, "error"),
+      message: stringField(reply.payload, "message") ?? `Failed to ${action} session (HTTP ${reply.status}).`,
+    };
+  } catch (error) {
+    return { ok: false, message: networkError(error) };
+  }
+}
+
 /** Set or clear (`null`) one repo's diff base; omit `repo` for a single-repo session. */
 export function setSessionDiffBase(
   id: string,
@@ -1708,8 +1729,8 @@ export function setSessionColor(id: string, color: string | null): Promise<Sessi
   return sessionUpdate(id, "color", jsonInit("PATCH", { color }));
 }
 
-export function setSessionArchive(id: string, archived: boolean, killPane = true): Promise<SessionResponse | null> {
-  return sessionUpdate(id, "archive", jsonInit("PATCH", { archived, kill_pane: killPane }));
+export function setSessionArchive(id: string, archived: boolean, killPane = true): Promise<SessionLifecycleResult> {
+  return sessionLifecycle(id, "archive", jsonInit("PATCH", { archived, kill_pane: killPane }));
 }
 
 /** Stop the live session but keep every durable artifact so it can be restored. */
@@ -1722,8 +1743,8 @@ export function restoreSession(id: string): Promise<SessionResponse | null> {
 }
 
 /** Stop the pane/worker but keep the session record (status `Stopped`). */
-export function stopSession(id: string): Promise<SessionResponse | null> {
-  return sessionUpdate(id, "stop", jsonInit("POST"));
+export function stopSession(id: string): Promise<SessionLifecycleResult> {
+  return sessionLifecycle(id, "stop", jsonInit("POST"));
 }
 
 /** A 409 code for a start refused because the session is archived or trashed. */
@@ -1745,8 +1766,8 @@ export async function startSession(id: string): Promise<StartSessionResult> {
 }
 
 /** `null` unsnoozes; otherwise 1..=43200 minutes, validated server-side. */
-export function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
-  return sessionUpdate(id, "snooze", jsonInit("PATCH", { minutes }));
+export function setSessionSnooze(id: string, minutes: number | null): Promise<SessionLifecycleResult> {
+  return sessionLifecycle(id, "snooze", jsonInit("PATCH", { minutes }));
 }
 
 /** `false` clears both the auto and manual unread markers. */

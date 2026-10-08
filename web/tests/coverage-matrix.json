@@ -3,6 +3,25 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "session.lifecycle-refusal-keeps-running-ui",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-context-menu.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/hooks/useSidebarTriage.ts",
+        "web/src/components/sidebar/useSidebarSelection.ts",
+        "web/src/lib/sidebarBulk.ts"
+      ]
+    },
+    {
+      "id": "session.lifecycle-refusal-preserves-authoritative-state",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/api.test.ts", "src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/hooks/useAcpSession.ts"]
+    },
+    {
       "id": "session.workspace-delete-pending-preserves-running-before-retry",
       "kind": "mocked-playwright",
       "risk": "high",

@@ -1277,19 +1277,15 @@ function AppContent({
     if (!stoppingSession) return;
     const sessionId = stoppingSession.id;
 
-    // Close the dialog and show "Stopped" immediately; the 2s status poller
-    // reconciles the true state and corrects this if the request fails.
     setStoppingSessionId(null);
-    setSessionStatus(sessionId, "Stopped");
-
     const result = await stopSession(sessionId);
-    if (!result) {
-      setSessionStatus(sessionId, "Error");
-      toastBus.handler?.error("Failed to stop session");
+    if (!result.ok) {
+      toastBus.handler?.error(result.message);
       return;
     }
+    applySession(result.session);
     toastBus.handler?.info("Session stopped");
-  }, [stoppingSession, setSessionStatus]);
+  }, [stoppingSession, applySession]);
 
   const switchViewSession = switchViewTarget
     ? (workspaces.flatMap((w) => w.sessions).find((s) => s.id === switchViewTarget.sessionId) ?? null)
@@ -1771,12 +1767,19 @@ function AppContent({
         setSnoozeTargetId(id);
         return;
       }
-      const run: Record<Exclude<SessionStateAction, "snooze">, () => Promise<SessionResponse | null>> = {
+      if (action === "archive" || action === "unarchive" || action === "unsnooze") {
+        const result =
+          action === "unsnooze" ? await setSessionSnooze(id, null) : await setSessionArchive(id, action === "archive");
+        if (result.ok) applySession(result.session);
+        else reportError(result.message);
+        return;
+      }
+      const run: Record<
+        Exclude<SessionStateAction, "snooze" | "archive" | "unarchive" | "unsnooze">,
+        () => Promise<SessionResponse | null>
+      > = {
         pin: () => setSessionPin(id, true),
         unpin: () => setSessionPin(id, false),
-        archive: () => setSessionArchive(id, true),
-        unarchive: () => setSessionArchive(id, false),
-        unsnooze: () => setSessionSnooze(id, null),
         trash: () => trashSession(id),
         untrash: () => restoreSession(id),
       };
@@ -2512,8 +2515,8 @@ function AppContent({
               const id = snoozeTargetId;
               setSnoozeTargetId(null);
               void setSessionSnooze(id, minutes).then((result) => {
-                if (result) applySession(result);
-                else reportError("Failed to snooze session");
+                if (result.ok) applySession(result.session);
+                else reportError(result.message);
               });
             }}
           />

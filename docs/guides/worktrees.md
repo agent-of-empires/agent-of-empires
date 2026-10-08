@@ -72,15 +72,25 @@ Deleting a session prompts to remove an aoe-managed worktree (or pass `--delete-
 
 Once teardown is quiescent, Trash relocates the managed checkout into a sibling `.aoe-trash/<session-id>` holding directory with `git worktree move`. Restore moves it back and refuses an occupied destination; Purge removes it.
 
-Checkout relocation and destructive cleanup require proof that the recorded runner process groups have exited. A `Stopped` row, a terminal-view selection, or a missing worker registry is not that proof. When teardown is pending, aoe retains the session and checkout; retry after the recorded executions exit. Cancelling your own pending Trash request does not move the checkout. Force does not bypass the quiescence guard. Unknown legacy execution history remains protected until aoe verifies a different boot.
+Checkout relocation and destructive cleanup require proof that the recorded runner process groups have exited. A `Stopped` row, a terminal-view selection, or a missing worker registry is not that proof. When teardown is pending, aoe retains the session and checkout; retry after the recorded executions exit. Cancelling your own pending Trash request does not move the checkout. Force does not bypass the quiescence guard.
 
 Cleanup checks every physical profile for sessions using the same checkout or an overlapping workspace, including readable aliases to stores outside the profiles directory. Both ancestor and descendant claims retain a checkout, so deleting a child beneath another session's workspace is conservative. Aliases to missing targets own no rows; unreadable ownership data retains the checkout rather than assuming it is unused.
 
-Creation and attach reserve the complete future path set durably before Git, workspace, or scratch effects. Ordinary path writers and profile deletion or rename cannot retire these claims. Completion through the original physical storage and unchanged plan retires them only after a successful write. A cancelled, failed, or interrupted operation retains its claim and resources when original ownership or native quiescence cannot be proved. Claims do not expire with a timeout; restarting aoe does not reclaim them. Legacy unfinished operations with an unknown path set fail closed until their original ownership can be established.
+Creation and attach reserve the complete future path set durably before Git, workspace, or scratch effects. Ordinary path writers and profile deletion or rename cannot retire these claims. Completion through the original physical storage and unchanged plan retires them only after a successful write. A cancelled, failed, or interrupted operation retains its claim and resources when original ownership or native quiescence cannot be proved. Claims do not expire with a timeout; restarting aoe does not reclaim them. Legacy unfinished operations with an unknown path set fail closed until their original ownership can be established. Lifecycle leases require an explicit path-claim state after migration; do not keep an older writer running against the upgraded store.
 
 **The default branch's checkout is never removed.** In a bare-repo layout the default branch lives in a linked worktree other tooling expects to stay put, so aoe refuses to remove that checkout or delete its branch, reports the refusal, and deletes the session anyway. Force does not bypass this, including trash auto-purge and `aoe session empty-trash`, and `aoe worktree cleanup` lists such a checkout as skipped. Detection uses what git states: the bare repo's own `HEAD` plus every remote's `refs/remotes/<remote>/HEAD`, falling back to `main` and `master` by convention when neither exists. To remove one anyway, do it with git and then delete the session.
 
 An externally placed `git worktree lock` is not a deletion guard: aoe locks every worktree it creates and unlocks before each intentional remove or move, so it unlocks yours too.
+
+### Legacy execution coverage after an upgrade
+
+Sessions whose old build did not record execution history remain protected in the same boot. Existing complete journals are preserved. To establish different-boot coverage:
+
+1. Stop the old TUI, CLI writers and `aoe serve` processes before upgrading. Open the upgraded build so its migrations durably record the actually observed boot for legacy journals. Keep the migration backups.
+2. Reboot the actual host or VM. Restarting aoe, its daemon or a container does not establish a different host boot.
+3. Reopen the upgraded build and retry the requested operation. It must observe both the stored baseline and a different real boot; if boot identity is unavailable, cleanup remains refused.
+
+This procedure establishes execution coverage only. It does not reconstruct original endpoint custody or clear Pending/Unknown filesystem intents. Those independent ownership guards may still retain the checkout and row.
 
 ## Warnings during create
 

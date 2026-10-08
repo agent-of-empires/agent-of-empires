@@ -1,11 +1,11 @@
 //! Legacy Attach leases have no recoverable candidate-path inventory.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 
 pub fn run() -> Result<()> {
+    tracing::info!(target: "migrations", "v038: preserving unfinished filesystem intents");
     let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
     let _identity = crate::session::acquire_session_identity_lock()?;
     let _namespace = crate::session::acquire_profile_namespace_lock()?;
@@ -58,34 +58,26 @@ fn migrate_document(document: &mut Value) -> Result<bool> {
         .as_array_mut()
         .context("sessions document is not an array")?;
     let mut changed = false;
-    let mut owners = std::collections::HashSet::with_capacity(rows.len());
     for row in rows {
-        let fields = row
-            .as_object_mut()
-            .context("session row is not an object")?;
-        if let Some(lease) = fields
+        let Some(fields) = row.as_object_mut() else {
+            continue;
+        };
+        let Some(lease) = fields
             .get_mut("lifecycle_reservation")
-            .filter(|lease| !lease.is_null())
-        {
-            let lease = lease
-                .as_object_mut()
-                .context("lifecycle reservation is not an object")?;
-            if let Some(claims) = lease.get("path_claims") {
-                crate::session::WorktreePathClaims::deserialize(claims)
-                    .context("invalid filesystem intent")?;
-            } else {
-                let state = match lease.get("op").and_then(Value::as_str) {
-                    Some("attach" | "create") => "unknown",
-                    Some("launch" | "capture" | "stop" | "purge" | "restore" | "trash") => "none",
-                    _ => anyhow::bail!("unknown lifecycle operation"),
-                };
-                lease.insert("path_claims".into(), serde_json::json!({"state": state}));
-                changed = true;
-            }
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if lease.contains_key("path_claims") {
+            continue;
         }
-        let instance = crate::session::Instance::deserialize(&*row)
-            .context("invalid session ownership row")?;
-        anyhow::ensure!(owners.insert(instance.id), "duplicate session owner");
+        let state = match lease.get("op").and_then(Value::as_str) {
+            Some("attach" | "create") => "unknown",
+            Some("launch" | "capture" | "stop" | "purge" | "restore" | "trash") => "none",
+            _ => continue,
+        };
+        lease.insert("path_claims".into(), serde_json::json!({"state": state}));
+        changed = true;
     }
     Ok(changed)
 }
@@ -93,9 +85,10 @@ fn migrate_document(document: &mut Value) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     #[test]
-    fn migration_preserves_unfinished_intents_and_refuses_unreadable_ownership() {
+    fn migration_preserves_intents_and_unrelated_corrupt_or_duplicate_rows() {
         let mut rows = (0..4)
             .map(|index| {
                 serde_json::to_value(crate::session::Instance::new(
@@ -130,16 +123,17 @@ mod tests {
         assert!(!migrate_document(&mut document).unwrap());
         let migrated = crate::session::Instance::deserialize(&document[0]).unwrap();
         assert!(migrated.has_active_lifecycle_reservation("2020-01-01T00:00:00Z".parse().unwrap()));
-        let mut duplicate = Value::Array(vec![document[0].clone(), document[0].clone()]);
-        assert!(migrate_document(&mut duplicate).is_err());
-        for mut invalid in [
-            serde_json::json!({"instances": []}),
-            serde_json::json!([null]),
-            serde_json::json!([{"lifecycle_reservation": "broken"}]),
-            serde_json::json!([{"lifecycle_reservation": {"op": "unsupported"}}]),
-            serde_json::json!([{"lifecycle_reservation": {"op": "attach", "path_claims": {"state": "broken"}}}]),
-        ] {
-            assert!(migrate_document(&mut invalid).is_err(), "{invalid}");
-        }
+        let mut retained = Value::Array(vec![
+            document[0].clone(),
+            document[0].clone(),
+            Value::Null,
+            serde_json::json!({"lifecycle_reservation": "broken"}),
+            serde_json::json!({"lifecycle_reservation": {"op": "unsupported"}}),
+            serde_json::json!({"lifecycle_reservation": {"op": "attach", "path_claims": {"state": "broken"}}}),
+        ]);
+        let before = retained.clone();
+        assert!(!migrate_document(&mut retained).unwrap());
+        assert_eq!(retained, before);
+        assert!(migrate_document(&mut serde_json::json!({"instances": []})).is_err());
     }
 }

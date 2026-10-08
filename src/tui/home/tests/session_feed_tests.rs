@@ -351,7 +351,10 @@ fn daemon_status_skips_a_row_mid_restart() {
 fn daemon_status_skips_a_row_mid_recovery() {
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Starting);
-    env.view.recovery_in_flight.insert(id.clone());
+    env.view.recovery_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
 
     env.view
         .apply_daemon_status_update(update(&id, Status::Idle));

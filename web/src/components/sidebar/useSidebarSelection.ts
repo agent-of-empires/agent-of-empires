@@ -43,7 +43,7 @@ export function useSidebarSelection({
   );
 
   const runBulkAction = useCallback(
-    async (verb: string, run: () => Promise<readonly { ok: boolean; skipped?: boolean }[]>) => {
+    async (verb: string, run: () => Promise<readonly { ok: boolean; skipped?: boolean; message?: string }[]>) => {
       const results = await run();
       const summary = summarizeBulkResults(verb, results);
       if (results.some((r) => !r.ok && !r.skipped)) reportError(summary);

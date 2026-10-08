@@ -456,7 +456,7 @@ impl HomeView {
             group_totals: HashMap::new(),
             recovery_rx: None,
             recovery_lock: None,
-            recovery_in_flight: std::collections::HashSet::new(),
+            recovery_in_flight: HashMap::new(),
             restart_cooldown_at: std::collections::HashMap::new(),
             tool_configs: user_config
                 .as_ref()

@@ -68,13 +68,16 @@ impl Default for ReconcilePoller {
 /// view reloads from the returned verdict rather than from a local-change
 /// notification.
 fn sweep(profiles: &[String]) -> bool {
-    let storages = profiles
-        .iter()
-        .map(|profile| crate::session::Storage::open_unwatched(profile))
-        .collect::<anyhow::Result<Vec<_>>>();
-    let mut changed = match storages
-        .and_then(|storages| crate::session::trash::reconcile_trashed_profiles(&storages))
-    {
+    let mut storages = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        match crate::session::Storage::open_unwatched(profile) {
+            Ok(storage) => storages.push(storage),
+            Err(error) => {
+                tracing::warn!(target: "tui.home", %profile, %error, "trash target could not be opened");
+            }
+        }
+    }
+    let mut changed = match crate::session::trash::reconcile_trashed_profiles(&storages) {
         Ok(healed) => !healed.is_empty(),
         Err(error) => {
             tracing::warn!(target: "tui.home", "trash reconciliation skipped: {error}");
@@ -126,7 +129,7 @@ mod tests {
             })
             .unwrap();
 
-        assert!(sweep(&["default".to_string()]));
+        assert!(sweep(&["absent".to_string(), "default".to_string()]));
         let healed = storage
             .load()
             .unwrap()
@@ -138,7 +141,9 @@ mod tests {
             healed.pre_trash_project_path.as_deref(),
             project.path().join("feat").to_str(),
         );
-        // Idempotent: a second pass has nothing left to do.
-        assert!(!sweep(&["default".to_string()]));
+        assert!(!sweep(&["default".to_string(), "absent".to_string()]));
+        assert!(!crate::session::get_profile_dir_path("absent")
+            .unwrap()
+            .exists());
     }
 }

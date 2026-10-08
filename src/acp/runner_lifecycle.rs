@@ -507,7 +507,7 @@ impl ExecutionAdmission {
         if state.cancelled_stop.is_none() {
             if let Some(preparation) = &state.preparation {
                 if let Err(error) = preparation.stopped(stop.clone()) {
-                    tracing::warn!(session = %stop.session_id(), %error, "original preparation Stop acknowledgement remains unproven");
+                    tracing::warn!(target: "acp.supervisor", session = %stop.session_id(), %error, "original preparation Stop acknowledgement remains unproven");
                 }
             }
             state.cancelled_stop = Some(stop);

@@ -170,7 +170,7 @@ async fn retire_captured_record(record: &worker_registry::WorkerRecord) -> bool 
     {
         Ok(()) => true,
         Err(error) => {
-            tracing::warn!(session = %record.session_id, %error, "captured runner execution not retired; retained");
+            tracing::warn!(target: "acp.supervisor", session = %record.session_id, %error, "captured runner execution not retired; retained");
             false
         }
     }
@@ -613,7 +613,7 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
         let stop = match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
             Ok(stop) => stop,
             Err(error) => {
-                tracing::debug!(%id, %error, "stale worker source changed before retirement");
+                tracing::debug!(target: "acp.supervisor", %id, %error, "stale worker source changed before retirement");
                 continue;
             }
         };

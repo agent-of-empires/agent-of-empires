@@ -402,7 +402,15 @@ impl PurgeTransaction {
     }
 
     fn acknowledge_retention(&mut self, result: &mut DeletionResult) {
-        result.retained_instance = self.release_reservation().ok().flatten();
+        result.retained_instance = match self.release_reservation() {
+            Ok(retained) => retained,
+            Err(error) => {
+                result
+                    .errors
+                    .push(format!("Failed to release purge reservation: {error}"));
+                None
+            }
+        };
         result.retained_origin = result
             .retained_instance
             .as_ref()
@@ -2942,6 +2950,41 @@ mod tests {
             .into_iter()
             .find(|row| row.id == instance.id)
             .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn failed_purge_reports_release_failure_and_preserves_replacement() {
+        let _guard = isolate_app_dir();
+        let storage = Storage::new_unwatched("retention").unwrap();
+        let instance = stored_instance(&storage, "retention", "/tmp/purge-retention");
+        let mut transaction = reserve("retention", instance).release_locks_for_teardown();
+        let profile = crate::session::get_profile_dir_path("retention").unwrap();
+        let displaced = profile.with_file_name("displaced-retention");
+        std::fs::rename(&profile, &displaced).unwrap();
+        let replacement = Storage::new_unwatched("retention").unwrap();
+        let replacement_row = stored_instance(&replacement, "retention", "/tmp/replacement");
+        let before = serde_json::to_value(replacement.load().unwrap()).unwrap();
+
+        let result = transaction.failed_after_release("original teardown refused");
+
+        assert_eq!(result.disposition, DeletionDisposition::Failed);
+        assert!(!result.success);
+        assert!(result.retained_instance.is_none());
+        assert!(result.retained_origin.is_none());
+        assert!(result
+            .errors
+            .iter()
+            .any(|error| error == "original teardown refused"));
+        assert!(result
+            .errors
+            .iter()
+            .any(|error| error.contains("failed to reopen target profile after destroy hooks")));
+        assert_eq!(
+            serde_json::to_value(replacement.load().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(replacement.load().unwrap()[0].id, replacement_row.id);
     }
 
     #[tokio::test]

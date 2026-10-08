@@ -266,12 +266,12 @@ export function useAcpSession(
         return;
       }
       // The reconciler skips snoozed sessions, so wake them before sending.
-      if (snoozedUntilRef.current && !(await setSessionSnooze(sessionId, null))) {
-        dispatch({
-          kind: "error",
-          message: "Could not wake this session. Please retry, or unsnooze from the sidebar.",
-        });
-        return;
+      if (snoozedUntilRef.current) {
+        const wake = await setSessionSnooze(sessionId, null);
+        if (!wake.ok) {
+          dispatch({ kind: "error", message: wake.message });
+          return;
+        }
       }
       const result = await dispatchPromptNow(text, attachments);
       if (result.kind === "queued") {

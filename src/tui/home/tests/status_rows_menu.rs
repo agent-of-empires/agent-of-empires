@@ -810,14 +810,17 @@ fn wants_paste_burst_only_for_paste_aware_dialogs() {
     );
 }
 
-/// Rows with recovery in flight are excluded from polling until the flag clears.
 #[test]
 #[serial]
 fn pollable_instances_excludes_recovery_in_flight() {
     {
         let mut env = create_test_env_with_sessions(3);
         let id_skipped = env.view.instance_at(1).id.clone();
-        env.view.recovery_in_flight.insert(id_skipped.clone());
+        env.view.recovery_in_flight.insert(
+            id_skipped.clone(),
+            super::super::RequestOrigin::capture(env.view.get_instance(&id_skipped).unwrap())
+                .unwrap(),
+        );
 
         let pollable = env.view.pollable_instances();
 
@@ -828,7 +831,10 @@ fn pollable_instances_excludes_recovery_in_flight() {
     {
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
-        env.view.recovery_in_flight.insert(id.clone());
+        env.view.recovery_in_flight.insert(
+            id.clone(),
+            super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+        );
         assert!(env.view.pollable_instances().is_empty());
 
         env.view.recovery_in_flight.remove(&id);

@@ -193,7 +193,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         let stop = match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
             Ok(stop) => stop,
             Err(error) => {
-                tracing::debug!(%id, %error, "idle worker source changed before retirement");
+                tracing::debug!(target: "acp.supervisor", %id, %error, "idle worker source changed before retirement");
                 continue;
             }
         };
@@ -224,7 +224,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         match state.acp_supervisor.shutdown_idle(stop.clone()).await {
             Ok(()) => {
                 if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
-                    tracing::warn!(%id, %error, "idle claim remains protected");
+                    tracing::warn!(target: "acp.supervisor", %id, %error, "idle claim remains protected");
                 }
                 tracing::info!(target: "acp.supervisor", session = %id, idle_secs, "auto-stopped idle structured view worker");
             }

@@ -245,15 +245,11 @@ describe("sendPrompt outcomes", () => {
   });
 
   describe("auto-wake (#1581)", () => {
-    const failingWake =
-      (suffix: string): Route =>
-      ({ url, method }) => {
-        if (url.endsWith(suffix) && method === "PATCH") return new Response("simulated failure", { status: 500 });
-        if (url.includes("/acp/prompt")) return json({ disposition: "queued", queued_id: "srv-queued-1" }, 202);
-        return undefined;
-      };
-    const queuedPrompt: Route = ({ url }) =>
-      url.includes("/acp/prompt") ? json({ disposition: "queued", queued_id: "srv-queued-1" }, 202) : undefined;
+    const queuedPrompt: Route = ({ url }) => {
+      if (url.includes("/acp/prompt")) return json({ disposition: "queued", queued_id: "srv-queued-1" }, 202);
+      if (url.endsWith("/snooze")) return json({ id: "sess-wake", snoozed_until: null });
+      return undefined;
+    };
     const patches = (suffix: string) => calls.filter((c) => c.method === "PATCH" && c.url.endsWith(suffix));
 
     it("wakes a snoozed session before sending", async () => {
@@ -291,15 +287,22 @@ describe("sendPrompt outcomes", () => {
       expect(result.current.state.queuedPrompts).toHaveLength(1);
     });
 
-    it("sends nothing when the snooze wake fails", async () => {
-      calls = installAcpFakes(failingWake("/snooze"));
+    it("sends nothing when the original snooze authority is refused", async () => {
+      calls = installAcpFakes(({ url }) =>
+        url.endsWith("/snooze")
+          ? json(
+              { error: "original_authority_changed", message: "original authority changed; reload the session" },
+              409,
+            )
+          : queuedPrompt({ url, method: "POST", body: null }),
+      );
       const { result } = render("sess-wake-fail", "absent", null, "2099-01-01T00:00:00Z");
       await flushAsync();
       await act(() => result.current.sendPrompt("wake me up"));
       await flushAsync();
       expect(posts("/acp/prompt")).toHaveLength(0);
       expect(result.current.state.queuedPrompts).toHaveLength(0);
-      expect(result.current.state.lastError).toMatch(/wake/i);
+      expect(result.current.state.lastError).toBe("original authority changed; reload the session");
     });
   });
 

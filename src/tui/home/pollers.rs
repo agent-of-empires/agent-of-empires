@@ -471,8 +471,20 @@ impl HomeView {
                         instance,
                         result,
                     } = update;
-                    let Ok(_authority) = self.completed_launch_authority(&before, &instance) else {
+                    if !super::RequestOrigin::retire(&mut self.recovery_in_flight, &before) {
                         continue;
+                    }
+                    touched = true;
+                    let _authority = match self.completed_launch_authority(&before, &instance) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            tracing::warn!(target: "session.startup_recovery", id = %instance_id, %error, "recovery result authority rejected");
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Recovery result rejected",
+                                &format!("{title}: {error}. The current session was not changed."),
+                            ));
+                            continue;
+                        }
                     };
                     match result {
                         Ok(crate::session::StartOutcome::Resumed) => {
@@ -507,7 +519,6 @@ impl HomeView {
                             );
                         }
                     }
-                    self.recovery_in_flight.remove(&instance_id);
                     if let Some(slot) = self.instances.get_mut(&instance_id) {
                         slot.merge_post_restart_with_baseline(&before, &instance);
                         slot.last_error = instance.last_error.clone();
@@ -551,6 +562,7 @@ impl HomeView {
         use std::sync::mpsc::TryRecvError;
 
         let mut touched = false;
+        let mut changed = false;
         loop {
             match self.restart_poller.try_recv_result() {
                 Ok(result) => {
@@ -566,8 +578,19 @@ impl HomeView {
                     }
                     let attach_after = self.attach_after_restart.remove(&session_id);
                     touched = true;
-                    let Ok(_authority) = self.completed_launch_authority(&before, &instance) else {
-                        continue;
+                    let _authority = match self.completed_launch_authority(&before, &instance) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            tracing::warn!(target: "session.restart", id = %session_id, %error, "restart result authority rejected");
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restart result rejected",
+                                &format!(
+                                    "{}: {error}. The current session was not changed.",
+                                    before.title
+                                ),
+                            ));
+                            continue;
+                        }
                     };
 
                     if attach_after && crate::session::restart::launched_agent(&outcome) {
@@ -633,7 +656,7 @@ impl HomeView {
                         slot.last_start_time = instance.last_start_time;
                         slot.retroactive_capture_excludes =
                             instance.retroactive_capture_excludes.clone();
-                        touched = true;
+                        changed = true;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -654,6 +677,8 @@ impl HomeView {
 
         if touched {
             self.refresh_rows_preserving_selection();
+        }
+        if changed {
             if let Err(e) = self.save() {
                 tracing::error!(target: "tui.home", "Failed to save after restart: {}", e);
             }
@@ -734,13 +759,24 @@ impl HomeView {
                 );
                 continue;
             }
+            let origin = match super::RequestOrigin::capture(elig) {
+                Ok(origin) => origin,
+                Err(error) => {
+                    tracing::warn!(target: "session.startup_recovery", id = %elig.id, %error, "recovery authority unavailable");
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Recovery not started",
+                        &format!("{}: {error}", elig.title),
+                    ));
+                    continue;
+                }
+            };
             if let Some(inst) = self.instances.get_mut(&elig.id) {
                 debug_assert!(inst.status != crate::session::Status::Creating);
                 // `last_start_time` arms the status poller's startup grace; without it the row flips to Error.
                 inst.status = crate::session::Status::Starting;
                 inst.last_error = None;
                 inst.last_start_time = Some(std::time::Instant::now());
-                self.recovery_in_flight.insert(inst.id.clone());
+                self.recovery_in_flight.insert(inst.id.clone(), origin);
                 candidates.push(inst.clone());
             }
         }

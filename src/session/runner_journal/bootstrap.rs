@@ -434,6 +434,8 @@ mod tests {
         }
 
         let (transferred, mut peer) = UnixStream::pair()?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .context("setting close-witness deadline")?;
         let descriptors = [transferred.as_raw_fd(); 5];
         sendmsg::<()>(
             sender.as_raw_fd(),
@@ -445,8 +447,6 @@ mod tests {
         .context("sending oversized descriptor transfer")?;
         drop(transferred);
         assert!(receive_descriptors(&receiver).is_err());
-        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .context("setting close-witness deadline")?;
         assert_eq!(
             peer.read(&mut [0])
                 .context("reading rejected-transfer close witness")?,

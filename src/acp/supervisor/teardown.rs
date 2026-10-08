@@ -165,11 +165,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(lease) = lease {
             self.settle(&lease, settlement);
         }
-        if handle
+        let publication_scope = if handle
             .as_ref()
             .is_some_and(|handle| !is_test_worker(handle))
-            && stop.with_scope(|_| Ok(())).is_ok()
         {
+            let original_stop = stop.clone();
+            matches!(
+                tokio::task::spawn_blocking(move || original_stop.with_scope(|_| Ok(()))).await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
+        };
+        if publication_scope {
             for agent_id in self.sink.unresolved_background_agent_ids(session_id) {
                 self.publish_next(
                     session_id,

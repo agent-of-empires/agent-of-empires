@@ -446,7 +446,7 @@ pub struct HomeView {
     /// Held while recovery workers run so a later daemon cannot duplicate cascades.
     recovery_lock: Option<crate::session::recovery::RecoveryLock>,
 
-    recovery_in_flight: std::collections::HashSet<String>,
+    recovery_in_flight: HashMap<String, RequestOrigin>,
 
     pub(super) restart_cooldown_at: std::collections::HashMap<String, std::time::Instant>,
 

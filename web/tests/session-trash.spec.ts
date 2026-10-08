@@ -1,5 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import type { Locator, Page } from "@playwright/test";
+import { sessionResponse } from "./helpers/sessions";
 import {
   confirmDelete,
   installTrashMocks,
@@ -128,7 +129,16 @@ test.describe("Multi-session workspace trash", () => {
     await page.route(/\/api\/sessions\/[^/]+\/(stop|start)$/, (r) => {
       const [, id, verb] = new URL(r.request().url()).pathname.match(/sessions\/([^/]+)\/(\w+)$/)!;
       lifecycle.push(`${verb} ${id}`);
-      return r.fulfill({ json: { id } });
+      return r.fulfill({
+        json: sessionResponse({
+          id,
+          project_path: "/tmp/repo",
+          group_path: id === "sess-b" ? "beta" : "gamma",
+          branch: "feat/x",
+          main_repo_path: "/tmp/repo",
+          status: verb === "stop" ? "Stopped" : "Running",
+        }),
+      });
     });
     await page.goto("/");
     // A two-session row is labelled by its branch, so gamma is the row naming neither single session.
@@ -341,7 +351,9 @@ test.describe("Delete active session", () => {
     await expect(dialog).toHaveCount(0);
     await expect(page).toHaveURL(/\/session\/sess-pending/);
     await expect(row).toBeVisible();
-    await expect(page.getByRole("alert")).toContainText("runner execution is still live");
+    await expect(page.getByRole("alert").filter({ hasText: "runner execution is still live" })).toContainText(
+      "runner execution is still live",
+    );
     await expect(row.locator(".text-status-running").first()).toBeVisible();
     await expect(row.locator(".text-status-error")).toHaveCount(0);
     expect(handle.deletedIds).toEqual([]);

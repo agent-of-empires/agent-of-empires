@@ -483,6 +483,7 @@ async fn sweep_orphan_workers(
         Ok(Ok(inventory)) => inventory,
         error => {
             tracing::warn!(
+                target: "acp.supervisor",
                 ?error,
                 "orphan inventory unavailable; no execution signalled"
             );
@@ -512,7 +513,7 @@ async fn sweep_orphan_workers(
                     crate::session::runner_journal::settle_captured_ticket(&id, identity, false)
                         .await
                 {
-                    tracing::warn!(session = %id, %error, "orphan execution remains protected");
+                    tracing::warn!(target: "acp.supervisor", session = %id, %error, "orphan execution remains protected");
                 }
             }),
         );

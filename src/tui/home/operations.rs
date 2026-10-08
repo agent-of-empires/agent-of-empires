@@ -1263,26 +1263,46 @@ impl HomeView {
         Ok(())
     }
 
+    fn prepare_runner_settlement(
+        &self,
+        instance: &Instance,
+        action: crate::tui::stop_poller::SettlementAction,
+    ) -> anyhow::Result<(
+        super::RequestOrigin,
+        crate::tui::stop_poller::SettlementRequest,
+    )> {
+        anyhow::ensure!(
+            !self.settlement_in_flight.contains_key(&instance.id),
+            "Runner settlement is already pending: {}",
+            instance.id
+        );
+        let origin = super::RequestOrigin::capture(instance)?;
+        let request = crate::tui::stop_poller::SettlementRequest {
+            session_id: instance.id.clone(),
+            storage: origin.storage.as_ref().clone(),
+            instance: instance.clone(),
+            action,
+        };
+        Ok((origin, request))
+    }
+
+    fn submit_runner_settlement(
+        &mut self,
+        origin: super::RequestOrigin,
+        request: crate::tui::stop_poller::SettlementRequest,
+    ) {
+        self.settlement_in_flight
+            .insert(request.session_id.clone(), origin);
+        self.settlement_poller.request(request);
+    }
+
     fn queue_runner_settlement(
         &mut self,
         instance: &Instance,
         action: crate::tui::stop_poller::SettlementAction,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.settlement_in_flight.contains_key(&instance.id),
-            "Runner settlement is already pending"
-        );
-        let origin = super::RequestOrigin::capture(instance)?;
-        let storage = origin.storage.as_ref().clone();
-        self.settlement_in_flight
-            .insert(instance.id.clone(), origin);
-        self.settlement_poller
-            .request(crate::tui::stop_poller::SettlementRequest {
-                session_id: instance.id.clone(),
-                storage,
-                instance: instance.clone(),
-                action,
-            });
+        let (origin, request) = self.prepare_runner_settlement(instance, action)?;
+        self.submit_runner_settlement(origin, request);
         Ok(())
     }
     /// Edit the selected session's worktree workdir name: move the worktree directory
@@ -2483,21 +2503,35 @@ impl HomeView {
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
         let mut ids = self.active_sessions_in_selected_group();
         ids.sort();
-        for id in ids {
-            let instance = self
-                .instances
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-            self.queue_runner_settlement(
-                &instance,
-                crate::tui::stop_poller::SettlementAction::Archive { reveal: true },
-            )?;
+        let prepared = ids
+            .iter()
+            .map(|id| {
+                let instance = self
+                    .instances
+                    .get(id)
+                    .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+                self.prepare_runner_settlement(
+                    instance,
+                    crate::tui::stop_poller::SettlementAction::Archive { reveal: true },
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>();
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Group archive not queued",
+                    &format!("No new member was queued: {error}"),
+                ));
+                return Err(error);
+            }
+        };
+        for (origin, request) in prepared {
+            self.submit_runner_settlement(origin, request);
         }
         self.reveal_archived_section();
         self.rebuild_flat_items();
-        // The project header vanishes once its last active member is archived, so the
-        // cursor's old index may point past the list end; clamp and re-resolve.
+        // Clamp after the last active member removes its project header.
         if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
             self.cursor = self.flat_items.len() - 1;
         }

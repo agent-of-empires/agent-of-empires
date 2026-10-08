@@ -5,6 +5,16 @@ pub(super) const BOOTSTRAP_RECV_FLAGS: i32 = 0;
 use std::collections::HashMap;
 use std::process::Command;
 
+pub(super) fn is_process_group_alive(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    if super::worker::is_pid_alive_and_ours(pgid) && !is_terminated(pgid) {
+        return true;
+    }
+    process_group_has_live_members(pgid).unwrap_or(true)
+}
+
 /// # Safety
 /// `message` must point to live writable data and control buffers.
 pub(crate) unsafe fn reject_truncated_bootstrap_rights(

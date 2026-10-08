@@ -296,8 +296,46 @@ fn test_delete_selected_group_updates_groups_field() {
     assert_eq!(reloaded_groups, tree_groups);
 }
 
-/// Archiving a manual group archives every session under it, including
-/// nested subgroups, and leaves sessions outside the group untouched.
+#[test]
+#[serial]
+fn group_archive_refuses_before_queuing_any_new_member() {
+    let mut env = create_test_env_with_group_sessions();
+    env.view.cursor = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .unwrap();
+    env.view.update_selected();
+    let mut members = env.view.active_sessions_in_selected_group();
+    members.sort();
+    let pending = members.last().unwrap().clone();
+    let origin =
+        crate::tui::home::RequestOrigin::capture(env.view.get_instance(&pending).unwrap()).unwrap();
+    env.view
+        .settlement_in_flight
+        .insert(pending.clone(), origin);
+    let storage = Storage::open_unwatched("test").unwrap();
+    let before = serde_json::to_value(storage.load().unwrap()).unwrap();
+
+    assert!(env.view.archive_selected_group().is_err());
+
+    for member in members {
+        let instance = env.view.get_instance(&member).unwrap();
+        assert!(!instance.is_archived());
+        assert_eq!(
+            env.view.settlement_in_flight.contains_key(&member),
+            member == pending
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(storage.load().unwrap()).unwrap(),
+        before
+    );
+    assert!(env.view.info_dialog.is_some());
+}
+
+/// Archiving a manual group includes nested members but not unrelated sessions.
 #[test]
 #[serial]
 fn test_archive_selected_group_archives_all_members() {
