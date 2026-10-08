@@ -1384,6 +1384,9 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
+    if inst.status == crate::session::Status::Deleting {
+        bail!("Session is being deleted and cannot be attached");
+    }
     bail_if_acp(inst, "attach")?;
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
@@ -3143,6 +3146,42 @@ mod start_blocked_tests {
                 assert!(!tmux.exists());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod attach_deleting_tests {
+    use super::{attach_session, SessionIdArgs};
+    use crate::session::{Instance, Status, Storage};
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn attach_refuses_a_session_with_a_deleting_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "attach-deleting-row";
+        let mut instance = Instance::new("deleting", "/tmp/deleting");
+        instance.source_profile = profile.to_string();
+        instance.status = Status::Deleting;
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(instance);
+                Ok(())
+            })
+            .unwrap();
+
+        let error = attach_session(
+            profile,
+            SessionIdArgs {
+                identifier: "deleting".to_string(),
+            },
+        )
+        .await
+        .expect_err("a deleting session must not be reattached");
+
+        assert!(error.to_string().contains("being deleted"));
     }
 }
 

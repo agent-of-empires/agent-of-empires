@@ -359,7 +359,8 @@ pub fn should_recover_lifecycle(command: Option<&Commands>) -> bool {
             SessionCommands::Import(args) => !args.dry_run,
             command => matches!(
                 command,
-                SessionCommands::Start(_)
+                SessionCommands::Attach(_)
+                    | SessionCommands::Start(_)
                     | SessionCommands::Stop(_)
                     | SessionCommands::Restart(_)
                     | SessionCommands::Rename(_)
@@ -452,6 +453,7 @@ mod tests {
             (&["aoe", "status"], false),
             (&["aoe", "ps"], false),
             (&["aoe", "session", "show", "demo"], false),
+            (&["aoe", "session", "attach", "demo"], true),
             (&["aoe", "session", "import", "--dry-run"], false),
             (&["aoe", "acp", "history", "demo"], false),
             (&["aoe", "profile", "list"], false),

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::move_journal::MoveJournalEntry;
 use super::storage::{atomic_write_verified, sync_parent_directory};
 use super::{Instance, Status};
 
@@ -58,7 +57,6 @@ impl LifecyclePhase {
 #[serde(tag = "intent", content = "payload", rename_all = "snake_case")]
 pub(crate) enum LifecycleJournalRecord {
     Deleting(Box<LifecycleJournalEntry>),
-    Moving(Box<MoveJournalEntry>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,35 +186,6 @@ pub(crate) fn record(entry: &LifecycleJournalEntry) -> Result<PathBuf> {
     )
 }
 
-pub(crate) fn record_move(
-    entry: &MoveJournalEntry,
-    source_sessions_path: &Path,
-) -> Result<PathBuf> {
-    record_move_with_sync(entry, source_sessions_path, sync_parent_directory)
-}
-
-pub(crate) fn record_move_with_sync<S>(
-    entry: &MoveJournalEntry,
-    source_sessions_path: &Path,
-    sync: S,
-) -> Result<PathBuf>
-where
-    S: FnMut(&Path) -> Result<()>,
-{
-    let dir = journal_dir_for(source_sessions_path);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let path = dir.join(format!("move-{nanos}-{}.json", std::process::id()));
-    record_at_with_sync(
-        &dir,
-        &path,
-        &LifecycleJournalRecord::Moving(Box::new(entry.clone())),
-        sync,
-    )
-}
-
 fn record_at_with_sync<S>(
     dir: &Path,
     path: &Path,
@@ -264,11 +233,6 @@ pub(crate) struct ScanResult {
     pub(crate) unreadable_dirs: Vec<(PathBuf, String)>,
 }
 
-pub(crate) struct MoveScanResult {
-    pub(crate) entries: Vec<(PathBuf, std::result::Result<MoveJournalEntry, String>)>,
-    pub(crate) unreadable_dirs: Vec<(PathBuf, String)>,
-}
-
 pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanResult {
     let mut result = ScanResult {
         entries: Vec::new(),
@@ -309,89 +273,11 @@ pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanRes
                         "lifecycle journal version {} is not supported (current: {LIFECYCLE_JOURNAL_VERSION})",
                         entry.version
                     ))),
-                Ok(LifecycleJournalRecord::Moving(_)) => None,
                 Err(error) => Some(Err(format!("{error:#}"))),
             };
             if let Some(parsed) = parsed {
                 result.entries.push((path, parsed));
             }
-        }
-    }
-    result
-}
-
-pub(crate) fn scan_moves(sessions_paths: impl IntoIterator<Item = PathBuf>) -> MoveScanResult {
-    const LEGACY_MOVE_JOURNAL_DIR_NAME: &str = ".move-journal";
-
-    let mut result = MoveScanResult {
-        entries: Vec::new(),
-        unreadable_dirs: Vec::new(),
-    };
-    let mut dirs: Vec<(PathBuf, bool)> = sessions_paths
-        .into_iter()
-        .flat_map(|path| {
-            let profile_dir = path.parent().unwrap_or(&path);
-            [
-                (journal_dir_for(&path), false),
-                (profile_dir.join(LEGACY_MOVE_JOURNAL_DIR_NAME), true),
-            ]
-        })
-        .collect();
-    dirs.sort();
-    dirs.dedup();
-    for (dir, legacy) in dirs {
-        let read_dir = match fs::read_dir(&dir) {
-            Ok(read_dir) => read_dir,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                result.unreadable_dirs.push((
-                    dir.clone(),
-                    format!("failed to list {}: {error}", dir.display()),
-                ));
-                continue;
-            }
-        };
-        let mut paths: Vec<PathBuf> = read_dir
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
-            })
-            .collect();
-        paths.sort();
-        for path in paths {
-            let parsed = if legacy {
-                fs::read(&path)
-                    .context("failed to read legacy move journal entry")
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<MoveJournalEntry>(&bytes)
-                            .context("malformed legacy move journal entry")
-                    })
-                    .and_then(|entry| {
-                        if entry.is_current() {
-                            Ok(entry)
-                        } else {
-                            anyhow::bail!(
-                                "move journal version {} is not supported (current: {})",
-                                entry.version,
-                                super::move_journal::MOVE_JOURNAL_VERSION
-                            )
-                        }
-                    })
-                    .map_err(|error| format!("{error:#}"))
-            } else {
-                match read_record(&path) {
-                    Ok(LifecycleJournalRecord::Deleting(_)) => continue,
-                    Ok(LifecycleJournalRecord::Moving(entry)) if entry.is_current() => Ok(*entry),
-                    Ok(LifecycleJournalRecord::Moving(entry)) => Err(format!(
-                        "move journal version {} is not supported (current: {})",
-                        entry.version,
-                        super::move_journal::MOVE_JOURNAL_VERSION
-                    )),
-                    Err(error) => Err(format!("{error:#}")),
-                }
-            };
-            result.entries.push((path, parsed));
         }
     }
     result
@@ -403,10 +289,6 @@ fn read_record(path: &Path) -> Result<LifecycleJournalRecord> {
         .or_else(|record_error| {
             serde_json::from_slice::<LifecycleJournalEntry>(&bytes)
                 .map(|entry| LifecycleJournalRecord::Deleting(Box::new(entry)))
-                .or_else(|_| {
-                    serde_json::from_slice::<MoveJournalEntry>(&bytes)
-                        .map(|entry| LifecycleJournalRecord::Moving(Box::new(entry)))
-                })
                 .map_err(|_| record_error)
         })
         .context("malformed lifecycle journal entry")
@@ -420,7 +302,6 @@ pub(crate) fn read_deletion(path: &Path) -> Result<Option<LifecycleJournalEntry>
             entry.version,
             LIFECYCLE_JOURNAL_VERSION
         ),
-        LifecycleJournalRecord::Moving(_) => Ok(None),
     }
 }
 
@@ -488,54 +369,6 @@ mod tests {
     }
 
     #[test]
-    fn moving_and_deleting_records_share_a_typed_journal() {
-        let temp = tempfile::tempdir().unwrap();
-        let sessions = temp.path().join("profile/sessions.json");
-        let target_sessions = temp.path().join("target/sessions.json");
-        std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(target_sessions.parent().unwrap()).unwrap();
-
-        let mut instance = Instance::new("journal-session", "/tmp/worktree");
-        instance.id = "journal-session".to_string();
-        instance.source_profile = "profile".to_string();
-        let deletion = LifecycleJournalEntry::deletion(
-            instance,
-            Status::Idle,
-            sessions.clone(),
-            LifecycleDeletionOptions {
-                generation: 1,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: false,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        );
-        let deletion_path = record(&deletion).unwrap();
-        let moving = MoveJournalEntry {
-            version: super::super::move_journal::MOVE_JOURNAL_VERSION,
-            ids: vec!["moving-session".to_string()],
-            source_profile: "profile".to_string(),
-            target_profile: "target".to_string(),
-            source_sessions_path: sessions.clone(),
-            target_sessions_path: target_sessions,
-            group_move_source_path: "".to_string(),
-            group_move_target_path: "".to_string(),
-            group_move_subtree: false,
-            created_at_epoch_ms: 1,
-        };
-        let moving_path = record_move(&moving, &sessions).unwrap();
-
-        assert_eq!(deletion_path.parent(), moving_path.parent());
-        assert_eq!(scan([sessions.clone()]).entries.len(), 1);
-        let move_scan = scan_moves([sessions]);
-        assert_eq!(move_scan.entries.len(), 1);
-        assert_eq!(move_scan.entries[0].1.as_ref().unwrap().ids, moving.ids);
-    }
-
-    #[test]
     fn version_one_deletion_records_default_to_no_transcript_cleanup() {
         let mut instance = Instance::new("journal-session", "/tmp/worktree");
         instance.id = "journal-session".to_string();
@@ -564,9 +397,7 @@ mod tests {
             .remove("purge_acp_transcript");
 
         let parsed: LifecycleJournalRecord = serde_json::from_value(record).unwrap();
-        let LifecycleJournalRecord::Deleting(entry) = parsed else {
-            panic!("expected deletion intent");
-        };
+        let LifecycleJournalRecord::Deleting(entry) = parsed;
         assert!(entry.is_current());
         assert!(!entry.purge_acp_transcript);
     }

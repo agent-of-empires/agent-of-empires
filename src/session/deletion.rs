@@ -1363,7 +1363,7 @@ pub fn recover_lifecycle_journals_once() -> Result<()> {
             .then_with(|| right.1.created_at_epoch_ms.cmp(&left.1.created_at_epoch_ms))
     });
 
-    let mut latest_sessions = std::collections::HashSet::new();
+    let mut handled_sessions = std::collections::HashSet::new();
     for (path, entry) in entries {
         let Some(dir) = path.parent() else {
             continue;
@@ -1372,37 +1372,36 @@ pub fn recover_lifecycle_journals_once() -> Result<()> {
             continue;
         }
         let key = (entry.source_profile.clone(), entry.session_id.clone());
-        if !latest_sessions.insert(key) {
-            if let Err(error) = crate::session::lifecycle_journal::consume(&path) {
-                tracing::warn!(
-                    target: "session.delete_recovery",
-                    path = %path.display(),
-                    %error,
-                    "superseded lifecycle journal could not be removed"
-                );
-            }
+        if handled_sessions.contains(&key) {
             continue;
         }
         if entry.phase == LifecyclePhase::Kept {
+            handled_sessions.insert(key);
             continue;
         }
         let Some(storage) = storages.get(&entry.source_profile) else {
             continue;
         };
         match recover_lifecycle_entry(&path, &entry, storage) {
-            Ok(true) => tracing::info!(
-                target: "session.delete_recovery",
-                profile = %entry.source_profile,
-                session_id = %entry.session_id,
-                "replayed interrupted session purge"
-            ),
+            Ok(true) => {
+                handled_sessions.insert(key);
+                tracing::info!(
+                    target: "session.delete_recovery",
+                    profile = %entry.source_profile,
+                    session_id = %entry.session_id,
+                    "replayed interrupted session purge"
+                );
+            }
             Ok(false) => {}
-            Err(error) => tracing::warn!(
-                target: "session.delete_recovery",
-                path = %path.display(),
-                error = %error,
-                "interrupted session purge remains journaled for retry"
-            ),
+            Err(error) => {
+                handled_sessions.insert(key);
+                tracing::warn!(
+                    target: "session.delete_recovery",
+                    path = %path.display(),
+                    error = %error,
+                    "interrupted session purge remains journaled for retry"
+                );
+            }
         }
     }
     Ok(())
@@ -1943,7 +1942,11 @@ fn stop_acp_runner_for_purge(instance: &Instance, generation: u64) -> Result<()>
         &instance.source_profile,
         generation,
     )?;
-    crate::process::worker_registry::terminate_and_confirm_stopped(&instance.id)
+    crate::process::worker_registry::terminate_and_confirm_stopped(
+        &instance.id,
+        &instance.source_profile,
+        generation,
+    )
 }
 
 pub(crate) fn purge_acp_transcript_rows(db_path: &Path, session_id: &str) -> Result<()> {
@@ -2936,6 +2939,94 @@ mod tests {
         (tmp, main_repo, worktree_path, instance)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn acp_writer_helper() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+
+        let Some(socket_path) = std::env::var_os("AOE_TEST_ACP_WRITER_SOCKET") else {
+            return;
+        };
+        let output_path =
+            std::env::var_os("AOE_TEST_ACP_WRITER_OUTPUT").expect("writer output path");
+        let listener = UnixListener::bind(socket_path).expect("bind ACP control socket");
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => drop(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("accept ACP control probe: {error}"),
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&output_path)
+                .and_then(|mut file| file.write_all(b"x"))
+                .expect("write ACP output");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn spawn_live_acp_writer(
+        socket_path: &Path,
+        output_path: &Path,
+        reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
+        use std::os::unix::process::CommandExt as _;
+
+        let control_path = crate::process::worker::control_socket_sibling(socket_path);
+        let executable = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(executable);
+        child
+            .args([
+                "--exact",
+                "session::deletion::tests::acp_writer_helper",
+                "--nocapture",
+            ])
+            .env("AOE_TEST_ACP_WRITER_SOCKET", &control_path)
+            .env("AOE_TEST_ACP_WRITER_OUTPUT", output_path)
+            .process_group(0);
+        let mut child = child.spawn().expect("spawn ACP writer stand-in");
+        let pid = child.id();
+        let waiter = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        reaped.store(true, std::sync::atomic::Ordering::Release);
+                        return status;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        crate::process::worker::kill_process_group(pid);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("wait for ACP writer: {error}");
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    crate::process::worker::kill_process_group(pid);
+                    let _ = child.kill();
+                    let status = child.wait().expect("reap timed-out ACP writer");
+                    reaped.store(true, std::sync::atomic::Ordering::Release);
+                    return status;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if crate::process::worker::peer_pid_from_socket(&control_path) == Some(pid) {
+                return (pid, waiter);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("ACP control socket did not report its runner PID {pid}");
+    }
+
     fn reserve(profile: &str, instance: Instance) -> PurgeTransaction {
         let storage = Storage::open_unwatched(profile).unwrap();
         match PurgeTransaction::reserve(storage, request(instance)).unwrap() {
@@ -3604,6 +3695,56 @@ mod tests {
 
     #[test]
     #[serial]
+    fn recovery_preserves_the_row_owned_generation_when_a_newer_journal_is_orphaned() {
+        let _guard = isolate_app_dir();
+        let profile = "purge-recovery-generation-crash";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = Instance::new("generation-crash", "/tmp/generation-crash");
+        instance.source_profile = profile.to_string();
+        let (snapshot, deleting_row, generation) = expired_deleting_row(instance);
+        storage
+            .update(|instances, _groups| {
+                instances.push(deleting_row);
+                Ok(())
+            })
+            .unwrap();
+
+        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
+            snapshot,
+            Status::Idle,
+            storage.sessions_path().to_path_buf(),
+            crate::session::lifecycle_journal::LifecycleDeletionOptions {
+                generation,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+                purge_acp_transcript: false,
+            },
+        );
+        let owned_path = crate::session::lifecycle_journal::record(&entry).unwrap();
+        let orphan_path =
+            crate::session::lifecycle_journal::record(&entry.with_generation(generation + 1))
+                .unwrap();
+        assert_ne!(owned_path, orphan_path);
+
+        recover_lifecycle_journals_once().unwrap();
+
+        assert!(
+            storage.load().unwrap().is_empty(),
+            "recovery should follow the generation still owned by the row"
+        );
+        assert!(
+            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()])
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[serial]
     fn startup_recovery_replays_a_purge_and_drops_superseded_restore_intent() {
         let _guard = isolate_app_dir();
         let profile = "purge-recovery";
@@ -3981,7 +4122,6 @@ mod tests {
     #[serial]
     #[cfg(unix)]
     fn recovery_stops_a_live_acp_writer_before_removing_its_workspace_and_transcript() {
-        use std::os::unix::process::CommandExt as _;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -3994,43 +4134,10 @@ mod tests {
         instance.view = View::Structured;
 
         let writer_path = worktree_path.join("live-writer-output");
-        let mut writer = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "while :; do printf x >> \"$1\"; sleep 0.01; done",
-                "sh",
-                writer_path.to_str().unwrap(),
-            ])
-            .process_group(0)
-            .spawn()
-            .expect("spawn ACP writer stand-in");
-        let writer_pid = writer.id();
         let reaped = Arc::new(AtomicBool::new(false));
-        let reaped_by_waiter = Arc::clone(&reaped);
-        let waiter = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                match writer.try_wait() {
-                    Ok(Some(status)) => {
-                        reaped_by_waiter.store(true, Ordering::Release);
-                        return status;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        crate::process::worker::kill_process_group(writer_pid);
-                        let _ = writer.kill();
-                        let _ = writer.wait();
-                        panic!("wait for ACP writer: {error}");
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
-                    crate::process::worker::kill_process_group(writer_pid);
-                    let _ = writer.kill();
-                    return writer.wait().expect("reap timed-out ACP writer");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
+        let socket_path = crate::process::worker_registry::socket_path_for(&instance.id).unwrap();
+        let (writer_pid, waiter) =
+            spawn_live_acp_writer(&socket_path, &writer_path, Arc::clone(&reaped));
         let writer_deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !writer_path.exists() {
             assert!(
@@ -4065,7 +4172,6 @@ mod tests {
         .with_phase(LifecyclePhase::TeardownStarted);
         crate::session::lifecycle_journal::record(&entry).unwrap();
 
-        let socket_path = crate::process::worker_registry::socket_path_for(&instance.id).unwrap();
         let record = crate::process::worker_registry::WorkerRecord::new(
             instance.id.clone(),
             writer_pid,
@@ -4080,7 +4186,6 @@ mod tests {
             Some(profile.to_string()),
         )
         .with_generation(1);
-        crate::process::worker_registry::touch_live_socket(&record.socket_path);
         crate::process::worker_registry::save(&record).unwrap();
         assert!(crate::process::worker_registry::is_record_live(&record));
 
