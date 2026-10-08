@@ -138,4 +138,3 @@ rate_limit_auto_resume = false
 ```
 
 Cold-start resume parallelism is a fixed 4 spawns, clamped to `max_concurrent_workers`, to bound Node bootup memory. `auto_stop_idle_secs` stops an event-idle worker with no in-flight turn (the session keeps its sidebar slot and shows `Stopped { reason: "idle_auto_stop" }`); mid-turn workers are never stopped and the check runs about once a minute. `AOE_ACP_NODE=/path/to/node` overrides Node discovery for one process.
-        

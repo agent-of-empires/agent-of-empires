@@ -173,6 +173,7 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let persisted = h.read_sessions();
+        let persisted = persisted.as_array().expect("sessions array");
         let all_archived = sessions.iter().all(|id| {
             persisted.iter().any(|row| {
                 row["id"].as_str() == Some(id.as_str())
