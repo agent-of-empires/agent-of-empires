@@ -211,6 +211,7 @@ pub(super) fn display_chord(spec: (KeyCode, KeyModifiers)) -> String {
         out.push_str("Shift+");
     }
     match code {
+        KeyCode::Char(' ') => out.push_str("Space"),
         KeyCode::Char(c) => out.push(c.to_ascii_uppercase()),
         KeyCode::Esc => out.push_str("Esc"),
         KeyCode::Tab => out.push_str("Tab"),
@@ -2730,6 +2731,27 @@ mod tests {
         let fallback = parse_chord_list("not-a-chord, also-bad");
         assert!(!fallback.is_empty());
         assert_eq!(fallback, parse_chord_list(DEFAULT_EXIT_CHORD));
+    }
+
+    #[test]
+    fn display_chord_names_space_instead_of_rendering_a_blank() {
+        for (chord, shown) in [
+            ("Space", "Space"),
+            ("C-Space", "Ctrl+Space"),
+            ("Ctrl+Space", "Ctrl+Space"),
+            ("M-Space", "Alt+Space"),
+            ("S-Space", "Shift+Space"),
+            ("C-M-Space", "Ctrl+Alt+Space"),
+            ("C-S-Space", "Ctrl+Shift+Space"),
+            ("M-S-Space", "Alt+Shift+Space"),
+            ("C-M-S-Space", "Ctrl+Alt+Shift+Space"),
+        ] {
+            assert_eq!(display_chord(parse_chord(chord).unwrap()), shown, "{chord}");
+        }
+        assert_eq!(
+            display_chord_list(&parse_chord_list("C-Space,C-q")),
+            "Ctrl+Space / Ctrl+Q"
+        );
     }
 
     #[test]

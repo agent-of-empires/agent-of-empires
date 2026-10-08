@@ -39,6 +39,7 @@ mod hide_stopped;
 mod intro;
 mod kiro_launch;
 mod live_send_paste_e2e;
+mod live_send_space_labels;
 mod live_takeover;
 mod logs;
 mod new_session;
