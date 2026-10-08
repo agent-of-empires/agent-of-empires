@@ -420,8 +420,14 @@ impl AcpClient {
             let mut issued =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
                     .await?;
-            let connected =
-                Self::connect_via_socket(socket_path, launch(sandbox), issued.nonce).await;
+            let admission = config
+                .execution_admission
+                .as_ref()
+                .expect("detached spawn validated its original admission");
+            let connected = tokio::select! {
+                result = Self::connect_via_socket(socket_path, launch(sandbox), issued.nonce) => result,
+                _ = admission.cancelled() => Err(AcpError::Spawn("native launch admission was cancelled".into())),
+            };
             let mut client = match connected {
                 Ok(client) => client,
                 Err(error) => {

@@ -107,7 +107,7 @@ async fn run_shutdown_sequence<R, F>(
     if tokio::time::timeout(grace * 4 / 5, reap).await.is_err() {
         tracing::warn!(
             target: "shutdown",
-            "plugin worker reap did not finish in time, continuing shutdown"
+            "producer and plugin drain did not finish in time, continuing shutdown"
         );
     }
 }
@@ -934,6 +934,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // exit after 5s of normal uptime). The deadline lives inside the
     // signal handler so the clock only starts after the signal fires.
     let shutdown_state = state.clone();
+    let shutdown_acp_supervisor = Arc::clone(&acp_supervisor);
     let shutdown_signal = async move {
         #[cfg(unix)]
         {
@@ -958,14 +959,23 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
         notify_stopping();
+        let native_drain = shutdown_acp_supervisor.close_admissions();
         let plugin_host = shutdown_state.plugin_host.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
             SHUTDOWN_GRACE,
             async move {
-                if let Some(host) = plugin_host {
-                    host.shutdown().await;
-                }
+                let plugins = async move {
+                    if let Some(host) = plugin_host {
+                        host.shutdown().await;
+                    }
+                };
+                let native = async move {
+                    if let Err(error) = native_drain.await {
+                        tracing::warn!(target: "serve.shutdown", %error, "original preparation retirement remains unproven");
+                    }
+                };
+                tokio::join!(plugins, native);
             },
             || std::process::exit(0),
         )

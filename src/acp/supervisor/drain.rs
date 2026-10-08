@@ -382,25 +382,25 @@ impl<S: BroadcastSink> Drain<S> {
         let previous_admission = config.execution_admission.as_ref()?.clone();
         let original = previous_admission.origin()?;
         let previous_retirement = previous_admission.preparation_retirement();
-        let begun = lock_recover(&self.lifecycle).begin_respawn(lease);
-        let Ok((respawn_lease, previous)) = begun else {
-            debug!(
-                target: "acp.supervisor",
-                session = %session_id,
-                "respawn skipped; the session's lease moved on"
-            );
-            return None;
-        };
-        let issued = lock_recover(&self.lifecycle).execution_admission(&respawn_lease);
-        issued.set_origin(original.clone()).ok()?;
-        let mut reservation = ResumeReservation {
-            lease: respawn_lease.clone(),
-            lifecycle: Arc::clone(&self.lifecycle),
-            notify: Arc::clone(&self.notify),
-            execution: previous,
-            custody: Some(issued.begin_job()),
-            retirement_required: true,
-            issued,
+        let (respawn_lease, previous, mut reservation) = {
+            let mut table = lock_recover(&self.lifecycle);
+            let Ok((respawn_lease, previous)) = table.begin_respawn(lease) else {
+                debug!(target: "acp.supervisor", session = %session_id, "respawn skipped; admission is stale or closed");
+                return None;
+            };
+            let issued = table.execution_admission(&respawn_lease);
+            issued.set_origin(original.clone()).ok()?;
+            let custody = Some(issued.begin_job());
+            let reservation = ResumeReservation {
+                lease: respawn_lease.clone(),
+                lifecycle: Arc::clone(&self.lifecycle),
+                notify: Arc::clone(&self.notify),
+                execution: previous,
+                custody,
+                retirement_required: true,
+                issued,
+            };
+            (respawn_lease, previous, reservation)
         };
         let _body_custody = reservation.issued.begin_job();
         if let Some(retirement) = previous_retirement {
@@ -410,6 +410,10 @@ impl<S: BroadcastSink> Drain<S> {
         }
 
         tokio::time::sleep(RESPAWN_BACKOFF).await;
+        if reservation.issued.is_shutdown_cancelled() {
+            reservation.retirement_required = false;
+            return None;
+        }
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
         if let Some(reason) = cancelled {
             if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease, previous) {

@@ -6,7 +6,7 @@ aoe is the ACP *client*; each agent (Claude Code, Gemini, `aoe-agent`, ...) is t
 
 ## Worker lifecycle
 
-Workers are detached `aoe __acp-runner` processes that outlive the daemon. `aoe serve --stop` drops the connection without terminating them, and a later daemon reattaches over the control socket, so in-flight turns survive a daemon stop, crash, suspend, or build-only update. `aoe acp stop|kill <session>` terminates one deliberately.
+Workers are detached `aoe __acp-runner` processes that outlive the daemon. `aoe serve --stop` closes new admissions and drains issued producers plus their actual canonical preparation ACKs before dropping control connections. Cancelling a pending attach releases its admission without stopping the resident runner. A later daemon reattaches over the control socket, so in-flight turns survive a daemon stop, crash, suspend, or build-only update. `aoe acp stop|kill <session>` terminates one deliberately.
 
 Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (pid, socket path, cached ACP session id, `build_version`, `runner_version`) beside its `.control.sock` and `.log`; `aoe ps --acp --dead` lists them. The runner terminates the ACP protocol: it owns the handshake, the turn, and every JSON-RPC id on the agent's stdin, while the daemon speaks a length-framed control protocol over the control socket. Notifications and turn completion share that one ordered channel, so a turn's terminal event cannot overtake the chunks before it. That wire order is not an application-event completion barrier: asynchronous SDK notification dispatch can lag terminal or handshake bookkeeping.
 

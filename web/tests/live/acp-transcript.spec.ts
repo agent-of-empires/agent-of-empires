@@ -28,7 +28,7 @@ import {
 const MOD = process.platform === "darwin" ? "Meta" : "Control";
 // A valid 1x1 PNG; its magic bytes satisfy the server's attachment sniff.
 const PNG_1X1_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-const IMAGE_CAPABLE = { promptCapabilities: { image: true } };
+const IMAGE_CAPABLE = { ...script(), promptCapabilities: { image: true } };
 
 function aoeAdd(env: NodeJS.ProcessEnv, projectDir: string, title: string) {
   const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", "claude"], { env });

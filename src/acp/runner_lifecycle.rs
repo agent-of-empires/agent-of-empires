@@ -109,6 +109,7 @@ impl RunnerIdentity {
 struct AdmissionState {
     identity: Option<RunnerIdentity>,
     cancelled: bool,
+    shutdown_requested: bool,
     cancelled_stop: Option<Arc<crate::session::runner_journal::OwnedStop>>,
     jobs: usize,
     origin: Option<Arc<crate::session::runner_journal::LaunchOrigin>>,
@@ -118,9 +119,15 @@ struct AdmissionState {
     preparation_retirement: Option<tokio::sync::watch::Receiver<Option<bool>>>,
 }
 
+#[derive(Debug)]
+struct Admission {
+    state: Mutex<AdmissionState>,
+    changed: tokio::sync::Notify,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionAdmission {
-    state: Arc<Mutex<AdmissionState>>,
+    inner: Arc<Admission>,
 }
 
 pub(crate) struct AdmissionRetirement {
@@ -169,9 +176,10 @@ pub(crate) struct ExecutionJob(ExecutionAdmission);
 
 impl Drop for ExecutionJob {
     fn drop(&mut self) {
-        let (retirement, preparation) = {
+        let (retirement, preparation, completed) = {
             let mut state = self
                 .0
+                .inner
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -183,14 +191,18 @@ impl Drop for ExecutionJob {
                         .take()
                         .map(|retirement| (retirement, state.identity)),
                     state.preparation.take(),
+                    true,
                 )
             } else {
-                (None, None)
+                (None, None, false)
             }
         };
         drop(preparation);
         if let Some((retirement, identity)) = retirement {
             retirement.finish(identity);
+        }
+        if completed {
+            self.0.inner.changed.notify_waiters();
         }
     }
 }
@@ -198,18 +210,108 @@ impl Drop for ExecutionJob {
 impl ExecutionAdmission {
     pub(crate) fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(AdmissionState::default())),
+            inner: Arc::new(Admission {
+                state: Mutex::new(AdmissionState::default()),
+                changed: tokio::sync::Notify::new(),
+            }),
         }
     }
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .cancelled
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn is_drained(&self) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.jobs == 0
+            && state.preparation.is_none()
+            && state
+                .preparation_retirement
+                .as_ref()
+                .map_or(state.prepared.is_none(), |retirement| {
+                    *retirement.borrow() == Some(true)
+                })
+    }
+
+    pub async fn drain(&self) -> anyhow::Result<()> {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.has_active_job() {
+                break;
+            }
+            changed.await;
+        }
+        let retirement = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            anyhow::ensure!(
+                state.preparation.is_none(),
+                "native preparation custody has not completed"
+            );
+            anyhow::ensure!(
+                state.prepared.is_none() || state.preparation_retirement.is_some(),
+                "issued preparation lost its actual retirement receiver"
+            );
+            state.preparation_retirement.clone()
+        };
+        if let Some(retirement) = retirement {
+            crate::session::runner_journal::PreparationCustody::await_retired(retirement).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn register_preparation_retirement(
+        &self,
+        retirement: tokio::sync::watch::Receiver<Option<bool>>,
+    ) -> anyhow::Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            state.preparation_retirement.is_none(),
+            "admission already retains an original preparation retirement"
+        );
+        state.preparation_retirement = Some(retirement);
+        Ok(())
     }
 
     pub(crate) fn set_origin(
         &self,
         origin: Arc<crate::session::runner_journal::LaunchOrigin>,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(original) = &state.origin {
             anyhow::ensure!(
                 Arc::ptr_eq(original, &origin),
@@ -226,7 +328,11 @@ impl ExecutionAdmission {
         origin: Arc<crate::session::runner_journal::LaunchOrigin>,
         preparation: crate::session::runner_journal::PreparationCustody,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let baseline = state
             .origin
             .as_ref()
@@ -240,7 +346,13 @@ impl ExecutionAdmission {
                 && origin.is_prepared_from(baseline),
             "native preparation replaced its operation lineage"
         );
-        state.preparation_retirement = Some(preparation.retirement());
+        anyhow::ensure!(
+            state
+                .preparation_retirement
+                .as_ref()
+                .is_some_and(|retirement| retirement.same_channel(preparation.retirement())),
+            "native preparation replaced its original retirement receiver"
+        );
         state.preparation = Some(preparation);
         Ok(())
     }
@@ -251,7 +363,11 @@ impl ExecutionAdmission {
         produced: Arc<crate::session::runner_journal::LaunchOrigin>,
         identity: Option<RunnerIdentity>,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         anyhow::ensure!(
             state
                 .prepared
@@ -273,7 +389,8 @@ impl ExecutionAdmission {
     }
 
     pub(crate) fn preparation_nonce(&self) -> Option<[u8; 16]> {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .preparation
@@ -284,7 +401,8 @@ impl ExecutionAdmission {
     pub(crate) fn preparation_retirement(
         &self,
     ) -> Option<tokio::sync::watch::Receiver<Option<bool>>> {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .preparation_retirement
@@ -292,14 +410,19 @@ impl ExecutionAdmission {
     }
 
     pub(crate) fn origin(&self) -> Option<Arc<crate::session::runner_journal::LaunchOrigin>> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.prepared.as_ref().or(state.origin.as_ref()).cloned()
     }
 
     pub(crate) fn original_baseline(
         &self,
     ) -> Option<Arc<crate::session::runner_journal::LaunchOrigin>> {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .origin
@@ -307,34 +430,79 @@ impl ExecutionAdmission {
     }
 
     pub(crate) fn check_active(&self) -> anyhow::Result<()> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         anyhow::ensure!(!state.cancelled, "native operation was cancelled");
         Ok(())
     }
 
     pub(crate) fn capture(&self, identity: RunnerIdentity) {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .identity = Some(identity);
     }
 
     pub(crate) fn snapshot(&self) -> Option<RunnerIdentity> {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .identity
     }
 
+    fn cancel_for_shutdown(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.shutdown_requested = true;
+        state.cancelled = true;
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+
+    pub(crate) fn is_shutdown_cancelled(&self) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.shutdown_requested && state.cancelled_stop.is_none()
+    }
+
+    pub(crate) async fn shutdown_cancelled(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_shutdown_cancelled() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub(crate) fn cancel(&self) {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .cancelled = true;
+        self.inner.changed.notify_waiters();
     }
 
     fn cancel_from_stop(&self, stop: Arc<crate::session::runner_journal::OwnedStop>) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.cancelled = true;
         if state.cancelled_stop.is_none() {
             if let Some(preparation) = &state.preparation {
@@ -344,10 +512,13 @@ impl ExecutionAdmission {
             }
             state.cancelled_stop = Some(stop);
         }
+        drop(state);
+        self.inner.changed.notify_waiters();
     }
 
     fn take_cancelled_stop(&self) -> Option<Arc<crate::session::runner_journal::OwnedStop>> {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .cancelled_stop
@@ -360,7 +531,11 @@ impl ExecutionAdmission {
         execution: Option<RunnerIdentity>,
         claim: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         anyhow::ensure!(
             !state.cancelled && state.prepared.is_none(),
             "runner admission was cancelled or already prepared"
@@ -376,7 +551,11 @@ impl ExecutionAdmission {
         &self,
         effect: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         anyhow::ensure!(
             !state.cancelled,
             "runner admission was cancelled before effect"
@@ -385,7 +564,8 @@ impl ExecutionAdmission {
     }
 
     pub(crate) fn begin_job(&self) -> ExecutionJob {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .jobs += 1;
@@ -393,7 +573,8 @@ impl ExecutionAdmission {
     }
 
     pub(crate) fn has_active_job(&self) -> bool {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .jobs
@@ -402,7 +583,11 @@ impl ExecutionAdmission {
 
     pub(crate) fn retire(&self, retirement: AdmissionRetirement) {
         let (identity, preparation) = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if state.jobs != 0 {
                 state.cancelled = true;
                 state.retirement = Some(retirement);
@@ -419,7 +604,11 @@ impl ExecutionAdmission {
         identity: RunnerIdentity,
         issue: impl FnOnce() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.identity = Some(identity);
         if state.cancelled {
             return Err(std::io::Error::other("runner admission was cancelled"));
@@ -521,6 +710,8 @@ pub enum AdmitError {
     /// fallback), carrying its reason.
     #[error("native resume cancelled: {0}")]
     Cancelled(String),
+    #[error("native admissions are closed for daemon shutdown")]
+    ShuttingDown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +762,8 @@ pub struct RetryClaim {
 
 pub struct LifecycleTable {
     entries: HashMap<String, Entry>,
+    closing: bool,
+    released_admissions: Vec<ExecutionAdmission>,
     /// Also the generation stamped on the next spawned runner, so it must
     /// stay unique across daemon restarts; the supervisor seeds it from
     /// the wall clock.
@@ -587,10 +780,50 @@ impl LifecycleTable {
     pub fn new(seed_epoch: u64) -> Self {
         Self {
             entries: HashMap::new(),
+            closing: false,
+            released_admissions: Vec::new(),
             next_epoch: seed_epoch.max(1),
             last_generation: HashMap::new(),
             stale_cancels: HashMap::new(),
         }
+    }
+
+    fn remember_released(&mut self, admission: ExecutionAdmission) {
+        self.released_admissions
+            .retain(|issued| !issued.is_drained());
+        if !admission.is_drained() {
+            self.released_admissions.push(admission);
+        }
+    }
+
+    fn remove_entry(&mut self, id: &str) {
+        if let Some(entry) = self.entries.remove(id) {
+            self.remember_released(entry.admission);
+        }
+    }
+
+    /// Fence future admissions; this barrier is lifetime custody, not native-death proof.
+    pub fn close_admissions(&mut self) -> Vec<ExecutionAdmission> {
+        self.closing = true;
+        for entry in self.entries.values() {
+            if matches!(
+                entry.phase,
+                Phase::Starting { .. } | Phase::Respawning { .. }
+            ) {
+                entry.admission.cancel_for_shutdown();
+            }
+        }
+        self.released_admissions
+            .retain(|issued| !issued.is_drained());
+        let mut issued = std::mem::take(&mut self.released_admissions);
+        issued.reserve(self.entries.len());
+        issued.extend(
+            self.entries
+                .values()
+                .filter(|entry| !entry.admission.is_drained())
+                .map(|entry| entry.admission.clone()),
+        );
+        issued
     }
 
     /// Next epoch.
@@ -684,7 +917,7 @@ impl LifecycleTable {
         }) {
             return false;
         }
-        self.entries.remove(session_id);
+        self.remove_entry(session_id);
         self.last_generation.remove(session_id);
         // Only the validated preparation CAS consumes an explicit resume override.
         true
@@ -705,6 +938,9 @@ impl LifecycleTable {
 
     /// Reserve the session for a spawn or attach.
     pub fn admit(&mut self, session_id: &str, kind: ResumeKind) -> Result<Lease, AdmitError> {
+        if self.closing {
+            return Err(AdmitError::ShuttingDown);
+        }
         match self.entries.get(session_id).map(|e| &e.phase) {
             None => {}
             Some(Phase::Stopping { .. } | Phase::TeardownRetry { .. }) => {
@@ -765,7 +1001,7 @@ impl LifecycleTable {
             _ => return false,
         };
         let scope = entry.admission.take_cancelled_stop();
-        self.entries.remove(&lease.session_id);
+        self.remove_entry(&lease.session_id);
         if let Some(reason) = cancel {
             self.stale_cancels.insert(
                 lease.session_id.clone(),
@@ -781,7 +1017,7 @@ impl LifecycleTable {
             return false;
         };
         if matches!(entry.phase, Phase::Running { .. }) {
-            self.entries.remove(&lease.session_id);
+            self.remove_entry(&lease.session_id);
             return true;
         }
         false
@@ -845,6 +1081,7 @@ impl LifecycleTable {
             .filter(|entry| entry.epoch == lease.epoch)?;
         entry
             .admission
+            .inner
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -930,7 +1167,7 @@ impl LifecycleTable {
         };
         match settlement {
             Settlement::Proven => {
-                self.entries.remove(&lease.session_id);
+                self.remove_entry(&lease.session_id);
             }
             Settlement::Unproven(identity) => {
                 entry.phase = Phase::TeardownRetry {
@@ -946,6 +1183,9 @@ impl LifecycleTable {
         &mut self,
         lease: &Lease,
     ) -> Result<(Lease, Option<RunnerIdentity>), InstallError> {
+        if self.closing {
+            return Err(InstallError::Stale);
+        }
         let session_id = lease.session_id.clone();
         let Some(entry) = self.current(lease) else {
             return Err(InstallError::Stale);
@@ -959,8 +1199,9 @@ impl LifecycleTable {
             .get_mut(&session_id)
             .expect("entry checked above");
         entry.epoch = epoch;
-        entry.admission = ExecutionAdmission::new();
+        let previous_admission = std::mem::replace(&mut entry.admission, ExecutionAdmission::new());
         entry.phase = Phase::Respawning { cancel: None };
+        self.remember_released(previous_admission);
         Ok((self.lease(&session_id, epoch), identity))
     }
 
@@ -1151,7 +1392,9 @@ impl LifecycleTable {
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        for entry in std::mem::take(&mut self.entries).into_values() {
+            self.remember_released(entry.admission);
+        }
     }
 }
 

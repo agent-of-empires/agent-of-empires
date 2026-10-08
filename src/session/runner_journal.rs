@@ -147,8 +147,8 @@ pub(crate) struct PreparationCustody {
 }
 
 impl PreparationCustody {
-    pub(crate) fn retirement(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
-        self.retired.clone()
+    pub(crate) fn retirement(&self) -> &tokio::sync::watch::Receiver<Option<bool>> {
+        &self.retired
     }
     pub(crate) fn produced(&self, origin: std::sync::Arc<LaunchOrigin>) -> Result<()> {
         self._completion
@@ -494,6 +494,7 @@ fn prepare_locked<'a>(
         _completion: completion,
         retired,
     };
+    admission.register_preparation_retirement(custody.retirement().clone())?;
     let authorization = storage.update_under_workspace_claim_lock(|rows, _| {
         let row = rows
             .iter_mut()
@@ -2996,8 +2997,34 @@ mod tests {
             storage.load().unwrap()[0].runner_journal.preparations.len(),
             1
         );
+        let workspace = super::super::acquire_session_workspace_claim_lock().unwrap();
         drop(last);
-        PreparationCustody::await_retired(retirement).await.unwrap();
+        let mut closing = lifecycle.lock().unwrap();
+        assert!(!closing.is_owned(&row.id));
+        let pending = closing.close_admissions();
+        for kind in [ResumeKind::Spawn, ResumeKind::Attach] {
+            assert_eq!(
+                closing.admit("future-admission", kind),
+                Err(crate::acp::runner_lifecycle::AdmitError::ShuttingDown)
+            );
+        }
+        drop(closing);
+        let original = pending
+            .into_iter()
+            .next()
+            .expect("original released preparation");
+        let drain = original.drain();
+        tokio::pin!(drain);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(matches!(
+                std::future::Future::poll(drain.as_mut(), cx),
+                std::task::Poll::Pending
+            )))
+            .await
+        );
+        assert_eq!(*retirement.borrow(), None);
+        drop(workspace);
+        drain.await.unwrap();
         settle(stop_generation.clone()).await.unwrap();
         assert!(!lifecycle.lock().unwrap().is_owned(&row.id));
         let final_row = storage.load().unwrap().remove(0);

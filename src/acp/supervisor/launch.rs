@@ -75,7 +75,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 Err(AdmitError::TeardownPending) => {
                     return Err(SupervisorError::TeardownPending(session_id.to_owned()))
                 }
-                Err(AdmitError::Cancelled(_)) => {
+                Err(AdmitError::Cancelled(_) | AdmitError::ShuttingDown) => {
                     return Err(SupervisorError::SpawnCancelled(session_id.to_owned()))
                 }
             };
@@ -742,7 +742,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         request: super::AttachRequest,
         record: &worker_registry::WorkerRecord,
-        reservation: ResumeReservation,
+        mut reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
         let _body_custody = reservation.issued.begin_job();
         let super::AttachRequest {
@@ -903,7 +903,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             None
         };
 
-        let mut client = AcpClient::attach(
+        let connected = AcpClient::attach(
             record.socket_path.clone(),
             cwd,
             additional_dirs,
@@ -914,8 +914,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             agent_key,
             Some(origin.storage().profile().to_owned()),
             nonce,
-        )
-        .await?;
+        );
+        let mut client = tokio::select! {
+            result = connected => result?,
+            _ = reservation.issued.shutdown_cancelled() => {
+                reservation.retirement_required = false;
+                return Err(SupervisorError::SpawnCancelled(session_id));
+            }
+        };
         client.capture_runner(identity);
 
         let inbound = client

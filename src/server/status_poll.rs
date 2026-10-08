@@ -144,7 +144,10 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
     let mut acp_capacity_deferred: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = state.shutdown.cancelled() => return,
+            _ = interval.tick() => {},
+        }
 
         let prev: std::collections::HashMap<String, crate::session::Status> = {
             let instances = state.instances.read().await;
@@ -262,6 +265,9 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
 
             drain_session_id_updates_in_state(&state).await;
 
+            if state.shutdown.is_cancelled() {
+                return;
+            }
             acp_reconciler::reconcile_acp_workers(
                 &state,
                 &mut attempted_acp_spawns,

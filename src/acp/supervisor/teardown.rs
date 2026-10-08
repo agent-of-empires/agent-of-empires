@@ -200,6 +200,27 @@ impl<S: BroadcastSink> Supervisor<S> {
         })
     }
 
+    /// Drain issued producers and their canonical preparation ACKs without stopping residents.
+    pub fn close_admissions(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static {
+        let issued = lock_recover(&self.lifecycle).close_admissions();
+        async move {
+            let mut first_error = None;
+            for admission in issued {
+                if let Err(error) = admission.drain().await {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
     /// Drop every worker handle without killing the runners (daemon restart).
     pub async fn detach_all(&self) {
         let drained: Vec<(String, WorkerHandle)> = self.workers.lock().await.drain().collect();
