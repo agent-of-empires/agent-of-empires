@@ -15,7 +15,7 @@ use agent_of_empires::acp::mcp_config;
 use agent_of_empires::acp::state::AcpSessionId;
 use agent_of_empires::session::mcp::mcp_model;
 
-use crate::common::{shim_path, shim_ready};
+use crate::common::shim::{shim_path, shim_ready};
 
 /// Config with no MCP servers; callers set `mcp_servers` afterward so this
 /// helper never has to name the schema's `McpServer` type.
@@ -29,7 +29,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),

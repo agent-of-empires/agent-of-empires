@@ -667,8 +667,15 @@ mod tests {
 
         let _home = crate::session::test_support::isolate_app_dir();
         let old = crate::session::Instance::new("old", "/tmp/old");
-        crate::server::test_support::seed_instances_on_disk_for_test("test", vec![old.clone()]);
-        let state = crate::server::test_support::build_test_app_state(vec![old]);
+        let occupant_dir = tempfile::tempdir().unwrap();
+        let mut occupant =
+            crate::session::Instance::new("occupant", occupant_dir.path().to_str().unwrap());
+        occupant.id = "occupant".to_string();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "test",
+            vec![old.clone(), occupant.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![old, occupant]);
         // Capacity prevents an external agent launch without bypassing creation or persistence.
         state.acp_supervisor.test_insert_worker("occupant").await;
         let epoch = state

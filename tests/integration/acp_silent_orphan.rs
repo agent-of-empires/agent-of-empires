@@ -16,11 +16,11 @@
 
 use std::time::{Duration, Instant};
 
-use agent_of_empires::acp::acp_client::AcpClient;
-use agent_of_empires::acp::state::{AcpSessionId, Event};
+use crate::acp::acp_client::AcpClient;
+use crate::acp::state::{AcpSessionId, Event};
 use serial_test::serial;
 
-use crate::common::{shim_ready, spawn_runner_with_shim, EnvGuard};
+use super::{environment::EnvGuard, runner_fixture::spawn_runner_with_shim, shim::shim_ready};
 
 /// Evidence retained across every observation phase of one turn.
 #[derive(Default)]
@@ -150,6 +150,12 @@ macro_rules! skip_without_shim {
 #[tokio::test]
 #[serial]
 async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(cost_bearing_wrap_up_without_response_ends_as_prompt_complete),
+    ) {
+        return;
+    }
     skip_without_shim!();
     let outcome = observe_parked_turn(
         "silent-orphan-positive",
@@ -161,10 +167,10 @@ async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
     .await;
 
     assert_eq!(
-        outcome.usage_cost,
-        Some(true),
-        "the fixture's cost-bearing UsageUpdate must reach the daemon, otherwise this turn is the no-cost wedge instead"
-    );
+    outcome.usage_cost,
+    Some(true),
+    "the fixture's cost-bearing UsageUpdate must reach the daemon, otherwise this turn is the no-cost wedge instead"
+);
     assert_eq!(
         outcome.stopped.as_deref(),
         Some("prompt_complete"),
@@ -178,6 +184,12 @@ async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
 #[tokio::test]
 #[serial]
 async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(silent_orphan_fires_when_the_turn_never_wraps_up),
+    ) {
+        return;
+    }
     skip_without_shim!();
     let outcome = observe_parked_turn(
         "silent-orphan-no-cost",
@@ -206,6 +218,12 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
 #[tokio::test]
 #[serial]
 async fn silent_orphan_disabled_by_zero_grace() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(silent_orphan_disabled_by_zero_grace),
+    ) {
+        return;
+    }
     skip_without_shim!();
     let outcome = observe_parked_turn(
         "silent-orphan-disabled",
@@ -217,10 +235,10 @@ async fn silent_orphan_disabled_by_zero_grace() {
     .await;
 
     assert_eq!(
-        outcome.usage_cost,
-        Some(true),
-        "the fixture's cost-bearing UsageUpdate must reach the daemon, otherwise a disabled watchdog is not what kept this turn quiet"
-    );
+    outcome.usage_cost,
+    Some(true),
+    "the fixture's cost-bearing UsageUpdate must reach the daemon, otherwise a disabled watchdog is not what kept this turn quiet"
+);
     assert!(
         outcome.stopped.is_none(),
         "the watchdog must stay fully disarmed when grace = 0; saw Stopped reason={:?}",
@@ -237,6 +255,12 @@ async fn silent_orphan_disabled_by_zero_grace() {
 #[tokio::test]
 #[serial]
 async fn silent_orphan_suppressed_while_off_protocol_work_is_pending() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(silent_orphan_suppressed_while_off_protocol_work_is_pending),
+    ) {
+        return;
+    }
     skip_without_shim!();
     // (preseed, prompt, awaited marker, expected usage evidence)
     let cases = [
@@ -267,10 +291,10 @@ async fn silent_orphan_suppressed_while_off_protocol_work_is_pending() {
             assert_eq!(outcome.usage_cost, expected, "{preseed}");
         }
         assert!(
-            outcome.stopped.is_none(),
-            "{preseed}: the watchdog must stay suppressed while off-protocol work is pending; saw Stopped reason={:?}",
-            outcome.stopped
-        );
+        outcome.stopped.is_none(),
+        "{preseed}: the watchdog must stay suppressed while off-protocol work is pending; saw Stopped reason={:?}",
+        outcome.stopped
+    );
     }
 }
 
@@ -281,6 +305,12 @@ async fn silent_orphan_suppressed_while_off_protocol_work_is_pending() {
 #[tokio::test]
 #[serial]
 async fn background_bash_wrap_up_ends_as_prompt_complete() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(background_bash_wrap_up_ends_as_prompt_complete),
+    ) {
+        return;
+    }
     skip_without_shim!();
     let outcome = observe_parked_turn(
         "so-bash-wrap",
@@ -292,10 +322,10 @@ async fn background_bash_wrap_up_ends_as_prompt_complete() {
     .await;
 
     assert_eq!(
-        outcome.usage_cost,
-        Some(true),
-        "the fixture's cost-bearing UsageUpdate must reach the daemon, otherwise the off-protocol floor is what kept this turn open"
-    );
+    outcome.usage_cost,
+    Some(true),
+    "the fixture's cost-bearing UsageUpdate must reach the daemon, otherwise the off-protocol floor is what kept this turn open"
+);
     assert_eq!(
         outcome.stopped.as_deref(),
         Some("prompt_complete"),

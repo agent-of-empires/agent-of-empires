@@ -4,7 +4,7 @@ use crate::process::worker_registry::SocketEndpointIdentity;
 use crate::process::ProcessIncarnation;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -14,6 +14,9 @@ use uuid::Uuid;
 use super::deletion::SessionPathOwner;
 use super::storage::{same_filesystem_identity, sync_parent_directory};
 use super::{Instance, LifecycleOperation, Storage};
+
+mod bootstrap;
+pub(crate) use bootstrap::LaunchBootstrap;
 
 pub(crate) type BootToken = [u8; 16];
 
@@ -38,7 +41,7 @@ struct RunnerLaunch {
     registry: Option<RegistryWitness>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct NativeBirthKey {
     nonce: [u8; 16],
     boot: BootToken,
@@ -61,7 +64,7 @@ impl RunnerLaunch {
 
 /// Native birth stays immutable; this is the current authorized JSON-file
 /// witness and the independently owned original control socket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RegistryWitness {
     record_file_identity: super::DirectoryIdentity,
     control_file_identity: SocketEndpointIdentity,
@@ -544,6 +547,11 @@ fn prepare_locked<'a>(
 /// Physical original and immutable execution plan shared by sealed issued epochs.
 struct LaunchPlan {
     storage: std::sync::Arc<Storage>,
+    execution: ExecutionPlan,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExecutionPlan {
     session_id: String,
     created_at: chrono::DateTime<chrono::Utc>,
     project_path: String,
@@ -561,6 +569,14 @@ struct LaunchPlan {
     title: String,
     archived: bool,
     trashed: bool,
+}
+
+impl std::ops::Deref for LaunchPlan {
+    type Target = ExecutionPlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.execution
+    }
 }
 
 /// One sealed original-profile authority epoch. A derivative cannot promote an old observer.
@@ -642,23 +658,25 @@ impl LaunchOrigin {
         Ok(Self {
             plan: std::sync::Arc::new(LaunchPlan {
                 storage,
-                session_id: expected.id.clone(),
-                created_at: expected.created_at,
-                project_path: expected.project_path.clone(),
-                worktree: expected.worktree_info.clone(),
-                workspace: expected.workspace_info.clone(),
-                sandbox: expected.sandbox_info.clone(),
-                command: expected.command.clone(),
-                extra_args: expected.extra_args.clone(),
-                tool: expected.tool.clone(),
-                detect_as: expected.detect_as.clone(),
-                yolo_mode: expected.yolo_mode,
-                agent_provider: expected.agent_provider.clone(),
-                first_launch_names_agent: expected.first_launch_names_agent,
-                active_execution: expected.active_execution.clone(),
-                title: expected.title.clone(),
-                archived: expected.is_archived(),
-                trashed: expected.is_trashed(),
+                execution: ExecutionPlan {
+                    session_id: expected.id.clone(),
+                    created_at: expected.created_at,
+                    project_path: expected.project_path.clone(),
+                    worktree: expected.worktree_info.clone(),
+                    workspace: expected.workspace_info.clone(),
+                    sandbox: expected.sandbox_info.clone(),
+                    command: expected.command.clone(),
+                    extra_args: expected.extra_args.clone(),
+                    tool: expected.tool.clone(),
+                    detect_as: expected.detect_as.clone(),
+                    yolo_mode: expected.yolo_mode,
+                    agent_provider: expected.agent_provider.clone(),
+                    first_launch_names_agent: expected.first_launch_names_agent,
+                    active_execution: expected.active_execution.clone(),
+                    title: expected.title.clone(),
+                    archived: expected.is_archived(),
+                    trashed: expected.is_trashed(),
+                },
             }),
             generation: expected.lifecycle_generation,
             births: expected
@@ -1437,7 +1455,7 @@ impl ManagedLaunch {
         self.nonce
     }
 
-    pub(crate) fn configure(&self, command: &mut tokio::process::Command) {
+    pub(crate) fn configure(&self, command: &mut std::process::Command) {
         command.arg("--managed-profile").arg(&self.profile);
         command.arg("--launch-nonce").arg(self.nonce.to_string());
     }
@@ -1447,11 +1465,62 @@ impl ManagedLaunch {
         storage: &Storage,
         command: &mut tokio::process::Command,
         admission: Option<&crate::acp::runner_lifecycle::ExecutionAdmission>,
-        mut capture: impl FnMut(crate::acp::runner_lifecycle::RunnerIdentity),
+        capture: impl FnMut(crate::acp::runner_lifecycle::RunnerIdentity),
     ) -> Result<u32> {
+        let (mut child, pid, published) = self.spawn_child(
+            storage,
+            admission,
+            |input| {
+                command.stdin(input);
+                let child = command.spawn()?;
+                command.stdin(std::process::Stdio::null());
+                Ok((child.id(), child))
+            },
+            capture,
+        )?;
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        published?;
+        pid.context("runner exited before identification")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_owned(
+        self,
+        storage: &Storage,
+        command: &mut std::process::Command,
+        admission: &crate::acp::runner_lifecycle::ExecutionAdmission,
+    ) -> Result<std::process::Child> {
+        let (mut child, _, published) = self.spawn_child(
+            storage,
+            Some(admission),
+            |input| {
+                command.stdin(input);
+                let child = command.spawn()?;
+                command.stdin(std::process::Stdio::null());
+                Ok((Some(child.id()), child))
+            },
+            |_| {},
+        )?;
+        if let Err(error) = published {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(child)
+    }
+
+    fn spawn_child<C>(
+        self,
+        storage: &Storage,
+        admission: Option<&crate::acp::runner_lifecycle::ExecutionAdmission>,
+        spawn: impl FnOnce(std::process::Stdio) -> Result<(Option<u32>, C)>,
+        mut capture: impl FnMut(crate::acp::runner_lifecycle::RunnerIdentity),
+    ) -> Result<(C, Option<u32>, Result<()>)> {
         let boot = current_boot().context("verified boot identity is unavailable")?;
-        let _workspace = super::acquire_session_workspace_claim_lock()?;
-        let _identity = super::acquire_session_identity_lock()?;
+        let workspace_fence = super::acquire_session_workspace_claim_lock()?;
+        let identity_fence = super::acquire_session_identity_lock()?;
         let admission = admission.context("managed launch has no native execution admission")?;
         let origin = admission
             .origin()
@@ -1465,10 +1534,10 @@ impl ManagedLaunch {
             storage.original_profile_identity()?.is_durable(),
             "fresh native launch has no durable original profile birth time"
         );
-        let _lifecycle = storage.acquire_instance_lifecycle_lock(&self.session_id)?;
+        let lifecycle_fence = storage.acquire_instance_lifecycle_lock(&self.session_id)?;
         ensure_unique_owner(storage, &self.session_id)?;
         let nonce = *self.nonce.as_bytes();
-        let launched = (|| -> Result<u32> {
+        let launched = (|| -> Result<(C, Option<u32>, Result<()>)> {
             storage.update_under_workspace_claim_lock(|rows, _| {
                 let row = rows
                     .iter_mut()
@@ -1537,10 +1606,9 @@ impl ManagedLaunch {
             let origin = pending;
             let (mut authorization, input) = std::os::unix::net::UnixStream::pair()?;
             let input: std::os::fd::OwnedFd = input.into();
-            command.stdin(std::process::Stdio::from(input));
-            let mut child = command.spawn()?;
-            let pid = child.id().context("runner exited before identification")?;
+            let (pid, child) = spawn(std::process::Stdio::from(input))?;
             let published = (|| -> Result<()> {
+                let pid = pid.context("runner exited before identification")?;
                 let profile_identity = storage.original_profile_identity()?;
                 let incarnation = crate::process::process_incarnation(pid)?
                     .context("runner incarnation is unavailable")?;
@@ -1583,168 +1651,87 @@ impl ManagedLaunch {
                     profile_identity: Some(profile_identity),
                     boot: Some(boot),
                 };
-                admission.record_produced_origin(
-                    &origin,
-                    origin.with_issued_birth(identity)?,
-                    Some(identity),
-                )?;
+                let issued = origin.with_issued_birth(identity)?;
+                admission.record_produced_origin(&origin, issued.clone(), Some(identity))?;
                 capture(identity);
-                let birth = profile_identity
-                    .birth_time
-                    .context("issued profile has no birth time")?
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .context("issued profile birth predates the native wire epoch")?;
-                let mut frame = [0u8; 44];
-                frame[..16].copy_from_slice(&nonce);
-                frame[16..24].copy_from_slice(&profile_identity.device.to_le_bytes());
-                frame[24..32].copy_from_slice(&profile_identity.inode.to_le_bytes());
-                frame[32..40].copy_from_slice(&birth.as_secs().to_le_bytes());
-                frame[40..].copy_from_slice(&birth.subsec_nanos().to_le_bytes());
-                admission.authorize(identity, || authorization.write_all(&frame))?;
+                bootstrap::publish_original(
+                    &mut authorization,
+                    &issued,
+                    identity,
+                    [&workspace_fence, &identity_fence, &lifecycle_fence],
+                )?;
+                admission.authorize(identity, || authorization.write_all(&[1]))?;
                 Ok(())
             })();
             drop(authorization);
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
-            published?;
-            Ok(pid)
+            Ok((child, pid, published))
         })();
         launched
     }
 }
 
-pub(crate) fn accept_authorization(
-    profile: &str,
-    id: &str,
-    nonce: Uuid,
-    generation: u64,
-) -> Result<(Storage, crate::acp::runner_lifecycle::RunnerIdentity)> {
-    let mut received = [0u8; 44];
-    std::io::stdin()
-        .read_exact(&mut received)
-        .context("runner authorization closed")?;
-    anyhow::ensure!(
-        received[..16] == nonce.as_bytes()[..],
-        "runner authorization nonce differs"
-    );
-    let nanos = u32::from_le_bytes(received[40..].try_into().unwrap());
-    anyhow::ensure!(
-        nanos < 1_000_000_000,
-        "issued profile birth nanoseconds are invalid"
-    );
-    let birth = std::time::SystemTime::UNIX_EPOCH
-        .checked_add(Duration::new(
-            u64::from_le_bytes(received[32..40].try_into().unwrap()),
-            nanos,
-        ))
-        .context("issued profile birth time is out of range")?;
-    let expected_profile = super::storage::DirectoryIdentity {
-        device: u64::from_le_bytes(received[16..24].try_into().unwrap()),
-        inode: u64::from_le_bytes(received[24..32].try_into().unwrap()),
-        birth_time: Some(birth),
-    };
-    anyhow::ensure!(!profile.is_empty(), "runner has no stored owner");
-    let boot = current_boot().context("verified boot identity is unavailable")?;
-    let pid = std::process::id();
-    let incarnation =
-        crate::process::process_incarnation(pid)?.context("runner incarnation is unavailable")?;
-    anyhow::ensure!(incarnation.group == pid, "runner is not its group leader");
-    let _workspace = super::acquire_session_workspace_claim_lock()?;
-    let _identity = super::acquire_session_identity_lock()?;
-    let storage = Storage::open_unwatched(profile)?;
-    let actual_profile = storage.original_profile_identity()?;
-    anyhow::ensure!(
-        actual_profile.is_durable() && actual_profile == expected_profile,
-        "runner's original physical profile was replaced or has no durable birth stamp"
-    );
-    ensure_unique_owner(&storage, id)?;
-    let row = storage
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == id)
-        .context("runner's session disappeared")?;
-    startable(&row)?;
-    anyhow::ensure!(
-        row.runner_journal.launches().iter().any(|launch| {
-            launch.nonce == *nonce.as_bytes()
-                && launch.boot == boot
-                && launch.generation == generation
-                && launch.incarnation == Some(incarnation)
-                && launch.profile_identity == Some(actual_profile)
-        }),
-        "runner lacks published execution authorization"
-    );
-    // Full issuer birth was checked before creating a lifecycle lock or endpoint.
-    Ok((
-        storage,
-        crate::acp::runner_lifecycle::RunnerIdentity {
-            pid,
-            generation,
-            launch_nonce: Some(nonce),
-            incarnation: Some(incarnation),
-            profile_identity: Some(actual_profile),
-            boot: Some(boot),
-        },
-    ))
-}
-
-pub(crate) fn record_stop_endpoint(
-    storage: &Storage,
-    id: &str,
-    nonce: Uuid,
-    generation: u64,
+fn record_stop_endpoint_under_original_fences(
+    original: &LaunchOrigin,
+    born: crate::acp::runner_lifecycle::RunnerIdentity,
     endpoint: SocketEndpointIdentity,
 ) -> Result<()> {
-    let boot = current_boot().context("verified boot identity is unavailable")?;
-    let incarnation = crate::process::process_incarnation(std::process::id())?
-        .context("runner incarnation is unavailable")?;
-    let _workspace = super::acquire_session_workspace_claim_lock()?;
-    let _identity = super::acquire_session_identity_lock()?;
+    let storage = original.storage();
     storage.verify_profile_identity()?;
-    let _lifecycle = storage.acquire_instance_lifecycle_lock(id)?;
-    let profile_identity = storage.original_profile_identity()?;
+    anyhow::ensure!(
+        born.birth_is_complete()
+            && born.pid == std::process::id()
+            && born.boot == current_boot()
+            && born.incarnation == crate::process::process_incarnation(born.pid)?
+            && born.profile_identity == Some(storage.original_profile_identity()?)
+            && endpoint.is_durable(),
+        "natal publication replaced its original native birth or endpoint"
+    );
     storage.update_under_workspace_claim_lock(|rows, _| {
         let row = rows
             .iter_mut()
-            .find(|row| row.id == id)
-            .context("runner's session disappeared")?;
-        startable(row)?;
+            .find(|row| row.id == original.session_id())
+            .context("runner's original session disappeared")?;
+        original.validate_row(row)?;
         let launch = row
             .runner_journal
             .launches_mut()
             .iter_mut()
             .find(|launch| {
-                launch.nonce == *nonce.as_bytes()
-                    && launch.boot == boot
-                    && launch.generation == generation
-                    && launch.incarnation == Some(incarnation)
-                    && launch.profile_identity == Some(profile_identity)
+                Some(Uuid::from_bytes(launch.nonce)) == born.launch_nonce
+                    && Some(launch.boot) == born.boot
+                    && launch.generation == born.generation
+                    && launch.incarnation == born.incarnation
+                    && launch.profile_identity == born.profile_identity
             })
-            .context("runner lacks its original published execution authorization")?;
+            .context("runner lacks its exact original native birth")?;
+        anyhow::ensure!(
+            launch.stop_endpoint.is_none(),
+            "natal endpoint was already published"
+        );
         launch.stop_endpoint = Some(endpoint);
         Ok(())
     })?;
     sync_parent_directory(storage.sessions_path())
 }
 
-/// Caller holds the original workspace and identity fences. Validate this
-/// birth before publication; the writer's still-open FD supplies the witness.
-pub(crate) fn publish_registry_under_locks<T>(
-    storage: &Storage,
+// Bootstrap retains the issuer's actual physical fences, without reacquiring them.
+fn publish_registry_under_original_fences<T>(
+    original: &LaunchOrigin,
     record: &mut crate::process::worker_registry::WorkerRecord,
     publish: impl FnOnce(&mut crate::process::worker_registry::WorkerRecord) -> Result<T>,
 ) -> Result<T> {
+    let storage = original.storage();
     storage.verify_profile_identity()?;
     let profile_identity = storage.original_profile_identity()?;
     let boot = current_boot().context("verified boot identity is unavailable")?;
     anyhow::ensure!(
         record.pid == std::process::id()
             && record.boot == Some(boot)
-            && record.profile_identity == Some(profile_identity),
+            && record.profile_identity == Some(profile_identity)
+            && record.source_profile.as_deref() == Some(original.profile()),
         "registry publication is not this original native runner"
     );
-    let _lifecycle = storage.acquire_instance_lifecycle_lock(&record.session_id)?;
+    original.validate_record_birth(record)?;
     ensure_unique_owner(storage, &record.session_id)?;
     let result = storage
         .update_under_workspace_claim_lock(|rows, _| {
@@ -1752,6 +1739,7 @@ pub(crate) fn publish_registry_under_locks<T>(
                 .iter_mut()
                 .find(|row| row.id == record.session_id)
                 .context("native registry's original session disappeared")?;
+            original.validate_row(row)?;
             let launch = row
                 .runner_journal
                 .launches_mut()

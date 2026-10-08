@@ -44,7 +44,7 @@ impl Drop for PreparationAuthorization<'_> {
 }
 
 /// Captured execution ticket of a runner. Legacy PID/generation alone are not authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunnerIdentity {
     pub pid: u32,
     pub generation: u64,

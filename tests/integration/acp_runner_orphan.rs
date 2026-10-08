@@ -60,28 +60,29 @@ fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -
     let socket = workers.join(format!("{session_id}.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let launch = crate::common::RunnerLaunchFixture::new(home, xdg, "main", session_id, 0);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(home, xdg, "main", session_id);
     let mut child = launch
-        .command()
-        .args([
-            "--socket",
-            socket.to_str().unwrap(),
-            "--session-id",
-            session_id,
-            "--agent-name",
-            "fake-agent",
-            "--cwd",
-            home.to_str().unwrap(),
-            "--",
-            "cat",
-        ])
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", xdg)
-        // Shrink the watchdog poll so an orphan dies in well under a second.
-        .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-        .spawn()
+        .spawn(
+            launch
+                .command()
+                .args([
+                    "--socket",
+                    socket.to_str().unwrap(),
+                    "--session-id",
+                    session_id,
+                    "--agent-name",
+                    "fake-agent",
+                    "--cwd",
+                    home.to_str().unwrap(),
+                    "--",
+                    "cat",
+                ])
+                .env("HOME", home)
+                .env("XDG_CONFIG_HOME", xdg)
+                // Shrink the watchdog poll so an orphan dies in well under a second.
+                .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+        )
         .expect("spawn acp runner");
-    launch.authorize(&mut child);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while !record.exists() {
@@ -164,6 +165,12 @@ fn assert_pid_gone_within(pid: u32, secs: u64, what: &str) {
 #[test]
 #[serial_test::parallel]
 fn orphaned_runner_self_terminates_when_record_deleted() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(orphaned_runner_self_terminates_when_record_deleted),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -202,6 +209,12 @@ fn orphaned_runner_self_terminates_when_record_deleted() {
 #[test]
 #[serial_test::parallel]
 fn superseded_runner_exits_without_deleting_replacement_record() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(superseded_runner_exits_without_deleting_replacement_record),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }

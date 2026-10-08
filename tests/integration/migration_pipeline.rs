@@ -43,7 +43,7 @@ fn post_v029_migrations_run_together_before_version_advances() -> Result<()> {
 
     fs::write(
         &sessions,
-        r#"[{"agent_session_id":"legacy","retroactive_capture_excludes":["excluded"]}]"#,
+        r#"[{"id":"legacy-work","title":"Legacy work","project_path":"/tmp/legacy-work","created_at":"2020-01-01T00:00:00Z","agent_session_id":"legacy","retroactive_capture_excludes":["excluded"]}]"#,
     )?;
     assert!(agent_of_empires::migrations::run_migrations().is_err());
     assert_eq!(fs::read_to_string(app.join(".schema_version"))?, "29");
@@ -83,7 +83,7 @@ fn schema_v30_runs_pr_conversation_migrations() -> Result<()> {
     fs::write(app.join(".schema_version"), "30")?;
     fs::write(
         &sessions,
-        r#"[{"agent_session_id":"legacy","retroactive_capture_excludes":["excluded"]}]"#,
+        r#"[{"id":"legacy-top-level","title":"Legacy top level","project_path":"/tmp/legacy-top-level","created_at":"2020-01-01T00:00:00Z","agent_session_id":"legacy","retroactive_capture_excludes":["excluded"]}]"#,
     )?;
 
     agent_of_empires::migrations::run_migrations()?;

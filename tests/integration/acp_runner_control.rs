@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-use agent_of_empires::acp::acp_client::AcpClient;
-use agent_of_empires::acp::state::AcpSessionId;
+use crate::acp::acp_client::AcpClient;
+use crate::acp::state::AcpSessionId;
 
 /// App data dir for the debug binary under this test's env, mirroring the
 /// XDG resolution the runner uses.
@@ -136,6 +136,12 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
 #[test]
 #[serial_test::parallel]
 fn runner_proxies_agent_requests_over_the_control_channel() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(runner_proxies_agent_requests_over_the_control_channel),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -151,32 +157,33 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session_id);
     let mut child = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session_id,
-                "--agent-name",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                // Absolute path: relying on the runner's inherited PATH makes a
-                // non-standard PATH (e.g. nix-first) surface as a confusing
-                // "registry record never appeared" instead of a clear failure.
-                "/bin/cat",
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session_id,
+                        "--agent-name",
+                        "fake-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        // Absolute path: relying on the runner's inherited PATH makes a
+                        // non-standard PATH (e.g. nix-first) surface as a confusing
+                        // "registry record never appeared" instead of a clear failure.
+                        "/bin/cat",
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+            )
             .expect("spawn acp runner"),
     );
-    launch.authorize(&mut child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -312,6 +319,12 @@ fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
 #[test]
 #[serial_test::parallel]
 fn runner_requeues_large_frame_after_stalled_writer() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(runner_requeues_large_frame_after_stalled_writer),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -357,32 +370,33 @@ for line in sys.stdin:
     let socket = workers.join(format!("{session_id}.sock"));
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session_id);
     let mut _child = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session_id,
-                "--agent-name",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent.to_str().unwrap(),
-                trigger.to_str().unwrap(),
-                emitted.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session_id,
+                        "--agent-name",
+                        "fake-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        python3.to_str().unwrap(),
+                        agent.to_str().unwrap(),
+                        trigger.to_str().unwrap(),
+                        emitted.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+            )
             .expect("spawn acp runner"),
     );
-    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -459,6 +473,12 @@ for line in sys.stdin:
 #[test]
 #[serial_test::parallel]
 fn agent_request_during_session_new_does_not_deadlock_the_runner() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(agent_request_during_session_new_does_not_deadlock_the_runner),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -518,30 +538,31 @@ for line in sys.stdin:
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session_id);
     let mut _child = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                workers.join(format!("{session_id}.sock")).to_str().unwrap(),
-                "--session-id",
-                session_id,
-                "--agent-name",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent_py.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        workers.join(format!("{session_id}.sock")).to_str().unwrap(),
+                        "--session-id",
+                        session_id,
+                        "--agent-name",
+                        "fake-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        python3.to_str().unwrap(),
+                        agent_py.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+            )
             .expect("spawn acp runner"),
     );
-    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -642,6 +663,12 @@ fn find_python3() -> Option<PathBuf> {
 #[tokio::test]
 #[serial_test::parallel]
 async fn cancelled_attach_reaps_runner_and_replacement_survives_load_fallback() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(cancelled_attach_reaps_runner_and_replacement_survives_load_fallback),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -661,8 +688,8 @@ async fn cancelled_attach_reaps_runner_and_replacement_survives_load_fallback() 
     let partial_read = scratch.0.join("partial-read");
     let agent_py = scratch.0.join("delayed_agent.py");
     std::fs::write(
-        &agent_py,
-        r#"
+    &agent_py,
+    r#"
 import json, os, sys, time
 with open(os.environ["AOE_FAKE_AGENT_PID"], "w") as f:
     f.write(str(os.getpid()))
@@ -694,8 +721,8 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
     sys.stdout.flush()
 "#,
-    )
-    .unwrap();
+)
+.unwrap();
 
     let session_id = "slate001";
     let workers = app_dir(&home, &xdg).join("acp-workers");
@@ -703,37 +730,40 @@ for line in sys.stdin:
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
     let spawn_runner = |delay: &str, fail_load: bool| {
-        let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
-        let mut child = launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session_id,
-                "--agent-name",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent_py.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_FAKE_AGENT_LOG", &agent_log)
-            .env("AOE_FAKE_AGENT_PID", &agent_pid_file)
-            .env("AOE_FAKE_INIT_DELAY_MS", delay)
-            .env("AOE_E2E_PARTIAL_FRAME_FILE", &partial_read)
-            .env("AOE_FAKE_LOAD_ERROR", if fail_load { "1" } else { "0" })
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "5000")
-            .spawn()
+        let launch =
+            super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session_id);
+        let child = launch
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session_id,
+                        "--agent-name",
+                        "fake-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        python3.to_str().unwrap(),
+                        agent_py.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("AOE_FAKE_AGENT_LOG", &agent_log)
+                    .env("AOE_FAKE_AGENT_PID", &agent_pid_file)
+                    .env("AOE_FAKE_INIT_DELAY_MS", delay)
+                    .env("AOE_E2E_PARTIAL_FRAME_FILE", &partial_read)
+                    .env("AOE_FAKE_LOAD_ERROR", if fail_load { "1" } else { "0" })
+                    .env("AOE_ACP_WATCHDOG_POLL_MS", "5000"),
+            )
             .expect("spawn acp runner");
-        launch.authorize(&mut child);
-        (child, launch.nonce)
+
+        (child, launch.nonce, launch)
     };
 
-    let (old, old_nonce) = spawn_runner("held", false);
+    let (old, old_nonce, _original_scope) = spawn_runner("held", false);
     let mut old = KillOnDrop(old);
     wait_for(&record, "old registry record");
     wait_for(&control, "old control socket");
@@ -775,28 +805,28 @@ for line in sys.stdin:
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Fresh publication must start in an absent namespace. Move the actual
-        // original files only after its held initialize was observed; the old
-        // actor still owns those inodes and its captured native birth.
+        // Keep the old issued original alive; admit the peer in a new physical profile.
         std::fs::rename(&record, workers.join(format!("{session_id}.original.json"))).unwrap();
         std::fs::rename(
             &control,
             workers.join(format!("{session_id}.original.control.sock")),
         )
         .unwrap();
-        let (replacement, _) = spawn_runner("0", true);
+        let app = app_dir(&home, &xdg);
+        std::fs::rename(app.join("profiles/main"), app.join("original-main")).unwrap();
+        let (replacement, _, replacement_scope) = spawn_runner("0", true);
         let replacement = KillOnDrop(replacement);
         wait_for_record_pid(&record, replacement.0.id());
-        replacement
+        (replacement, replacement_scope)
     };
-    let (attach, mut replacement) = tokio::join!(attach, spawn_replacement);
+    let (attach, (mut replacement, _replacement_scope)) = tokio::join!(attach, spawn_replacement);
     assert!(
         attach.is_err(),
         "delayed initialize must exceed the attach budget"
     );
     wait_for_runner_exit(&mut old.0);
     assert!(
-        !agent_of_empires::process::worker_registry::is_pid_alive(old_agent_pid),
+        !crate::process::worker_registry::is_pid_alive(old_agent_pid),
         "timed-out agent {old_agent_pid} stayed live"
     );
     assert!(
@@ -887,6 +917,12 @@ for line in sys.stdin:
 #[test]
 #[serial_test::parallel]
 fn runner_owns_handshake_and_caches_across_attaches() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(runner_owns_handshake_and_caches_across_attaches),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -907,8 +943,8 @@ fn runner_owns_handshake_and_caches_across_attaches() {
     let agent_log = scratch.0.join("agent-methods.log");
     let agent_py = scratch.0.join("fake_agent.py");
     std::fs::write(
-        &agent_py,
-        r#"
+    &agent_py,
+    r#"
 import sys, json, os
 log = os.environ["AOE_FAKE_AGENT_LOG"]
 for line in sys.stdin:
@@ -936,8 +972,8 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
     sys.stdout.flush()
 "#,
-    )
-    .unwrap();
+)
+.unwrap();
 
     let session_id = "shs00001";
     let workers = app_dir(&home, &xdg).join("acp-workers");
@@ -945,31 +981,32 @@ for line in sys.stdin:
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session_id);
     let mut _child = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session_id,
-                "--agent-name",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent_py.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_FAKE_AGENT_LOG", &agent_log)
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session_id,
+                        "--agent-name",
+                        "fake-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        python3.to_str().unwrap(),
+                        agent_py.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("AOE_FAKE_AGENT_LOG", &agent_log)
+                    .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+            )
             .expect("spawn acp runner"),
     );
-    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -1077,6 +1114,12 @@ for line in sys.stdin:
 #[test]
 #[serial_test::parallel]
 fn runner_load_uses_requested_id_and_caches_response() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(runner_load_uses_requested_id_and_caches_response),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -1096,38 +1139,39 @@ fn runner_load_uses_requested_id_and_caches_response() {
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session_id);
     let mut _child = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session_id,
-                "--agent-name",
-                "fake-codex-acp",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                crate::common::shim_node()
-                    .expect("Node prerequisite")
-                    .to_str()
-                    .unwrap(),
-                fake_agent.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("FAKE_ACP_DEBUG_LOG", &agent_log)
-            .env("FAKE_ACP_IMPERSONATE", "codex")
-            .env("FAKE_ACP_LOAD_REPLAY", "old agent answer")
-            .env("FAKE_ACP_LOAD_REPLAY_USER", "old user prompt")
-            .env("FAKE_ACP_LOAD_REPLAY_BEFORE_RESPONSE", "1")
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session_id,
+                        "--agent-name",
+                        "fake-codex-acp",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        super::shim::shim_node()
+                            .expect("Node prerequisite")
+                            .to_str()
+                            .unwrap(),
+                        fake_agent.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("FAKE_ACP_DEBUG_LOG", &agent_log)
+                    .env("FAKE_ACP_IMPERSONATE", "codex")
+                    .env("FAKE_ACP_LOAD_REPLAY", "old agent answer")
+                    .env("FAKE_ACP_LOAD_REPLAY_USER", "old user prompt")
+                    .env("FAKE_ACP_LOAD_REPLAY_BEFORE_RESPONSE", "1")
+                    .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+            )
             .expect("spawn acp runner"),
     );
-    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -1219,6 +1263,12 @@ fn runner_load_uses_requested_id_and_caches_response() {
 #[test]
 #[serial_test::parallel]
 fn runner_forwards_session_error_data_in_handshake_failed() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(runner_forwards_session_error_data_in_handshake_failed),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -1235,8 +1285,8 @@ fn runner_forwards_session_error_data_in_handshake_failed() {
 
     let agent_py = scratch.0.join("fail_agent.py");
     std::fs::write(
-        &agent_py,
-        r#"
+    &agent_py,
+    r#"
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -1259,8 +1309,8 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps(resp) + "\n")
     sys.stdout.flush()
 "#,
-    )
-    .unwrap();
+)
+.unwrap();
 
     let session_id = "shserr01";
     let workers = app_dir(&home, &xdg).join("acp-workers");
@@ -1268,30 +1318,31 @@ for line in sys.stdin:
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session_id, 0);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session_id);
     let mut _child = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session_id,
-                "--agent-name",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent_py.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session_id,
+                        "--agent-name",
+                        "fake-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        python3.to_str().unwrap(),
+                        agent_py.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+            )
             .expect("spawn acp runner"),
     );
-    launch.authorize(&mut _child.0);
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
@@ -1331,8 +1382,14 @@ for line in sys.stdin:
 #[tokio::test]
 #[serial_test::parallel]
 async fn resumed_client_uses_reset_committed_after_reattach() {
-    use agent_of_empires::acp::control_protocol::{self, ControlBody};
-    use agent_of_empires::acp::state::Event;
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(resumed_client_uses_reset_committed_after_reattach),
+    ) {
+        return;
+    }
+    use crate::acp::control_protocol::{self, ControlBody};
+    use crate::acp::state::Event;
 
     let Some(python3) = find_python3() else {
         return;
@@ -1373,32 +1430,34 @@ for line in sys.stdin:
 "#).unwrap();
     let session = "reset-resume";
     let socket = scratch.0.join(format!("{session}.sock"));
-    let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session, 0);
+    let control = crate::process::worker::control_socket_sibling(&socket);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session);
     let mut _runner = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session,
-                "--agent-name",
-                "review-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent.to_str().unwrap(),
-                received.to_str().unwrap(),
-                release.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session,
+                        "--agent-name",
+                        "review-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        python3.to_str().unwrap(),
+                        agent.to_str().unwrap(),
+                        received.to_str().unwrap(),
+                        release.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg),
+            )
             .unwrap(),
     );
-    launch.authorize(&mut _runner.0);
+
     wait_for(&control, "control socket");
     let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
     assert!(matches!(
@@ -1498,8 +1557,14 @@ for line in sys.stdin:
 #[tokio::test]
 #[serial_test::parallel]
 async fn streaming_during_reattach_does_not_overflow_pending_replay() {
-    use agent_of_empires::acp::control_protocol::{self, ControlBody};
-    use agent_of_empires::acp::state::Event;
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(streaming_during_reattach_does_not_overflow_pending_replay),
+    ) {
+        return;
+    }
+    use crate::acp::control_protocol::{self, ControlBody};
+    use crate::acp::state::Event;
 
     let Some(python3) = find_python3() else {
         return;
@@ -1517,8 +1582,8 @@ async fn streaming_during_reattach_does_not_overflow_pending_replay() {
     // update every ~2ms across the reattach handshake. The detached reverse
     // call is answered only after the runner has read the whole backlog.
     std::fs::write(
-        &agent,
-        r#"import json, sys, pathlib, time
+    &agent,
+    r#"import json, sys, pathlib, time
 trigger, flooded = map(pathlib.Path, sys.argv[1:])
 sid = None
 def send(msg):
@@ -1544,36 +1609,38 @@ for line in sys.stdin:
     else:
         send({"jsonrpc":"2.0","id":msg["id"],"result":{}})
 "#,
-    )
-    .unwrap();
+)
+.unwrap();
     let session = "stream-reattach";
     let socket = scratch.0.join(format!("{session}.sock"));
-    let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session, 0);
+    let control = crate::process::worker::control_socket_sibling(&socket);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session);
     let mut _runner = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session,
-                "--agent-name",
-                "stream-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent.to_str().unwrap(),
-                trigger.to_str().unwrap(),
-                flooded.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session,
+                        "--agent-name",
+                        "stream-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        python3.to_str().unwrap(),
+                        agent.to_str().unwrap(),
+                        trigger.to_str().unwrap(),
+                        flooded.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg),
+            )
             .unwrap(),
     );
-    launch.authorize(&mut _runner.0);
+
     wait_for(&control, "control socket");
 
     // First daemon: establish the native session, then detach.
@@ -1661,7 +1728,13 @@ for line in sys.stdin:
 #[tokio::test]
 #[serial_test::parallel]
 async fn resumed_prompt_completes_only_for_its_own_runner_request() {
-    use agent_of_empires::acp::state::Event;
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(resumed_prompt_completes_only_for_its_own_runner_request),
+    ) {
+        return;
+    }
+    use crate::acp::state::Event;
 
     let Some(python3) = find_python3() else {
         return;
@@ -1716,32 +1789,34 @@ for line in sys.stdin:
         .unwrap();
         let session = "prompt-correlation";
         let socket = scratch.0.join(format!("{session}.sock"));
-        let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
-        let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session, 0);
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session);
         let mut _runner = KillOnDrop(
             launch
-                .command()
-                .args([
-                    "--socket",
-                    socket.to_str().unwrap(),
-                    "--session-id",
-                    session,
-                    "--agent-name",
-                    "review-agent",
-                    "--cwd",
-                    home.to_str().unwrap(),
-                    "--",
-                    python3.to_str().unwrap(),
-                    agent.to_str().unwrap(),
-                    received.to_str().unwrap(),
-                    if old_first { "true" } else { "false" },
-                ])
-                .env("HOME", &home)
-                .env("XDG_CONFIG_HOME", &xdg)
-                .spawn()
+                .spawn(
+                    launch
+                        .command()
+                        .args([
+                            "--socket",
+                            socket.to_str().unwrap(),
+                            "--session-id",
+                            session,
+                            "--agent-name",
+                            "review-agent",
+                            "--cwd",
+                            home.to_str().unwrap(),
+                            "--",
+                            python3.to_str().unwrap(),
+                            agent.to_str().unwrap(),
+                            received.to_str().unwrap(),
+                            if old_first { "true" } else { "false" },
+                        ])
+                        .env("HOME", &home)
+                        .env("XDG_CONFIG_HOME", &xdg),
+                )
                 .unwrap(),
         );
-        launch.authorize(&mut _runner.0);
+
         wait_for(&control, "control socket");
         let mut first = UnixStream::connect(&control).unwrap();
         first
@@ -1805,6 +1880,12 @@ for line in sys.stdin:
 
 #[test]
 fn runner_native_identity_is_announced_before_callbacks_and_never_reassigned() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(runner_native_identity_is_announced_before_callbacks_and_never_reassigned),
+    ) {
+        return;
+    }
     let Some(python3) = find_python3() else {
         eprintln!("skipping: python3 not found for native identity protocol agent");
         return;
@@ -1846,31 +1927,33 @@ for line in sys.stdin:
     let workers = app_dir(&home, &xdg).join("acp-workers");
     let socket = workers.join(format!("{session}.sock"));
     let control = workers.join(format!("{session}.control.sock"));
-    let launch = crate::common::RunnerLaunchFixture::new(&home, &xdg, "main", session, 0);
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(&home, &xdg, "main", session);
     let mut _child = KillOnDrop(
         launch
-            .command()
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session,
-                "--agent-name",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent.to_str().unwrap(),
-                answers.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-            .spawn()
+            .spawn(
+                launch
+                    .command()
+                    .args([
+                        "--socket",
+                        socket.to_str().unwrap(),
+                        "--session-id",
+                        session,
+                        "--agent-name",
+                        "fake-agent",
+                        "--cwd",
+                        home.to_str().unwrap(),
+                        "--",
+                        python3.to_str().unwrap(),
+                        agent.to_str().unwrap(),
+                        answers.to_str().unwrap(),
+                    ])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+            )
             .expect("spawn native-identity runner"),
     );
-    launch.authorize(&mut _child.0);
+
     wait_for(&control, "native-identity control socket");
     let attach = || {
         let mut stream = UnixStream::connect(&control).unwrap();

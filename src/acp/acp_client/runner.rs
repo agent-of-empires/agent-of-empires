@@ -232,7 +232,7 @@ pub(super) async fn spawn_runner_detached(
     if let Some(stored) = &config.stored_acp_session_id {
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
-    launch.configure(&mut cmd);
+    launch.configure(cmd.as_std_mut());
     cmd.arg("--generation").arg(config.generation.to_string());
     cmd.arg("--");
     if let Some(s) = &sandbox_argv {

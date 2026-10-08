@@ -19,7 +19,7 @@ use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 
-use crate::common::{shim_path, shim_ready};
+use crate::common::shim::{shim_path, shim_ready};
 
 fn spawn_config(
     shim: PathBuf,
@@ -36,7 +36,7 @@ fn spawn_config(
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),

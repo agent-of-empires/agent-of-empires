@@ -108,12 +108,13 @@ pub struct AcpRunnerArgs {
 pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     // Paths are derived from the session id; reject traversal before touching the filesystem.
     worker_registry::validate_session_id(&args.session_id).context("invalid --session-id")?;
-    let (owner_storage, born_identity) = crate::session::runner_journal::accept_authorization(
+    let mut bootstrap = crate::session::runner_journal::LaunchBootstrap::receive(
         &args.managed_profile,
         &args.session_id,
         args.launch_nonce,
         args.generation,
     )?;
+    let born_identity = bootstrap.identity();
     init_runner_logging(&args.session_id)?;
 
     if let Ok(app_dir) = crate::session::get_app_dir() {
@@ -158,21 +159,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         endpoint_identity.is_durable(),
         "native stop endpoint birth time is unavailable; fresh publication is unproven"
     );
-    let endpoint_owner = owner_storage.clone();
-    let endpoint_id = args.session_id.clone();
-    let endpoint_nonce = args.launch_nonce;
-    let endpoint_generation = args.generation;
-    tokio::task::spawn_blocking(move || {
-        crate::session::runner_journal::record_stop_endpoint(
-            &endpoint_owner,
-            &endpoint_id,
-            endpoint_nonce,
-            endpoint_generation,
-            endpoint_identity,
-        )
-    })
-    .await
-    .context("publishing owned stop endpoint task")??;
+
     let mut record = WorkerRecord::new(
         args.session_id.clone(),
         our_pid,
@@ -191,32 +178,31 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     record.boot = born_identity.boot;
     record.incarnation = born_identity.incarnation;
     record.profile_identity = born_identity.profile_identity;
-    let (record, control_listener, _control_endpoint, owner_storage) =
-        tokio::task::spawn_blocking(move || {
-            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
-            let _identity = crate::session::acquire_session_identity_lock()?;
-            owner_storage.verify_profile_identity()?;
-            let (listener, endpoint) =
-                crate::session::runner_journal::publish_registry_under_locks(
-                    &owner_storage,
-                    &mut record,
-                    |record| {
-                        let endpoint =
-                            worker_registry::publish_control_listener(record, &control_socket)
-                                .context(
-                                    "publishing runner control listener and registry record",
-                                )?;
-                        Ok((endpoint.listener(), endpoint))
-                    },
-                )?;
-            anyhow::Ok((record, listener, endpoint, owner_storage))
-        })
-        .await
-        .context("publishing born runner control endpoint task")??;
+    let _control_endpoint = bootstrap.publish(&stop_endpoint, &mut record, &control_socket)?;
+    let control_listener = _control_endpoint.listener();
     let owner = Arc::new(shared::RegistryOwner {
-        storage: owner_storage,
+        storage: bootstrap.storage().clone(),
         record: std::sync::Mutex::new(record),
     });
+    let shared = Arc::new(RunnerShared::new(Some(owner.clone())));
+    let stop_request =
+        crate::session::runner_journal::wait_for_stop(stop_listener, args.launch_nonce, |idle| {
+            shared.admit_stop(idle)
+        });
+    tokio::pin!(stop_request);
+    tokio::select! {
+        requested = &mut stop_request => {
+            stop_endpoint.cleanup();
+            requested?;
+            let _ = owner.retire().await;
+            anyhow::ensure!(
+                crate::process::worker::kill_own_process_group_if_leader(our_pid),
+                "early Stop could not retire its original native group"
+            );
+            return Ok(());
+        }
+        authorized = bootstrap.await_authorization() => authorized?,
+    }
 
     let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
         Ok(handles) => handles,
@@ -241,8 +227,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             }
         });
     }
-
-    let shared = Arc::new(RunnerShared::new(Some(owner.clone())));
 
     // Shared, never split: closing stdin makes aoe-agent exit.
     let agent_stdin = Arc::new(Mutex::new(agent_stdin));
@@ -318,7 +302,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let mut preserve_registry = false;
 
     tokio::select! {
-        requested = crate::session::runner_journal::wait_for_stop(stop_listener, args.launch_nonce, |idle| shared.admit_stop(idle)) => {
+        requested = &mut stop_request => {
             stop_endpoint.cleanup();
             match requested {
                 Ok(true) => {

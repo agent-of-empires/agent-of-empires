@@ -405,6 +405,18 @@ pub(crate) struct StorageFlock {
     file: fs::File,
 }
 
+impl StorageFlock {
+    pub(crate) fn file_identity(&self) -> Result<DirectoryIdentity> {
+        Ok(DirectoryIdentity::from_metadata(&self.file.metadata()?))
+    }
+}
+
+impl std::os::fd::AsFd for StorageFlock {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
 impl Drop for StorageFlock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
@@ -1001,6 +1013,14 @@ impl Storage {
         self.profile_identity
             .context("original physical profile identity is unavailable")
     }
+    pub(crate) fn original_profile_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        self.profile_directory
+            .as_ref()
+            .map(|directory| directory.as_fd())
+            .context("original profile inode pin is unavailable")
+    }
+
     pub(crate) fn same_origin_as(&self, other: &Self) -> bool {
         self.profile_identity.is_some() && self.profile_identity == other.profile_identity
     }
@@ -1053,6 +1073,34 @@ impl Storage {
             profile_directory: Some(profile_directory),
             fail_writes_for_test: false,
         }
+    }
+
+    pub(crate) fn adopt_original_profile(
+        profile: String,
+        directory: File,
+        expected: DirectoryIdentity,
+    ) -> Result<Self> {
+        let metadata = directory.metadata()?;
+        anyhow::ensure!(
+            !profile.is_empty()
+                && metadata.is_dir()
+                && expected.is_durable()
+                && DirectoryIdentity::from_metadata(&metadata) == expected,
+            "received FD is not the issued original profile directory"
+        );
+        let sessions_path = get_profile_dir_path(&profile)?.join("sessions.json");
+        let storage = Self {
+            save_lock: save_lock_for(&profile),
+            profile,
+            sessions_path,
+            file_watch: FileWatchService::noop(),
+            profile_identity: Some(expected),
+            profile_directory: Some(Arc::new(directory)),
+            #[cfg(test)]
+            fail_writes_for_test: false,
+        };
+        storage.verify_profile_identity()?;
+        Ok(storage)
     }
 
     /// Construct a `Storage` for an existing profile, never creating it.

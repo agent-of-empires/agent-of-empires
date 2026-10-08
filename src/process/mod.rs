@@ -53,6 +53,10 @@ pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use platform::HAS_CODEX_MANAGED_PREFERENCES;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) const BOOTSTRAP_RECV_FLAGS: i32 = platform::BOOTSTRAP_RECV_FLAGS;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) const BOOTSTRAP_RECV_FLAGS: i32 = 0;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 

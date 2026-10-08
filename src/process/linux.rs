@@ -1,6 +1,7 @@
 //! Linux-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
+pub(super) const BOOTSTRAP_RECV_FLAGS: i32 = libc::MSG_CMSG_CLOEXEC;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

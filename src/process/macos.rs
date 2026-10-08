@@ -1,6 +1,7 @@
 //! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+pub(super) const BOOTSTRAP_RECV_FLAGS: i32 = 0;
 use std::collections::HashMap;
 use std::process::Command;
 

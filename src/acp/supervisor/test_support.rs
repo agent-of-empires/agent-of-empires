@@ -379,8 +379,7 @@ pub(super) fn save_record(session_id: &str, pid: u32, generation: u64) {
         .unwrap();
 }
 
-/// Real kernel execution, self-published endpoints, and a strong registry witness.
-/// The child consumes the production private authorization before publication.
+/// Real kernel execution and producer-fenced natal publication before authorization.
 pub(crate) struct PublishedExecution {
     pub pid: u32,
     pub identity: RunnerIdentity,
@@ -406,39 +405,23 @@ pub(super) async fn run_execution_fixture_child() -> bool {
     let Ok(encoded) = std::env::var("AOE_TEST_NATIVE_ISSUER") else {
         return false;
     };
-    let (profile, id, nonce, generation, expected, release, ready, hold_stop): (
+    let (profile, id, nonce, generation, release, ready, hold_stop): (
         String,
         String,
         uuid::Uuid,
         u64,
-        crate::session::Instance,
         PathBuf,
         PathBuf,
         bool,
     ) = serde_json::from_str(&encoded).unwrap();
-    let (storage, born) =
-        crate::session::runner_journal::accept_authorization(&profile, &id, nonce, generation)
+    let mut bootstrap =
+        crate::session::runner_journal::LaunchBootstrap::receive(&profile, &id, nonce, generation)
             .unwrap();
-    let mut expected = expected;
-    expected.storage_origin = Some(Arc::new(storage.clone()));
-    crate::session::LaunchOrigin::capture(&expected)
-        .unwrap()
-        .with_issued_birth(born)
-        .unwrap()
-        .validate()
-        .unwrap();
+    let born = bootstrap.identity();
     let stop_path = crate::session::runner_journal::stop_socket(&id, born.pid).unwrap();
     let stop_endpoint = worker_registry::BoundEndpoint::bind(&id, &stop_path).unwrap();
     let stop_listener = stop_endpoint.listener();
-    let stop_identity = stop_endpoint.identity();
-    crate::session::runner_journal::record_stop_endpoint(
-        &storage,
-        &id,
-        nonce,
-        generation,
-        stop_identity,
-    )
-    .unwrap();
+
     let socket = worker_registry::socket_path_for(&id).unwrap();
     let control = crate::process::worker::control_socket_sibling(&socket);
     let mut record = worker_record(&id, born.pid, socket).with_generation(generation);
@@ -447,16 +430,10 @@ pub(super) async fn run_execution_fixture_child() -> bool {
     record.boot = born.boot;
     record.incarnation = born.incarnation;
     record.profile_identity = born.profile_identity;
-    let _control_endpoint = {
-        let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
-        let _identity = crate::session::acquire_session_identity_lock().unwrap();
-        crate::session::runner_journal::publish_registry_under_locks(
-            &storage,
-            &mut record,
-            |record| worker_registry::publish_control_listener(record, &control),
-        )
-        .unwrap()
-    };
+    let _control_endpoint = bootstrap
+        .publish(&stop_endpoint, &mut record, &control)
+        .unwrap();
+    bootstrap.await_authorization().await.unwrap();
     std::fs::write(&ready, b"published").unwrap();
     let requested = release.with_file_name("requested");
     tokio::select! {
@@ -526,11 +503,7 @@ pub(crate) fn published_execution(
     let directory = tempfile::TempDir::new().unwrap();
     let release = directory.path().join("stop");
     let ready = directory.path().join("ready");
-    let expected = admission
-        .origin()
-        .unwrap()
-        .with_storage(|_, row| Ok(row))
-        .unwrap();
+
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
     command.args(["--exact", "acp::supervisor::drain::tests::drain_retires_attached_crash_without_trusting_registry_presence", "--nocapture"]);
     unsafe {
@@ -550,10 +523,8 @@ pub(crate) fn published_execution(
     let nonce = launch.nonce();
     command.env(
         "AOE_TEST_NATIVE_ISSUER",
-        serde_json::to_string(&(
-            profile, id, nonce, generation, expected, &release, &ready, hold_stop,
-        ))
-        .unwrap(),
+        serde_json::to_string(&(profile, id, nonce, generation, &release, &ready, hold_stop))
+            .unwrap(),
     );
     let mut born = None;
     let pid = launch

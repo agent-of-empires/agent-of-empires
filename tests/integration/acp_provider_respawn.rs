@@ -8,7 +8,10 @@ use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 
-use crate::common::{shim_path, shim_ready, EnvGuard};
+use crate::common::{
+    environment::EnvGuard,
+    shim::{shim_path, shim_ready},
+};
 
 fn routing_for(provider: Option<&str>) -> Vec<(String, String)> {
     let (bedrock, vertex) = match provider {
@@ -43,7 +46,7 @@ fn spawn_config(
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),

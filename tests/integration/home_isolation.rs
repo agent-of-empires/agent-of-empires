@@ -6,8 +6,9 @@
 fn temporary_home_restores_non_unicode_and_missing_variables_on_unwind() {
     use std::os::unix::ffi::OsStringExt;
     let original = std::ffi::OsString::from_vec(b"caller-home-\xff".to_vec());
-    let _caller = crate::common::EnvGuard::new(&["HOME", "XDG_CONFIG_HOME", "AOE_TMUX_SOCKET"])
-        .and_set("HOME", &original);
+    let _caller =
+        crate::common::environment::EnvGuard::new(&["HOME", "XDG_CONFIG_HOME", "AOE_TMUX_SOCKET"])
+            .and_set("HOME", &original);
     std::env::remove_var("XDG_CONFIG_HOME");
     let result = std::panic::catch_unwind(|| {
         let home = crate::common::setup_temp_home();

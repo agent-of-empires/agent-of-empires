@@ -109,25 +109,13 @@ impl<S: BroadcastSink> Drain<S> {
                 agent_unresponsive = end.agent_unresponsive,
                 "drain channel closed (agent connection task ended); evaluating respawn"
             );
-            if end.agent_unresponsive {
-                let identity = lock_recover(&self.lifecycle)
-                    .running(&self.session_id)
-                    .filter(|(current, _)| current == &lease)
-                    .and_then(|(_, identity)| identity);
-                let settlement = tear_down_runner(&self.session_id, identity).await;
-                if settlement != Settlement::Proven {
-                    warn!(target: "acp.supervisor", session = %self.session_id, "wedged execution remains protected; refusing respawn");
-                    self.drop_handle(&lease, Some(settlement)).await;
-                    return;
-                }
-            }
             if end.rate_limited {
                 info!(
                     target: "acp.supervisor",
                     session = %self.session_id,
                     "rate-limited; dropping worker handle without respawn"
                 );
-                self.drop_handle(&lease, None).await;
+                self.drop_handle(&lease).await;
                 return;
             }
             if end.startup_failed {
@@ -137,7 +125,7 @@ impl<S: BroadcastSink> Drain<S> {
                     "startup failed before a session was established; leaving the retry to the reconciler"
                 );
                 lock_recover(&self.startup_failures).insert(self.session_id.clone());
-                self.drop_handle(&lease, None).await;
+                self.drop_handle(&lease).await;
                 return;
             }
             let Some(config) = self.approve_respawn(&lease).await else {
@@ -275,54 +263,37 @@ impl<S: BroadcastSink> Drain<S> {
         lock_recover(&self.pending_context_resets).remove(&self.session_id)
     }
 
-    /// Remove only this epoch's handle, retaining its lease until the captured execution is proven retired.
-    /// Background tracking stops with the handle even when execution retirement remains pending.
-    async fn drop_handle(&self, lease: &Lease, settled: Option<Settlement>) {
-        let Some((_, identity)) = lock_recover(&self.lifecycle)
-            .running(&self.session_id)
-            .filter(|(current, _)| current == lease)
-        else {
-            return;
-        };
-        let settlement = match settled {
-            Some(settlement) => settlement,
-            None => tear_down_runner(&self.session_id, identity).await,
-        };
-        let dropped = {
-            let mut guard = self.workers.lock().await;
+    /// Claim this epoch before retirement; the reaper must not steal its final reason.
+    async fn drop_handle(&self, lease: &Lease) {
+        let (stop_lease, identity, _handle) = {
+            let mut workers = self.workers.lock().await;
             let mut table = lock_recover(&self.lifecycle);
-            let dropped = if settlement == Settlement::Proven {
-                table.release_running(lease)
-            } else if table
+            if !table
                 .running(&self.session_id)
                 .is_some_and(|(current, _)| current == *lease)
             {
-                if let crate::acp::runner_lifecycle::StopDecision::TearDown { lease, .. } =
-                    table.begin_lease_stop(lease, "drain_closed")
-                {
-                    table.settle(&lease, settlement);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if dropped {
-                guard.remove(&self.session_id);
+                return;
             }
-            dropped
+            let crate::acp::runner_lifecycle::StopDecision::TearDown {
+                lease: stop_lease,
+                identity,
+            } = table.begin_lease_stop(lease, "drain_closed")
+            else {
+                return;
+            };
+            (stop_lease, identity, workers.remove(&self.session_id))
         };
-        if dropped {
-            self.clear_pending_context_reset();
-            self.notify.notify_waiters();
-            super::publish::detach_orphaned_background_agents_on(
-                &*self.sink,
-                &self.next_seqs,
-                &self.session_id,
-                "the worker that was tracking this sub-agent stopped; tracking stopped",
-            );
-        }
+        self.clear_pending_context_reset();
+        self.notify.notify_waiters();
+        super::publish::detach_orphaned_background_agents_on(
+            &*self.sink,
+            &self.next_seqs,
+            &self.session_id,
+            "the worker that was tracking this sub-agent stopped; tracking stopped",
+        );
+        let settlement = tear_down_runner(&self.session_id, identity).await;
+        lock_recover(&self.lifecycle).settle(&stop_lease, settlement);
+        self.notify.notify_waiters();
     }
 
     /// Decide whether the closed worker respawns, publishing why when it does not.
@@ -367,7 +338,7 @@ impl<S: BroadcastSink> Drain<S> {
             }
             RestartDecision::Gone => return None,
         }
-        self.drop_handle(lease, None).await;
+        self.drop_handle(lease).await;
         None
     }
 
