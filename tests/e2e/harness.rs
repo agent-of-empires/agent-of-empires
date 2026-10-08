@@ -292,6 +292,7 @@ pub struct TuiTestHarness {
     cast_path: Option<PathBuf>,
     /// Exported on every spawned process (tmux session and `run_cli`).
     extra_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    extra_env_remove: Vec<String>,
     /// Prepended to PATH ahead of the `claude` stub.
     extra_path_dirs: Vec<PathBuf>,
     stop_daemon_on_drop: bool,
@@ -377,6 +378,7 @@ last_seen_version = "{}"
             cast_path: None,
             // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
             extra_env: vec![("AOE_TMUX_SOCKET".into(), tmux_socket_env.into())],
+            extra_env_remove: Vec::new(),
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
             acp_fork_fail: false,
@@ -412,6 +414,9 @@ last_seen_version = "{}"
             cmd.env_remove(key);
         }
         cmd.envs(self.extra_env.iter().map(|(key, value)| (key, value)));
+        for key in &self.extra_env_remove {
+            cmd.env_remove(key);
+        }
         cmd
     }
 
@@ -456,8 +461,19 @@ last_seen_version = "{}"
         key: impl AsRef<std::ffi::OsStr>,
         value: impl AsRef<std::ffi::OsStr>,
     ) {
+        let key = key.as_ref();
+        self.extra_env_remove
+            .retain(|removed| std::ffi::OsStr::new(removed) != key);
         self.extra_env
-            .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
+            .push((key.to_owned(), value.as_ref().to_owned()));
+    }
+
+    pub fn remove_env(&mut self, key: &str) {
+        self.extra_env
+            .retain(|(existing, _)| existing.as_os_str() != std::ffi::OsStr::new(key));
+        if !self.extra_env_remove.iter().any(|removed| removed == key) {
+            self.extra_env_remove.push(key.to_string());
+        }
     }
 
     pub fn add_path_dir(&mut self, dir: &Path) {
