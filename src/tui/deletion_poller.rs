@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::mpsc::TryRecvError;
 
-use crate::session::deletion::{execute_deletion, execute_drop};
+use crate::session::deletion::{execute_drop, execute_owned_deletion, PurgeOwner};
 pub use crate::session::deletion::{DeletionRequest, DeletionResult};
 use crate::session::Instance;
 use crate::tui::worker::Worker;
@@ -11,12 +11,14 @@ use crate::tui::worker::Worker;
 enum DeletionCommand {
     Cleanup(DeletionRequest),
     KeepPaths(Instance),
+    ForceRemove(Instance),
 }
 
 // Request ids correlate UI completions; they never authorize or advance Purge.
 struct DeletionJob {
     request_id: u64,
     command: DeletionCommand,
+    owner: PurgeOwner,
 }
 
 pub(super) struct DeletionDone {
@@ -38,7 +40,9 @@ fn spawn_worker(name: &str) -> Worker<DeletionJob, DeletionDone> {
     Worker::spawn(name, move |job: DeletionJob| {
         let (instance, forced) = match &job.command {
             DeletionCommand::Cleanup(request) => (&request.instance, request.force_delete),
-            DeletionCommand::KeepPaths(instance) => (instance, true),
+            DeletionCommand::KeepPaths(instance) | DeletionCommand::ForceRemove(instance) => {
+                (instance, true)
+            }
         };
         let result = if forced {
             instance
@@ -57,8 +61,16 @@ fn spawn_worker(name: &str) -> Worker<DeletionJob, DeletionDone> {
             Ok(()) => match runtime.as_ref() {
                 Ok(runtime) => runtime.block_on(async {
                     match job.command {
-                        DeletionCommand::Cleanup(request) => execute_deletion(request).await,
-                        DeletionCommand::KeepPaths(instance) => execute_drop(instance).await,
+                        DeletionCommand::Cleanup(request) => execute_owned_deletion(request, job.owner).await,
+                        DeletionCommand::KeepPaths(instance) => execute_drop(instance, Some(job.owner)).await,
+                        DeletionCommand::ForceRemove(instance) => {
+                            let request = DeletionRequest {
+                                session_id: instance.id.clone(), instance,
+                                delete_worktree: false, delete_branch: false, delete_sandbox: true,
+                                force_delete: true, detach_hooks: true, keep_scratch: true,
+                            };
+                            execute_owned_deletion(request, job.owner).await
+                        }
                     }
                 }),
                 Err(error) => DeletionResult::rejected(
@@ -86,7 +98,7 @@ impl DeletionPoller {
         }
     }
 
-    fn request(&mut self, command: DeletionCommand, forced: bool) -> u64 {
+    fn request(&mut self, command: DeletionCommand, forced: bool, owner: PurgeOwner) -> u64 {
         self.next_request = self
             .next_request
             .checked_add(1)
@@ -95,6 +107,7 @@ impl DeletionPoller {
         let job = DeletionJob {
             request_id,
             command,
+            owner,
         };
         if forced {
             let worker = spawn_worker("aoe-force-deletion");
@@ -107,13 +120,16 @@ impl DeletionPoller {
         request_id
     }
 
-    pub fn request_deletion(&mut self, request: DeletionRequest) -> u64 {
-        let forced = request.force_delete;
-        self.request(DeletionCommand::Cleanup(request), forced)
+    pub(super) fn request_deletion(&mut self, request: DeletionRequest, owner: PurgeOwner) -> u64 {
+        self.request(DeletionCommand::Cleanup(request), false, owner)
     }
 
-    pub(super) fn request_drop(&mut self, instance: Instance) -> u64 {
-        self.request(DeletionCommand::KeepPaths(instance), true)
+    pub(super) fn request_drop(&mut self, instance: Instance, owner: PurgeOwner) -> u64 {
+        self.request(DeletionCommand::KeepPaths(instance), true, owner)
+    }
+
+    pub(super) fn request_force_remove(&mut self, instance: Instance, owner: PurgeOwner) -> u64 {
+        self.request(DeletionCommand::ForceRemove(instance), true, owner)
     }
 
     pub(super) fn try_recv_result(&mut self) -> Option<Result<DeletionDone, Vec<u64>>> {
@@ -211,13 +227,16 @@ mod tests {
             keep_scratch: true,
         };
         let mut poller = DeletionPoller::new();
-        let normal_id = poller.request_deletion(request(false));
-        let force_id = poller.request_deletion(request(true));
+        let (normal_owner, _) = PurgeOwner::issue(&before).unwrap();
+        let normal_id = poller.request_deletion(request(false), normal_owner);
+        let (owner, control) = PurgeOwner::issue(&before).unwrap();
+        control.request_force();
+        let force_id = poller.request_force_remove(before.clone(), owner);
         let forced = next_result(&mut poller);
         assert_eq!(forced.request_id, force_id);
         assert_eq!(forced.result.disposition, DeletionDisposition::Failed);
         assert!(!forced.result.teardown_started);
-        assert!(forced.result.retained_origin.is_none());
+        assert!(forced.result.retained_stop.is_none());
         assert_eq!(
             std::fs::read(replacement.sessions_path()).unwrap(),
             replacement_bytes

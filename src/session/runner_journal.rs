@@ -882,7 +882,7 @@ impl LaunchOrigin {
         Ok(())
     }
 
-    fn validate_native_history(&self, row: &Instance) -> Result<()> {
+    pub(super) fn validate_native_history(&self, row: &Instance) -> Result<()> {
         anyhow::ensure!(
             row.runner_journal
                 .launches()
@@ -1906,11 +1906,76 @@ pub(crate) fn stop_socket(id: &str, pid: u32) -> Result<PathBuf> {
     Ok(record.with_file_name(format!("{id}.{pid}.stop")))
 }
 
+pub(crate) struct AcceptedStop {
+    connection: tokio::net::UnixStream,
+    nonce: Uuid,
+    mode: u8,
+}
+
+impl AcceptedStop {
+    pub(crate) fn forced(&self) -> bool {
+        self.mode == 1
+    }
+
+    pub(crate) fn can_upgrade(&self) -> bool {
+        self.mode == 0
+    }
+
+    pub(crate) async fn accept_force_upgrade(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.can_upgrade(),
+            "only a graceful Stop accepts Force on its original stream"
+        );
+        let mut frame = [0_u8; 17];
+        self.connection.read_exact(&mut frame).await?;
+        anyhow::ensure!(
+            frame[..16] == self.nonce.as_bytes()[..] && frame[16] == 1,
+            "invalid original-stream Stop upgrade"
+        );
+        frame[16] = 1;
+        tokio::time::timeout(Duration::from_secs(1), self.connection.write_all(&frame))
+            .await
+            .context("original-stream Force acknowledgement timed out")??;
+        self.mode = 1;
+        Ok(())
+    }
+    #[cfg(debug_assertions)]
+    pub(crate) fn isolated_retirement_gate(
+        &self,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+        let gate = (self.can_upgrade() && std::env::var_os("AOE_ISOLATED_RUNNER_TEST").is_some())
+            .then(|| std::env::var_os("AOE_TEST_STOP_RETIRE_GATE"))
+            .flatten()
+            .map(PathBuf::from);
+        let nonce = self.nonce;
+        async move {
+            if let Some(gate) = gate {
+                tokio::fs::write(
+                    gate.with_extension("entered"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "pid": std::process::id(), "nonce": nonce, "mode": 0
+                    }))?,
+                )
+                .await?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                while !tokio::fs::try_exists(&gate).await? {
+                    anyhow::ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "isolated original retirement gate was not released"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(crate) async fn wait_for_stop<F: std::future::Future<Output = bool>>(
     listener: std::sync::Arc<tokio::net::UnixListener>,
     nonce: Uuid,
     admit: impl Fn(bool) -> F,
-) -> Result<bool> {
+) -> Result<AcceptedStop> {
     loop {
         let (mut connection, _) = listener.accept().await?;
         let mut received = [0; 17];
@@ -1925,10 +1990,15 @@ pub(crate) async fn wait_for_stop<F: std::future::Future<Output = bool>>(
             let mut receipt = [0; 17];
             receipt[..16].copy_from_slice(nonce.as_bytes());
             receipt[16] = u8::from(accepted);
-            let _ =
+            let acknowledged =
                 tokio::time::timeout(Duration::from_secs(1), connection.write_all(&receipt)).await;
             if accepted {
-                return Ok(received[16] == 1);
+                acknowledged.context("original Stop acknowledgement timed out")??;
+                return Ok(AcceptedStop {
+                    connection,
+                    nonce,
+                    mode: received[16],
+                });
             }
         }
     }
@@ -2407,8 +2477,24 @@ fn validate_selected_births(storage: &Storage, id: &str, live: &[RunnerLaunch]) 
     Ok(())
 }
 
+pub(crate) async fn settle_purge(
+    stop: std::sync::Arc<OwnedStop>,
+    control: crate::session::deletion::PurgeControl,
+) -> Result<()> {
+    anyhow::ensure!(
+        control.owns_stop(&stop),
+        "force control does not own this original purge receipt"
+    );
+    let driver = tokio::spawn(settle_selected_owned(
+        JournalScope::Stop(stop),
+        None,
+        0,
+        Some(control),
+    ));
+    driver.await.context("owned original purge force driver")?
+}
 async fn settle_selected(scope: JournalScope, nonce: Option<[u8; 16]>, mode: u8) -> Result<()> {
-    let driver = tokio::spawn(settle_selected_owned(scope, nonce, mode));
+    let driver = tokio::spawn(settle_selected_owned(scope, nonce, mode, None));
     driver
         .await
         .context("owned original runner settlement driver")?
@@ -2418,6 +2504,7 @@ async fn settle_selected_owned(
     scope: JournalScope,
     nonce: Option<[u8; 16]>,
     mode: u8,
+    control: Option<crate::session::deletion::PurgeControl>,
 ) -> Result<()> {
     let scope_read = scope.clone();
     let (live, quiescent) = tokio::task::spawn_blocking(move || {
@@ -2437,6 +2524,7 @@ async fn settle_selected_owned(
     .await
     .context("original runner birth proof job")??;
     let mut authenticated_endpoints = Vec::new();
+    let mut force_deadline = None;
     if !quiescent {
         for launch in &live {
             let incarnation = launch
@@ -2466,9 +2554,13 @@ async fn settle_selected_owned(
             };
             let mut frame = [0; 17];
             frame[..16].copy_from_slice(&launch.nonce);
-            frame[16] = mode;
-            let requested = tokio::time::timeout(Duration::from_secs(1), async {
-                let mut socket = tokio::net::UnixStream::connect(&path).await?;
+            let requested = async {
+                let mut socket = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::net::UnixStream::connect(&path),
+                )
+                .await
+                .map_err(std::io::Error::other)??;
                 if crate::process::worker::peer_pid_from_connected_socket(&socket)
                     != Some(incarnation.pid)
                 {
@@ -2492,23 +2584,55 @@ async fn settle_selected_owned(
                 .await
                 .map_err(std::io::Error::other)?;
                 original_endpoint.map_err(std::io::Error::other)?;
-                socket.write_all(&frame).await?;
-                let mut receipt = [0; 17];
-                socket.read_exact(&mut receipt).await?;
-                if receipt[..16] != launch.nonce {
-                    return Err(std::io::Error::other(
-                        "runner execution ticket was not authenticated",
-                    ));
+                frame[16] = if control
+                    .as_ref()
+                    .is_some_and(|control| control.force_requested())
+                {
+                    1
+                } else {
+                    mode
+                };
+                if frame[16] == 1 {
+                    if let (Some(control), JournalScope::Stop(stop)) = (&control, &scope) {
+                        if !control.owns_stop(stop) {
+                            return Err(std::io::Error::other(
+                                "original purge owner was lost before forced Stop",
+                            ));
+                        }
+                    }
+                    force_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + Duration::from_secs(3)
+                    });
                 }
-                Ok::<_, std::io::Error>((receipt[16] == 1, socket))
-            })
+                let accepted = tokio::time::timeout(Duration::from_secs(1), async {
+                    socket.write_all(&frame).await?;
+                    let mut receipt = [0; 17];
+                    socket.read_exact(&mut receipt).await?;
+                    if receipt[..16] != launch.nonce {
+                        return Err(std::io::Error::other(
+                            "runner execution ticket was not authenticated",
+                        ));
+                    }
+                    Ok::<_, std::io::Error>(receipt[16] == 1)
+                })
+                .await
+                .map_err(std::io::Error::other)??;
+                Ok::<_, std::io::Error>((accepted, socket))
+            }
             .await;
             let accepted = match requested {
-                Ok(Ok((true, connection))) => {
-                    authenticated_endpoints.push((path, identity, connection));
+                Ok((true, connection)) => {
+                    authenticated_endpoints.push((
+                        path,
+                        identity,
+                        connection,
+                        incarnation,
+                        launch.nonce,
+                        frame[16] == 1,
+                    ));
                     true
                 }
-                Ok(Ok((false, _))) => {
+                Ok((false, _)) => {
                     anyhow::bail!("stop the session before moving its checkout; runner is busy")
                 }
                 _ => false,
@@ -2521,23 +2645,104 @@ async fn settle_selected_owned(
                 tracing::debug!(target: "acp.supervisor", session = %scope.session_id(), pid = incarnation.pid, "runner stop endpoint unavailable");
             }
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let graceful_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut upgraded = false;
         loop {
             let current_scope = scope.clone();
-            let current = tokio::task::spawn_blocking(move || {
-                snapshot(&current_scope, nonce).map(|journal| journal.proves_for(nonce))
-            })
-            .await??;
-            if current || tokio::time::Instant::now() >= deadline {
+            let mut proof = tokio::task::spawn_blocking(move || snapshot(&current_scope, nonce));
+            let journal = if let Some(control) = &control {
+                loop {
+                    tokio::select! {
+                        result = &mut proof => break result??,
+                        _ = control.changed(), if !upgraded => {}
+                    }
+                }
+            } else {
+                proof.await??
+            };
+            let current = journal.proves_for(nonce);
+            if !current
+                && !upgraded
+                && control
+                    .as_ref()
+                    .is_some_and(|control| control.force_requested())
+            {
+                let control = control
+                    .as_ref()
+                    .expect("force intent has an original control");
+                let JournalScope::Stop(stop) = &scope else {
+                    anyhow::bail!("force intent has no original purge receipt");
+                };
+                anyhow::ensure!(
+                    control.owns_stop(stop),
+                    "original purge owner was lost before force escalation"
+                );
+                for (_, _, connection, incarnation, ticket, forced) in &mut authenticated_endpoints
+                {
+                    if *forced {
+                        continue;
+                    }
+                    let check_scope = scope.clone();
+                    let expected = *incarnation;
+                    let still_live = tokio::task::spawn_blocking(move || {
+                        snapshot(&check_scope, nonce)?;
+                        Ok::<_, anyhow::Error>(
+                            crate::process::process_incarnation(expected.pid)? == Some(expected),
+                        )
+                    })
+                    .await??;
+                    if !still_live {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        control.owns_stop(stop),
+                        "original purge owner was lost before force escalation"
+                    );
+                    anyhow::ensure!(
+                        crate::process::worker::peer_pid_from_connected_socket(connection)
+                            == Some(incarnation.pid),
+                        "retained stop connection lost its original kernel peer"
+                    );
+                    let mut frame = [0; 17];
+                    frame[..16].copy_from_slice(ticket);
+                    frame[16] = 1;
+                    force_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + Duration::from_secs(3)
+                    });
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        connection.write_all(&frame).await?;
+                        let mut receipt = [0; 17];
+                        connection.read_exact(&mut receipt).await?;
+                        anyhow::ensure!(
+                            receipt[..16] == *ticket && receipt[16] == 1,
+                            "original runner refused force escalation"
+                        );
+                        anyhow::Ok(())
+                    })
+                    .await
+                    .context("original force receipt deadline")??;
+                    *forced = true;
+                }
+                upgraded = true;
+            }
+            if current || tokio::time::Instant::now() >= force_deadline.unwrap_or(graceful_deadline)
+            {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(control) = &control {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    _ = control.changed(), if !upgraded => {}
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
         }
     }
     let quiescent = tokio::task::spawn_blocking(move || {
         let journal = snapshot(&scope, nonce)?;
         anyhow::ensure!(journal.proves_for(nonce), "runner execution is not proven quiescent; retain the session and checkout. Legacy unknown history requires a verified boot change");
-        for (path, identity, _connection) in authenticated_endpoints {
+        for (path, identity, _connection, _, _, _) in authenticated_endpoints {
             crate::process::worker_registry::retire_endpoint(scope.session_id(), &path, &identity)?;
         }
         anyhow::Ok(())

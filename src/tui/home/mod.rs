@@ -95,12 +95,26 @@ pub(super) struct PendingDeletion {
     attempt: DeleteAttempt,
     origin: RequestOrigin,
     created_at: chrono::DateTime<chrono::Utc>,
+    control: crate::session::deletion::PurgeControl,
 }
 
 impl PendingDeletion {
-    fn capture(instance: &Instance, forced: bool) -> anyhow::Result<Self> {
+    fn capture(
+        instance: &Instance,
+        forced: bool,
+    ) -> anyhow::Result<(Self, crate::session::deletion::PurgeOwner)> {
+        let (owner, control) = crate::session::deletion::PurgeOwner::issue(instance)?;
+        Ok((Self::from_control(instance, forced, control)?, owner))
+    }
+
+    fn from_control(
+        instance: &Instance,
+        forced: bool,
+        control: crate::session::deletion::PurgeControl,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             session_id: instance.id.clone(),
+            control,
             attempt: DeleteAttempt {
                 forced,
                 trashed_at: instance.trashed_at,
@@ -116,8 +130,20 @@ impl PendingDeletion {
     fn matches(&self, instance: &Instance) -> bool {
         self.session_id == instance.id
             && self.created_at == instance.created_at
-            && self.origin.matches(instance)
+            && self.control.matches(instance)
     }
+}
+
+pub(super) enum PendingForceRemoval {
+    Existing {
+        request_id: u64,
+        control: crate::session::deletion::PurgeControl,
+    },
+    Standalone {
+        instance: Box<Instance>,
+        owner: crate::session::deletion::PurgeOwner,
+        control: crate::session::deletion::PurgeControl,
+    },
 }
 
 pub(super) struct GroupRenameContext {
@@ -317,7 +343,7 @@ pub struct HomeView {
     /// The last frame painted the mounted structured transcript into the preview, so
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,
-    pub(super) pending_force_remove_session: Option<String>,
+    pub(super) pending_force_remove_session: Option<PendingForceRemoval>,
     pub(super) pending_trash_session: Option<String>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,

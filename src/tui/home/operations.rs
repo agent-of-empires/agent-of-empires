@@ -941,33 +941,102 @@ impl HomeView {
         Ok(())
     }
 
-    pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        self.set_instance_status(session_id, Status::Deleting);
-        if let Some(instance) = self.instances.get(session_id).cloned() {
-            self.request_deletion(DeletionRequest {
-                session_id: session_id.to_owned(),
-                instance,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: true,
-                force_delete: true,
-                detach_hooks: true,
-                keep_scratch: true,
+    pub(super) fn prepare_force_removal(
+        &self,
+        instance: &Instance,
+    ) -> anyhow::Result<super::PendingForceRemoval> {
+        if let Some((request_id, pending)) = self
+            .deletes_in_flight
+            .iter()
+            .find(|(_, pending)| pending.session_id == instance.id)
+        {
+            anyhow::ensure!(
+                pending.matches(instance),
+                "The original deletion no longer matches this incarnation"
+            );
+            return Ok(super::PendingForceRemoval::Existing {
+                request_id: *request_id,
+                control: pending.control.clone(),
             });
+        }
+        let (owner, control) = crate::session::deletion::PurgeOwner::issue(instance)?;
+        Ok(super::PendingForceRemoval::Standalone {
+            instance: Box::new(instance.clone()),
+            owner,
+            control,
+        })
+    }
+
+    pub(super) fn force_remove_session(
+        &mut self,
+        target: super::PendingForceRemoval,
+    ) -> anyhow::Result<()> {
+        use crate::session::deletion::ForceIntent;
+        match target {
+            super::PendingForceRemoval::Existing {
+                request_id,
+                control,
+            } => {
+                let pending = self
+                    .deletes_in_flight
+                    .get_mut(&request_id)
+                    .ok_or_else(|| anyhow::anyhow!("The original deletion is no longer pending"))?;
+                let current = self
+                    .instances
+                    .get(&pending.session_id)
+                    .ok_or_else(|| anyhow::anyhow!("The original session is no longer visible"))?;
+                anyhow::ensure!(
+                    pending.matches(current),
+                    "The original deletion no longer matches this incarnation"
+                );
+                match control.request_force() {
+                    ForceIntent::Accepted | ForceIntent::AlreadyRequested => pending.attempt.forced = true,
+                    ForceIntent::TooLate => anyhow::bail!("The original deletion has already started hooks or commit; Force cannot change its cleanup"),
+                    ForceIntent::Closed => anyhow::bail!("The original deletion has finished; Force cannot retarget another owner"),
+                }
+            }
+            super::PendingForceRemoval::Standalone {
+                instance,
+                owner,
+                control,
+            } => {
+                anyhow::ensure!(
+                    !self.has_delete_in_flight(&instance.id),
+                    "A deletion started after confirmation; retry against its original owner"
+                );
+                let current = self
+                    .instances
+                    .get(&instance.id)
+                    .ok_or_else(|| anyhow::anyhow!("The original session is no longer visible"))?;
+                anyhow::ensure!(
+                    control.matches(current),
+                    "The confirmed original session changed before Force removal"
+                );
+                let pending =
+                    super::PendingDeletion::from_control(&instance, true, control.clone())?;
+                anyhow::ensure!(
+                    control.request_force() == ForceIntent::Accepted,
+                    "The confirmed force owner is no longer available"
+                );
+                self.set_instance_status(&instance.id, Status::Deleting);
+                let request_id = self.deletion_poller.request_force_remove(*instance, owner);
+                self.deletes_in_flight.insert(request_id, pending);
+            }
         }
         Ok(())
     }
 
     pub(super) fn request_deletion(&mut self, request: DeletionRequest) {
-        let pending = match super::PendingDeletion::capture(&request.instance, request.force_delete)
-        {
-            Ok(pending) => pending,
-            Err(error) => {
-                self.info_dialog = Some(InfoDialog::new("Delete refused", &format!("{error:#}")));
-                return;
-            }
-        };
-        let request_id = self.deletion_poller.request_deletion(request);
+        let (pending, owner) =
+            match super::PendingDeletion::capture(&request.instance, request.force_delete) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    self.info_dialog =
+                        Some(InfoDialog::new("Delete refused", &format!("{error:#}")));
+                    return;
+                }
+            };
+        let request_id = self.deletion_poller.request_deletion(request, owner);
         self.deletes_in_flight.insert(request_id, pending);
     }
 
@@ -991,7 +1060,7 @@ impl HomeView {
 
     /// Retain filesystem artifacts while the canonical Purge worker settles the original.
     fn drop_failed_trashed_session(&mut self, inst: &Instance) {
-        let pending = match super::PendingDeletion::capture(inst, true) {
+        let (pending, owner) = match super::PendingDeletion::capture(inst, true) {
             Ok(pending) => pending,
             Err(error) => {
                 self.info_dialog = Some(InfoDialog::new("Delete refused", &format!("{error:#}")));
@@ -999,7 +1068,7 @@ impl HomeView {
             }
         };
         self.set_instance_status(&inst.id, Status::Deleting);
-        let request_id = self.deletion_poller.request_drop(inst.clone());
+        let request_id = self.deletion_poller.request_drop(inst.clone(), owner);
         self.deletes_in_flight.insert(request_id, pending);
     }
 

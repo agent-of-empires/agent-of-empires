@@ -192,9 +192,31 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     tokio::pin!(stop_request);
     tokio::select! {
         requested = &mut stop_request => {
-            stop_endpoint.cleanup();
-            requested?;
-            let _ = owner.retire().await;
+            let mut accepted = requested?;
+            if !accepted.forced() {
+                #[cfg(debug_assertions)]
+                let gate = accepted.isolated_retirement_gate();
+                let retirement = async {
+                    #[cfg(debug_assertions)]
+                    gate.await?;
+                    owner.retire().await
+                };
+                tokio::pin!(retirement);
+                if accepted.can_upgrade() {
+                    tokio::select! {
+                        biased;
+                        upgrade = accepted.accept_force_upgrade() => {
+                            if let Err(error) = upgrade {
+                                warn!(target: "acp.runner", session = %args.session_id, %error, "early original Stop upgrade refused");
+                                let _ = retirement.await;
+                            }
+                        }
+                        _ = &mut retirement => {}
+                    }
+                } else {
+                    let _ = retirement.await;
+                }
+            }
             anyhow::ensure!(
                 crate::process::worker::kill_own_process_group_if_leader(our_pid),
                 "early Stop could not retire its original native group"
@@ -301,16 +323,43 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     tokio::select! {
         requested = &mut stop_request => {
-            stop_endpoint.cleanup();
             match requested {
-                Ok(true) => {
-                    let _ = owner.retire().await;
-                    if !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
+                Ok(mut accepted) => {
+                    let force_now = if accepted.forced() {
+                        true
+                    } else {
+                        #[cfg(debug_assertions)]
+                        let gate = accepted.isolated_retirement_gate();
+                        let retirement = async {
+                            #[cfg(debug_assertions)]
+                            gate.await?;
+                            self_terminate_agent_tree(WatchdogShutdown::Requested, &session_id, &owner, &mut agent_child).await;
+                            anyhow::Ok(())
+                        };
+                        tokio::pin!(retirement);
+                        if accepted.can_upgrade() {
+                            tokio::select! {
+                                biased;
+                                upgrade = accepted.accept_force_upgrade() => match upgrade {
+                                    Ok(()) => true,
+                                    Err(error) => {
+                                        warn!(target: "acp.runner", session = %session_id, %error, "original Stop upgrade refused; continuing graceful retirement");
+                                        let _ = retirement.await;
+                                        false
+                                    }
+                                },
+                                _ = &mut retirement => false,
+                            }
+                        } else {
+                            let _ = retirement.await;
+                            false
+                        }
+                    };
+                    if force_now && !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
                         let _ = agent_child.start_kill();
                         let _ = agent_child.wait().await;
                     }
                 }
-                Ok(false) => self_terminate_agent_tree(WatchdogShutdown::Requested, &session_id, &owner, &mut agent_child).await,
                 Err(error) => {
                     warn!(target: "acp.runner", session = %session_id, "stop endpoint failed: {error:#}");
                     self_terminate_agent_tree(WatchdogShutdown::Requested, &session_id, &owner, &mut agent_child).await;

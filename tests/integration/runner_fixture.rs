@@ -99,6 +99,10 @@ impl RunnerLaunchFixture {
         }
     }
 
+    pub(super) fn original_storage(&self) -> &Storage {
+        &self.storage
+    }
+
     pub(super) fn command(&self) -> Command {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new(super::aoe_binary());

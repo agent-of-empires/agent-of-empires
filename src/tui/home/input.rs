@@ -1036,9 +1036,11 @@ impl HomeView {
                 None
             }
             "force_remove_session" => {
-                if let Some(session_id) = self.pending_force_remove_session.take() {
-                    if let Err(e) = self.force_remove_session(&session_id) {
+                if let Some(target) = self.pending_force_remove_session.take() {
+                    if let Err(e) = self.force_remove_session(target) {
                         tracing::error!(target: "tui.input", "Failed to force remove session: {}", e);
+                        self.info_dialog =
+                            Some(InfoDialog::new("Force Remove Refused", &format!("{e:#}")));
                     }
                 }
                 None
@@ -5262,12 +5264,23 @@ impl HomeView {
                     return;
                 }
                 if inst.status == Status::Deleting {
+                    let target = match self.prepare_force_removal(inst) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Force Remove Refused",
+                                &format!("{error:#}"),
+                            ));
+                            return;
+                        }
+                    };
                     let message = format!(
-                        "Retry force removal of '{}' independently of queued deletions? \
-                         Worktrees and branches are kept. Removal still requires confirmed agent teardown.",
+                        "Force removal of '{}'? The original deletion is escalated when it is still pending. \
+                         Worktrees, branches and scratch files are kept. Agent teardown must still be proven, \
+                         and hooks or commit already started cannot be bypassed.",
                         inst.title
                     );
-                    self.pending_force_remove_session = Some(session_id.clone());
+                    self.pending_force_remove_session = Some(target);
                     self.confirm_dialog = Some(ConfirmDialog::new(
                         "Force Remove",
                         &message,

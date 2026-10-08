@@ -12,6 +12,183 @@ use crate::session::config::repo_config;
 use crate::session::storage::StorageFlock;
 use crate::session::{Instance, LifecycleOperation, Storage};
 
+#[derive(Clone)]
+pub(crate) struct PurgeControl {
+    shared: std::sync::Arc<PurgeControlState>,
+}
+
+struct PurgeControlState {
+    original: std::sync::Arc<crate::session::LaunchOrigin>,
+    phase: std::sync::Mutex<PurgeProgress>,
+    changed: tokio::sync::Notify,
+}
+
+struct PurgeProgress {
+    phase: PurgePhase,
+    force_keep_paths: bool,
+    receipt: Option<std::sync::Arc<crate::session::runner_journal::OwnedStop>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PurgePhase {
+    Queued,
+    Native,
+    HooksOrCommit,
+    Finished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForceIntent {
+    Accepted,
+    AlreadyRequested,
+    TooLate,
+    Closed,
+}
+
+pub(crate) struct PurgeOwner {
+    control: PurgeControl,
+}
+
+impl PurgeOwner {
+    pub(crate) fn issue(instance: &Instance) -> Result<(Self, PurgeControl)> {
+        let control = PurgeControl {
+            shared: std::sync::Arc::new(PurgeControlState {
+                original: crate::session::LaunchOrigin::capture(instance)?,
+                phase: std::sync::Mutex::new(PurgeProgress {
+                    phase: PurgePhase::Queued,
+                    force_keep_paths: false,
+                    receipt: None,
+                }),
+                changed: tokio::sync::Notify::new(),
+            }),
+        };
+        Ok((
+            Self {
+                control: control.clone(),
+            },
+            control,
+        ))
+    }
+
+    fn bind(&self, receipt: &std::sync::Arc<crate::session::runner_journal::OwnedStop>) {
+        let mut progress = self
+            .control
+            .shared
+            .phase
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(progress.phase == PurgePhase::Queued && progress.receipt.is_none());
+        progress.receipt = Some(receipt.clone());
+        progress.phase = PurgePhase::Native;
+    }
+
+    fn seal(&self) -> bool {
+        let mut progress = self
+            .control
+            .shared
+            .phase
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        progress.phase = PurgePhase::HooksOrCommit;
+        progress.force_keep_paths
+    }
+}
+
+impl Drop for PurgeOwner {
+    fn drop(&mut self) {
+        self.control
+            .shared
+            .phase
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase = PurgePhase::Finished;
+        self.control.shared.changed.notify_one();
+    }
+}
+
+impl PurgeControl {
+    pub(crate) fn request_force(&self) -> ForceIntent {
+        let mut progress = self
+            .shared
+            .phase
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match progress.phase {
+            PurgePhase::HooksOrCommit => ForceIntent::TooLate,
+            PurgePhase::Finished => ForceIntent::Closed,
+            PurgePhase::Queued | PurgePhase::Native if progress.force_keep_paths => {
+                ForceIntent::AlreadyRequested
+            }
+            PurgePhase::Queued | PurgePhase::Native => {
+                progress.force_keep_paths = true;
+                self.shared.changed.notify_one();
+                ForceIntent::Accepted
+            }
+        }
+    }
+
+    pub(crate) fn matches(&self, instance: &Instance) -> bool {
+        let progress = self
+            .shared
+            .phase
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = instance.lifecycle_generation;
+        if generation == self.shared.original.generation()
+            && self
+                .shared
+                .original
+                .validate_baseline_at(instance, generation)
+                .is_ok()
+        {
+            return true;
+        }
+        progress.receipt.as_ref().is_some_and(|receipt| {
+            generation == receipt.generation()
+                && (self
+                    .shared
+                    .original
+                    .validate_baseline_at(instance, generation)
+                    .is_ok()
+                    || receipt
+                        .current_projection()
+                        .validate_baseline_at(instance, generation)
+                        .is_ok())
+                && self
+                    .shared
+                    .original
+                    .validate_native_history(instance)
+                    .is_ok()
+        })
+    }
+
+    pub(crate) fn force_requested(&self) -> bool {
+        self.shared
+            .phase
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .force_keep_paths
+    }
+
+    pub(crate) async fn changed(&self) {
+        self.shared.changed.notified().await;
+    }
+    pub(crate) fn owns_stop(
+        &self,
+        stop: &std::sync::Arc<crate::session::runner_journal::OwnedStop>,
+    ) -> bool {
+        let progress = self
+            .shared
+            .phase
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        progress.phase == PurgePhase::Native
+            && progress
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| std::sync::Arc::ptr_eq(receipt, stop))
+    }
+}
 pub struct DeletionRequest {
     pub session_id: String,
     pub instance: Instance,
@@ -45,7 +222,7 @@ pub struct DeletionResult {
     pub teardown_started: bool,
     /// Latest durable row when the transaction deliberately kept it.
     pub retained_instance: Option<Instance>,
-    pub(crate) retained_origin: Option<std::sync::Arc<crate::session::LaunchOrigin>>,
+    pub(crate) retained_stop: Option<std::sync::Arc<crate::session::runner_journal::OwnedStop>>,
 }
 
 impl DeletionResult {
@@ -63,25 +240,30 @@ impl DeletionResult {
             disposition,
             retained_instance,
             teardown_started: false,
-            retained_origin: None,
+            retained_stop: None,
         }
     }
 
     pub(crate) fn retained_release_matches(&self, current: &Instance) -> bool {
-        let (Some(original), Some(retained)) = (&self.retained_origin, &self.retained_instance)
-        else {
+        let (Some(stop), Some(retained)) = (&self.retained_stop, &self.retained_instance) else {
             return false;
         };
+        let original = stop.original();
+        let acknowledged = stop.current_projection();
         current.same_storage_origin(retained)
             && current.trashed_at == retained.trashed_at
             && (current.lifecycle_generation == original.generation()
                 || current.lifecycle_generation == retained.lifecycle_generation)
-            && original
+            && (original
                 .validate_baseline_at(current, current.lifecycle_generation)
                 .is_ok()
-            && original
+                || acknowledged
+                    .validate_baseline_at(current, current.lifecycle_generation)
+                    .is_ok())
+            && acknowledged
                 .validate_baseline_at(retained, retained.lifecycle_generation)
                 .is_ok()
+            && original.validate_native_history(retained).is_ok()
     }
 }
 
@@ -101,6 +283,7 @@ pub struct PurgeTransaction {
     storage: Storage,
     original: std::sync::Arc<crate::session::LaunchOrigin>,
     native_stop: std::sync::Arc<crate::session::runner_journal::OwnedStop>,
+    control_owner: Option<PurgeOwner>,
     request: DeletionRequest,
     cleanup: PurgeCleanup,
     was_trashed: bool,
@@ -121,6 +304,7 @@ pub struct PurgeTransaction {
 pub struct CommittedPurge {
     request: DeletionRequest,
     cleanup: PurgeCleanup,
+    _control_owner: Option<PurgeOwner>,
     _lifecycle_lock: StorageFlock,
     _identity_lock: Option<StorageFlock>,
     _workspace_claim_lock: StorageFlock,
@@ -157,13 +341,14 @@ impl PurgeTransaction {
     }
 
     pub fn reserve(storage: Storage, request: DeletionRequest) -> Result<PurgeReservation> {
-        Self::reserve_with_cleanup(storage, request, PurgeCleanup::All)
+        Self::reserve_with_cleanup(storage, request, PurgeCleanup::All, None)
     }
 
     fn reserve_with_cleanup(
         storage: Storage,
         mut request: DeletionRequest,
         cleanup: PurgeCleanup,
+        control_owner: Option<PurgeOwner>,
     ) -> Result<PurgeReservation> {
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
@@ -175,7 +360,11 @@ impl PurgeTransaction {
             "purge request belongs to another physical profile"
         );
         origin.verify_profile_identity()?;
-        let original = crate::session::LaunchOrigin::capture(&request.instance)?;
+        let original = match &control_owner {
+            Some(owner) => owner.control.shared.original.clone(),
+            None => crate::session::LaunchOrigin::capture(&request.instance)?,
+        };
+        original.validate_baseline_at(&request.instance, original.generation())?;
         storage.verify_profile_identity()?;
         let expected_trashed_at = request.instance.trashed_at;
         let mut lifecycle_changed = false;
@@ -273,10 +462,14 @@ impl PurgeTransaction {
         }
         let native_stop =
             crate::session::runner_journal::OwnedStop::from_purge(original.clone(), generation);
+        if let Some(owner) = &control_owner {
+            owner.bind(&native_stop);
+        }
         Ok(PurgeReservation::Reserved(Self {
             storage,
             original,
             native_stop,
+            control_owner,
             request,
             cleanup,
             was_trashed,
@@ -305,6 +498,15 @@ impl PurgeTransaction {
             return Ok(self);
         };
         Err(Box::new(self.failed_after_release(message)))
+    }
+
+    fn seal_cleanup(&mut self) {
+        if self.control_owner.as_ref().is_some_and(PurgeOwner::seal) {
+            self.request.delete_worktree = false;
+            self.request.delete_branch = false;
+            self.request.keep_scratch = true;
+            self.cleanup = PurgeCleanup::SidecarsOnly;
+        }
     }
 
     fn ownership_error(&mut self) -> Option<String> {
@@ -351,11 +553,12 @@ impl PurgeTransaction {
     where
         F: FnOnce(&Instance, bool),
     {
+        self.seal_cleanup();
         let ownership_failed = self.ownership_error().is_some();
         self.lifecycle_lock = None;
         self.workspace_claim_lock = None;
         self.identity_lock = None;
-        if !ownership_failed {
+        if !ownership_failed && self.cleanup == PurgeCleanup::All {
             run_hooks(&self.request.instance, self.request.detach_hooks);
         }
         self
@@ -412,10 +615,10 @@ impl PurgeTransaction {
                 None
             }
         };
-        result.retained_origin = result
+        result.retained_stop = result
             .retained_instance
             .as_ref()
-            .map(|_| self.original.clone());
+            .map(|_| self.native_stop.clone());
     }
 
     fn release_reservation(&mut self) -> Result<Option<Instance>> {
@@ -426,7 +629,10 @@ impl PurgeTransaction {
         self.storage
             .update_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
-                    self.original.validate_baseline_at(stored, generation)?;
+                    self.native_stop
+                        .current_projection()
+                        .validate_baseline_at(stored, generation)?;
+                    self.original.validate_native_history(stored)?;
                     stored.release_lifecycle_reservation_if_owned(
                         LifecycleOperation::Purge,
                         generation,
@@ -450,14 +656,14 @@ impl PurgeTransaction {
                     outcome = Some((CompletionGate::AlreadyGone, None));
                     return Ok(());
                 };
-                if self
-                    .original
-                    .validate_baseline_at(stored, generation)
-                    .is_err()
-                    && self
-                        .original
-                        .validate_restored_at(stored, generation)
+                let acknowledged = self.native_stop.current_projection();
+                if self.original.validate_native_history(stored).is_err()
+                    || (acknowledged
+                        .validate_baseline_at(stored, generation)
                         .is_err()
+                        && acknowledged
+                            .validate_restored_at(stored, generation)
+                            .is_err())
                 {
                     outcome = Some((CompletionGate::Superseded, None));
                     return Ok(());
@@ -529,6 +735,7 @@ impl PurgeTransaction {
     pub fn begin_irreversible(
         mut self,
     ) -> std::result::Result<CommittedPurge, Box<DeletionResult>> {
+        self.seal_cleanup();
         if let Err(error) = self.ensure_lifecycle_lock() {
             return Err(Box::new(DeletionResult::rejected(
                 self.request.session_id.clone(),
@@ -551,14 +758,17 @@ impl PurgeTransaction {
                     commit = Some((CompletionGate::AlreadyGone, None));
                     return Ok(());
                 };
+                let acknowledged = self.native_stop.current_projection();
                 if self
                     .original
-                    .validate_baseline_at(&instances[index], generation)
+                    .validate_native_history(&instances[index])
                     .is_err()
-                    && self
-                        .original
-                        .validate_restored_at(&instances[index], generation)
+                    || (acknowledged
+                        .validate_baseline_at(&instances[index], generation)
                         .is_err()
+                        && acknowledged
+                            .validate_restored_at(&instances[index], generation)
+                            .is_err())
                 {
                     commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
                     return Ok(());
@@ -623,6 +833,7 @@ impl PurgeTransaction {
                 keep_scratch: self.request.keep_scratch,
             },
             cleanup: self.cleanup,
+            _control_owner: self.control_owner.take(),
             _workspace_claim_lock: self
                 .workspace_claim_lock
                 .take()
@@ -643,6 +854,13 @@ impl PurgeTransaction {
         commit_on_teardown_failure: bool,
         teardown: fn(&str) -> crate::containers::Teardown,
     ) -> DeletionResult {
+        self.seal_cleanup();
+        if self.cleanup == PurgeCleanup::SidecarsOnly {
+            return match self.begin_irreversible() {
+                Ok(committed) => committed.finish(),
+                Err(result) => *result,
+            };
+        }
         if let Err(error) = self.ensure_lifecycle_lock() {
             return DeletionResult::rejected(
                 self.request.session_id.clone(),
@@ -784,13 +1002,13 @@ impl Drop for PurgeTransaction {
         if !self.active {
             return;
         }
-        let original = self.original.clone();
+        let stop = self.native_stop.clone();
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let _ = std::thread::Builder::new()
             .name("aoe-purge-reservation-release".to_string())
             .spawn(move || {
-                let storage = original.storage();
+                let storage = stop.storage();
                 let Ok(_workspace) = crate::session::acquire_session_workspace_claim_lock() else {
                     return;
                 };
@@ -805,7 +1023,9 @@ impl Drop for PurgeTransaction {
                 };
                 let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
                     if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
-                        original.validate_baseline_at(stored, generation)?;
+                        stop.current_projection()
+                            .validate_baseline_at(stored, generation)?;
+                        stop.original().validate_native_history(stored)?;
                         stored.release_lifecycle_reservation_if_owned(
                             LifecycleOperation::Purge,
                             generation,
@@ -842,7 +1062,12 @@ async fn settle_runner_of_owned(
 ) -> Result<PurgeTransaction, Box<DeletionResult>> {
     let mut released = transaction.release_locks_for_teardown();
     let scope = released.native_stop_scope();
-    let outcome = crate::session::runner_journal::settle(scope).await;
+    let outcome = match &released.control_owner {
+        Some(owner) => {
+            crate::session::runner_journal::settle_purge(scope, owner.control.clone()).await
+        }
+        None => crate::session::runner_journal::settle(scope).await,
+    };
     match outcome {
         Ok(()) => Ok(released),
         Err(error) => {
@@ -857,10 +1082,17 @@ async fn settle_runner_of_owned(
 }
 
 pub async fn execute_deletion(request: DeletionRequest) -> DeletionResult {
-    execute_deletion_with_cleanup(request, PurgeCleanup::All).await
+    execute_deletion_with_cleanup(request, PurgeCleanup::All, None).await
 }
 
-pub(crate) async fn execute_drop(instance: Instance) -> DeletionResult {
+pub(crate) async fn execute_owned_deletion(
+    request: DeletionRequest,
+    owner: PurgeOwner,
+) -> DeletionResult {
+    execute_deletion_with_cleanup(request, PurgeCleanup::All, Some(owner)).await
+}
+
+pub(crate) async fn execute_drop(instance: Instance, owner: Option<PurgeOwner>) -> DeletionResult {
     let request = DeletionRequest {
         session_id: instance.id.clone(),
         instance,
@@ -871,19 +1103,40 @@ pub(crate) async fn execute_drop(instance: Instance) -> DeletionResult {
         detach_hooks: true,
         keep_scratch: true,
     };
-    execute_deletion_with_cleanup(request, PurgeCleanup::SidecarsOnly).await
+    execute_deletion_with_cleanup(request, PurgeCleanup::SidecarsOnly, owner).await
 }
 
 async fn execute_deletion_with_cleanup(
     request: DeletionRequest,
     cleanup: PurgeCleanup,
+    owner: Option<PurgeOwner>,
+) -> DeletionResult {
+    let id = request.session_id.clone();
+    let driver = tokio::spawn(execute_deletion_owned(request, cleanup, owner));
+    driver.await.unwrap_or_else(|error| {
+        DeletionResult::rejected(
+            id,
+            DeletionDisposition::Failed,
+            format!("Owned deletion driver failed: {error}"),
+            None,
+        )
+    })
+}
+
+async fn execute_deletion_owned(
+    request: DeletionRequest,
+    cleanup: PurgeCleanup,
+    owner: Option<PurgeOwner>,
 ) -> DeletionResult {
     let id = request.session_id.clone();
     let recent_entry = crate::session::recent_project_entry_for(&request.instance);
-    let reserved = (|| {
+    let reserved = tokio::task::spawn_blocking(move || {
         let storage = request.instance.original_storage()?;
-        PurgeTransaction::reserve_with_cleanup(storage.as_ref().clone(), request, cleanup)
-    })();
+        PurgeTransaction::reserve_with_cleanup(storage.as_ref().clone(), request, cleanup, owner)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
     let settled = match reserved {
         Ok(PurgeReservation::Reserved(transaction)) => settle_runner_of(transaction).await,
         Ok(PurgeReservation::Rejected(result)) => Err(Box::new(result)),
@@ -939,7 +1192,7 @@ fn perform_deletion_sidecars(request: &DeletionRequest) -> DeletionResult {
         disposition: DeletionDisposition::Removed,
         teardown_started: true,
         retained_instance: None,
-        retained_origin: None,
+        retained_stop: None,
     }
 }
 
@@ -1767,7 +2020,7 @@ fn perform_deletion_teardown_under_ownership_guard(
             )],
             disposition: DeletionDisposition::Failed,
             retained_instance: None,
-            retained_origin: None,
+            retained_stop: None,
         };
     }
 
@@ -1827,7 +2080,7 @@ fn perform_deletion_teardown_under_ownership_guard(
         errors,
         disposition: DeletionDisposition::Failed,
         retained_instance: None,
-        retained_origin: None,
+        retained_stop: None,
     }
 }
 
@@ -3203,7 +3456,7 @@ mod tests {
         assert_eq!(result.disposition, DeletionDisposition::Failed);
         assert!(!result.success);
         assert!(result.retained_instance.is_none());
-        assert!(result.retained_origin.is_none());
+        assert!(result.retained_stop.is_none());
         assert!(result
             .errors
             .iter()
@@ -3256,7 +3509,7 @@ mod tests {
                 })
                 .unwrap();
             let before = storage.load().unwrap().remove(0);
-            let result = execute_drop(requested).await;
+            let result = execute_drop(requested, None).await;
             assert_eq!(result.disposition, expected, "{profile}");
             if change == 0 {
                 assert!(result.retained_release_matches(&before));
@@ -4402,90 +4655,6 @@ mod tests {
                 );
             }
         }
-    }
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn stopped_structured_session_can_be_purged_after_registry_cleanup() {
-        use crate::process::worker_registry::{self, WorkerRecord};
-        let temp = tempfile::tempdir().unwrap();
-        let _home = isolate_app_dir_at(&temp.path().join("home"));
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let mut structured = Instance::new("Stopped", project.to_str().unwrap());
-        structured.id = "stopped-purge".into();
-        structured.view = crate::session::View::Structured;
-        structured.source_profile = "owner".into();
-        let storage = Storage::new_unwatched("owner").unwrap();
-        structured.storage_origin = Some(std::sync::Arc::new(storage.clone()));
-        storage
-            .update(|instances, _| {
-                instances.push(structured.clone());
-                Ok(())
-            })
-            .unwrap();
-        let mut command = std::process::Command::new("/bin/sh");
-        command
-            .args(["-c", "read -r ignored || :"])
-            .stdin(std::process::Stdio::piped());
-        crate::process::configure_process_group(&mut command);
-        let mut child = command.spawn().unwrap();
-        let pid = child.id();
-        let incarnation = crate::process::process_incarnation(pid).unwrap().unwrap();
-        let boot = *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap())
-            .unwrap()
-            .as_bytes();
-        structured.runner_journal = serde_json::from_value(serde_json::json!({
-            "coverage": "complete", "preparations": [], "launches": [{
-                "nonce": *uuid::Uuid::new_v4().as_bytes(), "boot": boot,
-                "generation": 0, "incarnation": incarnation,
-            }],
-        }))
-        .unwrap();
-        Storage::open_unwatched("owner")
-            .unwrap()
-            .update(|rows, _| {
-                rows.iter_mut()
-                    .find(|row| row.id == structured.id)
-                    .unwrap()
-                    .runner_journal = structured.runner_journal.clone();
-                Ok(())
-            })
-            .unwrap();
-        let record = WorkerRecord::new(
-            structured.id.clone(),
-            pid,
-            worker_registry::socket_path_for(&structured.id).unwrap(),
-            "agent".into(),
-            "agent".into(),
-            project.clone(),
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-            Some("owner".into()),
-        );
-        worker_registry::save(&record).unwrap();
-        drop(child.stdin.take());
-        assert!(child.wait().unwrap().success());
-        assert!(!crate::process::worker::is_process_group_alive(pid));
-        worker_registry::delete(&structured.id).unwrap();
-        assert!(worker_registry::load_strict(&structured.id)
-            .unwrap()
-            .is_none());
-        let transaction = match PurgeTransaction::reserve_unwatched(request(structured)).unwrap() {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(result) => panic!("reservation failed: {result:?}"),
-        };
-        let settled = settle_runner_of(transaction)
-            .await
-            .expect("a proven stopped runner must permit purge");
-        let result = settled.run_hooks_with(|_, _| {}).complete_with(|_| Ok(()));
-        assert_eq!(result.disposition, DeletionDisposition::Removed);
-        assert!(Storage::open_unwatched("owner")
-            .unwrap()
-            .load()
-            .unwrap()
-            .is_empty());
     }
 
     #[tokio::test]

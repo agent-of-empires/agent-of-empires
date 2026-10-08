@@ -129,8 +129,9 @@ jobs:
       # so no test can pass on state an earlier one left behind.
       - name: Cargo test (default features, everything except e2e)
         if: matrix.leg == 'core-rest'
-        # Echo the temp root so a silently-dropped TMPDIR is visible in the log
-        # rather than passing as a green run with the guard gone.
+        env:
+          AOE_CI_ORIGINAL_PURGE_FORCE: "1"
+        # Echo the guarded temp root so an unset override is visible.
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
           cargo build --bin aoe
@@ -273,6 +274,8 @@ jobs:
         run: npm ci
       - name: Cargo test (macOS, lib + bins)
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        env:
+          AOE_CI_ORIGINAL_PURGE_FORCE: "1"
         run: |
           cargo build --features e2e-tests --bin aoe
           cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
