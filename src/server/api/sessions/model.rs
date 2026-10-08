@@ -31,10 +31,8 @@ impl SessionResponse {
         acp_worker_state: crate::daemon::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
-        // `Some(description)` when the session has an armed `Monitor` (the
-        // inner description is itself optional); `None` when none is armed.
-        // Mirrors `EventStore::latest_active_monitor`'s return so the caller
-        // forwards it verbatim.
+        // `Some(description)` when the session has an armed `Monitor`, `None`
+        // otherwise, mirroring `EventStore::latest_active_monitor`.
         active_monitor: Option<Option<String>>,
     ) -> Self {
         let (monitor_active, monitor_description) = match active_monitor {
@@ -57,10 +55,12 @@ impl SessionResponse {
             idempotency_key: inst.idempotency_key.clone(),
             title: inst.title.clone(),
             project_path: inst.project_path.clone(),
+            agent_session_id: inst.agent_session_id.clone(),
             artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
             group_path: inst.group_path.clone(),
+            sort_index: inst.sort_index,
             tool: inst.tool.clone(),
             command: inst.command.clone(),
             extra_args: inst.extra_args.clone(),
@@ -98,21 +98,18 @@ impl SessionResponse {
             urgent: inst.is_urgent(),
             pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
             archived_at: inst.archived_at.map(|t| t.to_rfc3339()),
-            // Surface `snoozed_until` only when the snooze is still
-            // active. `is_snoozed()` returns false once the timestamp
-            // has expired, even though the persisted field stays set
-            // until the next mutation rewrites it. Mirroring that
-            // semantics on the wire prevents the web sidebar from
-            // showing a "snoozed 0m" chip on rows that have already
-            // woken on disk.
+            // Surface `snoozed_until` only while the snooze is active:
+            // `is_snoozed()` goes false once it expires, even though the
+            // persisted field stays set until the next mutation, and the web
+            // must not show a "snoozed 0m" chip on a row that already woke.
             snoozed_until: if inst.is_snoozed() {
                 inst.snoozed_until.map(|t| t.to_rfc3339())
             } else {
                 None
             },
             trashed_at: inst.trashed_at.map(|t| t.to_rfc3339()),
-            // Surface the marker (omitted when read); the web gates the
-            // visual on the `session.unread_indicator` setting.
+            // Surface the marker; the web gates the visual on the
+            // `session.unread_indicator` setting.
             unread: inst.unread,
             has_managed_worktree: inst
                 .worktree_info
@@ -144,10 +141,9 @@ impl SessionResponse {
             pending_approvals: Vec::new(),
             rate_limit: None,
             rate_limit_auto_resume: None,
-            // Built-in ACP capability is resolved here from a process-wide
-            // registry (cheap, no IO). Custom agents depend on profile
-            // config; the list and create handlers overlay that without a
-            // per-row config read.
+            // Built-in ACP capability resolves here from a process-wide
+            // registry (no IO). Custom agents depend on profile config, which
+            // the list and create handlers overlay without a per-row read.
             acp_capable: {
                 let resolved = inst
                     .agent_name
@@ -157,10 +153,9 @@ impl SessionResponse {
                 builtin_acp_registry().get(resolved).is_some()
             },
             acp_session_id: inst.acp_session_id.clone(),
-            // Resolved the same way as `acp_capable` above: `agent_name` when
-            // set and non-empty, else `tool`. This is the ACP registry key,
-            // so it matches `/api/acp/agents` names the switch-agent modal
-            // filters against. See #2803.
+            // Resolved like `acp_capable`: `agent_name` when non-empty, else
+            // `tool`. This is the ACP registry key, so it matches the
+            // `/api/acp/agents` names the switch-agent modal filters on (#2803).
             acp_agent: {
                 let resolved = inst
                     .agent_name
@@ -185,8 +180,8 @@ impl SessionResponse {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(inst.tool.as_str()),
             ),
-            // Same agent resolution as `acp_agent` above; the composer palette
-            // and queued-prompt clear-boundary hint read these instead of a
+            // Same agent resolution as `acp_agent`; the composer palette and
+            // queued-prompt clear-boundary hint read these instead of a
             // client-side per-agent mirror.
             clear_aliases: crate::acp::agent_profiles::resolve(
                 inst.agent_name
@@ -200,10 +195,7 @@ impl SessionResponse {
             .collect(),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
-            // `workspace_info`, so this lists both repos with no special case:
-            // the structured view's repo-relative path rendering, the diff-repo
-            // resolver and the sidebar's multi-repo grouping all see the same
-            // shape they see for a session created multi-repo.
+            // `workspace_info`, so both repos list here with no special case.
             workspace_repos: inst
                 .all_repos()
                 .iter()

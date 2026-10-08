@@ -362,6 +362,30 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         )?);
         Ok(PurgeReservation::Reserved(transaction))
     }
+    /// Resolve defaults after reservation from the complete authoritative snapshot.
+    pub(crate) fn resolve_cleanup_defaults(mut self) -> Result<Self> {
+        let instance = &self.request().instance;
+        let config = self.store().configuration(Some(&instance.source_profile))?;
+        let mut config = match repo_config::load_repo_config(
+            &repo_config::repo_config_source_path(Path::new(&instance.project_path)),
+        )? {
+            Some(repo) => repo_config::merge_repo_config(config, &repo),
+            None => config,
+        };
+        crate::session::config::profile_config::apply_cityhall_overrides(&mut config);
+        let managed = instance.has_managed_worktree_or_workspace();
+        let sandboxed = instance
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.enabled);
+        let request = self.request.as_mut().expect("active purge request");
+        request.delete_worktree = config.worktree.auto_cleanup && managed;
+        request.delete_branch = request.delete_worktree && config.worktree.delete_branch_on_cleanup;
+        request.delete_sandbox = config.sandbox.auto_cleanup && sandboxed;
+        // force_delete and keep_scratch are explicit request policy, not config defaults.
+        Ok(self)
+    }
+
     pub(crate) fn with_additional_protection(mut self, protection: CleanupProtection) -> Self {
         self.additional_protection = Some(protection);
         self
@@ -1753,11 +1777,8 @@ fn stage_remove_worktrees_and_branches(
         if let Some(ws_info) = &request.instance.workspace_info {
             if ws_info.cleanup_on_delete && root_cleanup_allowed {
                 let ws_path = PathBuf::from(&ws_info.workspace_dir);
-                // A record whose shape is not aoe-owned should never occur: it
-                // means workspace_dir was mis-written (e.g. set to the user's
-                // own checkout). Unlike the benign non-empty case below, fail
-                // loud with an error so a corrupt record is surfaced rather than
-                // silently clearing the row over it.
+                // A record whose shape is not aoe-owned should never occur: it means workspace_dir
+                // was mis-written (e.g. set to the user's own checkout).
                 if !workspace_dir_is_aoe_owned(ws_info) {
                     tracing::warn!(target: "session.delete",
                         session_id = %request.session_id,
@@ -1771,21 +1792,12 @@ fn stage_remove_worktrees_and_branches(
                     ));
                 } else if ws_path.exists() {
                     match std::fs::remove_dir(&ws_path) {
-                        // Normally unreachable: prune_empty_parent_dirs, run
-                        // after each worktree removal, already deletes the
-                        // emptied workspace dir. This is the fallback for the
-                        // rare case where prune stopped early (hop cap, or a
-                        // home / main-repo boundary) yet the dir is empty here.
+                        // Normally unreachable: prune_empty_parent_dirs, run after each worktree
+                        // removal, already deletes the emptied workspace dir.
                         Ok(()) => messages.push("Workspace directory removed".to_string()),
-                        // A non-empty dir still holds something that is not one of
-                        // the managed worktrees: unrelated content under a mislaid
-                        // record, or files written at the workspace root, which is
-                        // the session's own cwd. We cannot tell which, so we keep
-                        // them. The removal is non-recursive, so this is a safe
-                        // refusal, not a failure worth retrying: report it as a
-                        // message so the purge still clears the row instead of
-                        // retrying the same non-convergent refusal forever, as the
-                        // default-branch guard above does (#3215).
+                        // A non-empty dir still holds something that is not one of the managed
+                        // worktrees: unrelated content under a mislaid record, or files written at
+                        // the workspace root, which is the session's own cwd.
                         Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
                             messages.push(format!(
                                 "Workspace directory kept: {} is not empty, so it was not removed",
@@ -1841,19 +1853,17 @@ fn stage_remove_worktrees_and_branches(
         for repo in repos {
             // Branch ownership is independent from checkout ownership.
             if repo.branch_preexisting {
-                // Silent for an unmanaged workspace repo before the merge; now it
-                // says so, which matches what the attached path already reported
-                // and is the same reason the worktree stage reports a preserve.
+                // Silent for an unmanaged workspace repo before the merge; now it says so, which
+                // matches what the attached path already reported and is the same reason the
+                // worktree stage reports a preserve.
                 messages.push(format!(
                     "Branch '{}' ({}) kept; aoe did not create it",
                     repo.branch, repo.name
                 ));
                 continue;
             }
-            // Per-repo gate: only delete a repo's branch when that repo's
-            // worktree was actually removed. A repo whose worktree was
-            // preserved (or failed to remove) keeps its branch checked
-            // out (#2532).
+            // Per-repo gate: only delete a repo's branch when that repo's worktree was actually
+            // removed.
             if !removed_session_worktrees.contains(&PathBuf::from(&repo.worktree_path)) {
                 messages.push(format!(
                     "Branch '{}' ({}) kept; its worktree was preserved",
@@ -1924,11 +1934,7 @@ fn stage_cleanup_scratch(
                 "keep-scratch requested but project_path failed the guard or is missing"
             );
         } else if !path.exists() {
-            // Already gone (user removed it manually, FS hiccup, prior
-            // partial cleanup). Nothing to do, and we must not reach the
-            // guard branch: a canonicalized `is_scratch_path` rejects
-            // missing paths and would otherwise surface this as a guard
-            // refusal even though it is not a tampering case.
+            // Already gone (user removed it manually, FS hiccup, prior partial cleanup).
             tracing::debug!(
                 target: "session.delete",
                 session_id = %request.session_id,
@@ -1951,11 +1957,9 @@ fn stage_cleanup_scratch(
                 }
             }
         } else {
-            // Tampered `project_path` (e.g. JSON edited by hand to claim
-            // `scratch: true` while pointing outside the scratch root)
-            // is the only path that reaches this branch in normal use.
-            // The session record will still be deleted, so callers need
-            // a visible signal that on-disk cleanup was skipped.
+            // Tampered `project_path` (e.g. JSON edited by hand to claim `scratch: true` while
+            // pointing outside the scratch root) is the only path that reaches this branch in
+            // normal use.
             tracing::warn!(
                 target: "session.delete",
                 session_id = %request.session_id,
@@ -2051,9 +2055,8 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
     let is_sandboxed = instance.sandbox_info.as_ref().is_some_and(|s| s.enabled);
     let hook_env = repo_config::lifecycle_env_vars(instance);
 
-    // The caller controls detachment: TUI/web pass detach=true to avoid
-    // corrupting the rendered UI (see issue #901); CLI passes detach=false
-    // so interactive prompts work.
+    // The caller controls detachment: TUI/web pass detach=true to avoid corrupting the rendered UI
+    // (see issue); CLI passes detach=false so interactive prompts work.
     let errors = if is_sandboxed {
         if let Some(ref sandbox) = instance.sandbox_info {
             let workdir = instance.container_workdir();

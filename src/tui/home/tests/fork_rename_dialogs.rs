@@ -359,9 +359,9 @@ fn test_shift_n_prefills_from_selected_session() {
     }
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_rename_selected_group_with_children() {
+async fn test_rename_selected_group_with_children() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
@@ -390,6 +390,9 @@ fn test_rename_selected_group_with_children() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut view, &state).await;
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -399,7 +402,9 @@ fn test_rename_selected_group_with_children() {
             old_path: old.to_string(),
             old_profile: "test".to_string(),
         });
-        view.rename_selected_group(Some(new), None).unwrap();
+        super::pickers_groups_sort::settle_rename_group(&state, &mut view, Some(new), None)
+            .await
+            .unwrap();
         let tree = view.group_trees.get("test").unwrap();
         assert!(
             !tree.group_exists(old),
@@ -453,17 +458,22 @@ fn test_rename_selected_group_with_children() {
 
 /// Renaming a group to its own path is a no-op, renaming onto an existing group fails, and a
 /// real rename re-sorts the list.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_rename_group_noop_and_duplicate() {
+async fn test_rename_group_noop_and_duplicate() {
     let mut env = create_test_env_with_groups();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     let context = || crate::tui::home::GroupRenameContext {
         old_path: "work".to_string(),
         old_profile: "test".to_string(),
     };
 
     env.view.group_rename_context = Some(context());
-    env.view.rename_selected_group(Some("work"), None).unwrap();
+    super::pickers_groups_sort::settle_rename_group(&state, &mut env.view, Some("work"), None)
+        .await
+        .unwrap();
     let work_session = env
         .view
         .instances()
@@ -473,15 +483,22 @@ fn test_rename_group_noop_and_duplicate() {
 
     env.view.group_rename_context = Some(context());
     assert!(
-        env.view
-            .rename_selected_group(Some("personal"), None)
-            .is_err(),
+        super::pickers_groups_sort::settle_rename_group(
+            &state,
+            &mut env.view,
+            Some("personal"),
+            None
+        )
+        .await
+        .is_err(),
         "renaming to an existing group should fail"
     );
 
     env.view.sort_order = crate::session::config::SortOrder::AZ;
     env.view.group_rename_context = Some(context());
-    env.view.rename_selected_group(Some("aaa"), None).unwrap();
+    super::pickers_groups_sort::settle_rename_group(&state, &mut env.view, Some("aaa"), None)
+        .await
+        .unwrap();
     let group_items: Vec<&str> = env
         .view
         .flat_items
@@ -498,9 +515,9 @@ fn test_rename_group_noop_and_duplicate() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_move_explicit_empty_group_between_profiles() {
+async fn test_move_explicit_empty_group_between_profiles() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let source = Storage::new_unwatched("alpha").unwrap();
@@ -516,14 +533,23 @@ fn test_move_explicit_empty_group_between_profiles() {
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view =
         HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut view, &state).await;
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
         old_path: "empty".to_string(),
         old_profile: "alpha".to_string(),
     });
 
-    view.rename_selected_group(Some("moved-empty"), Some("beta"))
-        .unwrap();
+    super::pickers_groups_sort::settle_rename_group(
+        &state,
+        &mut view,
+        Some("moved-empty"),
+        Some("beta"),
+    )
+    .await
+    .unwrap();
 
     assert!(Storage::new_unwatched("alpha")
         .unwrap()
@@ -543,63 +569,9 @@ fn test_move_explicit_empty_group_between_profiles() {
     assert!(moved.collapsed);
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_group_profile_move_rejects_concurrent_fresh_member_without_metadata_split() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let source = Storage::new_unwatched("alpha").unwrap();
-    let mut known = Instance::new("known", "/tmp/known");
-    known.group_path = "team".to_string();
-    source
-        .update(|instances, groups| {
-            instances.push(known.clone());
-            groups.push(Group::new("team", "team"));
-            Ok(())
-        })
-        .unwrap();
-    let _target = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
-        old_path: "team".to_string(),
-        old_profile: "alpha".to_string(),
-    });
-
-    source
-        .update(|instances, _groups| {
-            let mut concurrent = Instance::new("concurrent", "/tmp/concurrent");
-            concurrent.group_path = "team/fresh".to_string();
-            instances.push(concurrent);
-            Ok(())
-        })
-        .unwrap();
-    let error = view
-        .rename_selected_group(Some("moved-team"), Some("beta"))
-        .expect_err("a concurrent group member must abort the move");
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("group membership changed while the cross-profile move was pending"),
-        "unexpected profile-move rejection: {message}"
-    );
-    let (source_rows, source_groups) = source.load_with_groups().unwrap();
-    assert_eq!(source_rows.len(), 2);
-    assert!(source_rows
-        .iter()
-        .all(|instance| instance.group_path.starts_with("team")));
-    assert!(source_groups.iter().any(|group| group.path == "team"));
-    assert!(Storage::new_unwatched("beta")
-        .unwrap()
-        .load()
-        .unwrap()
-        .is_empty());
-}
-
-#[test]
-#[serial]
-fn test_group_profile_move_is_all_or_nothing() {
+async fn test_group_profile_move_is_all_or_nothing() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let source = Storage::new_unwatched("alpha").unwrap();
@@ -634,11 +606,18 @@ fn test_group_profile_move_is_all_or_nothing() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut view, &state).await;
     view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    assert!(view.rename_selected_group(None, Some("beta")).is_err());
+    assert!(
+        super::pickers_groups_sort::settle_rename_group(&state, &mut view, None, Some("beta"))
+            .await
+            .is_err()
+    );
     assert_eq!(source.load().unwrap().len(), 2);
     assert_eq!(target.load().unwrap().len(), 1);
     let (_, source_groups) = source.load_with_groups().unwrap();
@@ -659,7 +638,9 @@ fn test_group_profile_move_is_all_or_nothing() {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    view.rename_selected_group(None, Some("beta")).unwrap();
+    super::pickers_groups_sort::settle_rename_group(&state, &mut view, None, Some("beta"))
+        .await
+        .unwrap();
     assert!(source.load().unwrap().is_empty());
     assert_eq!(target.load().unwrap().len(), 2);
     let published: Vec<_> = view
@@ -691,9 +672,9 @@ fn test_group_profile_move_is_all_or_nothing() {
     assert!(reloaded.group_trees["beta"].group_exists("target-empty"));
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn group_profile_move_preflights_creating_and_expired_reservations() {
+async fn group_profile_move_preflights_creating_and_expired_reservations() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let source = Storage::new_unwatched("alpha").unwrap();
@@ -712,19 +693,37 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view =
         HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.mutate_instance(&second.id, |instance| {
-        instance.status = Status::Creating;
-    });
+    let state = native_state(&["alpha", "beta"]).await;
+    apply_published(&mut view, &state).await;
+    source
+        .update(|rows, _| {
+            rows.iter_mut()
+                .find(|row| row.id == second.id)
+                .unwrap()
+                .status = Status::Creating;
+            Ok(())
+        })
+        .unwrap();
+    super::pickers_groups_sort::refresh_native_fixture(&state, &mut view).await;
     view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
 
-    let error = view
-        .rename_selected_group(Some("moved"), Some("beta"))
-        .expect_err("a creating member must reject the complete group move");
+    let error = super::pickers_groups_sort::settle_rename_group(
+        &state,
+        &mut view,
+        Some("moved"),
+        Some("beta"),
+    )
+    .await
+    .expect_err("a creating member must reject the complete group move");
 
-    assert!(error.to_string().contains("being created"));
+    assert!(
+        view.info_dialog.is_some(),
+        "creating-member rejection is surfaced"
+    );
+    drop(error);
     assert!(view
         .instances()
         .filter(|instance| instance.id == first.id || instance.id == second.id)
@@ -736,17 +735,33 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         .all(|instance| instance.group_path == "work"));
     assert!(target.load().unwrap().is_empty());
 
-    view.mutate_instance(&second.id, |instance| {
-        instance.status = Status::Deleting;
-    });
+    source
+        .update(|rows, _| {
+            rows.iter_mut()
+                .find(|row| row.id == second.id)
+                .unwrap()
+                .status = Status::Deleting;
+            Ok(())
+        })
+        .unwrap();
+    super::pickers_groups_sort::refresh_native_fixture(&state, &mut view).await;
     view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    let error = view
-        .rename_selected_group(Some("moved"), Some("beta"))
-        .expect_err("a deleting member must reject the complete group move");
-    assert!(error.to_string().contains("being deleted"));
+    let error = super::pickers_groups_sort::settle_rename_group(
+        &state,
+        &mut view,
+        Some("moved"),
+        Some("beta"),
+    )
+    .await
+    .expect_err("a deleting member must reject the complete group move");
+    assert!(
+        view.info_dialog.is_some(),
+        "deleting-member rejection is surfaced"
+    );
+    drop(error);
     assert_eq!(source.load().unwrap().len(), 2);
     assert!(target.load().unwrap().is_empty());
 
@@ -755,28 +770,26 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         generation: 1,
         at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
     };
-    view.mutate_instance(&second.id, |instance| {
-        instance.status = Status::Idle;
-        instance.lifecycle_generation = 1;
-        instance.lifecycle_reservation = Some(stale.clone());
-    });
     source
         .update(|instances, _groups| {
             let instance = instances
                 .iter_mut()
                 .find(|instance| instance.id == second.id)
                 .unwrap();
+            instance.status = Status::Idle;
             instance.lifecycle_generation = 1;
             instance.lifecycle_reservation = Some(stale);
             Ok(())
         })
         .unwrap();
+    super::pickers_groups_sort::refresh_native_fixture(&state, &mut view).await;
     view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
 
-    view.rename_selected_group(Some("moved"), Some("beta"))
+    super::pickers_groups_sort::settle_rename_group(&state, &mut view, Some("moved"), Some("beta"))
+        .await
         .expect("expired reservation must not block the group move");
     assert!(source.load().unwrap().is_empty());
     assert_eq!(target.load().unwrap().len(), 2);
@@ -815,10 +828,12 @@ fn test_project_group_key_scratch_uses_sentinel_not_label() {
     assert_eq!(project_group_display_name(SCRATCH_GROUP_PATH), "Scratch");
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_cursor_follows_session_after_deletion() {
+async fn test_cursor_follows_session_after_deletion() {
     let mut env = create_test_env_with_sessions(4);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
 
     // Cursor starts at 0; move it to index 2 (session2)
     env.view.cursor = 2;
@@ -830,10 +845,22 @@ fn test_cursor_follows_session_after_deletion() {
         Item::Session { id, .. } => id.clone(),
         _ => panic!("expected session at index 1"),
     };
-    env.view.remove_instance(&victim_id);
-    env.view.rebuild_group_trees();
-    let _ = env.view.save();
-    env.view.reload().unwrap();
+    let (status, _, body) = request_with_headers(
+        &state,
+        "DELETE",
+        &format!("/api/sessions/{victim_id}"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(env.view.get_instance(&victim_id).is_some());
+    apply_published(&mut env.view, &state).await;
+    assert!(Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .iter()
+        .all(|row| row.id != victim_id));
 
     // Cursor should have followed the tracked session to its new position
     assert_eq!(

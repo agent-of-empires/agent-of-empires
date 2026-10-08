@@ -163,10 +163,9 @@ fn parse_key_name(name: &str, has_ctrl: bool) -> Option<KeyCode> {
         "right" => KeyCode::Right,
         "space" => KeyCode::Char(' '),
         _ => {
-            // Single-char key: drop case sensitivity when a modifier
-            // is held (tmux conventionally treats Ctrl+a and Ctrl+A
-            // as the same chord). Without modifiers, preserve case so
-            // a config of "Q" really means uppercase Q.
+            // Single-char key: drop case sensitivity when a modifier is held, as tmux
+            // treats Ctrl+a and Ctrl+A alike. Unmodified, case is preserved so a
+            // configured "Q" means uppercase Q.
             let mut chars = name.chars();
             let first = chars.next()?;
             if chars.next().is_some() {
@@ -418,9 +417,8 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
                 }
             }
             WorkerMsg::Send(TmuxKey::Paste(text)) => {
-                // Never merged: a paste is one discrete tmux paste-buffer
-                // call, and folding it into a neighbouring run would put the
-                // payload back on the literal path the markers came from.
+                // Never merged: a paste is one discrete tmux paste-buffer call, and
+                // folding it into a run would put the payload back on the literal path.
                 flush(&mut out, &mut run);
                 out.push(TmuxAction::Paste(text));
             }
@@ -492,19 +490,13 @@ impl LiveSendWorker {
             use std::sync::atomic::Ordering;
             use std::sync::mpsc::RecvTimeoutError;
 
-            // TUI live-send is an active take-over: entering live mode steals
-            // the session's size so the web PTY relay and the mobile live
-            // view defer to it. Entry is the ONLY steal: afterwards
-            // ownership is merely refreshed, and losing it (a web "take
-            // over" tap, another TUI's live entry) flips `lock_lost` so the
-            // UI exits live mode instead of fighting the new owner.
-            // Re-stealing after entry is how a background TUI used to
-            // silently revert a phone takeover: any keystroke, or any
-            // preview-rect jitter (a one-frame toast, a divider drag)
-            // re-asserted this worker's grid and yanked the pane size back.
-            // Released (and `window-size latest` restored) when live mode
-            // exits and the channel closes; on a lost lock the release is a
-            // no-op and the new owner's sizing stands.
+            // Entering live mode is an active take-over: it steals the session's size so
+            // the web PTY relay and mobile live view defer to it. Entry is the only steal;
+            // afterwards ownership is merely refreshed, and losing it flips `lock_lost` so
+            // the UI exits instead of fighting. Re-stealing after entry is how a
+            // background TUI used to silently revert a phone takeover on any keystroke or
+            // preview-rect jitter. Released (and `window-size latest` restored) on exit;
+            // after a lost lock the release is a no-op and the new owner's sizing stands.
             let owner_id = format!(
                 "tui-{}-{}",
                 std::process::id(),
@@ -514,16 +506,13 @@ impl LiveSendWorker {
                 return;
             }
             let session = crate::tmux::Session::from_name(&tmux_name);
-            // Entering live mode is explicit user intent, so entry forces the
-            // lock even over a live holder. False means either the tmux
-            // session is missing/broken at entry or another surface won the
-            // confirm-read race; the retry on the next resize batch tells
-            // those apart (a slow-to-appear pane still gets owned, a real
-            // takeover is flagged instead of fought).
+            // Entry is explicit user intent, so it forces the lock even over a live
+            // holder. False means the session is missing or broken at entry, or another
+            // surface won the confirm-read race; the retry on the next resize batch tells
+            // those apart.
             let mut owned = session.steal_size_owner(&owner_id);
-            // Refresh-or-flag: bump our heartbeat iff we still hold the
-            // lock; a failed refresh means another surface took over, which
-            // is flagged once and never fought.
+            // Refresh-or-flag: bump the heartbeat only while we still hold the lock; a
+            // failed refresh means another surface took over, flagged once and not fought.
             let maintain = |owned: bool| -> bool {
                 if !owned || thread_lock_lost.load(Ordering::Relaxed) {
                     return false;
@@ -535,20 +524,15 @@ impl LiveSendWorker {
                 still_owner
             };
 
-            // Block (up to a heartbeat) for the first message, then drain
-            // anything else that piled up. The drain plus `coalesce` collapses
-            // paste-bursts and held-key autorepeat into one fork per literal
-            // run, so typing a long sentence costs one `tmux send-keys -l`
-            // invocation, not one per character.
+            // Block (up to a heartbeat) for the first message, then drain what piled up.
+            // The drain plus `coalesce` collapses paste bursts and autorepeat into one
+            // fork per literal run.
             //
-            // Owner bookkeeping stays OFF the keystroke critical path: a
-            // steal is ~5 tmux forks (3-13ms each on macOS) and used to run
-            // ahead of every batch's byte write, which made typing in live
-            // mode measurably laggier than a direct tmux attach. Keystrokes
-            // never read the size lock, so they dispatch first and ownership
-            // is re-asserted at most once per heartbeat afterwards. Resize
-            // batches are the exception: geometry must not race another
-            // owner's grid, so they keep the steal-before-dispatch ordering.
+            // Owner bookkeeping stays off the keystroke path: a steal is ~5 tmux forks and
+            // running it ahead of every batch made typing measurably laggier than a direct
+            // attach. Keystrokes never read the size lock, so they dispatch first and
+            // ownership is re-asserted at most once per heartbeat. Resize batches keep the
+            // steal-before-dispatch ordering, since geometry must not race another grid.
             let mut last_owner_maintenance = std::time::Instant::now();
             // The sender may be revoked while a batch is queued.
             // The dispatch path checks again before every fork.
@@ -562,20 +546,17 @@ impl LiveSendWorker {
                         while let Ok(msg) = rx.try_recv() {
                             batch.push(msg);
                         }
-                        // Geometry must not race another owner's grid, so a
-                        // batch carrying a resize VERIFIES ownership first;
-                        // plain keystrokes never read the lock.
+                        // A batch carrying a resize verifies ownership first; plain
+                        // keystrokes never read the lock.
                         let mut resize_unverified = false;
                         if batch_needs_owner_first(&batch) {
                             if !owned {
-                                // Entry steal failed. Claim rather than steal:
-                                // a vacant, stale, or already-ours lock still
-                                // gets taken (the slow-to-appear pane case),
-                                // but a live holder means another surface won
-                                // the lock and must not be stomped. Re-forcing
-                                // here would fight a takeover the entry race
-                                // makes indistinguishable from a missing pane,
-                                // and would never flag the loss.
+                                // Entry steal failed, so claim rather than steal: a
+                                // vacant, stale or already-ours lock is still taken (the
+                                // slow-to-appear pane), while a live holder means another
+                                // surface won and must not be stomped. Re-forcing would
+                                // fight a takeover the entry race makes indistinguishable
+                                // from a missing pane, and would never flag the loss.
                                 owned = session
                                     .claim_size_owner(&owner_id, crate::tmux::SIZE_OWNER_TTL);
                                 if !owned {
@@ -595,9 +576,9 @@ impl LiveSendWorker {
                         }
                         let lock_lost = thread_lock_lost.load(Ordering::Relaxed);
                         if !resize_dispatch_authorized(owned, lock_lost) {
-                            // A resize without verified ownership could stomp
-                            // another surface's grid. Keys remain independent
-                            // of the size lock and still deliver in order.
+                            // A resize without verified ownership could stomp another
+                            // surface's grid; keys stay independent of the lock and still
+                            // deliver in order.
                             batch.retain(|m| !matches!(m, WorkerMsg::Resize { .. }));
                             if resize_unverified {
                                 thread_resize_failed.store(true, Ordering::Relaxed);
@@ -626,10 +607,9 @@ impl LiveSendWorker {
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        // Idle heartbeat. A failed refresh here is usually
-                        // the earliest takeover signal (the web steals while
-                        // the desktop sits idle); `maintain` flags it so the
-                        // UI can exit live mode without waiting for input.
+                        // Idle heartbeat: a failed refresh here is usually the earliest
+                        // takeover signal (the web steals while the desktop sits idle), so
+                        // `maintain` flags it and the UI exits without waiting for input.
                         if maintain(owned) {
                             last_owner_maintenance = std::time::Instant::now();
                         }
@@ -670,10 +650,8 @@ impl LiveSendWorker {
     /// `tmux send-keys` fork happens on the worker thread, so the UI
     /// never blocks on tmux latency.
     pub(super) fn send(&self, key: TmuxKey) {
-        // Channel send only fails if the worker thread panicked. Drop
-        // silently rather than spam logs: the user's next exit attempt
-        // (Ctrl+q) will clear the dead worker and we'll spawn a fresh
-        // one on the next live-send entry.
+        // A send only fails if the worker thread panicked. Drop silently: the user's next
+        // exit clears the dead worker and the next entry spawns a fresh one.
         let _ = self.tx.send(WorkerMsg::Send(key));
     }
 
@@ -1191,11 +1169,10 @@ fn capture_composited_over_grid(
             .capture_window_layout_with_deadline(pane_count, deadline)
         {
             Some(layout) => *state.layout = Some((std::time::Instant::now(), layout)),
-            // The window is no longer the one these rectangles describe. Drop
-            // them rather than compositing a pane that is gone, force a count
-            // re-probe on the next cycle, and let the fallback below carry this
-            // frame: it probes `window_panes` in the same fork as its capture,
-            // so it is correct no matter how stale the count had become.
+            // The window is no longer the one these rectangles describe: drop them rather
+            // than composite a pane that is gone, force a count re-probe, and let the
+            // fallback carry this frame, since it probes `window_panes` in the same fork as
+            // its capture.
             None => {
                 *state.layout = None;
                 *state.last_pane_probe = None;
@@ -1220,17 +1197,16 @@ fn capture_composited_over_grid(
         return capture_composited(name, lines, forward_empty, deadline);
     };
     if sample.incomplete {
-        // Pane 0 is mid-repaint. Splicing it beside panes captured whole tears
-        // the composite, and a `capture-pane` fallback would only fork to read
-        // the same half-drawn cells, so keep the frame the preview has until
-        // the bracket closes or is abandoned.
+        // Pane 0 is mid-repaint. Splicing it beside whole-captured panes tears the
+        // composite, and a `capture-pane` fallback would fork to read the same half-drawn
+        // cells, so keep the frame the preview has until the bracket closes.
         return (None, None);
     }
     let (rows, mut cursor) = (sample.rows, sample.cursor);
 
-    // The sampled cursor stays pane relative after its rows are painted on
-    // the window grid. Rebase only the frame dimensions and carry pane 0's
-    // rectangle so the renderer can add its origin.
+    // The sampled cursor stays pane relative after its rows are painted on the window
+    // grid, so rebase only the frame dimensions and carry pane 0's rectangle for the
+    // renderer to add its origin.
     cursor.pane_height = layout.window_height;
     cursor.pane_width = layout.window_width;
     // A composite carries no scrollback (panes have independent histories), so
@@ -1331,13 +1307,11 @@ impl LiveCaptureWorker {
         let stop = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<ClipboardFrame>>> = Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicU64::new(0));
-        // Spawned enabled; the render reconcile pushes the real
-        // `[tmux] vt_live` value right after spawn (and on every config
-        // refresh), so the worker itself never touches the config file.
+        // Spawned enabled; the render reconcile pushes the real `[tmux] vt_live` value
+        // right after spawn and on every config refresh, so the worker never reads config.
         let vt_enabled = Arc::new(AtomicBool::new(true));
-        // Start disabled until the render reconcile publishes the Clipboard
-        // Pass-through setting, avoiding an observer before configuration is
-        // available for a newly created worker.
+        // Start disabled until the render reconcile publishes the Clipboard Pass-through
+        // setting, so a new worker never runs an observer before it is configured.
         let clipboard_capture_enabled = Arc::new(AtomicBool::new(false));
         let cycles = Arc::new(AtomicU64::new(0));
         let cycles_cell = cycles.clone();
@@ -1363,45 +1337,38 @@ impl LiveCaptureWorker {
             #[cfg(unix)]
             let mut next_authoritative_capture: Option<std::time::Instant> = None;
             let mut last_captured: Option<String> = None;
-            // Budget the currently-held capture was published at. A budget
-            // change alone (scroll depth, viewport resize over a quiet pane)
-            // must republish even when the bytes are identical, or consumers
-            // waiting for a wider/deeper capture stall forever.
+            // Budget the held capture was published at. A budget change alone (scroll
+            // depth, viewport resize over a quiet pane) must republish even when the bytes
+            // are identical, or consumers waiting for a deeper capture stall forever.
             let mut last_published_budget: usize = 0;
             let mut last_published_cursor: Option<crate::tmux::PaneCursor> = None;
             // When the frame that is currently in the mailbox (or the last
             // one consumed) was published, for the inter-publish floor.
             let mut last_published_at: Option<std::time::Instant> = None;
-            // When the current unpublished change first started being held by
-            // the repaint-quiescence debounce, for its latency cap. `None`
-            // whenever nothing is pending. Cleared on publish, on retarget, and
-            // whenever a cycle ends with nothing deferred.
+            // When the current unpublished change first entered the repaint-quiescence
+            // debounce, for its latency cap. `None` whenever nothing is pending; cleared on
+            // publish, on retarget, and when a cycle ends with nothing deferred.
             let mut pending_since: Option<std::time::Instant> = None;
-            // Render the live preview from an in-process vt100 grid fed by
-            // `tmux pipe-pane` (and, on tmux 3.8+, route input back through
-            // the same socket), instead of scraping `capture-pane` and forking
-            // `send-keys` per keystroke. This is the default; the
-            // `[tmux] vt_live` setting turns it off (`vt_enabled_cell`,
-            // re-read every cycle so a settings change applies in place).
-            // When a pane can't arm a VT channel (tmux < 3.4, stopped pane), the
-            // worker also falls back to capture for that pane.
+            // Render the live preview from an in-process vt100 grid fed by `tmux pipe-pane`
+            // (and, on tmux 3.8+, route input back through the same socket) instead of
+            // scraping `capture-pane` and forking `send-keys` per keystroke. Default on;
+            // `[tmux] vt_live` turns it off via `vt_enabled_cell`, re-read every cycle. A
+            // pane that cannot arm a channel falls back to capture.
             #[cfg(unix)]
             let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
-            // Terminal snapshots do not include raw OSC 52 escapes. When VT is
-            // intentionally off for a terminal pane, this observer restores
-            // clipboard forwarding without constructing a grid or seed.
+            // Terminal snapshots carry no raw OSC 52 escapes, so when VT is off for a
+            // terminal pane this observer restores clipboard forwarding without building a
+            // grid or seed.
             #[cfg(unix)]
             let mut osc52_source: Option<
                 std::sync::Arc<crate::tmux::vt::Osc52Channel>,
             > = None;
             #[cfg(unix)]
             let mut osc52_seen = 0;
-            // When the last arm attempt for the current target ran, so a
-            // failure (or a channel death: pane killed and the tmux session
-            // recreated under the same name, e.g. a session restart) retries
-            // on a throttle instead of either re-arming every 25ms tick or
-            // latching onto the capture fallback until the user switches
-            // panes. Reset on target change so a new pane arms once settled.
+            // When the last arm attempt for this target ran, so a failure or a channel
+            // death (the pane killed and its tmux session recreated under the same name)
+            // retries on a throttle instead of re-arming every tick or latching onto the
+            // capture fallback until the user switches panes. Reset on target change.
             #[cfg(unix)]
             let mut last_vt_arm: Option<std::time::Instant> = None;
             #[cfg(unix)]
@@ -1419,18 +1386,15 @@ impl LiveCaptureWorker {
             // When the current target was first seen, until its first frame
             // publishes; traces the retarget-to-first-frame interval.
             let mut retarget_seen: Option<std::time::Instant> = None;
-            // Panes in the target window, refreshed on the lazy
-            // `PANE_COUNT_PROBE_MS` cadence. The seed only covers the window
-            // between arming and the first probe, which runs on the first cycle
-            // (`last_pane_probe` starts unset), so an already-split window
-            // composites immediately rather than showing one pane first. Reset on
-            // retarget so a probe runs for the new pane.
+            // Panes in the target window, refreshed on the lazy `PANE_COUNT_PROBE_MS`
+            // cadence. The seed only covers the gap before the first probe, which runs on
+            // the first cycle, so an already-split window composites immediately. Reset on
+            // retarget.
             let mut pane_count: u16 = 1;
             let mut last_pane_probe: Option<std::time::Instant> = None;
-            // Window geometry plus the captured rows of every pane, reused
-            // across frames while pane 0 is re-rendered from its VT grid.
-            // Dropped on retarget and whenever the pane count changes, since
-            // the cached rectangles then describe a layout that is gone.
+            // Window geometry plus every pane's captured rows, reused across frames while
+            // pane 0 re-renders from its VT grid. Dropped on retarget and on any pane-count
+            // change, since the cached rectangles then describe a layout that is gone.
             let mut composite_layout: Option<(
                 std::time::Instant,
                 crate::tmux::composite::WindowLayout,
@@ -1445,16 +1409,13 @@ impl LiveCaptureWorker {
                     .ok()
                     .map(|g| g.clone())
                     .unwrap_or_default();
-                // How long a change deferred this iteration must wait before
-                // re-checking (the sooner of the publish-floor and debounce
-                // remainders). `Some` shrinks the wait below so the held frame
-                // goes out as soon as its blockers reopen; `None` means nothing
-                // was deferred.
+                // How long a change deferred this iteration must wait before re-checking
+                // (the sooner of the publish-floor and debounce remainders). `Some` shrinks
+                // the wait below so the held frame goes out as its blockers reopen.
                 let mut defer_wait_ms: Option<u64> = None;
-                // The generation this cycle's frames belong to. Read once per
-                // cycle so a mid-fork retarget is caught by the still_current
-                // recheck below, and a frame that slips past it still carries
-                // the old generation for the consumer to drop.
+                // The generation this cycle's frames belong to, read once per cycle so a
+                // mid-fork retarget is caught by the still_current recheck and a frame that
+                // slips past still carries the old generation for the consumer to drop.
                 let generation_now = generation_cell.load(Ordering::Relaxed);
                 let command_deadline = crate::tmux::TmuxCommandDeadline::new();
                 // Channels detached this cycle, shut down after its frame.
@@ -1462,9 +1423,8 @@ impl LiveCaptureWorker {
                 let mut stale_vt = Vec::new();
                 #[cfg(unix)]
                 let mut stale_osc52 = Vec::new();
-                // A retarget resets the dedup so the new generation's first
-                // frame always publishes, even in an ABA switch A -> B -> A
-                // that happens entirely between worker cycles and leaves the
+                // A retarget resets the dedup so the new generation's first frame always
+                // publishes, even in an A -> B -> A switch between cycles that leaves the
                 // name unchanged.
                 if capture_target_changed(&last_target, last_generation, &name, generation_now) {
                     last_target = name.clone();
@@ -1478,12 +1438,10 @@ impl LiveCaptureWorker {
                     last_published_at = None;
                     pending_since = None;
                     retarget_seen = Some(std::time::Instant::now());
-                    // Detach the channels armed for the old target (also fires
-                    // on retarget-to-empty); they are shut down after this
-                    // cycle's frame so the teardown fork never precedes the new
-                    // pane's first frame. An arm still in flight is left to
-                    // finish; its result carries the old generation and is
-                    // dropped on arrival.
+                    // Detach the channels armed for the old target (also on
+                    // retarget-to-empty); they shut down after this cycle's frame so the
+                    // teardown fork never precedes the new pane's first frame. An arm still
+                    // in flight finishes and is dropped on arrival by its generation.
                     #[cfg(unix)]
                     {
                         stale_vt.extend(vt_source.take());
@@ -1504,9 +1462,9 @@ impl LiveCaptureWorker {
                 if let Some(v) =
                     PendingArm::take(&mut pending_vt_arm, generation_now, &mut stale_vt)
                 {
-                    // Event-driven echo: the channel pokes our nudge condvar
-                    // on every grid change, so the wait below ends the moment
-                    // output lands instead of after a poll interval.
+                    // Event-driven echo: the channel pokes the nudge condvar on every grid
+                    // change, so the wait below ends as output lands rather than after a
+                    // poll interval.
                     v.set_change_wakeup(nudge_thread.clone());
                     next_authoritative_capture =
                         Some(std::time::Instant::now() + AUTHORITATIVE_CAPTURE_INTERVAL);
@@ -1519,10 +1477,9 @@ impl LiveCaptureWorker {
                     osc52_seen = source.clipboard_sequence();
                     osc52_source = Some(source);
                 }
-                // `[tmux] vt_live`, re-read every cycle. Toggling off while a
-                // channel is armed tears it down (disabling its `pipe-pane`);
-                // resetting the arm latch lets a later re-enable arm afresh
-                // for the same target instead of waiting for a retarget.
+                // `[tmux] vt_live`, re-read every cycle. Toggling off tears down an armed
+                // channel, and resetting the arm latch lets a later re-enable arm afresh for
+                // the same target instead of waiting for a retarget.
                 #[cfg(unix)]
                 let vt_enabled = !scripted_capture && vt_enabled_cell.load(Ordering::Relaxed);
                 #[cfg(unix)]
@@ -1544,9 +1501,8 @@ impl LiveCaptureWorker {
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty_policy = forward_empty_cell.load(Ordering::Relaxed);
-                    // Keep a lazy count of the target window's panes so a
-                    // hand-made split stops being invisible. One tiny fork
-                    // every couple of seconds on the single previewed pane.
+                    // Keep a lazy count of the target window's panes so a hand-made split
+                    // stops being invisible: one tiny fork every couple of seconds.
                     if !scripted_capture
                         && last_pane_probe.is_none_or(|t| {
                             t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
@@ -1561,15 +1517,13 @@ impl LiveCaptureWorker {
                             pane_count = seen;
                         }
                     }
-                    // A split window renders through the compositor in BOTH
-                    // passive and live mode. With a VT channel armed the split
-                    // costs no more per frame than an unsplit session: pane 0
-                    // still comes from the grid, and only the panes beside it
-                    // are re-captured, on their own slower cadence.
+                    // A split window renders through the compositor in both passive and
+                    // live mode. With a VT channel armed it costs no more per frame than an
+                    // unsplit session: pane 0 still comes from the grid, and only the panes
+                    // beside it are re-captured, on their own cadence.
                     let composite = pane_count > 1;
-                    // An OSC 52 clipboard write the displayed pane emitted
-                    // since the last cycle. Published below under the same
-                    // retarget guard as the cursor.
+                    // An OSC 52 clipboard write the displayed pane emitted since the last
+                    // cycle, published below under the same retarget guard as the cursor.
                     #[cfg(unix)]
                     let observe_osc52 =
                         !vt_enabled && forward_empty_policy && clipboard_capture_enabled;
@@ -1610,18 +1564,15 @@ impl LiveCaptureWorker {
                     });
                     #[cfg(not(unix))]
                     let clipboard_now: Option<String> = None;
-                    // Acquire one frame + cursor. Default: sample the in-process
-                    // vt100 grid, arming a `pipe-pane` channel once the
-                    // selection rests on this target (cursor and alt/mouse
-                    // flags come authoritatively from the grid). Until it is
-                    // armed, or if arming fails (tmux too old, stopped pane),
-                    // one `capture-pane` fork serves this pane, and a failure
-                    // retries on the `VT_REARM_INTERVAL` throttle.
-                    // Capture-path policy: outside live-send, empty captures
-                    // are FORWARDED (a missing or killed pane must surface
-                    // as "No output available", not stale bytes); during
-                    // live-send the #1501 kill switch preserves the
-                    // last-good frame against transient tmux errors.
+                    // Acquire one frame plus cursor. By default sample the in-process
+                    // vt100 grid, arming a `pipe-pane` channel once the selection rests on
+                    // this target (cursor and alt/mouse flags come authoritatively from the
+                    // grid). Until armed, or if arming fails, one `capture-pane` fork serves
+                    // the pane and retries on the `VT_REARM_INTERVAL` throttle.
+                    // Capture-path policy: outside live-send an empty capture is forwarded,
+                    // so a killed pane surfaces as "No output available" rather than stale
+                    // bytes; during live-send the #1501 kill switch preserves the last-good
+                    // frame against transient tmux errors.
                     let forward_empty = forward_empty_policy || !live_cell.load(Ordering::Relaxed);
                     #[cfg(test)]
                     let capture_override = test_capture.as_mut().map(|capture| capture());
@@ -1648,12 +1599,10 @@ impl LiveCaptureWorker {
                                 crate::tmux::vt::VtChannel::acquire_with_deadline,
                             ));
                         }
-                        // A channel whose forwarder has disconnected stops
-                        // updating its grid; drop it and fall back to capture
-                        // for this pane. The arm throttle above then re-arms
-                        // after `VT_REARM_INTERVAL` (a session restart reuses
-                        // the tmux name, so the pane usually comes back)
-                        // without thrashing on a permanently broken pane.
+                        // A channel whose forwarder disconnected stops updating its grid,
+                        // so drop it and fall back to capture for this pane; the throttle
+                        // re-arms after `VT_REARM_INTERVAL` (a session restart reuses the
+                        // name) without thrashing on a permanently broken pane.
                         if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
                             shutdown_vt_source(&mut vt_source, &command_deadline);
                             next_authoritative_capture = None;
@@ -1697,10 +1646,9 @@ impl LiveCaptureWorker {
                                     )
                                 } else {
                                     let sample = v.sample_with_deadline(lines, &command_deadline);
-                                    // A half-drawn synchronized-output frame is
-                                    // not published: the bracket closing (or
-                                    // abandoning) brings a whole one, and the
-                                    // preview keeps the last frame until then.
+                                    // A half-drawn synchronized-output frame is not
+                                    // published: the bracket closing brings a whole one and
+                                    // the preview keeps the last frame until then.
                                     if sample.incomplete {
                                         (None, None)
                                     } else {
@@ -1730,25 +1678,22 @@ impl LiveCaptureWorker {
                     } else {
                         capture_via_tmux(&name, lines, forward_empty, &command_deadline)
                     };
-                    // Chunk-arrival timing for the repaint-quiescence debounce,
-                    // only when sampling a live VT grid. `None` on the
-                    // capture-pane fallback and non-unix, which leaves pacing to
-                    // the publish floor alone.
+                    // Chunk-arrival timing for the repaint-quiescence debounce, only while
+                    // sampling a live VT grid; `None` on the capture fallback and non-unix,
+                    // which leaves pacing to the publish floor.
                     #[cfg(unix)]
                     let vt_timing = vt_source.as_ref().and_then(|v| v.chunk_timing());
                     #[cfg(not(unix))]
                     let vt_timing: Option<(u64, u64)> = None;
-                    // Recheck the target once for both publishes: a retarget
-                    // mid-fork means these bytes (and this cursor) belong to
-                    // the old pane and must not land under the new view.
-                    // `set_target` also clears the mailbox, but the fork may
-                    // have started before that switch.
+                    // Recheck the target once for both publishes: a retarget mid-fork means
+                    // these bytes belong to the old pane. `set_target` also clears the
+                    // mailbox, but the fork may have started before that switch.
                     let still_current = target_cell.lock().ok().is_some_and(|g| *g == name)
                         && generation_cell.load(Ordering::Relaxed) == generation_now;
-                    // Publish an agent clipboard write and wake the render loop
-                    // even if the frame dedups, fails, or is withheld as half
-                    // drawn: the read above already consumed it, and this tap is
-                    // the only path an agent's copy has to the host (#2420).
+                    // Publish an agent clipboard write and wake the render loop even if the
+                    // frame dedups, fails or is withheld as half drawn: the read above
+                    // already consumed it, and this tap is the agent's only path to the host
+                    // clipboard (#2420).
                     if still_current {
                         if let Some(text) = clipboard_now {
                             if let Ok(mut guard) = clipboard_cell.lock() {
@@ -1762,17 +1707,14 @@ impl LiveCaptureWorker {
                         }
                     }
                     if let Some(content) = capture {
-                        // Skip unchanged frames (no point waking a re-parse).
-                        // Empties are skipped too unless this pane forwards
-                        // them; only changed captures reach (and wake) the
-                        // render loop, so an idle pane never repaints.
+                        // Skip unchanged frames, and empties unless this pane forwards
+                        // them, so only changed captures wake the render loop and an idle
+                        // pane never repaints.
                         let changed = last_captured.as_deref() != Some(content.as_str());
 
                         if still_current {
-                            // A budget change alone (deeper scroll, viewport
-                            // resize over a quiet pane) must republish even
-                            // when the bytes are identical, or consumers
-                            // waiting for a wider/deeper capture stall.
+                            // A budget change alone must republish even when the bytes are
+                            // identical, or consumers waiting for a deeper capture stall.
                             if (forward_empty || !content.is_empty())
                                 && frame_needs_publish(
                                     changed,
@@ -1784,13 +1726,11 @@ impl LiveCaptureWorker {
                                 let since =
                                     last_published_at.map(|t| t.elapsed().as_millis() as u64);
                                 let floor = publish_floor_wait_ms(since);
-                                // Repaint-quiescence debounce (VT path only):
-                                // hold a changed frame while output streams in
-                                // back-to-back chunks so a multi-chunk
-                                // clear-then-reprint publishes once it settles,
-                                // not mid-repaint (#2903). A lone chunk (a
-                                // keystroke echo) reports not-streaming and
-                                // never waits, preserving the #2822 echo path.
+                                // Repaint-quiescence debounce (VT path only): hold a
+                                // changed frame while output streams back-to-back so a
+                                // multi-chunk clear-then-reprint publishes once settled
+                                // (#2903). A lone chunk reports not-streaming and never
+                                // waits, preserving the #2822 echo path.
                                 let debounce = match vt_timing {
                                     Some((since_last_chunk, gap)) => {
                                         let streaming = gap < SAMPLE_QUIESCENCE_MS;
@@ -1826,10 +1766,9 @@ impl LiveCaptureWorker {
                                     }
                                     wake.notify_one();
                                 } else {
-                                    // Held by the floor and/or the debounce:
-                                    // defer, don't drop. `last_captured` stays
-                                    // stale so the next cycle re-detects this
-                                    // frame and publishes it once both reopen.
+                                    // Held by the floor or the debounce: defer, don't
+                                    // drop. `last_captured` stays stale so the next cycle
+                                    // re-detects this frame and publishes it.
                                     if pending_since.is_none() {
                                         pending_since = Some(std::time::Instant::now());
                                     }
@@ -1853,13 +1792,11 @@ impl LiveCaptureWorker {
                         shutdown_osc52_source(&mut Some(channel), &command_deadline);
                     }
                 }
-                // Nothing deferred this cycle means no frame is being held, so
-                // clear the debounce hold and let the next repaint's latency cap
-                // start fresh. Covers both a publish (already cleared above) and
-                // a mid-repaint change that evaporated back to the last
-                // published content without ever publishing, which would
-                // otherwise leave a stale `pending_since` that makes the next
-                // repaint hit the cap immediately and skip the debounce.
+                // Nothing deferred means no frame is held, so clear the debounce hold and
+                // let the next repaint's latency cap start fresh. Covers a mid-repaint
+                // change that evaporated back to the published content without publishing,
+                // which would leave a stale `pending_since` that makes the next repaint hit
+                // the cap immediately and skip the debounce.
                 if defer_wait_ms.is_none() {
                     pending_since = None;
                 }
@@ -1872,22 +1809,17 @@ impl LiveCaptureWorker {
                         let _ = done.send((generation_now, lines));
                     }
                 }
-                // Interruptible wait: `set_live` / `set_target` notify the
-                // condvar so a cadence or target change is picked up at once
-                // rather than after the current sleep, and on the VT path the
-                // channel's reader thread notifies it on every grid change,
-                // so fresh output samples immediately instead of waiting out
-                // the interval. A generation under the condvar mutex preserves
-                // a wake that arrives before this thread parks; multiple wakes
-                // may coalesce into one extra cycle, which dedup makes harmless.
+                // Interruptible wait: `set_live` / `set_target` notify the condvar so a
+                // cadence or target change is picked up at once, and on the VT path the
+                // channel's reader notifies on every grid change, so fresh output samples
+                // immediately. A generation under the condvar mutex preserves a wake that
+                // arrives before this thread parks; coalesced wakes cost one extra cycle,
+                // which dedup makes harmless.
                 //
-                // A live in-process vt channel samples the grid cheaply (no
-                // `capture-pane` fork) and dedups unchanged frames, so the idle
-                // throttle buys nothing there: pace it fast so the PREVIEWED
-                // pane scrolls / streams as smoothly as the active live pane,
-                // even when it isn't the live-send target. The idle cadence
-                // still governs the capture-pane fallback, whose every sample is
-                // an expensive fork.
+                // A live vt channel samples the grid cheaply and dedups unchanged frames, so
+                // the idle throttle buys nothing there: pace it fast so the previewed pane
+                // streams as smoothly as the live one. The idle cadence still governs the
+                // capture-pane fallback, where every sample is a fork.
                 #[cfg(unix)]
                 let vt_active = vt_source.as_ref().is_some_and(|v| v.is_alive());
                 #[cfg(not(unix))]
@@ -2030,10 +1962,9 @@ impl LiveCaptureWorker {
         let changed = if let Ok(mut guard) = self.target.lock() {
             if *guard != name {
                 *guard = name;
-                // Invalidate every frame the in-flight cycle might publish:
-                // it tagged its frames with the old generation, so even a
-                // frame that slips past the mailbox clear is dropped by
-                // `frame_is_current`.
+                // Invalidate every frame the in-flight cycle might publish: it tagged them
+                // with the old generation, so even one that slips past the mailbox clear is
+                // dropped by `frame_is_current`.
                 self.generation
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut latest) = self.latest.lock() {
@@ -2074,9 +2005,8 @@ impl LiveCaptureWorker {
             .swap(ms, std::sync::atomic::Ordering::Relaxed);
         self.live.store(live, std::sync::atomic::Ordering::Relaxed);
         if prev != ms {
-            // Apply the new cadence now: a mid-idle-sleep worker would
-            // otherwise keep the old (up to 250ms) interval for one cycle,
-            // lagging the first live capture on live-send entry.
+            // Apply the new cadence now: a mid-idle-sleep worker would keep the old
+            // interval for a cycle and lag the first live capture on entry.
             self.nudge();
         }
     }
@@ -2236,9 +2166,9 @@ fn dispatch_batch(
     lease: &crate::tui::session_feed::NativeLease,
 ) -> ResizeDispatchResult {
     let actions = coalesce(batch);
-    // A Paste can only go through tmux (paste-buffer -p decides whether the
-    // pane gets bracketed-paste markers), so pin the whole mixed batch to tmux
-    // and preserve one ordered writer for the pty.
+    // A Paste can only go through tmux (`paste-buffer -p` decides whether the pane gets
+    // bracketed-paste markers), so pin the whole mixed batch to tmux and keep one ordered
+    // writer for the pty.
     let force_tmux = actions.iter().any(|a| matches!(a, TmuxAction::Paste(_)));
     let mut resize_result = ResizeDispatchResult::None;
     for action in actions {
@@ -2276,29 +2206,20 @@ fn dispatch_via_fork(
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
 
-    // Fast path (`[tmux] vt_live`): when a *live* input channel is armed for this
-    // pane, ALL pane input goes through the socket, never `send-keys`. This is a
-    // single-writer invariant: mixing the socket and `send-keys` would interleave
-    // two writers on the one pty input stream and can corrupt multi-byte
-    // sequences (tmux pipe-pane -I shares the input stream with no arbitration).
-    // `input_mode` returns `Some` only while the forwarder is connected, so a
-    // not-yet-connected or dead channel reports `None` and input falls through
-    // to the `send-keys` fork below instead of vanishing. Keys are encoded to
-    // bytes here using the pane's cursor-key mode (DECCKM) from the grid, since
-    // we bypass tmux's own key translation. `Resize` is not pane input (it's
-    // `resize-window`), so it still forks below.
+    // Fast path (`[tmux] vt_live`): while a live input channel is armed for this pane, all
+    // pane input goes through the socket and none through `send-keys`. Mixing the two would
+    // interleave writers on one pty input stream and can corrupt multi-byte sequences, as
+    // `pipe-pane -I` arbitrates nothing. `input_mode` returns `Some` only while the
+    // forwarder is connected, so a dead or not-yet-connected channel falls through to the
+    // fork below instead of vanishing. Keys are encoded here against the pane's DECCKM from
+    // the grid, since tmux's own translation is bypassed. `Resize` is not pane input.
     //
-    // The invariant only forbids *concurrent* writers, not a sequential
-    // fallback. `try_send_input`'s `write_all` on a blocking `UnixStream` fails
-    // only on a broken pipe / EOF, never a transient WouldBlock, so `false`
-    // reliably means the forwarder already died between the `input_mode` check
-    // above and this write (a TOCTOU race), not that it's merely busy. At that
-    // point the socket has no live writer left, so forking `send-keys` for this
-    // one action is safe and delivers the keystroke instead of dropping it
-    // silently. An empty-bytes encoding (a key we can't represent while the
-    // channel is genuinely alive) still drops without forking: there is no
-    // failure to prove the writer is dead, so falling back here could race a
-    // still-live socket writer.
+    // The invariant forbids concurrent writers, not a sequential fallback:
+    // `try_send_input`'s `write_all` on a blocking `UnixStream` fails only on a broken pipe,
+    // never a transient WouldBlock, so `false` means the forwarder died between the
+    // `input_mode` check and this write, leaving no live writer and making the fork safe. An
+    // empty-bytes encoding still drops without forking: nothing proves the writer is dead,
+    // so falling back could race a live socket writer.
     #[cfg(unix)]
     if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name).filter(|_| !force_tmux) {
         if !matches!(action, TmuxAction::Resize { .. } | TmuxAction::Paste(_)) {
@@ -2324,15 +2245,10 @@ fn dispatch_via_fork(
     cmd.stderr(Stdio::null());
     match action {
         TmuxAction::Literal(s) => {
-            // tmux's command parser treats a trailing `;` in a
-            // `send-keys -l` payload as a command separator and silently
-            // drops it, even after the `--` end-of-options marker, so a
-            // lone or trailing semicolon never reaches the pane (#1942).
-            // Peel the trailing semicolons off and deliver them as raw
-            // hex bytes (`-H 3b`), which tmux passes through verbatim;
-            // the remaining head still rides the literal path. Embedded
-            // and leading semicolons survive `-l` fine, so only the
-            // trailing run needs the hex detour.
+            // tmux's command parser reads a trailing `;` in a `send-keys -l` payload as a
+            // command separator and drops it, even after `--`, so it never reaches the pane
+            // (#1942). Peel the trailing semicolons and send them as raw hex (`-H 3b`),
+            // which tmux passes through verbatim; embedded and leading ones survive `-l`.
             let (head, semis) = crate::tmux::peel_trailing_semicolons(s);
             if semis > 0 {
                 if !head.is_empty() {
@@ -2341,41 +2257,35 @@ fn dispatch_via_fork(
                 return crate::tmux::Session::from_name(tmux_name)
                     .send_raw_bytes(&vec![0x3b; semis]);
             }
-            // `-l --` mirrors `send_literal_no_enter`: literal-mode
-            // send, followed by the end-of-options marker so a payload
-            // starting with `-` isn't reparsed as a flag.
+            // `-l --` mirrors `send_literal_no_enter`: a literal send plus the
+            // end-of-options marker, so a payload starting with `-` isn't read as a flag.
             cmd.args(["send-keys", "-t", &target, "-l", "--", s.as_str()]);
         }
         TmuxAction::Named(name) => {
             cmd.args(["send-keys", "-t", &target, name.as_str()]);
         }
         TmuxAction::NamedRepeat { name, count } => {
-            // `-N <count>` repeats the key `count` times in one fork. tmux
-            // renders each press in the pane's current cursor-key mode, so
-            // the wheel-forward arrows honor DECCKM just like a single
-            // `Named` does.
+            // `-N <count>` repeats the key in one fork. tmux renders each press in the
+            // pane's current cursor-key mode, so wheel-forward arrows honor DECCKM.
             let count = count.to_string();
             cmd.args(["send-keys", "-t", &target, "-N", &count, name.as_str()]);
         }
         TmuxAction::HexBytes(bytes) => {
-            // `-H` sends each subsequent arg as the hex byte value of an
-            // ASCII character. We use this for control bytes (CR, TAB,
-            // ESC) and the bracketed-paste markers, none of which can
-            // ride a `-l` payload safely. Chunking against ARG_MAX and
-            // the per-byte hex encoding live in the shared tmux layer
-            // (the web live view's input path uses the same fn).
+            // `-H` sends each arg as the hex value of an ASCII character, used for control
+            // bytes (CR, TAB, ESC) and the bracketed-paste markers, none of which ride a
+            // `-l` payload safely. ARG_MAX chunking and the hex encoding live in the shared
+            // tmux layer, which the web live view's input path also uses.
             return crate::tmux::Session::from_name(tmux_name).send_raw_bytes(bytes);
         }
         TmuxAction::Paste(text) => {
-            // tmux emits the bracketed-paste markers only if the program in
-            // the pane set DECSET 2004, so a raw shell or a SQL REPL gets
-            // clean text instead of literal `00~` / `01~` leftovers.
+            // tmux emits the bracketed-paste markers only when the program set DECSET
+            // 2004, so a raw shell gets clean text instead of literal `00~` / `01~`.
             return crate::tmux::Session::from_name(tmux_name).paste_text(text);
         }
         TmuxAction::Resize { cols, rows } => {
-            // Ownership is checked by tmux in the same command queue as the
-            // resize. The worker's earlier heartbeat check only filters stale
-            // batches; it cannot authorize a later subprocess safely.
+            // tmux checks ownership in the same command queue as the resize; the worker's
+            // earlier heartbeat check only filters stale batches and cannot authorize a
+            // later subprocess.
             let owner = resize_owner
                 .ok_or_else(|| anyhow::anyhow!("live-send resize has no owner token"))?;
             if !crate::tmux::Session::from_name(tmux_name)
@@ -2482,11 +2392,10 @@ fn encode_named_key(name: &str, app_cursor: bool) -> Vec<u8> {
         };
     }
 
-    // Editing block (CSI n ~), modifier as `;modp`. Not affected by DECCKM.
-    // `PageUp`/`PageDown` are accepted alongside the tmux `PPage`/`NPage`
-    // names: the wheel- and edge-autoscroll page-forward paths emit the former
-    // (tmux `send-keys` takes both), and without the alias those keys would
-    // encode to nothing and be dropped on the VT input path.
+    // Editing block (CSI n ~), modifier as `;modp`, unaffected by DECCKM.
+    // `PageUp`/`PageDown` are accepted alongside tmux's `PPage`/`NPage` because the wheel
+    // and edge-autoscroll paths emit the former; without the alias those keys would encode
+    // to nothing on the VT input path.
     if let Some(n) = match base {
         "IC" => Some(2),
         "DC" => Some(3),
@@ -2546,9 +2455,9 @@ fn encode_named_key(name: &str, app_cursor: bool) -> Vec<u8> {
             }
         }
         _ => {
-            // Single char: `C-<letter>` -> C0 control byte; otherwise the char,
-            // ESC-prefixed for Alt. (Shift never reaches here: plain chars are
-            // sent literally with case already applied.)
+            // Single char: `C-<letter>` becomes a C0 control byte, otherwise the char,
+            // ESC-prefixed for Alt. Shift never reaches here, since plain chars are sent
+            // literally with case applied.
             let b = base.as_bytes();
             if b.len() == 1 {
                 let c = b[0];
@@ -2684,11 +2593,10 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         TmuxKey::HexBytes(bytes) => TmuxAction::HexBytes(bytes),
         TmuxKey::Paste(text) => TmuxAction::Paste(text),
     };
-    // `Builder::spawn` returns the OS error instead of panicking (`spawn`
-    // panics if the OS refuses a new thread), so a thread-creation failure
-    // under load can't take down the UI thread we're called from. The slot is
-    // released by the `OneshotSlot` guard inside the closure on completion or
-    // panic; if the spawn never starts, release the reserved slot here.
+    // `Builder::spawn` returns the OS error instead of panicking, so a thread-creation
+    // failure under load can't take down the calling UI thread. The `OneshotSlot` guard
+    // inside the closure releases the slot on completion or panic; a spawn that never
+    // starts releases it here.
     let spawned = std::thread::Builder::new()
         .name("aoe-wheel-forward".to_string())
         .spawn(move || {
@@ -2794,28 +2702,19 @@ pub fn translate(key: KeyEvent) -> LiveDispatch {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-    // Shift+Enter (and only Shift+Enter) becomes ESC+CR, the readline
-    // convention for "meta-Enter = insert newline". Byte-identical to
-    // what tmux emits for the named chord `M-Enter` (the existing
-    // M-Enter test case in `vt_input_encode_tests::simple_keys_and_chords`
-    // asserts the same `\x1b\r`), so agents that accept Alt+Enter as
-    // newline (Claude Code, Codex, opencode, ...) need no further
-    // mapping. Only reachable when DISAMBIGUATE_ESCAPE_CODES is active
-    // on a kitty-protocol-capable terminal (#2362); legacy terminals
-    // still deliver bare Enter and fall through to the named-key path
-    // below. Strict modifier equality keeps the Ctrl+Shift+Enter and
-    // Alt+Shift+Enter chords on the named-key path so future keybinds
-    // can rely on `C-S-Enter` etc. HexBytes is chosen over
-    // `Named("M-Enter")` because it short-circuits tmux chord-name
-    // parsing and matches the byte representation unambiguously across
-    // tmux versions.
+    // Shift+Enter alone becomes ESC+CR, the readline "meta-Enter inserts a newline"
+    // convention and byte-identical to tmux's `M-Enter`, so agents that accept Alt+Enter
+    // need no further mapping. Only reachable under DISAMBIGUATE_ESCAPE_CODES on a
+    // kitty-protocol terminal (#2362); legacy terminals deliver bare Enter and fall through
+    // to the named-key path. Strict modifier equality keeps Ctrl+Shift+Enter and
+    // Alt+Shift+Enter on that path for future keybinds. HexBytes short-circuits tmux
+    // chord-name parsing and matches the byte representation across tmux versions.
     if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT {
         return LiveDispatch::Send(TmuxKey::HexBytes(vec![0x1b, b'\r']));
     }
 
-    // Char path: tmux chord names are case-insensitive for letters and
-    // the case in `Char(c)` already carries Shift, so we drop `S-` here
-    // to avoid double-encoding.
+    // Char path: tmux chord names are case-insensitive for letters and `Char(c)` already
+    // carries Shift, so `S-` is dropped to avoid double-encoding.
     if let KeyCode::Char(c) = key.code {
         if ctrl || alt {
             let p = mod_prefix(ctrl, alt, false);
@@ -2824,9 +2723,8 @@ pub fn translate(key: KeyEvent) -> LiveDispatch {
         return LiveDispatch::Send(TmuxKey::Literal(c.to_string()));
     }
 
-    // Named-key path: Shift IS meaningful (S-Up vs Up for editor text
-    // selection). BackTab is shift+Tab semantically by its own keycode,
-    // so it gets the no-shift prefix.
+    // Named-key path: Shift is meaningful (S-Up vs Up for editor selection). BackTab is
+    // Shift+Tab by its own keycode, so it gets the no-shift prefix.
     let name = match key.code {
         KeyCode::Up => "Up",
         KeyCode::Down => "Down",
@@ -2945,8 +2843,7 @@ mod tests {
         }
     }
 
-    // Exit-chord detection moved out of translate() into
-    // handle_live_send_key. Translate now never emits Exit; the
+    // translate never emits Exit (the chord check lives in handle_live_send_key); the
     // chord-list tests below cover the configurable exit path.
 
     #[test]
@@ -3096,9 +2993,8 @@ mod tests {
 
     #[test]
     fn shift_arrow_chord_uses_s_prefix() {
-        // Editors inside the pane rely on `S-Up` / `S-Down` etc. for
-        // text selection. Without the S- prefix Shift+arrow looks the
-        // same as plain arrow and the editor never sees the modifier.
+        // Editors rely on `S-Up` / `S-Down` for text selection: without the prefix
+        // Shift+arrow looks like a plain arrow and the editor never sees the modifier.
         assert_named(translate(k_mod(KeyCode::Up, KeyModifiers::SHIFT)), "S-Up");
         assert_named(
             translate(k_mod(KeyCode::Home, KeyModifiers::SHIFT)),
@@ -3121,11 +3017,9 @@ mod tests {
 
     #[test]
     fn shift_enter_emits_esc_cr_hex_bytes() {
-        // Shift+Enter on a kitty-protocol-capable terminal lands here
-        // (#2362). The agent in the pane reads ESC+CR as the
-        // readline meta-Enter "insert newline" convention, identical
-        // to how Alt+Enter / M-Enter already works today on terminals
-        // that pre-encode Shift+Enter as ESC+CR (Ghostty default).
+        // Shift+Enter on a kitty-protocol terminal lands here (#2362). The agent reads
+        // ESC+CR as readline's meta-Enter newline, identical to Alt+Enter on terminals that
+        // pre-encode Shift+Enter that way.
         assert_hex(
             translate(k_mod(KeyCode::Enter, KeyModifiers::SHIFT)),
             b"\x1b\r",
@@ -3134,11 +3028,9 @@ mod tests {
 
     #[test]
     fn alt_enter_still_named_m_enter() {
-        // Alt+Enter (legacy path: terminals that pre-encode Shift+Enter
-        // as ESC+CR deliver Enter+ALT) must continue to produce the
-        // named `M-Enter` chord, which tmux expands to ESC+CR. The
-        // kitty-protocol fix adds a parallel path for Shift+Enter; it
-        // must not displace this one.
+        // Alt+Enter (terminals that pre-encode Shift+Enter as ESC+CR deliver Enter+ALT)
+        // must keep producing the named `M-Enter`, which tmux expands to ESC+CR; the
+        // kitty-protocol path must not displace it.
         assert_named(
             translate(k_mod(KeyCode::Enter, KeyModifiers::ALT)),
             "M-Enter",
@@ -3147,9 +3039,8 @@ mod tests {
 
     #[test]
     fn ctrl_shift_enter_falls_through_to_named() {
-        // Strict modifier equality means C-S-Enter does NOT hit the
-        // HexBytes arm; it stays on the named-key path so a future
-        // keybind can target `C-S-Enter` distinctly from Shift+Enter.
+        // Strict modifier equality keeps C-S-Enter off the HexBytes arm and on the
+        // named-key path, so a future keybind can target it distinctly.
         assert_named(
             translate(k_mod(
                 KeyCode::Enter,
@@ -3161,10 +3052,8 @@ mod tests {
 
     #[test]
     fn alt_shift_enter_falls_through_to_named() {
-        // Symmetric to `ctrl_shift_enter_falls_through_to_named`: any
-        // modifier set beyond SHIFT alone is rejected by strict equality
-        // and falls through to the named-key path so a future keybind
-        // can target `M-S-Enter` distinctly from plain Shift+Enter.
+        // Symmetric to `ctrl_shift_enter_falls_through_to_named`: any modifier beyond
+        // SHIFT alone falls through to the named-key path, so `M-S-Enter` stays targetable.
         assert_named(
             translate(k_mod(
                 KeyCode::Enter,
@@ -3297,10 +3186,8 @@ mod tests {
 
     #[test]
     fn coalesce_resize_breaks_literal_run() {
-        // A pane resize sandwiched between keystrokes must dispatch in
-        // order so the agent renders the trailing keys at the new
-        // geometry (relevant for any agent using cursor-position
-        // escapes or column-aware wrapping).
+        // A resize sandwiched between keystrokes must dispatch in order, so the agent
+        // renders the trailing keys at the new geometry.
         let out = coalesce(vec![
             snd_lit("a"),
             snd_lit("b"),
@@ -3325,12 +3212,9 @@ mod tests {
 
     #[test]
     fn coalesce_paste_breaks_literal_run_and_never_merges() {
-        // A paste must stay its own action: folding it into a
-        // neighbouring literal run would put the payload back on the
-        // `send-keys` path, where tmux never gets to decide about the
-        // bracketed-paste markers (the `00~` / `01~` bug), and would
-        // also drop the #1546 one-paste framing for agents that DO set
-        // DECSET 2004. Ordering across the batch has to survive too.
+        // A paste must stay its own action: folding it into a literal run would put the
+        // payload back on the `send-keys` path, where tmux never decides about the
+        // bracketed-paste markers, and would drop the #1546 one-paste framing.
         let out = coalesce(vec![
             snd_lit("a"),
             snd_lit("b"),
@@ -3357,9 +3241,8 @@ mod tests {
 
     #[test]
     fn plain_q_is_literal_not_exit() {
-        // Without Ctrl, `q` is just a letter the user wants to send.
-        // translate doesn't decide exit any more, but this still
-        // verifies the passthrough.
+        // Without Ctrl, `q` is just a letter to send; translate no longer decides exit, but
+        // the passthrough still needs a guard.
         assert_literal(translate(k(KeyCode::Char('q'))), "q");
         assert_literal(translate(k(KeyCode::Char('Q'))), "Q");
     }
@@ -3662,9 +3545,8 @@ mod tests {
     }
     #[test]
     fn publish_floor_first_change_after_quiet_publishes_immediately() {
-        // The typed-echo case: no prior publish (or one long past) must never
-        // wait. Reintroducing a wait here re-creates the live-mode echo lag
-        // the event-driven wakeup exists to kill.
+        // The typed-echo case: no prior publish, or one long past, must never wait, or the
+        // live-mode echo lag the event-driven wakeup kills comes back.
         assert_eq!(publish_floor_wait_ms(None), 0);
         assert_eq!(
             publish_floor_wait_ms(Some(LIVE_CAPTURE_INTERVAL_FAST_MS)),
@@ -3675,10 +3557,9 @@ mod tests {
 
     #[test]
     fn publish_floor_paces_sustained_streaming_at_fast_cadence() {
-        // Back-to-back changes must not publish faster than the fast
-        // interval: the 33ms render ticker and its cooldown were calibrated
-        // against that pacing, and faster publishes tear on terminals
-        // without synchronized updates.
+        // Back-to-back changes must not publish faster than the fast interval: the 33ms
+        // render ticker was calibrated against that pacing, and faster publishes tear on
+        // terminals without synchronized updates.
         assert_eq!(
             publish_floor_wait_ms(Some(0)),
             LIVE_CAPTURE_INTERVAL_FAST_MS
@@ -3691,10 +3572,9 @@ mod tests {
 
     #[test]
     fn sample_debounce_lone_chunk_never_waits() {
-        // A lone chunk (a keystroke echo, or the first chunk after a quiet gap)
-        // reports `streaming == false`, so it must sample with zero added delay
-        // regardless of how recently it landed. Adding a wait here re-creates
-        // the live-mode echo lag the #2822 event-driven wakeup exists to kill.
+        // A lone chunk (an echo, or the first after a quiet gap) reports
+        // `streaming == false` and must sample with no added delay however recently it
+        // landed, or the #2822 echo lag returns.
         assert_eq!(sample_debounce_wait_ms(false, 0, 0), 0);
         assert_eq!(sample_debounce_wait_ms(false, 0, 100), 0);
         assert_eq!(sample_debounce_wait_ms(false, 3, 0), 0);
@@ -3702,10 +3582,9 @@ mod tests {
 
     #[test]
     fn sample_debounce_holds_active_stream_until_quiescent() {
-        // While chunks are arriving back-to-back and the stream has not gone
-        // quiet, a changed frame is held so a multi-chunk repaint publishes once
-        // it settles instead of mid-repaint. The wait is the remaining
-        // quiescence window.
+        // While chunks arrive back-to-back and the stream has not gone quiet, a changed
+        // frame is held so a multi-chunk repaint publishes once settled. The wait is the
+        // remaining quiescence window.
         assert_eq!(
             sample_debounce_wait_ms(true, 0, 0),
             SAMPLE_QUIESCENCE_MS,
@@ -3720,9 +3599,8 @@ mod tests {
 
     #[test]
     fn sample_debounce_publishes_once_stream_goes_quiet() {
-        // Once the stream has been silent for the quiescence window, the
-        // settled frame publishes immediately (this is the repaint's final
-        // frame arriving right after output stops).
+        // Once the stream has been silent for the quiescence window, the settled frame
+        // publishes immediately.
         assert_eq!(sample_debounce_wait_ms(true, SAMPLE_QUIESCENCE_MS, 10), 0);
         assert_eq!(
             sample_debounce_wait_ms(true, SAMPLE_QUIESCENCE_MS + 5, 10),
@@ -3732,10 +3610,8 @@ mod tests {
 
     #[test]
     fn sample_debounce_latency_cap_bounds_sustained_streaming() {
-        // A stream that never goes quiet must still render: once a held frame
-        // has waited out the latency cap it publishes regardless of how
-        // recently the last chunk landed, so heavy output paces at the cap
-        // rather than stalling until it happens to pause.
+        // A stream that never goes quiet must still render: a held frame publishes once it
+        // waits out the latency cap, so heavy output paces at the cap rather than stalling.
         assert_eq!(sample_debounce_wait_ms(true, 0, SAMPLE_LATENCY_CAP_MS), 0);
         assert_eq!(
             sample_debounce_wait_ms(true, 0, SAMPLE_LATENCY_CAP_MS + 100),
@@ -3750,11 +3626,9 @@ mod tests {
 
     #[test]
     fn resize_batches_require_verified_ownership_before_dispatch() {
-        // Keystroke batches must dispatch without waiting on the size-owner
-        // check (a few tmux forks); putting it back ahead of plain input
-        // re-creates the per-keystroke latency this classifier exists to
-        // avoid. Resizes keep verify-first so geometry never races another
-        // owner's grid.
+        // Keystroke batches must dispatch without waiting on the size-owner check; putting
+        // it back ahead of plain input re-creates the per-keystroke latency this classifier
+        // avoids. Resizes keep verify-first so geometry never races another owner's grid.
         assert!(batch_needs_owner_first(&[WorkerMsg::Resize {
             cols: 80,
             rows: 24
@@ -3787,10 +3661,9 @@ mod tests {
 
     #[test]
     fn live_capture_worker_forwards_empty_when_policy_set() {
-        // Terminal / container panes set `forward_empty`, so a missing or
-        // cleared pane must surface as an empty capture (clearing stale
-        // preview text) instead of being dropped like the agent kill switch.
-        // Deterministic without a real tmux session: a missing pane reads empty.
+        // Terminal / container panes set `forward_empty`, so a missing or cleared pane must
+        // surface as an empty capture rather than being dropped like the agent kill switch.
+        // Deterministic without tmux: a missing pane reads empty.
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_target("aoe_test_capture_forward_empty".into());
         worker.set_forward_empty(true);
@@ -3806,13 +3679,11 @@ mod tests {
 
     #[test]
     fn live_capture_worker_publishes_failure_as_empty_outside_live() {
-        // Regression (worker-only cutover): when the displayed agent/tool
-        // pane DIES, the capture fails instead of returning empty content,
-        // and only `forward_empty` panes used to surface that. Outside
-        // live-send a failed capture must publish an empty frame so the
-        // preview shows "No output available" instead of the dead pane's
-        // last bytes forever. Deterministic without tmux: a missing pane
-        // always fails its capture. Live mode keeps the #1501 kill switch.
+        // When a displayed agent/tool pane dies its capture fails rather than returning
+        // empty content, and only `forward_empty` panes used to surface that. Outside
+        // live-send a failed capture must publish an empty frame, so the preview shows "No
+        // output available" instead of the dead pane's last bytes. Live mode keeps the
+        // #1501 kill switch.
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_target("aoe_test_capture_dead_agent".into());
         worker.set_capture_lines(40);
@@ -3825,11 +3696,10 @@ mod tests {
 
     #[test]
     fn live_capture_worker_republishes_on_budget_change() {
-        // A budget change alone (deeper scroll over a quiet pane) must
-        // republish even when the captured bytes are identical: consumers
-        // waiting for a wider/deeper capture would otherwise stall forever.
-        // Deterministic without tmux: forward-empty + missing pane produces
-        // identical empty content at every budget.
+        // A budget change alone (deeper scroll over a quiet pane) must republish even when
+        // the bytes are identical, or consumers waiting for a deeper capture stall forever.
+        // Deterministic without tmux: forward-empty plus a missing pane is empty at every
+        // budget.
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_target("aoe_test_capture_budget_change".into());
         worker.set_forward_empty(true);
@@ -3963,9 +3833,8 @@ mod tests {
         // A web live viewer takes over (what live_ws's Claim handler does).
         assert!(session.steal_size_owner("live-test-thief"));
 
-        // The next resize must verify, observe the loss, flag it, and be
-        // dropped. (The idle heartbeat may flag it first; either path is
-        // the behavior under test.)
+        // The next resize must verify, observe the loss, flag it and be dropped. The idle
+        // heartbeat may flag it first; either path is the behavior under test.
         worker.resize(60, 20);
         wait_until("lock_lost flag", std::time::Duration::from_secs(5), || {
             worker.lock_lost()

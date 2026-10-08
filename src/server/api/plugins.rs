@@ -16,16 +16,12 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::AppState;
+use super::{api_error, AppState};
 use crate::plugin;
 use crate::plugin::install::OperationLog;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 
 const CAP_COMPOSER_READ: &str = "composer.read";
-
-fn error_response(status: StatusCode, code: &str, message: String) -> Response {
-    (status, Json(json!({ "error": code, "message": message }))).into_response()
-}
 
 /// Apply mutation restrictions before resolving the authenticated principal.
 async fn mutation_gate(
@@ -242,7 +238,7 @@ pub async fn plugin_discover(
     }
     match plugin::discover::discover(query.q.as_deref()).await {
         Ok(results) => Json(json!({ "results": results })).into_response(),
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, "discover_failed", format!("{e:#}")),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, "discover_failed", format!("{e:#}")),
     }
 }
 
@@ -267,7 +263,7 @@ pub async fn plugin_details(
         // GitHub fetch failure is reported in-band (manifest_error / empty
         // release tags), so a hard error here is bad client input, not an
         // upstream outage.
-        Err(e) => error_response(StatusCode::BAD_REQUEST, "invalid_source", format!("{e:#}")),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "invalid_source", format!("{e:#}")),
     }
 }
 
@@ -299,7 +295,7 @@ pub struct PluginActionBody {
 pub async fn invoke_plugin_action(
     State(state): State<std::sync::Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<PluginActionBody>,
+    body: Result<Json<PluginActionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if state.read_only {
         return super::read_only_response();
@@ -308,24 +304,24 @@ pub async fn invoke_plugin_action(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let Some(host) = state.plugin_host.as_ref() else {
-        return error_response(
+        return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_host",
-            "Plugin host is not running".into(),
+            "Plugin host is not running",
         );
     };
-    // Read the UI revision before forwarding, not the value the dashboard
-    // last polled: that one is stale, so an unrelated push between the last poll
-    // and this click would already exceed it and clear the spinner before the
-    // worker has done anything. Scoped to the firing UI's session so another
-    // session's activity cannot move it. The dashboard holds the spinner until
-    // this scope's revision moves off the baseline.
+    // Read the UI revision now rather than the value the dashboard last polled:
+    // that one is stale, so an unrelated push since would already exceed it and
+    // clear the spinner early. Scoped to the firing session so another session's
+    // activity cannot move it.
     let baseline_revision = host.ui_revision(&id, body.session_id.as_deref());
-    // Forward the firing UI's session to the worker so a per-session action
-    // (e.g. github.refresh) can scope its work to that session instead of every
-    // one. Merged into the params object; a worker that does not use it ignores
-    // it (the honest-plugin model).
+    // Forward the firing session so a per-session action can scope its work.
+    // A worker that does not use it ignores it.
     let mut params = body.params;
     strip_composer_snapshot_without_capability(&id, &mut params);
     if let Some(sid) = &body.session_id {
@@ -344,7 +340,7 @@ pub async fn invoke_plugin_action(
         )
             .into_response()
     } else {
-        error_response(
+        api_error(
             StatusCode::NOT_FOUND,
             "no_worker",
             format!("No running worker for plugin {id}"),
@@ -386,8 +382,8 @@ pub async fn invoke_plugin_command(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    // Resolve fqid -> (plugin_id, has_action). Plugin ids contain dots, so match
-    // against the registry rather than string-splitting the fqid.
+    // Plugin ids contain dots, so resolve fqid against the registry rather
+    // than string-splitting it.
     let mut resolved: Option<(String, bool)> = None;
     for p in plugin::registry().active() {
         let plugin_id = p.id().to_string();
@@ -398,14 +394,14 @@ pub async fn invoke_plugin_command(
         }
     }
     let Some((plugin_id, has_action)) = resolved else {
-        return error_response(
+        return api_error(
             StatusCode::NOT_FOUND,
             "unknown_command",
             format!("No active plugin command {fqid}"),
         );
     };
     if has_action {
-        return error_response(
+        return api_error(
             StatusCode::BAD_REQUEST,
             "client_action_command",
             format!(
@@ -420,17 +416,17 @@ pub async fn invoke_plugin_command(
         .iter()
         .any(|i| i.id == body.session_id)
     {
-        return error_response(
+        return api_error(
             StatusCode::NOT_FOUND,
             "unknown_session",
             format!("No session {}", body.session_id),
         );
     }
     let Some(host) = state.plugin_host.as_ref() else {
-        return error_response(
+        return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_host",
-            "Plugin host is not running".into(),
+            "Plugin host is not running",
         );
     };
     let params = json!({ "command": fqid, "session_id": body.session_id });
@@ -440,7 +436,7 @@ pub async fn invoke_plugin_command(
     {
         (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
     } else {
-        error_response(
+        api_error(
             StatusCode::NOT_FOUND,
             "no_worker",
             format!("No running worker for plugin {plugin_id}"),
@@ -485,7 +481,7 @@ pub async fn plugin_update_preview(
     }
     match plugin::install::preview_update(&id).await {
         Ok(preview) => Json(preview).into_response(),
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
     }
 }
 
@@ -554,8 +550,8 @@ pub async fn dismiss_plugin_update(
     .await;
     match result {
         Ok(Ok(())) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -579,18 +575,17 @@ pub async fn set_plugin_enabled(
         tokio::task::spawn_blocking(move || plugin::install::set_enabled(&id, body.enabled)).await;
     match result {
         Ok(Ok(())) => {
-            // set_enabled reloaded the global registry on disk; reconcile the
-            // live host so enabling launches the worker and disabling tears it
-            // down, without waiting for a full daemon restart. reconcile is
-            // async, so it runs here after the sync spawn_blocking returns,
-            // never inside it.
+            // set_enabled reloaded the on-disk registry; reconcile the live
+            // host so enabling launches the worker and disabling tears it down
+            // without a daemon restart. reconcile is async, so it runs after
+            // the sync spawn_blocking returns, never inside it.
             if let Some(host) = state.plugin_host.clone() {
                 host.reconcile(&crate::plugin::registry()).await;
             }
             list_plugins(State(state)).await
         }
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -608,9 +603,7 @@ pub async fn restart_plugin_worker(
     }
     let registry = match tokio::task::spawn_blocking(plugin::reload_registry).await {
         Ok(registry) => registry,
-        Err(e) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
-        }
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     };
     if let Some(host) = state.plugin_host.clone() {
         host.restart_worker(&id, &registry).await;
@@ -767,10 +760,10 @@ where
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let Some((job_id, log_path)) = state.plugin_jobs.begin(kind, target) else {
-        return error_response(
+        return api_error(
             StatusCode::CONFLICT,
             "plugin_job_active",
-            "Another plugin operation is already running".into(),
+            "Another plugin operation is already running",
         );
     };
     let jobs = state.plugin_jobs.clone();
@@ -807,7 +800,7 @@ pub async fn preview_plugin_install(
     }
     match plugin::install::preview_install(&body.source).await {
         Ok(consent) => Json(consent).into_response(),
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
     }
 }
 
@@ -892,7 +885,7 @@ pub async fn plugin_job_status(
         return resp;
     }
     let Some(job) = state.plugin_jobs.get(&job_id) else {
-        return error_response(
+        return api_error(
             StatusCode::NOT_FOUND,
             "job_not_found",
             format!("No plugin job {job_id}"),
@@ -915,12 +908,12 @@ pub async fn plugin_job_status(
             }
         }))
         .into_response(),
-        Ok(Err(e)) => error_response(
+        Ok(Err(e)) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "log_read_failed",
             format!("{e}"),
         ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -1022,10 +1015,9 @@ mod tests {
 
     struct AppDirEnvGuard {
         // Field drop order is load-bearing: `_env` restores HOME / XDG /
-        // USERPROFILE (and releases the shared env lock) first, then
-        // `_reload` reloads the registry against the restored dirs, then
-        // `_temp` deletes the tempdir. `_env` also holds the process-global
-        // env lock for the guard's whole lifetime (issues #2864, #2600).
+        // USERPROFILE and releases the shared env lock first, then `_reload`
+        // reloads the registry against the restored dirs, then `_temp` deletes
+        // the tempdir (#2864, #2600).
         _env: crate::session::test_support::EnvGuard,
         _reload: crate::plugin::ReloadRegistryOnDrop,
         _temp: tempfile::TempDir,

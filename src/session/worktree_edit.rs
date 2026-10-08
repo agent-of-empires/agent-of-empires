@@ -186,9 +186,8 @@ pub fn ensure_sandbox_container_released(session_id: &str, is_sandboxed: bool) -
                     false
                 }
                 Teardown::AlreadyGone => false,
-                // Couldn't drop it, so assume it still holds the mount and
-                // fail the rename with a real reason instead of letting git
-                // fail with a bare `Permission denied`.
+                // Couldn't drop it, so assume it still holds the mount and fail the rename with a
+                // real reason instead of letting git fail with a bare `Permission denied`.
                 Teardown::Failed(e) => {
                     tracing::warn!(
                         target: "containers.runtime",
@@ -340,9 +339,9 @@ pub fn edit_worktree_workdir(
         return Err(WorktreeEditError::EmptyName);
     }
 
-    // The new branch name uses the same git-ref sanitizer as creation; the
-    // directory leaf uses the path-safe sanitizer (slashes become dashes),
-    // mirroring how `resolve_template` derives a leaf from a branch.
+    // The new branch name uses the same git-ref sanitizer as creation; the directory leaf uses the
+    // path-safe sanitizer (slashes become dashes), mirroring how `resolve_template` derives a leaf
+    // from a branch.
     let new_branch = git_sanitize_branch_name(req.new_name);
 
     let new_path = target_worktree_path(req.current_path, req.new_name)
@@ -362,10 +361,8 @@ pub fn edit_worktree_workdir(
             req.current_path.to_path_buf(),
         ));
     }
-    // #2653 fail-closed gate: swallowing `Err` as "absent" would
-    // clobber a branch that actually existed or explode inside
-    // `rename_branch`. See `GitWorktree::branch_exists` docstring
-    // for the tri-state contract.
+    // fail-closed gate: swallowing `Err` as "absent" would clobber a branch that actually existed
+    // or explode inside `rename_branch`.
     if branch_changes && git.branch_exists(&new_branch)? {
         return Err(WorktreeEditError::BranchExists(new_branch));
     }
@@ -391,9 +388,7 @@ pub fn edit_worktree_workdir(
                         old = %req.worktree_info.branch,
                         "worktree edit: branch-rename rollback failed after move error: {rollback}"
                     );
-                    // The repo is now on `new_branch` with the directory still
-                    // at its old path. Surface both failures so the caller does
-                    // not treat this as a clean "move failed, nothing changed".
+                    // The repo is now on `new_branch` with the directory still at its old path.
                     return Err(WorktreeEditError::RollbackFailed {
                         move_err: e.to_string(),
                         rollback_err: rollback.to_string(),

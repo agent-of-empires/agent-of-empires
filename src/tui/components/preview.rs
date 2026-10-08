@@ -168,8 +168,7 @@ impl Preview {
         use crate::session::PanePresence;
         // One source of truth for the header / banner / output split. Compact
         // viewports and the hidden-header toggle both collapse to "output owns
-        // the whole area" inside `PreviewLayout::compute`, symmetric with the
-        // Structured view's `render_with_cache`.
+        // the whole area" inside `PreviewLayout::compute`.
         let layout =
             PreviewLayout::compute(area, compact, show_info, terminal_info_height(instance));
 
@@ -227,9 +226,8 @@ impl Preview {
         let line_count = parsed_output.map_or(0, |t| t.lines.len());
 
         // The inner ` Terminal Output ` banner is present exactly when the info
-        // section is (see `PreviewLayout`): with it hidden the outer block title
-        // already names the view and the scroll indicator is hoisted there by
-        // the caller, so the body claims the freed row.
+        // section is: with it hidden the outer block title already names the
+        // view, so the body claims the freed row.
         if let Some(banner) = layout.banner {
             let mut block = Block::default()
                 .borders(Borders::TOP)
@@ -289,9 +287,8 @@ impl Preview {
         show_info: bool,
     ) {
         // One source of truth for the split. With the header hidden or the
-        // viewport compact, `PreviewLayout::compute` returns `info: None` /
-        // `banner: None` and the output claims the whole pane (the outer block
-        // already says "Preview", so an inner banner would be redundant chrome).
+        // viewport compact the output claims the whole pane, and the outer block
+        // already says "Preview".
         let layout = PreviewLayout::compute(area, compact, show_info, agent_info_height(instance));
         if let Some(info_area) = layout.info {
             Self::render_info(frame, info_area, instance, theme, idle_decay_window);
@@ -422,9 +419,9 @@ impl Preview {
         scroll_offset: u16,
         theme: &Theme,
     ) {
-        // `output.height` is the visible-row count straight from `PreviewLayout`;
-        // there is no banner subtraction here (the banner, when present, sits in
-        // its own row above `output`).
+        // `output.height` is the visible-row count straight from
+        // `PreviewLayout`. The error path below returns early, so `parsed_output`
+        // is the caller's cached parse by the time the Paragraph uses it.
         let visible_height = output.height as usize;
         // The error path below returns early, so by the time we use
         // `parsed_output` for the output Paragraph the error case has
@@ -433,9 +430,8 @@ impl Preview {
         let parsed_output = cached_output.text;
         let line_count = parsed_output.map_or(0, |t| t.lines.len());
 
-        // The inner ` Output ` banner is drawn only when `PreviewLayout` gave us
-        // a banner row (info header shown, non-compact). The outer block already
-        // names the session when it's hidden, so the body claims the freed row.
+        // The inner ` Output ` banner is drawn only when `PreviewLayout` gave a
+        // banner row; otherwise the body claims the freed row.
         if let Some(banner) = banner {
             let mut block = Block::default()
                 .borders(Borders::TOP)
@@ -650,9 +646,8 @@ mod tests {
         assert_eq!(shortened, "");
     }
 
-    // Single source of truth for the preview split. These pin down the row
-    // arithmetic that #1521 / #1570 / #1604 each got wrong in a different
-    // derivation; now there is only one.
+    // Single source of truth for the preview split, pinning the row arithmetic
+    // that #1521 / #1570 / #1604 each got wrong in a different derivation.
     fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
         Rect {
             x,
@@ -700,9 +695,7 @@ mod tests {
     }
 
     // End to end: a captured screen exactly as tall as the banner-less output,
-    // live-following (offset 0). The scroll must be 0 so the top row (a fresh
-    // shell's cursor) stays on screen. This is the #1604 "first row hidden"
-    // regression, now expressed against the single layout source.
+    // live-following. Scroll must be 0 so the top row stays on screen (#1604).
     #[test]
     fn full_height_capture_does_not_scroll_when_banner_hidden() {
         let area = rect(0, 0, 80, 40);
@@ -771,10 +764,9 @@ mod tests {
         );
     }
 
-    // `agent_info_height` drives both the preview layout split and the
-    // live-send worker geometry queued from render. A one-row drift here brings
-    // the shifted-preview bug right back, so each branch of the formula
-    // gets a dedicated case.
+    // `agent_info_height` drives both the preview layout split and the live-send
+    // worker geometry, so each branch of the formula gets a case: a one-row drift
+    // brings the shifted-preview bug back.
     mod agent_info_height {
         use super::super::agent_info_height;
         use crate::session::{Instance, SandboxInfo, WorktreeInfo};
@@ -849,10 +841,8 @@ mod tests {
         }
     }
 
-    // Terminal-view counterpart of `agent_info_height`. Same drift-guard
-    // motivation: the live-send sync resize against a terminal target
-    // sizes the tmux pane to `inner - terminal_info_height - 1`. A wrong
-    // formula here brings the shifted-preview bug back in Terminal view.
+    // Terminal-view counterpart of `agent_info_height`, guarding the same drift:
+    // the live-send resize sizes the pane to `inner - terminal_info_height - 1`.
     mod terminal_info_height {
         use super::super::terminal_info_height;
         use crate::session::{Instance, SandboxInfo, WorktreeInfo};

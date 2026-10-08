@@ -55,17 +55,12 @@ export function useProjects(): ProjectRegistry & { refresh: () => Promise<void> 
     });
   }, []);
 
-  const refresh = useCallback(() => {
-    setRegistry((current) => ({ ...current, ready: false }));
-    return load();
-  }, [load]);
-
   useEffect(() => {
     const requests = generation;
     const reads = active;
     void load();
     const onFocus = () => {
-      if (document.visibilityState === "visible") void refresh();
+      if (document.visibilityState === "visible") void load();
     };
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
@@ -80,7 +75,7 @@ export function useProjects(): ProjectRegistry & { refresh: () => Promise<void> 
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, [load, refresh]);
+  }, [load]);
 
-  return { ...registry, refresh };
+  return { ...registry, refresh: load };
 }

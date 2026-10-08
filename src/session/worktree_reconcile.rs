@@ -52,15 +52,7 @@ fn select_live_worktree(
     branch: &str,
     main_repo: &Path,
 ) -> WorktreePathResolution {
-    // The main worktree is never a candidate. `list_worktrees` reports it like
-    // any other entry, and it can legitimately end up on the session's branch
-    // once the linked checkout is gone (`git worktree unlock` plus `prune` plus
-    // `git checkout`, or a single `git checkout --ignore-other-worktrees`).
-    // Repointing a managed session there would hand its agent the user's
-    // primary checkout to work in. Same canonicalize-and-compare guard
-    // `crate::git::cleanup::remove_worktree_dir` applies before deleting a
-    // directory, down to falling back on the path as written when it cannot
-    // be canonicalized, so an unresolvable main repo still excludes itself.
+    // The main worktree is never a candidate.
     let main = main_repo
         .canonicalize()
         .unwrap_or_else(|_| main_repo.to_path_buf());

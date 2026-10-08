@@ -155,14 +155,16 @@ fn right_click_unarchive_action_restores_session() {
 }
 
 /// A trashed row's menu offers Restore (#4116) instead of the live-row triage items.
-#[test]
+#[tokio::test]
 #[serial]
-fn right_click_trashed_row_offers_restore() {
+async fn right_click_trashed_row_offers_restore() {
     let mut env = create_test_env_with_sessions(2);
     setup_inner(&mut env);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
+    super::pickers_groups_sort::settle_trash(&state, &mut env.view, &id).await;
     assert!(env.view.get_instance(&id).unwrap().is_trashed());
 
     let idx = env
@@ -183,8 +185,19 @@ fn right_click_trashed_row_offers_restore() {
         ]
     );
 
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(env.view.context_menu.is_none());
+    super::pickers_groups_sort::settle_row_command(
+        &state,
+        &mut env.view,
+        &id,
+        crate::tui::session_feed::SessionRequest::Restore,
+        |view| {
+            view.handle_key(key(KeyCode::Enter), None);
+            assert!(view.context_menu.is_none());
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "context-menu Restore must restore the session"
@@ -211,12 +224,10 @@ fn right_click_fork_requires_provenance_not_a_tool_label() {
         .iter()
         .any(|(action, _)| *action == ContextMenuAction::Fork));
     env.view.context_menu = None;
-    env.view
-        .apply_user_action(&id, |instance| {
-            instance.agent_session_binding = binding;
-            instance.tool = "status-alias".into();
-        })
-        .unwrap();
+    env.view.mutate_instance(&id, |instance| {
+        instance.agent_session_binding = binding;
+        instance.tool = "status-alias".into();
+    });
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
         .view
@@ -246,8 +257,7 @@ fn right_click_session_menu_hides_fork_for_unforkable_agent() {
         _ => panic!("expected a session row"),
     };
     env.view
-        .apply_user_action(&id, |inst| inst.tool = "gemini".to_string())
-        .unwrap();
+        .mutate_instance(&id, |inst| inst.tool = "gemini".to_string());
     env.view.flat_items = env.view.build_flat_items();
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env

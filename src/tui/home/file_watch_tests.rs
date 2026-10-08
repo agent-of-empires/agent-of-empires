@@ -52,8 +52,9 @@ fn env_seeded(profile: &str, seed_dirs: &[&str], seed: impl FnOnce(&Arc<FileWatc
     for dir in seed_dirs {
         crate::session::get_profile_dir(dir).expect("seed dir");
     }
+    crate::session::get_profile_dir(profile).expect("fixture profile");
     seed(&live);
-    let view = HomeView::new_for_test(
+    let view = HomeView::new(
         Some(profile.to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),

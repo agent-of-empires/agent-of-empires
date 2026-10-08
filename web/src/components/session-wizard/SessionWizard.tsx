@@ -164,6 +164,7 @@ interface Props {
   prefill?: WizardPrefill;
   /** Authority for implicit reads; the machine default is not the served profile. */
   servedProfile?: string;
+  onRetryServedProfile?: () => Promise<void>;
   /** CityHall client mode: only a title is asked; the server derives the rest. */
   nameOnly?: boolean;
 }
@@ -174,6 +175,7 @@ export function SessionWizard({
   onCreatedInBackground,
   prefill,
   servedProfile,
+  onRetryServedProfile,
   nameOnly = false,
 }: Props) {
   const [state, dispatch] = useReducer(reducer, {
@@ -223,6 +225,29 @@ export function SessionWizard({
   const defaultsReady = defaultsProfile !== null && defaultsProfile === (state.data.profile || servedProfile);
   const defaultsGeneration = useRef(0);
   const selectedProfile = useRef<string | null>(null);
+  const resetImplicitDefaults = useRef(false);
+  const [resolvingServedProfile, setResolvingServedProfile] = useState(
+    !servedProfile && !prefill?.profile && Boolean(onRetryServedProfile),
+  );
+  const retryServedProfile = useCallback(async () => {
+    if (!onRetryServedProfile) return;
+    setResolvingServedProfile(true);
+    try {
+      await onRetryServedProfile();
+    } finally {
+      setResolvingServedProfile(false);
+    }
+  }, [onRetryServedProfile]);
+  useEffect(() => {
+    if (servedProfile || prefill?.profile || !onRetryServedProfile) return;
+    let active = true;
+    void onRetryServedProfile().finally(() => {
+      if (active) setResolvingServedProfile(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [servedProfile, prefill?.profile, onRetryServedProfile]);
 
   useEffect(() => {
     const generations = defaultsGeneration;
@@ -242,8 +267,9 @@ export function SessionWizard({
     if (selectedProfile.current !== null) return;
     const generation = ++defaultsGeneration.current;
     const initialPath = state.data.path;
-    const effectiveProfile = prefill?.profile || servedProfile;
+    const effectiveProfile = state.data.profile || servedProfile;
     if (!effectiveProfile) return;
+    const resetDefaults = resetImplicitDefaults.current;
     const projectSeed =
       initialPath && effectiveProfile
         ? fetchProjects({ profile: effectiveProfile })
@@ -267,10 +293,14 @@ export function SessionWizard({
         dispatch({
           type: "APPLY_PROFILE_DEFAULTS",
           ...defaults,
-          yoloMode: prefill?.yoloMode ?? defaults.yoloMode,
-          sandboxEnabled: prefill?.sandboxEnabled ?? defaults.sandboxEnabled,
-          skipIfDirty: true,
+          yoloMode: resetDefaults ? defaults.yoloMode : (prefill?.yoloMode ?? defaults.yoloMode),
+          sandboxEnabled: resetDefaults
+            ? defaults.sandboxEnabled
+            : (prefill?.sandboxEnabled ?? defaults.sandboxEnabled),
+          skipIfDirty: !resetDefaults,
+          resetStructuredViewDirty: resetDefaults,
         });
+        resetImplicitDefaults.current = false;
       })
       .catch(() => {})
       .finally(() => {
@@ -336,10 +366,15 @@ export function SessionWizard({
     handleChange("profile", profileName);
     setPanel(null);
     selectedProfile.current = profileName || null;
+    resetImplicitDefaults.current = false;
     const generation = ++defaultsGeneration.current;
     setDefaultsProfile(null);
     const effectiveProfile = profileName || servedProfile;
-    if (!effectiveProfile) return;
+    if (!effectiveProfile) {
+      resetImplicitDefaults.current = true;
+      await retryServedProfile();
+      return;
+    }
     try {
       const settings = await fetchSettings(effectiveProfile);
       if (generation === defaultsGeneration.current && settings) {
@@ -771,6 +806,22 @@ export function SessionWizard({
           </button>
         </div>
         <div className="flex-1 overflow-y-auto px-4 md:px-5 py-4">
+          {!nameOnly && !state.data.profile && !servedProfile && (
+            <div
+              role="alert"
+              className="mb-4 rounded-md border border-status-warning/40 px-3 py-2 text-sm text-text-secondary"
+            >
+              The server profile could not be loaded. Session defaults cannot be resolved yet.
+              <button
+                type="button"
+                disabled={resolvingServedProfile || !onRetryServedProfile}
+                onClick={() => void retryServedProfile()}
+                className="ml-2 text-brand-400 hover:underline cursor-pointer disabled:opacity-50"
+              >
+                Retry server profile
+              </button>
+            </div>
+          )}
           {creating ? (
             <CreateProgressView progress={progress} />
           ) : panel ? (

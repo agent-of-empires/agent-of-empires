@@ -3,17 +3,24 @@
 use super::*;
 
 /// Callers retain namespace, submission and instance exclusion through cleanup.
-async fn purge_session_artifacts(
+pub(crate) async fn purge_session_artifacts(
     state: &Arc<AppState>,
     id: &str,
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
     additional_protection: Option<crate::session::path_identity::CleanupProtection>,
+    selection: Option<crate::session::deletion::PurgeSelection>,
 ) -> anyhow::Result<PurgeOutcome> {
     use crate::session::deletion::{DeletionDisposition, PurgeReservation, PurgeTransaction};
     if state.cityhall_mode && !instance.is_structured() {
         anyhow::bail!(super::lifecycle::LifecycleTargetError::CityHall);
+    }
+    if body.expected_trash && !instance.is_trashed() {
+        return Ok(PurgeOutcome::Kept {
+            messages: vec!["Session was restored before trash purge".into()],
+            teardown_started: false,
+        });
     }
     let profile = instance.source_profile.clone();
     anyhow::ensure!(!profile.is_empty(), "Session has no source profile");
@@ -35,7 +42,7 @@ async fn purge_session_artifacts(
             &profile,
             Some(status_id),
         )?;
-        PurgeTransaction::reserve(store, request, None)
+        PurgeTransaction::reserve(store, request, selection)
     })
     .await??;
     let transaction = match reservation {
@@ -71,6 +78,11 @@ async fn purge_session_artifacts(
             }
         }
     };
+    let transaction = if body.use_cleanup_defaults {
+        tokio::task::spawn_blocking(move || transaction.resolve_cleanup_defaults()).await??
+    } else {
+        transaction
+    };
     let transaction = match additional_protection {
         Some(protection) => transaction.with_additional_protection(protection),
         None => transaction,
@@ -83,19 +95,18 @@ async fn purge_session_artifacts(
             Ok(committed) => {
                 // Commit removal before destroying a transcript that cannot be restored.
                 let shutdown = finish_structured_purge(state, id).await;
-                // The row is gone from storage on BOTH paths, so the in-memory
-                // locks it held must be released on both. Skipping them on the
-                // unproven path would leave a prompt lock behind that wedges
-                // every later prompt for this id, with no row left to clear it.
+                // Both paths removed the row; neither may retain its prompt lock.
                 release_removed_session_locks(state, id).await;
-                let finished = tokio::task::spawn_blocking(move || committed.finish()).await?;
                 if let Err(error) = shutdown {
+                    // Dropping CommittedPurge releases exclusion, never its durable journal owner.
+                    // Recovery will prove structured exit before retrying resource teardown.
+                    drop(committed);
                     return Ok(PurgeOutcome::Deleted {
                         messages: Vec::new(),
                         cleanup_errors: vec![format!("Session removed, but resources retained because structured shutdown is unproven: {error}")],
                     });
                 }
-                finished
+                tokio::task::spawn_blocking(move || committed.finish()).await?
             }
         }
     } else {
@@ -221,15 +232,18 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
 }
 
 /// Repair moved worktree references through complete native profile publication.
-pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
+pub(crate) async fn reconcile_worktree_paths(
+    state: &Arc<AppState>,
+) -> std::collections::HashSet<String> {
+    let mut failed = std::collections::HashSet::new();
     use crate::session::SessionStore;
 
     if state.read_only {
-        return;
+        return failed;
     }
     let _namespace = state.profile_namespace.read().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
-        return;
+        return failed;
     }
     let candidates: Vec<String> = state
         .instances
@@ -281,13 +295,16 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                failed.insert(id.clone());
                 tracing::warn!(target: "http.api.sessions", session = %id, "worktree path reconcile skipped: {error}")
             }
             Err(error) => {
+                failed.insert(id.clone());
                 tracing::warn!(target: "http.api.sessions", session = %id, "worktree path reconcile join failed: {error}")
             }
         }
     }
+    failed
 }
 
 /// Relocate any trashed managed worktree still sitting in the active dir into
@@ -296,55 +313,71 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
 /// once on daemon startup, best-effort and per-session locked; a failure on one
 /// session logs and moves on. The git move is blocking, so it runs off the
 /// async runtime.
-pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
-    let candidates: Vec<(String, String)> = {
-        let instances = state.instances.read().await;
-        instances
-            .iter()
-            .filter(|i| i.is_trashed())
-            .map(|i| (i.id.clone(), i.source_profile.clone()))
-            .collect()
-    };
-    for (id, _profile) in candidates {
+pub(crate) async fn reconcile_trashed_worktrees(
+    state: &Arc<AppState>,
+) -> std::collections::HashSet<String> {
+    use crate::session::SessionStore;
+    let mut failed = std::collections::HashSet::new();
+    if state.read_only {
+        return failed;
+    }
+    let _namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return failed;
+    }
+    let candidates: Vec<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| row.is_trashed())
+        .map(|row| row.id.clone())
+        .collect();
+    for id in candidates {
         let lock = state.instance_lock(&id).await;
         let _guard = lock.lock().await;
-
-        let snapshot = {
-            let instances = state.instances.read().await;
-            match instances.iter().find(|instance| instance.id == id) {
-                Some(instance) if instance.is_trashed() => instance.clone(),
-                _ => continue,
-            }
-        };
-        let reconciled = match tokio::task::spawn_blocking(move || {
-            let mut instance = snapshot;
-            let changed = crate::session::trash::reconcile_trashed_transition(&mut instance)?;
-            anyhow::Ok((changed, instance))
-        })
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(error)) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile skipped: {error}");
+        let profile = {
+            let rows = state.instances.read().await;
+            let Some(row) = rows.iter().find(|row| row.id == id && row.is_trashed()) else {
                 continue;
+            };
+            if state.cityhall_mode && !row.is_structured() {
+                continue;
+            }
+            row.source_profile.clone()
+        };
+        let worker_state = state.clone();
+        let worker_id = id.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let store = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                &profile,
+                Some(worker_id.clone()),
+            )?;
+            let Some(mut instance) = store
+                .load()?
+                .into_iter()
+                .find(|row| row.id == worker_id && row.is_trashed())
+            else {
+                return Ok(());
+            };
+            crate::session::trash::reconcile_trashed_transition(&store, &mut instance)?;
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                failed.insert(id.clone());
+                tracing::warn!(target: "http.api.sessions", session = %id, %error, "trash reconcile failed; recovery excluded");
             }
             Err(error) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile join failed: {error}");
-                continue;
+                failed.insert(id.clone());
+                tracing::warn!(target: "http.api.sessions", session = %id, %error, "trash reconcile join failed; recovery excluded");
             }
-        };
-        if !reconciled.0 {
-            continue;
-        }
-        let moved = reconciled.1;
-        let mut instances = state.instances.write().await;
-        if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
-            instance.project_path = moved.project_path;
-            instance.pre_trash_project_path = moved.pre_trash_project_path;
-            instance.lifecycle_generation = moved.lifecycle_generation;
-            instance.lifecycle_reservation = moved.lifecycle_reservation;
         }
     }
+    failed
 }
 
 /// Auto-purge trashed sessions whose retention window has elapsed
@@ -420,8 +453,10 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             delete_sandbox: config.sandbox.auto_cleanup,
             force_delete: true,
             keep_scratch: false,
+            expected_trash: true,
+            use_cleanup_defaults: false,
         };
-        match purge_session_artifacts(state, &id, instance, &body, recent_entry, None).await {
+        match purge_session_artifacts(state, &id, instance, &body, recent_entry, None, None).await {
             Ok(outcome) => {
                 tracing::info!(target: "http.api.sessions", session = %id, removed = matches!(outcome, PurgeOutcome::Deleted { .. }), "expired trash purge completed")
             }
@@ -462,6 +497,16 @@ pub async fn delete_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    if body.use_cleanup_defaults
+        && (body.delete_worktree || body.delete_branch || body.delete_sandbox)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_cleanup_mode",
+            "Default cleanup policy cannot be combined with explicit cleanup flags",
+        );
+    }
     let join = tokio::spawn(async move {
         let namespace = state
             .runtime
@@ -470,7 +515,6 @@ pub async fn delete_session(
         if let Some(response) = cityhall_block_non_structured(&state, &id).await {
             return response;
         }
-        let body = body.map(|Json(body)| body).unwrap_or_default();
         let Some(submission) = state
             .session_service
             .prompt_submission_for_session(&id)
@@ -480,19 +524,44 @@ pub async fn delete_session(
         };
         let lock = state.instance_lock(&id).await;
         let guard = lock.lock().await;
-        let instance = state
+        let profile = state
             .instances
             .read()
             .await
             .iter()
             .find(|row| row.id == id)
-            .cloned();
+            .map(|row| row.source_profile.clone());
+        let Some(profile) = profile else {
+            return crate::server::api::session_not_found();
+        };
+        let worker_state = state.clone();
+        let worker_id = id.clone();
+        let instance = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            use crate::session::SessionStore;
+            let store = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                &profile,
+                Some(worker_id.clone()),
+            )?;
+            Ok(store.load()?.into_iter().find(|row| row.id == worker_id))
+        })
+        .await
+        {
+            Ok(Ok(instance)) => instance,
+            Ok(Err(error)) => {
+                if let Some(response) = super::lifecycle::lifecycle_rejection(&state, &error) {
+                    return response;
+                }
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
         let Some(instance) = instance else {
             return crate::server::api::session_not_found();
         };
         let recent_entry = crate::session::recent_project_entry_for(&instance);
         let result =
-            purge_session_artifacts(&state, &id, instance, &body, recent_entry, None).await;
+            purge_session_artifacts(&state, &id, instance, &body, recent_entry, None, None).await;
         drop(guard);
         drop(submission);
         drop(namespace);
@@ -697,6 +766,7 @@ pub(super) fn order_workspace_deletion(
         delete_sandbox: body.delete_sandbox,
         force_delete: body.force_delete,
         keep_scratch: body.keep_scratch,
+        ..Default::default()
     };
     let owner_body = DeleteSessionBody {
         delete_worktree: body.delete_worktree,
@@ -704,6 +774,7 @@ pub(super) fn order_workspace_deletion(
         delete_sandbox: body.delete_sandbox,
         force_delete: body.force_delete,
         keep_scratch: body.keep_scratch,
+        ..Default::default()
     };
     let mut plan: Vec<(String, DeleteSessionBody)> = siblings
         .iter()
@@ -851,15 +922,16 @@ pub(super) async fn purge_workspace_artifacts(
             instances.iter().find(|i| i.id == id).cloned()
         };
         let Some(instance) = instance else {
-            // Already deleted (a concurrent retention auto-purge won the race).
-            // The row we were asked to delete is gone, so this is a no-op, not
-            // a failure.
+            // A concurrent retention auto-purge won the race, so the row we
+            // were asked to delete is gone. A no-op, not a failure.
             continue;
         };
 
         let recent_entry = crate::session::recent_project_entry_for(&instance);
         let protection = (id == owner_id).then(|| owner_protection.take()).flatten();
-        match purge_session_artifacts(state, &id, instance, &body, recent_entry, protection).await {
+        match purge_session_artifacts(state, &id, instance, &body, recent_entry, protection, None)
+            .await
+        {
             Ok(PurgeOutcome::Deleted {
                 messages: mut msgs,
                 cleanup_errors,
@@ -906,7 +978,7 @@ pub async fn delete_workspace(
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    // Dedupe up front so a repeated id can't have the owner deleted with
+    // Dedupe up front so a repeated id cannot have the owner deleted with
     // sibling flags and then skipped (#2536 review).
     let mut session_ids = dedupe_session_ids(&body.session_ids);
     if session_ids.is_empty() {

@@ -49,10 +49,11 @@ describe("served project registry", () => {
     expect(result.current.projects.map((p) => p.path)).toEqual(["/renamed"]);
   });
 
-  it("does not admit writes from a failed or superseded project refresh", async () => {
+  it("rejects superseded profile reads and retains an acknowledged registry until the profile changes", async () => {
     let release!: (value: Response) => void;
     let served = "alpha";
     let fail = false;
+    let failProjects = false;
     const old = new Promise<Response>((resolve) => {
       release = resolve;
     });
@@ -62,6 +63,7 @@ describe("served project registry", () => {
         if (url === "/api/about")
           return new Response(JSON.stringify({ profile: served }), { status: fail ? 503 : 200 });
         if (new URL(url, "http://localhost").searchParams.get("profile") === "alpha") return old;
+        if (failProjects) return new Response("", { status: 503 });
         return new Response(JSON.stringify([{ name: "current", path: "/current", scope: "profile", pinned: true }]), {
           status: 200,
         });
@@ -87,11 +89,20 @@ describe("served project registry", () => {
     await act(async () => {
       await result.current.refresh();
     });
-    expect(result.current.ready).toBe(false);
+    expect(result.current.ready).toBe(true);
     expect(result.current.profile).toBe("renamed");
+    fail = false;
+    failProjects = true;
+    served = "third";
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.profile).toBe("third");
+    expect(result.current.projects).toEqual([]);
+    expect(result.current.ready).toBe(false);
   });
   it.each(["about", "projects"])(
-    "aborts a stalled %s read at its deadline and on disposal, preserving the last registry but gating writes",
+    "aborts a stalled %s read at its deadline and on disposal without revoking the acknowledged profile registry",
     async (stage) => {
       vi.useFakeTimers();
       const signals: AbortSignal[] = [];
@@ -125,14 +136,14 @@ describe("served project registry", () => {
         refresh = result.current.refresh();
         await vi.advanceTimersByTimeAsync(0);
       });
-      expect(result.current.ready).toBe(false);
+      expect(result.current.ready).toBe(true);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(15000);
         await refresh;
       });
       expect(signals[0]!.aborted).toBe(true);
       expect(result.current.projects.map((project) => project.path)).toEqual(["/alpha"]);
-      expect(result.current.ready).toBe(false);
+      expect(result.current.ready).toBe(true);
       stall = false;
       await act(async () => {
         await result.current.refresh();

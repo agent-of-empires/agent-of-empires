@@ -2423,6 +2423,7 @@ function AppContent({
         {showSessionWizard && (
           <SessionWizard
             servedProfile={serverAbout?.profile}
+            onRetryServedProfile={refreshServerAbout}
             onClose={() => {
               setShowSessionWizard(false);
               setWizardPrefill(undefined);

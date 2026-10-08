@@ -465,12 +465,8 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-// Since #2348 the ACP one-shot is deferred to the first `prompt_complete`
-// `Event::Stopped`, so it no longer races the live worker for the same
-// provider API. The terminal path (below) fires only after the poller sees the
-// pane go idle, so it likewise runs post-turn. Standalone the call finishes
-// well under 12s; 60s is a conservative ceiling that leaves headroom for cold
-// agent starts.
+// The ACP one-shot is deferred to the first `prompt_complete` `Event::Stopped`, so it never races
+// the live worker for the same provider API.
 pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Run the agent one-shot in the session's working directory, capturing
@@ -499,9 +495,8 @@ pub(crate) async fn run_oneshot(
     cmd.args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        // Capture stderr so a non-zero exit logs WHY (e.g. codex's
-        // "Not inside a trusted directory"); without it the failure is an
-        // opaque exit code.
+        // Capture stderr so a non-zero exit logs WHY (e.g. codex's "Not inside a trusted
+        // directory"); without it the failure is an opaque exit code.
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     if !cwd.is_empty() {
@@ -717,10 +712,9 @@ fn spawn_detached(profile: &str, session_id: &str, force: bool) {
         }
     }
     match cmd.spawn() {
-        // The child is setsid-detached and does its own work; we only need to
-        // reap it so it does not linger as a zombie in the long-lived poller
-        // process (unlike __acp-runner, this child exits quickly). A short
-        // dedicated thread waits for it, then ends.
+        // The child is setsid-detached and does its own work; we only need to reap it so it does
+        // not linger as a zombie in the long-lived poller process (unlike __acp-runner, this child
+        // exits quickly).
         Ok(child) => {
             std::thread::spawn(move || {
                 let mut child = child;
@@ -799,10 +793,7 @@ fn strip_agent_banner(text: &str, tool: &str) -> String {
     if !tool.eq_ignore_ascii_case("claude") {
         return text.to_string();
     }
-    // Gate loosely: the startup box names the tool ("Claude Code v2.1.216" in
-    // its top border). A false positive is harmless because the line filter
-    // below only strips an actual leading run of box chrome, so a task that
-    // merely mentions Claude Code (with no leading box) loses nothing.
+    // Gate loosely: the startup box names the tool ("Claude Code v2.1.216" in its top border).
     if !text.to_lowercase().contains("claude code") {
         return text.to_string();
     }
@@ -816,9 +807,9 @@ fn strip_agent_banner(text: &str, tool: &str) -> String {
         kept.push(line);
     }
     let stripped = kept.join("\n");
-    // Guard against eating the whole transcript (a pane that was nothing but
-    // banner, or a future banner shape that trips the heuristic): keep the
-    // original when stripping leaves too little to title.
+    // Guard against eating the whole transcript (a pane that was nothing but banner, or a future
+    // banner shape that trips the heuristic): keep the original when stripping leaves too little to
+    // title.
     if stripped.chars().filter(|c| c.is_alphabetic()).count() < 12 {
         return text.to_string();
     }
@@ -869,7 +860,7 @@ fn is_claude_banner_line(line: &str) -> bool {
     if t.starts_with('\u{26A0}') || t.starts_with('\u{203B}') || lc.starts_with("tip:") {
         return true;
     }
-    // Numbered tip: "1. ..." or "2) ...".
+    // Numbered tip: "1...." or "2)...".
     let mut chars = t.chars();
     matches!((chars.next(), chars.next()), (Some(d), Some(p)) if d.is_ascii_digit() && (p == '.' || p == ')'))
 }
@@ -1346,9 +1337,8 @@ mod serve {
             return;
         };
 
-        // Re-check attempted after taking the inflight slot: another task may
-        // have completed and marked this session between the entry check and
-        // acquiring the guard.
+        // Re-check attempted after taking the inflight slot: another task may have completed and
+        // marked this session between the entry check and acquiring the guard.
         if attempted_contains(&state, &session_id) {
             return;
         }
@@ -1359,15 +1349,7 @@ mod serve {
             return;
         };
 
-        // A spawn error, timeout, or non-zero exit returns None. Do NOT mark the
-        // session attempted in that case: a transient slow first prompt (cold
-        // agent start) must not permanently disable naming. A later prompt
-        // retries. The inflight guard above already prevents concurrent spawns.
-        //
-        // The permit is scoped tightly around `run_oneshot` so ineligible /
-        // early-return paths above never consume a slot. Same-session duplicates
-        // are already rejected by the InflightGuard, so this permit only gates
-        // cross-session concurrency (#2348).
+        // A spawn error, timeout, or non-zero exit returns None.
         let Some(target) = resolve_oneshot_target(
             &session_id,
             sandboxed,
@@ -1391,9 +1373,7 @@ mod serve {
             return;
         };
 
-        // The agent produced output (usable or not). Mark attempted now, once per
-        // session lifetime: an answer the sanitizer rejects is not worth respawning
-        // a one-shot agent (tokens) for on every later prompt.
+        // The agent produced output (usable or not).
         {
             let mut attempted = state
                 .smart_rename_attempted
@@ -1665,11 +1645,8 @@ mod serve {
 
         #[test]
         fn is_duplicate_session_normalizes_trailing_slash() {
-            // The skip in `apply_auto_title` / `apply_terminal_title` reuses the
-            // creation predicate, which trims trailing '/' on both sides before
-            // comparing paths. Pin that normalization explicitly: an existing
-            // session at "/tmp/shared" collides with a candidate whose path
-            // differs only by a trailing slash.
+            // The skip in `apply_auto_title` / `apply_terminal_title` reuses the creation
+            // predicate, which trims trailing '/' on both sides before comparing paths.
             let mut existing = crate::session::Instance::new("Already owned", "/tmp/shared");
             existing.source_profile = "default".to_string();
             let instances = [existing];
@@ -1694,9 +1671,8 @@ mod serve {
 
         #[tokio::test]
         async fn run_oneshot_returns_none_on_spawn_failure() {
-            // A failed spawn must surface as None so try_smart_rename leaves the
-            // session un-attempted and a later prompt can retry. A binary that
-            // does not exist is the deterministic, machine-independent failure.
+            // A failed spawn must surface as None so try_smart_rename leaves the session
+            // un-attempted and a later prompt can retry.
             let argv = vec![
                 "aoe-smart-rename-nonexistent-binary-xyz".to_string(),
                 "-p".to_string(),
@@ -1957,212 +1933,124 @@ mod tests {
         );
     }
 
-    #[test]
-    fn argv_codex_skips_git_repo_check_with_prompt_last() {
-        // codex `exec` refuses to run outside a git repo without this flag, so a
-        // scratch-session one-shot would exit non-zero. The flag goes between
-        // the token and the prompt; the prompt stays the final element.
-        // codex has no built-in cheap alias, so with no override it takes no
-        // model args: still [binary, flag, skip-git-repo-check, prompt].
-        let codex = agents::get_agent("codex").unwrap();
-        let argv =
-            build_oneshot_argv(codex, "name this", title_default(codex)).expect("codex one-shot");
-        assert_eq!(
-            argv,
-            vec!["codex", "exec", "--skip-git-repo-check", "name this"]
-        );
-        // claude pins the cheap `haiku` alias between the flag and the prompt;
-        // the prompt stays the final element.
-        assert_eq!(
-            build_oneshot_argv(claude(), "name this", title_default(claude())).unwrap(),
-            vec!["claude", "-p", "--model", "haiku", "name this"]
-        );
+    fn argv_for(name: &str, model: Option<&str>) -> Vec<String> {
+        let agent = agents::get_agent(name).expect("agent exists");
+        let models = model
+            .map(|model| HashMap::from([(name.to_string(), model.to_string())]))
+            .unwrap_or_default();
+        build_oneshot_argv(
+            agent,
+            "name this",
+            OneshotModel::Title(resolve_title_model_args(agent, &models)),
+        )
+        .expect("one-shot")
     }
 
     #[test]
-    fn argv_copilot_appends_silent_autoapprove_flags_after_prompt() {
-        // Copilot's `-p` binds the prompt as its value, so the auto-approve and
-        // silent flags follow the prompt. Without them a non-interactive title
-        // call can block on a permission prompt or print stats that pollute the
-        // title; with them stdout is just the final answer.
-        let copilot = agents::get_agent("copilot").unwrap();
-        let argv = build_oneshot_argv(copilot, "name this", title_default(copilot))
-            .expect("copilot one-shot");
-        assert_eq!(
-            argv,
-            vec![
+    fn oneshot_argv_places_model_args_by_agent_convention() {
+        let cases: [(&str, Option<&str>, &[&str]); 8] = [
+            (
+                "claude",
+                Some("picked-small"),
+                &["claude", "-p", "--model", "picked-small", "name this"],
+            ),
+            (
+                "codex",
+                None,
+                &["codex", "exec", "--skip-git-repo-check", "name this"],
+            ),
+            (
                 "copilot",
-                "-p",
-                "name this",
-                "-s",
-                "--allow-all-tools",
-                "--no-ask-user"
-            ]
-        );
-    }
-
-    #[test]
-    fn argv_claude_injects_cheap_model_before_prompt() {
-        let argv = build_oneshot_argv(claude(), "name this", title_default(claude()))
-            .expect("claude one-shot");
-        let model_idx = argv.iter().position(|a| a == "--model").expect("--model");
-        assert_eq!(argv[model_idx + 1], "haiku");
-        let prompt_idx = argv.iter().position(|a| a == "name this").expect("prompt");
-        assert!(
-            model_idx < prompt_idx,
-            "model args must precede the prompt, got {argv:?}"
-        );
-        assert_eq!(
-            prompt_idx,
-            argv.len() - 1,
-            "prompt must be the last element"
-        );
-    }
-
-    #[test]
-    fn argv_summary_model_uses_cli_default() {
-        // conversation_summary reads the whole transcript and may need a bigger
-        // model turn, so OneshotModel::CliDefault must NOT inject any model
-        // selector: the argv is exactly the pre-tunable CLI-default shape.
-        let argv = build_oneshot_argv(claude(), "name this", OneshotModel::CliDefault)
-            .expect("claude one-shot");
-        assert!(!argv.iter().any(|a| a == "--model" || a == "haiku"));
-        assert_eq!(argv, vec!["claude", "-p", "name this"]);
-    }
-
-    #[test]
-    fn argv_cli_default_omits_only_the_resolved_model_args() {
-        // Across every one-shot agent, CliDefault yields exactly the built-in
-        // Title argv minus the resolved model slot: the model selector is the
-        // only difference between the two intents.
-        for agent in agents::AGENTS.iter().filter(|a| a.oneshot_flag.is_some()) {
-            let default_args = resolve_title_model_args(agent, &HashMap::new());
-            let title = build_oneshot_argv(
-                agent,
-                "name this",
-                OneshotModel::Title(default_args.clone()),
-            )
-            .expect("one-shot");
-            let cli =
-                build_oneshot_argv(agent, "name this", OneshotModel::CliDefault).expect("one-shot");
-            assert!(!cli.iter().any(|a| a == "--model" || a == "-m"));
-            assert_eq!(cli.len(), title.len() - default_args.len());
+                None,
+                &[
+                    "copilot",
+                    "-p",
+                    "name this",
+                    "-s",
+                    "--allow-all-tools",
+                    "--no-ask-user",
+                ],
+            ),
+            (
+                "codex",
+                Some("gpt-5"),
+                &[
+                    "codex",
+                    "exec",
+                    "-m",
+                    "gpt-5",
+                    "--skip-git-repo-check",
+                    "name this",
+                ],
+            ),
+            (
+                "copilot",
+                Some("claude-haiku-4.5"),
+                &[
+                    "copilot",
+                    "-p",
+                    "name this",
+                    "--model",
+                    "claude-haiku-4.5",
+                    "-s",
+                    "--allow-all-tools",
+                    "--no-ask-user",
+                ],
+            ),
+            (
+                "gemini",
+                Some("gemini-2.5-flash"),
+                &["gemini", "-p", "name this", "-m", "gemini-2.5-flash"],
+            ),
+            (
+                "kimi",
+                Some("moonshot-v1-8k"),
+                &["kimi", "-p", "name this", "-m", "moonshot-v1-8k"],
+            ),
+            (
+                "opencode",
+                Some("anthropic/claude-haiku-4-5"),
+                &[
+                    "opencode",
+                    "run",
+                    "-m",
+                    "anthropic/claude-haiku-4-5",
+                    "name this",
+                ],
+            ),
+        ];
+        for (name, model, expected) in cases {
+            let argv = argv_for(name, model);
+            assert_eq!(argv.as_slice(), expected, "{name} {model:?}");
         }
-    }
-
-    #[test]
-    fn argv_agents_without_cheap_default_take_no_model_args() {
-        // With no user override, only claude has a built-in cheap alias; every
-        // other one-shot agent runs the CLI default (no model flag).
         for name in ["opencode", "kimi", "codex", "gemini", "copilot"] {
-            let agent = agents::get_agent(name).unwrap();
-            let argv = build_oneshot_argv(agent, "name this", title_default(agent))
-                .unwrap_or_else(|| panic!("{name} one-shot"));
+            let argv = argv_for(name, None);
             assert!(
-                !argv.iter().any(|a| a == "--model" || a == "-m"),
-                "{name} has no built-in cheap alias, so its default argv carries no model flag: {argv:?}"
+                !argv.iter().any(|arg| arg == "--model" || arg == "-m"),
+                "{name} has no built-in cheap alias: {argv:?}"
             );
         }
     }
 
     #[test]
-    fn argv_user_model_override_positioned_by_flag_binding() {
-        // A positional-prompt agent (codex `exec`) gets the model selector
-        // before the prompt; a value-binding agent (copilot `-p`) gets it after
-        // the prompt so the flag never swallows `--model` as its value.
-        let mut models = HashMap::new();
-        models.insert("codex".to_string(), "gpt-5".to_string());
-        models.insert("copilot".to_string(), "claude-haiku-4.5".to_string());
-
-        let codex = agents::get_agent("codex").unwrap();
-        let codex_argv = build_oneshot_argv(
-            codex,
-            "name this",
-            OneshotModel::Title(resolve_title_model_args(codex, &models)),
-        )
-        .expect("codex one-shot");
+    fn cli_default_drops_only_the_resolved_model_args() {
         assert_eq!(
-            codex_argv,
-            vec![
-                "codex",
-                "exec",
-                "-m",
-                "gpt-5",
-                "--skip-git-repo-check",
-                "name this"
-            ]
+            build_oneshot_argv(claude(), "name this", OneshotModel::CliDefault).unwrap(),
+            vec!["claude", "-p", "name this"]
         );
-
-        let copilot = agents::get_agent("copilot").unwrap();
-        let copilot_argv = build_oneshot_argv(
-            copilot,
-            "name this",
-            OneshotModel::Title(resolve_title_model_args(copilot, &models)),
-        )
-        .expect("copilot one-shot");
-        assert_eq!(
-            copilot_argv,
-            vec![
-                "copilot",
-                "-p",
-                "name this",
-                "--model",
-                "claude-haiku-4.5",
-                "-s",
-                "--allow-all-tools",
-                "--no-ask-user"
-            ]
-        );
-
-        // gemini and kimi `-p` are value-binding (verified), so the model
-        // selector must trail the prompt, exactly like copilot.
-        let mut vb_models = HashMap::new();
-        vb_models.insert("gemini".to_string(), "gemini-2.5-flash".to_string());
-        vb_models.insert("kimi".to_string(), "moonshot-v1-8k".to_string());
-        let gemini = agents::get_agent("gemini").unwrap();
-        assert_eq!(
-            build_oneshot_argv(
-                gemini,
-                "name this",
-                OneshotModel::Title(resolve_title_model_args(gemini, &vb_models)),
-            )
-            .expect("gemini one-shot"),
-            vec!["gemini", "-p", "name this", "-m", "gemini-2.5-flash"]
-        );
-        let kimi = agents::get_agent("kimi").unwrap();
-        assert_eq!(
-            build_oneshot_argv(
-                kimi,
-                "name this",
-                OneshotModel::Title(resolve_title_model_args(kimi, &vb_models)),
-            )
-            .expect("kimi one-shot"),
-            vec!["kimi", "-p", "name this", "-m", "moonshot-v1-8k"]
-        );
-
-        // opencode `run` takes a positional prompt, so its model selector goes
-        // before the prompt.
-        let mut oc_models = HashMap::new();
-        oc_models.insert(
-            "opencode".to_string(),
-            "anthropic/claude-haiku-4-5".to_string(),
-        );
-        let opencode = agents::get_agent("opencode").unwrap();
-        assert_eq!(
-            build_oneshot_argv(
-                opencode,
-                "name this",
-                OneshotModel::Title(resolve_title_model_args(opencode, &oc_models)),
-            )
-            .expect("opencode one-shot"),
-            vec![
-                "opencode",
-                "run",
-                "-m",
-                "anthropic/claude-haiku-4-5",
-                "name this"
-            ]
-        );
+        for agent in agents::AGENTS
+            .iter()
+            .filter(|agent| agent.oneshot_flag.is_some())
+        {
+            let default_args = resolve_title_model_args(agent, &HashMap::new());
+            let model_arg_count = default_args.len();
+            let title = build_oneshot_argv(agent, "name this", OneshotModel::Title(default_args))
+                .expect("one-shot");
+            let cli =
+                build_oneshot_argv(agent, "name this", OneshotModel::CliDefault).expect("one-shot");
+            assert!(!cli.iter().any(|arg| arg == "--model" || arg == "-m"));
+            assert_eq!(cli.len(), title.len() - model_arg_count);
+        }
     }
 
     #[test]

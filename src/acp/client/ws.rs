@@ -124,9 +124,11 @@ impl WsHandle {
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         let mut task = self.task;
-        match tokio::time::timeout(SHUTDOWN_GRACE, &mut task).await {
-            Ok(_) => {}
-            Err(_) => task.abort(),
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
         }
     }
 }
@@ -264,29 +266,25 @@ async fn reader_loop<S>(
             next = stream.next() => {
                 match next {
                     Some(Ok(Message::Text(text))) => {
-                        match parse_text(&text) {
-                            // Keepalive: no consumer-visible state, so
-                            // don't wake the consumer at all.
-                            Ok(None) => {}
-                            Ok(Some(msg)) => {
-                                if tx.send(Ok(msg)).await.is_err() {
-                                    return; // consumer dropped
-                                }
-                            }
-                            Err(e) => {
-                                if tx.send(Err(e)).await.is_err() {
-                                    return; // consumer dropped
-                                }
+                        // `Ok(None)` is a keepalive: nothing to wake the consumer for.
+                        let delivery = match parse_text(&text) {
+                            Ok(None) => None,
+                            Ok(Some(msg)) => Some(Ok(msg)),
+                            Err(error) => Some(Err(error)),
+                        };
+                        if let Some(delivery) = delivery {
+                            if tx.send(delivery).await.is_err() {
+                                return; // consumer dropped
                             }
                         }
-                    }
-                    Some(Ok(Message::Binary(_))) => {
-                        // Daemon never sends binary; ignore defensively.
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         let _ = stream.send(Message::Pong(payload)).await;
                     }
-                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                    // The daemon never sends binary; ignore defensively.
+                    Some(Ok(
+                        Message::Binary(_) | Message::Pong(_) | Message::Frame(_),
+                    )) => {}
                     Some(Ok(Message::Close(frame))) => {
                         let code = frame.as_ref().map(|f| f.code);
                         let _ = tx.send(Err(WsError::UnexpectedClose(code))).await;
@@ -311,12 +309,9 @@ async fn reader_loop<S>(
 /// distinct from `Err` because consumers escalate a parse error to a
 /// socket teardown and reconnect.
 fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
-    // The daemon sends an `AcpBroadcastFrame` JSON object or a
-    // `{ "kind": ... }` control frame. A real frame never carries `kind`
-    // (its serializer emits only session_id/seq/event), so the key's
-    // presence alone marks a control frame, whatever its value.
-    // `Option<Option<_>>` with the helper below tells an absent `kind` apart
-    // from a present-but-null one: only absence means "event frame".
+    // An event frame serializes only session_id/seq/event, so the presence of
+    // `kind` alone marks a control frame. `Option<Option<_>>` tells an absent
+    // `kind` apart from a present-but-null one.
     #[derive(serde::Deserialize)]
     struct KindProbe {
         #[serde(default, deserialize_with = "present")]
@@ -346,9 +341,7 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
         let kind = kind.unwrap_or(serde_json::Value::Null);
         match kind.as_str() {
             Some("lagged") => return Ok(Some(WsMessage::Lagged)),
-            // App-level keepalive (#2287). A real frame always carries
-            // `session_id`/`seq`/`event` and never a `kind`, so this
-            // cannot shadow one.
+            // App-level keepalive (#2287).
             Some("heartbeat") => return Ok(None),
             // Server-folded transcript rows (Tier 4). The connect snapshot
             // carries every row; each live event carries its row delta.
@@ -373,10 +366,8 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
                     unchanged: frame.unchanged,
                 }));
             }
-            // A control frame this build does not consume, typically a
-            // sentinel a newer daemon grew. Dropping it is safe: the
-            // projections above are re-sent on every event and on connect
-            // (#3560).
+            // A sentinel a newer daemon grew. Dropping it is safe: every
+            // projection above is re-sent on connect and on each event (#3560).
             _ => {
                 debug!(
                     target: "acp.client.ws",
@@ -502,9 +493,7 @@ mod tests {
 
     #[test]
     fn parse_text_reads_the_reduced_state_frame() {
-        // The whole control state rides on this frame, and the fields the
-        // sender omits must default rather than fail the parse: a parse error
-        // reads as a dead socket to the consumer.
+        // An omitted field must default: a parse error reads as a dead socket.
         let raw = serde_json::json!({
             "kind": "reduced_state",
             "session_id": "s-1",
@@ -561,12 +550,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn session_headers_carry_a_cached_passphrase_session() {
-        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
-        let dir = tempfile::tempdir().unwrap();
-        let passphrase_path = dir.path().join("serve.passphrase");
-        std::fs::write(&passphrase_path, "hunter2").unwrap();
-        let e = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::LocalDaemon)
-            .with_local_passphrase_path(passphrase_path);
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "hunter2")]);
+        let e = endpoint("http://127.0.0.1:8080", None);
         let cache = PassphraseSessionCache::default();
         cache.set_for_test(passphrase_session::PassphraseSession {
             cookie: "aoe_session=abc123".to_string(),

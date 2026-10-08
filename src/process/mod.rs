@@ -619,10 +619,8 @@ fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) 
     };
     match child.try_wait() {
         Ok(None) => true,
-        // A nonzero exit code (not a signal) means the helper itself failed to
-        // hold the lock; latch so the reconciler stops respawning a doomed
-        // child. Death by signal (`code() == None`) is an external kill of a
-        // live holder, so report not-held and let it respawn.
+        // A nonzero exit means the helper failed to hold the lock; death by signal is an
+        // external kill, so respawn.
         Ok(Some(status)) if status.code().is_some_and(|c| c != 0) => {
             latch_sleep_inhibit_unavailable(exit_reason);
             true
@@ -791,9 +789,7 @@ mod tests {
         let marker = format!("aoe_orphan_scan_marker_{}", std::process::id());
         let absent = format!("aoe_absent_scan_marker_{}", std::process::id());
 
-        // The marker rides as `$0` of a `sh` running a compound list, so sh
-        // does not exec-optimize away and stays alive (with the marker in
-        // argv) for the sleep.
+        // The marker rides as `$0` of a compound list so sh does not exec it away.
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("sleep 30; true")
@@ -1060,75 +1056,31 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_descendants_from_map_empty() {
-        let children_map = HashMap::new();
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-        assert_eq!(pids, vec![100]);
-    }
-
-    #[test]
-    fn test_collect_descendants_from_map_single_child() {
-        let mut children_map = HashMap::new();
-        children_map.insert(100, vec![101]);
-
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-        assert_eq!(pids, vec![100, 101]);
-    }
-
-    #[test]
-    fn test_collect_descendants_from_map_multiple_children() {
-        let mut children_map = HashMap::new();
-        children_map.insert(100, vec![101, 102, 103]);
-
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-        assert_eq!(pids, vec![100, 101, 102, 103]);
-    }
-
-    #[test]
-    fn test_collect_descendants_from_map_nested() {
-        // Tree: 100 -> 101 -> 102 -> 103
-        let mut children_map = HashMap::new();
-        children_map.insert(100, vec![101]);
-        children_map.insert(101, vec![102]);
-        children_map.insert(102, vec![103]);
-
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-        assert_eq!(pids, vec![100, 101, 102, 103]);
-    }
-
-    #[test]
-    fn test_collect_descendants_from_map_branching() {
-        // Tree: 100 -> [101, 102], 101 -> [103, 104], 102 -> [105]
-        let mut children_map = HashMap::new();
-        children_map.insert(100, vec![101, 102]);
-        children_map.insert(101, vec![103, 104]);
-        children_map.insert(102, vec![105]);
-
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-
-        assert!(pids.contains(&100));
-        assert!(pids.contains(&101));
-        assert!(pids.contains(&102));
-        assert!(pids.contains(&103));
-        assert!(pids.contains(&104));
-        assert!(pids.contains(&105));
-        assert_eq!(pids.len(), 6);
-    }
-
-    #[test]
-    fn test_collect_descendants_unrelated_processes() {
-        let mut children_map = HashMap::new();
-        children_map.insert(200, vec![201, 202]);
-        children_map.insert(300, vec![301]);
-
-        let mut pids = vec![100];
-        collect_descendants_from_map(100, &children_map, &mut pids);
-        assert_eq!(pids, vec![100]);
+    fn collect_descendants_from_map_walks_only_the_root_subtree() {
+        let cases: [(&[(u32, &[u32])], &[u32]); 6] = [
+            (&[], &[100]),
+            (&[(100, &[101])], &[100, 101]),
+            (&[(100, &[101, 102, 103])], &[100, 101, 102, 103]),
+            (
+                &[(100, &[101]), (101, &[102]), (102, &[103])],
+                &[100, 101, 102, 103],
+            ),
+            (
+                &[(100, &[101, 102]), (101, &[103, 104]), (102, &[105])],
+                &[100, 101, 102, 103, 104, 105],
+            ),
+            (&[(200, &[201, 202]), (300, &[301])], &[100]),
+        ];
+        for (edges, expected) in cases {
+            let children_map: HashMap<u32, Vec<u32>> = edges
+                .iter()
+                .map(|(parent, kids)| (*parent, kids.to_vec()))
+                .collect();
+            let mut pids = vec![100];
+            collect_descendants_from_map(100, &children_map, &mut pids);
+            pids.sort_unstable();
+            assert_eq!(pids, expected, "{edges:?}");
+        }
     }
 
     #[test]

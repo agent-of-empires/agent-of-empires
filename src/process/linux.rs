@@ -179,10 +179,7 @@ pub(super) fn sample_memory() -> super::metrics::MemorySample {
     let psi_io_some_avg10 =
         parse_psi_some_avg10(&fs::read_to_string("/proc/pressure/io").unwrap_or_default());
 
-    // Both figures must be known together: a 0 available against a real total
-    // reads as 100% used, a false Critical. Old kernels (and WSL1) omit
-    // MemAvailable, so require both and otherwise report "unknown" (0/0), which
-    // the renderer shows as counts-only.
+    // Old kernels and WSL1 omit MemAvailable; report unknown rather than a false 100% used.
     let (total_bytes, available_bytes) = match (total, avail) {
         (Some(t), Some(a)) => (t, a),
         _ => (0, 0),
@@ -333,9 +330,7 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
         return None;
     }
 
-    // Skip-and-continue on any unreadable or non-PID entry (a process can
-    // exit between readdir and the stat read); aborting the whole scan on
-    // one transient entry would silently fall back to the shell PID.
+    // A process can exit mid-scan; skip it rather than abort to the shell pid.
     for entry in fs::read_dir(proc_dir).ok()?.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -424,20 +419,14 @@ impl super::SleepInhibit for SystemdInhibitor {
             }
             Err(e) => return Err(e.into()),
         };
-        // Retain the piped stdin: `systemd-inhibit` holds the lock only while
-        // the wrapped `cat` runs, and `cat` runs until its stdin hits EOF.
-        // Dropping this handle early sends EOF and releases the lock at once,
-        // so it stays owned for the whole assertion.
+        // `systemd-inhibit` holds the lock only while `cat` runs, which ends at stdin EOF.
         self.stdin = child.stdin.take();
         self.child = Some(child);
         Ok(())
     }
 
     fn release(&mut self) {
-        // Close our stdin fd (cat sees EOF), then SIGKILL as a guaranteed
-        // fallback: logind releases the lock on the holder's death by any
-        // cause, and an uncatchable kill means `wait` cannot wedge on a stuck
-        // child. Then reap.
+        // logind releases the lock when the holder dies by any cause.
         self.stdin = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();

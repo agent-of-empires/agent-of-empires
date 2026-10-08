@@ -71,9 +71,8 @@ pub async fn send_message(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    // Terminal keystroke injection: CityHall sessions are structured-view only
-    // (the composer drives the agent via the ACP prompt route), so close this
-    // explicitly rather than leaning on the downstream StructuredView error.
+    // Terminal keystroke injection: CityHall sessions are structured-view only,
+    // so close this explicitly rather than leaning on the downstream error.
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
     }
@@ -90,22 +89,14 @@ pub async fn send_message(
             .into_response();
     }
 
-    // Serialize concurrent sends (and other tmux mutations) for this id.
-    // Without this, two POSTs racing against the same session would issue
-    // overlapping `tmux send-keys -l` invocations and the bytes can interleave
-    // inside the pane.
+    // Serialize concurrent sends (and other tmux mutations) for this id, or two
+    // racing POSTs interleave their bytes inside the pane.
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+    let Some(instance) = crate::server::api::find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
     // Covers `revive: false` and a live pane too; an archived session takes no input.
     if let Err(blocked) = instance.ensure_startable() {
@@ -117,21 +108,14 @@ pub async fn send_message(
     let message = req.message;
     let revive = req.revive;
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
-        // Revive the pane before sending. Without this, a send to a dead
-        // pane silently writes keystrokes to a corpse with no agent.
-        // Skipped when the caller opts out via `revive: false`.
+        // Revive the pane before sending, unless the caller opted out: a send
+        // to a dead pane silently writes keystrokes to a corpse.
         //
-        // The closure surfaces both `inst_owned` AND the
-        // `EnsureReadyOutcome` on the Err arm so the caller can sync
-        // post-resume-path mutations (`agent_session_id`, failure marker,
-        // and `retroactive_capture_excludes`) back to live state regardless
-        // of which failure path fires. The
-        // outcome lets the caller distinguish cascade-fired
-        // (`Respawned`/`Started`) from the no-op `AlreadyAlive` path
-        // so a sync only happens when there's actual cascade state to
-        // propagate; this avoids clobbering live `last_error` on the
-        // `revive=false + NotRunning` path where `started` is
-        // unmutated.
+        // The Err arm surfaces both `inst_owned` and the `EnsureReadyOutcome`,
+        // so the caller can sync post-resume-path mutations back to live state
+        // whichever failure path fires, and can tell a cascade-fired outcome
+        // from the no-op `AlreadyAlive` one. Without that split, the
+        // `revive=false + NotRunning` path would clobber live `last_error`.
         let mut inst_owned = instance;
         let outcome = if revive {
             match inst_owned.ensure_pane_ready() {
@@ -143,16 +127,12 @@ pub async fn send_message(
                         EnsureReadyError::Blocked(b) => SendKeysError::Blocked(b),
                         EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
                     };
-                    // ensure_pane_ready did not mutate user-visible
-                    // state via the outcome path. Tag as AlreadyAlive
-                    // so the outer match's `did_work` flag stays
-                    // false. `EnsureReadyError::Tmux` may be either
-                    // pre-cascade (tmux_session() / start_with_size
-                    // subprocess failure: `inst_owned` unmutated) or
-                    // post-resume-path (mutations committed).
-                    // The Tmux outer arm syncs unconditionally and
-                    // covers both shapes; the others (Transient /
-                    // StructuredView) bail before any mutation.
+                    // Tagged AlreadyAlive because ensure_pane_ready did not
+                    // mutate user-visible state here, keeping the outer
+                    // `did_work` flag false. `EnsureReadyError::Tmux` covers
+                    // both an unmutated pre-cascade failure and a committed
+                    // post-resume-path one, so its outer arm syncs
+                    // unconditionally; the others bail before any mutation.
                     return Err(Box::new((
                         inst_owned,
                         EnsureReadyOutcome::AlreadyAlive,
@@ -251,20 +231,17 @@ pub async fn send_message(
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;
-            // ensure_pane_ready did mutate state when the outcome is
-            // anything other than AlreadyAlive. `Started` and `Respawned`
-            // touch fields the live entry needs to reflect (fresh sid from
-            // acquire, last_start_time, etc.). Sync only when work happened.
+            // Anything other than AlreadyAlive means ensure_pane_ready touched
+            // fields the live entry needs (fresh sid, last_start_time), so sync
+            // only when work happened.
             let did_work = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             match send_err {
                 SendKeysError::NotRunning => {
-                    // External kill or remain-on-exit-off crash can race
-                    // ensure_pane_ready's Alive decision against the
-                    // tmux_session.exists() check. Propagate resume-path
-                    // state when applicable; use the narrow sync helper to
-                    // leave status and last_error untouched (NotRunning is
-                    // recoverable; `started.status = Starting` from
-                    // finalize_launch would briefly mis-paint a broken pane).
+                    // An external kill or a remain-on-exit-off crash can race
+                    // ensure_pane_ready's Alive decision. Use the narrow sync
+                    // helper so status and last_error stay untouched: NotRunning
+                    // is recoverable, and `Starting` from finalize_launch would
+                    // briefly mis-paint a broken pane.
                     if did_work {
                         let mut instances = state.instances.write().await;
                         if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
@@ -328,15 +305,12 @@ pub async fn send_message(
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();
-                    // Sync cascade-mutated fields back to live state. Mirror
-                    // `ensure_session`'s Err arm: full sync, then override
-                    // `status` and `last_error` so observers don't see
-                    // `Status::Starting` (set by `finalize_launch`) on a
-                    // broken session. Tmux Err is the
-                    // catch-all for both pre-cascade tmux failures (where
-                    // `started` is unmutated and the sync is a no-op) and
-                    // post-resume-path failures (where durable resume state
-                    // must be copied back from the clone).
+                    // Mirror `ensure_session`'s Err arm: full sync, then
+                    // override `status` and `last_error` so observers do not see
+                    // `Status::Starting` on a broken session. Tmux Err is the
+                    // catch-all for both an unmutated pre-cascade failure and a
+                    // post-resume-path one whose durable state must be copied
+                    // back from the clone.
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                         if apply_post_restart_sync(i, &sync_base, &started) {
@@ -409,7 +383,7 @@ fn write_paste_image(
 ) -> std::io::Result<(std::path::PathBuf, String)> {
     let dir = std::path::Path::new(project_path).join(PASTE_IMAGE_DIR);
     std::fs::create_dir_all(&dir)?;
-    // A `.gitignore` of `*` also ignores itself, so the whole directory stays
+    // A `.gitignore` of `*` also ignores itself, so the directory stays
     // invisible to `git add` with no git subprocess.
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
@@ -459,9 +433,9 @@ pub async fn paste_image(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    // Allowed for the CityHall composer, but only against a structured
-    // session: a plain/terminal target would let a locked-down client write
-    // into another session's worktree.
+    // Allowed for the CityHall composer, but only against a structured session:
+    // a terminal target would let a locked-down client write into another
+    // session's worktree.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -470,15 +444,9 @@ pub async fn paste_image(
         Err(rej) => return rej.into_response(),
     };
 
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+    let Some(instance) = crate::server::api::find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
     let bytes = match base64::engine::general_purpose::STANDARD.decode(req.data.as_bytes()) {
         Ok(b) => b,
@@ -587,8 +555,8 @@ pub async fn read_output(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<OutputQuery>,
 ) -> impl IntoResponse {
-    // Raw terminal pane content: CityHall hides the terminal UI + WS relay, so
-    // this read must be closed too or the pane is reachable by session id.
+    // Raw terminal pane content: CityHall hides the terminal UI and WS relay,
+    // so this read must be closed too.
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
     }
@@ -608,15 +576,9 @@ pub async fn read_output(
         }
     };
 
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+    let Some(instance) = crate::server::api::find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
     let capture_result = tokio::task::spawn_blocking(move || -> Result<String, CaptureError> {
         let tmux_session = instance.tmux_session().map_err(CaptureError::Tmux)?;

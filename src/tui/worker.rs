@@ -93,19 +93,6 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         self.result_rx.try_recv()
     }
 
-    #[cfg(test)]
-    pub(crate) fn finish_for_test(self) -> thread::Result<()> {
-        let Self {
-            request_tx,
-            result_rx,
-            _handle,
-            ..
-        } = self;
-        drop(request_tx);
-        let result = _handle.join();
-        drop(result_rx);
-        result
-    }
     /// Test-only worker with one pre-seeded result; requests are ignored.
     #[cfg(test)]
     pub(crate) fn seeded_for_test(thread_name: &str, result: Res) -> Self {

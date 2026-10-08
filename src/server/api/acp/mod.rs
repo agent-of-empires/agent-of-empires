@@ -14,7 +14,7 @@ use crate::acp::supervisor::{SpawnRequest, SupervisorError};
 use crate::server::AppState;
 
 use super::cityhall_block;
-pub(crate) use super::read_only_block;
+use super::read_only_block;
 
 mod attachments;
 mod config;

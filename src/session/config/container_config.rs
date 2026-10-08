@@ -1707,14 +1707,10 @@ pub(crate) fn compute_volume_paths_with_resolve(
     project_path: &Path,
     project_path_str: &str,
 ) -> Result<(Vec<VolumeMount>, String, MountResolve)> {
-    // Only look for a main repo if the project path itself has a .git entry (file or
-    // directory). This prevents git2::Repository::discover from walking up the directory
-    // tree and finding an unrelated ancestor repo (e.g., a dotfile-managed home directory),
-    // which would cause aoe to mount that ancestor -- potentially the user's entire $HOME --
-    // into the container.
-    //
-    // Legitimate git repos have a .git directory; worktrees have a .git file containing a
-    // gitdir pointer. Both cases are covered by this check.
+    // Only look for a main repo when the project path itself has a `.git` entry:
+    // a repo has a directory, a worktree a file holding a gitdir pointer. Without
+    // the check `Repository::discover` walks up into an unrelated ancestor repo
+    // (a dotfile-managed home) and mounts the whole of $HOME into the container.
     if project_path.join(".git").exists() {
         if let Ok(main_repo) = GitWorktree::find_main_repo(project_path) {
             // Canonicalize paths for reliable comparison (handles symlinks like /tmp -> /private/tmp)
@@ -2552,13 +2548,11 @@ pub(crate) fn build_container_config(
     );
     let config_tool = active_agent.map_or(agent_selection.tool, |agent| agent.name);
 
-    // Determine mount path(s) and working directory.
-    // For multi-repo workspaces, mount the workspace dir and all main repos.
-    // For bare repo worktrees, mount the entire bare repo and set working_dir to the worktree.
-    // For sibling worktrees, mount the main repo and worktree as separate volumes.
-    // A workspace resolve is always Resolved: compute_workspace_volume_paths derives
-    // its mounts from the stored `main_repo_path` of each repo and never consults
-    // `find_main_repo`, so it has no degraded fallback to report.
+    // A workspace mounts its own dir plus every main repo, a bare-repo worktree
+    // mounts the whole bare repo with working_dir inside it, and a sibling
+    // worktree mounts the main repo and the worktree separately. A workspace
+    // resolve is always Resolved: it derives mounts from each repo's stored
+    // `main_repo_path` and never falls back to `find_main_repo`.
     let (project_volumes, workspace_path, mount_resolve) = if let Some(ws_info) = workspace_info {
         let (volumes, path) = compute_workspace_volume_paths(project_path, ws_info)?;
         (volumes, path, MountResolve::Resolved)
@@ -3777,9 +3771,8 @@ mod tests {
             return;
         }
 
-        // AoE's create_worktree converts .git to relative paths via
-        // convert_git_file_to_relative. Replicate that here since we
-        // called git directly.
+        // AoE's create_worktree rewrites .git to a relative gitdir; calling git
+        // directly does not, so replicate it.
         let git_file = worktree_path.join(".git");
         let content = fs::read_to_string(&git_file).unwrap();
         let abs_path = content

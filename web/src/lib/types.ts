@@ -10,6 +10,7 @@ export interface SessionResponse {
   /** Host path of the session's managed artifact directory. */
   artifact_dir: string;
   group_path: string;
+  sort_index?: number | null;
   tool: string;
   status: SessionStatus;
   /** Worker auto-stopped for inactivity (resumable), unlike a deliberate Stop. */

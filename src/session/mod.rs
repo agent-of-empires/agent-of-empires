@@ -80,7 +80,7 @@ pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{
     duplicate_session_error, is_duplicate_session, PassiveStatusPatch, ResumeIntent, SidWrite,
-    ToolLaunchUnavailable, NEWER_GENERATION_BUSY_REASON,
+    ToolLaunchUnavailable,
 };
 pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
@@ -89,11 +89,12 @@ pub(crate) use instance::{
 pub use instance::{
     is_valid_session_color, AuxiliaryObservation, AuxiliaryTarget, ConversationBinding,
     ConversationProvenance, DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding,
-    ExecutionLocation, Instance, LaunchSidOutcome, LifecycleOperation, LifecycleReservation,
-    LifecycleReservationError, PaneObservation, PanePresence, PendingInitialTurn,
-    PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket, SessionGone, StartBlocked,
-    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
+    ExecutionLocation, Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity,
+    LifecycleOperation, LifecycleReservation, LifecycleReservationError, PaneObservation,
+    PanePresence, PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo,
+    SessionBucket, SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
+    TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions,
@@ -106,7 +107,9 @@ pub(crate) use move_journal::{
 pub(crate) use storage::acquire_session_identity_lock;
 #[cfg(test)]
 pub(crate) use storage::observe_lock_contention_for_test;
-pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
+pub(crate) use storage::{
+    duplicate_reports, reconcile_profile_duplicates, DuplicateIdReport, ProfileMovePlan,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -164,11 +167,11 @@ pub use scope::SessionScope;
 #[cfg(test)]
 pub(crate) use storage::migration_backups;
 pub(crate) use storage::{
-    acquire_open_storage_flock, acquire_session_title_lock, acquire_storage_flock,
-    acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
-    replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
-    GroupMovePlan, LaunchConfig, NativeStoreUnavailable, ProfileMoveRejected, SessionMutation,
-    SessionStore, StorageFlock, StorageTransition, STORAGE_LOCK_FILENAME,
+    acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
+    backup_before_migration, read_file_no_follow, replace_file_no_follow, resolve_symlink_chain,
+    try_acquire_storage_flock, CaptureStorage, GroupMovePlan, LaunchConfig, NativeStoreUnavailable,
+    ProfileMoveRejected, SessionCommitApplied, SessionMutation, SessionStore, StorageFlock,
+    StorageTransition, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
@@ -407,9 +410,8 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     };
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
-        // Only a name about to be created runs the strict grammar; an
-        // existing directory still opens, so older malformed profiles stay
-        // listable and deletable.
+        // Only a name about to be created runs the strict grammar; an existing directory still
+        // opens, so older malformed profiles stay listable and deletable.
         validate_new_profile_name(profile_name)?;
         fs::create_dir_all(&dir)?;
     }
@@ -467,10 +469,7 @@ pub fn resolve_existing_profile(profile: &str) -> Result<String> {
 }
 
 pub fn list_profiles() -> Result<Vec<String>> {
-    // Test-only failure injection: when set, the next call returns
-    // Err and the flag clears. Used by the file-watch regression test
-    // that locks the rewire-after-mutation error-handling path
-    // without requiring a platform-fragile permission denial.
+    // Test-only failure injection: when set, the next call returns Err and the flag clears.
     #[cfg(test)]
     if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
         anyhow::bail!("list_profiles failure injected for test");
@@ -681,9 +680,7 @@ fn validate_profile_name(name: &str) -> Result<()> {
     if name.eq_ignore_ascii_case("all") {
         anyhow::bail!("Profile name 'all' is reserved");
     }
-    // Unix Path treats `\` as a regular byte, so backslashes pass the
-    // components check below. Reject them explicitly so the validator
-    // behaves the same on every host the binary might land on.
+    // Unix Path treats `\` as a regular byte, so backslashes pass the components check below.
     if name.contains('\\') {
         anyhow::bail!("Profile name cannot contain path separators");
     }
@@ -976,11 +973,9 @@ fn collect_startup_warnings(profile: &str, class: WarningClass) -> Option<String
     } else {
         profile.to_string()
     };
-    // Non-creating resolver: `get_profile_config_path` goes through the
-    // creating `get_profile_dir`, so naming an unknown profile (`aoe list -p
-    // ghost`) would birth `profiles/ghost/` here, before the command's own
-    // `resolve_existing_profile` gets to reject it. See
-    // `tests/e2e/profile_lazy_creation.rs`.
+    // Non-creating resolver: `get_profile_config_path` goes through the creating `get_profile_dir`,
+    // so naming an unknown profile (`aoe list -p ghost`) would birth `profiles/ghost/` here, before
+    // the command's own `resolve_existing_profile` gets to reject it.
     let profile_path_display = get_profile_dir_path(&effective)
         .map(|p| p.join("config.toml").display().to_string())
         .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));

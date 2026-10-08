@@ -22,6 +22,121 @@ import type {
 import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 
+type Payload = Record<string, unknown>;
+
+interface Reply {
+  ok: boolean;
+  status: number;
+  /** Parsed JSON body, or null when the body is not JSON. */
+  payload: Payload | null;
+}
+
+type Failure = { kind: "error"; message: string };
+
+async function send(url: string, init?: RequestInit): Promise<Reply> {
+  const res = await fetch(url, init);
+  const payload = (await res.json().catch(() => null)) as Payload | null;
+  return { ok: res.ok, status: res.status, payload };
+}
+
+async function fetchOk(url: string, init?: RequestInit): Promise<boolean> {
+  try {
+    return (await fetch(url, init)).ok;
+  } catch {
+    return false;
+  }
+}
+
+const jsonInit = (method: string, body?: unknown, headers: Record<string, string> = {}): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json", ...headers },
+  body: JSON.stringify(body),
+});
+
+const ACCEPT_JSON = { Accept: "application/json" };
+
+const stringField = (payload: Payload | null | undefined, key: string): string | undefined =>
+  typeof payload?.[key] === "string" ? (payload[key] as string) : undefined;
+
+const rawMessage = (payload: Payload | null | undefined) => payload?.message as string | undefined;
+
+const networkError = (e: unknown) => `Network error: ${e instanceof Error ? e.message : "connection failed"}`;
+
+async function kindRequest<Ok>(
+  url: string,
+  init: RequestInit,
+  toOk: (payload: Payload) => Ok | null,
+  fallback: string | ((status: number) => string),
+): Promise<Ok | Failure> {
+  const reply = await send(url, init).catch(() => null);
+  if (!reply) return { kind: "error", message: "Network error." };
+  const ok = reply.ok && reply.payload ? toOk(reply.payload) : null;
+  if (ok) return ok;
+  const message =
+    stringField(reply.payload, "message") ??
+    (typeof fallback === "string" ? `${fallback} (HTTP ${reply.status}).` : fallback(reply.status));
+  return { kind: "error", message };
+}
+
+async function okWithMessage(url: string, init: RequestInit): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(url, init);
+    if (res.ok) return { ok: true };
+    const payload = (await res.json().catch(() => null)) as Payload | null;
+    return { ok: false, message: stringField(payload, "message") };
+  } catch {
+    return { ok: false };
+  }
+}
+
+async function withBindingSecret<T extends { ok: boolean; error?: string }>(
+  unavailable: string,
+  request: (secret: string) => Promise<T>,
+): Promise<T | { ok: false; error: string }> {
+  let secret: string;
+  try {
+    secret = getOrCreateDeviceBindingSecret();
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : unavailable };
+  }
+  try {
+    return await request(secret);
+  } catch {
+    return { ok: false, error: "Network error" };
+  }
+}
+
+async function skillRequest<T extends { ok: boolean; error?: string; status?: number }>(
+  url: string,
+  init: RequestInit,
+  onOk: (payload: Payload) => Omit<T, "ok" | "status">,
+  failureExtra: Partial<T> = {},
+): Promise<T> {
+  try {
+    const res = await fetch(url, init);
+    const payload = (await res.json().catch(() => ({}))) as Payload;
+    if (!res.ok) {
+      return {
+        ...failureExtra,
+        ok: false,
+        error: (payload.message as string | undefined) ?? `Server error (${res.status})`,
+        status: res.status,
+      } as T;
+    }
+    return { ok: true, ...onOk(payload), status: res.status } as T;
+  } catch (e) {
+    return { ok: false, ...failureExtra, error: networkError(e) } as T;
+  }
+}
+
+const queuePath = (sessionId: string, promptId?: string) =>
+  `/api/sessions/${encodeURIComponent(sessionId)}/queue${promptId === undefined ? "" : `/${encodeURIComponent(promptId)}`}`;
+
+const sessionUpdate = (id: string, action: string, init: RequestInit) =>
+  fetchJson<SessionResponse>(`/api/sessions/${id}/${action}`, init);
+
+const mcpPath = (name: string, action: string) => `/api/mcp/servers/${encodeURIComponent(name)}/${action}`;
+
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> {
   try {
@@ -90,17 +205,14 @@ export interface ConversationSearchHit {
   match_count: number;
 }
 
-interface ConversationSearchResponse {
-  results: ConversationSearchHit[];
-}
-
 // Full-text search over session conversation content. Returns one hit per
 // matching session, newest first. `signal` lets the caller abort a stale
 // in-flight search when the query changes.
 export async function searchConversations(query: string, signal?: AbortSignal): Promise<ConversationSearchHit[]> {
-  const res = await fetchJson<ConversationSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(query)}`, {
-    signal,
-  });
+  const res = await fetchJson<{ results: ConversationSearchHit[] }>(
+    `/api/sessions/search?q=${encodeURIComponent(query)}`,
+    { signal },
+  );
   return res?.results ?? [];
 }
 
@@ -126,12 +238,7 @@ export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
 
 export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
   try {
-    const res = await fetch("/api/workspace-ordering", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ order }),
-    });
-    return res.ok;
+    return await fetchOk("/api/workspace-ordering", jsonInit("PUT", { order }));
   } catch {
     return false;
   }
@@ -215,14 +322,11 @@ function fileToBase64(file: File): Promise<string> {
 export async function pasteImage(id: string, file: File): Promise<string | null> {
   try {
     const data = await fileToBase64(file);
-    const res = await fetch(`/api/sessions/${id}/paste-image`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mime_type: file.type, data }),
-    });
-    if (!res.ok) return null;
-    const body = await res.json().catch(() => ({}));
-    return typeof body.path === "string" ? body.path : null;
+    const body = await fetchJson<Payload>(
+      `/api/sessions/${id}/paste-image`,
+      jsonInit("POST", { mime_type: file.type, data }),
+    );
+    return stringField(body, "path") ?? null;
   } catch {
     return null;
   }
@@ -233,10 +337,7 @@ export async function pasteImage(id: string, file: File): Promise<string | null>
  *  from the web UI (the server rejects it); closing that tab only hides it. */
 export async function killTerminal(id: string, index: number): Promise<boolean> {
   try {
-    const res = await fetch(`/api/sessions/${id}/terminal?index=${index}`, {
-      method: "DELETE",
-    });
-    return res.ok;
+    return await fetchOk(`/api/sessions/${id}/terminal?index=${index}`, { method: "DELETE" });
   } catch {
     return false;
   }
@@ -451,15 +552,6 @@ export function fetchPluginCommands(): Promise<PluginCommandsResponse | null> {
   return fetchJson<PluginCommandsResponse>("/api/plugins/commands");
 }
 
-function isValidPluginListResponse(payload: unknown): payload is PluginListResponse {
-  return (
-    typeof payload === "object" &&
-    payload !== null &&
-    Array.isArray((payload as Record<string, unknown>).plugins) &&
-    Array.isArray((payload as Record<string, unknown>).load_errors)
-  );
-}
-
 /** One plugin's update status (`GET /api/plugins/updates`). An on-demand
  *  network check, kept off the always-on plugin list. `available` is a short
  *  commit for an outdated GitHub source, "modified" for a changed local tree,
@@ -480,14 +572,12 @@ export type PluginUpdatesResult = { kind: "ok"; updates: PluginUpdateStatus[] } 
  *  silently doing nothing on an HTTP/network/JSON error. */
 export async function fetchPluginUpdates(): Promise<PluginUpdatesResult> {
   try {
-    const res = await fetch("/api/plugins/updates", { headers: { Accept: "application/json" } });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && Array.isArray(payload.updates)) {
-      return { kind: "ok", updates: payload.updates as PluginUpdateStatus[] };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Update check failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
+    return await kindRequest(
+      "/api/plugins/updates",
+      { headers: ACCEPT_JSON },
+      (p) => (Array.isArray(p.updates) ? { kind: "ok" as const, updates: p.updates as PluginUpdateStatus[] } : null),
+      "Update check failed",
+    );
   } catch {
     return { kind: "error", message: "Network error." };
   }
@@ -516,16 +606,12 @@ export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | 
 export async function discoverPlugins(query: string): Promise<DiscoverResult> {
   const qs = query.trim() ? `?q=${encodeURIComponent(query.trim())}` : "";
   try {
-    const res = await fetch(`/api/plugins/discover${qs}`, {
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && Array.isArray(payload.results)) {
-      return { kind: "ok", results: payload.results as PluginDiscoveryResult[] };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Discovery failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
+    return await kindRequest(
+      `/api/plugins/discover${qs}`,
+      { headers: ACCEPT_JSON },
+      (p) => (Array.isArray(p.results) ? { kind: "ok" as const, results: p.results as PluginDiscoveryResult[] } : null),
+      "Discovery failed",
+    );
   } catch {
     return { kind: "error", message: "Network error." };
   }
@@ -564,16 +650,12 @@ export type PluginDetailResult = { kind: "ok"; detail: PluginDetail } | { kind: 
  *  Only gh:owner/repo sources are supported server-side. */
 export async function fetchPluginDetails(source: string): Promise<PluginDetailResult> {
   try {
-    const res = await fetch(`/api/plugins/details?source=${encodeURIComponent(source)}`, {
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.source === "string") {
-      return { kind: "ok", detail: payload as unknown as PluginDetail };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Details failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
+    return await kindRequest(
+      `/api/plugins/details?source=${encodeURIComponent(source)}`,
+      { headers: ACCEPT_JSON },
+      (p) => (typeof p.source === "string" ? { kind: "ok" as const, detail: p as unknown as PluginDetail } : null),
+      "Details failed",
+    );
   } catch {
     return { kind: "error", message: "Network error." };
   }
@@ -638,7 +720,7 @@ export type PluginUpdatePreviewResult =
  *  server response is rejected rather than passed on: a safe_update must carry a
  *  string fingerprint (else the apply would send no pin) and a consent_required
  *  must carry a consent object (else the modal path would blow up). */
-function isValidPreview(payload: Record<string, unknown>): payload is PluginUpdatePreview {
+function isValidPreview(payload: Payload): payload is PluginUpdatePreview {
   switch (payload.kind) {
     case "no_update":
       return true;
@@ -655,18 +737,12 @@ function isValidPreview(payload: Record<string, unknown>): payload is PluginUpda
  *  When consent is required the payload carries the full disclosure. */
 export async function previewPluginUpdate(id: string): Promise<PluginUpdatePreviewResult> {
   try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/preview`, {
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && isValidPreview(payload)) {
-      return { kind: "ok", preview: payload };
-    }
-    const message =
-      typeof payload?.message === "string"
-        ? (payload.message as string)
-        : `Update preview failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
+    return await kindRequest(
+      `/api/plugins/${encodeURIComponent(id)}/update/preview`,
+      { headers: ACCEPT_JSON },
+      (p) => (isValidPreview(p) ? { kind: "ok" as const, preview: p } : null),
+      "Update preview failed",
+    );
   } catch {
     return { kind: "error", message: "Network error." };
   }
@@ -709,20 +785,15 @@ export type PluginInstallPreviewResult =
  *  installing. Backs the install consent modal. */
 export async function previewPluginInstall(source: string): Promise<PluginInstallPreviewResult> {
   try {
-    const res = await fetch("/api/plugins/install/preview", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ source }),
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.fingerprint === "string") {
-      return { kind: "ok", consent: payload as unknown as PluginInstallConsent };
-    }
-    const message =
-      typeof payload?.message === "string"
-        ? (payload.message as string)
-        : `Install preview failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
+    return await kindRequest(
+      "/api/plugins/install/preview",
+      jsonInit("POST", { source }, ACCEPT_JSON),
+      (p) =>
+        typeof p.fingerprint === "string"
+          ? { kind: "ok" as const, consent: p as unknown as PluginInstallConsent }
+          : null,
+      "Install preview failed",
+    );
   } catch {
     return { kind: "error", message: "Network error." };
   }
@@ -734,18 +805,12 @@ export type PluginJobStartResult = { kind: "ok"; jobId: string } | { kind: "erro
 
 async function startPluginJob(url: string, body: unknown): Promise<PluginJobStartResult> {
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.job_id === "string") {
-      return { kind: "ok", jobId: payload.job_id as string };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Request failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
+    return await kindRequest(
+      url,
+      jsonInit("POST", body, ACCEPT_JSON),
+      (p) => (typeof p.job_id === "string" ? { kind: "ok" as const, jobId: p.job_id } : null),
+      "Request failed",
+    );
   } catch {
     return { kind: "error", message: "Network error." };
   }
@@ -792,16 +857,15 @@ export type PluginJobResult = { kind: "ok"; job: PluginJob } | { kind: "error"; 
  *  a daemon restart) from a transient failure worth retrying. */
 export async function fetchPluginJob(jobId: string, tail = 200): Promise<PluginJobResult> {
   try {
-    const res = await fetch(`/api/plugins/jobs/${encodeURIComponent(jobId)}?tail=${tail}`, {
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.job === "object" && payload.job !== null) {
+    const reply = await send(`/api/plugins/jobs/${encodeURIComponent(jobId)}?tail=${tail}`, {
+      headers: ACCEPT_JSON,
+    }).catch(() => null);
+    if (!reply) return { kind: "error", status: 0, message: "Network error." };
+    const { ok, status, payload } = reply;
+    if (ok && typeof payload?.job === "object" && payload.job !== null) {
       return { kind: "ok", job: payload as unknown as PluginJob };
     }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Job status failed (HTTP ${res.status}).`;
-    return { kind: "error", status: res.status, message };
+    return { kind: "error", status, message: stringField(payload, "message") ?? `Job status failed (HTTP ${status}).` };
   } catch {
     return { kind: "error", status: 0, message: "Network error." };
   }
@@ -813,18 +877,10 @@ export type PluginDismissResult = { kind: "ok" } | { kind: "error"; message: str
  *  next version. */
 export async function dismissPluginUpdate(id: string, fingerprint: string): Promise<PluginDismissResult> {
   try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/dismiss`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fingerprint }),
-    });
-    if (res.ok) {
-      return { kind: "ok" };
-    }
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Dismiss failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/dismiss`, jsonInit("POST", { fingerprint }));
+    if (res.ok) return { kind: "ok" };
+    const payload = (await res.json().catch(() => null)) as Payload | null;
+    return { kind: "error", message: stringField(payload, "message") ?? `Dismiss failed (HTTP ${res.status}).` };
   } catch {
     return { kind: "error", message: "Network error." };
   }
@@ -893,20 +949,15 @@ export function fetchPluginUiState(): Promise<PluginUiState | null> {
 
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
   try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/enabled`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && isValidPluginListResponse(payload)) {
-      return { kind: "ok", data: payload };
-    }
-    const message =
-      typeof payload?.message === "string"
-        ? (payload.message as string)
-        : `Failed to ${enabled ? "enable" : "disable"} plugin (${res.status}).`;
-    return { kind: "error", message };
+    return await kindRequest(
+      `/api/plugins/${encodeURIComponent(id)}/enabled`,
+      jsonInit("POST", { enabled }),
+      (p) =>
+        Array.isArray(p.plugins) && Array.isArray(p.load_errors)
+          ? { kind: "ok" as const, data: p as unknown as PluginListResponse }
+          : null,
+      (status) => `Failed to ${enabled ? "enable" : "disable"} plugin (${status}).`,
+    );
   } catch {
     return { kind: "error", message: "Network error." };
   }
@@ -936,17 +987,15 @@ export async function invokePluginAction(
   params: Record<string, unknown> = {},
 ): Promise<PluginActionAccepted | null> {
   try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ method, params, session_id: sessionId ?? null }),
-    });
+    const res = await fetch(
+      `/api/plugins/${encodeURIComponent(pluginId)}/action`,
+      jsonInit("POST", { method, params, session_id: sessionId ?? null }),
+    );
     if (!res.ok) return null;
-    const body = (await res.json().catch(() => null)) as { baseline_revision?: unknown } | null;
-    // A missing baseline (older daemon) is a sentinel, not revision 0: 0 would
-    // wedge the spinner until timeout since the polled revision is also 0.
-    const rev = typeof body?.baseline_revision === "number" ? body.baseline_revision : null;
-    return { baselineRevision: rev };
+    const payload = (await res.json().catch(() => null)) as Payload | null;
+    // A missing baseline is a sentinel, not revision 0, which would wedge the spinner.
+    const revision = payload?.baseline_revision;
+    return { baselineRevision: typeof revision === "number" ? revision : null };
   } catch {
     return null;
   }
@@ -962,12 +1011,10 @@ export async function invokePluginAction(
  */
 export async function invokePluginCommand(fqid: string, sessionId: string): Promise<boolean> {
   try {
-    const res = await fetch(`/api/plugins/commands/${encodeURIComponent(fqid)}/invoke`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId }),
-    });
-    return res.ok;
+    return await fetchOk(
+      `/api/plugins/commands/${encodeURIComponent(fqid)}/invoke`,
+      jsonInit("POST", { session_id: sessionId }),
+    );
   } catch {
     return false;
   }
@@ -995,12 +1042,7 @@ export function updateMachineSettings(updates: Record<string, unknown>): Promise
  */
 export async function updateTheme(patch: { name?: string; color_mode?: string }): Promise<boolean> {
   try {
-    const res = await fetch("/api/theme", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    return res.ok;
+    return await fetchOk("/api/theme", jsonInit("PATCH", patch));
   } catch {
     return false;
   }
@@ -1015,10 +1057,7 @@ export async function updateTheme(patch: { name?: string; color_mode?: string })
  */
 export async function markWebTourSeen(): Promise<boolean> {
   try {
-    const res = await fetch("/api/app-state/web-tour-seen", {
-      method: "POST",
-    });
-    return res.ok;
+    return await fetchOk("/api/app-state/web-tour-seen", { method: "POST" });
   } catch {
     return false;
   }
@@ -1050,12 +1089,7 @@ export function fetchTips(): Promise<TipsResponse | null> {
  *  {@link markWebTourSeen}: off the elevation wall, blocked on read-only. */
 export async function markTipSeen(id: string): Promise<boolean> {
   try {
-    const res = await fetch("/api/app-state/tip-seen", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id }),
-    });
-    return res.ok;
+    return await fetchOk("/api/app-state/tip-seen", jsonInit("POST", { id }));
   } catch {
     return false;
   }
@@ -1066,12 +1100,7 @@ export async function markTipSeen(id: string): Promise<boolean> {
  *  elevation wall. Returns false on read-only (403) or network failure. */
 export async function setShowTips(enabled: boolean): Promise<boolean> {
   try {
-    const res = await fetch("/api/tips/show", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    return res.ok;
+    return await fetchOk("/api/tips/show", jsonInit("POST", { enabled }));
   } catch {
     return false;
   }
@@ -1090,12 +1119,7 @@ export async function getWebUiState(): Promise<Record<string, string> | null> {
  *  set, or `null` to delete the key. Best-effort; returns success. */
 export async function patchWebUiState(patch: Record<string, string | null>): Promise<boolean> {
   try {
-    const res = await fetch("/api/app-state/web-ui-state", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    return res.ok;
+    return await fetchOk("/api/app-state/web-ui-state", jsonInit("PATCH", patch));
   } catch {
     return false;
   }
@@ -1129,9 +1153,7 @@ export async function fetchVolumeIgnoresPreview(
   try {
     const params = new URLSearchParams({ path });
     if (profile) params.set("profile", profile);
-    const res = await fetch(`/api/sandbox/volume-ignores-preview?${params.toString()}`);
-    if (!res.ok) return null;
-    return (await res.json()) as VolumeIgnoresPreviewResponse;
+    return await fetchJson<VolumeIgnoresPreviewResponse>(`/api/sandbox/volume-ignores-preview?${params.toString()}`);
   } catch {
     return null;
   }
@@ -1145,10 +1167,7 @@ export async function fetchVolumeIgnoresPreview(
  */
 export async function markVolumeIgnoresGlobsAcknowledged(): Promise<boolean> {
   try {
-    const res = await fetch("/api/app-state/volume-ignores-globs-acknowledged", {
-      method: "POST",
-    });
-    return res.ok;
+    return await fetchOk("/api/app-state/volume-ignores-globs-acknowledged", { method: "POST" });
   } catch {
     return false;
   }
@@ -1158,12 +1177,7 @@ export async function markVolumeIgnoresGlobsAcknowledged(): Promise<boolean> {
 
 export async function createProfile(name: string): Promise<boolean> {
   try {
-    const res = await fetch("/api/profiles", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    });
-    return res.ok;
+    return await fetchOk("/api/profiles", jsonInit("POST", { name }));
   } catch {
     return false;
   }
@@ -1171,10 +1185,7 @@ export async function createProfile(name: string): Promise<boolean> {
 
 export async function deleteProfile(name: string): Promise<boolean> {
   try {
-    const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, {
-      method: "DELETE",
-    });
-    return res.ok;
+    return await fetchOk(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
   } catch {
     return false;
   }
@@ -1182,12 +1193,7 @@ export async function deleteProfile(name: string): Promise<boolean> {
 
 export async function renameProfile(name: string, newName: string): Promise<boolean> {
   try {
-    const res = await fetch(`/api/profiles/${encodeURIComponent(name)}/rename`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ new_name: newName }),
-    });
-    return res.ok;
+    return await fetchOk(`/api/profiles/${encodeURIComponent(name)}/rename`, jsonInit("PATCH", { new_name: newName }));
   } catch {
     return false;
   }
@@ -1368,13 +1374,7 @@ export function fetchTelemetryStatus(): Promise<TelemetryStatus | null> {
 /// status, or null on failure.
 export async function setTelemetryConsent(enabled: boolean): Promise<TelemetryStatus | null> {
   try {
-    const res = await fetch("/api/telemetry/consent", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    if (!res.ok) return null;
-    return await res.json();
+    return await fetchJson<TelemetryStatus>("/api/telemetry/consent", jsonInit("POST", { enabled }));
   } catch {
     return null;
   }
@@ -1392,21 +1392,13 @@ export type TelemetrySignal = "web" | "structured_view" | "diff_panel" | "diff_c
 /// count when the install is opted in. The browser never posts to the telemetry
 /// backend; it pings the local daemon, which folds both into its own snapshot.
 export function reportTelemetrySeen(surface: TelemetrySignal): void {
-  void fetch("/api/telemetry/seen", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ surface, form_factor: clientFormFactor() }),
-  }).catch(() => {});
+  void fetch("/api/telemetry/seen", jsonInit("POST", { surface, form_factor: clientFormFactor() })).catch(() => {});
 }
 
 /// Report a browser ACP interaction for the daemon's next opt-in snapshot.
 /// Best-effort; the daemon only sends counts when the user is opted in.
 export function reportAcpInteraction(kind: "prompt_queued"): void {
-  void fetch("/api/telemetry/structured-interaction", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind }),
-  }).catch(() => {});
+  void fetch("/api/telemetry/structured-interaction", jsonInit("POST", { kind })).catch(() => {});
 }
 
 /** Runtime helper around `ServerAbout.build_flavor`. See #1055. */
@@ -1437,12 +1429,7 @@ export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
  *  success; the banner optimistically hides regardless. */
 export async function dismissUpdate(version: string): Promise<boolean> {
   try {
-    const res = await fetch("/api/app-state/dismiss-update", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ version }),
-    });
-    return res.ok;
+    return await fetchOk("/api/app-state/dismiss-update", jsonInit("POST", { version }));
   } catch {
     return false;
   }
@@ -1563,11 +1550,10 @@ export async function switchAcpAgent(
   const body: { target: string; model?: string; reason?: string } = { target };
   if (model) body.model = model;
   if (reason) body.reason = reason;
-  return fetchJson<SwitchAgentResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-agent`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  return fetchJson<SwitchAgentResponse>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-agent`,
+    jsonInit("POST", body),
+  );
 }
 
 export interface SwitchProviderResponse {
@@ -1585,18 +1571,16 @@ export interface SwitchProviderResponse {
  *  leaves the session changed, so the caller must not read a failure as a
  *  no-op. */
 export async function switchAcpProvider(sessionId: string, provider: string): Promise<SwitchProviderResponse> {
-  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-provider`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ provider }),
-  });
+  const res = await fetch(
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-provider`,
+    jsonInit("POST", { provider }),
+  );
   const body = await res.text();
   if (!res.ok) {
     // Structured refusals carry `message`; the respawn failures are plain text.
     let message: string | undefined;
     try {
-      const parsed = JSON.parse(body) as { message?: unknown };
-      message = typeof parsed.message === "string" ? parsed.message : undefined;
+      message = stringField(JSON.parse(body) as Payload, "message");
     } catch {
       message = undefined;
     }
@@ -1616,9 +1600,7 @@ export interface ViewSwitchResponse {
  *  session with a resumable transcript the conversation is carried over; other
  *  agents restart fresh. Resolves with the updated view or null on non-2xx. */
 export async function acpEnable(sessionId: string): Promise<ViewSwitchResponse | null> {
-  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/enable`, {
-    method: "POST",
-  });
+  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/enable`, { method: "POST" });
 }
 
 export async function acpDisable(
@@ -1667,22 +1649,6 @@ export interface QueueAttachmentUpload {
   dataB64: string;
 }
 
-async function fetchOk(url: string, init?: RequestInit): Promise<boolean> {
-  try {
-    return (await fetch(url, init)).ok;
-  } catch {
-    return false;
-  }
-}
-
-const jsonInit = (method: string, body: unknown): RequestInit => ({
-  method,
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(body),
-});
-
-const networkError = (e: unknown) => `Network error: ${e instanceof Error ? e.message : "connection failed"}`;
-
 const stringList = (value: unknown) => (Array.isArray(value) ? value : []);
 
 /** Enqueue a prompt server-side (POST /queue). `id` is the client-minted stable
@@ -1699,7 +1665,7 @@ export async function enqueueServerPrompt(
   },
 ): Promise<ServerQueuedPrompt | null> {
   return fetchJson<ServerQueuedPrompt>(
-    `/api/sessions/${encodeURIComponent(sessionId)}/queue`,
+    queuePath(sessionId),
     jsonInit("POST", {
       id: prompt.id,
       text: prompt.text,
@@ -1718,28 +1684,23 @@ export async function enqueueServerPrompt(
  *  array: a non-array body (error page, unexpected shape) yields `[]` so callers
  *  can `.map` without guarding. */
 export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[]> {
-  const rows = await fetchJson<ServerQueuedPrompt[]>(`/api/sessions/${encodeURIComponent(sessionId)}/queue`);
+  const rows = await fetchJson<ServerQueuedPrompt[]>(queuePath(sessionId));
   return Array.isArray(rows) ? rows : [];
 }
 
 /** Replace a queued prompt's text (PATCH /queue/{id}). */
 export async function editServerQueuedPrompt(sessionId: string, promptId: string, text: string): Promise<boolean> {
-  return fetchOk(
-    `/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`,
-    jsonInit("PATCH", { text }),
-  );
+  return fetchOk(queuePath(sessionId, promptId), jsonInit("PATCH", { text }));
 }
 
 /** Remove one queued prompt (DELETE /queue/{id}). */
 export async function removeServerQueuedPrompt(sessionId: string, promptId: string): Promise<boolean> {
-  return fetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`, {
-    method: "DELETE",
-  });
+  return fetchOk(queuePath(sessionId, promptId), { method: "DELETE" });
 }
 
 /** Drop the whole server queue for a session (DELETE /queue). */
 export async function clearServerQueue(sessionId: string): Promise<boolean> {
-  return fetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/queue`, { method: "DELETE" });
+  return fetchOk(queuePath(sessionId), { method: "DELETE" });
 }
 
 // --- Acp install agent (Tier 2 of #2109) ---
@@ -1763,20 +1724,13 @@ export interface InstallAgentResponse {
  *  missing) so the caller can surface why. The caller respawns the worker
  *  separately via `useRespawnSession` on `success`. */
 export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
-  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
+  const { ok, status, payload } = await send(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
-  const body = (await res.json().catch(() => null)) as
-    | (Partial<InstallAgentResponse> & { error?: string; message?: string })
-    | null;
-  if (!res.ok) {
-    throw new Error(body?.message || body?.error || `Server returned ${res.status}`);
-  }
-  if (!body) {
-    throw new Error("Server returned an invalid or empty response");
-  }
-  return body as InstallAgentResponse;
+  if (!ok) throw new Error(rawMessage(payload) || (payload?.error as string) || `Server returned ${status}`);
+  if (!payload) throw new Error("Server returned an invalid or empty response");
+  return payload as unknown as InstallAgentResponse;
 }
 
 /** Fetch a markdown primer built from events `seq < beforeSeq`. Used
@@ -1819,8 +1773,7 @@ export function fetchDevices(): Promise<DeviceSession[] | null> {
  *  user to retry after confirming. */
 export async function revokeDevice(sessionId: string): Promise<boolean> {
   try {
-    const res = await fetch(`/api/login/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
-    return res.ok;
+    return await fetchOk(`/api/login/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
   } catch {
     return false;
   }
@@ -1830,8 +1783,7 @@ export async function revokeDevice(sessionId: string): Promise<boolean> {
  *  everyone out"). Ends this session too. Elevation-gated. */
 export async function signOutAllDevices(): Promise<boolean> {
   try {
-    const res = await fetch("/api/login/logout-all", { method: "POST" });
-    return res.ok;
+    return await fetchOk("/api/login/logout-all", { method: "POST" });
   } catch {
     return false;
   }
@@ -1882,14 +1834,11 @@ export async function resolvePluginOptions(
   depends: string[],
 ): Promise<{ value: string; label: string }[]> {
   try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings/options/resolve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, depends }),
-    });
-    if (!res.ok) return [];
-    const body = (await res.json()) as { options?: { value: string; label: string }[] };
-    return body.options ?? [];
+    const body = await fetchJson<{ options?: { value: string; label: string }[] }>(
+      `/api/plugins/${encodeURIComponent(pluginId)}/settings/options/resolve`,
+      jsonInit("POST", { source, depends }),
+    );
+    return body?.options ?? [];
   } catch {
     return [];
   }
@@ -2011,12 +1960,7 @@ export async function updateProject(
 }
 
 export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
-  return (
-    (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? {
-      available: false,
-      runtime: null,
-    }
-  );
+  return (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? { available: false, runtime: null };
 }
 
 /** The repo's hooks need approval before this session can be created
@@ -2188,11 +2132,7 @@ export async function cloneRepo(
     if (opts?.destination) body.destination = opts.destination;
     if (opts?.shallow) body.shallow = true;
     if (opts?.bare) body.bare = true;
-    const res = await fetch("/api/git/clone", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const res = await fetch("/api/git/clone", jsonInit("POST", body));
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       return {
@@ -2242,41 +2182,19 @@ export async function loginStatus(): Promise<LoginStatus> {
  *  is accepted instead of being misread as a token rejection. */
 export async function verifyToken(): Promise<boolean> {
   try {
-    const res = await fetch("/api/login/status");
-    return res.ok;
+    return await fetchOk("/api/login/status");
   } catch {
     return false;
   }
 }
 
 export async function login(passphrase: string): Promise<{ ok: boolean; error?: string }> {
-  let deviceBindingSecret: string;
-  try {
-    deviceBindingSecret = getOrCreateDeviceBindingSecret();
-  } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : "Could not create device binding for this browser",
-    };
-  }
-  try {
-    const res = await fetch("/api/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        passphrase,
-        device_binding_secret: deviceBindingSecret,
-      }),
-    });
+  return withBindingSecret("Could not create device binding for this browser", async (secret) => {
+    const res = await fetch("/api/login", jsonInit("POST", { passphrase, device_binding_secret: secret }));
     if (res.ok) return { ok: true };
-    const data = await res.json().catch(() => null);
-    return {
-      ok: false,
-      error: data?.message ?? `Login failed (${res.status})`,
-    };
-  } catch {
-    return { ok: false, error: "Network error" };
-  }
+    const payload = (await res.json().catch(() => null)) as Payload | null;
+    return { ok: false, error: rawMessage(payload) ?? `Login failed (${res.status})` };
+  });
 }
 
 /**
@@ -2292,41 +2210,14 @@ export async function login(passphrase: string): Promise<{ ok: boolean; error?: 
 export async function elevateLogin(
   passphrase: string,
 ): Promise<{ ok: boolean; error?: string; elevated_until_secs?: number }> {
-  let bindingSecret: string;
-  try {
-    bindingSecret = getOrCreateDeviceBindingSecret();
-  } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : "Could not access device binding for this browser",
-    };
-  }
-  try {
-    const res = await fetch("/api/login/elevate", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Aoe-Device-Binding": bindingSecret,
-      },
-      body: JSON.stringify({ passphrase }),
-    });
-    if (res.ok) {
-      const data = (await res.json().catch(() => null)) as {
-        elevated_until_secs?: number;
-      } | null;
-      return {
-        ok: true,
-        elevated_until_secs: data?.elevated_until_secs,
-      };
-    }
-    const data = await res.json().catch(() => null);
-    return {
-      ok: false,
-      error: data?.message ?? `Elevation failed (${res.status})`,
-    };
-  } catch {
-    return { ok: false, error: "Network error" };
-  }
+  return withBindingSecret("Could not access device binding for this browser", async (secret) => {
+    const { ok, status, payload } = await send(
+      "/api/login/elevate",
+      jsonInit("POST", { passphrase }, { "X-Aoe-Device-Binding": secret }),
+    );
+    if (ok) return { ok: true, elevated_until_secs: payload?.elevated_until_secs as number | undefined };
+    return { ok: false, error: rawMessage(payload) ?? `Elevation failed (${status})` };
+  });
 }
 
 export async function logout(): Promise<void> {
@@ -2363,31 +2254,25 @@ export async function logout(): Promise<void> {
  * to match and returns 409 if the session is running, so the message is
  * surfaced to the caller. See #1927.
  */
-export async function renameSession(
-  id: string,
-  title: string,
-): Promise<{ ok: boolean; message?: string; warnings?: string[] }> {
+export type SessionEditResult =
+  | (SessionMutation & { ok: true; warnings?: string[] })
+  | { ok: false; message?: string; warnings?: never; session?: never; cursor?: never };
+
+export async function renameSession(id: string, title: string): Promise<SessionEditResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title }),
-    });
-    if (res.ok) {
-      const body = await res.json().catch(() => null);
-      const warnings = Array.isArray(body?.warnings)
-        ? body.warnings.filter((warning: unknown): warning is string => typeof warning === "string")
-        : [];
-      return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
+    const res = await fetch("/api/sessions/" + id, jsonInit("PATCH", { title }));
+    if (!res.ok) {
+      const payload = (await res.json().catch(() => null)) as Payload | null;
+      return { ok: false, message: stringField(payload, "message") };
     }
-    let message: string | undefined;
-    try {
-      const body = await res.json();
-      message = typeof body?.message === "string" ? body.message : undefined;
-    } catch {
-      // non-JSON error body; fall through with no message
-    }
-    return { ok: false, message };
+    const mutation = await sessionMutation(res);
+    if (!mutation)
+      return { ok: false, message: "Session rename acknowledgment is unavailable; its outcome may be unknown." };
+    const { outcome, ...session } = mutation.session as SessionResponse & { outcome?: Payload };
+    const receipt = { session, cursor: mutation.cursor };
+    if (!outcome) return { ok: false, message: "Session rename outcome is unavailable; its outcome may be unknown." };
+    const warnings = stringList(outcome.warnings).filter((warning): warning is string => typeof warning === "string");
+    return warnings.length > 0 ? { ok: true, ...receipt, warnings } : { ok: true, ...receipt };
   } catch {
     return { ok: false };
   }
@@ -2402,18 +2287,7 @@ export async function renameSession(
  */
 export async function smartRenameSession(id: string): Promise<{ ok: boolean; message?: string }> {
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/smart-rename`, {
-      method: "POST",
-    });
-    if (res.ok) return { ok: true };
-    let message: string | undefined;
-    try {
-      const body = await res.json();
-      message = typeof body?.message === "string" ? body.message : undefined;
-    } catch {
-      // non-JSON error body; fall through with no message
-    }
-    return { ok: false, message };
+    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/smart-rename`, { method: "POST" });
   } catch {
     return { ok: false };
   }
@@ -2429,18 +2303,7 @@ export async function smartRenameSession(id: string): Promise<{ ok: boolean; mes
  */
 export async function summarizeSession(id: string): Promise<{ ok: boolean; message?: string }> {
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/summarize`, {
-      method: "POST",
-    });
-    if (res.ok) return { ok: true };
-    let message: string | undefined;
-    try {
-      const body = await res.json();
-      message = typeof body?.message === "string" ? body.message : undefined;
-    } catch {
-      // non-JSON error body; fall through with no message
-    }
-    return { ok: false, message };
+    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/summarize`, { method: "POST" });
   } catch {
     return { ok: false };
   }
@@ -2452,26 +2315,24 @@ export async function summarizeSession(id: string): Promise<{ ok: boolean; messa
  * running. Returns the server's validation message on failure so the caller
  * can surface it. See #1723.
  */
-export async function setWorktreeName(
-  id: string,
-  name: string,
-  renameBranch: boolean,
-): Promise<{ ok: boolean; message?: string }> {
+export async function setWorktreeName(id: string, name: string, renameBranch: boolean): Promise<SessionEditResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}/worktree-name`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, rename_branch: renameBranch }),
-    });
-    if (res.ok) return { ok: true };
-    let message: string | undefined;
-    try {
-      const body = await res.json();
-      message = typeof body?.message === "string" ? body.message : undefined;
-    } catch {
-      // non-JSON error body; fall through with no message
+    const res = await fetch(
+      "/api/sessions/" + id + "/worktree-name",
+      jsonInit("PATCH", { name, rename_branch: renameBranch }),
+    );
+    if (!res.ok) {
+      const payload = (await res.json().catch(() => null)) as Payload | null;
+      return { ok: false, message: stringField(payload, "message") };
     }
-    return { ok: false, message };
+    const mutation = await sessionMutation(res);
+    if (!mutation)
+      return { ok: false, message: "Worktree edit acknowledgment is unavailable; its outcome may be unknown." };
+    const { outcome, ...session } = mutation.session as SessionResponse & { outcome?: Payload };
+    const receipt = { session, cursor: mutation.cursor };
+    if (!outcome) return { ok: false, message: "Worktree edit outcome is unavailable; its outcome may be unknown." };
+    const warnings = stringList(outcome.warnings).filter((warning): warning is string => typeof warning === "string");
+    return warnings.length > 0 ? { ok: true, ...receipt, warnings } : { ok: true, ...receipt };
   } catch {
     return { ok: false };
   }
@@ -2482,6 +2343,9 @@ export type AttachProjectWorker = "restarted" | "not_running" | "restart_failed"
 
 export interface AttachProjectResult {
   ok: boolean;
+  /** Canonical session and cursor are present on every acknowledged success. */
+  session?: SessionResponse;
+  cursor?: RuntimeCursor;
   /** Server validation message on failure, or the worker message on a failed restart. */
   message?: string;
   worker?: AttachProjectWorker;
@@ -2504,7 +2368,7 @@ export interface AttachProjectResult {
  *
  * `project` is a path or the name of a registered project.
  *
- * A 200 with `worker: "restart_failed"` means the repo is attached and durable
+ * A 200 with `outcome.worker.status: "restart_failed"` means the repo is attached and durable
  * but the session did not come back, so the caller must surface that rather than
  * treating the call as a plain success.
  */
@@ -2514,36 +2378,37 @@ export async function attachSessionProject(
   opts: { attachExistingBranch?: boolean } = {},
 ): Promise<AttachProjectResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}/projects`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        project,
-        attach_existing_branch: opts.attachExistingBranch ?? false,
-      }),
-    });
-    let body: Record<string, unknown> | undefined;
-    try {
-      body = await res.json();
-    } catch {
-      // non-JSON body; fall through with no detail
-    }
+    const res = await fetch(
+      "/api/sessions/" + id + "/projects",
+      jsonInit("POST", { project, attach_existing_branch: opts.attachExistingBranch ?? false }),
+    );
     if (!res.ok) {
-      return {
-        ok: false,
-        message: typeof body?.message === "string" ? body.message : undefined,
-      };
+      const payload = (await res.json().catch(() => null)) as Payload | null;
+      return { ok: false, message: stringField(payload, "message") };
     }
-    const attached = body?.attached as Record<string, unknown> | undefined;
+    const mutation = await sessionMutation(res);
+    if (!mutation)
+      return { ok: false, message: "Project attachment acknowledgment is unavailable; its outcome may be unknown." };
+    const { outcome, ...session } = mutation.session as SessionResponse & { outcome?: Payload };
+    const receipt = { session, cursor: mutation.cursor };
+    if (!outcome)
+      return { ok: false, message: "Project attachment outcome is unavailable; its outcome may be unknown." };
+    const attached = outcome.attached as Payload | undefined;
+    const worker = outcome.worker as Payload | undefined;
+    const status = worker?.status;
+    if (!attached || !worker || (status !== "restarted" && status !== "not_running" && status !== "restart_failed")) {
+      return { ok: false, message: "Project attachment outcome is invalid; its outcome may be unknown." };
+    }
     return {
       ok: true,
-      worker: body?.worker as AttachProjectWorker | undefined,
-      message: typeof body?.worker_message === "string" ? body.worker_message : undefined,
-      name: typeof attached?.name === "string" ? attached.name : undefined,
-      branch: typeof attached?.branch === "string" ? attached.branch : undefined,
-      branchCreated: typeof attached?.branch_created === "boolean" ? attached.branch_created : undefined,
-      movedTo: typeof attached?.moved_to === "string" ? attached.moved_to : undefined,
-      warnings: Array.isArray(body?.warnings) ? (body.warnings as string[]) : undefined,
+      ...receipt,
+      worker: status,
+      message: stringField(worker, "message"),
+      name: stringField(attached, "name"),
+      branch: stringField(attached, "branch"),
+      branchCreated: typeof attached.branch_created === "boolean" ? attached.branch_created : undefined,
+      movedTo: stringField(attached, "moved_to"),
+      warnings: Array.isArray(outcome.warnings) ? (outcome.warnings as string[]) : undefined,
     };
   } catch {
     return { ok: false };
@@ -2556,12 +2421,7 @@ export async function attachSessionProject(
  *  TUI). Hits the dedicated `PATCH /api/sessions/:id/group` sub-route. */
 export async function updateSessionGroup(id: string, group: string): Promise<boolean> {
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/group`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ group }),
-    });
-    return res.ok;
+    return await fetchOk(`/api/sessions/${encodeURIComponent(id)}/group`, jsonInit("PATCH", { group }));
   } catch {
     return false;
   }
@@ -2578,15 +2438,10 @@ export async function setSessionNotifications(
 ): Promise<SessionMutation | null> {
   const value = preset === "off" ? false : preset === "all" ? true : null;
   try {
-    const res = await fetch(`/api/sessions/${id}/notifications`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        notify_on_waiting: value,
-        notify_on_idle: value,
-        notify_on_error: value,
-      }),
-    });
+    const res = await fetch(
+      `/api/sessions/${id}/notifications`,
+      jsonInit("PATCH", { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value }),
+    );
     return await sessionMutation(res);
   } catch {
     return null;
@@ -2604,13 +2459,11 @@ export async function setSessionDiffBase(
   repo?: string | null,
 ): Promise<SessionResponse | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/diff-base`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(repo ? { base_branch: baseBranch, repo } : { base_branch: baseBranch }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionUpdate(
+      id,
+      "diff-base",
+      jsonInit("PATCH", repo ? { base_branch: baseBranch, repo } : { base_branch: baseBranch }),
+    );
   } catch {
     return null;
   }
@@ -2621,13 +2474,7 @@ export async function setSessionDiffBase(
  *  Distinct from the TUI favorite signal. See #1581. */
 export async function setSessionPin(id: string, pinned: boolean): Promise<SessionResponse | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/pin`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pinned }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionUpdate(id, "pin", jsonInit("PATCH", { pinned }));
   } catch {
     return null;
   }
@@ -2638,11 +2485,7 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
  *  settable from the CLI via `aoe session color`. See #2383. */
 export async function setSessionColor(id: string, color: string | null): Promise<SessionMutation | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/color`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ color }),
-    });
+    const res = await fetch(`/api/sessions/${id}/color`, jsonInit("PATCH", { color }));
     return await sessionMutation(res);
   } catch {
     return null;
@@ -2659,13 +2502,7 @@ export async function setSessionArchive(
   killPane = true,
 ): Promise<SessionResponse | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/archive`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ archived, kill_pane: killPane }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionUpdate(id, "archive", jsonInit("PATCH", { archived, kill_pane: killPane }));
   } catch {
     return null;
   }
@@ -2677,13 +2514,7 @@ export async function setSessionArchive(
  *  it can be restored. NOT a permanent delete; use `deleteWorkspace` for that. */
 export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/trash`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kill_pane: killPane }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionUpdate(id, "trash", jsonInit("POST", { kill_pane: killPane }));
   } catch {
     return null;
   }
@@ -2693,12 +2524,7 @@ export async function trashSession(id: string, killPane = true): Promise<Session
  *  its prior bucket with its transcript and metadata intact. */
 export async function restoreSession(id: string): Promise<SessionResponse | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/restore`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionUpdate(id, "restore", jsonInit("POST"));
   } catch {
     return null;
   }
@@ -2710,12 +2536,7 @@ export async function restoreSession(id: string): Promise<SessionResponse | null
  *  preserved with status `Stopped` and can be resumed later. NOT a delete. */
 export async function stopSession(id: string): Promise<SessionResponse | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionUpdate(id, "stop", jsonInit("POST"));
   } catch {
     return null;
   }
@@ -2756,13 +2577,7 @@ export async function startSession(id: string): Promise<StartSessionResult> {
  *  #1581. */
 export async function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/snooze`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ minutes }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionUpdate(id, "snooze", jsonInit("PATCH", { minutes }));
   } catch {
     return null;
   }
@@ -2774,13 +2589,7 @@ export async function setSessionSnooze(id: string, minutes: number | null): Prom
  *  sync with the server. */
 export async function setSessionUnread(id: string, unread: boolean): Promise<SessionResponse | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/unread`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ unread }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
+    return await sessionUpdate(id, "unread", jsonInit("PATCH", { unread }));
   } catch {
     return null;
   }
@@ -2822,11 +2631,7 @@ export async function deleteWorkspace(
   options: DeleteSessionOptions = {},
 ): Promise<DeleteWorkspaceResult> {
   try {
-    const res = await fetch(`/api/workspaces`, {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_ids: sessionIds, ...options }),
-    });
+    const res = await fetch(`/api/workspaces`, jsonInit("DELETE", { session_ids: sessionIds, ...options }));
     const data = (await res.json().catch(() => ({}))) as {
       message?: string;
       messages?: string[];
@@ -2891,18 +2696,6 @@ export function fetchMcpServers(agent?: string): Promise<McpServersResponse | nu
   return fetchJson<McpServersResponse>(`/api/mcp/servers${q}`);
 }
 
-async function postMcp(url: string, body: unknown): Promise<Response | null> {
-  try {
-    return await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    return null;
-  }
-}
-
 export type McpResolveResult = "applied" | "stale" | "error";
 
 export async function resolveMcpConflict(
@@ -2911,25 +2704,22 @@ export async function resolveMcpConflict(
   winner: "aoe" | "native",
   fingerprint: string,
 ): Promise<McpResolveResult> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/resolve`, {
-    agent,
-    winner,
-    fingerprint,
-  });
-  if (!res) return "error";
-  if (res.ok) return "applied";
-  if (res.status === 409) return "stale";
-  return "error";
+  const url = mcpPath(name, "resolve");
+  try {
+    const res = await fetch(url, jsonInit("POST", { agent, winner, fingerprint }));
+    if (res.ok) return "applied";
+    return res.status === 409 ? "stale" : "error";
+  } catch {
+    return "error";
+  }
 }
 
 export async function keepMcpServer(name: string, agent: string): Promise<boolean> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/keep`, { agent });
-  return !!res && res.ok;
+  return fetchOk(mcpPath(name, "keep"), jsonInit("POST", { agent }));
 }
 
 export async function dropMcpServer(name: string, agent: string): Promise<boolean> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/drop`, { agent });
-  return !!res && res.ok;
+  return fetchOk(mcpPath(name, "drop"), jsonInit("POST", { agent }));
 }
 
 // --- Skills (#3050) ---
@@ -2983,23 +2773,13 @@ export function fetchSkill(source: string, directory: string): Promise<SkillDeta
 
 async function skillMutation(url: string, method: string, body?: unknown): Promise<SkillMutationResult> {
   try {
-    const response = await fetch(url, {
-      method,
-      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const data = (await response.json().catch(() => ({}))) as {
-      directory?: string | null;
-      message?: string;
-    };
-    if (!response.ok) {
-      return {
-        ok: false,
-        error: data.message ?? `Server error (${response.status})`,
-        status: response.status,
-      };
-    }
-    return { ok: true, directory: data.directory ?? undefined, status: response.status };
+    return await skillRequest<SkillMutationResult>(
+      url,
+      body === undefined ? { method } : jsonInit(method, body),
+      (p) => ({
+        directory: (p.directory as string | null | undefined) ?? undefined,
+      }),
+    );
   } catch (error) {
     return {
       ok: false,
@@ -3063,24 +2843,12 @@ export async function syncSkills(options?: {
   directories?: string[];
 }): Promise<SkillSyncResult> {
   try {
-    const response = await fetch("/api/skills/sync", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ roots: options?.roots, replace: options?.replace, directories: options?.directories }),
-    });
-    const data = (await response.json().catch(() => ({}))) as {
-      outcomes?: SkillSyncOutcome[];
-      message?: string;
-    };
-    if (!response.ok) {
-      return {
-        ok: false,
-        outcomes: [],
-        error: data.message ?? `Server error (${response.status})`,
-        status: response.status,
-      };
-    }
-    return { ok: true, outcomes: data.outcomes ?? [], status: response.status };
+    return await skillRequest<SkillSyncResult>(
+      "/api/skills/sync",
+      jsonInit("POST", { roots: options?.roots, replace: options?.replace, directories: options?.directories }),
+      (p) => ({ outcomes: (p.outcomes as SkillSyncOutcome[] | undefined) ?? [] }),
+      { outcomes: [] },
+    );
   } catch (error) {
     return {
       ok: false,

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { StrictMode } from "react";
+import { StrictMode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
@@ -713,5 +713,70 @@ describe("SessionWizard served-profile authority", () => {
     view.rerender(<SessionWizard servedProfile="Alpha" onClose={() => {}} onCreated={() => {}} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
     await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" }));
+  });
+
+  it("recovers a single served profile after an initial failure without reseeding dirty choices", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce([{ name: "Alpha", is_default: false }] as never);
+    vi.mocked(fetchSettings).mockImplementation(async (profile) => settings(profile!));
+    let publish!: (profile: string) => void;
+    let attempts = 0;
+    const retry = vi.fn(async () => {
+      if (++attempts > 1) publish("Alpha");
+    });
+    function Harness() {
+      const [served, setServed] = useState<string>();
+      publish = setServed;
+      return (
+        <SessionWizard
+          servedProfile={served}
+          onRetryServedProfile={retry}
+          prefill={{ path: "/tmp/proj", tool: "claude" }}
+          onClose={() => {}}
+          onCreated={() => {}}
+        />
+      );
+    }
+    render(<Harness />);
+    const retryButton = await screen.findByRole("button", { name: "Retry server profile" });
+    await waitFor(() => expect(retryButton.hasAttribute("disabled")).toBe(false));
+    expect(screen.getByText(/Launch session/).closest("button")!.disabled).toBe(true);
+    expect(fetchSettings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("switch", { name: "Auto-approve actions" }));
+    fireEvent.click(retryButton);
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload()).toMatchObject({ yolo_mode: true });
+    expect(payload().profile).toBeUndefined();
+    expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" });
+    expect(vi.mocked(fetchSettings).mock.calls.some(([profile]) => profile === "Main")).toBe(false);
+  });
+
+  it("resolves Server default after explicit Beta without retaining the old prefill defaults", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    vi.mocked(fetchSettings).mockImplementation(async (profile) => settings(profile!));
+    let publish!: (profile: string) => void;
+    const retry = async () => publish("Alpha");
+    function Harness() {
+      const [served, setServed] = useState<string>();
+      publish = setServed;
+      return (
+        <SessionWizard
+          servedProfile={served}
+          onRetryServedProfile={retry}
+          prefill={{ path: "/tmp/proj", tool: "claude", profile: "Beta", yoloMode: true }}
+          onClose={() => {}}
+          onCreated={() => {}}
+        />
+      );
+    }
+    render(<Harness />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe("true"),
+    );
+    await chooseProfile("");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload()).toMatchObject({ yolo_mode: false });
+    expect(payload().profile).toBeUndefined();
   });
 });

@@ -123,19 +123,7 @@ impl HomeView {
                 &hotkey_warnings.join("\n"),
             ));
         }
-        // Watcher path: stash for tick-loop dispatch (App owns theme state).
-        // Reads via `resolve_theme_name` (global-only by contract), not
-        // `config.theme.name` which would carry a stale per-profile override.
-        // Guard is load-bearing: Interactive already returns
-        // `Action::SetTheme` directly from input handlers, so stashing
-        // unconditionally would double-dispatch on every settings save.
-        // Note: `resolve_theme_name` swallows read errors via `load_or_warn`
-        // and falls back to "zinc"; a peer write landing between the
-        // `resolve_config` above and this call momentarily flips the theme
-        // and the next watcher event recovers. Diverges from the
-        // "preserve prior state on Err" contract honored by other fields
-        // here; acceptable since `set_theme` is idempotent and the race
-        // window is microseconds wide.
+        // Interactive saves already dispatch `Action::SetTheme`; the theme is global-only.
         if matches!(origin, ConfigRefreshOrigin::Watcher) {
             self.pending_watcher_theme = Some(crate::session::config::resolve_theme_name());
         }
@@ -229,7 +217,7 @@ mod tests {
         std::fs::write(&profile_path, "[session\n").unwrap();
         view.refresh_from_config(ConfigRefreshOrigin::Interactive);
         assert_eq!(view.sidebar_position, SidebarPosition::Right);
-        let reopened = HomeView::new_for_test(
+        let reopened = HomeView::new(
             Some("test".to_string()),
             AvailableTools::with_tools(&["claude"]),
             crate::file_watch::FileWatchService::noop(),

@@ -157,6 +157,15 @@ impl NativeSessionStore {
                 None
             }
         };
+        let legacy_scope = {
+            let metadata = self.state.canonical_metadata.blocking_read();
+            let rows = self.state.instances.blocking_read();
+            super::pane::legacy_tool_scope_for_panes(
+                &rows,
+                &metadata.raw_tool_names,
+                panes.as_ref(),
+            )
+        };
         self.update_runtime_fields(instance, |row| {
             let metadata = self.state.canonical_metadata.blocking_read();
             let tools = metadata
@@ -164,7 +173,7 @@ impl NativeSessionStore {
                 .get(&row.source_profile)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            super::pane::sample_panes(row, tools, panes.as_ref());
+            super::pane::sample_panes(row, tools, panes.as_ref(), legacy_scope.as_ref());
         })
     }
 
@@ -205,6 +214,31 @@ impl NativeSessionStore {
     ) -> Result<()>
     where
         F: FnOnce(&[Instance], &mut [Instance]) -> Result<()>,
+    {
+        self.move_instances_to_with_effect(
+            target,
+            changes,
+            crate::session::ProfileMovePlan {
+                group_move,
+                merge_complete_post: false,
+                account_swap: false,
+            },
+            validate_target,
+            |_| Ok(()),
+        )
+    }
+
+    pub(crate) fn move_instances_to_with_effect<F, B>(
+        &self,
+        target: &Self,
+        changes: &[(Instance, Instance)],
+        profile: crate::session::ProfileMovePlan<'_>,
+        validate_target: F,
+        before_commit: B,
+    ) -> Result<()>
+    where
+        F: FnOnce(&[Instance], &mut [Instance]) -> Result<()>,
+        B: FnOnce(&[Instance]) -> Result<()>,
     {
         anyhow::ensure!(
             Arc::ptr_eq(&self.state, &target.state),
@@ -249,19 +283,20 @@ impl NativeSessionStore {
                 }
             }
         }
-        let mut rejected = false;
+        let rejected = std::cell::Cell::new(false);
         let committed = transition
-            .move_instances_with_snapshot(
+            .move_instances_with_effect_snapshot(
                 &self.storage,
                 &target.storage,
                 changes,
-                group_move,
+                profile,
                 |existing, candidates| {
-                    validate_target(existing, candidates).inspect_err(|_| rejected = true)
+                    validate_target(existing, candidates).inspect_err(|_| rejected.set(true))
                 },
+                |candidates| before_commit(candidates).inspect_err(|_| rejected.set(true)),
             )
             .map_err(|error| {
-                if rejected || error.is::<crate::session::ProfileMoveRejected>() {
+                if rejected.get() || error.is::<crate::session::ProfileMoveRejected>() {
                     error
                 } else {
                     unavailable(error)
@@ -285,7 +320,9 @@ impl NativeSessionStore {
                 |_| false,
                 &publication,
             ))
-            .map_err(|error| unavailable(error.into()))
+            .map_err(|error| {
+                unavailable(error.into()).context(crate::session::SessionCommitApplied)
+            })
     }
 
     fn run_sandbox_migration(&self, run: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -433,7 +470,7 @@ impl SessionStore for NativeSessionStore {
         {
             *self.state.canonical_health.blocking_write() = error.health.clone();
             self.state.runtime.request_publish();
-            return Err(error.into());
+            return Err(anyhow::Error::new(error).context(crate::session::SessionCommitApplied));
         }
         Ok(())
     }
@@ -498,6 +535,9 @@ impl SessionStore for NativeSessionStore {
                     metadata
                         .auxiliary_tools
                         .insert(name.to_owned(), details.auxiliary_tools);
+                    metadata
+                        .raw_tool_names
+                        .insert(name.to_owned(), details.raw_tool_names);
                     metadata.profiles.push(crate::daemon::ProfileSnapshot {
                         name: name.to_owned(),
                         description: details.description,

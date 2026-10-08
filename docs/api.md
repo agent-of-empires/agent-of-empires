@@ -21,6 +21,10 @@ The private local Unix socket verifies its owner instead. A native client using
 that socket does not need the TCP passphrase or a loopback login, including when
 the dashboard runs behind a proxy.
 
+Native clients require HTTPS for credentials outside loopback and disable
+redirects. Local native connections bypass environment proxies. Their error
+diagnostics omit login and elevation response bodies, which can reflect secrets.
+
 Read-only mode (`aoe serve --read-only`) blocks every write endpoint
 with `403 read_only`. Read endpoints work normally.
 
@@ -263,6 +267,9 @@ same epoch at or beyond that revision before acting on the new row.
 An omitted `profile` targets the served profile reported by `GET /api/about`, not
 the machine-default profile. Load project registries and launch defaults for that
 same profile until an explicit profile is selected.
+If `/api/about` is unavailable, keep creation disabled until the served profile
+is resolved rather than guessing a default. The web wizard provides **Retry
+server profile** and preserves choices already edited by the user.
 
 An optional `size` object, such as `{"cols":137,"rows":41}`, sets the initial
 terminal dimensions. Both dimensions must be nonzero. Replaying a creation

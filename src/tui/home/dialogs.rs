@@ -36,43 +36,66 @@ impl HomeView {
 
     /// Show the profile picker dialog with fresh data from disk.
     pub(in crate::tui) fn show_profile_picker(&mut self) {
-        use crate::session::list_profiles_for_display;
         use crate::tui::dialogs::{ProfileEntry, ProfilePickerDialog};
-
         let current_profile = self
             .active_profile
             .clone()
-            .unwrap_or_else(|| "all".to_string());
-        let profiles = list_profiles_for_display()
-            .unwrap_or_else(|_| vec![crate::session::config::resolve_default_profile()]);
-        let mut entries: Vec<ProfileEntry> = profiles
-            .iter()
-            .map(|name| {
-                let session_count = Storage::new(name, self.file_watch.clone())
-                    .and_then(|s| s.load())
-                    .map(|instances| instances.len())
-                    .unwrap_or(0);
-                ProfileEntry {
-                    name: name.clone(),
-                    session_count,
-                    is_active: self.active_profile.as_deref() == Some(name.as_str()),
+            .unwrap_or_else(|| "all".to_owned());
+        let canonical = self.session_feed.applied_snapshot();
+        let mut entries: Vec<ProfileEntry> = if let Some(snapshot) = canonical.as_ref() {
+            snapshot
+                .contents
+                .profiles
+                .iter()
+                .map(|profile| ProfileEntry {
+                    name: profile.name.clone(),
+                    session_count: snapshot
+                        .contents
+                        .sessions
+                        .iter()
+                        .filter(|row| row.profile == profile.name)
+                        .count(),
+                    is_active: self.active_profile.as_deref() == Some(profile.name.as_str()),
+                })
+                .collect()
+        } else {
+            let entries = (|| -> anyhow::Result<Vec<ProfileEntry>> {
+                crate::session::list_profiles_for_display()?
+                    .into_iter()
+                    .map(|name| {
+                        let storage = Storage::open(&name, self.file_watch.clone())?;
+                        Ok(ProfileEntry {
+                            session_count: storage.load_complete_with_groups()?.0.len(),
+                            is_active: self.active_profile.as_deref() == Some(name.as_str()),
+                            name,
+                        })
+                    })
+                    .collect()
+            })();
+            match entries {
+                Ok(entries) => entries,
+                Err(error) => {
+                    self.info_dialog =
+                        Some(InfoDialog::new("Cannot Read Profiles", &error.to_string()));
+                    return;
                 }
-            })
-            .collect();
-
-        // In filtered mode, add "all" entry at top
+            }
+        };
+        if canonical.is_some() {
+            entries.sort_by(|left, right| {
+                (left.name == "default", &left.name).cmp(&(right.name == "default", &right.name))
+            });
+        }
         if self.active_profile.is_some() {
-            let total: usize = entries.iter().map(|e| e.session_count).sum();
             entries.insert(
                 0,
                 ProfileEntry {
-                    name: "all".to_string(),
-                    session_count: total,
+                    name: "all".to_owned(),
+                    session_count: entries.iter().map(|entry| entry.session_count).sum(),
                     is_active: false,
                 },
             );
         }
-
         self.profile_picker_dialog = Some(ProfilePickerDialog::new(entries, &current_profile));
     }
 
@@ -123,14 +146,9 @@ impl HomeView {
         // unconditionally, so the refusal has to live here.
         let shelved = self.get_instance(&id).and_then(|inst| {
             if inst.scratch {
-                // No repo of its own to widen: a scratch session's cwd is a
-                // throwaway directory under the app dir. `attach_project::plan`
-                // refuses it too; catching it here means the picker never opens
-                // on a session where every choice would fail.
                 Some((
                     "Scratch Session",
-                    "This is a scratch session, which has no repo to attach to. Create a session on the repo instead."
-                        .to_string(),
+                    "This is a scratch session, which has no repo to attach to. Create a session on the repo instead.",
                 ))
             } else if matches!(
                 inst.status,
@@ -138,40 +156,30 @@ impl HomeView {
             ) {
                 Some((
                     "Session Busy",
-                    "This session is still being created or is being deleted; wait for it to settle before attaching a project.".to_string(),
+                    "This session is still being created or is being deleted; wait for it to settle before attaching a project.",
                 ))
             } else if inst.status.blocks_worktree_edit() {
-                // Attaching bounces the worker, which mid-turn would drop the
-                // agent's reply, and `Waiting` is a turn in flight too: the agent
-                // has paused on a question, so a SIGTERM here throws away a
-                // pending approval. The daemon endpoint refuses on the
-                // authoritative event-log probe (`has_in_flight_turn`); the TUI
-                // has no handle on that store, so it reuses the status set
-                // `blocks_worktree_edit` already encodes for exactly this reason
-                // rather than keeping its own narrower copy.
+                // The status gate mirrors the daemon’s in-flight-turn refusal.
                 Some((
                     "Agent Working",
-                    "This session's agent is mid-turn and attaching restarts it. Wait for the turn to finish, or stop the session first."
-                        .to_string(),
+                    "This session's agent is mid-turn and attaching restarts it. Wait for the turn to finish, or stop the session first.",
                 ))
             } else if inst.is_trashed() {
                 Some((
                     "Session in Trash",
-                    "This session is in the trash. Restore it before attaching a project."
-                        .to_string(),
+                    "This session is in the trash. Restore it before attaching a project.",
                 ))
             } else if inst.is_archived() {
                 Some((
                     "Session Archived",
-                    "This session is archived and its agent stays stopped. Unarchive it before attaching a project."
-                        .to_string(),
+                    "This session is archived and its agent stays stopped. Unarchive it before attaching a project.",
                 ))
             } else {
                 None
             }
         });
         if let Some((dialog_title, body)) = shelved {
-            self.info_dialog = Some(InfoDialog::new(dialog_title, &body));
+            self.info_dialog = Some(InfoDialog::new(dialog_title, body));
             return;
         }
 
@@ -218,82 +226,18 @@ impl HomeView {
         id: &str,
         project: &crate::session::Project,
     ) {
-        match self.add_project_to_session(id, std::path::Path::new(&project.path)) {
-            Ok(()) => {
-                self.info_dialog = Some(InfoDialog::new(
+        self.info_dialog = Some(
+            match self.add_project_to_session(id, std::path::Path::new(&project.path)) {
+                Ok(()) => InfoDialog::new(
                     "Attaching Project",
                     &format!(
                         "Attaching '{}'. Creating the worktree can take a moment; this dialog \
-                         updates when it finishes.",
-                        project.name
+                     updates when it finishes.",
+                        project.name,
                     ),
-                ));
-            }
-            Err(e) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Could Not Attach Project",
-                    &format!("{e:#}"),
-                ));
-            }
-        }
-    }
-
-    /// Drain finished attaches, reload from disk and report each outcome.
-    ///
-    /// Returns true when anything landed, so the caller repaints. Both outcomes
-    /// get a dialog rather than a transient toast: a success has consequences
-    /// worth stating (the agent is restarting, or will only see the repo on next
-    /// start), and a failure is usually the branch-already-exists refusal, which
-    /// the user needs to read to know the CLI flag exists.
-    pub fn apply_attach_project_results(&mut self) -> bool {
-        use std::sync::mpsc::TryRecvError;
-
-        let mut touched = false;
-        loop {
-            match self.attach_project_poller.try_recv_result() {
-                Ok(result) => {
-                    self.attach_project_in_flight.remove(&result.session_id);
-                    touched = true;
-                    match result.outcome {
-                        Ok(message) => {
-                            // The worker persisted through `Storage`, so the
-                            // in-memory list is stale until this reload. The disk
-                            // watcher would get here on its own eventually; doing
-                            // it now means the new repo is on the row by the time
-                            // the success dialog is read.
-                            if let Err(e) = self.reload() {
-                                tracing::warn!(
-                                    target: "session.attach",
-                                    id = %result.session_id,
-                                    "attach landed but the reload failed: {e:#}"
-                                );
-                            }
-                            self.info_dialog = Some(InfoDialog::new("Project Attached", &message));
-                        }
-                        Err(message) => {
-                            self.info_dialog =
-                                Some(InfoDialog::new("Could Not Attach Project", &message));
-                        }
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    // The worker thread is gone (a panic in the attach). Clearing
-                    // the markers matters more than the lost result: otherwise
-                    // every session it held stays permanently unattachable.
-                    if !self.attach_project_in_flight.is_empty() {
-                        tracing::error!(
-                            target: "session.attach",
-                            pending = self.attach_project_in_flight.len(),
-                            "attach poller thread is gone; clearing in-flight markers"
-                        );
-                        self.attach_project_in_flight.clear();
-                        touched = true;
-                    }
-                    break;
-                }
-            }
-        }
-        touched
+                ),
+                Err(e) => InfoDialog::new("Could Not Attach Project", &format!("{e:#}")),
+            },
+        );
     }
 }

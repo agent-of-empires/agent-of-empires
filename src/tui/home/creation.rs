@@ -3,16 +3,6 @@
 
 use super::*;
 
-/// Cross-process guards for a single-session title mutation or profile move.
-/// The source profile's lifecycle flock is intentionally nested inside the
-/// per-session title flock; callers retain this value through durable
-/// persistence and any tmux rekey so a terminal launch cannot observe the
-/// transition halfway through.
-pub(in crate::tui) struct SessionMutationGuards {
-    pub(super) _session_title: crate::session::StorageFlock,
-    pub(super) _lifecycle: crate::session::StorageFlock,
-}
-
 impl HomeView {
     /// Request session creation from the daemon. The stub is a display-only
     /// placeholder: the daemon provisions, runs the hooks, and commits the row,
@@ -145,39 +135,41 @@ impl HomeView {
         });
     }
 
-    /// Bind a pending creation to the daemon's own row and keep that row out of
-    /// the sidebar. Runs on every applied snapshot: the reservation is published
-    /// before provisioning, so this binds the id without waiting for a progress
-    /// frame, and re-hides the row if a reload brought it back in. Returns
-    /// whether anything changed.
+    pub(super) fn bind_in_flight_creation(&mut self, rows: &[crate::daemon::SessionResponse]) {
+        let Some(pending) = self.pending_creation.as_mut() else {
+            return;
+        };
+        if pending.confirmation.is_none() && pending.daemon_id.is_none() {
+            if let Some(row) = rows
+                .iter()
+                .find(|row| row.idempotency_key.as_deref() == Some(pending.request_key.as_str()))
+            {
+                pending.daemon_id = Some(row.id.clone());
+            }
+        }
+    }
+
     pub(super) fn reconcile_in_flight_creation(
         &mut self,
         rows: &[crate::daemon::SessionResponse],
     ) -> bool {
-        let id = {
-            let Some(pending) = self.pending_creation.as_mut() else {
-                return false;
-            };
-            if pending.confirmation.is_some() {
-                return false;
-            }
-            if let Some(id) = pending.daemon_id.clone() {
-                id
-            } else {
-                let Some(row) = rows.iter().find(|row| {
-                    row.idempotency_key.as_deref() == Some(pending.request_key.as_str())
-                }) else {
-                    return false;
-                };
-                pending.daemon_id = Some(row.id.clone());
-                row.id.clone()
-            }
+        self.bind_in_flight_creation(rows);
+        let Some(pending) = self.pending_creation.as_ref() else {
+            return false;
         };
-        if self.instances.contains_key(&id) {
-            self.hide_in_flight_reservation(&id);
-            return true;
+        if pending.confirmation.is_some() {
+            return false;
         }
-        false
+        let Some(id) = pending
+            .daemon_id
+            .as_ref()
+            .filter(|id| self.instances.contains_key(*id))
+        else {
+            return false;
+        };
+        let id = id.clone();
+        self.hide_in_flight_reservation(&id);
+        true
     }
 
     /// The daemon's session id for the creation this view is displaying.
@@ -409,7 +401,7 @@ impl HomeView {
         if let Some(message) = failure {
             self.info_dialog = Some(InfoDialog::sized_to_fit("Session created", &message));
             pending.reload_retry_at =
-                Some(std::time::Instant::now() + Self::RECONCILE_RELOAD_RETRY_INTERVAL);
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
             self.pending_creation = Some(pending);
             return None;
         }
@@ -509,9 +501,9 @@ impl HomeView {
     pub(in crate::tui) fn apply_confirm_dont_ask_again(&mut self, action: &str) {
         match action {
             "quit" => self.disable_confirm_before_quit(),
-            // Written globally, matching the quit opt-out. A profile that
-            // overrides confirm_delete = true keeps prompting; that override
-            // is cleared from the settings pane, not from here.
+            // Written globally, matching the quit opt-out. A profile that overrides
+            // confirm_delete = true keeps prompting; that override is cleared from the
+            // settings pane.
             "trash_session" => {
                 if let Err(e) = update_config(|config| {
                     config.session.confirm_delete = false;

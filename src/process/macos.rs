@@ -157,9 +157,7 @@ pub(super) fn processes_matching(
 /// existing shell-out convention. Populates total/available RAM and the native
 /// memory-pressure level; PSI has no macOS analogue and stays `None`.
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
-    // Require both figures: total comes from a reliable sysctl but available is
-    // parsed from vm_stat, so a vm_stat failure alone would otherwise read as a
-    // false 100%. Report "unknown" (0/0) unless both are present.
+    // A vm_stat failure alone would otherwise read as a false 100% used.
     let (total_bytes, available_bytes) = match (
         sysctl_u64("hw.memsize"),
         read_vm_stat().and_then(|s| parse_vm_stat_available(&s)),
@@ -489,9 +487,7 @@ impl super::SleepInhibit for CaffeinateInhibitor {
         if super::sleep_inhibit_unavailable() {
             return Ok(());
         }
-        // `-w <daemon_pid>` makes caffeinate exit when the daemon exits, so
-        // the assertion is released even on `std::process::exit`, a panic,
-        // OOM, or `kill -9`, none of which run a `Drop`.
+        // `-w <daemon_pid>` releases the assertion even when the daemon dies without `Drop`.
         let child = match Command::new("caffeinate")
             .args(["-i", "-w", &std::process::id().to_string()])
             .stdin(std::process::Stdio::null())

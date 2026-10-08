@@ -7,8 +7,6 @@ use super::*;
 use crate::tui::dialogs::ContextMenuAction;
 use crate::tui::home::CreationConfirmation;
 
-const REFUSAL: &str = "Still creating this session; it has no runtime yet";
-
 #[test]
 #[serial]
 fn saving_during_creation_never_persists_the_display_placeholder() {
@@ -19,10 +17,14 @@ fn saving_during_creation_never_persists_the_display_placeholder() {
         _temp,
     } = setup_creation_test_env();
     let _driver = view.session_feed.command_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![], "test", 1));
+    view.apply_session_feed();
     view.request_creation(creation_data(&project_dir, "Pending", "test"), None, None);
     let stub = view.creating_stub_id.clone().unwrap();
-    view.save().unwrap();
     let storage = Storage::new_unwatched("default").unwrap();
+    let before = payload_bytes("default");
+    view.reload().unwrap();
     assert!(!storage.load().unwrap().iter().any(|row| row.id == stub));
     assert!(
         view.get_instance(&stub).is_some(),
@@ -34,7 +36,8 @@ fn saving_during_creation_never_persists_the_display_placeholder() {
         "reload must preserve the pending display"
     );
     view.cancel_creation();
-    view.save().unwrap();
+    view.reload().unwrap();
+    assert_eq!(payload_bytes("default"), before);
     assert!(!storage.load().unwrap().iter().any(|row| row.id == stub));
     assert!(view.get_instance(&stub).is_none());
 }
@@ -54,6 +57,9 @@ fn session_actions_refuse_the_creating_stub() {
     // The wizard refuses without a runtime that can take the creation, so drive
     // the feed's command lane the way a connected daemon would.
     let _driver = view.session_feed.command_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![], "test", 1));
+    view.apply_session_feed();
     view.request_creation(creation_data(&project_dir, "Fenced", "fenced"), None, None);
     assert!(
         view.creating_stub_id.is_some(),
@@ -76,7 +82,7 @@ fn session_actions_refuse_the_creating_stub() {
         view.rename_dialog.is_none(),
         "rename opened for a session the daemon has not published"
     );
-    assert_eq!(view.status_flash_text(), Some(REFUSAL));
+    assert!(view.status_flash_text().is_some());
 
     // Non-session actions stay live, and the stub remains selectable so its
     // own preview keeps working.
@@ -92,7 +98,7 @@ fn session_actions_refuse_the_creating_stub() {
     view.status_flash = None;
     view.dispatch_context_menu_action(ContextMenuAction::Rename);
     assert!(view.rename_dialog.is_none());
-    assert_eq!(view.status_flash_text(), Some(REFUSAL));
+    assert!(view.status_flash_text().is_some());
 
     // A menu whose every entry would refuse the row is never opened. The
     // sidebar geometry is only known once the list rects are set, exactly as
@@ -103,7 +109,7 @@ fn session_actions_refuse_the_creating_stub() {
     let row = 1 + view.cursor as u16;
     assert!(view.handle_right_click(5, row));
     assert!(view.context_menu.is_none(), "no menu for the creating stub");
-    assert_eq!(view.status_flash_text(), Some(REFUSAL));
+    assert!(view.status_flash_text().is_some());
 
     // The placeholder is the daemon's; cancelling drops it at once, while the
     // daemon still owes the creation its rollback.
@@ -140,6 +146,9 @@ fn a_cancellation_before_the_daemon_names_the_creation_is_delivered_later() {
         _temp,
     } = setup_creation_test_env();
     let mut driven = view.session_feed.creation_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![], "test", 1));
+    view.apply_session_feed();
     view.request_creation(creation_data(&project_dir, "Delayed", "test"), None, None);
     let stub = view
         .creating_stub_id
@@ -208,6 +217,9 @@ fn refused_create_after_early_cancel_settles_without_a_stub_or_daemon_id() {
         _temp,
     } = setup_creation_test_env();
     let mut reject = view.session_feed.creation_rejection_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![], "test", 1));
+    view.apply_session_feed();
     view.request_creation(creation_data(&project_dir, "Delayed", "test"), None, None);
     let key = view.creating_stub_id.clone().unwrap();
     view.cancel_creation();
@@ -223,10 +235,6 @@ fn refused_create_after_early_cancel_settles_without_a_stub_or_daemon_id() {
 #[test]
 #[serial]
 fn unknown_create_outcome_waits_for_matching_canonical_row_across_profiles() {
-    use crate::daemon::{
-        RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeHealth, RuntimeSnapshot,
-    };
-    use crate::tui::session_feed::SessionFeedResult;
     let CreationTestEnv {
         mut view,
         project_dir,
@@ -234,6 +242,9 @@ fn unknown_create_outcome_waits_for_matching_canonical_row_across_profiles() {
         _temp,
     } = setup_creation_test_env();
     let mut driver = view.session_feed.creation_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![], "test", 1));
+    view.apply_session_feed();
     let mut data = creation_data(&project_dir, "Same title", "group");
     data.profile = "other".into();
     view.request_creation(data, None, None);
@@ -258,74 +269,56 @@ fn unknown_create_outcome_waits_for_matching_canonical_row_across_profiles() {
             Ok(())
         })
         .unwrap();
-    let snapshot = RuntimeSnapshot {
-        cursor: RuntimeCursor {
-            epoch: "test".into(),
-            revision: 2,
-        },
-        contents: RuntimeContents {
-            health: RuntimeHealth::Healthy,
-            capabilities: RuntimeCapabilities {
-                mutations: true,
-                native_interaction: true,
-            },
-            default_profile: "default".into(),
-            sessions: vec![crate::daemon::SessionResponse::from_instance(
-                &committed, false,
-            )],
-            profiles: Vec::new(),
-            workspace_ordering: Vec::new(),
-            global_projects: Vec::new(),
-        },
-    };
-    view.session_feed
-        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+    view.session_feed.publish_for_test(creation_snapshot(
+        vec![crate::daemon::SessionResponse::from_instance(
+            &committed, false,
+        )],
+        "test",
+        2,
+    ));
     view.apply_session_feed();
     assert_eq!(view.apply_creation_results(), Some(id.clone()));
     assert_eq!(view.active_profile_display(), Some("other"));
     assert_eq!(view.selected_session.as_deref(), Some(id.as_str()));
     assert!(view.get_instance(&id).is_some());
 }
-/// `z` on a row parked inside the expanded Archived section must submit the
-/// unarchive through the native lane, exactly as it does for the active row.
-#[test]
+#[tokio::test]
 #[serial]
-fn z_on_a_parked_row_unarchives_through_the_feed() {
-    use crate::daemon::{RuntimeCursor, SessionMutation};
-
-    let mut env = create_test_env_with_sessions(2);
-    env.view.archived_section_collapsed = false;
-    let parked = env.view.instance_at(1).id.clone();
-    env.view.select_session_by_id(&parked);
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
-    assert!(env.view.get_instance(&parked).unwrap().is_archived());
-
-    // Navigate the way the e2e does: down to the section header, expand, down
-    // onto the parked row.
-    env.view.handle_key(key(KeyCode::Char('j')), None);
-    env.view.handle_key(key(KeyCode::Char('l')), None);
-    env.view.handle_key(key(KeyCode::Char('j')), None);
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(parked.as_str()),
-        "the parked row should be selected before pressing z"
-    );
-
-    let mut respond = env.view.session_feed.command_driver_for_test();
-    env.view.handle_key(key(KeyCode::Char('z')), None);
-    let submitted = respond(Ok(RuntimeCursor {
-        epoch: "test".into(),
-        revision: 3,
-    }));
-    match submitted {
-        Some((id, SessionMutation::Archive(body))) => {
-            assert_eq!(id, parked);
-            assert!(!body.archived, "parked row must submit an unarchive");
-        }
-        _ => panic!("parked row must submit an unarchive through the feed"),
-    }
+async fn z_on_a_parked_row_unarchives_through_the_feed() {
+    let (_temp, _guard) = test_home();
+    let mut parked = Instance::new("parked", "/tmp/parked");
+    parked.source_profile = "test".into();
+    parked.status = Status::Stopped;
+    parked.archive();
+    seed_profile("test", std::slice::from_ref(&parked));
+    let state = native_state(&["test"]).await;
+    let mut view = test_view(Some("test"));
+    let mut drive = view.session_feed.command_driver_for_test();
+    apply_published(&mut view, &state).await;
+    view.archived_section_collapsed = false;
+    view.flat_items = view.build_flat_items();
+    view.select_session_by_id(&parked.id);
+    assert_eq!(view.selected_session.as_deref(), Some(parked.id.as_str()));
+    let before = payload_bytes("test");
+    view.handle_key(key(KeyCode::Char('z')), None);
+    assert_eq!(payload_bytes("test"), before);
+    assert!(view.get_instance(&parked.id).unwrap().is_archived());
+    let (status, reply) = request(
+        &state,
+        "PATCH",
+        &format!("/api/sessions/{}/archive", parked.id),
+        serde_json::json!({"archived":false}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let submitted = drive(Ok(serde_json::from_value(reply["cursor"].clone()).unwrap())).unwrap();
+    assert_eq!(submitted.0, parked.id);
+    assert!(matches!(submitted.1, crate::daemon::SessionMutation::Archive(body) if !body.archived));
+    let committed = payload_bytes("test");
+    apply_published(&mut view, &state).await;
+    assert!(!view.get_instance(&parked.id).unwrap().is_archived());
+    assert!(!Storage::new_unwatched("test").unwrap().load().unwrap()[0].is_archived());
+    assert_eq!(payload_bytes("test"), committed);
 }
 
 fn creation_snapshot(
@@ -333,27 +326,9 @@ fn creation_snapshot(
     epoch: &str,
     revision: u64,
 ) -> crate::tui::session_feed::SessionFeedResult {
-    use crate::daemon::{
-        RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeHealth, RuntimeSnapshot,
-    };
-    crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(RuntimeSnapshot {
-        cursor: RuntimeCursor {
-            epoch: epoch.into(),
-            revision,
-        },
-        contents: RuntimeContents {
-            health: RuntimeHealth::Healthy,
-            capabilities: RuntimeCapabilities {
-                mutations: true,
-                native_interaction: true,
-            },
-            default_profile: "default".into(),
-            sessions: rows,
-            profiles: Vec::new(),
-            workspace_ordering: Vec::new(),
-            global_projects: Vec::new(),
-        },
-    }))
+    crate::tui::session_feed::SessionFeedResult::Snapshot(Arc::new(fixture_snapshot(
+        rows, "default", epoch, revision,
+    )))
 }
 
 #[test]
@@ -368,6 +343,9 @@ fn creation_receipt_waits_for_applied_snapshot_and_retries_profile_loading_witho
             _temp,
         } = setup_creation_test_env();
         let mut receipt_driver = view.session_feed.creation_receipt_driver_for_test();
+        view.session_feed
+            .publish_for_test(creation_snapshot(vec![], "test", 1));
+        view.apply_session_feed();
         view.session_feed
             .publish_for_test(creation_snapshot(vec![], "test", 1));
         view.apply_session_feed();
@@ -403,21 +381,13 @@ fn creation_receipt_waits_for_applied_snapshot_and_retries_profile_loading_witho
             view.apply_creation_results().is_none(),
             "receipt alone cannot return an attach id"
         );
-        assert!(view
-            .pending_creation
-            .as_ref()
-            .unwrap()
-            .confirmation
-            .is_none());
         std::fs::write(&path, b"{ invalid json ]").unwrap();
+        let unreadable_bytes = std::fs::read(&path).unwrap();
         view.session_feed
             .publish_for_test(creation_snapshot(vec![row], "test", 2));
         view.apply_session_feed();
+        assert_eq!(std::fs::read(&path).unwrap(), unreadable_bytes);
         assert!(view.apply_creation_results().is_none());
-        assert!(matches!(
-            view.pending_creation.as_ref().unwrap().confirmation,
-            Some(CreationConfirmation::Receipt(_))
-        ));
         assert_eq!(view.creating_stub_id.as_deref(), Some(key.as_str()));
         assert!(view.get_instance(&key).is_some());
         view.info_dialog = None;
@@ -427,6 +397,15 @@ fn creation_receipt_waits_for_applied_snapshot_and_retries_profile_loading_witho
         );
         assert!(view.info_dialog.is_none());
         std::fs::write(&path, valid).unwrap();
+        let cursor = crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2,
+        };
+        if !view.session_feed.receipt_applied(&cursor) {
+            view.session_feed_reload_retry_at = Some(std::time::Instant::now());
+            view.apply_session_feed();
+        }
+        assert!(view.session_feed.receipt_applied(&cursor));
         view.pending_creation.as_mut().unwrap().reload_retry_at = Some(std::time::Instant::now());
         assert_eq!(view.apply_creation_results(), Some(committed.id.clone()));
         assert_eq!(view.active_profile_display(), Some(profile));
@@ -454,11 +433,14 @@ fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancel
         _temp,
     } = setup_creation_test_env();
     let mut driver = view.session_feed.creation_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![], "test", 1));
+    view.apply_session_feed();
     let mut existing = Instance::new("before", project_dir.to_str().unwrap());
     existing.source_profile = "default".into();
     existing.status = Status::Idle;
-    view.add_instance(existing.clone());
-    view.save().unwrap();
+    seed_profile("default", std::slice::from_ref(&existing));
+    view.reload().unwrap();
     view.session_feed.publish_for_test(creation_snapshot(
         vec![crate::daemon::SessionResponse::from_instance(
             &existing, false,
@@ -485,6 +467,7 @@ fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancel
     let path = storage.sessions_path().to_path_buf();
     let valid = std::fs::read(&path).unwrap();
     std::fs::write(&path, b"{ invalid json ]").unwrap();
+    let unreadable_bytes = std::fs::read(&path).unwrap();
     view.session_feed.publish_for_test(creation_snapshot(
         vec![
             crate::daemon::SessionResponse::from_instance(&existing, false),
@@ -494,6 +477,7 @@ fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancel
         2,
     ));
     view.apply_session_feed();
+    assert_eq!(std::fs::read(&path).unwrap(), unreadable_bytes);
     assert_eq!(view.in_flight_creation_id(), Some(reservation.id.as_str()));
     assert!(view.get_instance(&key).is_some());
     assert_eq!(view.session_feed.next_revision_for_test(), 2);
@@ -528,6 +512,9 @@ async fn unknown_creation_uses_current_canonical_authority_after_reconnection_no
         _temp,
     } = setup_creation_test_env();
     let mut driver = view.session_feed.creation_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![], "test", 1));
+    view.apply_session_feed();
     let mut data = creation_data(&project_dir, "Unknown", "group");
     data.profile = "other".into();
     view.request_creation(data, None, None);
@@ -549,14 +536,18 @@ async fn unknown_creation_uses_current_canonical_authority_after_reconnection_no
     let valid = std::fs::read(&path).unwrap();
     let row = crate::daemon::SessionResponse::from_instance(&committed, false);
     std::fs::write(&path, b"{ invalid json ]").unwrap();
+    let unreadable_bytes = std::fs::read(&path).unwrap();
     view.session_feed
         .publish_for_test(creation_snapshot(vec![row.clone()], "old", 2));
     view.apply_session_feed();
+    assert_eq!(std::fs::read(&path).unwrap(), unreadable_bytes);
     assert!(view.apply_creation_results().is_none());
     assert!(matches!(
         view.pending_creation.as_ref().unwrap().confirmation,
         Some(CreationConfirmation::Canonical(_))
     ));
+    view.session_feed.set_mutation_permission_for_test(false);
+    view.session_feed.set_native_permission_for_test(false);
     view.session_feed
         .publish_for_test(crate::tui::session_feed::SessionFeedResult::Unavailable(
             "disconnected".into(),

@@ -1,7 +1,7 @@
 //! Data migrations for handling breaking changes across versions.
 //!
 //! Each migration is a one-time transformation that runs when upgrading from
-//! an older version. Migrations are numbered sequentially and run in order.
+//! an older version. Migrations run in increasing version order.
 //!
 //! To add a new migration:
 //! 1. Create a new module `vNNN_description.rs`
@@ -50,7 +50,6 @@ pub(crate) mod v033_isolate_sandbox_content;
 mod v034_trash_retention_minutes;
 mod v035_serve_passphrase_policy;
 mod v036_pending_purge_owners;
-mod v037_capture_purge_runners;
 mod v038_canonical_sidebar;
 mod v039_custom_sort_order;
 mod v040_reconcile_serve_passphrase_policy;
@@ -285,11 +284,6 @@ const MIGRATIONS: &[Migration] = &[
         run: v036_pending_purge_owners::run,
     },
     Migration {
-        version: 37,
-        name: "capture_purge_runners",
-        run: v037_capture_purge_runners::run,
-    },
-    Migration {
         version: 38,
         name: "canonical_sidebar",
         run: v038_canonical_sidebar::run,
@@ -415,7 +409,7 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
     if current == CURRENT_VERSION {
         v027_isolate_sandbox_stores::reconcile_pending(explicit_migrate)?;
         v033_isolate_sandbox_content::reconcile_pending(move_stores)?;
-        return v037_capture_purge_runners::reconcile();
+        return Ok(());
     }
 
     let pending: Vec<&Migration> = MIGRATIONS
@@ -626,7 +620,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn schema_33_upgrade_initializes_then_captures_purge_ownership() {
+    fn schema_33_upgrade_initializes_purge_ownership() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -653,9 +647,10 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         fs::write(app.join(VERSION_FILE), CURRENT_VERSION.to_string()).unwrap();
 
-        let error = run_migrations().unwrap_err().to_string();
-
-        assert!(error.contains("Pending purge ownership journal is missing"));
+        run_migrations().unwrap();
+        let storage =
+            crate::session::Storage::new_for_test_path("default", app.join("sessions.json"));
+        assert!(crate::session::purge_owners::protection(&storage, None).is_err());
         assert!(!app.join(crate::session::purge_owners::FILE_NAME).exists());
     }
 
@@ -697,18 +692,16 @@ mod tests {
         assert_eq!(before[0].pending_initial_turn.as_deref(), Some("go"));
     }
 
-    /// One `announce`, two reconciliations, one meaning. v027 and v033 both
-    /// read it as "this run may act on a still-pending sandbox move, not just
-    /// report it", but they name the parameter differently because each reads
-    /// it differently: v027 also narrates (`defer = !explicit_migrate`),
-    /// v033 only migrates (`move_stores || only.is_some()`). This pins the
-    /// shared value at the seam: on a current schema, an explicit `aoe
-    /// migrate` acts and a bare startup reports, for both.
     #[test]
     #[serial_test::serial]
     fn an_explicit_migrate_acts_on_both_sandbox_reconciliations_and_a_startup_only_reports() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _probes = v033_isolate_sandbox_content::install_test_reconcile_probes(
+            |_| Ok(false),
+            |_| Ok(true),
+            |_| Ok(Vec::new()),
+        );
         let app = crate::session::get_app_dir().unwrap();
         let home = dirs::home_dir().unwrap();
         fs::create_dir_all(&app).unwrap();

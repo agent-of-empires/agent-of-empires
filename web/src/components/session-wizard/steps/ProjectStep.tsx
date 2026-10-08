@@ -85,7 +85,7 @@ export function ProjectStep({
       {error && (
         <div
           role="alert"
-          className="mb-4 rounded-md border border-warning-600/40 bg-surface-900 px-3 py-2 text-sm text-text-secondary"
+          className="mb-4 rounded-md border border-status-warning/40 bg-surface-900 px-3 py-2 text-sm text-text-secondary"
         >
           Saved projects could not be loaded. Browse and Clone are still available.
           <button type="button" onClick={retry} className="ml-2 text-brand-400 hover:underline cursor-pointer">

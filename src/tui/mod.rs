@@ -2,11 +2,9 @@
 
 mod app;
 mod approval_poller;
-mod attach_project_poller;
 mod boot_spinner;
 pub(crate) mod clipboard;
 mod components;
-mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
 pub(crate) mod home;
@@ -17,7 +15,6 @@ pub(crate) mod markdown;
 mod metrics_poller;
 pub(crate) mod open_url;
 pub(crate) mod plugin_ui;
-mod reconcile_poller;
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
 mod session_feed;
@@ -25,7 +22,6 @@ pub mod settings;
 mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
-mod trash_poller;
 mod worker;
 
 pub use app::*;
@@ -171,9 +167,7 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter(enable_mouse: bool, mosh_active: bool) -> Result<Self> {
-        // Roll back any already-applied state if a later step fails, so a
-        // partial enter (e.g. raw mode on, alternate screen failed) never
-        // leaves the shell wedged before a guard exists to restore it on drop.
+        // Roll back partial state so a failed enter never wedges the shell.
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
@@ -187,28 +181,9 @@ impl TerminalGuard {
                 return Err(err.into());
             }
         }
-        // Push the kitty keyboard protocol's DISAMBIGUATE_ESCAPE_CODES flag so
-        // crossterm's parser sees `Shift+Enter` as `KeyEvent { Enter, SHIFT }`
-        // instead of a bare CR indistinguishable from plain Enter (#2362). On
-        // every kitty-protocol-capable terminal (Ghostty, Kitty, WezTerm,
-        // foot, Konsole 24+, recent Alacritty/xterm) this enables the
-        // `translate()` Shift+Enter arm in live_send. Non-supporting terminals
-        // (Apple Terminal, default iTerm2, Termius, Mosh) silently ignore the
-        // unknown `ESC[>1u` CSI; the user falls back to today's behavior.
-        //
-        // No `supports_keyboard_enhancement()` probe: it blocks for up to 2s
-        // on unresponsive terminals (slow SSH, mosh) and conflicts with the
-        // concurrent EventStream reader the TUI is about to start. Unknown
-        // CSI is a safer default than a 2s startup stall.
-        //
-        // Only `DISAMBIGUATE_ESCAPE_CODES`. NOT `REPORT_EVENT_TYPES` (would
-        // start emitting `KeyEventKind::Release` events that several input
-        // pumps would need explicit filtering for). NOT `REPORT_ALTERNATE_KEYS`
-        // (broader change in `KeyEvent` shape that would re-test every chord).
-        //
-        // Best-effort: a push failure here means we lose the Shift+Enter
-        // distinction (status quo before #2362), not anything worth aborting
-        // TUI startup for. Mirrors the Drop pop's best-effort posture.
+        // Kitty DISAMBIGUATE_ESCAPE_CODES makes Shift+Enter distinct from Enter;
+        // other terminals ignore it. No support probe: it can stall startup for
+        // 2s. Other flags would change key event shapes. Best-effort.
         #[cfg(unix)]
         if let Err(err) = execute!(
             stdout,
@@ -228,9 +203,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        // Pop the kitty enhancement stack first, before anything else, so the
-        // shell never inherits an active stack even if a later restore fails.
-        // Best-effort, ignore errors.
+        // Pop the kitty stack first so the shell never inherits it.
         #[cfg(unix)]
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
@@ -282,29 +255,17 @@ pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(
 }
 
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
-    // Cross-machine entrypoint: when `AOE_DAEMON_URL` is set, swap the
-    // local home view for the remote structured view picker so the user never
-    // sees a session list that doesn't reflect the daemon they pointed
-    // us at. Tmux check + migrations are intentionally skipped here:
-    // the remote machine owns those, this side is a pure client.
+    // `AOE_DAEMON_URL` makes this a pure client of a remote daemon.
     if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
         let _ = startup_warning; // remote mode skips the local startup-warning channel
         let _ = profile;
         return remote_home::run_standalone(endpoint).await;
     }
 
-    // Opening the local session store creates the profile directory, so an
-    // unknown name is refused first (#148); the remote client above never
-    // touches local profiles.
+    // Opening the store creates the profile directory, so refuse unknown names first.
     crate::session::require_known_profile(profile)?;
 
-    // Run pending migrations with a spinner that names the migration, its
-    // current step and the elapsed time, and keeps the notices a migration
-    // emits (what is being moved, how to defer it) on screen. Unconditional
-    // because the spinner writes nothing until a migration reports something,
-    // so the schema-current path costs nothing. This covers the startup pass
-    // only: v027's per-session store move runs from a launch, on the store
-    // move poller, and narrates itself on the home status line.
+    // The spinner writes nothing unless a migration reports progress.
     {
         let console = std::sync::Arc::new(std::sync::Mutex::new(
             migrations::progress::ConsoleProgress::default(),
@@ -380,26 +341,17 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
             .await;
     });
 
-    // Bail early if stdin is not a terminal. Running without a tty would
-    // cause the event loop to busy-loop after the parent terminal dies.
+    // Without a tty the event loop would busy-loop after the parent terminal dies.
     if !io::stdin().is_terminal() {
         anyhow::bail!("stdin is not a terminal; aoe requires an interactive TTY");
     }
 
-    // Setup terminal. Resolve the mouse/mosh policy BEFORE entering raw mode so
-    // the RAII `TerminalGuard` owns the whole enter/restore lifecycle.
-    //
-    // Mouse capture is ON by default to preserve preview-pane wheel scroll
-    // (#795); toggle it off via Settings > Interaction > Mouse Capture, or set
-    // AOE_MOUSE_CAPTURE=0 as a backstop on iOS Mosh + Termius/Blink, which
-    // can't reliably forward mouse-tracking escapes to mobile clients.
-    //
-    // Additionally: even when explicitly requested, Mosh mangles xterm
-    // mouse-tracking escapes (inverted/duplicated scroll on Termius, Blink,
-    // Mosh4iOS; broken right-click selection on desktop Mosh). MOSH_CONNECTION
-    // is set by mosh-server and propagates through the user's environment;
-    // when present, fall back to the terminal's native scroll regardless of
-    // AOE_MOUSE_CAPTURE so the user can select text without aoe eating events.
+    // Preserve first-run local UI without minting a profile in the observer.
+    if crate::session::list_profiles()?.is_empty() {
+        crate::acp::client::daemon_manager::ensure_daemon(profile).await?;
+    }
+    // Mosh mangles mouse-tracking escapes, so capture stays off under it.
+    // `App` re-resolves the config so a mid-session toggle still applies.
     let mosh_active = std::env::var_os("MOSH_CONNECTION").is_some();
     // Resolve once for the startup enable; `App` re-resolves on its own reload
     // cadence so a mid-session settings toggle still applies.
@@ -412,16 +364,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
     let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
 
-    // Combine the caller-supplied startup warning (e.g. debug-log file
-    // failures) with any config-parse failures we detect at startup.
-    // `tracing::warn!` events from the `_or_warn` config helpers are dropped
-    // by default in TUI mode (no subscriber attached), so we surface them
-    // through the same InfoDialog channel here.
-    //
-    // Detected before `App::new` so we can suppress the first-run welcome /
-    // changelog dialogs when there's a warning, both for UX (the warning is
-    // the more important thing for the user to see) and to avoid overwriting
-    // a malformed config.toml with defaults via `update_config`.
+    // Config warnings have no tracing subscriber in TUI mode, so they surface
+    // as a dialog. Known before `App::new` so first-run dialogs are suppressed
+    // and a malformed config.toml isn't overwritten with defaults.
     let combined_warning = match (
         startup_warning,
         crate::session::collect_startup_config_warnings(profile),
@@ -432,12 +377,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         (None, None) => None,
     };
 
-    // The TUI process owns its own FileWatchService Arc; threaded into every
-    // consumer (HomeView, DiffView, per-profile Storage) so peer-process
-    // writes to `sessions.json` / `groups.json` propagate within the
-    // primitive's debounce window. Init failure must not abort the TUI;
-    // fall back to a noop service. The 5s heartbeat path is the sole
-    // reload signal in that case.
+    // Without file watching, the 5s heartbeat is the only reload signal.
     let file_watch = crate::file_watch::FileWatchService::new().unwrap_or_else(|e| {
         tracing::warn!(
             target: "tui.file_watch",
@@ -458,17 +398,14 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     if let Some(warning) = combined_warning {
         app.show_startup_warning(&warning);
     }
-    // Built after `App` so it can share the map the renderer fills: the
-    // backend re-emits OSC 8 around whatever cells the frame marked as links.
+    // Shares the hyperlink map the renderer fills.
     let backend = crate::tui::hyperlink::HyperlinkBackend::new(io::stdout(), app.hyperlink_cells());
     let mut terminal = Terminal::new(backend)?;
     let result = app.run(&mut terminal).await;
 
     crate::session::clear_tui_heartbeat();
 
-    // Terminal restore (raw mode, alternate screen, bracketed paste, mouse
-    // capture, cursor) happens in `_terminal_guard`'s Drop, so it runs on every
-    // exit path including a panic, not just this normal return.
+    // `_terminal_guard` restores the terminal on drop.
     drop(terminal);
     result
 }

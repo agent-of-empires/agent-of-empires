@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::session::attach_project::{AttachOutcome, ExistingBranch};
-use crate::session::Storage;
 
 use super::AppState;
 
@@ -26,7 +25,7 @@ pub(crate) enum AttachError {
     /// A turn is in flight.
     TurnInFlight,
     /// Validation, git, or persistence failure from the session-domain half.
-    Rejected(String),
+    Rejected(anyhow::Error),
 }
 
 impl std::fmt::Display for AttachError {
@@ -51,8 +50,6 @@ pub(crate) async fn attach_project(
     repo_path: &Path,
     on_existing: ExistingBranch,
 ) -> Result<(AttachOutcome, WorkerOutcome), AttachError> {
-    // `instance_lock` alone stopped being the whole barrier once prompt submission moved to
-    // its own authority.
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(id)
@@ -60,210 +57,198 @@ pub(crate) async fn attach_project(
     else {
         return Err(AttachError::NotFound);
     };
-    let inst_lock = state.instance_lock(id).await;
-    // Held across the turn probe, the stop, the persist and the start.
-    let _guard = inst_lock.lock().await;
-
-    let (profile, was_running) = {
-        let instances = state.instances.read().await;
-        let inst = instances
-            .iter()
-            .find(|i| i.id == id)
-            .ok_or(AttachError::NotFound)?;
-        (
-            inst.source_profile.clone(),
-            matches!(
-                state.acp_supervisor.worker_state(id).await,
-                crate::daemon::AcpWorkerState::Running
-            ),
-        )
-    };
-
+    let lock = state.instance_lock(id).await;
+    let _guard = lock.lock().await;
+    let profile = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .map(|row| row.source_profile.clone())
+        .ok_or(AttachError::NotFound)?;
+    let was_running = matches!(
+        state.acp_supervisor.worker_state(id).await,
+        crate::daemon::AcpWorkerState::Running
+    );
     if was_running {
         let store = state.acp_event_store.clone();
-        let id_owned = id.to_string();
-        let in_flight = tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_owned))
+        let probe_id = id.to_owned();
+        let in_flight = tokio::task::spawn_blocking(move || store.has_in_flight_turn(&probe_id))
             .await
-            .unwrap_or(false);
+            .map_err(|error| AttachError::Rejected(error.into()))?;
         if in_flight {
             return Err(AttachError::TurnInFlight);
         }
     }
-
-    // Validation first, with nothing stopped and nothing written.
-    let (instance, plan, restarts) = {
-        let profile = profile.clone();
-        let id_owned = id.to_string();
-        let repo = repo_path.to_path_buf();
-        let file_watch = state.file_watch.clone();
-        tokio::task::spawn_blocking(move || {
-            let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
-            let instances = storage.load().map_err(|e| format!("{e:#}"))?;
-            let instance = instances
-                .into_iter()
-                .find(|i| i.id == id_owned)
-                .ok_or_else(|| format!("session not found: {id_owned}"))?;
-            let plan =
-                crate::session::attach_project::plan(&instance, &profile, &repo, on_existing)
-                    .map_err(|e| format!("{e:#}"))?;
-            let restarts =
-                crate::session::attach_project::needs_restart(&plan, instance.is_sandboxed());
-            Ok::<_, String>((instance, plan, restarts))
-        })
-        .await
-        .map_err(|e| AttachError::Rejected(format!("attach task panicked: {e}")))?
-        .map_err(AttachError::Rejected)?
-    };
-
-    // Order is load-bearing.
+    // Plan through the bound native store. Validation happens before stopping
+    // workers or touching git; attach_planned repeats it under lifecycle exclusion.
+    let plan_id = id.to_owned();
+    let repo = repo_path.to_path_buf();
+    let (instance, plan, restarts) = run_blocking(state, &profile, id, move |storage| {
+        let instance = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == plan_id)
+            .ok_or(crate::session::SessionGone)?;
+        let plan = crate::session::attach_project::plan(
+            &instance,
+            storage.storage().profile(),
+            &repo,
+            on_existing,
+        )?;
+        let restarts =
+            crate::session::attach_project::needs_restart(&plan, instance.is_sandboxed());
+        Ok((instance, plan, restarts))
+    })
+    .await
+    .map_err(|error| {
+        if error.is::<crate::session::SessionGone>() {
+            AttachError::NotFound
+        } else {
+            AttachError::Rejected(error)
+        }
+    })?;
     if restarts && was_running {
-        if let Err(e) = state
+        state
             .acp_supervisor
             .shutdown_and_wait(id, std::time::Duration::from_secs(5))
             .await
-        {
-            return Err(AttachError::Rejected(format!(
-                "could not stop the current worker: {e}"
-            )));
-        }
+            .map_err(|error| {
+                AttachError::Rejected(anyhow::anyhow!(
+                    "could not stop the current worker: {error}"
+                ))
+            })?;
     }
-
     let quiesced = if restarts {
-        // The worker registry entry is already gone, so this takes down the tmux
-        // pane and the sandbox container and reports only what it stopped.
-        match run_blocking(state, &profile, {
-            let instance = instance.clone();
-            move |storage| {
-                crate::session::attach_project::quiesce_for_conversion(storage, &instance)
-                    .map_err(|e| format!("{e:#}"))
-            }
+        let instance = instance.clone();
+        run_blocking(state, &profile, id, move |storage| {
+            crate::session::attach_project::quiesce_for_conversion(storage, &instance)
         })
         .await
-        {
-            Ok(q) => {
-                clear_sandbox_pins(state, id).await;
-                q
-            }
-            Err(e) => return Err(AttachError::Rejected(e)),
-        }
+        .map_err(AttachError::Rejected)?
     } else {
         crate::session::attach_project::Quiesced::default()
     };
-
-    let outcome = {
-        let id_owned = id.to_string();
-        let instance = instance.clone();
-        match run_blocking(state, &profile, move |storage| {
-            crate::session::attach_project::attach_planned(
-                storage,
-                &id_owned,
-                &instance,
-                plan,
-                quiesced.lifecycle_generation,
-            )
-            .map_err(|e| format!("{e:#}"))
-        })
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // Put the session back.
-                restore_after_failure(state, id, &profile, quiesced, was_running && restarts).await;
-                return Err(AttachError::Rejected(e));
+    let attach_id = id.to_owned();
+    let result = run_blocking(state, &profile, id, move |storage| {
+        crate::session::attach_project::attach_planned(
+            storage,
+            &attach_id,
+            &instance,
+            plan,
+            quiesced.lifecycle_generation,
+        )
+    })
+    .await;
+    let mut outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Only restore a rejected/precommit conversion. A durable write
+            // whose canonical adoption failed must not be 'undone' on disk.
+            if !error.is::<crate::session::SessionCommitApplied>()
+                && !error.is::<crate::session::NativeStoreUnavailable>()
+                && !error.is::<crate::session::attach_project::AttachRollbackIncomplete>()
+            {
+                let warnings =
+                    restore_after_failure(state, id, &profile, quiesced, was_running && restarts)
+                        .await;
+                if !warnings.is_empty() {
+                    return Err(AttachError::Rejected(error.context(format!(
+                        "restoring the previous session after the failed attachment also failed: {}", warnings.join("; ")))));
+                }
             }
+            return Err(AttachError::Rejected(error));
         }
     };
-
-    // Persist landed, so mirror it into the live state before anything reads the instance
-    // again.
-    mirror_conversion(state, id, &outcome).await;
-
+    // Every write above has already adopted a complete canonical profile.
+    // There is no hand-patched cache row and no second unlocked disk read.
     if !restarts {
         return Ok((outcome, WorkerOutcome::NotRunning));
     }
-
-    // The tmux pane, when there was one.
-    let pane_warnings = run_blocking(state, &profile, {
-        let id_owned = id.to_string();
-        move |storage| {
-            Ok(crate::session::attach_project::resume_after_conversion(
-                storage, &id_owned, quiesced,
-            ))
-        }
+    let resume_id = id.to_owned();
+    let pane_warnings = run_blocking(state, &profile, id, move |storage| {
+        Ok(crate::session::attach_project::resume_after_conversion(
+            storage, &resume_id, quiesced,
+        ))
     })
     .await
-    .unwrap_or_else(|e| vec![e]);
-    if let Some(first) = pane_warnings.into_iter().next() {
-        return Ok((outcome, WorkerOutcome::RestartFailed(first)));
+    .unwrap_or_else(|error| vec![format!("{error:#}")]);
+    if !pane_warnings.is_empty() {
+        let message = pane_warnings.join("; ");
+        outcome.warnings.extend(pane_warnings);
+        return Ok((outcome, WorkerOutcome::RestartFailed(message)));
     }
-
-    if !was_running {
-        return Ok((outcome, WorkerOutcome::NotRunning));
-    }
-    let worker = spawn_worker(state, id).await;
+    let worker = if was_running {
+        spawn_worker(state, id).await
+    } else {
+        WorkerOutcome::NotRunning
+    };
     Ok((outcome, worker))
 }
 
-/// Run a closure that needs a `Storage` for this profile on a blocking thread.
-async fn run_blocking<T, F>(state: &Arc<AppState>, profile: &str, f: F) -> Result<T, String>
+async fn run_blocking<T, F>(
+    state: &Arc<AppState>,
+    profile: &str,
+    id: &str,
+    action: F,
+) -> anyhow::Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(&Storage) -> Result<T, String> + Send + 'static,
+    F: FnOnce(&dyn crate::session::SessionStore) -> anyhow::Result<T> + Send + 'static,
 {
-    let profile = profile.to_string();
-    let file_watch = state.file_watch.clone();
-    tokio::task::spawn_blocking(move || {
-        let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
-        f(&storage)
+    let worker_state = state.clone();
+    let profile = profile.to_owned();
+    let id = id.to_owned();
+    let failure_profile = profile.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let store =
+            super::session_store::NativeSessionStore::open(worker_state, &profile, Some(id))?;
+        action(&store)
     })
-    .await
-    .unwrap_or_else(|e| Err(format!("attach task panicked: {e}")))
+    .await?;
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is::<crate::session::attach_project::AttachRollbackIncomplete>())
+    {
+        state
+            .mark_reload_failure(crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::ProfileData,
+                profiles: vec![failure_profile],
+            })
+            .await;
+    }
+    result
 }
 
-/// Bring the session back after an attach that failed with it stopped.
 async fn restore_after_failure(
     state: &Arc<AppState>,
     id: &str,
     profile: &str,
     quiesced: crate::session::attach_project::Quiesced,
     respawn_worker: bool,
-) {
-    let id_owned = id.to_string();
-    let warnings = run_blocking(state, profile, move |storage| {
+) -> Vec<String> {
+    let resume_id = id.to_owned();
+    let mut warnings = run_blocking(state, profile, id, move |storage| {
         Ok(crate::session::attach_project::resume_after_conversion(
-            storage, &id_owned, quiesced,
+            storage, &resume_id, quiesced,
         ))
     })
     .await
-    .unwrap_or_else(|e| vec![e]);
-    for warning in warnings {
-        tracing::warn!(
-            target: "session.attach",
-            session = %id,
-            "could not restore the session after a failed attach: {warning}"
-        );
+    .unwrap_or_else(|error| vec![format!("{error:#}")]);
+    let can_respawn = warnings.is_empty();
+    for warning in &warnings {
+        tracing::warn!(target: "session.attach", session = %id,
+            "could not restore the session after a failed attach: {warning}");
     }
-    if respawn_worker {
-        if let WorkerOutcome::RestartFailed(e) = spawn_worker(state, id).await {
-            tracing::warn!(
-                target: "session.attach",
-                session = %id,
-                "could not restart the worker after a failed attach: {e}"
-            );
+    if respawn_worker && can_respawn {
+        if let WorkerOutcome::RestartFailed(error) = spawn_worker(state, id).await {
+            tracing::warn!(target: "session.attach", session = %id,
+                "could not restart the worker after a failed attach: {error}");
+            warnings.push(error);
         }
     }
-}
-
-/// Mirror the persisted conversion into the live instance map.
-async fn mirror_conversion(state: &Arc<AppState>, id: &str, outcome: &AttachOutcome) {
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        inst.workspace_info = Some(outcome.workspace_info.clone());
-        if let Some(moved_to) = &outcome.moved_to {
-            inst.project_path = moved_to.clone();
-            inst.worktree_info = None;
-        }
-    }
+    warnings
 }
 
 /// Start the session's worker again, in the workspace the conversion produced.
@@ -279,7 +264,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             session_id: id.to_string(),
             agent: inst.tool.clone(),
             tool: inst.tool.clone(),
-            // The mirrored instance, so this is the workspace directory when the
+            // The canonical instance, so this is the workspace directory when the
             // attach converted the session, not the path it started from.
             cwd: PathBuf::from(&inst.project_path),
             additional_dirs: vec![],
@@ -309,17 +294,6 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
     match state.acp_supervisor.spawn(request).await {
         Ok(()) => WorkerOutcome::Restarted,
         Err(e) => WorkerOutcome::RestartFailed(format!("worker respawn failed: {e}")),
-    }
-}
-
-/// Drop the create-time container pins from the live instance.
-async fn clear_sandbox_pins(state: &Arc<AppState>, id: &str) {
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        if let Some(sandbox) = inst.sandbox_info.as_mut() {
-            sandbox.container_id = None;
-            sandbox.container_workdir = None;
-        }
     }
 }
 

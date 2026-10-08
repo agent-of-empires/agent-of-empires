@@ -125,7 +125,7 @@ pub async fn update_session_color(
         Err(rej) => return rej.into_response(),
     };
 
-    // Validate up front so an unknown color never reaches disk. `None` clears
+    // Validate up front so an unknown color never reaches disk; `None` clears
     // the label. Mirrors the CLI's palette check.
     let new_color = body.color.map(|c| c.trim().to_lowercase());
     if let Some(c) = &new_color {
@@ -543,110 +543,118 @@ pub async fn restore_session(
 
     let worker_state = state.clone();
     let worker_id = id.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let native = crate::server::session_store::NativeSessionStore::open(
-            worker_state.clone(),
-            &profile,
-            Some(worker_id.clone()),
-        )?;
-        let store: &dyn crate::session::SessionStore = &native;
-        let _identity = crate::session::acquire_session_identity_lock()?;
-        let _lifecycle = store
-            .storage()
-            .acquire_instance_lifecycle_lock(&worker_id)?;
-        let claimed = store.update(|rows, _| {
-            let row = rows
-                .iter()
-                .find(|row| row.id == worker_id)
-                .ok_or(LifecycleTargetError::Missing)?;
-            if worker_state.cityhall_mode && !row.is_structured() {
-                return Err(LifecycleTargetError::CityHall.into());
-            }
-            let now = chrono::Utc::now();
-            if !row.is_trashed() {
-                if row.has_fresh_lifecycle_reservation(now) {
-                    return Err(LifecycleTargetError::Busy.into());
-                }
-                return Ok(None);
-            }
-            match crate::session::claim::decide_restore_claim(rows, &worker_id, now)? {
-                crate::session::claim::RestoreClaimDecision::Claimed(generation) => {
-                    let row = rows
-                        .iter()
-                        .find(|row| row.id == worker_id)
-                        .ok_or(LifecycleTargetError::Missing)?;
-                    Ok(Some((generation, row.clone())))
-                }
-                crate::session::claim::RestoreClaimDecision::AlreadyGone => {
-                    Err(LifecycleTargetError::Missing.into())
-                }
-                crate::session::claim::RestoreClaimDecision::Busy(_) => {
-                    Err(LifecycleTargetError::Busy.into())
-                }
-            }
-        })?;
-        let Some((generation, mut instance)) = claimed else {
-            return Ok(());
-        };
-        instance.source_profile = profile;
-        instance.file_watch = Some(worker_state.file_watch.clone());
-        if let crate::session::trash::RestoreOutcome::Failed { reason } =
-            crate::session::trash::restore_worktree_location(&mut instance)
-        {
-            store.update(|rows, _| {
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<crate::daemon::RestoreOutcome> {
+            let native = crate::server::session_store::NativeSessionStore::open(
+                worker_state.clone(),
+                &profile,
+                Some(worker_id.clone()),
+            )?;
+            let store: &dyn crate::session::SessionStore = &native;
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            let _lifecycle = store
+                .storage()
+                .acquire_instance_lifecycle_lock(&worker_id)?;
+            let claimed = store.update(|rows, _| {
                 let row = rows
-                    .iter_mut()
+                    .iter()
                     .find(|row| row.id == worker_id)
                     .ok_or(LifecycleTargetError::Missing)?;
-                if !row
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation)
-                {
-                    return Err(LifecycleTargetError::Busy.into());
+                if worker_state.cityhall_mode && !row.is_structured() {
+                    return Err(LifecycleTargetError::CityHall.into());
                 }
-                Ok(())
+                let now = chrono::Utc::now();
+                if !row.is_trashed() {
+                    if row.has_fresh_lifecycle_reservation(now) {
+                        return Err(LifecycleTargetError::Busy.into());
+                    }
+                    return Ok(None);
+                }
+                match crate::session::claim::decide_restore_claim(rows, &worker_id, now)? {
+                    crate::session::claim::RestoreClaimDecision::Claimed(generation) => {
+                        let row = rows
+                            .iter()
+                            .find(|row| row.id == worker_id)
+                            .ok_or(LifecycleTargetError::Missing)?;
+                        Ok(Some((generation, row.clone())))
+                    }
+                    crate::session::claim::RestoreClaimDecision::AlreadyGone => {
+                        Err(LifecycleTargetError::Missing.into())
+                    }
+                    crate::session::claim::RestoreClaimDecision::Busy(_) => {
+                        Err(LifecycleTargetError::Busy.into())
+                    }
+                }
             })?;
-            return Err(WorktreeFailure(reason).into());
-        }
-        store.update(|rows, _| {
-            match crate::session::claim::finalize_restore_commit(
-                rows,
-                &worker_id,
-                generation,
-                &instance.project_path,
-                &instance.pre_trash_project_path,
-            ) {
-                crate::session::claim::RestoreCommit::Committed => Ok(()),
-                crate::session::claim::RestoreCommit::AlreadyGone => {
-                    Err(LifecycleTargetError::Missing.into())
-                }
-                crate::session::claim::RestoreCommit::Superseded => {
-                    Err(LifecycleTargetError::Busy.into())
-                }
+            let Some((generation, mut instance)) = claimed else {
+                return Ok(crate::daemon::RestoreOutcome::AlreadyRestored);
+            };
+            instance.source_profile = profile;
+            instance.file_watch = Some(worker_state.file_watch.clone());
+            if let crate::session::trash::RestoreOutcome::Failed { reason } =
+                crate::session::trash::restore_worktree_location(&mut instance)
+            {
+                store.update(|rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == worker_id)
+                        .ok_or(LifecycleTargetError::Missing)?;
+                    if !row.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Restore,
+                        generation,
+                    ) {
+                        return Err(LifecycleTargetError::Busy.into());
+                    }
+                    Ok(())
+                })?;
+                return Err(WorktreeFailure(reason).into());
             }
+            store.update(|rows, _| {
+                match crate::session::claim::finalize_restore_commit(
+                    rows,
+                    &worker_id,
+                    generation,
+                    &instance.project_path,
+                    &instance.pre_trash_project_path,
+                ) {
+                    crate::session::claim::RestoreCommit::Committed => Ok(()),
+                    crate::session::claim::RestoreCommit::AlreadyGone => {
+                        Err(LifecycleTargetError::Missing.into())
+                    }
+                    crate::session::claim::RestoreCommit::Superseded => {
+                        Err(LifecycleTargetError::Busy.into())
+                    }
+                }
+            })?;
+            Ok(crate::daemon::RestoreOutcome::Restored)
         })
-    })
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|result| result);
-    if let Err(error) = result {
-        if let Some(response) = lifecycle_rejection(&state, &error) {
-            return response;
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(&state, &error) {
+                return response;
+            }
+            if let Some(WorktreeFailure(reason)) = error.downcast_ref::<WorktreeFailure>() {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "worktree_restore_failed",
+                    format!("Could not restore the worktree: {reason}"),
+                );
+            }
+            if error.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "restore transition failed");
+            return persist_failed_response();
         }
-        if let Some(WorktreeFailure(reason)) = error.downcast_ref::<WorktreeFailure>() {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
-                "error": "worktree_restore_failed", "message": format!("Could not restore the worktree: {reason}"),
-            }))).into_response();
-        }
-        if error.is::<crate::session::NativeStoreUnavailable>() {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        tracing::warn!(target: "http.api.sessions", session = %id, %error, "restore transition failed");
-        return persist_failed_response();
-    }
+    };
     drop(guard);
     drop(submission);
     drop(namespace);
-    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+    crate::server::runtime::session_mutation_response(&state, &id, Some(outcome)).await
 }
 
 /// `POST /api/sessions/:id/smart-rename`. Regenerates a structured session's
@@ -661,7 +669,7 @@ pub async fn force_smart_rename(
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    if let Some(resp) = crate::server::api::acp::read_only_block(&state) {
+    if let Some(resp) = crate::server::api::read_only_block(&state) {
         return resp;
     }
 
@@ -699,19 +707,14 @@ pub async fn force_smart_rename(
         &command,
         &config.agent_command_override,
     ) {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": reason.as_str(), "message": reason.user_message() })),
-        )
-            .into_response();
+        return api_error(StatusCode::CONFLICT, reason.as_str(), reason.user_message());
     }
 
     // A sandboxed session's one-shot runs inside its container, so a stopped
-    // container is the one remaining way the spawned job would drop the session
-    // after the static gate passed. Probe it here too, else this would answer 202
-    // while nothing renames, which is exactly what the gate above exists to
-    // prevent. Same check and wording as the TUI's preflight; the spawned
-    // try_smart_rename re-probes and stays the authority.
+    // container is the remaining way the spawned job would drop the session
+    // after the static gate passed. Without probing here this would answer 202
+    // while nothing renames. The spawned try_smart_rename re-probes and stays
+    // the authority.
     if sandboxed {
         use crate::containers::Probe;
         let sid = id.clone();
@@ -720,33 +723,18 @@ pub async fn force_smart_rename(
         })
         .await;
         // A failed inspection is not a stopped container: telling the user to
-        // start a container that may already be running sends them the wrong
-        // way, so the runtime error is surfaced as its own state. Same split as
-        // the TUI preflight.
+        // start one that may already be running sends them the wrong way, so the
+        // runtime error is its own state. Same split as the TUI preflight.
         let unknown = match probe {
             Ok(Probe::Running) => None,
             Ok(Probe::NotRunning) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "container_not_running",
-                        "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
-                    })),
-                )
-                    .into_response();
+                return api_error(StatusCode::CONFLICT, "container_not_running", "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.");
             }
             Ok(Probe::Unknown(e)) => Some(e.to_string()),
             Err(e) => Some(e.to_string()),
         };
         if let Some(err) = unknown {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "container_state_unknown",
-                    "message": format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"),
-                })),
-            )
-                .into_response();
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "container_state_unknown", format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"));
         }
     }
 
@@ -767,17 +755,16 @@ pub async fn force_smart_rename(
         .acp_event_store
         .first_turn_context(&id, crate::session::smart_rename::FIRST_TURN_AGENT_BYTES)
     else {
-        return (
+        return api_error(
             StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "no_prompt", "message": "No prompt to name this session from yet" })), 
-        )
-            .into_response();
+            "no_prompt",
+            "No prompt to name this session from yet",
+        );
     };
     let context = crate::session::smart_rename::render_first_turn(&first_user_prompt, &agent_prose);
 
     // Clear the attempted gate so try_smart_rename does not short-circuit on a
-    // prior failed attempt. The inflight guard inside try_smart_rename still
-    // prevents a concurrent one-shot for the same session.
+    // prior failed attempt. Its inflight guard still prevents a concurrent run.
     {
         let mut attempted = state
             .smart_rename_attempted
@@ -820,7 +807,7 @@ pub async fn summarize_session(
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    if let Some(resp) = crate::server::api::acp::read_only_block(&state) {
+    if let Some(resp) = crate::server::api::read_only_block(&state) {
         return resp;
     }
 
@@ -1152,18 +1139,23 @@ async fn stop_with_commit(
     };
     adopt_lifecycle_commit(state, profile, id, result, &publication).await?;
     {
+        let metadata = state.canonical_metadata.read().await;
         let mut rows = state.instances.write().await;
+        let legacy_scope = crate::server::pane::legacy_tool_scope_for_panes(
+            &rows,
+            &metadata.raw_tool_names,
+            panes.as_ref(),
+        );
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
             .ok_or_else(crate::server::api::session_gone_after_persist)?;
-        let metadata = state.canonical_metadata.read().await;
         let tools = metadata
             .auxiliary_tools
             .get(&row.source_profile)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        crate::server::pane::sample_panes(row, tools, panes.as_ref());
+        crate::server::pane::sample_panes(row, tools, panes.as_ref(), legacy_scope.as_ref());
         // A direct stop settles the row without going through
         // `apply_status_intent`, which normally releases a plugin's pending revival
         // mark on reaching a terminal status; release it here instead, on the same
@@ -1180,9 +1172,11 @@ async fn stop_with_commit(
     drop(title);
     if let Err(error) = effect {
         tracing::warn!(target: "http.api.sessions", session = %id, "stop resources failed: {error}");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "stop_failed", "message": "Failed to stop session resources"})))
-            .into_response());
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stop_failed",
+            "Failed to stop session resources",
+        ));
     }
     let cleanup_id = id.to_owned();
     tokio::task::spawn_blocking(move || crate::hooks::cleanup_hook_status_dir(&cleanup_id))
@@ -1266,11 +1260,7 @@ pub async fn restart_session(
         body.extra_args.as_deref().unwrap_or_default(),
         "extra_args",
     )]) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": message})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", message);
     }
     prepare_agent_session(
         state,
@@ -1600,13 +1590,11 @@ async fn finish_structured_restart(
                 return response;
             }
             tracing::warn!(session = %id, %error, "structured restart failed");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error":"start_failed", "message":"Structured restart failed",
-                })),
+                "start_failed",
+                "Structured restart failed",
             )
-                .into_response()
         }
     }
 }
@@ -1693,10 +1681,11 @@ pub(super) async fn prepare_agent_session(
             .iter()
             .any(|profile| profile.name == target)
         {
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "profile_not_found", "message": format!("Profile '{target}' does not exist")})),
-            ).into_response();
+                "profile_not_found",
+                format!("Profile '{target}' does not exist"),
+            );
         }
     }
     if instance.is_structured() && restart.is_some() {
@@ -2066,7 +2055,13 @@ pub(super) async fn prepare_agent_session(
         Ok(Ok(Some((generation, started, outcome, ownership, panes)))) => {
             let adopted = {
                 let _publication = state.publication.write().await;
+                let metadata = state.canonical_metadata.read().await;
                 let mut instances = state.instances.write().await;
+                let legacy_scope = crate::server::pane::legacy_tool_scope_for_panes(
+                    &instances,
+                    &metadata.raw_tool_names,
+                    panes.as_ref(),
+                );
                 match instances.iter_mut().find(|row| row.id == id) {
                     Some(row)
                         if row.lifecycle_generation == generation
@@ -2077,13 +2072,17 @@ pub(super) async fn prepare_agent_session(
                         row.inherit_process_runtime(started);
                         restart_identity =
                             Some((row.lifecycle_generation, row.source_profile.clone()));
-                        let metadata = state.canonical_metadata.read().await;
                         let tools = metadata
                             .auxiliary_tools
                             .get(&row.source_profile)
                             .map(Vec::as_slice)
                             .unwrap_or_default();
-                        crate::server::pane::sample_panes(row, tools, panes.as_ref());
+                        crate::server::pane::sample_panes(
+                            row,
+                            tools,
+                            panes.as_ref(),
+                            legacy_scope.as_ref(),
+                        );
                         state
                             .mutation_epoch
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2113,13 +2112,11 @@ pub(super) async fn prepare_agent_session(
             if error.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"error": "start_failed", "message": "Session start failed"}),
-                ),
-            )
-                .into_response();
+                "start_failed",
+                "Session start failed",
+            );
         }
         Ok(Some(crate::session::StartOutcome::ResumeFailed { sid })) => {
             return (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::ResumeFailed.header(), Json(serde_json::json!({
@@ -2219,14 +2216,7 @@ pub async fn update_session_snooze(
     // Share the CLI and TUI duration bounds.
     if let Some(minutes) = body.minutes {
         if let Err(msg) = crate::session::validate_snooze_duration(minutes as u64) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "validation_failed",
-                    "message": msg,
-                })),
-            )
-                .into_response();
+            return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         }
     }
 

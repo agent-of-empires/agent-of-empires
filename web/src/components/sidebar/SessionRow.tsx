@@ -141,6 +141,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     if (!trimmed || trimmed === model.sessionTitle || !sessionId) return;
     const result = await renameSession(sessionId, trimmed);
     if (result.ok) {
+      props.onSessionMutation(result);
       // The title persisted; a tmux rekey warning is informational.
       result.warnings?.forEach((warning) => reportInfo(warning));
     } else {
@@ -334,6 +335,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         setModal={setModal}
         model={model}
         addProjectOptions={addProjectOptions}
+        onSessionMutation={props.onSessionMutation}
         onSnooze={(minutes) => {
           closeMenu();
           setModal(null);
@@ -416,12 +418,14 @@ function RowModals({
   model,
   addProjectOptions,
   onSnooze,
+  onSessionMutation,
 }: {
   modal: Modal;
   setModal: (m: Modal) => void;
   model: RowModel;
   addProjectOptions: { name: string; path: string }[];
   onSnooze: (minutes: number) => void;
+  onSessionMutation: SessionRowProps["onSessionMutation"];
 }) {
   const { label, sessionId } = model;
   const close = () => setModal(null);
@@ -448,7 +452,11 @@ function RowModals({
         onCancel={close}
         onSubmit={async (name, renameBranch) => {
           const res = await setWorktreeName(sessionId, name, renameBranch);
-          if (res.ok) close();
+          if (res.ok) {
+            onSessionMutation(res);
+            res.warnings?.forEach((warning) => reportInfo(warning));
+            close();
+          }
           return res;
         }}
       />,
@@ -462,7 +470,13 @@ function RowModals({
         projects={addProjectOptions}
         onCancel={close}
         onDone={close}
-        onSubmit={(project, attachExistingBranch) => attachSessionProject(sessionId, project, { attachExistingBranch })}
+        onSubmit={async (project, attachExistingBranch) => {
+          const result = await attachSessionProject(sessionId, project, { attachExistingBranch });
+          if (result.ok && result.session && result.cursor) {
+            onSessionMutation({ session: result.session, cursor: result.cursor });
+          }
+          return result;
+        }}
       />,
       document.body,
     );

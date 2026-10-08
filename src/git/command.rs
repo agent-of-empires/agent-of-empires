@@ -210,6 +210,35 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
+    #[test]
+    fn run_git_quiet_demotes_expected_failure_to_debug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = crate::session::test_support::LogCapture::start();
+        // Unlocking outside a repository fails without affecting any worktree.
+        let args = ["worktree", "unlock", "/nonexistent"];
+        let timeout = Duration::from_secs(30);
+        let loud = run_git_with_timeout(tmp.path(), args, timeout)
+            .expect("git should spawn")
+            .expect("git should not time out");
+        let quiet = run_git_quiet_with_timeout(tmp.path(), args, timeout)
+            .expect("git should spawn")
+            .expect("git should not time out");
+        assert!(!loud.status.success());
+        assert!(!quiet.status.success());
+
+        let logs = logs.contents();
+        let failures = |level: &str| {
+            logs.lines()
+                .filter(|line| line.contains(level) && line.contains("git command failed"))
+                .count()
+        };
+        assert_eq!(
+            (failures("WARN"), failures("DEBUG")),
+            (1, 1),
+            "expected 1 warn and 1 debug failure line: {logs}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_git_with_timeout_kills_a_stalled_command() {

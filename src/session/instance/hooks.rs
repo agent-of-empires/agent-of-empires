@@ -457,11 +457,7 @@ impl Instance {
     /// session gets its own copy from `build_container_config`, which reconciles
     /// into the sandbox dir rather than relying on this host pass.
     fn propagate_managed_skills(&self) {
-        // Read the global config, not the profile chain. `auto_propagate` is
-        // declared `global_only`, and the sandbox path reads it globally too, so
-        // resolving it per profile here would let a profile enable host
-        // propagation while the same profile's sandboxed sessions ignored it,
-        // and would widen a privilege the settings UI never offers per profile.
+        // Read the global config, not the profile chain.
         let config = crate::session::config::Config::load_or_warn();
         if !config.skills.auto_propagate {
             return;
@@ -483,27 +479,19 @@ impl Instance {
         &self,
         agent: Option<&'static crate::agents::AgentDef>,
     ) -> Result<()> {
-        let sandboxed = self.is_sandboxed();
         let Some(agent) = agent else {
             return Ok(());
         };
-        if sandboxed {
+        if self.is_sandboxed() {
             return Ok(());
         }
-        let profile = self.effective_profile();
-        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-        let hook_install_required =
-            crate::agents::hook_install_required(agent, config.session.agent_status_hooks);
-        if !hook_install_required {
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
+        if !crate::agents::hook_install_required(agent, config.session.agent_status_hooks) {
             return Ok(());
         }
-        if !sandboxed
-            && hook_install_required
-            && !crate::session::config::load_config()
-                .ok()
-                .flatten()
-                .is_some_and(|config| config.app_state.has_acknowledged_agent_hooks)
-        {
+        if !host_hooks_acknowledged() {
             bail!(
                 "agent hook paths have not been approved; run `aoe hooks approve` \
                  before launching this host session"
@@ -511,14 +499,9 @@ impl Instance {
         }
         let profile_environment = self.profile_host_environment();
         let resolved_environment = self.resolved_host_environment();
-        let home_from = |environment: &[String]| {
-            crate::session::environment::resolve_host_environment_value(environment, "HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(dirs::home_dir)
-        };
-        let profile_home = home_from(&profile_environment)
+        let profile_home = host_home(&profile_environment)
             .context("home directory unavailable for disclosed hook path")?;
-        let resolved_home = home_from(&resolved_environment)
+        let resolved_home = host_home(&resolved_environment)
             .context("home directory unavailable for resolved hook path")?;
         // Both sides carry the store this launch routes, so what is compared
         // is what the installer writes: a `before_session` redirect still has
@@ -578,33 +561,22 @@ impl Instance {
             .flatten()
     }
 
-    pub(super) fn resolved_host_home(&self) -> Option<std::path::PathBuf> {
-        crate::session::environment::resolve_host_environment_value(
-            &self.resolved_host_environment(),
-            "HOME",
-        )
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir)
-    }
-
     /// Install optional status hooks and mandatory authoritative identity hooks.
     pub(super) fn install_agent_status_hooks(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
     ) {
         self.identity_publisher_launched = false;
-        let profile = self.effective_profile();
-        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
         let status_hooks_enabled = config.session.agent_status_hooks;
         let Some(agent) = agent else {
             return;
         };
         if !self.is_sandboxed()
             && crate::agents::hook_install_required(agent, status_hooks_enabled)
-            && !crate::session::config::load_config()
-                .ok()
-                .flatten()
-                .is_some_and(|config| config.app_state.has_acknowledged_agent_hooks)
+            && !host_hooks_acknowledged()
         {
             tracing::warn!(
                 target: "hooks.install",
@@ -714,7 +686,8 @@ impl Instance {
         if !config.session.pre_trust_agent_folders {
             return;
         }
-        let (Some(agent), Some(home)) = (agent, self.resolved_host_home()) else {
+        let (Some(agent), Some(home)) = (agent, host_home(&self.resolved_host_environment()))
+        else {
             return;
         };
         let project_path = std::fs::canonicalize(&self.project_path)
@@ -905,18 +878,19 @@ fn same_hook_target(disclosed: &std::path::Path, resolved: &std::path::Path) -> 
 }
 
 fn first_read_only_report(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| {
-        path.parent()
-            .and_then(|parent| std::fs::canonicalize(parent).ok())
-            .zip(path.file_name())
-            .map(|(parent, file_name)| parent.join(file_name))
-            .unwrap_or_else(|| path.to_path_buf())
-    });
+    let key = hook_target_identity(path);
     READ_ONLY_SETTINGS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(key.clone())
         .then_some(key)
+}
+
+fn host_hooks_acknowledged() -> bool {
+    crate::session::config::load_config()
+        .ok()
+        .flatten()
+        .is_some_and(|config| config.app_state.has_acknowledged_agent_hooks)
 }
 
 pub(super) fn host_home(host_environment: &[String]) -> Option<std::path::PathBuf> {

@@ -152,9 +152,8 @@ fn is_stranded_checkout(worktree: &Path) -> bool {
         // A repo of its own, not a linked worktree; nothing to strand.
         return false;
     }
-    // `Path::exists` reports false for every error, so a permission or I/O
-    // blip on the admin dir would read a live checkout as stranded. Only a
-    // definite absence is terminal; anything else stays retriable.
+    // `Path::exists` reports false for every error, so a permission or I/O blip on the admin dir
+    // would read a live checkout as stranded.
     match crate::git::cleanup::read_linked_worktree_gitdir(worktree) {
         Some(admin) => matches!(admin.try_exists(), Ok(false)),
         None => false,
@@ -179,12 +178,9 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
     if inst.pre_trash_project_path.is_some() {
         return RelocateOutcome::Skipped;
     }
-    // A default branch's checkout is infrastructure: sibling tooling expects
-    // `<project>/main` to stay where it is, so moving it into the holding area
-    // breaks that layout even though the move is reversible. Leaving it in place
-    // also keeps the purge from stranding it in `.aoe-trash` forever, since the
-    // purge now refuses to remove it (#3215). Skipped, not Failed: this is the
-    // intended outcome, not a move that could not run.
+    // A default branch's checkout is infrastructure: sibling tooling expects `<project>/main` to
+    // stay where it is, so moving it into the holding area breaks that layout even though the move
+    // is reversible.
     if is_protected_default_branch(inst) {
         tracing::info!(
             target: "session.trash",
@@ -515,11 +511,9 @@ fn plan_trashed_reconcile_cached(
         return ReconcilePlan::Nothing;
     }
 
-    // Upgrade path for #3215: a default branch's checkout that an earlier
-    // version relocated is still sitting in the holding area, and the purge now
-    // refuses to remove it, so clearing the row would leave that checkout there
-    // with nothing pointing at it. Move it back instead. Strict like every
-    // restore: an occupied original leaves the row untouched.
+    // Upgrade path for: a default branch's checkout that an earlier version relocated is still
+    // sitting in the holding area, and the purge now refuses to remove it, so clearing the row
+    // would leave that checkout there with nothing pointing at it.
     if inst.pre_trash_project_path.is_some() && is_protected_default_branch_cached(inst, cache) {
         return ReconcilePlan::RestoreDefaultBranch;
     }
@@ -537,33 +531,20 @@ fn plan_trashed_reconcile_cached(
     };
 
     if current.exists() {
-        // Legacy backfill: a trashed managed worktree still sitting in the
-        // active dir with no marker gets relocated now. An already-relocated
-        // row (marker set, current == holding) is left alone, as is a
-        // markerless row that already sits in the holding area (relocating it
-        // again would nest it under .aoe-trash/.aoe-trash/<id>).
+        // Legacy backfill: a trashed managed worktree still sitting in the active dir with no
+        // marker gets relocated now.
         if inst.pre_trash_project_path.is_some()
             || current == holding
             || is_holding_path(&current, &inst.id)
         {
             return ReconcilePlan::Nothing;
         }
-        // Crash case: the worktree was already moved to `holding` but the
-        // marker/pointer persist was lost and something was recreated at the
-        // original path. Retrying the move would fail (the target exists) and
-        // leave project_path on the wrong dir, so heal to the existing holding
-        // path and record the marker. Restore can then fail cleanly if the
-        // original stays occupied.
+        // Crash case: the worktree was already moved to `holding` but the marker/pointer persist
+        // was lost and something was recreated at the original path.
         if holding.exists() {
             return ReconcilePlan::PointAtHolding { holding, original };
         }
-        // Terminal state for a relocation that can never succeed (#3611). An
-        // orphaned checkout fails `git worktree move` with "not a working
-        // tree" no matter how often it is retried, and the old pass re-ran it
-        // on every launch and every poller tick forever. Derived from the
-        // filesystem rather than recorded on the row, so a repaired repo
-        // becomes relocatable again on its own and no transient git failure
-        // can ever freeze into `sessions.json`.
+        // Terminal state for a relocation that can never succeed.
         if is_stranded_checkout(&current) {
             tracing::warn!(
                 target: "session.trash",
@@ -573,9 +554,9 @@ fn plan_trashed_reconcile_cached(
             );
             return ReconcilePlan::Nothing;
         }
-        // A default branch's checkout is never relocated (#3215), so planning
-        // the move would reserve the row, take its flock, and write twice on
-        // every sweep for a relocation that always answers Skipped.
+        // A default branch's checkout is never relocated, so planning the move would reserve the
+        // row, take its flock, and write twice on every sweep for a relocation that always answers
+        // Skipped.
         if is_protected_default_branch_cached(inst, cache) {
             return ReconcilePlan::Nothing;
         }
@@ -691,9 +672,9 @@ pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>>
 
     let mut healed = Vec::new();
     for batch in candidates.chunks(RECONCILE_BATCH) {
-        // One batch's write failure must not abandon the rest of the profile:
-        // the pass this replaced logged per row and carried on, and a batch
-        // that bails leaves its reservations to expire on the TTL.
+        // One batch's write failure must not abandon the rest of the profile: the pass this
+        // replaced logged per row and carried on, and a batch that bails leaves its reservations to
+        // expire on the TTL.
         match reconcile_trashed_batch(&storage, batch) {
             Ok(batch_healed) => healed.extend(batch_healed),
             Err(error) => tracing::warn!(
@@ -741,12 +722,8 @@ fn reconcile_trashed_batch(
             else {
                 continue;
             };
-            // Compare and set: the plan was decided from a snapshot taken
-            // without any lock, so a peer can have restored, purged, or moved
-            // the row since. Reserving it anyway would put a Trash reservation
-            // on a live session and hold it for the rest of the batch, making
-            // that session's launch, restore, and purge report Busy behind
-            // unrelated worktree moves.
+            // Compare and set: the plan was decided from a snapshot taken without any lock, so a
+            // peer can have restored, purged, or moved the row since.
             if !plan_inputs_unchanged(snapshot, stored) {
                 tracing::debug!(
                     target: "session.trash",
@@ -771,11 +748,7 @@ fn reconcile_trashed_batch(
         Ok(reserved)
     })?;
 
-    // Each row takes its own lifecycle flock only across its own filesystem
-    // work. Holding the batch's flocks throughout would make a peer wanting any
-    // one of these sessions wait behind every other row's `git worktree move`.
-    // The reservation taken above, not the flock, is what keeps peers off these
-    // rows for the whole batch.
+    // Each row takes its own lifecycle flock only across its own filesystem work.
     let reconciled: Vec<(u64, bool, Instance)> = reserved
         .into_iter()
         .map(|(generation, mut durable)| {
@@ -838,7 +811,10 @@ fn reconcile_trashed_batch(
 ///
 /// The caller's snapshot is replaced with the durable row after commit. A
 /// fresh peer reservation refuses the pass; an expired reservation is superseded.
-pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool> {
+pub(crate) fn reconcile_trashed_transition(
+    store: &dyn crate::session::SessionStore,
+    inst: &mut Instance,
+) -> anyhow::Result<bool> {
     // A stale no-op snapshot can wait for the next reconciliation pass.
     if plan_trashed_reconcile(inst) == ReconcilePlan::Nothing {
         return Ok(false);
@@ -848,11 +824,10 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
         !profile.is_empty(),
         "session has no source profile; refusing trash reconciliation"
     );
-    let storage = crate::session::Storage::open_unwatched(&profile)?;
     let _identity = crate::session::acquire_session_identity_lock()?;
-    let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&inst.id)?;
+    let _lifecycle_lock = store.storage().acquire_instance_lifecycle_lock(&inst.id)?;
     let id = inst.id.clone();
-    let (generation, mut durable) = storage.update(|instances, _groups| {
+    let (generation, mut durable) = store.update(|instances, _groups| {
         let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) else {
             anyhow::bail!("session disappeared before trash reconciliation");
         };
@@ -869,7 +844,7 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
         new_project_path: durable.project_path.clone(),
         pre_trash_project_path: durable.pre_trash_project_path.clone(),
     };
-    storage.update(|instances, _groups| {
+    store.update(|instances, _groups| {
         if changed {
             let commit = crate::session::claim::commit_trash_relocation(
                 instances,

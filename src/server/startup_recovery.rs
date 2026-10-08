@@ -4,14 +4,168 @@ use std::sync::Arc;
 
 use super::state::AppState;
 
+pub(super) fn repair_startup_profile_ownership(
+    file_watch: &Arc<crate::file_watch::FileWatchService>,
+) -> anyhow::Result<()> {
+    let profiles = crate::session::list_profiles()?;
+    let mut storages = Vec::with_capacity(profiles.len());
+    let mut loads = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let storage = crate::session::Storage::open(&profile, file_watch.clone())?;
+        let (mut instances, _) = storage.load_complete_with_groups()?;
+        for instance in &mut instances {
+            instance.source_profile = profile.clone();
+        }
+        loads.push((profile.clone(), instances));
+        storages.push((profile, storage));
+    }
+    let loads_view: Vec<(&str, &[crate::session::Instance])> = loads
+        .iter()
+        .map(|(profile, rows)| (profile.as_str(), rows.as_slice()))
+        .collect();
+    let storages_view: Vec<(&str, &crate::session::Storage)> = storages
+        .iter()
+        .map(|(profile, storage)| (profile.as_str(), storage))
+        .collect();
+    let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
+    for report in &outcome.reports {
+        tracing::warn!(target: "session.startup_recovery", ?report, "ambiguous profile identity retained for operator review");
+    }
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    for (_, storage) in &storages {
+        let instances = storage.load_complete_with_groups()?.0;
+        let now = chrono::Utc::now();
+        // Purge owners must survive until recover_pending_purges has proved teardown.
+        let mut expired: Vec<String> = instances
+            .iter()
+            .filter(|row| {
+                row.lifecycle_reservation
+                    .as_ref()
+                    .is_some_and(|reservation| {
+                        reservation.op != crate::session::LifecycleOperation::Purge
+                    })
+                    && !row.has_fresh_lifecycle_reservation(now)
+            })
+            .map(|row| row.id.clone())
+            .collect();
+        expired.sort();
+        let mut locks = Vec::with_capacity(expired.len());
+        for id in &expired {
+            locks.push(storage.acquire_instance_lifecycle_lock(id)?);
+        }
+        if expired.is_empty() {
+            continue;
+        }
+        storage.update(|rows, _groups| {
+            for id in &expired {
+                if let Some(row) = rows.iter_mut().find(|row| &row.id == id) {
+                    if row
+                        .lifecycle_reservation
+                        .as_ref()
+                        .is_some_and(|reservation| {
+                            reservation.op != crate::session::LifecycleOperation::Purge
+                        })
+                    {
+                        row.clear_expired_lifecycle_reservation(
+                            crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                            now,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+pub(super) async fn publish_startup_identity(state: &Arc<AppState>) {
+    let instances: Vec<_> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| !state.cityhall_mode || row.is_structured())
+        .cloned()
+        .collect();
+    match tokio::task::spawn_blocking(move || {
+        // Batch-sync instance IDs and captured session IDs to tmux hidden env
+        // so that build_exclusion_set() on other AoE instances can see them.
+        // One observation for both per-instance walks below. They visit every
+        // instance in the view, so a per-item `list-sessions` fork scales with
+        // the whole store, measured as the dominant tmux cost of this pass on
+        // a store of a few hundred sessions.
+        let live = crate::tmux::LiveSessionSnapshot::new();
+        {
+            let mut set_batch: Vec<(String, String, String)> = Vec::new();
+            let mut unset_batch: Vec<(String, String)> = Vec::new();
+            for inst in &instances {
+                // This publication is one-shot: no reload re-runs it and a
+                // poller does not re-emit an unchanged sid, so a row dropped
+                // here stays unpublished until an unrelated sid change or a
+                // relaunch. A snapshot that could not reach the server is
+                // therefore probed per row rather than read as "no live pane".
+                let Some(tmux_name) = inst.tmux_env_session_name_in_or_probe(&live) else {
+                    continue;
+                };
+
+                set_batch.push((
+                    tmux_name.clone(),
+                    crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+                    inst.id.clone(),
+                ));
+                if let Some(ref sid) = inst.agent_session_id {
+                    set_batch.push((
+                        tmux_name,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                        sid.clone(),
+                    ));
+                } else {
+                    unset_batch.push((
+                        tmux_name,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    ));
+                }
+            }
+            if !set_batch.is_empty() {
+                let batch_refs: Vec<(&str, &str, &str)> = set_batch
+                    .iter()
+                    .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
+                    .collect();
+                if let Err(e) = crate::tmux::env::set_hidden_env_batch(&batch_refs) {
+                    tracing::warn!(target: "session.startup_recovery", "Batch env sync failed: {}", e);
+                }
+            }
+            if !unset_batch.is_empty() {
+                let batch_refs: Vec<(&str, &str)> = unset_batch
+                    .iter()
+                    .map(|(s, k)| (s.as_str(), k.as_str()))
+                    .collect();
+                if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&batch_refs) {
+                    tracing::warn!(target: "tui.home", "Batch env unset failed: {}", e);
+                }
+            }
+        }
+    }).await {
+        Ok(()) => {},
+        Err(error) => tracing::warn!(target: "session.startup_recovery", %error, "initial tmux identity publication failed"),
+    }
+}
+
 /// Startup auto-recovery for AI agent sessions whose tmux pane is missing after a daemon
 /// restart or system reboot.
 pub(super) async fn daemon_startup_recovery_mark(
     state: Arc<AppState>,
+    failed_repairs: &std::collections::HashSet<String>,
 ) -> Option<(
     crate::session::recovery::RecoveryLock,
     Vec<crate::session::Instance>,
 )> {
+    if state.read_only
+        || *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy
+    {
+        return None;
+    }
     let lock = match crate::session::recovery::try_acquire_recovery_lock() {
         Ok(Some(l)) => l,
         Ok(None) => {
@@ -62,7 +216,10 @@ pub(super) async fn daemon_startup_recovery_mark(
                     .get(&session_name)
                     .map(|m| !m.pane_dead)
                     .unwrap_or(false);
-                !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
+                !failed_repairs.contains(&i.id)
+                    && (!state.cityhall_mode || i.is_structured())
+                    && !has_live_tmux
+                    && crate::session::recovery::is_recovery_candidate(i)
             })
             .cloned()
             .collect()
@@ -317,9 +474,293 @@ pub(super) async fn daemon_startup_recovery_cascade(
 }
 
 #[cfg(test)]
+mod migrated_tui_ownership_tests {
+    use super::repair_startup_profile_ownership;
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
+    use crate::session::{
+        Group, Instance, LifecycleOperation, LifecycleReservation, Status, Storage,
+    };
+    use serial_test::serial;
+    use tempfile::TempDir;
+    fn setup_test_home(temp: &TempDir) -> AppDirGuard {
+        isolate_app_dir_at(temp.path())
+    }
+    fn boot_ambiguous_state(with_journal: bool) -> (TempDir, AppDirGuard, String) {
+        let temp = TempDir::new().unwrap();
+        let guard = setup_test_home(&temp);
+        let alpha = Storage::new_unwatched("alpha").unwrap();
+        let mut inst = Instance::new("moved", "/repo/moved");
+        inst.group_path = "work".to_string();
+        let id = inst.id.clone();
+        alpha
+            .update(|i, g| {
+                i.push(inst.clone());
+                g.push(Group::new("work", "work"));
+                Ok(())
+            })
+            .unwrap();
+        let beta = Storage::new_unwatched("beta").unwrap();
+        beta.update(|i, _| {
+            let mut copy = inst.clone();
+            copy.source_profile = "beta".to_string();
+            i.push(copy);
+            Ok(())
+        })
+        .unwrap();
+        if with_journal {
+            crate::session::record_move_journal(
+                &crate::session::MoveJournalEntry {
+                    version: crate::session::MOVE_JOURNAL_VERSION,
+                    ids: vec![id.clone()],
+                    source_profile: "alpha".to_string(),
+                    target_profile: "beta".to_string(),
+                    source_sessions_path: alpha.sessions_path().to_path_buf(),
+                    target_sessions_path: beta.sessions_path().to_path_buf(),
+                    group_move_source_path: "work".to_string(),
+                    group_move_target_path: "moved".to_string(),
+                    group_move_subtree: false,
+                    created_at_epoch_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default(),
+                },
+                alpha.sessions_path(),
+            )
+            .unwrap();
+        }
+        (temp, guard, id)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn interrupted_move_with_journal_repairs_before_canonical_publish() {
+        let (_temp, _guard, id) = boot_ambiguous_state(true);
+        repair_startup_profile_ownership(&crate::file_watch::FileWatchService::noop()).unwrap();
+        let loaded =
+            crate::server::reload::load_all_profiles(&crate::file_watch::FileWatchService::noop())
+                .unwrap();
+        assert_eq!(
+            loaded.instances.iter().filter(|row| row.id == id).count(),
+            1
+        );
+        assert_eq!(
+            loaded
+                .instances
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .source_profile,
+            "beta"
+        );
+        assert!(Storage::new_unwatched("alpha")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
+        let beta = Storage::new_unwatched("beta").unwrap().load().unwrap();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].id, id);
+        let state = crate::server::test_support::build_test_app_state(loaded.instances);
+        *state.canonical_metadata.write().await = loaded.metadata;
+        let published = state.runtime.publish(&state).await.unwrap();
+        assert_eq!(
+            published
+                .value
+                .contents
+                .sessions
+                .iter()
+                .filter(|row| row.id == id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            published
+                .value
+                .contents
+                .sessions
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .profile,
+            "beta"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn startup_retains_fresh_launch_owner_but_releases_expired_owner_before_profile_move() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        for expired in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let _guard = setup_test_home(&temp);
+            let source = Storage::new_unwatched("source").unwrap();
+            let target = Storage::new_unwatched("target").unwrap();
+            target.update(|_, _| Ok(())).unwrap();
+            let mut row = Instance::new("reserved", "/tmp/reserved");
+            row.source_profile = "source".into();
+            row.status = Status::Starting;
+            row.lifecycle_generation = 1;
+            let at = if expired {
+                chrono::Utc::now()
+                    - Instance::LIFECYCLE_RESERVATION_TTL
+                    - chrono::Duration::seconds(1)
+            } else {
+                chrono::Utc::now()
+            };
+            row.lifecycle_reservation = Some(LifecycleReservation {
+                op: LifecycleOperation::Launch,
+                generation: 1,
+                at,
+            });
+            source
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            repair_startup_profile_ownership(&crate::file_watch::FileWatchService::noop()).unwrap();
+            let persisted = source.load().unwrap();
+            assert_eq!(persisted[0].lifecycle_reservation.is_none(), expired);
+            let loaded = crate::server::reload::load_all_profiles(
+                &crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            let state = crate::server::test_support::build_test_app_state_with_policy(
+                loaded.instances,
+                vec!["localhost".into()],
+                Vec::new(),
+                None,
+            );
+            *state.canonical_metadata.write().await = loaded.metadata;
+            let response = crate::server::test_support::build_router_for_test(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/sessions/{}", row.id))
+                        .header("host", "localhost")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"profile":"target"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if expired {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+            assert_eq!(
+                source.load().unwrap().iter().any(|r| r.id == row.id),
+                !expired
+            );
+            assert_eq!(
+                target.load().unwrap().iter().any(|r| r.id == row.id),
+                expired
+            );
+            if expired {
+                let published = state.runtime.publish(&state).await.unwrap();
+                let moved = published
+                    .value
+                    .contents
+                    .sessions
+                    .iter()
+                    .find(|r| r.id == row.id)
+                    .unwrap();
+                assert_eq!(moved.profile, "target");
+                assert!(moved.lifecycle_reservation.is_none());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::test_support;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn startup_recovery_requires_healthy_authority_without_consuming_ledger() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let ledger = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV,
+            ledger.path(),
+        )]);
+        let mut row = crate::session::Instance::new("needs-repair", "/tmp/stale-recovery-path");
+        row.agent_session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(crate::session::recovery::is_recovery_candidate(&row));
+        let id = row.id.clone();
+        let state = test_support::build_test_app_state(vec![row]);
+        for code in [
+            crate::daemon::ReloadFailureCode::Metadata,
+            crate::daemon::ReloadFailureCode::ProfileData,
+        ] {
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                code,
+                profiles: vec!["default".into()],
+            };
+            assert!(
+                daemon_startup_recovery_mark(state.clone(), &std::collections::HashSet::new())
+                    .await
+                    .is_none()
+            );
+            assert!(!crate::session::recovery::recovery_attempted_this_boot().contains(&id));
+            assert!(!state.recovery_pending.read().unwrap().contains(&id));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_startup_repair_is_not_consumed_as_a_recovery_attempt() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let ledger = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV,
+            ledger.path(),
+        )]);
+        let repaired = tempfile::tempdir().unwrap();
+        let mut row =
+            crate::session::Instance::new("repaired-path", repaired.path().to_str().unwrap());
+        row.agent_session_id = Some(uuid::Uuid::new_v4().to_string());
+        let id = row.id.clone();
+        assert!(crate::session::recovery::is_recovery_candidate(&row));
+        let state = test_support::build_test_app_state(vec![row]);
+        assert!(daemon_startup_recovery_mark(
+            state.clone(),
+            &std::collections::HashSet::from([id.clone()])
+        )
+        .await
+        .is_none());
+        assert!(!crate::session::recovery::recovery_attempted_this_boot().contains(&id));
+        assert!(!state.recovery_pending.read().unwrap().contains(&id));
+        let (lock, candidates) =
+            daemon_startup_recovery_mark(state.clone(), &std::collections::HashSet::new())
+                .await
+                .expect("repaired row becomes eligible");
+        let selected = candidates.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(
+            std::path::Path::new(&selected.project_path),
+            repaired.path()
+        );
+        drop(lock);
+        assert!(crate::session::recovery::recovery_attempted_this_boot().contains(&id));
+        assert!(
+            daemon_startup_recovery_mark(state, &std::collections::HashSet::new())
+                .await
+                .is_none()
+        );
+    }
 
     /// #2994 wiring test for `daemon_startup_recovery_mark` (Phase A).
     #[tokio::test]
@@ -352,7 +793,8 @@ mod tests {
         // Pass 1: no orphan, id_a unattempted -> included (and now marked).
         {
             let state = test_support::build_test_app_state(vec![inst_a.clone()]);
-            let picked = daemon_startup_recovery_mark(state).await;
+            let picked =
+                daemon_startup_recovery_mark(state, &std::collections::HashSet::new()).await;
             let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
             assert!(
                 candidates.iter().any(|c| c.id == id_a),
@@ -365,7 +807,8 @@ mod tests {
             crate::session::recovery::recovery_attempted_this_boot().contains(&id_a);
         if ledger_active {
             let state = test_support::build_test_app_state(vec![inst_a.clone()]);
-            let picked = daemon_startup_recovery_mark(state).await;
+            let picked =
+                daemon_startup_recovery_mark(state, &std::collections::HashSet::new()).await;
             let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
             assert!(
                 !candidates.iter().any(|c| c.id == id_a),
@@ -411,7 +854,7 @@ mod tests {
         }
 
         let state = test_support::build_test_app_state(vec![inst_b.clone()]);
-        let picked = daemon_startup_recovery_mark(state).await;
+        let picked = daemon_startup_recovery_mark(state, &std::collections::HashSet::new()).await;
         let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
 
         let _ = decoy.kill();

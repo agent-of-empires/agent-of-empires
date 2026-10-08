@@ -466,12 +466,8 @@ impl Instance {
         };
         self.session_id_poller_retry_after = None;
 
-        // Unlike the eligibility checks above, this forks `tmux list-sessions`,
-        // so it stays behind the budget gate rather than joining them: an
-        // over-budget process would otherwise pay a fork per deferred repair.
-        // A session that is both over budget and without an agent pane is
-        // reported as over budget, and the next repair tick stops looking once
-        // its own snapshot agrees the agent pane is gone.
+        // Unlike the eligibility checks above, this forks `tmux list-sessions`, so it stays behind
+        // the budget gate rather than joining them.
         let Some(tmux_session_name) = poller_seed_name(
             self.live_agent_seed(),
             || self.tmux_session().ok().map(|s| s.name().to_string()),
@@ -988,7 +984,7 @@ mod tests {
             None,
         );
         assert!(
-            inst.has_live_tmux_pane_in(&live),
+            inst.has_live_agent_pane_in(&live),
             "fixture pane must read live"
         );
         assert!(inst.supports_session_poller());

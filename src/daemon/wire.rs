@@ -118,8 +118,68 @@ pub struct CreateSessionBody {
     pub retry_origin: Option<String>,
 }
 
-/// Persisted group identity; empty paths and synthetic sidebar sections are invalid.
 #[derive(Serialize, Deserialize)]
+pub struct RenameSessionBody {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub rename_branch: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenameOutcome {
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SetWorktreeNameBody {
+    pub name: String,
+    #[serde(default)]
+    pub rename_branch: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorktreeEditOutcome {
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AttachProjectBody {
+    pub project: String,
+    #[serde(default)]
+    pub attach_existing_branch: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttachedProject {
+    pub name: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub branch_created: bool,
+    pub moved_to: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AttachedWorkerOutcome {
+    Restarted,
+    NotRunning,
+    RestartFailed { message: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttachProjectOutcome {
+    pub attached: AttachedProject,
+    pub warnings: Vec<String>,
+    pub worker: AttachedWorkerOutcome,
+}
+
+/// Persisted group identity; empty paths and synthetic sidebar sections are invalid.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GroupLocation {
     pub profile: String,
     pub path: String,
@@ -136,29 +196,80 @@ pub struct CollapseGroupBody {
     pub collapsed: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteGroupMode {
     EmptyOnly,
     KeepSessions,
+    DeleteSessions,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteGroupBody {
     pub group: GroupLocation,
     pub mode: DeleteGroupMode,
+    #[serde(default)]
+    pub cleanup: DeleteSessionBody,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GroupSessionOutcome {
     pub id: String,
     #[serde(flatten)]
     pub outcome: PurgeOutcome,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupSessionFailureCode {
+    LifecycleBusy,
+    Superseded,
+    PurgeFailed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GroupSessionFailure {
+    pub id: String,
+    pub code: GroupSessionFailureCode,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteGroupOutcome {
     pub sessions: Vec<GroupSessionOutcome>,
+    pub failures: Vec<GroupSessionFailure>,
+    pub group_removed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum ReorderBody {
+    Session {
+        id: String,
+        profile: String,
+        source_group: String,
+        direction: MoveDirection,
+        destination: Option<String>,
+    },
+    Group {
+        group: GroupLocation,
+        direction: MoveDirection,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReorderOutcome {
+    Moved { destination: Option<GroupLocation> },
+    AtEdge,
+    Stale,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -242,12 +353,88 @@ pub struct RestartOutcome {
     pub target: Option<TerminalTarget>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StopAuxiliaryBody {
+    #[serde(flatten)]
+    pub target: crate::session::AuxiliaryTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<crate::session::LegacyToolAdoption>,
+}
+
+impl<'de> Deserialize<'de> for StopAuxiliaryBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum Body {
+            Host {
+                index: u32,
+            },
+            Container {
+                index: u32,
+            },
+            Tool {
+                tool_name: String,
+                #[serde(default)]
+                adoption: Option<crate::session::LegacyToolAdoption>,
+            },
+        }
+        use crate::session::AuxiliaryTarget;
+        let (target, adoption) = match Body::deserialize(deserializer)? {
+            Body::Host { index } => (AuxiliaryTarget::Host { index }, None),
+            Body::Container { index } => (AuxiliaryTarget::Container { index }, None),
+            Body::Tool {
+                tool_name,
+                adoption,
+            } => (AuxiliaryTarget::Tool { tool_name }, adoption),
+        };
+        Ok(Self { target, adoption })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnsureToolBody {
     pub tool_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<TerminalSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<crate::session::LegacyToolAdoption>,
+}
+
+#[cfg(test)]
+mod legacy_tool_body_tests {
+    use super::*;
+
+    #[test]
+    fn stop_body_decodes_exact_adoption_and_rejects_non_tool_or_unknown_fields() {
+        let body = serde_json::json!({
+            "kind":"tool", "tool_name":"git|log",
+            "adoption": {
+                "tmux_session":"aoe_tool_git_log_old_abc12345",
+                "identity":{"session_id":"$42", "pane_id":"%42", "pane_pid":4242},
+                "profile":"work", "lifecycle_generation":7,
+            },
+        });
+        let decoded: StopAuxiliaryBody = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), body);
+        for bad in [
+            serde_json::json!({"kind":"host","index":0,"adoption":body["adoption"]}),
+            serde_json::json!({"kind":"tool","tool_name":"git","unexpected":true}),
+            serde_json::json!({"kind":"tool","tool_name":"git","adoption":{
+                "tmux_session":"x", "identity":{"session_id":"$42", "pane_id":"%42"},
+                "profile":"work","lifecycle_generation":7,
+            }}),
+        ] {
+            assert!(serde_json::from_value::<StopAuxiliaryBody>(bad).is_err());
+        }
+        let plain: StopAuxiliaryBody =
+            serde_json::from_value(serde_json::json!({"kind":"host", "index":0})).unwrap();
+        assert_eq!(
+            plain.target,
+            crate::session::AuxiliaryTarget::Host { index: 0 }
+        );
+        assert!(plain.adoption.is_none());
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -310,8 +497,7 @@ impl Default for TrashSessionBody {
         }
     }
 }
-
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeleteSessionBody {
     #[serde(default)]
     pub delete_worktree: bool,
@@ -324,6 +510,12 @@ pub struct DeleteSessionBody {
     /// Retain the scratch directory while removing its session row.
     #[serde(default)]
     pub keep_scratch: bool,
+    /// Reject a row restored before this trash-only purge is reserved.
+    #[serde(default)]
+    pub expected_trash: bool,
+    /// Resolve resource cleanup policy on the daemon from the reserved row.
+    #[serde(default)]
+    pub use_cleanup_defaults: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -599,6 +791,13 @@ pub struct PendingApproval {
     pub choice: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RestoreOutcome {
+    Restored,
+    AlreadyRestored,
+}
+
 /// One session from the daemon. Only `id` is required when decoding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionResponse {
@@ -616,6 +815,8 @@ pub struct SessionResponse {
     pub artifact_dir: String,
     #[serde(default)]
     pub group_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<u32>,
     #[serde(default)]
     pub tool: String,
     #[serde(default)]
@@ -624,6 +825,8 @@ pub struct SessionResponse {
     pub extra_args: String,
     #[serde(default)]
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_reservation: Option<crate::session::LifecycleReservation>,
     #[serde(default)]

@@ -338,7 +338,15 @@ const requestCases: RequestCase[] = [
       result: { ok: true, session },
     },
   ],
-  ["PATCH /api/sessions/s1", () => api.renameSession("s1", "T"), { body: { title: "T" }, result: { ok: true } }],
+  [
+    "PATCH /api/sessions/s1",
+    () => api.renameSession("s1", "T"),
+    {
+      body: { title: "T" },
+      respond: runtimeJson({ ...session, outcome: { warnings: [] } }),
+      result: { ok: true, session, cursor },
+    },
+  ],
   [
     "POST /api/sessions/s1/smart-rename",
     () => api.smartRenameSession("s1"),
@@ -348,7 +356,11 @@ const requestCases: RequestCase[] = [
   [
     "PATCH /api/sessions/s1/worktree-name",
     () => api.setWorktreeName("s1", "feature", true),
-    { body: { name: "feature", rename_branch: true }, result: { ok: true } },
+    {
+      body: { name: "feature", rename_branch: true },
+      respond: runtimeJson({ ...session, outcome: { warnings: [] } }),
+      result: { ok: true, session, cursor },
+    },
   ],
   ["PATCH /api/sessions/a%2Fb/group", () => api.updateSessionGroup("a/b", ""), { body: { group: "" }, result: true }],
   ...(
@@ -419,14 +431,18 @@ const requestCases: RequestCase[] = [
     () => api.attachSessionProject("s1", "/r"),
     {
       body: { project: "/r", attach_existing_branch: false },
-      respond: json({
-        worker: "restart_failed",
-        worker_message: "boom",
-        attached: { name: "r", branch: "b", branch_created: false, moved_to: "/w" },
-        warnings: ["w"],
+      respond: runtimeJson({
+        ...session,
+        outcome: {
+          worker: { status: "restart_failed", message: "boom" },
+          attached: { name: "r", worktree_path: "/w/r", branch: "b", branch_created: false, moved_to: "/w" },
+          warnings: ["w"],
+        },
       }),
       result: {
         ok: true,
+        session,
+        cursor,
         worker: "restart_failed",
         message: "boom",
         name: "r",
@@ -1007,8 +1023,8 @@ describe("login", () => {
 
 describe("session mutation messages", () => {
   it("renameSession keeps only string warnings", async () => {
-    fetchSpy.mockResolvedValueOnce(json({ warnings: ["kept", 3, null] }));
-    expect(await api.renameSession("s1", "T")).toEqual({ ok: true, warnings: ["kept"] });
+    fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome: { warnings: ["kept", 3, null] } }));
+    expect(await api.renameSession("s1", "T")).toEqual({ ok: true, session, cursor, warnings: ["kept"] });
   });
 
   it.each([
@@ -1253,4 +1269,33 @@ describe("runtime snapshots and cancellation", () => {
       expect(await request).toBeNull();
     },
   );
+});
+
+describe("header-complete operations", () => {
+  it.each([
+    ["login", () => api.login("fixture"), { ok: true }],
+    ["terminal", () => api.ensureTerminal("s1"), { ok: true }],
+    ["summary", () => api.summarizeSession("s1"), { ok: true }],
+    ["smart rename", () => api.smartRenameSession("s1"), { ok: true }],
+    ["dismiss plugin update", () => api.dismissPluginUpdate("p", "fingerprint"), { kind: "ok" }],
+    ["refused plugin action", () => api.invokePluginAction("p.action", "s1"), null, 403],
+  ] as const)("settles %s without waiting for an open response body", async (_name, call, expected, status = 200) => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+      },
+    });
+    fetchSpy.mockResolvedValueOnce(new Response(stream, { status }));
+    let timer!: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Operation waited for an irrelevant body")), 1000);
+    });
+    try {
+      expect(await Promise.race([call(), deadline])).toEqual(expected);
+    } finally {
+      clearTimeout(timer);
+      controller.close();
+    }
+  });
 });

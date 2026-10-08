@@ -80,6 +80,11 @@ pub fn sanitize_session_name(name: &str) -> String {
         .collect()
 }
 
+fn chain_set_option(args: &mut Vec<String>, flags: &[&str]) {
+    args.extend([";".to_owned(), "set-option".to_owned()]);
+    args.extend(flags.iter().map(|flag| (*flag).to_owned()));
+}
+
 /// Append `; set-option -p -t <target> remain-on-exit on` to an in-flight
 /// tmux argument list so that remain-on-exit is set atomically with session
 /// creation. Using pane-level (`-p`) avoids bleeding into user-created panes
@@ -87,15 +92,7 @@ pub fn sanitize_session_name(name: &str) -> String {
 ///
 /// Note: the `-p` (pane-level) flag requires tmux >= 3.0.
 pub fn append_remain_on_exit_args(args: &mut Vec<String>, target: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-p".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "remain-on-exit".to_string(),
-        "on".to_string(),
-    ]);
+    chain_set_option(args, &["-p", "-t", target, "remain-on-exit", "on"]);
 }
 
 /// Append `; set-option -t <target> pane-base-index 0` to an in-flight tmux
@@ -105,14 +102,7 @@ pub fn append_remain_on_exit_args(args: &mut Vec<String>, target: &str) {
 /// captures addressing every pane without a prior `list-panes` round trip.
 /// See #488.
 pub fn append_pane_base_index_args(args: &mut Vec<String>, target: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "pane-base-index".to_string(),
-        "0".to_string(),
-    ]);
+    chain_set_option(args, &["-t", target, "pane-base-index", "0"]);
 }
 
 /// Append `; set-option -t <target> default-shell <shell>` so panes the user
@@ -122,14 +112,7 @@ pub fn append_pane_base_index_args(args: &mut Vec<String>, target: &str) {
 /// login-shell command at create time because a `default-shell` set chained
 /// after `new-session` is too late for the already-spawned pane.
 pub fn append_default_shell_args(args: &mut Vec<String>, target: &str, shell: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "default-shell".to_string(),
-        shell.to_string(),
-    ]);
+    chain_set_option(args, &["-t", target, "default-shell", shell]);
 }
 
 /// Append every `[tmux]`-driven option write that a brand-new session needs, in
@@ -175,10 +158,6 @@ pub fn append_tmux_setting_args(args: &mut Vec<String>, target: &str, config: &C
 /// list. Pure over the writes, so the emitted tokens are table-testable.
 fn append_tmux_setting_writes(args: &mut Vec<String>, target: &str, writes: &[TmuxOptionWrite]) {
     for write in writes {
-        args.push(";".to_string());
-        args.push("set-option".to_string());
-        // Only the scope flags differ per variant; the `-q` guard and the
-        // option/value pushes are shared.
         let (scope_flags, option, value, quiet) = match *write {
             TmuxOptionWrite::Session {
                 option,
@@ -196,9 +175,7 @@ fn append_tmux_setting_writes(args: &mut Vec<String>, target: &str, writes: &[Tm
                 quiet,
             } => (&["-w", "-t", target][..], option, value, quiet),
         };
-        if quiet {
-            args.push("-q".to_string());
-        }
+        chain_set_option(args, if quiet { &["-q"] } else { &[] });
         args.extend(scope_flags.iter().map(|flag| flag.to_string()));
         args.push(option.to_string());
         args.push(value.to_string());
@@ -211,14 +188,22 @@ fn append_tmux_setting_writes(args: &mut Vec<String>, target: &str, writes: &[Tm
 /// `window-size smallest`, which would shrink the window to the smallest
 /// attached PTY regardless of which client is primary.
 pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "window-size".to_string(),
-        "latest".to_string(),
-    ]);
+    chain_set_option(args, &["-t", target, "window-size", "latest"]);
+}
+
+pub(crate) fn append_session_setup_args(
+    args: &mut Vec<String>,
+    target: &str,
+    config: &Config,
+    default_shell: Option<&str>,
+) {
+    append_remain_on_exit_args(args, target);
+    append_pane_base_index_args(args, target);
+    append_window_size_args(args, target);
+    if let Some(shell) = default_shell {
+        append_default_shell_args(args, target, shell);
+    }
+    append_tmux_setting_args(args, target, config);
 }
 
 /// Outcome of one `#{pane_dead}` probe against a session's agent pane.
@@ -390,13 +375,7 @@ pub(crate) fn classify_pane_probe(succeeded: bool, stdout: &str, stderr: &[u8]) 
     match stdout {
         "1" => PaneProbe::Dead,
         "0" => PaneProbe::Alive,
-        "" => {
-            if succeeded || tmux_no_server_running(stderr) {
-                PaneProbe::Missing
-            } else {
-                PaneProbe::Unknown
-            }
-        }
+        "" if succeeded || tmux_no_server_running(stderr) => PaneProbe::Missing,
         _ => PaneProbe::Unknown,
     }
 }
@@ -499,13 +478,8 @@ pub fn is_pane_running_shell(session_name: &str) -> bool {
     if !is_shell_command(&current_command) {
         return false;
     }
-
-    // Protected pane environment values are sourced by a short-lived script
-    // executed by the user's POSIX shell. While the launch command is alive,
-    // tmux therefore reports that shell rather than the agent as the pane's
-    // current command. The script itself is the pane command, so once the agent
-    // exits the pane becomes dead instead of returning to a prompt. Do not
-    // mistake this live wrapper for a resurrected or interactive shell.
+    // The protected env launch script runs under a POSIX shell, which tmux
+    // reports while the agent is alive; that wrapper is not a prompt.
     is_pane_running_shell_command(
         &current_command,
         pane_start_command_is_protected(session_name),
@@ -1128,7 +1102,15 @@ mod tests {
                 ),
                 (
                     "tool",
-                    crate::tmux::ToolSession::new(&instance.id, "proof", "tool").kill(),
+                    crate::tmux::ToolSession::new(&instance.id, "proof", "tool").kill_verified(
+                        &instance.id,
+                        "tool",
+                        &crate::session::LegacyToolIdentity {
+                            session_id: "$1".into(),
+                            pane_id: "%1".into(),
+                            pane_pid: 1,
+                        },
+                    ),
                 ),
             ];
             for (kind, result) in results {

@@ -27,8 +27,7 @@ pub enum SessionMutation {
     Start(super::StartSessionBody),
     Restart(super::RestartSessionBody),
     Stop,
-    StopAuxiliary(crate::session::AuxiliaryTarget),
-    Restore,
+    StopAuxiliary(super::StopAuxiliaryBody),
     AbandonPurge(super::AbandonPurgeBody),
     Archive(super::UpdateArchiveBody),
     Access,
@@ -49,7 +48,6 @@ impl SessionMutation {
             Self::Restart(_) => "restart",
             Self::Stop => "stop",
             Self::StopAuxiliary(_) => "auxiliary/stop",
-            Self::Restore => "restore",
             Self::AbandonPurge(_) => "purge/abandon",
             Self::Archive(_) => "archive",
             Self::Access => "access",
@@ -96,6 +94,20 @@ pub enum ProfileMutation {
         query: super::DeleteProfileQuery,
     },
     SetDefault(super::DefaultProfileBody),
+}
+pub(crate) enum NamespaceMutation {
+    CollapseGroup(super::CollapseGroupBody),
+    MoveGroup(super::MoveGroupBody),
+    DeleteGroup(super::DeleteGroupBody),
+    Reorder(super::ReorderBody),
+    Profile(ProfileMutation),
+}
+
+#[derive(Debug)]
+pub(crate) enum NamespaceOutcome {
+    Committed,
+    DeletedGroup(super::DeleteGroupOutcome),
+    Reordered(super::ReorderOutcome),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

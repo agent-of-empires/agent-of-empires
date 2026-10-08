@@ -52,8 +52,9 @@ fn boot_ambiguous_state(with_journal: bool) -> (TempDir, AppDirGuard, String) {
 
 #[test]
 #[serial]
-fn interrupted_move_with_journal_repairs_before_publish() {
+fn tui_never_repairs_move_journals_or_writes_profile_payloads() {
     let (_temp, _guard, id) = boot_ambiguous_state(true);
+    let before = (payload_bytes("alpha"), payload_bytes("beta"));
 
     let view = HomeView::new_for_test(
         None,
@@ -62,26 +63,32 @@ fn interrupted_move_with_journal_repairs_before_publish() {
     )
     .unwrap();
 
-    // The journal arbitrates before the unified map is published, so the
-    // repaired row is usable immediately instead of being excluded.
-    assert_eq!(view.instances.len(), 1, "exactly the winning row publishes");
-    let row = view.instances.get(&id).expect("repaired row present");
-    assert_eq!(row.source_profile, "beta", "target copy wins per journal");
-    assert!(view.legacy_duplicate_reports.is_empty());
-    assert!(
+    assert!(view.instances.get(&id).is_none());
+    assert_eq!(view.legacy_duplicate_reports.len(), 1);
+    assert_eq!(
         Storage::new_unwatched("alpha")
             .unwrap()
             .load()
             .unwrap()
-            .is_empty(),
-        "losing source copy removed on disk"
+            .len(),
+        1
     );
+    assert_eq!(
+        Storage::new_unwatched("beta")
+            .unwrap()
+            .load()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!((payload_bytes("alpha"), payload_bytes("beta")), before);
 }
 
 #[test]
 #[serial]
 fn legacy_duplicate_stays_excluded_and_is_surfaced() {
     let (_temp, _guard, id) = boot_ambiguous_state(false);
+    let before = (payload_bytes("alpha"), payload_bytes("beta"));
 
     let mut view = HomeView::new_for_test(
         None,
@@ -98,6 +105,7 @@ fn legacy_duplicate_stays_excluded_and_is_surfaced() {
     let message = view.legacy_duplicate_reports[0].actionable_message();
     assert!(message.contains(&id) && message.contains("alpha") && message.contains("beta"));
 
+    assert_eq!((payload_bytes("alpha"), payload_bytes("beta")), before);
     // The fail-closed state must be visible, not silent.
     let theme = crate::tui::styles::load_theme("empire");
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();

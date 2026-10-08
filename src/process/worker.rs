@@ -123,19 +123,13 @@ fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::UnixStream> {
         None,
     )
     .ok()?;
-    // `SockFlag::SOCK_NONBLOCK` and `SOCK_CLOEXEC` are gated to
-    // linux_android/BSD in nix 0.31, so set `FD_CLOEXEC` and
-    // `O_NONBLOCK` via fcntl for portability with macOS. Matches
-    // `std::os::unix::net::UnixStream::connect`, which sets
-    // `FD_CLOEXEC` on the returned fd.
+    // `SOCK_NONBLOCK`/`SOCK_CLOEXEC` are Linux/BSD-only in nix, so set them via fcntl.
     fcntl(fd.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).ok()?;
     fcntl(fd.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).ok()?;
 
     match connect(fd.as_raw_fd(), &addr) {
         Ok(()) => {}
-        // `EAGAIN` is Linux AF_UNIX's variant of `EINPROGRESS`
-        // (`unix(7)`): connect cannot complete immediately; the
-        // same POLLOUT wait applies.
+        // Linux AF_UNIX reports `EAGAIN` where others report `EINPROGRESS`.
         Err(Errno::EINPROGRESS | Errno::EAGAIN) => {
             let mut pfds = [PollFd::new(fd.as_fd(), PollFlags::POLLOUT)];
             // 100ms: same-host UDS connect completes in microseconds
@@ -145,8 +139,7 @@ fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::UnixStream> {
             if poll(&mut pfds, 100u16).ok()? == 0 {
                 return None;
             }
-            // POLLOUT also fires on connect failure (ECONNREFUSED, etc.);
-            // check `SO_ERROR` before trusting the socket.
+            // POLLOUT also fires on connect failure; check `SO_ERROR`.
             if getsockopt(&fd, SocketError).ok()? != 0 {
                 return None;
             }
@@ -297,9 +290,7 @@ pub fn log_path(dir: &Path, id: &str) -> Result<PathBuf> {
 /// from the legacy base path retained in registry records: `x.sock` becomes
 /// `x.control.sock`. Validated session ids cannot confuse the extension swap.
 pub fn control_socket_sibling(main_socket: &Path) -> PathBuf {
-    // Guard against self-application: feeding an already-derived control
-    // path would silently yield `x.control.control.sock`. All callers pass
-    // the main `.sock`; this makes future misuse loud in debug builds.
+    // Self-application would yield `x.control.control.sock`.
     debug_assert!(
         !main_socket.to_string_lossy().ends_with(".control.sock"),
         "control_socket_sibling called on an already-derived control path: {}",

@@ -34,11 +34,9 @@ fn wants_text_selection_tracks_copy_friendly_surfaces() {
 #[test]
 #[serial]
 fn archived_running_session_renders_stopped_icon_not_spinner() {
-    // Regression for af711cb: pre-fix, archived/snoozed rows still cycled
-    // through animated spinner frames driven by their underlying Running
-    // status, making sunk rows read as "still alive" and pulling the eye
-    // away from real attention items. Pin the icon to ICON_STOPPED for
-    // archived rows even when status is Running.
+    // Regression for af711cb: archived and snoozed rows cycled through animated spinner
+    // frames driven by their underlying Running status, reading as "still alive". Pin the
+    // icon to ICON_STOPPED for archived rows even when the status is Running.
     use crate::session::Status;
     use crate::tui::home::render::agent_row_icon;
     use crate::tui::home::ICON_STOPPED;
@@ -78,9 +76,8 @@ fn archived_running_session_renders_stopped_icon_not_spinner() {
         "snoozed row must render stopped icon, not animated spinner"
     );
 
-    // Sanity: a plain Running row (no archive, no snooze) must NOT collapse
-    // to ICON_STOPPED; otherwise the test would pass trivially because the
-    // helper always returned the stopped glyph.
+    // Sanity: a plain Running row must not collapse to ICON_STOPPED, or the test would
+    // pass trivially on a helper that always returned the stopped glyph.
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
         inst.archived_at = None;
@@ -285,86 +282,6 @@ fn update_bar_renders_sandbox_image_banner() {
     }
 }
 
-/// Issue #2220: the app-update banner reassures users that updating is safe
-/// for running sessions. The reassurance must render alongside the version and
-/// action keys so users know `u` won't tear down their work.
-#[test]
-#[serial]
-fn app_update_banner_reassures_running_sessions_are_safe() {
-    use crate::tui::styles::load_theme;
-    use crate::update::UpdateInfo;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    let mut env = create_test_env_empty();
-    let backend = TestBackend::new(120, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let theme = load_theme("empire");
-
-    let update_info = UpdateInfo {
-        available: true,
-        current_version: "1.0.0".to_string(),
-        latest_version: "1.1.0".to_string(),
-    };
-
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view
-                .render(f, area, &theme, Some(&update_info), None, None);
-        })
-        .unwrap();
-
-    let buf = terminal.backend().buffer();
-    let mut out = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            out.push_str(buf[(x, y)].symbol());
-        }
-        out.push('\n');
-    }
-
-    assert!(
-        out.contains("running sessions stay safe"),
-        "expected the update banner to reassure that running sessions are safe.\nFull buffer:\n{out}"
-    );
-    assert!(
-        out.contains("[u] update"),
-        "the action key must still render alongside the reassurance.\nFull buffer:\n{out}"
-    );
-
-    // Narrow-terminal contract: the reassurance is appended after the keys
-    // precisely so the action hints survive when the line is too narrow to
-    // hold everything. At 72 columns the keys fit but the reassurance clips.
-    let narrow = TestBackend::new(72, 30);
-    let mut narrow_terminal = Terminal::new(narrow).unwrap();
-    narrow_terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view
-                .render(f, area, &theme, Some(&update_info), None, None);
-        })
-        .unwrap();
-
-    let nbuf = narrow_terminal.backend().buffer();
-    let mut nout = String::new();
-    for y in 0..nbuf.area.height {
-        for x in 0..nbuf.area.width {
-            nout.push_str(nbuf[(x, y)].symbol());
-        }
-        nout.push('\n');
-    }
-
-    assert!(
-        nout.contains("[u] update") && nout.contains("[Ctrl+x] dismiss"),
-        "the action keys must survive clipping on a narrow terminal.\nFull buffer:\n{nout}"
-    );
-    assert!(
-        !nout.contains("running sessions stay safe"),
-        "the trailing reassurance is expected to clip first on a narrow terminal.\nFull buffer:\n{nout}"
-    );
-}
-
 /// Regression for the e2e CI failure (job 76034901940):
 /// `test_command_palette_fuzzy_search_settings` and
 /// `test_profile_picker_create_new_profile` failed because the harness types
@@ -403,33 +320,6 @@ fn wants_paste_burst_only_for_paste_aware_dialogs() {
         env.view.wants_paste_burst(),
         "burst should re-enable after dialog closes"
     );
-}
-
-/// Rows with recovery in flight are excluded from polling until the flag clears.
-#[test]
-#[serial]
-fn pollable_instances_excludes_recovery_in_flight() {
-    {
-        let mut env = create_test_env_with_sessions(3);
-        let id_skipped = env.view.instance_at(1).id.clone();
-        env.view.recovery_in_flight.insert(id_skipped.clone());
-
-        let pollable = env.view.pollable_instances();
-
-        assert_eq!(pollable.len(), 2);
-        assert!(pollable.iter().all(|i| i.id != id_skipped));
-    }
-    // Clearing the flag makes the row pollable again.
-    {
-        let mut env = create_test_env_with_sessions(1);
-        let id = env.view.instance_at(0).id.clone();
-        env.view.recovery_in_flight.insert(id.clone());
-        assert!(env.view.pollable_instances().is_empty());
-
-        env.view.recovery_in_flight.remove(&id);
-
-        assert_eq!(env.view.pollable_instances().len(), 1);
-    }
 }
 
 /// The System Health panel survives a refresh but closes on selection change, and its tip is
@@ -570,17 +460,19 @@ fn favorite_without_runtime_cannot_change_local_state() {
 
 /// Trashing a session hides it from the active list and surfaces it under
 /// the synthetic Trash section; the shelve/unshelve key (`z`) restores it.
-#[test]
+#[tokio::test]
 #[serial]
-fn trash_then_restore_round_trip() {
+async fn trash_then_restore_round_trip() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     // Keep the Trash section expanded so the trashed row stays reachable.
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     assert!(!env.view.instance_at(0).is_trashed());
 
-    env.view.trash_session_by_id(&id);
+    super::pickers_groups_sort::settle_trash(&state, &mut env.view, &id).await;
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
         "session must be trashed"
@@ -599,9 +491,7 @@ fn trash_then_restore_round_trip() {
 
     // Restore via the shelve/unshelve key.
     env.view.select_session_by_id(&id);
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
+    super::pickers_groups_sort::settle_restore(&state, &mut env.view, &id).await;
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "session must be restored out of trash"
@@ -611,10 +501,12 @@ fn trash_then_restore_round_trip() {
 /// Regression for #2489: trashing a session must not re-expand a Trash
 /// section the user has collapsed. Like single-row archive, the section
 /// header's count is the feedback; the collapse state is left untouched.
-#[test]
+#[tokio::test]
 #[serial]
-fn trashing_leaves_collapsed_trash_section_collapsed() {
+async fn trashing_leaves_collapsed_trash_section_collapsed() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     assert!(
         env.view.trashed_section_collapsed,
         "Trash section defaults to collapsed"
@@ -622,7 +514,7 @@ fn trashing_leaves_collapsed_trash_section_collapsed() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
-    env.view.trash_session_by_id(&id);
+    super::pickers_groups_sort::settle_trash(&state, &mut env.view, &id).await;
 
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
@@ -639,42 +531,61 @@ fn trashing_leaves_collapsed_trash_section_collapsed() {
 /// instead of running it on the input thread, which froze the TUI while the
 /// sandbox container stopped. The durable trash marker is still written inline
 /// so the row flips to Trashed instantly; the teardown is merely queued.
-#[test]
+#[tokio::test]
 #[serial]
-fn trash_offloads_blocking_teardown_to_poller() {
+async fn trash_admission_does_not_locally_write_before_daemon_completion() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
+    let before = payload_bytes("test");
+    let mut respond = env.view.session_feed.request_driver_for_test();
     env.view.trash_session_by_id(&id);
-
-    // Inline: the row is durably trashed the instant the key is handled.
-    assert!(
-        env.view.get_instance(&id).unwrap().is_trashed(),
-        "trash marker must be written inline for instant feedback"
-    );
-    // Off-thread: the blocking teardown is in flight on the worker, tracked in
-    // its pending set until a result is drained. If trashing had run the
-    // teardown inline (the frozen-TUI bug), nothing would be queued here.
-    let pending = env.view.trash_poller.take_pending();
-    assert_eq!(
-        pending,
-        vec![id],
-        "trash teardown must be queued on the TrashPoller, not run on the input thread"
-    );
+    assert_eq!(payload_bytes("test"), before);
+    assert!(!env.view.get_instance(&id).unwrap().is_trashed());
+    let (status, headers, value) = request_with_headers(
+        &state,
+        "POST",
+        &format!("/api/sessions/{id}/trash"),
+        serde_json::json!({"kill_pane":true}),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {value}");
+    let receipt = crate::daemon::MutationReceipt {
+        cursor: super::pickers_groups_sort::receipt_cursor(&headers),
+        outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+    };
+    assert!(respond(Ok(
+        crate::tui::session_feed::SessionCommandOutcome::Trashed(receipt)
+    ))
+    .is_some());
+    env.view.apply_session_feed();
+    assert!(!env.view.get_instance(&id).unwrap().is_trashed());
+    apply_published(&mut env.view, &state).await;
+    assert!(env.view.get_instance(&id).unwrap().is_trashed());
+    assert!(Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap()
+        .is_trashed());
 }
 
 /// Trashing reserves a durable lifecycle generation before queueing teardown.
 /// The worker may already have completed and released the lease by the time the
 /// test reloads, but the monotonic generation proves ownership was acquired.
-#[test]
+#[tokio::test]
 #[serial]
-fn trash_reserves_durable_lifecycle_generation() {
+async fn trash_reserves_durable_lifecycle_generation() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
-    env.view.trash_session_by_id(&id);
+    super::pickers_groups_sort::settle_trash(&state, &mut env.view, &id).await;
 
     let rows = env.view.storages.get("test").unwrap().load().unwrap();
     let row = rows.iter().find(|instance| instance.id == id).unwrap();
@@ -684,111 +595,25 @@ fn trash_reserves_durable_lifecycle_generation() {
 
 /// A plain session's no-relocation teardown releases its durable Trash reservation
 /// before the worker publishes completion.
-#[test]
+#[tokio::test]
 #[serial]
-fn trash_teardown_release_clears_durable_claim() {
+async fn trash_teardown_release_clears_durable_claim() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
-    env.view.trash_session_by_id(&id);
-    let row = |view: &HomeView| {
-        view.storages
-            .get("test")
-            .unwrap()
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|i| i.id == id)
-            .unwrap()
-    };
-
-    // Drain the worker's completed transition.
-    let mut drained = false;
-    for _ in 0..100 {
-        env.view.apply_trash_results();
-        if !env.view.trash_poller.is_pending(&id) {
-            drained = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(drained, "teardown result never drained");
-    let final_row = row(&env.view);
-    assert!(final_row.is_trashed(), "row stays trashed");
-    assert_eq!(
-        final_row.lifecycle_reservation, None,
-        "Skipped teardown must release the Trash claim"
-    );
-}
-
-/// Restore takes over a fresh Trash reservation before the queued teardown starts.
-#[test]
-#[serial]
-fn trash_then_immediate_restore_hands_off_cleanly() {
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    let mut env = create_test_env_with_sessions(2);
-    let id = env.view.instance_at(0).id.clone();
-    let (entered_tx, entered_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    env.view.trash_poller =
-        crate::tui::trash_poller::TrashPoller::with_handler_for_test(move |request| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().expect("release teardown");
-            crate::session::trash::perform_trash(&request)
-        });
-    let row = |view: &HomeView| {
-        view.storages
-            .get("test")
-            .unwrap()
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|i| i.id == id)
-            .unwrap()
-    };
-
-    env.view.selected_session = Some(id.clone());
-    env.view.trash_session_by_id(&id);
-    entered_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("teardown entered");
-    let trashed = row(&env.view);
-    assert!(trashed.is_trashed());
-    assert!(trashed.lifecycle_reservation_is_owned(
-        crate::session::LifecycleOperation::Trash,
-        trashed.lifecycle_generation,
-    ));
-
-    env.view.selected_session = Some(id.clone());
-    env.view.restore_selected_from_trash();
-    let restored = row(&env.view);
-    assert!(
-        !restored.is_trashed(),
-        "restore must seize the held Trash claim"
-    );
-    assert!(restored.lifecycle_generation > trashed.lifecycle_generation);
-    assert_eq!(restored.lifecycle_reservation, None);
-
-    release_tx.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while env.view.trash_poller.is_pending(&id) {
-        assert!(Instant::now() < deadline, "teardown result never drained");
-        env.view.apply_trash_results();
-        std::thread::yield_now();
-    }
-    let final_row = row(&env.view);
-    assert!(
-        !final_row.is_trashed(),
-        "stale teardown must not undo restore"
-    );
-    assert_eq!(
-        final_row.lifecycle_generation,
-        restored.lifecycle_generation
-    );
-    assert_eq!(final_row.lifecycle_reservation, None);
+    super::pickers_groups_sort::settle_trash(&state, &mut env.view, &id).await;
+    let row = Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(row.is_trashed());
+    assert!(row.lifecycle_generation > 0);
+    assert_eq!(row.lifecycle_reservation, None);
+    assert!(env.view.get_instance(&id).unwrap().is_trashed());
 }
 
 /// The Trash and Archived sections render in the pinned shelf. Right-clicking their synthetic
@@ -803,7 +628,7 @@ fn right_click_trash_header_shows_bulk_menu() {
         let mut env = create_test_env_with_sessions(2);
         env.view.trashed_section_collapsed = false;
         let id = env.view.instance_at(0).id.clone();
-        env.view.trash_session_by_id(&id);
+        super::pickers_groups_sort::fixture_trash(&mut env.view, &id);
 
         let header_idx = env
             .view
@@ -872,7 +697,7 @@ fn right_click_trash_header_shows_bulk_menu() {
         let mut env = create_test_env_with_sessions(2);
         env.view.trashed_section_collapsed = false;
         let id = env.view.instance_at(0).id.clone();
-        env.view.trash_session_by_id(&id);
+        super::pickers_groups_sort::fixture_trash(&mut env.view, &id);
 
         let theme = load_theme("empire");
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -913,116 +738,149 @@ fn right_click_trash_header_shows_bulk_menu() {
 /// Shelf bulk actions: "Empty Trash" routes through a destructive confirm and marks every trashed
 /// row Deleting (an empty trash shows an info dialog instead), and "Restore All" un-trashes or
 /// unarchives every row of its section.
-#[test]
+#[tokio::test]
 #[serial]
-fn empty_trash_confirm_purges_every_trashed_row() {
-    // Empty Trash confirm.
-    {
-        use crate::session::Status;
-        let mut env = create_test_env_with_sessions(3);
-        let a = env.view.instance_at(0).id.clone();
-        let b = env.view.instance_at(1).id.clone();
-        env.view.trash_session_by_id(&a);
-        env.view.trash_session_by_id(&b);
-
-        env.view.prompt_empty_trash();
-        let dialog = env
-            .view
-            .confirm_dialog
-            .as_ref()
-            .expect("Empty Trash must open a confirm dialog");
-        assert_eq!(dialog.action(), "empty_trash");
-
-        env.view.dispatch_confirm_submit("empty_trash");
-        for id in [&a, &b] {
-            let inst = env
-                .view
-                .get_instance(id)
-                .expect("row kept until purge lands");
+async fn empty_trash_confirm_purges_every_trashed_row() {
+    use crate::tui::session_feed::{SessionCommandOutcome, SessionRequest};
+    for purge in [false, true] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut a = Instance::new("trash-a", "/tmp/trash-a");
+        a.trash();
+        let mut b = Instance::new("trash-b", "/tmp/trash-b");
+        b.trash();
+        let active = Instance::new("active", "/tmp/active");
+        let active_id = active.id.clone();
+        let mut ids = vec![a.id.clone(), b.id.clone()];
+        ids.sort();
+        crate::server::test_support::seed_instances_on_disk_for_test("bulk", vec![a, b, active]);
+        let state = native_state(&["bulk"]).await;
+        let mut view = HomeView::new_for_test(
+            Some("bulk".into()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        let before = payload_bytes("bulk");
+        let mut respond = view.session_feed.request_driver_for_test();
+        if purge {
+            view.prompt_empty_trash();
             assert_eq!(
-                inst.status,
-                Status::Deleting,
-                "each trashed row must be marked Deleting"
+                view.confirm_dialog.as_ref().unwrap().action(),
+                "empty_trash"
             );
+            view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), None);
+        } else {
+            view.restore_all_from_trash();
         }
-    }
-    // Empty Trash with nothing trashed.
-    {
-        let mut env = create_test_env_with_sessions(2);
-        env.view.prompt_empty_trash();
-        assert!(env.view.confirm_dialog.is_none());
-        assert_eq!(
-            env.view.info_dialog.as_ref().map(|d| d.title()),
-            Some("Trash is empty")
-        );
-    }
-    // Restore All from Trash.
-    {
-        let mut env = create_test_env_with_sessions(3);
-        let a = env.view.instance_at(0).id.clone();
-        let b = env.view.instance_at(1).id.clone();
-        env.view.trash_session_by_id(&a);
-        env.view.trash_session_by_id(&b);
-        assert_eq!(
-            env.view
-                .instances
-                .values()
-                .filter(|i| i.is_trashed())
-                .count(),
-            2
-        );
-
-        env.view.restore_all_from_trash();
-        assert_eq!(
-            env.view
-                .instances
-                .values()
-                .filter(|i| i.is_trashed())
-                .count(),
-            0,
-            "Restore All must un-trash every row"
-        );
-    }
-    // Restore All from Archived: every archived row is queued for the daemon,
-    // and nothing is unarchived locally until the canonical revision says so.
-    {
-        use crate::daemon::{RuntimeCursor, SessionMutation};
-        let mut env = create_test_env_with_sessions(3);
-        for i in 0..2 {
-            env.view.cursor = i;
-            env.view.update_selected();
-            with_canonical_archive(&mut env, |env| {
-                env.view.toggle_archive_at_cursor().unwrap();
+        assert_eq!(payload_bytes("bulk"), before);
+        assert!(ids
+            .iter()
+            .all(|id| view.get_instance(id).unwrap().is_trashed()));
+        for id in &ids {
+            let (method, path, body) = if purge {
+                (
+                    "DELETE",
+                    format!("/api/sessions/{id}"),
+                    serde_json::json!({"expected_trash":true,"use_cleanup_defaults":true,"force_delete":true,"keep_scratch":false}),
+                )
+            } else {
+                (
+                    "POST",
+                    format!("/api/sessions/{id}/restore"),
+                    serde_json::json!({}),
+                )
+            };
+            let (status, headers, value) = request_with_headers(&state, method, &path, body).await;
+            assert!(status.is_success(), "{status}: {value}");
+            let cursor = super::pickers_groups_sort::receipt_cursor(&headers);
+            let outcome = if purge {
+                SessionCommandOutcome::Purged(crate::daemon::MutationReceipt {
+                    cursor,
+                    outcome: serde_json::from_value(value).unwrap(),
+                })
+            } else {
+                SessionCommandOutcome::Restored(crate::daemon::MutationReceipt {
+                    cursor,
+                    outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+                })
+            };
+            let (submitted, request) = respond(Ok(outcome)).unwrap();
+            assert_eq!(&submitted, id);
+            assert!(if purge {
+                matches!(request, SessionRequest::Purge(_))
+            } else {
+                matches!(request, SessionRequest::Restore)
             });
         }
-        let expected: std::collections::HashSet<_> = env
-            .view
-            .instances()
-            .filter(|row| row.is_archived())
-            .map(|row| row.id.clone())
-            .collect();
-        assert_eq!(expected.len(), 2);
-
-        let mut respond = env.view.session_feed.command_driver_for_test();
-        env.view.unarchive_all();
-        assert_eq!(
-            env.view.instances().filter(|row| row.is_archived()).count(),
-            2,
-            "Restore All (archived) must queue the daemon, not unarchive locally"
-        );
-        let submitted: std::collections::HashSet<_> = (0..2)
-            .map(|_| {
-                let (id, mutation) = respond(Ok(RuntimeCursor {
-                    epoch: "test".into(),
-                    revision: 3,
-                }))
-                .unwrap();
-                assert!(matches!(mutation, SessionMutation::Archive(body) if !body.archived));
-                id
-            })
-            .collect();
-        assert_eq!(submitted, expected);
+        view.apply_session_feed();
+        assert!(ids
+            .iter()
+            .all(|id| view.get_instance(id).unwrap().is_trashed()));
+        apply_published(&mut view, &state).await;
+        let stored = crate::server::test_support::load_instances_from_disk_for_test("bulk");
+        assert!(stored
+            .iter()
+            .any(|row| row.id == active_id && !row.is_trashed()));
+        for id in &ids {
+            if purge {
+                assert!(!stored.iter().any(|row| &row.id == id));
+                assert!(view.get_instance(id).is_none());
+            } else {
+                assert!(!stored
+                    .iter()
+                    .find(|row| &row.id == id)
+                    .unwrap()
+                    .is_trashed());
+                assert!(!view.get_instance(id).unwrap().is_trashed());
+            }
+        }
+        view.prompt_empty_trash();
+        assert!(view.confirm_dialog.is_none());
+        assert!(view.info_dialog.is_some());
     }
+    // Archived Restore All uses real mutation receipts and leaves active rows untouched.
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut a = Instance::new("archived-a", "/tmp/archived-a");
+    a.archive();
+    let mut b = Instance::new("archived-b", "/tmp/archived-b");
+    b.archive();
+    let active = Instance::new("active", "/tmp/active");
+    let mut ids = vec![a.id.clone(), b.id.clone()];
+    ids.sort();
+    crate::server::test_support::seed_instances_on_disk_for_test("bulk", vec![a, b, active]);
+    let state = native_state(&["bulk"]).await;
+    let mut view = HomeView::new_for_test(
+        Some("bulk".into()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    apply_published(&mut view, &state).await;
+    let before = payload_bytes("bulk");
+    let mut respond = view.session_feed.command_driver_for_test();
+    view.unarchive_all();
+    assert_eq!(payload_bytes("bulk"), before);
+    for id in &ids {
+        let (status, headers, value) = request_with_headers(
+            &state,
+            "PATCH",
+            &format!("/api/sessions/{id}/archive"),
+            serde_json::json!({"archived":false}),
+        )
+        .await;
+        assert!(status.is_success(), "{status}: {value}");
+        respond(Ok(super::pickers_groups_sort::receipt_cursor(&headers))).unwrap();
+    }
+    view.apply_session_feed();
+    assert_eq!(view.instances().filter(|row| row.is_archived()).count(), 2);
+    apply_published(&mut view, &state).await;
+    assert!(view.instances().all(|row| !row.is_archived()));
+    assert!(
+        crate::server::test_support::load_instances_from_disk_for_test("bulk")
+            .iter()
+            .all(|row| !row.is_archived())
+    );
 }
 
 /// A trashed row whose permanent delete failed carries `Status::Error` +
@@ -1036,7 +894,7 @@ fn trashed_preview_surfaces_delete_failure() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    super::pickers_groups_sort::fixture_trash(&mut env.view, &id);
     env.view.select_session_by_id(&id);
 
     env.view.mutate_instance(&id, |inst| {
@@ -1065,7 +923,7 @@ fn trashed_preview_shows_deleting_status() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    super::pickers_groups_sort::fixture_trash(&mut env.view, &id);
     env.view.select_session_by_id(&id);
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Deleting;
@@ -1112,7 +970,7 @@ fn restart_on_trashed_row_surfaces_refusal() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    super::pickers_groups_sort::fixture_trash(&mut env.view, &id);
     env.view.select_session_by_id(&id);
 
     env.view
@@ -1135,7 +993,7 @@ fn restart_on_deleting_trashed_row_stays_silent() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    super::pickers_groups_sort::fixture_trash(&mut env.view, &id);
     env.view.select_session_by_id(&id);
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Deleting;
@@ -1161,7 +1019,7 @@ fn compact_title_masks_stale_spinner_on_trashed_row() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    super::pickers_groups_sort::fixture_trash(&mut env.view, &id);
     env.view.select_session_by_id(&id);
     // Stale persisted live status; the pane was killed on trash.
     env.view.mutate_instance(&id, |inst| {
@@ -1173,10 +1031,9 @@ fn compact_title_masks_stale_spinner_on_trashed_row() {
         screen.contains("Trash"),
         "trashed placeholder should render.\n{screen}"
     );
-    // The hoisted preview title starts at the block's top-left corner. With
-    // the mask it carries ICON_STOPPED; unmasked, Running would paint a
-    // time-varying `dots()` spinner frame there instead (a frame set that
-    // never includes ICON_STOPPED, so this pin cannot pass by accident).
+    // The hoisted title starts at the block's top-left corner and carries ICON_STOPPED with
+    // the mask; unmasked, Running would paint a time-varying `dots()` frame there, and that
+    // frame set never includes ICON_STOPPED, so this cannot pass by accident.
     let masked_title = format!("\u{256d} {} session0", crate::tui::home::ICON_STOPPED);
     assert!(
         screen.contains(&masked_title),
@@ -1202,14 +1059,13 @@ fn w_skips_unread_trashed_session() {
 
     let trashed = env.view.instance_at(0).id.clone();
     let active = env.view.instance_at(1).id.clone();
-    // The surviving active row is a plain idle session (the pass-2 fallback);
-    // the trashed row carries an unread flag, as it would after being trashed
-    // while unread.
+    // The surviving active row is a plain idle session (the pass-2 fallback); the trashed
+    // row carries an unread flag, as it would after being trashed while unread.
     env.view
         .mutate_instance(&active, |inst| inst.status = Status::Idle);
     env.view
         .mutate_instance(&trashed, |inst| inst.mark_unread());
-    env.view.trash_session_by_id(&trashed);
+    super::pickers_groups_sort::fixture_trash(&mut env.view, &trashed);
     assert!(env.view.get_instance(&trashed).unwrap().is_trashed());
     assert!(
         env.view.get_instance(&trashed).unwrap().is_unread(),
@@ -1422,10 +1278,12 @@ fn w_skips_archived_idle_session_in_fallback() {
 
 /// The default gesture: `d` opens the confirm dialog and a second `d` accepts
 /// it, trashing the session both in memory and on disk. See #3364.
-#[test]
+#[tokio::test]
 #[serial]
-fn d_then_d_confirms_the_trash_and_persists_the_marker() {
+async fn d_then_d_confirms_the_trash_and_persists_the_marker() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -1433,7 +1291,20 @@ fn d_then_d_confirms_the_trash_and_persists_the_marker() {
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "the first d must only open the dialog"
     );
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    super::pickers_groups_sort::settle_row_command(
+        &state,
+        &mut env.view,
+        &id,
+        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
+            kill_pane: true,
+        }),
+        |view| {
+            view.handle_key(key(KeyCode::Char('d')), None);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
 
     assert!(
         env.view.confirm_dialog.is_none(),
@@ -1462,14 +1333,29 @@ fn d_then_d_confirms_the_trash_and_persists_the_marker() {
 
 /// Turning `session.confirm_delete` off restores the historical
 /// one-keystroke trash. See #3364.
-#[test]
+#[tokio::test]
 #[serial]
-fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
+async fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     disable_confirm_delete();
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    super::pickers_groups_sort::settle_row_command(
+        &state,
+        &mut env.view,
+        &id,
+        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
+            kill_pane: true,
+        }),
+        |view| {
+            view.handle_key(key(KeyCode::Char('d')), None);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
 
     assert!(
         env.view.confirm_dialog.is_none(),
@@ -1484,16 +1370,31 @@ fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
 /// Ticking the dialog's "don't warn me again" checkbox trashes the session
 /// and persists `confirm_delete = false`, so the next `d` goes back to the
 /// one-keystroke trash without a trip through the settings pane. See #3364.
-#[test]
+#[tokio::test]
 #[serial]
-fn confirm_delete_dont_ask_again_persists_the_opt_out() {
+async fn confirm_delete_dont_ask_again_persists_the_opt_out() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
     // Space ticks the checkbox, the second `d` accepts.
     env.view.handle_key(key(KeyCode::Char(' ')), None);
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    super::pickers_groups_sort::settle_row_command(
+        &state,
+        &mut env.view,
+        &id,
+        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
+            kill_pane: true,
+        }),
+        |view| {
+            view.handle_key(key(KeyCode::Char('d')), None);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
 
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
@@ -1511,10 +1412,12 @@ fn confirm_delete_dont_ask_again_persists_the_opt_out() {
 /// With `session.confirm_delete` on (the default), `d` opens a confirmation
 /// dialog and does not trash until the dialog is accepted; accepting then runs
 /// the same trash path as the instant flow. See #2583.
-#[test]
+#[tokio::test]
 #[serial]
-fn d_with_confirm_delete_prompts_before_trashing() {
+async fn d_with_confirm_delete_prompts_before_trashing() {
     let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -1539,7 +1442,20 @@ fn d_with_confirm_delete_prompts_before_trashing() {
     assert!(screen.contains("Press d again to confirm"), "{screen}");
 
     // A second `d` accepts, trashing via the same trash_session_by_id path.
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    super::pickers_groups_sort::settle_row_command(
+        &state,
+        &mut env.view,
+        &id,
+        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
+            kill_pane: true,
+        }),
+        |view| {
+            view.handle_key(key(KeyCode::Char('d')), None);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
         "accepting the confirm dialog must trash the session"

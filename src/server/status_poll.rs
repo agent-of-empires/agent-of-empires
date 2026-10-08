@@ -455,11 +455,10 @@ pub(super) async fn status_poll_loop(
                 .collect()
         };
 
-        // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker
-        // that unmarks between the scrape and the per-instance decision
-        // cannot combine "pane missing" metadata with a cleared mark and
-        // re-emit the phantom Error transition the suppression exists to
-        // prevent.
+        // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker that unmarks
+        // between the scrape and the per-instance decision cannot combine "pane missing"
+        // metadata with a cleared mark and re-emit the phantom Error transition the
+        // suppression exists to prevent.
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let file_watch_for_poll = state.file_watch.clone();
@@ -486,6 +485,11 @@ pub(super) async fn status_poll_loop(
                 pane_metadata.as_ref().ok(),
                 &sandbox_health,
             );
+            let legacy_scope = super::pane::legacy_tool_scope_for_panes(
+                &instances,
+                &loaded.metadata.raw_tool_names,
+                pane_metadata.as_ref().ok(),
+            );
             for row in &mut instances {
                 let tools = loaded
                     .metadata
@@ -493,7 +497,12 @@ pub(super) async fn status_poll_loop(
                     .get(&row.source_profile)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                super::pane::sample_panes(row, tools, pane_metadata.as_ref().ok());
+                super::pane::sample_panes(
+                    row,
+                    tools,
+                    pane_metadata.as_ref().ok(),
+                    legacy_scope.as_ref(),
+                );
             }
             Ok::<_, super::reload::ReloadFailure>((
                 instances,
@@ -729,8 +738,7 @@ mod tests {
         assert!(attempted.contains(&doomed) && attempted.contains(&kept));
         assert!(parked.contains(&doomed) && parked.contains(&kept));
 
-        // Delete the session (drops out of the live set), then tick: every
-        // map must forget it while the surviving session's entries remain.
+        // Delete the session (drops out of the live set), then tick.
         live.remove(doomed.as_str());
         gc_reconciler_session_maps(
             &live,

@@ -495,6 +495,9 @@ mod tests {
 
     fn pane(pid: Option<u32>, dead: bool) -> crate::tmux::PaneMetadata {
         crate::tmux::PaneMetadata {
+            session_id: "$42".into(),
+            pane_id: "%42".into(),
+            session_kind: None,
             tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
             pane_dead: dead,
             pane_current_command: None,

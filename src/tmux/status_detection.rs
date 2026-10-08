@@ -2,6 +2,7 @@
 
 use crate::session::Status;
 
+use super::detect::{Detection, HookObservation};
 use super::utils::strip_ansi;
 
 /// Rules-aware pane detection for `profile`'s session. Configured declarative
@@ -10,9 +11,7 @@ use super::utils::strip_ansi;
 /// override when the user writes rules for a built-in name. Rules are looked up
 /// per `(profile, tool)`, so a session consults only its own profile's rules.
 pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -> Status {
-    // Strip ANSI escape codes before passing to detectors. capture-pane is
-    // called with -e (to preserve colors for the TUI preview), but color codes
-    // interspersed in text like "esc interrupt" break plain substring matches.
+    // capture-pane runs with -e, so colors would split plain substring matches.
     let clean = strip_ansi(content);
     if let Some(status) = super::status_rules::detect(profile, tool, &clean) {
         return status;
@@ -41,10 +40,10 @@ pub fn detect_with_rules(
     agent: &str,
     clean: &str,
     osc_title: &str,
-    hook: Option<super::detect::HookObservation>,
-) -> Option<super::detect::Detection> {
+    hook: Option<HookObservation>,
+) -> Option<Detection> {
     if let Some(status) = super::status_rules::detect(profile, rules_tool, clean) {
-        return Some(super::detect::Detection {
+        return Some(Detection {
             status: Some(status),
             visible: true,
             rule: "configured_status_rule",

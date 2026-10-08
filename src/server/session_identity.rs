@@ -201,6 +201,376 @@ fn changed_repair_backoffs(
 }
 
 #[cfg(test)]
+mod migrated_tui_identity_tests {
+    use crate::server::{test_support, AppState};
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
+    use crate::session::{GroupTree, Instance, Storage};
+    use serial_test::serial;
+    use tempfile::TempDir;
+    fn setup_test_home(temp: &TempDir) -> AppDirGuard {
+        isolate_app_dir_at(temp.path())
+    }
+    use crate::session::poller::SessionPoller;
+    use crate::session::{ResumeIntent, View};
+    use std::sync::{Arc, Mutex};
+
+    const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
+
+    struct TmuxSession(String);
+
+    impl TmuxSession {
+        fn create(id: &str, title: &str) -> Self {
+            Self::create_named(crate::tmux::Session::generate_name(id, title))
+        }
+
+        fn create_terminal(id: &str, title: &str) -> Self {
+            Self::create_named(crate::tmux::TerminalSession::generate_name(id, title))
+        }
+
+        fn create_named(name: String) -> Self {
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &name])
+                .output();
+            let status = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &name])
+                .status()
+                .expect("failed to spawn tmux");
+            assert!(status.success(), "tmux new-session failed for {}", name);
+            crate::tmux::refresh_session_cache();
+            Self(name)
+        }
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Drop for TmuxSession {
+        fn drop(&mut self) {
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &self.0])
+                .output();
+            crate::tmux::refresh_session_cache();
+        }
+    }
+
+    fn skip_if_no_tmux() -> bool {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux not available");
+            return true;
+        }
+        false
+    }
+
+    fn captured_env(name: &str) -> Option<String> {
+        crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+    }
+
+    async fn build_state_with_inst(profile: &str, inst: &Instance) -> Arc<AppState> {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, groups| {
+                *rows = vec![inst.clone()];
+                *groups =
+                    GroupTree::new_with_groups(std::slice::from_ref(inst), &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let state = test_support::build_test_app_state(vec![inst.clone()]);
+        test_support::refresh_canonical_metadata_for_test(&state).await;
+        state
+    }
+    async fn attach_poller_with_update(state: &Arc<AppState>, id: &str, sid: &str) {
+        let mut rows = state.instances.write().await;
+        test_support::attach_session_id_update_for_test(
+            rows.iter_mut().find(|row| row.id == id).unwrap(),
+            sid,
+        );
+    }
+    async fn memory_sid(state: &Arc<AppState>, id: &str) -> Option<String> {
+        state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .agent_session_id
+            .clone()
+    }
+    async fn stop_pollers(state: &Arc<AppState>) {
+        for row in state.instances.read().await.iter() {
+            if let Some(poller) = &row.session_id_poller {
+                poller.lock().unwrap_or_else(|p| p.into_inner()).stop();
+            }
+        }
+    }
+    fn fresh_instance(profile: &str, title: &str) -> Instance {
+        let mut inst = Instance::new(title, "/tmp/x");
+        inst.tool = "claude".to_string();
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = None;
+        inst.resume_intent = ResumeIntent::Default;
+        inst
+    }
+
+    /// An applied CAS publishes the new sid to whichever pane the row runs in: the agent
+    /// session by default, the paired terminal for terminal rows, and nowhere without a pane.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_identity_publishes_after_cas() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        // (profile, terminal row, create a pane)
+        for (profile, terminal, with_pane) in [
+            ("apply-publish", false, true),
+            ("apply-terminal-publish", true, true),
+            ("apply-pane-dead", false, false),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let _guard = setup_test_home(&temp);
+            let mut inst = fresh_instance(profile, profile);
+            if terminal {
+                inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            }
+            let state = build_state_with_inst(profile, &inst).await;
+            let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let tmux = with_pane.then(|| {
+                if terminal {
+                    TmuxSession::create_terminal(&inst.id, &inst.title)
+                } else {
+                    TmuxSession::create(&inst.id, &inst.title)
+                }
+            });
+
+            attach_poller_with_update(&state, &inst.id, NEW_SID).await;
+
+            test_support::drain_session_id_updates_for_test(&state).await;
+            let mem_sid = memory_sid(&state, &inst.id).await;
+            assert_eq!(
+                Storage::new_unwatched(profile).unwrap().load().unwrap()[0]
+                    .agent_session_id
+                    .as_deref(),
+                Some(NEW_SID)
+            );
+            assert_eq!(mem_sid.as_deref(), Some(NEW_SID), "{profile}");
+            match &tmux {
+                Some(tmux) => {
+                    assert_eq!(
+                        captured_env(tmux.name()).as_deref(),
+                        Some(NEW_SID),
+                        "{profile}"
+                    );
+                    if terminal {
+                        assert!(captured_env(&agent_name).is_none(), "{profile}");
+                    }
+                }
+                None => assert!(
+                    captured_env(&agent_name).is_none(),
+                    "{profile}: no tmux session means no publish target"
+                ),
+            }
+            stop_pollers(&state).await;
+        }
+    }
+
+    /// A sid filtered before the CAS (retroactively excluded or invalid) stays out of memory,
+    /// and the pane env converges on the disk-backed mirror (None) rather than the stale value.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_identity_filtered_sid_clears_env() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        // (profile, sid the poller reports, exclude it retroactively)
+        for (profile, sid, exclude) in [
+            ("apply-excludes", NEW_SID, true),
+            ("apply-invalid", "bad sid!", false),
+        ] {
+            let inst = fresh_instance(profile, profile);
+            let state = build_state_with_inst(profile, &inst).await;
+            if exclude {
+                if let Some(i) = state
+                    .instances
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|row| row.id == inst.id)
+                {
+                    i.retroactive_capture_excludes.insert(
+                        crate::session::ConversationBinding::unknown(sid.to_string()),
+                    );
+                }
+            }
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            crate::tmux::env::set_hidden_env(
+                tmux.name(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                "stale-untouched",
+            )
+            .unwrap();
+
+            attach_poller_with_update(&state, &inst.id, sid).await;
+
+            let before =
+                std::fs::read(Storage::new_unwatched(profile).unwrap().sessions_path()).unwrap();
+            test_support::drain_session_id_updates_for_test(&state).await;
+            assert_eq!(
+                std::fs::read(Storage::new_unwatched(profile).unwrap().sessions_path()).unwrap(),
+                before
+            );
+            let mem_sid = memory_sid(&state, &inst.id).await;
+            assert!(mem_sid.is_none(), "{profile}: filtered sid entered memory");
+            assert!(
+                captured_env(tmux.name()).is_none(),
+                "{profile}: env must converge on disk (None)"
+            );
+            stop_pollers(&state).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_identity_skipped_publishes_disk_value() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        let profile = "apply-skipped";
+        let peer_sid = "019342aa-3333-7eee-8fff-aaaabbbbcccc";
+        let other_peer = "019342bb-4444-7fff-8000-111122223333";
+
+        let mut inst = fresh_instance(profile, "ase");
+        inst.agent_session_id = Some(peer_sid.to_string());
+        let state = build_state_with_inst(profile, &inst).await;
+
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|i, _g| {
+                i[0].agent_session_id = Some(other_peer.to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            NEW_SID,
+        )
+        .unwrap();
+
+        attach_poller_with_update(&state, &inst.id, NEW_SID).await;
+
+        test_support::drain_session_id_updates_for_test(&state).await;
+        let mem_sid = memory_sid(&state, &inst.id).await;
+        assert_eq!(
+            Storage::new_unwatched(profile).unwrap().load().unwrap()[0]
+                .agent_session_id
+                .as_deref(),
+            Some(other_peer)
+        );
+        assert_eq!(
+            mem_sid.as_deref(),
+            Some(other_peer),
+            "memory rolls back to disk after CAS skip"
+        );
+        assert_eq!(
+            captured_env(tmux.name()).as_deref(),
+            Some(other_peer),
+            "env converges from poller's pre-published NEW_SID to disk's other_peer"
+        );
+        stop_pollers(&state).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_identity_repair_skips_structured_and_repairs_live_terminal() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        let profile = "apply-poller-repair";
+        let terminal = fresh_instance(profile, "repair-terminal");
+        let mut structured = fresh_instance(profile, "repair-structured");
+        structured.view = View::Structured;
+        let state = build_state_with_inst(profile, &terminal).await;
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                rows.push(structured.clone());
+                Ok(())
+            })
+            .unwrap();
+        state.instances.write().await.push(structured.clone());
+        let terminal_stopped = Arc::new(Mutex::new(SessionPoller::new(
+            "stopped".into(),
+            "claude".into(),
+            None,
+        )));
+        let structured_stopped = Arc::new(Mutex::new(SessionPoller::new(
+            "stopped".into(),
+            "claude".into(),
+            None,
+        )));
+        {
+            let mut rows = state.instances.write().await;
+            rows.iter_mut()
+                .find(|row| row.id == terminal.id)
+                .unwrap()
+                .session_id_poller = Some(terminal_stopped.clone());
+            rows.iter_mut()
+                .find(|row| row.id == structured.id)
+                .unwrap()
+                .session_id_poller = Some(structured_stopped.clone());
+        }
+        let _tmux = TmuxSession::create(&terminal.id, &terminal.title);
+        let before =
+            std::fs::read(Storage::new_unwatched(profile).unwrap().sessions_path()).unwrap();
+        test_support::drain_session_id_updates_for_test(&state).await;
+        let rows = state.instances.read().await;
+        let repaired = rows
+            .iter()
+            .find(|row| row.id == terminal.id)
+            .unwrap()
+            .session_id_poller
+            .clone()
+            .expect("live pane replacement poller");
+        assert!(!Arc::ptr_eq(&repaired, &terminal_stopped));
+        assert!(repaired
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_running());
+        assert!(Arc::ptr_eq(
+            rows.iter()
+                .find(|row| row.id == structured.id)
+                .unwrap()
+                .session_id_poller
+                .as_ref()
+                .unwrap(),
+            &structured_stopped
+        ));
+        drop(rows);
+        assert_eq!(
+            std::fs::read(Storage::new_unwatched(profile).unwrap().sessions_path()).unwrap(),
+            before
+        );
+        repaired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

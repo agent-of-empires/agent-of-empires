@@ -325,15 +325,31 @@ hotkey = "Alt+t"
 
     h.wait_for("Tool: echotool");
 
-    // Pressing Enter triggers AttachToolSession, which (a) creates the
-    // tool tmux session via `tmux new-session` running our command, then
-    // (b) tries to switch-client / attach-session. Both attach paths
-    // return errors when invoked from inside the harness's existing
-    // tmux session ("sessions should be nested with care"), but that
-    // error is swallowed and the tool tmux session itself is created.
-    // Observe the recreated outer EventStream before sending its render fence.
     let resume = h.terminal_resume_sequence();
     h.send_keys("Enter");
+    crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        let output = h
+            .tmux()
+            .args(["list-clients", "-F", "#{client_session}"])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        let clients = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+        if clients
+            .lines()
+            .any(|name| name.starts_with("aoe_dev_tool_") && name.contains(id_suffix))
+        {
+            Ok(())
+        } else {
+            Err(format!("Tool client is not attached: {clients}"))
+        }
+    });
+    h.wait_for(MARKER);
+    // Detach the native tmux client before fencing the outer TUI's resumed input.
+    h.send_keys_unfenced("C-b");
+    h.send_keys_unfenced("d");
     h.wait_for_terminal_resume(resume);
 
     h.wait_for(MARKER);
@@ -355,9 +371,7 @@ hotkey = "Alt+t"
         pre_remove
     );
 
-    // Quit the TUI so the removal CLI can write sessions.json without
-    // racing the TUI's poller. `q` opens the quit confirmation (#1569),
-    // so confirm with `y` to actually exit.
+    // The shared Core remains available to CLI removal after the TUI exits.
     h.send_keys("q");
     h.wait_for("Quit Agent of Empires");
     h.send_keys("y");
@@ -608,6 +622,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
             &agent_of_empires::daemon::EnsureToolBody {
                 tool_name: "..".into(),
                 size: None,
+                adoption: None,
             },
             &epoch,
         )
@@ -640,6 +655,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
             &agent_of_empires::daemon::EnsureToolBody {
                 tool_name: "..".into(),
                 size: None,
+                adoption: None,
             },
             &epoch,
         )
@@ -706,6 +722,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
             &agent_of_empires::daemon::EnsureToolBody {
                 tool_name: "..".into(),
                 size: None,
+                adoption: None,
             },
             &epoch,
         )

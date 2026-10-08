@@ -37,8 +37,6 @@ impl LifecycleOperation {
     }
 }
 
-pub(crate) const NEWER_GENERATION_BUSY_REASON: &str = "busy with a newer lifecycle generation";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleReservationError {
     Busy(LifecycleOperation),

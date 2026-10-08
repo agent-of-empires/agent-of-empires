@@ -33,12 +33,19 @@ fn belongs(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn check_row(row: &Instance, cityhall: bool) -> Result<()> {
-    if cityhall && !row.is_structured() {
+fn check_structured(row: &Instance) -> Result<()> {
+    if !row.is_structured() {
         return Err(reject(
             StatusCode::FORBIDDEN,
             "CityHall requires structured sessions",
         ));
+    }
+    Ok(())
+}
+
+fn check_row(row: &Instance, cityhall: bool) -> Result<()> {
+    if cityhall {
+        check_structured(row)?;
     }
     if matches!(row.status, Status::Creating | Status::Deleting)
         || row.has_fresh_lifecycle_reservation(chrono::Utc::now())
@@ -401,7 +408,6 @@ pub async fn delete_group(
     State(state): State<Arc<AppState>>,
     body: Result<Json<crate::daemon::DeleteGroupBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    use crate::daemon::{DeleteGroupMode, DeleteGroupOutcome, GroupSessionOutcome, PurgeOutcome};
     if state.read_only {
         return super::read_only_response();
     }
@@ -412,7 +418,40 @@ pub async fn delete_group(
     if let Err(response) = validate_location(&body.group) {
         return response;
     }
-    let namespace = state.profile_namespace.read().await;
+    if (!matches!(body.mode, crate::daemon::DeleteGroupMode::DeleteSessions)
+        && (body.cleanup.delete_worktree
+            || body.cleanup.delete_branch
+            || body.cleanup.delete_sandbox
+            || body.cleanup.force_delete
+            || body.cleanup.keep_scratch
+            || body.cleanup.expected_trash
+            || body.cleanup.use_cleanup_defaults))
+        || body.cleanup.expected_trash
+        || body.cleanup.use_cleanup_defaults
+        || body.cleanup.keep_scratch
+    {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "invalid_cleanup_mode", "message": "Group deletion requires explicit cleanup options; cleanup is valid only with delete_sessions"
+        }))).into_response();
+    }
+    match tokio::spawn(delete_group_owned(state, body)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn delete_group_owned(
+    state: Arc<AppState>,
+    body: crate::daemon::DeleteGroupBody,
+) -> Response {
+    use crate::daemon::{
+        DeleteGroupMode, DeleteGroupOutcome, GroupSessionFailure, GroupSessionFailureCode,
+        GroupSessionOutcome, PurgeOutcome,
+    };
+    let namespace = state
+        .runtime
+        .purge_namespace_lease(&state.profile_namespace)
+        .await;
     if *state.canonical_health.read().await != RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -479,6 +518,7 @@ pub async fn delete_group(
         for id in &ids {
             lifecycle_guards.push(store.storage().acquire_instance_lifecycle_lock(id)?);
         }
+        let mut detached = Vec::with_capacity(ids.len());
         (&store as &dyn SessionStore).update(|rows, groups| {
             check_members(rows, &body.group.path, &ids, cityhall)?;
             let mut tree = GroupTree::new_with_groups(rows, groups);
@@ -494,35 +534,346 @@ pub async fn delete_group(
                 .filter(|row| belongs(&row.group_path, &body.group.path))
             {
                 row.group_path.clear();
+                detached.push(row.clone());
             }
             *groups = tree.get_all_groups();
             Ok(())
         })?;
-        Ok(DeleteGroupOutcome {
-            sessions: ids
-                .into_iter()
-                .map(|id| GroupSessionOutcome {
-                    id,
-                    outcome: PurgeOutcome::Kept {
-                        messages: Vec::new(),
-                        teardown_started: false,
-                    },
-                })
-                .collect(),
-        })
+        detached.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok((body, detached))
     })
     .await;
+    let (body, detached) = match committed {
+        Ok(Ok(committed)) => committed,
+        Ok(Err(error)) => return failure(&state, error).await,
+        Err(error) => return failure(&state, error.into()).await,
+    };
+    let mut outcome = DeleteGroupOutcome {
+        sessions: Vec::with_capacity(detached.len()),
+        failures: Vec::new(),
+        group_removed: true,
+    };
+    for row in detached {
+        let id = row.id.clone();
+        if !matches!(body.mode, DeleteGroupMode::DeleteSessions) {
+            outcome.sessions.push(GroupSessionOutcome {
+                id,
+                outcome: PurgeOutcome::Kept {
+                    messages: Vec::new(),
+                    teardown_started: false,
+                },
+            });
+            continue;
+        }
+        let managed = row.has_managed_worktree_or_workspace();
+        let cleanup = crate::daemon::DeleteSessionBody {
+            delete_worktree: body.cleanup.delete_worktree && managed,
+            delete_branch: body.cleanup.delete_branch && managed,
+            delete_sandbox: body.cleanup.delete_sandbox
+                && row
+                    .sandbox_info
+                    .as_ref()
+                    .is_some_and(|sandbox| sandbox.enabled),
+            force_delete: body.cleanup.force_delete,
+            keep_scratch: false,
+            ..Default::default()
+        };
+        // Capture POST-detachment location and generation, not the removed group's path.
+        let selection = crate::session::deletion::PurgeSelection {
+            profile: row.source_profile.clone(),
+            group_path: row.group_path.clone(),
+            lifecycle_generation: row.lifecycle_generation,
+        };
+        let recent = crate::session::recent_project_entry_for(&row);
+        match super::sessions::purge_session_artifacts(
+            &state,
+            &id,
+            row,
+            &cleanup,
+            recent,
+            None,
+            Some(selection),
+        )
+        .await
+        {
+            Ok(purge) => outcome
+                .sessions
+                .push(GroupSessionOutcome { id, outcome: purge }),
+            Err(error) => {
+                if error.is::<crate::session::NativeStoreUnavailable>()
+                    || *state.canonical_health.read().await != RuntimeHealth::Healthy
+                {
+                    return failure(&state, error).await;
+                }
+                let code = match error.downcast_ref::<crate::session::LifecycleReservationError>() {
+                    Some(crate::session::LifecycleReservationError::Busy(_)) => {
+                        GroupSessionFailureCode::LifecycleBusy
+                    }
+                    Some(crate::session::LifecycleReservationError::Superseded) => {
+                        GroupSessionFailureCode::Superseded
+                    }
+                    _ => GroupSessionFailureCode::PurgeFailed,
+                };
+                tracing::warn!(target: "http.api.groups", session = %id, %error, "detached member purge failed");
+                let message = match code {
+                    GroupSessionFailureCode::LifecycleBusy => "Session lifecycle is busy",
+                    GroupSessionFailureCode::Superseded => "Session changed before purge",
+                    GroupSessionFailureCode::PurgeFailed => {
+                        "Session purge failed; detached session was retained"
+                    }
+                }
+                .to_owned();
+                outcome
+                    .failures
+                    .push(GroupSessionFailure { id, code, message });
+            }
+        }
+    }
     drop(instance_guards);
     drop(submission_guards);
     drop(namespace);
-    match committed {
-        Ok(Ok(outcome)) => match state.runtime.publish(&state).await {
+    match state.runtime.publish(&state).await {
+        Ok(snapshot) => {
+            crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+        }
+        Err(error) => failure(&state, error).await,
+    }
+}
+
+pub async fn reorder(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<crate::daemon::ReorderBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    match &body {
+        crate::daemon::ReorderBody::Group { group, .. } => {
+            if let Err(response) = validate_location(group) {
+                return response;
+            }
+        }
+        crate::daemon::ReorderBody::Session {
+            source_group,
+            destination,
+            ..
+        } => {
+            for path in std::iter::once(source_group).chain(destination.iter()) {
+                if !path.is_empty()
+                    && (crate::session::is_synthetic_project_header(path)
+                        || super::validate_display_label(path, "group").is_err())
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "message": "A persisted group path or ungrouped bucket is required"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    // An admitted command survives HTTP cancellation with its namespace exclusion.
+    match tokio::spawn(reorder_owned(state, body)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -> Response {
+    use crate::daemon::{ReorderBody, ReorderOutcome};
+    // A metadata-only transition may touch the entire live sibling set. Taking the
+    // namespace write guard avoids selecting a partial set of per-session locks.
+    let namespace = state.profile_namespace.write().await;
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let profile = match &body {
+        ReorderBody::Session { profile, .. } => profile,
+        ReorderBody::Group { group, .. } => &group.profile,
+    };
+    let exists = state
+        .canonical_metadata
+        .read()
+        .await
+        .profiles
+        .iter()
+        .any(|entry| &entry.name == profile);
+    let result = if !exists {
+        Ok(ReorderOutcome::Stale)
+    } else {
+        let worker_state = state.clone();
+        let profile = profile.clone();
+        match tokio::task::spawn_blocking(move || -> Result<ReorderOutcome> {
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            let store = NativeSessionStore::open(worker_state.clone(), &profile, None)?;
+            let _lifecycle = match &body {
+                ReorderBody::Session { id, .. } => {
+                    Some(store.storage().acquire_instance_lifecycle_lock(id)?)
+                }
+                ReorderBody::Group { .. } => None,
+            };
+            let mut outcome = ReorderOutcome::Stale;
+            (&store as &dyn SessionStore).update(|rows, groups| {
+                outcome = apply_canonical_reorder(rows, groups, &body, worker_state.cityhall_mode)?;
+                Ok(())
+            })?;
+            Ok(outcome)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        }
+    };
+    drop(namespace);
+    match result {
+        Ok(outcome) => match state.runtime.publish(&state).await {
             Ok(snapshot) => {
                 crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
             }
             Err(error) => failure(&state, error).await,
         },
-        Ok(Err(error)) => failure(&state, error).await,
-        Err(error) => failure(&state, error.into()).await,
+        Err(error) => failure(&state, error).await,
+    }
+}
+
+fn apply_canonical_reorder(
+    rows: &mut [Instance],
+    groups: &mut Vec<crate::session::Group>,
+    body: &crate::daemon::ReorderBody,
+    cityhall: bool,
+) -> Result<crate::daemon::ReorderOutcome> {
+    use crate::daemon::{MoveDirection, ReorderBody, ReorderOutcome};
+    match body {
+        ReorderBody::Group { group, direction } => {
+            if cityhall {
+                let parent = group.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                for row in rows.iter().filter(|row| {
+                    row.group_path != parent
+                        && (parent.is_empty() || belongs(&row.group_path, parent))
+                }) {
+                    check_structured(row)?;
+                }
+            }
+            let mut tree = GroupTree::new_with_groups(rows, groups);
+            if !tree.group_exists(&group.path) {
+                return Ok(ReorderOutcome::Stale);
+            }
+            let delta = match direction {
+                MoveDirection::Up => -1,
+                MoveDirection::Down => 1,
+            };
+            if !tree.move_group(&group.path, delta) {
+                return Ok(ReorderOutcome::AtEdge);
+            }
+            *groups = tree.get_all_groups();
+            Ok(ReorderOutcome::Moved { destination: None })
+        }
+        ReorderBody::Session {
+            id,
+            profile,
+            source_group,
+            direction,
+            destination,
+        } => {
+            let Some(anchor) = rows.iter().position(|row| {
+                &row.id == id
+                    && &row.source_profile == profile
+                    && &row.group_path == source_group
+                    && !row.is_archived()
+                    && !row.is_trashed()
+            }) else {
+                return Ok(ReorderOutcome::Stale);
+            };
+            check_row(&rows[anchor], cityhall)?;
+            let group = destination.as_ref().unwrap_or(source_group);
+            if let Some(destination) = destination {
+                if destination == source_group
+                    || !(destination.is_empty()
+                        || groups.iter().any(|group| &group.path == destination)
+                        || rows.iter().any(|row| {
+                            &row.source_profile == profile
+                                && belongs(&row.group_path, destination)
+                                && !row.is_archived()
+                                && !row.is_trashed()
+                        }))
+                {
+                    return Ok(ReorderOutcome::Stale);
+                }
+            }
+            let mut order: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(index, row)| {
+                    &row.source_profile == profile
+                        && &row.group_path == group
+                        && !row.is_archived()
+                        && !row.is_trashed()
+                        && (destination.is_none() || *index != anchor)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if cityhall {
+                for index in &order {
+                    check_structured(&rows[*index])?;
+                }
+            }
+            order.sort_by_key(|index| {
+                (
+                    rows[*index].sort_index.unwrap_or(u32::MAX),
+                    std::cmp::Reverse(rows[*index].created_at),
+                )
+            });
+            if destination.is_some() {
+                match direction {
+                    MoveDirection::Up => order.push(anchor),
+                    MoveDirection::Down => order.insert(0, anchor),
+                }
+            } else {
+                let at = order
+                    .iter()
+                    .position(|index| *index == anchor)
+                    .expect("current anchor is in its authoritative sibling set");
+                let to = match direction {
+                    MoveDirection::Up => at.checked_sub(1),
+                    MoveDirection::Down => at.checked_add(1).filter(|to| *to < order.len()),
+                };
+                let Some(to) = to else {
+                    return Ok(ReorderOutcome::AtEdge);
+                };
+                order.swap(at, to);
+            }
+            // Reject overflow before writing any row; no lossy usize -> u32 cast.
+            if let Some(last) = order.len().checked_sub(1) {
+                u32::try_from(last)?;
+            }
+            for (position, index) in order.into_iter().enumerate() {
+                rows[index].sort_index = Some(position as u32);
+            }
+            if let Some(destination) = destination {
+                rows[anchor].group_path = destination.clone();
+                // Reveal only explicit persisted ancestors; implicit paths are synthesized
+                // from the newly committed row by the normal GroupTree projection.
+                for group in groups.iter_mut() {
+                    if !group.path.is_empty() && belongs(destination, &group.path) {
+                        group.collapsed = false;
+                    }
+                }
+                Ok(ReorderOutcome::Moved {
+                    destination: Some(GroupLocation {
+                        profile: profile.clone(),
+                        path: destination.clone(),
+                    }),
+                })
+            } else {
+                Ok(ReorderOutcome::Moved { destination: None })
+            }
+        }
     }
 }

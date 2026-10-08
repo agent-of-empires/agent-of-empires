@@ -42,7 +42,10 @@ export function useSessions() {
   }, []);
 
   const applyResult = useCallback((data: SessionsEnvelope | null) => {
+    setLoaded(true);
     if (data !== null) {
+      setError(false);
+      setServerDown(false);
       const cursor = data.cursor;
       const floor = floorGet.current;
       if (abandonedEpochs.current.has(cursor.epoch)) return;
@@ -58,13 +61,10 @@ export function useSessions() {
       if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
         setWorkspaceOrdering(data.workspace_ordering);
       }
-      setError(false);
-      setServerDown(false);
     } else {
       setError(true);
       setServerDown(true);
     }
-    setLoaded(true);
   }, []);
 
   useEffect(() => {

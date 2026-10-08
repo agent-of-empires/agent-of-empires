@@ -1,17 +1,12 @@
 //! Canonical runtime projection and local system-health sampling.
 
 use super::*;
+use crate::session::Status;
 
 impl HomeView {
-    /// Rows eligible for local system-health sampling. Recovery owns its rows
-    /// on a worker, so in-flight recoveries are skipped; a daemon start in
-    /// flight only reserves the row and never skips the health sample.
+    /// Local health samples observe every canonical row; daemon recovery owns mutations.
     pub(in crate::tui) fn pollable_instances(&self) -> Vec<Instance> {
-        self.instances
-            .values()
-            .filter(|i| !self.recovery_in_flight.contains(&i.id))
-            .cloned()
-            .collect()
+        self.instances.values().cloned().collect()
     }
 
     /// Request a system-health sample in the background while either health
@@ -43,9 +38,8 @@ impl HomeView {
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                // The sampler thread died (a panic in sample_memory /
-                // count_running_agents). Respawn so pending_metrics_refresh
-                // does not stay stuck and freeze the strip.
+                // The sampler thread died, so respawn or pending_metrics_refresh stays
+                // stuck and the strip freezes.
                 tracing::error!(
                     target: "tui.home",
                     "metrics poller worker gone; respawning a fresh poller",
@@ -150,12 +144,29 @@ impl HomeView {
     ) -> bool {
         use crate::tui::session_feed::SidebarSource;
 
-        if self.sidebar_source == source {
+        let reason = (source == SidebarSource::Disconnected).then(|| {
+            reason
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("The daemon could not be reached.")
+        });
+        let cached_reason = self
+            .runtime_failure_message
+            .as_deref()
+            .and_then(|message| message.strip_prefix("Runtime unavailable\n\n"))
+            .and_then(|message| {
+                message.strip_suffix("\n\nr: Reconnect / start local runtime\nq: Quit")
+            });
+        if self.sidebar_source == source && reason == cached_reason {
             return false;
         }
+        self.runtime_failure_message = reason.map(|reason| {
+            format!(
+                "Runtime unavailable\n\n{reason}\n\nr: Reconnect / start local runtime\nq: Quit"
+            )
+        });
         self.sidebar_source = source;
         if source == SidebarSource::Daemon {
-            self.runtime_authoritative = true;
+            self.project_registry_authoritative = true;
         }
         if source != SidebarSource::Daemon {
             self.cancel_native_attachment();
@@ -213,17 +224,44 @@ impl HomeView {
             return true;
         }
 
+        let namespace_changed = self.session_feed.applied_snapshot().is_none_or(|applied| {
+            applied.contents.profiles.len() != snapshot.contents.profiles.len()
+                || snapshot.contents.profiles.iter().any(|incoming| {
+                    applied
+                        .contents
+                        .profiles
+                        .iter()
+                        .find(|previous| previous.name == incoming.name)
+                        .is_none_or(|previous| previous.groups != incoming.groups)
+                })
+                || applied.contents.sessions.len() != snapshot.contents.sessions.len()
+                || applied
+                    .contents
+                    .sessions
+                    .iter()
+                    .zip(&snapshot.contents.sessions)
+                    .any(|(previous, row)| {
+                        previous.id != row.id
+                            || previous.workspace_repos != row.workspace_repos
+                            || previous.workspace_dir != row.workspace_dir
+                            || previous.workspace_branch != row.workspace_branch
+                            || previous.workspace_created_at != row.workspace_created_at
+                            || previous.workspace_cleanup_on_delete
+                                != row.workspace_cleanup_on_delete
+                            || previous.is_sandboxed != row.is_sandboxed
+                            || previous.sandbox_container_name != row.sandbox_container_name
+                    })
+        });
+        if namespace_changed {
+            return true;
+        }
         snapshot.contents.sessions.iter().any(|row| {
             // An unknown row in a tracked profile is handled by the caller's
             // addition check; one outside this view's scope is not its row.
             let Some(instance) = self.instances.get(&row.id) else {
                 return false;
             };
-            // Older/minimal runtime rows may omit descriptive metadata. Do
-            // not manufacture changes from serde defaults on those rows.
-            if row.title.is_empty() && row.profile.is_empty() {
-                return false;
-            }
+
             let expected_worktree = row
                 .has_managed_worktree
                 .then_some(row.branch.as_deref())
@@ -232,9 +270,22 @@ impl HomeView {
                 .worktree_info
                 .as_ref()
                 .map(|worktree| worktree.branch.as_str());
-            instance.title != row.title
+            instance.color != row.color
+                || instance.command != row.command
+                || instance.extra_args != row.extra_args
+                || instance.yolo_mode != row.yolo_mode
+                || instance.scratch != row.scratch
+                || instance.notify_on_waiting != row.notify_on_waiting
+                || instance.notify_on_idle != row.notify_on_idle
+                || instance.notify_on_error != row.notify_on_error
+                || instance.project_path != row.project_path
+                || instance.sort_index != row.sort_index
+                || instance.agent_session_id != row.agent_session_id
+                || instance.lifecycle_generation != row.lifecycle_generation
+                || instance.lifecycle_reservation != row.lifecycle_reservation
+                || instance.title != row.title
                 || instance.group_path != row.group_path
-                || (!row.profile.is_empty() && instance.source_profile != row.profile)
+                || instance.source_profile != row.profile
                 || instance.tool != row.tool
                 || instance.view != row.view
                 || instance.base_branch_override != row.base_branch_override
@@ -318,12 +369,253 @@ impl HomeView {
         );
     }
 
+    pub(super) fn apply_canonical_projection(
+        &mut self,
+        snapshot: &crate::daemon::RuntimeSnapshot,
+        refresh_metadata: bool,
+    ) -> anyhow::Result<()> {
+        let mut next = indexmap::IndexMap::new();
+        // Discover this creation's reservation without mutating the displayed model.
+        let in_flight = self.in_flight_creation_id().or_else(|| {
+            let pending = self.pending_creation.as_ref()?;
+            if pending.confirmation.is_some() {
+                return None;
+            }
+            snapshot
+                .contents
+                .sessions
+                .iter()
+                .find(|row| row.idempotency_key.as_deref() == Some(pending.request_key.as_str()))
+                .map(|row| row.id.as_str())
+        });
+        let mut opened_storages = HashMap::new();
+        let mut profile_loads = HashMap::new();
+        for profile in &snapshot.contents.profiles {
+            if self
+                .active_profile
+                .as_ref()
+                .is_some_and(|active| *active != profile.name)
+            {
+                continue;
+            }
+            if !self.storages.contains_key(&profile.name) {
+                opened_storages.insert(
+                    profile.name.clone(),
+                    Storage::open(&profile.name, self.file_watch.clone())?,
+                );
+            }
+            let needs_metadata = refresh_metadata
+                || snapshot.contents.sessions.iter().any(|row| {
+                    row.profile == profile.name
+                        && in_flight != Some(row.id.as_str())
+                        && self
+                            .instances
+                            .get(&row.id)
+                            .is_none_or(|local| local.source_profile != row.profile)
+                });
+            if needs_metadata {
+                let storage = self
+                    .storages
+                    .get(&profile.name)
+                    .or_else(|| opened_storages.get(&profile.name))
+                    .expect("profile store staged");
+                profile_loads.insert(profile.name.clone(), storage.load_complete_with_groups()?.0);
+            }
+        }
+        let duplicate_reports = if refresh_metadata {
+            let loads: Vec<(&str, &[Instance])> = profile_loads
+                .iter()
+                .map(|(name, rows)| (name.as_str(), rows.as_slice()))
+                .collect();
+            let stores: Vec<(&str, &Storage)> = self
+                .storages
+                .iter()
+                .chain(opened_storages.iter())
+                .map(|(name, storage)| (name.as_str(), storage))
+                .collect();
+            Some(crate::session::duplicate_reports(&loads, &stores))
+        } else {
+            None
+        };
+        // Each profile is loaded once; consume its owned rows instead of copying them again.
+        let mut persisted_profiles: HashMap<_, _> = profile_loads
+            .into_iter()
+            .map(|(name, rows)| (name, Self::build_instances_map(rows)))
+            .collect();
+        for row in &snapshot.contents.sessions {
+            if self
+                .active_profile
+                .as_ref()
+                .is_some_and(|active| *active != row.profile)
+                || in_flight == Some(row.id.as_str())
+            {
+                continue;
+            }
+            let reports = duplicate_reports
+                .as_deref()
+                .unwrap_or(&self.legacy_duplicate_reports);
+            anyhow::ensure!(
+                !reports.iter().any(|report| report.id == row.id),
+                "Canonical session '{}' has ambiguous native metadata copies",
+                row.id
+            );
+            // A refreshed profile must contain the row, even if the old display did.
+            // Never manufacture native worktree/conversation metadata from a wire row.
+            let mut instance = if let Some(rows) = persisted_profiles.get_mut(&row.profile) {
+                let mut instance = rows.swap_remove(&row.id).ok_or_else(|| {
+                    anyhow::anyhow!("Canonical session '{}' is not available in the read-only metadata projection", row.id)
+                })?;
+                if let Some(previous) = self.instances.get(&row.id) {
+                    instance.merge_runtime_from_reload(previous);
+                }
+                instance
+            } else {
+                self.instances.get(&row.id).filter(|local| local.source_profile == row.profile)
+                    .cloned().ok_or_else(|| {
+                        anyhow::anyhow!("Canonical session '{}' is not available in the read-only metadata projection", row.id)
+                    })?
+            };
+            instance.title.clone_from(&row.title);
+            instance.project_path.clone_from(&row.project_path);
+            instance.source_profile.clone_from(&row.profile);
+            instance.group_path.clone_from(&row.group_path);
+            instance.sort_index = row.sort_index;
+            instance.tool.clone_from(&row.tool);
+            instance.command.clone_from(&row.command);
+            instance.extra_args.clone_from(&row.extra_args);
+            instance.view = row.view;
+            instance
+                .base_branch_override
+                .clone_from(&row.base_branch_override);
+            instance.agent_session_id.clone_from(&row.agent_session_id);
+            instance.lifecycle_generation = row.lifecycle_generation;
+            instance
+                .lifecycle_reservation
+                .clone_from(&row.lifecycle_reservation);
+            instance.agent_pane.clone_from(&row.agent_pane);
+            instance.auxiliary.clone_from(&row.auxiliary);
+            instance.unread = row.unread;
+            instance.color.clone_from(&row.color);
+            instance.yolo_mode = row.yolo_mode;
+            instance.scratch = row.scratch;
+            instance.notify_on_waiting = row.notify_on_waiting;
+            instance.notify_on_idle = row.notify_on_idle;
+            instance.notify_on_error = row.notify_on_error;
+            instance.last_error.clone_from(&row.last_error);
+            instance.pane_dead_observed = row.pane_dead_observed;
+            if let Some(status) = Status::from_api_str(&row.status) {
+                instance.status = status;
+            }
+            if let Some(worktree) = instance.worktree_info.as_mut() {
+                if let Some(branch) = &row.branch {
+                    worktree.branch.clone_from(branch);
+                }
+            }
+            for (raw, current) in [
+                (row.trashed_at.as_deref(), &mut instance.trashed_at),
+                (row.archived_at.as_deref(), &mut instance.archived_at),
+                (row.favorited_at.as_deref(), &mut instance.favorited_at),
+                (row.snoozed_until.as_deref(), &mut instance.snoozed_until),
+                (row.pinned_at.as_deref(), &mut instance.pinned_at),
+                (
+                    row.last_accessed_at.as_deref(),
+                    &mut instance.last_accessed_at,
+                ),
+                (
+                    row.idle_entered_at.as_deref(),
+                    &mut instance.idle_entered_at,
+                ),
+                (
+                    row.idle_dormant_since.as_deref(),
+                    &mut instance.idle_dormant_since,
+                ),
+            ] {
+                *current = raw
+                    .map(chrono::DateTime::parse_from_rfc3339)
+                    .transpose()?
+                    .map(|stamp| stamp.with_timezone(&chrono::Utc));
+            }
+            next.insert(row.id.clone(), instance);
+        }
+        if let Some(stub) = self
+            .creating_stub_id
+            .as_ref()
+            .and_then(|id| self.instances.get(id))
+            .cloned()
+        {
+            next.insert(stub.id.clone(), stub);
+        }
+        let mut trees = HashMap::new();
+        for profile in &snapshot.contents.profiles {
+            if self
+                .active_profile
+                .as_ref()
+                .is_some_and(|active| *active != profile.name)
+            {
+                continue;
+            }
+            let rows: Vec<_> = next
+                .values()
+                .filter(|row| row.source_profile == profile.name)
+                .cloned()
+                .collect();
+            trees.insert(
+                profile.name.clone(),
+                GroupTree::new_with_groups(&rows, &profile.groups),
+            );
+        }
+        // No displayed row, approval, selection, or sound changes before every read and parse succeeds.
+        for (id, instance) in &next {
+            if let Some(previous) = self.instances.get(id) {
+                if previous.status != instance.status {
+                    crate::sound::play_for_transition(
+                        previous.status,
+                        instance.status,
+                        &self.sound_config,
+                    );
+                }
+            }
+        }
+        self.instances = next;
+        self.group_trees = trees;
+        self.storages.extend(opened_storages);
+        self.storages.retain(|name, _| {
+            snapshot.contents.profiles.iter().any(|profile| {
+                profile.name == *name
+                    && self
+                        .active_profile
+                        .as_ref()
+                        .is_none_or(|active| active == name)
+            })
+        });
+        if let Some(reports) = duplicate_reports {
+            log_legacy_duplicates_once(&reports);
+            self.legacy_duplicate_reports = reports;
+            self.remote_owner_cache.borrow_mut().clear();
+            let mut disk_profiles: Vec<_> = self.storages.keys().cloned().collect();
+            disk_profiles.sort();
+            self.rewire_disk_subscriptions(&disk_profiles);
+            let config_profiles: Vec<_> = snapshot
+                .contents
+                .profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect();
+            self.rewire_config_subscriptions(&config_profiles);
+        }
+        self.reconcile_in_flight_creation(&snapshot.contents.sessions);
+        self.refresh_registered_projects();
+        Ok(())
+    }
+
     /// Apply a pending session-list result from the daemon. Returns true if
     /// the caller should redraw.
     pub fn apply_session_feed(&mut self) -> bool {
         use crate::tui::session_feed::{SessionFeedResult, SidebarSource};
         use std::sync::mpsc::TryRecvError;
 
+        let pending_before =
+            self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
         let mut snapshot_applied = false;
         let updated = match self.session_feed.try_recv() {
             Ok(result) => match result {
@@ -334,130 +626,64 @@ impl HomeView {
                     {
                         false
                     } else {
+                        self.bind_in_flight_creation(&snapshot.contents.sessions);
                         let persisted_ordering = crate::session::load_workspace_ordering()
                             .map(|ordering| ordering.order)
                             .unwrap_or_default();
-                        let mut metadata_changed = false;
-                        // Durable rows come from the locked storage load, preserving the creation stub.
-                        metadata_changed |=
-                            self.reconcile_in_flight_creation(&snapshot.contents.sessions);
-                        let in_flight = self.in_flight_creation_id();
                         let unknown_row = snapshot.contents.sessions.iter().any(|row| {
-                            Some(row.id.as_str()) != in_flight
+                            self.active_profile
+                                .as_ref()
+                                .is_none_or(|active| *active == row.profile)
                                 && !self.instances.contains_key(&row.id)
-                                && self.storages.contains_key(&row.profile)
+                                && self.in_flight_creation_id() != Some(row.id.as_str())
+                                && !self.pending_creation.as_ref().is_some_and(|pending| {
+                                    pending.confirmation.is_none()
+                                        && row.idempotency_key.as_deref()
+                                            == Some(pending.request_key.as_str())
+                                })
                         });
-                        // A failed load keeps the revision unapplied, even if a later reload masks its diff.
-                        let mut reload_failed = false;
-                        if self.session_feed_reload_retry_at.is_some()
+                        let refresh_metadata = self.session_feed_reload_retry_at.is_some()
                             || unknown_row
-                            || self.snapshot_requires_storage_reload(&snapshot, &persisted_ordering)
-                        {
-                            match self.reload() {
-                                Ok(()) => metadata_changed = true,
-                                Err(error) => {
-                                    reload_failed = true;
-                                    self.session_feed_reload_retry_at = Some(
-                                        std::time::Instant::now()
-                                            + Self::RECONCILE_RELOAD_RETRY_INTERVAL,
-                                    );
-                                    tracing::warn!(
-                                        target: "tui.session_feed",
-                                        %error,
-                                        "reload before applying a canonical runtime revision failed"
-                                    );
-                                    self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                                        "Runtime state not applied",
-                                        &format!(
-                                            "The runtime's canonical state could not be loaded, so this revision stays unapplied and a session blocked on an unknown outcome stays blocked.\n\n{error}"
-                                        ),
-                                    ));
-                                }
+                            || self
+                                .snapshot_requires_storage_reload(&snapshot, &persisted_ordering);
+                        let mut metadata_changed = false;
+                        match self.apply_canonical_projection(&snapshot, refresh_metadata) {
+                            Err(error) => {
+                                self.session_feed_reload_retry_at = Some(
+                                    std::time::Instant::now()
+                                        + Self::CANONICAL_RELOAD_RETRY_INTERVAL,
+                                );
+                                tracing::warn!(target: "tui.session_feed", %error,
+                                    "staging a canonical runtime revision failed");
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Runtime state not applied",
+                                    &error.to_string(),
+                                ));
                             }
-                        }
-                        for row in &snapshot.contents.sessions {
-                            metadata_changed |= self.apply_daemon_status_update(row);
-                            let Some(instance) = self.instances.get_mut(&row.id) else {
-                                continue;
-                            };
-                            if instance.agent_pane != row.agent_pane {
-                                instance.agent_pane.clone_from(&row.agent_pane);
+                            Ok(()) => {
                                 metadata_changed = true;
-                            }
-                            if instance.auxiliary != row.auxiliary {
-                                instance.auxiliary.clone_from(&row.auxiliary);
-                                metadata_changed = true;
-                            }
-                            if instance.unread != row.unread {
-                                instance.unread = row.unread;
-                                metadata_changed = true;
-                                if !row.unread
-                                    && self.manual_unread_hold.as_deref() == Some(&row.id)
-                                {
-                                    self.manual_unread_hold = None;
-                                }
-                            }
-                            for (raw, current) in [
-                                (row.archived_at.as_deref(), &mut instance.archived_at),
-                                (row.favorited_at.as_deref(), &mut instance.favorited_at),
-                                (row.snoozed_until.as_deref(), &mut instance.snoozed_until),
-                                (row.pinned_at.as_deref(), &mut instance.pinned_at),
-                                (
-                                    row.last_accessed_at.as_deref(),
-                                    &mut instance.last_accessed_at,
-                                ),
-                                (
-                                    row.idle_entered_at.as_deref(),
-                                    &mut instance.idle_entered_at,
-                                ),
-                                (
-                                    row.idle_dormant_since.as_deref(),
-                                    &mut instance.idle_dormant_since,
-                                ),
-                            ] {
-                                let next = match raw {
-                                    Some(value) => {
-                                        match chrono::DateTime::parse_from_rfc3339(value) {
-                                            Ok(value) => Some(value.with_timezone(&chrono::Utc)),
-                                            Err(_) => continue,
-                                        }
+                                for row in &snapshot.contents.sessions {
+                                    self.apply_daemon_status_update(row);
+                                    if !row.unread
+                                        && self.manual_unread_hold.as_deref() == Some(&row.id)
+                                    {
+                                        self.manual_unread_hold = None;
                                     }
-                                    None => None,
-                                };
-                                if *current != next {
-                                    *current = next;
-                                    metadata_changed = true;
                                 }
+                                let ids: std::collections::HashSet<_> =
+                                    self.instances.keys().map(String::as_str).collect();
+                                self.structured_pending_approvals
+                                    .retain(|id, _| ids.contains(id.as_str()));
+                                self.rebuild_flat_items_keeping_cursor();
+                                self.update_selected();
+                                self.session_feed_reload_retry_at = None;
+                                self.observed_workspace_ordering = persisted_ordering;
+                                metadata_changed |=
+                                    self.session_feed.mark_snapshot_applied(snapshot);
+                                snapshot_applied = true;
                             }
-                        }
-                        if metadata_changed {
-                            self.rebuild_flat_items();
-                            self.reseat_cursor_after_rebuild();
-                            // A rebuild reorders rows under the cursor: resolve the
-                            // selection for the row that now sits there, so a key
-                            // pressed right after a canonical frame acts on what the
-                            // user sees instead of on nothing.
-                            self.update_selected();
                         }
                         metadata_changed |= self.set_sidebar_source(SidebarSource::Daemon, None);
-                        if !self.structured_pending_approvals.is_empty() {
-                            let ids: std::collections::HashSet<_> = snapshot
-                                .contents
-                                .sessions
-                                .iter()
-                                .map(|row| row.id.as_str())
-                                .collect();
-                            let count = self.structured_pending_approvals.len();
-                            self.structured_pending_approvals
-                                .retain(|id, _| ids.contains(id.as_str()));
-                            metadata_changed |= count != self.structured_pending_approvals.len();
-                        }
-                        if !reload_failed {
-                            self.session_feed_reload_retry_at = None;
-                            self.observed_workspace_ordering = persisted_ordering;
-                            metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
-                            snapshot_applied = true;
-                        }
                         metadata_changed
                     }
                 }
@@ -493,7 +719,14 @@ impl HomeView {
                 self.clear_unread_on_view(&id);
             }
         }
-        updated || command_error || archive_cursor_changed
+        let outcomes_changed = self.apply_runtime_outcomes();
+        let pending_after =
+            self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
+        updated
+            || command_error
+            || archive_cursor_changed
+            || outcomes_changed
+            || pending_before != pending_after
     }
 
     pub(in crate::tui) fn apply_daemon_status_update(
@@ -604,17 +837,16 @@ impl HomeView {
         use crate::tui::approval_poller::ApprovalResolution;
 
         match result.resolution {
-            // Success: the card is answered, clear it. The optimistic removal
-            // in `resolve_structured_approval` already did this; re-run it in
-            // case a poll tick re-added the nonce between submit and apply.
+            // Success: the card is answered, so clear it. The optimistic removal in
+            // `resolve_structured_approval` already did, but a poll tick may have re-added
+            // the nonce between submit and apply.
             ApprovalResolution::Resolved => {
                 self.remove_structured_pending_approval(&result.session_id, &result.nonce);
             }
-            // Already resolved elsewhere (dashboard, or the server's
-            // compare-and-set lost the race). Clear it and say so, matching
-            // the structured view's "approval already resolved" feedback
-            // instead of silently dropping it. Guarded so it can't stomp an
-            // info dialog the user is mid-read on.
+            // Already resolved elsewhere (the dashboard, or the server's compare-and-set
+            // lost the race): clear it and say so, matching the structured view's feedback
+            // instead of dropping it silently. Guarded so it can't stomp an info dialog the
+            // user is mid-read on.
             ApprovalResolution::Gone => {
                 self.remove_structured_pending_approval(&result.session_id, &result.nonce);
                 if self.info_dialog.is_none() {
@@ -624,10 +856,9 @@ impl HomeView {
                     ));
                 }
             }
-            // Transient failure: leave the card cleared and surface the error.
-            // The still-pending approval will be restored by the next 1 Hz
-            // daemon poll (the server still lists it), so there is no manual
-            // re-insert to couple to request order.
+            // Transient failure: leave the card cleared and surface the error. The still
+            // pending approval comes back on the next 1 Hz daemon poll, so there is no
+            // manual re-insert coupled to request order.
             ApprovalResolution::Failed(error) => {
                 if self.info_dialog.is_none() {
                     self.info_dialog = Some(InfoDialog::new(
@@ -659,9 +890,244 @@ impl HomeView {
             ViewMode::Structured => PanePresence::Unknown,
         }
     }
+    fn record_runtime_message(&mut self, message: String) {
+        tracing::info!(target: "tui.runtime_outcome", message, "Runtime domain outcome");
+        self.runtime_outcome_messages.push(message);
+    }
+
+    fn record_purge_outcome(&mut self, id: &str, outcome: crate::daemon::PurgeOutcome) {
+        match outcome {
+            crate::daemon::PurgeOutcome::Deleted {
+                messages,
+                cleanup_errors,
+            } => {
+                for message in messages {
+                    self.record_runtime_message(format!("{id}: {message}"));
+                }
+                for error in cleanup_errors {
+                    self.record_runtime_message(format!(
+                        "{id}: Session deletion committed, but cleanup is incomplete: {error}"
+                    ));
+                }
+            }
+            crate::daemon::PurgeOutcome::Kept {
+                messages,
+                teardown_started,
+            } => {
+                self.record_runtime_message(format!(
+                    "{id}: Session kept{}.",
+                    if teardown_started {
+                        " after runtime teardown began"
+                    } else {
+                        " without runtime teardown"
+                    }
+                ));
+                for message in messages {
+                    self.record_runtime_message(format!("{id}: {message}"));
+                }
+            }
+        }
+    }
+
+    fn apply_runtime_outcomes(&mut self) -> bool {
+        use crate::daemon::{NamespaceOutcome, ReorderOutcome};
+        use crate::tui::session_feed::{CommandFailure, SessionCommandOutcome};
+        let row_outcomes = self.session_feed.drain_session_outcomes();
+        let namespace = self.session_feed.drain_namespace_result();
+        let mut changed = !row_outcomes.is_empty() || namespace.is_some();
+        for (id, outcome) in row_outcomes {
+            match outcome {
+                SessionCommandOutcome::Trashed(receipt) => {
+                    if let crate::daemon::TrashRelocationOutcome::Failed { reason } =
+                        receipt.outcome.relocation
+                    {
+                        self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
+                    }
+                }
+                SessionCommandOutcome::Purged(receipt) => {
+                    self.record_purge_outcome(&id, receipt.outcome)
+                }
+                SessionCommandOutcome::Renamed(receipt) => {
+                    for warning in receipt.outcome.warnings {
+                        self.record_runtime_message(format!("{id}: {warning}"));
+                    }
+                }
+                SessionCommandOutcome::WorktreeEdited(receipt) => {
+                    for warning in receipt.outcome.warnings {
+                        self.record_runtime_message(format!("{id}: {warning}"));
+                    }
+                }
+                SessionCommandOutcome::ProjectAttached(receipt) => {
+                    if self
+                        .info_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.title() == "Attaching Project")
+                    {
+                        self.info_dialog = None;
+                    }
+                    let attached = receipt.outcome.attached;
+                    self.record_runtime_message(format!(
+                        "{id}: Attached '{}' at '{}' on branch '{}'{}{}.",
+                        attached.name,
+                        attached.worktree_path,
+                        attached.branch,
+                        if attached.branch_created {
+                            " (new branch)"
+                        } else {
+                            " (existing branch)"
+                        },
+                        attached
+                            .moved_to
+                            .map(|path| format!("; session moved to '{path}'"))
+                            .unwrap_or_default()
+                    ));
+                    for warning in receipt.outcome.warnings {
+                        self.record_runtime_message(format!("{id}: {warning}"));
+                    }
+                    self.record_runtime_message(match receipt.outcome.worker {
+                        crate::daemon::AttachedWorkerOutcome::Restarted => format!("{id}: The agent restarted and sees the attached project."),
+                        crate::daemon::AttachedWorkerOutcome::NotRunning => format!("{id}: The stopped agent will see the project on its next start."),
+                        crate::daemon::AttachedWorkerOutcome::RestartFailed { message } => format!("{id}: Project attachment committed, but the agent restart failed: {message}"),
+                    });
+                }
+                SessionCommandOutcome::Restored(receipt) => match receipt.outcome {
+                    crate::daemon::RestoreOutcome::Restored => {
+                        if self.selected_session.as_deref() == Some(id.as_str()) {
+                            self.select_session_by_id(&id);
+                        }
+                    }
+                    crate::daemon::RestoreOutcome::AlreadyRestored => self.record_runtime_message(
+                        format!("{id}: already restored; canonical state retained"),
+                    ),
+                },
+            }
+        }
+        if let Some(result) = namespace {
+            let intent = self.pending_namespace_intent.take();
+            match result {
+                Err(CommandFailure::Rejected(message)) => {
+                    self.record_runtime_message(format!("Namespace change rejected: {message}"))
+                }
+                Err(CommandFailure::Unknown(message)) => {
+                    self.namespace_unknown_message = Some(message);
+                    self.open_namespace_indeterminate_dialog();
+                }
+                Ok(receipt) => match receipt.outcome {
+                    NamespaceOutcome::Committed => match intent {
+                        Some(NamespaceIntent::ProfileCreated(name)) => {
+                            if let Err(error) = self.switch_profile(Some(name)) {
+                                self.record_runtime_message(format!("Profile created, but changing the displayed profile failed: {error}"));
+                            }
+                        }
+                        Some(NamespaceIntent::ProfileDeleted(name)) => {
+                            self.rewire_after_profile_delete(&name);
+                            self.show_profile_picker();
+                        }
+                        _ => {}
+                    },
+                    NamespaceOutcome::DeletedGroup(outcome) => {
+                        if !outcome.group_removed {
+                            self.record_runtime_message(
+                                "The group remains in the canonical namespace.".to_owned(),
+                            );
+                        }
+                        for session in outcome.sessions {
+                            self.record_purge_outcome(&session.id, session.outcome);
+                        }
+                        for failure in outcome.failures {
+                            self.record_runtime_message(format!(
+                                "{}: {}",
+                                failure.id, failure.message
+                            ));
+                        }
+                    }
+                    NamespaceOutcome::Reordered(outcome) => match outcome {
+                        ReorderOutcome::Moved { destination } => {
+                            if let Some(NamespaceIntent::ReorderSession { id, .. }) = intent {
+                                self.follow_committed_reorder(&id, destination.as_ref());
+                            } else {
+                                self.rebuild_flat_items_keeping_cursor();
+                                self.update_selected();
+                            }
+                        }
+                        ReorderOutcome::AtEdge => {
+                            if let Some(NamespaceIntent::ReorderSession {
+                                id,
+                                profile,
+                                source_group,
+                                delta,
+                                crossing: false,
+                                continuation_destination,
+                            }) = intent
+                            {
+                                // A keystroke owns both steps, but each receipt has its
+                                // own applied fence. Never retarget to the new cursor.
+                                if self.instances.get(&id).is_some_and(|row| {
+                                    row.source_profile == profile
+                                        && row.group_path == source_group
+                                        && !row.is_archived()
+                                        && !row.is_trashed()
+                                }) {
+                                    if let Some(destination) = continuation_destination {
+                                        if destination.is_empty()
+                                            || self
+                                                .group_trees
+                                                .get(&profile)
+                                                .is_some_and(|tree| tree.group_exists(&destination))
+                                        {
+                                            if let Err(error) = self.submit_session_reorder(
+                                                &id,
+                                                delta,
+                                                Some(destination),
+                                            ) {
+                                                self.record_runtime_message(format!(
+                                                    "Could not cross the group boundary: {error}"
+                                                ));
+                                            }
+                                        } else {
+                                            let _ = self.refresh_after_stale_move();
+                                        }
+                                    }
+                                } else {
+                                    let _ = self.refresh_after_stale_move();
+                                }
+                            }
+                        }
+                        ReorderOutcome::Stale => {
+                            let _ = self.refresh_after_stale_move();
+                        }
+                    },
+                },
+            }
+        }
+        if self.info_dialog.is_none() && !self.runtime_outcome_messages.is_empty() {
+            let messages = std::mem::take(&mut self.runtime_outcome_messages);
+            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                "Runtime change",
+                &messages.join("\n"),
+            ));
+            changed = true;
+        }
+        changed
+    }
+
+    pub(super) fn open_namespace_indeterminate_dialog(&mut self) {
+        if !self.session_feed.namespace_indeterminate() {
+            return;
+        }
+        let message = self
+            .namespace_unknown_message
+            .as_deref()
+            .unwrap_or("The admitted namespace operation was interrupted.");
+        self.confirm_dialog = Some(ConfirmDialog::new("Resolve Unknown Namespace Outcome", &format!("{message}\n\nReview the current canonical sessions, groups and profiles. Resolving acknowledges uncertainty; it does not retry the operation. Keep Blocked leaves the namespace quarantined. Reopen with Ctrl+K: Resolve unknown runtime change."), "resolve_namespace_indeterminate").buttons("Acknowledge", "Keep Blocked"));
+    }
 
     /// Open the oldest unresolved outcome without replaying its mutation.
     pub(super) fn promote_next_indeterminate(&mut self) {
+        if self.session_feed.namespace_indeterminate() {
+            self.open_namespace_indeterminate_dialog();
+            return;
+        }
         let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() else {
             return;
         };

@@ -101,7 +101,7 @@ reqwest = { version = "0.13", features = ["json", "query", "rustls", "stream"], 
 percent-encoding = "2"
 
 # Unix sockets + futures-compat for ACP byte streams
-tokio-util = { version = "0.7", features = ["codec", "compat", "io", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec", "compat", "io-util"] }
 
 # Process handling
 nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll"] }

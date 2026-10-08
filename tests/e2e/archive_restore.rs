@@ -140,8 +140,7 @@ fn test_archive_then_unarchive_cycle() {
         "the Archived section header should appear with the count\n{after_archive}"
     );
 
-    // Navigate into the Archived section: down to the header, expand it,
-    // down onto the parked row. Its preview shows the calm placeholder.
+    // Down to the header, expand it, down onto the parked row.
     h.send_keys("j");
     h.send_keys("l");
     h.send_keys("j");
@@ -152,19 +151,8 @@ fn test_archive_then_unarchive_cycle() {
         "archived preview should point at z to unarchive\n{parked}"
     );
 
-    // Unarchive it; the row returns to the active list, still selected.
-    // The archive command can still be in flight here, and the native lane
-    // refuses a second change for the same row until the first resolves (a local
-    // toggle had no such window). Press, and press once more if the row is still
-    // parked, instead of racing that window.
+    h.wait_for("Runtime ready");
     h.send_keys("z");
-    let deadline = std::time::Instant::now() + Duration::from_secs(4);
-    while h.capture_screen().contains("is parked") && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    if h.capture_screen().contains("is parked") {
-        h.send_keys("z");
-    }
     h.wait_for_absent("is parked", Duration::from_secs(5));
     // The unarchive is a daemon mutation now, so the row rises when the applied
     // snapshot carries the cleared stamp: wait for the empty section to go with
@@ -457,13 +445,9 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
         .iter()
         .map(|(id, title)| agent_of_empires::tmux::Session::generate_name(id, title))
         .collect();
-
-    // Pre-create long-lived agent sessions on the harness socket so they are
-    // demonstrably alive right up until archive; because the tmux session
-    // already exists under the name the instance computes, TUI startup detects
-    // it as running and does not relaunch it. These run before `spawn_tui` and
-    // so start the tmux server, which is why they must go through the harness
-    // helper: it pins the same env `spawn_tui` uses onto the server.
+    // Pre-created under the name the instance computes, so TUI startup sees
+    // them running and does not relaunch. They start the tmux server, so they
+    // must go through the harness, which pins `spawn_tui`'s env onto it.
     for name in &names {
         h.tmux_new_detached(name, "sleep 600");
     }
@@ -473,8 +457,7 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     // subscription to report readiness before driving panes.
     h.wait_for("Runtime ready");
     h.wait_for_ready();
-    // The group header renders as "name (count)"; its presence proves the group
-    // loaded with all three members.
+    // "name (count)" proves the group loaded with all three members.
     h.wait_for("bulkarch (3)");
 
     // Pre-condition: every agent session is alive before we archive, so a later
@@ -487,20 +470,9 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
         );
     }
 
-    // Groups render before ungrouped rows, so the group header is the top row.
-    // `Home` jumps the cursor there in one keystroke; `z` on a selected group
-    // opens the archive-confirm dialog and `y` submits it.
-    //
-    // Deliberately `Home` rather than a run of `k` presses. The app coalesces
-    // printable keys arriving less than PASTE_BURST_INTER_KEY_MS apart into a
-    // paste burst (src/tui/app.rs), for Mosh clients that strip bracketed-paste
-    // markers. A burst of identical keys is exempt via `is_auto_repeat_burst`,
-    // but "kkz" is not: when a loaded CI box stalls the TUI long enough for the
-    // queued keystrokes to be read back to back, the mixed run is routed to
-    // `handle_paste`, the `z` lands in `pending_paste` instead of opening the
-    // dialog, and the wait below times out. `Home` is not a burst candidate
-    // (only `Char` and `Enter` are), and two keys can never reach
-    // PASTE_BURST_MIN_LEN, so this sequence cannot be misread as a paste.
+    // `Home` rather than repeated `k`: a mixed run of printable keys arriving
+    // back to back is coalesced into a paste burst (src/tui/app.rs), which
+    // would swallow the `z`. `Home` is not a burst candidate.
     h.send_keys("Home");
     h.send_keys("z");
     h.wait_for("Archive all 3 sessions");

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
+use super::api_error;
 use super::AppState;
 
 #[derive(Serialize)]
@@ -58,21 +59,21 @@ pub async fn set_telemetry_consent(
         config.telemetry.enabled = req.enabled;
     }) {
         tracing::error!(target: "http.api.telemetry", "failed to save telemetry consent: {e}");
-        return (
+        return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "save_failed", "message": "Failed to save telemetry setting"})),
-        )
-            .into_response();
+            "save_failed",
+            "Failed to save telemetry setting",
+        );
     }
     if let Err(e) = crate::session::update_app_state(|state| {
         state.has_responded_to_telemetry = true;
     }) {
         tracing::error!(target: "http.api.telemetry", "failed to save telemetry consent: {e}");
-        return (
+        return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "save_failed", "message": "Failed to save telemetry setting"})),
-        )
-            .into_response();
+            "save_failed",
+            "Failed to save telemetry setting",
+        );
     }
     // Reconcile the install id (no-op under DO_NOT_TRACK). The daemon, not the
     // browser, owns the id.
@@ -106,36 +107,34 @@ pub async fn post_telemetry_seen(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // Validate an optional form-factor up front so a non-allowlisted value (a
-    // user-agent string, a screen size, a typo) is rejected before any counter
-    // moves, the way an unknown surface is. Absent on older clients.
+    // Validate an optional form-factor up front, so a non-allowlisted value is
+    // rejected before any counter moves, the way an unknown surface is.
     let form_factor = match req.form_factor.as_deref() {
         Some(value) => match crate::telemetry::form_factor::parse(value) {
             Some(ff) => Some(ff),
             None => {
-                return (
+                return api_error(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "bad_form_factor", "message": format!("unknown form_factor '{value}'")})),
-                )
-                    .into_response();
+                    "bad_form_factor",
+                    format!("unknown form_factor '{value}'"),
+                );
             }
         },
         None => None,
     };
 
-    // Validate + count the surface against the allowlisted registry; an off-list
-    // name is rejected and never creates a counter, so it can never reach a
-    // snapshot. This is the open count for the surface.
+    // Validate and count the surface against the allowlisted registry; an
+    // off-list name never creates a counter, so it can never reach a snapshot.
     if !state.telemetry_usage_seen.record(&req.surface) {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "bad_surface", "message": format!("unknown surface '{}'", req.surface)})),
-        )
-            .into_response();
+            "bad_surface",
+            format!("unknown surface '{}'", req.surface),
+        );
     }
 
-    // Layer the per-form-factor class onto the browser surfaces. The registry
-    // already counted the open; this records which client class it came from.
+    // Layer the per-form-factor class onto the browser surfaces: the registry
+    // already counted the open, this records which client class it came from.
     if let Some(ff) = form_factor {
         match req.surface.as_str() {
             "web" => state.telemetry_web_clients.increment(ff),
@@ -179,11 +178,11 @@ pub async fn post_telemetry_structured_interaction(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         other => {
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "bad_kind", "message": format!("unknown interaction kind '{other}'")})),
-            )
-                .into_response();
+                "bad_kind",
+                format!("unknown interaction kind '{other}'"),
+            );
         }
     }
     StatusCode::NO_CONTENT.into_response()

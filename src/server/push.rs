@@ -100,8 +100,7 @@ impl VapidKeypair {
             .open(&lock_path)?;
         lock_file.lock_exclusive()?;
 
-        // Re-check: another process may have generated while we were
-        // waiting for the lock.
+        // Re-check.
         if path.exists() {
             if let Err(e) = FileExt::unlock(&lock_file) {
                 tracing::debug!(target: "http.middleware", "Failed to release lock file: {e}");
@@ -134,8 +133,7 @@ impl VapidKeypair {
             .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)?
             .to_string();
 
-        // Public key in uncompressed SEC1 form, base64url encoded. This
-        // is the shape browsers expect for applicationServerKey.
+        // Public key in uncompressed SEC1 form, base64url encoded.
         let public_bytes = verifying_key.to_encoded_point(false);
         let public_b64url = base64_url_encode(public_bytes.as_bytes());
 
@@ -506,9 +504,8 @@ pub async fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
         // instead of every 500ms tick while the dashboard is open.
         let mut last_suppress_reason: Option<&'static str> = None;
 
-        // Interleave receiving status changes with polling the dwell
-        // map for sessions whose dwell window has elapsed. A simple
-        // 500ms tick is precise enough and cheap.
+        // Interleave receiving status changes with polling the dwell map for sessions whose
+        // dwell window has elapsed.
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -541,10 +538,7 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
     let entry = dwell.entry(change.instance_id.clone()).or_default();
     entry.title = change.instance_title;
     let now = std::time::Instant::now();
-    // Exactly one `*_since` is set at a time: the current state's timer.
-    // Transitioning clears the others. Each fresh entry into a fire-worthy
-    // state resets that state's dwell timer (a flicker Waiting → Running →
-    // Waiting restarts the 5s clock, which is what we want).
+    // Exactly one `*_since` is set at a time.
     entry.waiting_since = None;
     entry.idle_since = None;
     entry.error_since = None;
@@ -554,9 +548,8 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
         Status::Error => entry.error_since = Some(now),
         _ => {}
     }
-    // Drop entries for transitions into Stopped/Deleting so the map
-    // doesn't grow forever in long-running servers that create and
-    // destroy many sessions.
+    // Drop entries for transitions into Stopped/Deleting so the map doesn't grow forever in
+    // long-running servers that create and destroy many sessions.
     if matches!(change.new, Status::Stopped | Status::Deleting) {
         dwell.remove(&change.instance_id);
     }
@@ -614,12 +607,7 @@ async fn fire_due_pushes(
     };
     let push = push.clone();
 
-    // Suppress pushes when the user is actively using aoe (TUI or web
-    // dashboard). They can already see session state changes in real
-    // time, so OS-level push notifications are noise. Checked BEFORE
-    // the dwell collection loop so that dwell timers are preserved:
-    // when the user stops using aoe, any session that has been waiting
-    // past the dwell threshold fires on the next tick.
+    // Suppress pushes when the user is actively using aoe (TUI or web dashboard).
     let suppress_reason = if crate::session::is_tui_active(std::time::Duration::from_secs(30)) {
         Some("TUI is active")
     } else if app_state.web_active_within(std::time::Duration::from_secs(30)) {
@@ -627,8 +615,7 @@ async fn fire_due_pushes(
     } else {
         None
     };
-    // Only log on transitions: entering a new suppression reason or
-    // resuming after suppression ends. Otherwise this fires every 500ms.
+    // Only log on transitions.
     if suppress_reason != *last_suppress_reason {
         match (*last_suppress_reason, suppress_reason) {
             (None, Some(reason)) => {
@@ -649,23 +636,18 @@ async fn fire_due_pushes(
     }
 
     let now = std::time::Instant::now();
-    // Collect (instance_id, title, event) tuples to fire. Firing mutates
-    // the dwell map (clear `*_since`, set `last_notified`) so we collect
-    // before sending to avoid holding a borrow across the await boundary.
+    // Collect (instance_id, title, event) tuples to fire.
     let mut to_fire: Vec<(String, String, NotificationEvent)> = Vec::new();
 
     for (id, state) in dwell.iter_mut() {
-        // Cooldown gates ALL event types for this session. Rapid
-        // oscillation Error → Running → Error shouldn't double-buzz.
+        // Cooldown gates ALL event types for this session.
         if let Some(last) = state.last_notified {
             if now.duration_since(last).as_millis() < COOLDOWN_MS as u128 {
                 continue;
             }
         }
 
-        // Evaluate each event in priority order. At most one *_since is
-        // set at any time (handle_status_change maintains this), so this
-        // loop terminates early with a single fire or zero fires.
+        // Evaluate each event in priority order.
         let checks = [
             (NotificationEvent::Waiting, state.waiting_since),
             (NotificationEvent::Error, state.error_since),
@@ -695,11 +677,9 @@ async fn fire_due_pushes(
     let web_config = app_state.web_config.clone();
 
     for (instance_id, instance_title, event) in to_fire {
-        // If the instance vanished (externally deleted, tmux killed,
-        // storage file hand-edited) between the dwell timer starting
-        // and firing, skip rather than sending a notification that
-        // deep-links to a 404. Also drop the dwell entry so we don't
-        // keep retrying every tick forever.
+        // If the instance vanished (externally deleted, tmux killed, storage file
+        // hand-edited) between the dwell timer starting and firing, skip rather than
+        // sending a notification that deep-links to a 404.
         let Some(instance) = instances.iter().find(|i| i.id == instance_id) else {
             dwell.remove(&instance_id);
             continue;
@@ -712,12 +692,8 @@ async fn fire_due_pushes(
         }
 
         // Acp approval and question pushes are dispatched immediately from
-        // `acp_event_listener` with their own tags and bypass the
-        // TUI/web active-session suppression. If the session has any
-        // unresolved structured view approval or elicitation, the user has
-        // already been notified through that channel; a second
-        // status-change push five seconds later for the same underlying
-        // event would just be noise. See #1038, #2146.
+        // `acp_event_listener` with their own tags and bypass the TUI/web active-session
+        // suppression.
         if event == NotificationEvent::Waiting
             && (!app_state
                 .acp_event_store
@@ -1209,8 +1185,7 @@ pub async fn test(
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
 
-    // Confirm ownership before doing anything. Reject cross-owner test
-    // calls with 403 even if the subscription exists.
+    // Confirm ownership before doing anything.
     let owned = push
         .store
         .for_owner(&auth.0)
@@ -1230,8 +1205,7 @@ pub async fn test(
     };
 
     let Some(url) = build_push_url(&subscription, "/") else {
-        // Stale subscription with no recorded origin. Test path can't be
-        // useful without an absolute URL; ask the user to re-subscribe.
+        // Stale subscription with no recorded origin.
         tracing::info!(
             target: "push",
             endpoint = %subscription.endpoint,
@@ -1718,8 +1692,7 @@ mod tests {
             &inst
         ));
 
-        // Trash deliberately stops the pane. A late poll result must not turn
-        // that teardown into a false error notification.
+        // Trash deliberately stops the pane.
         inst.trash();
         assert!(!notification_matches_live_instance(
             NotificationEvent::Waiting,

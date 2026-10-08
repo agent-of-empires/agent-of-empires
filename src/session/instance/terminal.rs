@@ -183,6 +183,8 @@ impl Instance {
         tool_name: &str,
         size: Option<(u16, u16)>,
         store: &dyn crate::session::SessionStore,
+        adoption: Option<&crate::session::LegacyToolAdoption>,
+        legacy_scope: Option<&crate::tmux::LegacyToolScope>,
     ) -> Result<(tmux::ToolSession, bool)> {
         let (_title, _lifecycle) = self.acquire_auxiliary_locks_in(store)?;
         let config = store.configuration(Some(store.storage().profile()))?;
@@ -192,11 +194,33 @@ impl Instance {
             .filter(|tool| !tool.command.is_empty() && !tool.background)
             .ok_or_else(|| ToolLaunchUnavailable(tool_name.to_owned()))?;
         let panes = crate::tmux::batch_pane_metadata()?;
-        let session = tmux::ToolSession::from_snapshot(&self.id, &self.title, tool_name, &panes)
-            .map_err(|error| error.context(ToolLaunchUnavailable(tool_name.to_owned())))?;
+        let session = if let Some(adoption) = adoption {
+            anyhow::ensure!(
+                adoption.profile == self.source_profile
+                    && adoption.lifecycle_generation == self.lifecycle_generation,
+                LifecycleReservationError::Superseded
+            );
+            let scope = legacy_scope.ok_or(crate::tmux::LegacyToolUnavailable(
+                "complete catalogue unavailable",
+            ))?;
+            tmux::ToolSession::adopt_legacy_snapshot(
+                &self.id,
+                &self.title,
+                tool_name,
+                &self.source_profile,
+                adoption,
+                &panes,
+                scope,
+            )?
+            .0
+        } else {
+            tmux::ToolSession::from_snapshot(&self.id, &self.title, tool_name, &panes)
+                .map_err(|error| error.context(ToolLaunchUnavailable(tool_name.to_owned())))?
+        };
         let metadata = panes.get(session.session_name());
-        if metadata.is_some_and(|pane| pane.pane_dead) {
-            session.kill()?;
+        if let Some(metadata) = metadata.filter(|pane| pane.pane_dead) {
+            let identity = tmux::ToolSession::legacy_identity(metadata)?;
+            session.kill_verified(&self.id, tool_name, &identity)?;
         }
         let created = metadata.is_none_or(|pane| pane.pane_dead);
         if created {
@@ -244,10 +268,6 @@ impl Instance {
             .as_ref()
             .map(|t| t.created)
             .unwrap_or(false)
-    }
-
-    pub fn start_terminal(&mut self) -> Result<()> {
-        self.start_terminal_with_size(None)
     }
 
     pub fn start_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
@@ -311,14 +331,7 @@ impl Instance {
         Ok(())
     }
 
-    /// Kill the paired terminal tmux session if its pane is dead (shell
-    /// exited while `remain-on-exit on` kept the session as a tombstone).
-    /// Returns true if a kill happened so the caller knows to re-spawn.
-    /// A missing session or a live pane both return Ok(false).
-    pub fn kill_terminal_if_dead(&self) -> Result<bool> {
-        self.kill_terminal_if_dead_indexed(0)
-    }
-
+    /// Remove a shell-exit tombstone left by `remain-on-exit`.
     pub fn kill_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
         let session = self.terminal_tmux_session_indexed(index)?;
         if session.exists() && session.is_pane_dead() {

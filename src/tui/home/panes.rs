@@ -44,6 +44,17 @@ impl NativePane {
     }
 }
 
+pub(super) struct PendingLegacyToolPreparation {
+    id: String,
+    pane: NativePane,
+    size: Option<(u16, u16)>,
+    intent: PaneIntent,
+    adoption: crate::session::LegacyToolAdoption,
+    profile_filter: Option<String>,
+    view_mode: ViewMode,
+    terminal_mode: TerminalMode,
+}
+
 pub(super) struct PendingNativeAttachment {
     id: String,
     profile_filter: Option<String>,
@@ -67,6 +78,95 @@ impl HomeView {
             self.selected_session.as_deref() == Some(id),
             "Session is no longer selected"
         );
+        if let NativePane::Auxiliary(crate::session::AuxiliaryTarget::Tool { tool_name }) = &pane {
+            let row = self
+                .get_instance(id)
+                .ok_or_else(|| anyhow::anyhow!("Session is unknown to this view"))?;
+            let observation = row.auxiliary.iter().find(|observation|
+                matches!(&observation.target, crate::session::AuxiliaryTarget::Tool { tool_name: name } if name == tool_name))
+                .ok_or_else(|| anyhow::anyhow!("Tool ownership has not been observed yet. Wait for the runtime snapshot."))?;
+            {
+                if let Some(identity) = &observation.pane.legacy_tool {
+                    let adoption = crate::session::LegacyToolAdoption {
+                        tmux_session: observation
+                            .pane
+                            .tmux_session
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Legacy pane name unavailable"))?,
+                        identity: identity.clone(),
+                        profile: row.source_profile.clone(),
+                        lifecycle_generation: row.lifecycle_generation,
+                    };
+                    let message = format!("Adopt legacy tool '{}' for '{}'\nRow: {} / {} / generation {}\nTmux: {} ({} / {}, PID {})\nConfirm ownership of this exact unmarked pane before opening it.",
+                        tool_name, row.title, row.source_profile, row.id, row.lifecycle_generation,
+                        adoption.tmux_session, identity.session_id, identity.pane_id, identity.pane_pid);
+                    self.pending_legacy_tool_preparation = Some(PendingLegacyToolPreparation {
+                        id: id.to_owned(),
+                        pane,
+                        size,
+                        intent,
+                        adoption,
+                        profile_filter: self.active_profile.clone(),
+                        view_mode: self.view_mode.clone(),
+                        terminal_mode: self.get_terminal_mode(id),
+                    });
+                    self.confirm_dialog = Some(
+                        ConfirmDialog::new("Adopt Legacy Tool", &message, "adopt_legacy_tool")
+                            .buttons("Adopt", "Cancel"),
+                    );
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    observation.pane.state != crate::session::PanePresence::Unknown,
+                    "Tool ownership is unavailable, invalid, or ambiguous; no tool was opened"
+                );
+            }
+        }
+        self.prepare_native_attachment_authorized(id, pane, size, intent, None)
+    }
+
+    pub(super) fn confirm_legacy_tool_preparation(&mut self) -> anyhow::Result<()> {
+        let pending = self
+            .pending_legacy_tool_preparation
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Legacy tool confirmation is no longer available"))?;
+        anyhow::ensure!(
+            self.selected_session.as_deref() == Some(&pending.id)
+                && self.active_profile == pending.profile_filter
+                && self.view_mode == pending.view_mode
+                && self.get_terminal_mode(&pending.id) == pending.terminal_mode,
+            "Tool selection changed while confirmation was open"
+        );
+        let row = self
+            .get_instance(&pending.id)
+            .ok_or_else(|| anyhow::anyhow!("Session no longer exists"))?;
+        anyhow::ensure!(
+            row.source_profile == pending.adoption.profile
+                && row.lifecycle_generation == pending.adoption.lifecycle_generation,
+            "Session identity changed while confirmation was open"
+        );
+        self.prepare_native_attachment_authorized(
+            &pending.id,
+            pending.pane,
+            pending.size,
+            pending.intent,
+            Some(pending.adoption),
+        )
+    }
+
+    fn prepare_native_attachment_authorized(
+        &mut self,
+        id: &str,
+        pane: NativePane,
+        size: Option<(u16, u16)>,
+        intent: PaneIntent,
+        adoption: Option<crate::session::LegacyToolAdoption>,
+    ) -> anyhow::Result<()> {
+        self.cancel_native_attachment();
+        anyhow::ensure!(
+            self.selected_session.as_deref() == Some(id),
+            "Session is no longer selected"
+        );
         // The applied snapshot can trail by a frame; the profile the fence
         // compares comes from the row this view holds either way.
         let source_profile = self
@@ -82,7 +182,7 @@ impl HomeView {
             NativePane::Agent => self.session_feed.ensure_agent(id.into(), size)?,
             NativePane::Auxiliary(target) => {
                 self.session_feed
-                    .ensure_auxiliary(id.into(), target, size)?
+                    .ensure_auxiliary(id.into(), target, size, adoption)?
             }
         };
         self.pending_native_attachment = Some(PendingNativeAttachment {
@@ -122,6 +222,7 @@ impl HomeView {
     }
 
     pub(super) fn cancel_native_attachment(&mut self) {
+        self.pending_legacy_tool_preparation = None;
         if let Some(pending) = self.pending_native_attachment.take() {
             pending.preparation.lease.cancel_continuation();
         }

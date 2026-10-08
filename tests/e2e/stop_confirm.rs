@@ -88,7 +88,36 @@ fn second_shift_x_confirms_tool_kill_in_strict_mode() {
 
     h.send_keys("M-t");
     h.wait_for("Tool: idletool");
-    stop_twice(&h, "X", "Kill Tool", &tool);
+    let probe = h
+        .tmux()
+        .args(["display-message", "-t", &tool, "-p", "#{@aoe_tool_owner}"])
+        .output()
+        .unwrap();
+    assert!(probe.status.success());
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).trim().is_empty(),
+        "fixture remains deliberately unmarked"
+    );
+    h.send_keys("X");
+    h.wait_for("Kill Tool");
+    h.assert_screen_contains("Adopt and kill legacy tool");
+    h.assert_screen_contains(&id);
+    h.assert_screen_contains(&tool);
+    h.assert_screen_contains("Press X again to confirm");
+    h.send_keys("j");
+    h.assert_screen_contains("Kill Tool");
+    assert!(h.tmux_has_session(&tool));
+    let probe = h
+        .tmux()
+        .args(["display-message", "-t", &tool, "-p", "#{@aoe_tool_owner}"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).trim().is_empty(),
+        "opening confirmation never stamps ownership"
+    );
+    h.send_keys("X");
+    wait_gone(&h, &tool);
     assert!(
         h.tmux_has_session(&agent),
         "killing the tool must not stop the agent"

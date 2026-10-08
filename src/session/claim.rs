@@ -50,32 +50,9 @@ pub(crate) fn decide_restore_claim(
     id: &str,
     now: DateTime<Utc>,
 ) -> Result<RestoreClaimDecision, LifecycleReservationError> {
-    decide_restore_claim_inner(all, id, None, now)
-}
-
-/// Replace the exact Trash reservation queued by this caller with a Restore
-/// reservation. A mismatched generation remains peer-owned and busy.
-pub(crate) fn decide_restore_claim_after_trash(
-    all: &mut [Instance],
-    id: &str,
-    trash_generation: u64,
-    now: DateTime<Utc>,
-) -> Result<RestoreClaimDecision, LifecycleReservationError> {
-    decide_restore_claim_inner(all, id, Some(trash_generation), now)
-}
-
-fn decide_restore_claim_inner(
-    all: &mut [Instance],
-    id: &str,
-    owned_trash_generation: Option<u64>,
-    now: DateTime<Utc>,
-) -> Result<RestoreClaimDecision, LifecycleReservationError> {
     let Some(stored) = all.iter_mut().find(|instance| instance.id == id) else {
         return Ok(RestoreClaimDecision::AlreadyGone);
     };
-    if let Some(generation) = owned_trash_generation {
-        stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
-    }
     match stored.try_acquire_lifecycle_reservation(
         LifecycleOperation::Restore,
         Instance::LIFECYCLE_RESERVATION_TTL,
@@ -201,30 +178,6 @@ mod tests {
             RestoreClaimDecision::Busy(LifecycleOperation::Restore),
         );
         assert_eq!(busy_generation, 1);
-        let mut handed_off = trashed("handed-off");
-        let trash_generation = handed_off
-            .try_acquire_lifecycle_reservation(
-                LifecycleOperation::Trash,
-                Instance::LIFECYCLE_RESERVATION_TTL,
-                now,
-            )
-            .unwrap();
-        instances.push(handed_off);
-        assert_eq!(
-            decide_restore_claim_after_trash(
-                &mut instances,
-                "handed-off",
-                trash_generation + 1,
-                now,
-            )
-            .unwrap(),
-            RestoreClaimDecision::Busy(LifecycleOperation::Trash),
-        );
-        assert_eq!(
-            decide_restore_claim_after_trash(&mut instances, "handed-off", trash_generation, now,)
-                .unwrap(),
-            RestoreClaimDecision::Claimed(trash_generation + 1),
-        );
     }
 
     #[test]

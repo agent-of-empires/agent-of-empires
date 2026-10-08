@@ -23,9 +23,9 @@ pub async fn update_session_group(
         Err(rej) => return rej.into_response(),
     };
     let group = body.group;
-    // Match `create_session`'s group handling exactly: display-label
-    // check on a non-empty path, no trimming or slash normalization. The
-    // empty string is the ungroup sentinel and skips validation.
+    // Match `create_session`'s group handling exactly: display-label check on a
+    // non-empty path, no trimming or slash normalization. The empty string is
+    // the ungroup sentinel and skips validation.
     if !group.is_empty() {
         if let Err(msg) = validate_display_label(&group, "group") {
             return (
@@ -200,14 +200,11 @@ pub(super) async fn adopt_profile_update<R>(
 
 /// Report a storage failure without exposing host diagnostics.
 pub(super) fn persist_failed_response() -> axum::response::Response {
-    (
+    api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": "persist_failed",
-            "message": "Failed to persist session update"
-        })),
+        "persist_failed",
+        "Failed to persist session update",
     )
-        .into_response()
 }
 
 pub async fn update_session_notifications(
@@ -222,9 +219,8 @@ pub async fn update_session_notifications(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // Apply each field independently. `Unset` leaves the stored value
-    // alone; `Clear` sets it to None (inherit default); `Set(v)` writes
-    // an explicit override.
+    // `Unset` leaves the stored value alone, `Clear` sets it to None (inherit
+    // default), `Set(v)` writes an explicit override.
     fn apply(target: &mut Option<bool>, tri: Tristate) {
         match tri {
             Tristate::Unset => {}
@@ -318,36 +314,26 @@ pub async fn update_session_diff_base(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return crate::server::api::session_not_found();
         };
-        // Reject a target that names no entry, so a stale client cannot
-        // silently write an override the diff never reads.
+        // Reject a target that names no entry, so a stale client cannot write
+        // an override the diff never reads.
         match body.repo.as_deref() {
             Some(name) => {
                 if !inst.all_repos().iter().any(|r| r.name == name) {
-                    return (
+                    return api_error(
                         StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "bad_request",
-                            "message": "unknown workspace repo"
-                        })),
-                    )
-                        .into_response();
+                        "bad_request",
+                        "unknown workspace repo",
+                    );
                 }
             }
             None => {
                 if inst.workspace_info.is_some() {
                     let names: Vec<&str> =
                         inst.all_repos().iter().map(|r| r.name.as_str()).collect();
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "bad_request",
-                            "message": format!(
+                    return api_error(StatusCode::BAD_REQUEST, "bad_request", format!(
                                 "this session is a multi-repo workspace; name the repo to set a diff base for ({})",
                                 names.join(", ")
-                            )
-                        })),
-                    )
-                        .into_response();
+                            ));
                 }
             }
         }

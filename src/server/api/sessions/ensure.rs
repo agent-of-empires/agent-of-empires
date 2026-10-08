@@ -5,7 +5,7 @@ use super::*;
 pub async fn stop_auxiliary(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Result<Json<crate::session::AuxiliaryTarget>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<crate::daemon::StopAuxiliaryBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
@@ -28,6 +28,11 @@ pub async fn stop_auxiliary(
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
                 return response;
+            }
+            if error.is::<crate::tmux::LegacyToolUnavailable>() {
+                return (StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error":"legacy_tool_ownership_unavailable", "message":error.to_string()})))
+                    .into_response();
             }
             if error.is::<crate::server::pane::AuxiliaryTargetUnavailable>() {
                 return (
@@ -79,14 +84,26 @@ pub async fn ensure_tool(
     let worker_state = state.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let native = crate::server::session_store::NativeSessionStore::open(
-            worker_state,
+            worker_state.clone(),
             &instance.source_profile,
             None,
         )?;
+        let legacy_scope = if body.adoption.is_some() {
+            let loaded = crate::server::reload::load_all_profiles(&worker_state.file_watch)
+                .map_err(|error| error.source.context(crate::session::NativeStoreUnavailable))?;
+            Some(crate::server::pane::legacy_tool_scope(
+                &loaded.instances,
+                &loaded.metadata.raw_tool_names,
+            ))
+        } else {
+            None
+        };
         let (tool, created) = instance.start_tool_with_size_in(
             &body.tool_name,
             body.size.map(|size| (size.cols.get(), size.rows.get())),
             &native,
+            body.adoption.as_ref(),
+            legacy_scope.as_ref(),
         )?;
         Ok((tool, created, instance, body.tool_name))
     })
@@ -132,6 +149,11 @@ pub async fn ensure_tool(
             }
             if error.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if error.is::<crate::tmux::LegacyToolUnavailable>() {
+                return (StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error":"legacy_tool_ownership_unavailable", "message":error.to_string()})))
+                    .into_response();
             }
             if error.is::<crate::session::ToolLaunchUnavailable>() {
                 return (
@@ -266,6 +288,7 @@ pub(super) async fn agent_target_response(
             crate::session::PaneObservation {
                 state: crate::session::PanePresence::Alive,
                 tmux_session: Some(name.clone()),
+                legacy_tool: None,
             },
         )?;
         Ok((instance, name, ownership))

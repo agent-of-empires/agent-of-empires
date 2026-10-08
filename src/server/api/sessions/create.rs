@@ -204,10 +204,8 @@ pub(crate) fn agent_is_acp_capable(
         return true;
     }
     // Keyed off `resolved`, not `tool`: an explicit `agent_name` can point at a
-    // different `agent_acp_cmd` entry, and `resolve_agent_spec` resolves the
-    // custom map by that same name. Looking up `tool` here would report
-    // not-capable for an agent that spawns fine, skipping the up-front 403 in
-    // favor of a late refusal at spawn.
+    // different `agent_acp_cmd` entry, so looking up `tool` would report
+    // not-capable for an agent that spawns fine.
     let session = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         profile,
         project_path,
@@ -217,8 +215,8 @@ pub(crate) fn agent_is_acp_capable(
         .agent_acp_cmd
         .get(resolved)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(resolved, cmd).is_ok())
-        // A custom agent inheriting a registry-backed base via `agent_detect_as`
-        // spawns fine through the base adapter, so report it capable up front.
+        // A custom agent inheriting a registry-backed base spawns through that
+        // base adapter, so report it capable up front.
         || crate::acp::inherited_acp_base(resolved, &session.agent_detect_as).is_some()
 }
 
@@ -354,9 +352,7 @@ pub async fn review_creation_trust(
     ) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    // An explicit `body.profile` is the caller's authority and overrides the
-    // served one; with none, the trust review runs against the profile this
-    // daemon serves, same as every other unaddressed read.
+    // Unaddressed reads use the served profile; an explicit profile overrides it.
     let profile = match body.profile {
         Some(profile) => profile,
         None => state.served_profile().to_string(),
@@ -402,8 +398,18 @@ pub async fn review_creation_trust(
     .await;
     match result {
         Ok(Ok(review)) => Json(review).into_response(),
-        Ok(Err(_)) => StatusCode::BAD_REQUEST.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", error = %error, "Creation trust review refused");
+            (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", error = %error, "Creation trust review worker failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Creation trust review failed; see the daemon log",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -750,25 +756,18 @@ pub async fn create_session(
         }
         let projects = crate::session::projects::load_merged(&default_profile).unwrap_or_default();
         if projects.is_empty() {
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "cityhall_no_projects",
-                    "message": "CityHall mode requires at least one configured project"
-                })),
-            )
-                .into_response();
+                "cityhall_no_projects",
+                "CityHall mode requires at least one configured project",
+            );
         }
         body.scratch = false;
-        // Reset every client-controllable spawn / branch field to its default.
-        // Deriving path/repos/view is not enough: a crafted request could still
-        // smuggle an alternate binary, extra args/env, yolo mode, a chosen
-        // branch/base, or a sandbox container past the locked-down mode.
-        // `command_override` is the load-bearing one: the ACP supervisor
-        // validates the registry-default binary but then adopts the client's
-        // `argv[0]` unchecked, so `command_override: "/bin/sh -c ..."` on a
-        // registry ACP tool would pass the ACP-capable gate below and spawn an
-        // arbitrary binary as the agent. See #7 review.
+        // Reset every client-controllable spawn / branch field. Deriving
+        // path/repos/view is not enough: `command_override` is load-bearing,
+        // since the ACP supervisor validates the registry-default binary but
+        // then adopts the client's `argv[0]` unchecked, so a shell command on a
+        // registry ACP tool would pass the gate below and spawn anything (#7).
         body.command_override = String::new();
         body.extra_args = String::new();
         body.extra_env = Vec::new();
@@ -780,21 +779,18 @@ pub async fn create_session(
         body.sandbox = false;
         body.sandbox_image = None;
         // Do not let the client approve the repo's `on_create` host hooks: that
-        // would run (and persist durable trust for) operator-repo commands from
-        // a locked-down user. Reset to the untrusted default. See #7 review.
+        // would run operator-repo commands from a locked-down user (#7).
         body.trust_hooks = None;
         body.trust_review = None;
         // The "primary" repo is the first entry in merged registry order; the
-        // rest ride along as workspace repos. With multiple projects that pick
-        // is arbitrary but deterministic (registry order is stable), and the
-        // session spans them all regardless, so which one is primary only
-        // affects labeling. Non-empty is checked above, so `next()` is Some.
+        // rest ride along as workspace repos. The pick only affects labeling.
+        // Non-empty is checked above, so `next()` is Some.
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
         body.extra_repo_paths = paths.collect();
         body.view = crate::session::View::Structured;
-        // Fork / import resume an existing agent session and would bypass the
-        // server-derived path + ACP gate, so they are not honored in the mode.
+        // Fork and import resume an existing agent session and would bypass the
+        // server-derived path and ACP gate, so they are not honored here.
         body.fork_from = None;
         body.import_acp_session_id = None;
         let profile = body
@@ -807,14 +803,11 @@ pub async fn create_session(
             &body.tool,
             body.agent_name.as_deref(),
         ) {
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "cityhall_agent_not_acp",
-                    "message": "CityHall mode requires an ACP-capable agent"
-                })),
-            )
-                .into_response();
+                "cityhall_agent_not_acp",
+                "CityHall mode requires an ACP-capable agent",
+            );
         }
     }
     let _creation_profile = state
@@ -822,87 +815,59 @@ pub async fn create_session(
         .claim_creation_profile(body.profile.as_deref().unwrap_or(&default_profile));
     drop(namespace);
 
-    // Scratch sessions are server-provisioned; the worktree path is the
-    // wrong model for them. Reject the combination before reaching the
-    // builder so misbehaving clients get a clear 400 instead of a
-    // less-specific builder bail surfaced as 500.
+    // Scratch sessions are server-provisioned, so the worktree path is the
+    // wrong model. Reject before the builder, for a clear 400 instead of a
+    // less-specific bail surfaced as 500.
     if create_body_combines_scratch_and_worktree(&body) {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "validation_failed",
-                "message": "Cannot combine scratch with worktree mode"
-            })),
-        )
-            .into_response();
+            "validation_failed",
+            "Cannot combine scratch with worktree mode",
+        );
     }
     if body.scratch && !body.extra_repo_paths.is_empty() {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "validation_failed",
-                "message": "Cannot combine scratch with extra_repo_paths"
-            })),
-        )
-            .into_response();
+            "validation_failed",
+            "Cannot combine scratch with extra_repo_paths",
+        );
     }
-    // The builder ignores `path` in scratch mode (provisions its own
-    // directory), but accepting both silently is a surprising contract
-    // for API callers and can make repo-aware tool validation consult
-    // config from a repo the session will never use. Fail loudly.
+    // The builder ignores `path` in scratch mode, but accepting both silently
+    // can make repo-aware tool validation consult config from a repo the session
+    // never uses. Fail loudly.
     if body.scratch && !body.path.trim().is_empty() {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "validation_failed",
-                "message": "Cannot combine scratch with path"
-            })),
-        )
-            .into_response();
+            "validation_failed",
+            "Cannot combine scratch with path",
+        );
     }
 
-    // Validate user inputs for shell injection. For scratch sessions the
-    // `path` field is server-provisioned (and clients typically send an
-    // empty string), so skip the path entry in that case.
+    // Validate user inputs for shell injection. `path` is server-provisioned
+    // for scratch sessions, so skip it there.
     let mut shell_checks: Vec<(&str, &str)> = vec![(body.extra_args.as_str(), "extra_args")];
     if !body.scratch {
         shell_checks.push((body.path.as_str(), "path"));
     }
     if let Err(msg) = super::validate_shell_fields(&shell_checks) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
     }
-    // #2624: `title`/`group` are display labels, not shell input, so they
-    // go through `validate_display_label` (control characters only)
-    // instead. `tool` is checked against the agent registry below
-    // (`validate_session_tool_identity`); `worktree_branch` is re-sanitized
-    // for git-ref safety in the builder; `profile` is checked against
-    // `list_profiles()` right below. None of the four ever reach a shell,
-    // so `validate_no_shell_injection` no longer runs on them.
+    // #2624: `title`/`group` are display labels, so they go through
+    // `validate_display_label` instead. `tool` is checked against the registry,
+    // `worktree_branch` is re-sanitized for git-ref safety in the builder, and
+    // `profile` is checked against `list_profiles()`. None reaches a shell.
     if let Err(msg) = validate_display_label(&body.group, "group") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
     }
     if let Some(ref title) = body.title {
         if let Err(msg) = validate_display_label(title, "title") {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response();
+            return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         }
     }
     if let Some(ref profile_name) = body.profile {
-        // Verify the profile exists. Every profile is a real directory under
-        // profiles/; there is no implicitly-valid profile name. Distinguish
-        // an enumeration failure (I/O, permissions) from a missing profile
-        // so the client doesn't see a 400 when the real problem is server-side.
+        // Every profile is a real directory under profiles/. Distinguish an
+        // enumeration failure from a missing profile so the client does not see
+        // a 400 when the real problem is server-side.
         let known = match crate::session::list_profiles() {
             Ok(list) => list,
             Err(e) => {
@@ -910,25 +875,19 @@ pub async fn create_session(
                     target: "server.sessions",
                     "failed to enumerate profiles while validating create_session: {e:#}"
                 );
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "internal_error",
-                        "message": format!("Failed to enumerate profiles: {e}"),
-                    })),
-                )
-                    .into_response();
+                    "internal_error",
+                    format!("Failed to enumerate profiles: {e}"),
+                );
             }
         };
         if !known.contains(profile_name) {
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "profile_not_found",
-                    "message": format!("Profile '{}' does not exist", profile_name)
-                })),
-            )
-                .into_response();
+                "profile_not_found",
+                format!("Profile '{}' does not exist", profile_name),
+            );
         }
     }
 
@@ -938,30 +897,19 @@ pub async fn create_session(
         validation_profile,
         std::path::Path::new(&body.path),
     ) {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "validation_failed",
-                "message": format!("Unknown agent '{}'", body.tool),
-            })),
-        )
-            .into_response();
+            "validation_failed",
+            format!("Unknown agent '{}'", body.tool),
+        );
     }
 
-    // Operator agent allowlist (#3241). Answer here rather than letting the
-    // session get built and then fail at spawn, which is the complaint the issue
-    // opens with. Applies in and out of CityHall: a shared deployment wants the
-    // restriction too, and CityHall's own create path above only proves the agent
-    // is ACP-capable, not that the operator permits it.
-    //
-    // After the tool-identity check above on purpose: an unknown agent is a 400
-    // about the request, not a 403 about policy, and judging policy on a name
-    // that names nothing would report the wrong reason.
-    //
-    // Gated on the session actually running ACP. A Structured request for a
-    // non-ACP tool is downgraded to a terminal session further down, and terminal
-    // sessions are deliberately out of scope (a pane can exec any binary), so
-    // refusing here would reject a session the policy does not govern.
+    // Operator agent allowlist (#3241), answered here rather than failing at
+    // spawn. Applies outside CityHall too, whose create path only proves the
+    // agent is ACP-capable, not that the operator permits it. Placed after the
+    // tool-identity check so an unknown agent reports a 400 about the request
+    // rather than a 403 about policy, and gated on the session actually running
+    // ACP, since terminal sessions are out of scope.
     if body.view == crate::session::View::Structured {
         let agent_key = acp_agent_key(&body.tool, body.agent_name.as_deref());
         let profile = validation_profile.to_string();
@@ -974,54 +922,37 @@ pub async fn create_session(
         .await
         .unwrap_or(false);
         if acp_capable && !crate::server::api::agent_policy().await.allows(agent_key) {
-            return (
+            return api_error(
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "agent_not_allowed",
-                    "message": crate::acp::supervisor::SupervisorError::AgentNotAllowed(
-                        agent_key.to_string(),
-                    )
+                "agent_not_allowed",
+                crate::acp::supervisor::SupervisorError::AgentNotAllowed(agent_key.to_string())
                     .to_string(),
-                })),
-            )
-                .into_response();
+            );
         }
     }
 
     // A new session has exactly one conversation source.
     if create_body_has_conflicting_sources(&body) {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "invalid_request",
-                "message": "Choose only one import or fork source",
-            })),
-        )
-            .into_response();
+            "invalid_request",
+            "Choose only one import or fork source",
+        );
     }
 
     let worktree_enabled = create_body_uses_worktree(&body);
 
-    // Importing an existing Claude session (#2276) is tightly scoped: it
-    // resumes a specific on-disk session id in its original cwd via the claude
-    // structured agent. Reject any request that pairs the id with a different
-    // workspace shape, a non-claude agent, or a cwd the id doesn't belong to,
-    // so a stale or hand-written request can't seed the transcript in the
-    // wrong place. Runs after tool-identity validation so it sits ahead of
-    // the build's spawn_blocking but behind the agent check.
+    // Importing a Claude session (#2276) is tightly scoped: it resumes one
+    // on-disk id in its original cwd via the claude structured agent. Reject an
+    // id paired with a different workspace shape, a non-claude agent, or a
+    // foreign cwd. Runs after tool-identity validation, ahead of the build.
     if let Some(import_id) = body
         .import_acp_session_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let bad = |msg: &str| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response()
-        };
+        let bad = |msg: &str| api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         if body.tool != "claude"
             || body
                 .agent_name
@@ -1065,38 +996,30 @@ pub async fn create_session(
         .filter(|s| !s.is_empty())
     {
         Some(parent_id) => {
-            // Reject a malformed parent id up front. `build_fork_flags` fails
-            // closed on an invalid id (no fork flags), which would otherwise
-            // start a fresh, non-forked session with no error to the caller.
+            // `build_fork_flags` fails closed on an invalid id, which would
+            // otherwise start a fresh, non-forked session with no error.
             if !crate::session::capture::is_valid_session_id(parent_id) {
-                return (
+                return api_error(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "fork_invalid",
-                        "message": "fork_from is not a valid session id",
-                    })),
-                )
-                    .into_response();
+                    "fork_invalid",
+                    "fork_from is not a valid session id",
+                );
             }
             let structured = body.view == crate::session::View::Structured;
-            // A structured fork only runs over a live ACP connection. Reject it
-            // here for a non-ACP agent rather than letting the post-build
-            // capability check silently downgrade it to a non-forked terminal
-            // session (the fork markers would be cleared, dropping the fork).
+            // A structured fork needs a live ACP connection. Reject it here, or
+            // the post-build capability check silently downgrades it to a
+            // non-forked terminal session, dropping the fork.
             if structured
                 && !crate::session::fork::structured_fork_capable(
                     &body.tool,
                     body.agent_name.as_deref(),
                 )
             {
-                return (
+                return api_error(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "fork_unsupported",
-                        "message": "A structured fork requires an ACP agent that supports forking",
-                    })),
-                )
-                    .into_response();
+                    "fork_unsupported",
+                    "A structured fork requires an ACP agent that supports forking",
+                );
             }
             let parents = if structured {
                 Vec::new()
@@ -1133,14 +1056,11 @@ pub async fn create_session(
                     let (title, id) = index.map_or((parent_id, parent_id), |index| {
                         (parents[index].title.as_str(), parents[index].id.as_str())
                     });
-                    return (
+                    return api_error(
                         StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "fork_unsupported",
-                            "message": denied.user_message(title, id, &parent_profile),
-                        })),
-                    )
-                        .into_response();
+                        "fork_unsupported",
+                        denied.user_message(title, id, &parent_profile),
+                    );
                 }
             }
         }
@@ -1149,11 +1069,7 @@ pub async fn create_session(
 
     if let Some(url) = body.callback_url.as_deref() {
         if let Err(msg) = crate::server::callback::validate_callback_url(url) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response();
+            return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         }
     }
 
@@ -1213,7 +1129,7 @@ pub async fn create_session(
         idempotency_key: body.idempotency_key.clone(),
         profile,
         // Never decoded from the request body: only the plugin host path
-        // stamps these, through create_structured_session. See #2897.
+        // stamps these, through create_structured_session (#2897).
         created_by_plugin: None,
         plugin_create_idempotency: None,
         pending_initial_turn: None,

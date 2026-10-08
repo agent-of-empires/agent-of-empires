@@ -6,10 +6,7 @@
 
 use anyhow::{bail, Result};
 
-use super::utils::{
-    append_default_shell_args, append_pane_base_index_args, append_remain_on_exit_args,
-    append_tmux_setting_args, append_window_size_args, is_pane_dead, sanitize_session_name,
-};
+use super::utils::{append_session_setup_args, is_pane_dead, sanitize_session_name};
 use super::{refresh_session_cache, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX};
 use crate::cli::truncate_id;
 use crate::process;
@@ -277,13 +274,7 @@ impl PairedTerminal {
             size,
         );
         let target = format!("={}:", self.name);
-        append_remain_on_exit_args(&mut args, &target);
-        append_pane_base_index_args(&mut args, &target);
-        append_window_size_args(&mut args, &target);
-        if let Some(shell) = default_shell.as_deref() {
-            append_default_shell_args(&mut args, &target, shell);
-        }
-        append_tmux_setting_args(&mut args, &target, &config);
+        append_session_setup_args(&mut args, &target, &config, default_shell.as_deref());
         crate::tmux::append_session_kind_args(&mut args, &self.name, self.kind.session_kind());
 
         let output = crate::tmux::tmux_command().args(&args).output()?;

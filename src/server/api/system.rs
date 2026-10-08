@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::api_error;
 use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedTokenHash;
@@ -160,9 +161,8 @@ fn build_custom_agent_infos(
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
                 || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
             acp_allowed: policy.allows(name),
-            // Custom agents' acp_command is never serialized here (it can hold
-            // hostnames or secrets), so we don't probe its install state; the
-            // import tab is claude-only regardless.
+            // A custom agent's acp_command is never serialized (it can hold
+            // hostnames or secrets), so its install state is not probed.
             acp_installed: false,
             // Custom agents' command values are deliberately never
             // serialized here; they can hold hostnames or secrets.
@@ -284,11 +284,7 @@ fn requested_profile(query: &SettingsQuery, served: &str) -> Result<String, Stri
 }
 
 fn bad_request(message: impl Into<String>) -> axum::response::Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({"error": "validation_failed", "message": message.into()})),
-    )
-        .into_response()
+    api_error(StatusCode::BAD_REQUEST, "validation_failed", message)
 }
 
 /// `GET /api/settings` reads one settings layer. Without a query it reads the
@@ -317,20 +313,20 @@ pub async fn get_settings(
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => {
                 tracing::error!(target: "http.api.system", "Settings serialization failed: {}", e);
-                (
+                api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize settings"})),
+                    "serialize_failed",
+                    "Failed to serialize settings",
                 )
-                    .into_response()
             }
         },
         Err(e) => {
             tracing::error!(target: "http.api.system", "Settings load failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "load_failed", "message": "Failed to load settings"})),
+                "load_failed",
+                "Failed to load settings",
             )
-                .into_response()
         }
     }
 }
@@ -656,11 +652,7 @@ async fn save_settings_patch(
                 } else {
                     format!("Failed to update machine-wide settings: {e}")
                 };
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "update_failed", "message": message})),
-                )
-                    .into_response();
+                return api_error(StatusCode::BAD_REQUEST, "update_failed", message);
             }
             Err(e) => {
                 tracing::error!(target: "http.api.system", "Settings update panicked: {e}");
@@ -683,11 +675,11 @@ async fn save_settings_patch(
         Ok(Ok(config)) => config,
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.system", "Settings read-back failed: {e}");
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "load_failed", "message": "Failed to read back settings"})),
-            )
-                .into_response();
+                "load_failed",
+                "Failed to read back settings",
+            );
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Settings read-back panicked: {e}");
@@ -698,21 +690,21 @@ async fn save_settings_patch(
         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
         Err(e) => {
             tracing::error!(target: "http.api.system", "Settings serialization failed: {e}");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize settings"})),
+                "serialize_failed",
+                "Failed to serialize settings",
             )
-                .into_response()
         }
     }
 }
 
 fn internal_error() -> axum::response::Response {
-    (
+    api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+        "internal",
+        "Internal server error",
     )
-        .into_response()
 }
 
 /// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
@@ -741,19 +733,19 @@ pub async fn get_cityhall_bundle(
             .into_response(),
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.system", "CityHall bundle export failed: {e}");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "export_failed", "message": e.to_string()})),
+                "export_failed",
+                e.to_string(),
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "CityHall bundle export panicked: {e}");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -814,34 +806,28 @@ pub async fn update_theme(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // CityHall hides the color-mode control in the Theme tab, so drop any
-    // client-supplied color_mode; only the theme name is writable here (#7).
+    // CityHall hides the color-mode control, so only the name is writable (#7).
     if state.cityhall_mode {
         patch.color_mode = None;
     }
-    // Reject an unknown theme name so a typo can't repaint to the `default`
-    // fallback. Empty is allowed (clears back to the default builtin).
+    // Reject an unknown name so a typo cannot silently repaint to `default`.
+    // Empty is allowed and clears back to the default builtin.
     if let Some(name) = &patch.name {
         if !name.is_empty()
             && !crate::tui::styles::available_themes()
                 .iter()
                 .any(|t| t == name)
         {
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "unknown_theme",
-                    "message": format!("Unknown theme '{name}'"),
-                })),
-            )
-                .into_response();
+                "unknown_theme",
+                format!("Unknown theme '{name}'"),
+            );
         }
     }
     let result = tokio::task::spawn_blocking(move || {
-        // `update_config` re-loads via `Config::load()` (not `load_or_warn`),
-        // so a corrupt config.toml surfaces as an error instead of being
-        // silently replaced with defaults, wiping every other setting, just
-        // to change a theme. A parse error surfaces as a 400 below.
+        // `update_config` re-loads via `Config::load()`, so a corrupt
+        // config.toml errors out instead of being replaced with defaults.
         let theme_name = crate::session::update_config(|config| {
             if let Some(name) = patch.name {
                 config.theme.name = name;
@@ -860,28 +846,28 @@ pub async fn update_theme(
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => {
                 tracing::error!(target: "http.api.system", "theme serialization failed: {}", e);
-                (
+                api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize theme"})),
+                    "serialize_failed",
+                    "Failed to serialize theme",
                 )
-                    .into_response()
             }
         },
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "theme update failed: {}", e);
-            (
+            api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "update_failed", "message": "Failed to update theme"})),
+                "update_failed",
+                "Failed to update theme",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "theme update panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -915,19 +901,19 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking web tour seen failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tour state"})),
+                "save_failed",
+                "Failed to persist tour state",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking web tour seen panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -985,8 +971,8 @@ pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse 
 
     match result {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        // Best-effort: an unreadable config yields an empty, disabled payload so
-        // the dashboard simply shows no badge rather than erroring.
+        // Best-effort: an unreadable config yields an empty, disabled payload
+        // so the dashboard shows no badge rather than erroring.
         _ => (
             StatusCode::OK,
             Json(TipsResponse {
@@ -1021,11 +1007,11 @@ pub async fn mark_tip_seen(
         Err(rej) => return rej.into_response(),
     };
     if !crate::tips::id_in_catalog(&id) {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "unknown_tip", "message": format!("Unknown tip id '{id}'")})),
-        )
-            .into_response();
+            "unknown_tip",
+            format!("Unknown tip id '{id}'"),
+        );
     }
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1041,19 +1027,19 @@ pub async fn mark_tip_seen(
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking tip seen failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tip state"})),
+                "save_failed",
+                "Failed to persist tip state",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking tip seen panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -1097,19 +1083,19 @@ pub async fn set_show_tips(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Setting show_tips failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tips state"})),
+                "save_failed",
+                "Failed to persist tips state",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Setting show_tips panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -1154,19 +1140,19 @@ pub async fn dismiss_update(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Dismissing update failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist dismissal"})),
+                "save_failed",
+                "Failed to persist dismissal",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Dismissing update panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -1184,8 +1170,8 @@ pub async fn get_web_ui_state(State(_state): State<Arc<AppState>>) -> impl IntoR
     .await;
     match result {
         Ok(Ok(map)) => (StatusCode::OK, Json(serde_json::json!(map))).into_response(),
-        // Best-effort: an unreadable config yields an empty blob rather than an
-        // error, so the dashboard just falls back to its localStorage cache.
+        // Best-effort: an unreadable config yields an empty blob, so the
+        // dashboard falls back to its localStorage cache.
         _ => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
     }
 }
@@ -1211,9 +1197,8 @@ pub async fn patch_web_ui_state(
         Err(rej) => return rej.into_response(),
     };
 
-    // Values must be string (set) or null (delete); reject anything else
-    // explicitly so a client regression surfaces instead of silently dropping
-    // part of the sync.
+    // Reject anything that is not a string (set) or null (delete), so a client
+    // regression surfaces instead of silently dropping part of the sync.
     let invalid: Vec<&String> = patch
         .iter()
         .filter(|(_, v)| !v.is_string() && !v.is_null())
@@ -1241,7 +1226,7 @@ pub async fn patch_web_ui_state(
                     serde_json::Value::String(s) => {
                         state.web_ui_state.insert(key, s);
                     }
-                    // Already rejected above; keep exhaustive for safety.
+                    // Already rejected above; kept exhaustive.
                     _ => {}
                 }
             }
@@ -1253,19 +1238,19 @@ pub async fn patch_web_ui_state(
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Persisting web UI state failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist UI state"})),
+                "save_failed",
+                "Failed to persist UI state",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Persisting web UI state panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -1297,19 +1282,19 @@ pub async fn mark_volume_ignores_globs_acknowledged(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking volume_ignores globs acknowledged failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist acknowledgment"})),
+                "save_failed",
+                "Failed to persist acknowledgment",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking volume_ignores globs acknowledged panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -1533,10 +1518,8 @@ pub async fn browse_filesystem(
                     continue;
                 }
             }
-            // Probing `.git` inside a directory opens it, which on macOS
-            // triggers a TCC permission prompt. Skip the probe for the
-            // standard system folders directly under $HOME (Downloads,
-            // Desktop, Music, Pictures, etc.); none of them is ever a repo.
+            // Probing `.git` opens the directory, which prompts under macOS
+            // TCC. None of the standard $HOME folders is ever a repo.
             let is_git_repo = if skip_git_probe(&canonical, &name, home.as_deref()) {
                 false
             } else {
@@ -1549,8 +1532,8 @@ pub async fn browse_filesystem(
                 is_git_repo,
             });
         }
-        // Cached: avoids re-allocating the lowercase String on every comparison
-        // (sort_by_key calls the keyfn O(n log n) times, sort_by_cached_key calls it O(n)).
+        // Cached: `sort_by_cached_key` calls the keyfn O(n) times rather than
+        // O(n log n), so the lowercase String is allocated once per entry.
         entries.sort_by_cached_key(|e| e.name.to_lowercase());
         let has_more = entries.len() > limit;
         entries.truncate(limit);
@@ -1560,16 +1543,8 @@ pub async fn browse_filesystem(
 
     match result {
         Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
-        Ok(Err(msg)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "browse_failed", "message": msg})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(msg)) => api_error(StatusCode::BAD_REQUEST, "browse_failed", msg),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -1961,13 +1936,7 @@ async fn commit_profile(
     };
     for name in names.into_iter().flatten() {
         if let Err(error) = validate_profile_name(name) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "validation_failed", "message": error,
-                })),
-            )
-                .into_response();
+            return api_error(StatusCode::BAD_REQUEST, "validation_failed", error);
         }
     }
     let transaction = tokio::select! {
@@ -1987,9 +1956,11 @@ async fn commit_profile(
     };
     if matches!(&mutation, ProfileMutation::Delete { name, .. } if name == &*state.served_profile())
     {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "served_profile", "message": "The profile served by this daemon cannot be deleted",
-        }))).into_response();
+        return api_error(
+            StatusCode::CONFLICT,
+            "served_profile",
+            "The profile served by this daemon cannot be deleted",
+        );
     }
     if *state.canonical_health.read().await != RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -2117,11 +2088,7 @@ async fn commit_profile(
             ProfileMutation::Delete { .. } => "delete_failed",
             ProfileMutation::SetDefault(_) => "update_failed",
         };
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": code, "message": error.to_string()})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, code, error.to_string());
     }
     let status = if matches!(mutation, ProfileMutation::Create(_)) {
         StatusCode::CREATED
@@ -2215,30 +2182,23 @@ pub async fn get_profile_settings(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = validate_profile_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     let result = tokio::task::spawn_blocking(move || {
         let profile = crate::session::load_profile_config(&name)?;
         let global = crate::session::Config::load_or_warn();
         let mut val = serde_json::to_value(&profile)?;
-        // The `logging` section lives on global Config (no profile
-        // override surface yet). Splice it into the response so the
-        // settings UI can render its current values from a single
-        // GET — without this the dropdowns would reset on every page
-        // load even after a successful PATCH.
+        // `logging` lives on the global Config with no profile override
+        // surface, so splice it in; otherwise the settings dropdowns reset on
+        // every page load even after a successful PATCH.
         if let Some(obj) = val.as_object_mut() {
             obj.insert(
                 "logging".to_string(),
                 serde_json::to_value(&global.logging)?,
             );
-            // Plugin settings live in the global config (global-only at Tier 0),
-            // not the profile override. Splice them in so the dashboard's plugin
-            // settings render their persisted values instead of reverting to the
-            // manifest default on every profile-view load (#2094).
+            // Plugin settings are global-only at Tier 0, so splice them in or
+            // the dashboard reverts to manifest defaults on every profile-view
+            // load (#2094).
             obj.insert(
                 "plugins".to_string(),
                 serde_json::to_value(&global.plugins)?,
@@ -2249,16 +2209,12 @@ pub async fn get_profile_settings(
     .await;
     match result {
         Ok(Ok(val)) => (StatusCode::OK, Json(val)).into_response(),
-        Ok(Err(e)) => (
+        Ok(Err(e)) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "load_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+            "load_failed",
+            e.to_string(),
+        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -2312,11 +2268,7 @@ pub async fn update_profile_settings(
         Err(rej) => return rej.into_response(),
     };
     if let Err(e) = validate_profile_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     // Keep the CityHall profile endpoint restricted to its explicit allowlist.
 
@@ -2350,22 +2302,14 @@ pub async fn update_profile_settings(
     match result {
         Ok(Ok(config)) => match serde_json::to_value(&config) {
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-            Err(e) => (
+            Err(e) => api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "serialize_failed", "message": e.to_string()})),
-            )
-                .into_response(),
+                "serialize_failed",
+                e.to_string(),
+            ),
         },
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "update_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "update_failed", e.to_string()),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -2384,10 +2328,8 @@ pub async fn list_sounds() -> Json<Vec<String>> {
 pub async fn serve_sound_file(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // The validation step (directory enumeration) stays on the blocking
-    // pool because `list_available_sounds` does sync `read_dir`. The
-    // file read itself uses `tokio::fs::read` so the larger I/O cost
-    // does not block a runtime worker.
+    // `list_available_sounds` does a sync `read_dir`, so validation stays on
+    // the blocking pool; the file read uses `tokio::fs::read`.
     let lookup_name = name.clone();
     let validated = tokio::task::spawn_blocking(move || {
         if !crate::sound::list_available_sounds().contains(&lookup_name) {
@@ -2629,18 +2571,16 @@ mod tests {
 
     #[test]
     fn derive_sleep_inhibit_status_gates_held_on_backend() {
-        // First three rows are reconciler-reachable states; the last two are
-        // not reachable from the writer (toggle off releases the slot) but pin
-        // the pure gate, proving `currently_held` excludes prevent_sleep_enabled.
+        // The last two rows are unreachable from the writer but pin the pure
+        // gate, proving `currently_held` excludes prevent_sleep_enabled.
         // (prevent_sleep_enabled, slot_present, backend_available) -> currently_held
         let cases = [
             // supported host actively holding the assertion
             ((true, true, true), true),
             // toggle on but every session idle past grace: slot released
             ((true, false, true), false),
-            // backend latched unavailable (helper missing / WSL2) or no-op
-            // platform: is_held_alive keeps the slot to suppress respawns, yet
-            // no real assertion is held
+            // backend latched unavailable or no-op platform: the slot is kept
+            // to suppress respawns, yet no real assertion is held
             ((true, true, false), false),
             // gate guard: enabled must not force held when the backend is down
             ((false, true, false), false),
@@ -2693,12 +2633,10 @@ mod tests {
     fn skip_git_probe_avoids_protected_home_folders() {
         let home = std::path::Path::new("/Users/alice");
 
-        // The skip is macOS-only: the TCC prompt does not exist elsewhere,
-        // so other platforms probe normally and keep the git badge.
+        // The TCC prompt is macOS-only, so other platforms probe normally.
         let macos = cfg!(target_os = "macos");
 
-        // Protected/system folders directly under $HOME: skipped on macOS so
-        // it never prompts for Downloads/Desktop/Music/Pictures.
+        // Protected folders directly under $HOME: skipped on macOS.
         for name in ["Downloads", "Desktop", "Music", "Pictures", "Documents"] {
             assert_eq!(
                 skip_git_probe(home, name, Some(home)),
@@ -2711,8 +2649,7 @@ mod tests {
         // badge is preserved.
         assert!(!skip_git_probe(home, "myproject", Some(home)));
 
-        // A folder named like a system dir but NOT directly under $HOME is
-        // probed normally (only the direct-$HOME set is protected).
+        // A system-looking name that is not directly under $HOME is probed.
         let sub = std::path::Path::new("/Users/alice/code");
         assert!(!skip_git_probe(sub, "Downloads", Some(home)));
 

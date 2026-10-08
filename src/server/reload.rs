@@ -21,6 +21,7 @@ pub(crate) struct CanonicalMetadata {
     pub global_projects: Vec<crate::daemon::ProjectResponse>,
     pub status_hooks: std::collections::HashMap<String, crate::status_hooks::StatusHookConfig>,
     pub auxiliary_tools: std::collections::HashMap<String, Vec<String>>,
+    pub raw_tool_names: std::collections::HashMap<String, Vec<String>>,
 }
 
 pub(crate) struct LoadedProfiles {
@@ -76,6 +77,7 @@ pub(super) fn load_all_profiles(
     let mut profile_metadata = Vec::with_capacity(profiles.len());
     let mut status_hooks = std::collections::HashMap::new();
     let mut auxiliary_tools = std::collections::HashMap::new();
+    let mut raw_tool_names = std::collections::HashMap::new();
     for profile in profiles {
         let (mut instances, groups, details) = (|| {
             let (instances, groups) =
@@ -96,6 +98,7 @@ pub(super) fn load_all_profiles(
         all.extend(instances);
         status_hooks.insert(profile.clone(), details.status_hooks);
         auxiliary_tools.insert(profile.clone(), details.auxiliary_tools);
+        raw_tool_names.insert(profile.clone(), details.raw_tool_names);
         profile_metadata.push(ProfileSnapshot {
             name: profile,
             description: details.description,
@@ -112,6 +115,7 @@ pub(super) fn load_all_profiles(
             global_projects,
             status_hooks,
             auxiliary_tools,
+            raw_tool_names,
         },
     })
 }
@@ -121,6 +125,7 @@ pub(super) struct ProfileDetails {
     pub projects: Vec<crate::daemon::ProjectResponse>,
     pub status_hooks: crate::status_hooks::StatusHookConfig,
     pub auxiliary_tools: Vec<String>,
+    pub raw_tool_names: Vec<String>,
 }
 
 pub(super) fn load_profile_details(profile: &str) -> anyhow::Result<ProfileDetails> {
@@ -130,6 +135,8 @@ pub(super) fn load_profile_details(profile: &str) -> anyhow::Result<ProfileDetai
         .map(crate::daemon::ProjectResponse::from)
         .collect();
     let config = crate::session::resolve_config(profile)?;
+    let mut raw_tool_names: Vec<_> = config.tools.keys().cloned().collect();
+    raw_tool_names.sort_unstable();
     let mut auxiliary_tools: Vec<_> = config
         .tools
         .into_iter()
@@ -142,6 +149,7 @@ pub(super) fn load_profile_details(profile: &str) -> anyhow::Result<ProfileDetai
         projects,
         status_hooks: config.status_hooks,
         auxiliary_tools,
+        raw_tool_names,
     })
 }
 
@@ -448,10 +456,8 @@ pub(super) fn apply_tick_status_decisions(
             continue;
         }
         inst.live_status_baseline = prev.get(&inst.id).copied();
-        // A trashed row remains in storage until its retention period ends,
-        // but it is no longer a live session. Do not turn its deliberately
-        // stopped pane into a synthetic Error, and do not emit a status event
-        // that the push consumer could notify about.
+        // A trashed row remains in storage until its retention period ends, but it is no
+        // longer a live session.
         if inst.is_trashed() {
             if let Some(live) = inst.live_status_baseline {
                 inst.status = live;
@@ -891,6 +897,7 @@ mod tests {
                 global_projects: Vec::new(),
                 status_hooks: Default::default(),
                 auxiliary_tools: Default::default(),
+                raw_tool_names: Default::default(),
             };
             let original_rows = serde_json::to_value(&current).unwrap();
             let original_metadata = metadata.clone();
@@ -1683,13 +1690,14 @@ mod tests {
         let mut tracking: std::collections::HashMap<String, PriorTickTracking> =
             std::collections::HashMap::new();
 
-        // One daemon tick, reporting the status it settled on and the rule
-        // that decided. `window_activity` is supplied rather than scraped so
-        // the capture-skip gate is driven, not raced.
+        // One daemon tick, reporting the status it settled on and the rule that decided.
         let mut tick = |window_activity: Option<i64>| {
             let metadata = std::collections::HashMap::from([(
                 session_name.clone(),
                 crate::tmux::PaneMetadata {
+                    session_id: "$42".into(),
+                    pane_id: "%42".into(),
+                    session_kind: None,
                     tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
                     pane_dead: false,
                     pane_current_command: Some("claude".to_string()),
@@ -1721,8 +1729,7 @@ mod tests {
             (instances[0].status, instances[0].detection.rule)
         };
 
-        // No activity stamp: nothing to skip against, so both ticks decide on
-        // a real capture.
+        // No activity stamp.
         assert_eq!(
             tick(None).0,
             Status::Running,
@@ -1734,8 +1741,7 @@ mod tests {
             "the tick that agrees publishes it (#3642)"
         );
 
-        // A stamp whose second is already past: the tick that records it still
-        // captures, and the one after it has the proof the gate asks for.
+        // A stamp whose second is already past.
         let settled = Utc::now().timestamp() - 60;
         assert_eq!(tick(Some(settled)).0, Status::Idle);
         assert_eq!(

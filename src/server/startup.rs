@@ -107,10 +107,7 @@ async fn run_shutdown_sequence<R, F>(
     F: FnOnce() + Send + 'static,
 {
     shutdown.cancel();
-    // Build the timer here, not inside the task: `sleep` fixes its deadline
-    // from the clock at construction, so constructing it in the task would
-    // restart the window at the task's first poll, which the reap's own
-    // synchronous work can delay.
+    // Build the timer here, not inside the task.
     let deadline = tokio::time::sleep(grace);
     tokio::spawn(async move {
         deadline.await;
@@ -288,10 +285,7 @@ pub(crate) async fn start_server(
 
     raise_fd_limit();
 
-    // Single live `FileWatchService` per daemon. Threaded into AppState
-    // and into every `Storage::new` call so in-process writes surface via
-    // `notify_local_change` and per-profile subscriptions multiplex
-    // through one kernel watcher.
+    // Single live `FileWatchService` per daemon.
     let file_watch = FileWatchService::new().unwrap_or_else(|e| {
         tracing::warn!(
             target: "server.file_watch",
@@ -301,12 +295,18 @@ pub(crate) async fn start_server(
         FileWatchService::noop()
     });
 
+    if !read_only && std::env::var_os("AOE_CITYHALL_MODE").is_none() {
+        // First-run bootstrap belongs to the daemon, not HomeView::new.
+        if crate::session::list_profiles()?.is_empty() {
+            crate::session::Storage::new(profile, file_watch.clone())?;
+        }
+        super::startup_recovery::repair_startup_profile_ownership(&file_watch)?;
+    }
     let loaded = load_all_profiles(&file_watch)?;
     let instances = loaded.instances;
     let canonical_metadata = loaded.metadata;
 
-    // Only `--auth=token` issues a URL token. The other two modes are
-    // separated below, once the login wall they depend on exists.
+    // Only `--auth=token` issues a URL token.
     let auth_token = match auth_mode {
         AuthMode::Token => Some(load_or_generate_token().await?),
         AuthMode::Passphrase | AuthMode::None => None,
@@ -333,17 +333,12 @@ pub(crate) async fn start_server(
         token_grace,
     ));
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
-    // Feed the unread-feature gate from this daemon's resolved config. Like
-    // `push_enabled`, this is read once at startup; a config change needs a
-    // restart to take effect. The TUI process maintains its own copy.
+    // Feed the unread-feature gate from this daemon's resolved config.
     crate::session::set_unread_enabled(config.session.unread_indicator);
     crate::session::set_favorites_first(config.session.favorites_first);
 
-    // Login sessions persist across daemon restarts by default (#1235) so
-    // signed-in devices are not re-prompted for the passphrase on every
-    // bounce. The owner-only store lives in the app dir; fall back to an
-    // in-memory manager when persistence is disabled or no app dir
-    // resolves.
+    // Login sessions persist across daemon restarts by default so signed-in devices are not
+    // re-prompted for the passphrase on every bounce.
     let login_manager = Arc::new(if config.auth.persist_sessions {
         match crate::session::get_app_dir() {
             Ok(app_dir) => login::LoginManager::with_persistence(passphrase, &app_dir),
@@ -362,8 +357,7 @@ pub(crate) async fn start_server(
     });
     let rate_limiter = Arc::new(RateLimiter::new());
 
-    // Fail closed before anything binds: check the gates that actually
-    // came up against the mode that was asked for. See #3843.
+    // Fail closed before anything binds.
     check_auth_gate(auth_mode, auth_token.is_some(), login_manager.is_enabled())?;
 
     if matches!(auth_mode, AuthMode::Passphrase) {
@@ -377,17 +371,15 @@ pub(crate) async fn start_server(
         info!("Passphrase login enabled (second-factor authentication)");
     }
 
-    // Persist the plaintext passphrase so the TUI can display it on
-    // reopen, including after a TUI restart or when the daemon was
-    // started from the CLI. Owner-only perms; cleaned up on shutdown.
+    // Persist the plaintext passphrase so the TUI can display it on reopen, including after
+    // a TUI restart or when the daemon was started from the CLI.
     if let Some(pp) = passphrase {
         if let Ok(app_dir) = crate::session::get_app_dir() {
             write_secret_file(&app_dir.join("serve.passphrase"), pp).await;
         }
     }
 
-    // Push notifications: initialize only when the operator flag is on at
-    // startup. Flipping it later requires a server restart to take effect.
+    // Push notifications.
     let push_enabled = config.web.notifications_enabled;
     let push_state = if push_enabled {
         match crate::session::get_app_dir() {
@@ -422,10 +414,9 @@ pub(crate) async fn start_server(
     };
     let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
     let acp_supervisor = {
-        // Approval pushes are dispatched from `acp_event_listener`,
-        // which subscribes to the broadcast that ChannelSink::publish
-        // feeds and has `Arc<AppState>` in scope without a closure
-        // dance through the supervisor. See #1038.
+        // Approval pushes are dispatched from `acp_event_listener`, which subscribes to the
+        // broadcast that ChannelSink::publish feeds and has `Arc<AppState>` in scope
+        // without a closure dance through the supervisor.
         let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
             tx: acp_events_tx.clone(),
             event_store: acp_event_store.clone(),
@@ -435,19 +426,12 @@ pub(crate) async fn start_server(
             sink,
             config.acp.max_concurrent_workers,
         ));
-        // Seed the seq counter from disk so fresh publishes don't
-        // collide with restored history. Without this, after a
-        // restart the first publish would be seq=1 — duplicate of
-        // the row already on disk — and INSERT OR IGNORE would
-        // silently drop it.
+        // Seed the seq counter from disk so fresh publishes don't collide with restored
+        // history.
         supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
         supervisor
     };
-    // The Tier 1 plugin worker host. Opening it (the plugin event-bus database,
-    // the worker log dir) is cheap and side-effect-free until workers launch,
-    // which happens after the daemon is up. A failure here is logged, not fatal:
-    // The session-domain service is built before the plugin host so the
-    // host's session RPCs (#2897) get it by construction, never late-bound.
+    // The Tier 1 plugin worker host.
     let instances = Arc::new(RwLock::new(instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -514,11 +498,7 @@ pub(crate) async fn start_server(
         }
     };
 
-    // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot.
-    // The boot announcement fires here, before transport setup, so a launch
-    // attempt is still recorded even if a remote tunnel later fails to come up.
-    // The periodic `usage_snapshot` loop is spawned only after the transport is
-    // resolved (below), so its first tick can report the real `serve_mode`.
+    // Telemetry (opt-in, no-op otherwise).
     crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
 
     // Resolve the coarse auth mode once at launch; `/api/about` and the
@@ -543,15 +523,7 @@ pub(crate) async fn start_server(
         crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
     }
 
-    // Start tunnel if remote mode. Preference order:
-    //  1. User-specified named Cloudflare tunnel (stable, explicit choice).
-    //  2. Tailscale Funnel if tailscale is installed and logged in
-    //     (stable .ts.net URL, installable PWAs keep working).
-    //  3. Cloudflare quick tunnel (fallback; URL rotates per restart,
-    //     which breaks installed PWAs).
-    // Capture the Tailscale probe result before the branch so the
-    // debug log shows why we did or didn't take the Tailscale path.
-    // The probe itself also logs details about each underlying call.
+    // Start tunnel if remote mode.
     let tailscale_ok = if remote && !no_tailscale {
         let available = tunnel::tailscale_available().await;
         tracing::debug!(target: "http.middleware",
@@ -572,12 +544,7 @@ pub(crate) async fn start_server(
             tunnel::TunnelHandle::spawn_named(name, url, local_port).await?
         } else if tailscale_ok {
             info!("Tailscale detected; using Tailscale Funnel for stable HTTPS origin");
-            // Do NOT fall back to Cloudflare on Tailscale failure: the
-            // user is on the Tailscale path because they want the
-            // stable-URL benefit, and silently downgrading to a rotating
-            // Cloudflare URL would break the feature they wanted. Bail
-            // with the real error; the user fixes Tailscale or passes
-            // --no-tailscale to explicitly opt into Cloudflare.
+            // Do NOT fall back to Cloudflare on Tailscale failure.
             tunnel::TunnelHandle::spawn_tailscale(local_port)
                 .await
                 .map_err(|e| {
@@ -639,9 +606,8 @@ pub(crate) async fn start_server(
             let contents =
                 remote_serve_url_contents(&handle.url, local_port, auth_token.as_deref());
             write_secret_file(&app_dir.join("serve.url"), &contents).await;
-            // serve.mode lets the TUI reattach to a running daemon and
-            // render the right transport label: "tunnel" for Cloudflare,
-            // "tailscale" for Tailscale Funnel, "local" for local-only.
+            // serve.mode lets the TUI reattach to a running daemon and render the right
+            // transport label.
             let mode = format!("{}\n", handle.mode_label());
             if let Err(e) = tokio::fs::write(app_dir.join("serve.mode"), mode).await {
                 tracing::debug!(target: "http.middleware", "Failed to write serve.mode: {e}");
@@ -708,16 +674,13 @@ pub(crate) async fn start_server(
                     maybe_open_browser(primary);
                 }
             } else {
-                // Opening a browser on an API-only daemon lands on a 404. Say
-                // so rather than dropping the flag on the floor.
+                // Opening a browser on an API-only daemon lands on a 404.
                 eprintln!("--open ignored: this build has no dashboard bundle");
             }
         }
 
-        // serve.url: primary URL on line 1 (unlabeled, backward-compatible
-        // with any `head -1 serve.url` consumer). Alternates below as
-        // `kind\turl` so the TUI can cycle them. Always owner-only perms
-        // since the URL embeds the auth token.
+        // serve.url: primary URL on line 1 (unlabeled, backward-compatible with any `head
+        // -1 serve.url` consumer).
         if let Ok(app_dir) = crate::session::get_app_dir() {
             let mut contents = String::new();
             if let Some((_, primary)) = labeled_urls.first() {
@@ -739,21 +702,14 @@ pub(crate) async fn start_server(
         None
     };
 
-    // Coarse exposure label for telemetry, read straight from the resolved
-    // transport so it cannot drift from what was actually spawned: the tunnel
-    // handle reports "tunnel" (Cloudflare quick or named) or "tailscale", and a
-    // local-only daemon has no handle. Named-tunnel names never leak; only the
-    // coarse mode is taken.
+    // Coarse exposure label for telemetry, read straight from the resolved transport so it
+    // cannot drift from what was actually spawned.
     let serve_mode: &'static str = tunnel_handle
         .as_ref()
         .map(|h| h.mode_label())
         .unwrap_or("local");
 
-    // DNS-rebinding gate (#2735). Auto-inject the tunnel/Tailscale public host
-    // so remote dashboards and their live-terminal WS upgrade (which carries
-    // `Origin: https://<tunnel-host>`) pass without any operator flag; the URL
-    // rotates on quick tunnels and the bind is forced to loopback, so
-    // `--allowed-host` cannot cover this path.
+    // DNS-rebinding gate.
     let tunnel_host: Option<String> = tunnel_handle.as_ref().and_then(|h| host_from_url(&h.url));
     let (allowed_hosts, allowed_origins) = resolve_access_policy(
         host,
@@ -863,25 +819,19 @@ pub(crate) async fn start_server(
 
     // Maintenance starts persisted ACP workers, including later CLI additions.
 
-    // Seed acp sessions' status from the on-disk event log before
-    // any background task runs. The status_poll_loop overlay reads
-    // `state.instances` and the acp_event_listener only sees
-    // live transitions, so a session that was mid-turn when the
-    // previous daemon died otherwise renders Idle until the next
-    // lifecycle event arrives. See #1103.
+    // Seed acp sessions' status from the on-disk event log before any background task runs.
     seed_acp_statuses(state.clone()).await;
+    let mut failed_repairs = std::collections::HashSet::new();
     if !state.read_only {
         crate::server::api::sessions::recover_pending_purges(&state).await;
+        failed_repairs.extend(crate::server::api::reconcile_trashed_worktrees(&state).await);
+        failed_repairs.extend(crate::server::api::reconcile_worktree_paths(&state).await);
+        super::startup_recovery::publish_startup_identity(&state).await;
     }
 
-    // Two-phase startup recovery. Phase A runs synchronously (acquire
-    // lock, snapshot candidates, mark them in `recently_restarted`) so
-    // that the marks are in place before `status_poll_loop` is spawned
-    // and its first tick fires; otherwise the first poll could observe
-    // missing tmux state and broadcast a phantom Idle->Error transition.
-    // Phase B (the cascade workers) runs in a spawned task and holds
-    // the lock until done.
-    let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
+    // Mark recovery before status polling can observe missing recovering panes.
+    let recovery_inputs = daemon_startup_recovery_mark(state.clone(), &failed_repairs).await;
+    super::pane::seed_initial_observations(&state).await?;
     state.runtime.publish(&state).await?;
     {
         let runtime_state = state.clone();
@@ -896,9 +846,8 @@ pub(crate) async fn start_server(
     // Snapshot only after transport setup and restored session state.
     spawn_serve_snapshot_loop(state.clone()).await;
 
-    // GC the recently_restarted suppression map periodically; the TTL
-    // check on read filters but does not remove entries. Without this,
-    // a long-running daemon's map grows unbounded.
+    // GC the recently_restarted suppression map periodically; the TTL check on read filters
+    // but does not remove entries.
     {
         let gc_map = state.recently_restarted.clone();
         let shutdown = state.shutdown.clone();
@@ -920,25 +869,11 @@ pub(crate) async fn start_server(
             });
     }
 
-    // Trash retention sweep: auto-purge trashed sessions past their
-    // retention window. First tick fires immediately (startup sweep), then
-    // hourly. The daemon is the sole enforcer so there is no multi-process
-    // purge race; without a daemon, expired trash is purged on the next
-    // daemon start or by an explicit manual purge. Skipped entirely in
-    // read-only mode: a read-only daemon must not permanently delete
-    // sessions in the background, since that bypasses every handler's
-    // read-only guard. See #2489.
+    // Trash retention sweep.
     if !state.read_only {
         let sweep_state = state.clone();
         let shutdown = state.shutdown.clone();
         state.runtime.work.spawn("server.trash_retention_sweep", async move {
-            // One-shot startup backfill: relocate trashed worktrees still in
-            // the active dir (rows trashed before relocation existed) and heal
-            // any pointer a crash left stale. See #2522.
-            crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
-            // Same one-shot startup slot: repoint any managed worktree whose
-            // directory was moved outside aoe. See #2002.
-            crate::server::api::reconcile_worktree_paths(&sweep_state).await;
             loop {
                 let swept_at = tokio::time::Instant::now();
                 crate::server::api::purge_expired_trash(&sweep_state).await;
@@ -969,12 +904,7 @@ pub(crate) async fn start_server(
     }
 
     if let Some((lock, candidates)) = recovery_inputs {
-        // Background mark-refresher (#1264). Re-stamps every still-pending
-        // candidate in `recently_restarted` every RECENTLY_RESTARTED_TTL / 2
-        // so a candidate queued past the TTL behind a
-        // STARTUP_RECOVERY_CONCURRENCY permit does not age out of suppression
-        // and trip a phantom Status::Error in status_poll_loop. Exits once the
-        // pending set drains (every worker finished) or on shutdown.
+        // Background mark-refresher.
         {
             let pending = state.recovery_pending.clone();
             let recently = state.recently_restarted.clone();
@@ -1048,13 +978,7 @@ pub(crate) async fn start_server(
             });
     }
 
-    // Acp broadcast listener: a single subscriber that handles
-    // every in-process consumer of acp events. Status mirroring
-    // (sidebar dot, push-notification source) and ACP-session-id
-    // persistence (so `session/load` works across restart) used to be
-    // two separate subscribers, which doubled the broadcast clone
-    // count and locked `state.instances` twice for the events that
-    // matter to both (e.g. AcpSessionAssigned).
+    // Acp broadcast listener.
     {
         let listener_state = state.clone();
         state
@@ -1075,10 +999,7 @@ pub(crate) async fn start_server(
         host.start(&crate::plugin::registry()).await;
     }
 
-    // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
-    // non-blocking so daemon startup never waits on git/network. The plugin host
-    // (when running) is the notifier: it restarts workers onto applied updates
-    // and surfaces consent-needed skips as dashboard notifications.
+    // Opt-in clean-only plugin auto-update sweep (off by default).
     let update_notifier = state
         .plugin_host
         .clone()
@@ -1098,10 +1019,9 @@ pub(crate) async fn start_server(
     login_manager.spawn_cleanup_task(state.shutdown.clone());
 
     if remote {
-        // The tunnel URL is stable across the daemon's lifetime (Tailscale
-        // and named CF tunnels are stable; quick CF rotates only on
-        // restart, which is outside this task's scope). Capture once so
-        // the rotation task can rebuild `serve.url` with the new token.
+        // The tunnel URL is stable across the daemon's lifetime (Tailscale and named CF
+        // tunnels are stable; quick CF rotates only on restart, which is outside this
+        // task's scope).
         let rot_base_url: Option<String> = tunnel_handle.as_ref().map(|h| h.url.clone());
         state.runtime.work.spawn(
             "server.token_rotation",
@@ -1114,11 +1034,7 @@ pub(crate) async fn start_server(
             ),
         );
     } else if test_token_lifetime_override().is_some() && auth_token.is_some() {
-        // Debug-build test path: live Playwright specs set
-        // AOE_TEST_TOKEN_LIFETIME_SECS (and optionally AOE_TEST_TOKEN_GRACE_SECS)
-        // so they can observe the rotation grace window without waiting hours.
-        // Skips the remote-only serve.url rewrite and push retain steps because
-        // neither exists in the local test setup.
+        // Debug-build test path.
         token_manager.spawn_rotation_task();
     }
 
@@ -1251,16 +1167,14 @@ async fn remote_rotation_loop(
             _ = shutdown.cancelled() => break,
         }
 
-        // Capture the hashes of the current and (about-to-be) previous tokens
-        // BEFORE rotating, so we know which owner-hashes are still valid in
-        // the store.
+        // Capture the hashes of the current and (about-to-be) previous tokens BEFORE
+        // rotating, so we know which owner-hashes are still valid in the store.
         let pre_rotate_current = token_manager.current_token().await;
         let grace_expires = token_manager.rotate().await;
         let post_rotate_current = token_manager.current_token().await;
 
-        // Refresh `serve.url` so the TUI display and the QR-code URL stay in
-        // sync with the rotated token. Without this the TUI keeps showing
-        // `?token=<old>`, which stops working once the grace window closes.
+        // Refresh `serve.url` so the TUI display and the QR-code URL stay in sync with the
+        // rotated token.
         if let (Some(base_url), Some(token)) = (base_url.as_ref(), post_rotate_current.as_ref()) {
             if let Ok(app_dir) = crate::session::get_app_dir() {
                 let contents = remote_serve_url_contents(base_url, local_port, Some(token));
@@ -1469,8 +1383,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Stands in for slow push-store I/O: the loop's first post-rotation
-        // prune cannot finish before the test releases this at `stall`.
+        // Stands in for slow push-store I/O.
         let store_lock = push.store.hold_for_test().await;
         let deadline = tokio::time::Instant::now() + lifetime + grace;
         let shutdown = CancellationToken::new();
@@ -1486,15 +1399,13 @@ mod tests {
         assert!(manager.holds_previous().await, "rotation has happened");
         drop(store_lock);
 
-        // Just before the deadline: the rotated-out token is still accepted,
-        // and its subscription still belongs to a valid owner.
+        // Just before the deadline.
         tokio::time::sleep_until(deadline - Duration::from_secs(1)).await;
         assert!(manager.validate("old_token").await.0);
         assert!(manager.holds_previous().await);
         assert_eq!(push.store.snapshot().await.len(), 1);
 
-        // Validation and cleanup agree. Sleeping a fresh grace after the
-        // stalled prune would clear the state only at `deadline + stall`.
+        // Validation and cleanup agree.
         tokio::time::timeout_at(deadline + stall / 2, async {
             while manager.holds_previous().await || !push.store.snapshot().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;

@@ -814,13 +814,8 @@ impl SessionService {
             no_revive,
         } = turn;
         use crate::server::acp_reconciler::ResumeTrigger;
-        // Ownership gate, before ANY side effect (no wake, resume, publish,
-        // or forward for a denied caller): a plugin may deliver turns only
-        // to sessions it created. Ownership is immutable after creation, so
-        // a read snapshot suffices. Deliberately no instance_lock anywhere in
-        // this function: it waits on worker readiness below, and the resume it
-        // waits for needs that lock to finish (#3172, #3621). Callers own the
-        // per-session ordering through [`Self::prompt_submission`] instead.
+        // Ownership gate, before ANY side effect (no wake, resume, publish, or forward for
+        // a denied caller).
         let (acp_mode_id, yolo_mode) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
@@ -836,21 +831,7 @@ impl SessionService {
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode)
         };
-        // Resume a worker that is not currently live. Two cases:
-        //   - Idle-dormant wake: the worker was auto-stopped for inactivity
-        //     (#1689) and the reconciler will not respawn it until its next
-        //     ~2s tick.
-        //   - Dead worker: the worker exited for another reason (e.g. the
-        //     silent-orphan watchdog escalated a monitor / `/loop` turn) and
-        //     is neither dormant nor mid-respawn, so a send would otherwise
-        //     404 and force a manual `aoe acp restart`.
-        // Either way, reserve the resume slot synchronously and drive a fresh
-        // spawn in a detached task NOW so the `send_prompt` below blocks on
-        // `wait_for_worker` until the worker is live instead of racing ahead
-        // to a 404. The detached task survives the originating request being
-        // cancelled on client disconnect. `is_running` is true for a live or
-        // mid-respawn worker, so a healthy session never double-spawns. See
-        // #1748.
+        // Resume a worker that is not currently live.
         let needs_resume = woke_idle_dormant || !self.acp_supervisor.is_running(id).await;
         if no_revive && needs_resume {
             return Err(SendTurnError::RevivalRefused);
@@ -862,19 +843,7 @@ impl SessionService {
                 Err(e) => return Err(SendTurnError::ResumeFailed(e)),
             }
         }
-        // Gate the publish below on the worker actually being there. Without
-        // this the prompt lands in the durable event stream and only THEN
-        // does `send_prompt` discover the respawn never finished, leaving a
-        // `UserPromptSent` with no turn behind it and a UI stuck on
-        // "running" until someone stops the session and re-sends (#3172).
-        // Failing here instead returns a 503 the frontend already treats as
-        // transient: it rolls the optimistic row back and re-queues for the
-        // drain to re-fire on the next `AcpSessionAssigned` (#3094).
-        //
-        // Unconditional, not gated on `needs_resume`: `is_running` is also
-        // true for a resume another caller already reserved, so a false
-        // `needs_resume` does not imply a live worker. For one that is live
-        // this is a single worker-map lookup.
+        // Gate the publish below on the worker actually being there.
         if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
             return match e {
                 crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
@@ -883,12 +852,7 @@ impl SessionService {
                 other => Err(SendTurnError::ResumeFailed(other)),
             };
         }
-        // A plugin-delivered turn must run under the session's persisted
-        // explicit mode: re-assert it before publishing, and withhold the
-        // prompt when the assertion fails (#2897). set_mode waits on the
-        // same ready-client path send_prompt uses, so a just-resumed worker
-        // is awaited, not raced. User surfaces skip this; the supervisor
-        // already re-asserts the mode on every (re)spawn.
+        // A plugin-delivered turn must run under the session's persisted explicit mode.
         if matches!(caller, SessionCaller::Plugin { .. }) {
             if let Some(mode_id) = &acp_mode_id {
                 if let Err(e) = self.acp_supervisor.set_mode(id, mode_id).await {
@@ -896,19 +860,8 @@ impl SessionService {
                 }
             }
         }
-        // Publish the user's prompt into the event stream BEFORE forwarding
-        // to the agent so the replay buffer / on-disk store captures it
-        // even if the agent forward fails. The frontend treats UserPromptSent
-        // as authoritative and dedupes against its own optimistic row.
-        //
-        // The publish step owns clear-command detection and tells us what to
-        // do with the text: either forward it as an ordinary prompt or drive
-        // a real reset on the live worker for a clear alias whose adapter
-        // cannot hand back a durable post-reset session id. Forwarding a codex
-        // `/new` would be swallowed as an unknown command and the conversation
-        // would silently keep its context (#2979); forwarding a claude
-        // `/clear` resets the context but leaves the new conversation
-        // unresumable across a worker restart (upstream #906).
+        // Publish the user's prompt into the event stream BEFORE forwarding to the agent so
+        // the replay buffer / on-disk store captures it even if the agent forward fails.
         let disposition = self
             .acp_supervisor
             .publish_user_prompt_with_attachments(
@@ -931,11 +884,7 @@ impl SessionService {
         };
         match outcome {
             Ok(()) => Ok(()),
-            // Intentional override of the canonical UnknownSession 404: the
-            // readiness barrier above passed, so the worker was alive a
-            // moment ago and died in the gap. Retryable rather than a 404,
-            // same as before. This one IS post-publish; closing that window
-            // needs delivery acknowledgements, not a longer timeout.
+            // Intentional override of the canonical UnknownSession 404.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
                 Err(SendTurnError::WorkerNotReady)
             }
@@ -969,9 +918,7 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        // Non-vivifying: the reconciler spawns this from an earlier snapshot,
-        // so a delete can have completed in the gap and the raw guard would
-        // leave a fresh registry entry nothing prunes (#3687).
+        // Non-vivifying.
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
         };
@@ -1003,10 +950,8 @@ impl SessionService {
         }) else {
             return;
         };
-        // Reload the attachment blobs so a rate-limit resume continuation
-        // replays the interrupted prompt's images/files, not just its text
-        // (#3028). Refs are empty for create-time initial turns. Bytes live in
-        // the event store (a locking sqlite read), so load off the runtime.
+        // Reload the attachment blobs so a rate-limit resume continuation replays the
+        // interrupted prompt's images/files, not just its text.
         let attachments = if attachment_refs.is_empty() {
             Vec::new()
         } else {
@@ -1275,11 +1220,7 @@ impl SessionService {
                             inst.queued_prompts = mirrored.queued_prompts;
                             inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
                             inst.idle_dormant_since = mirrored.idle_dormant_since;
-                            // Monotone max, never `touch_last_accessed()`: a
-                            // queued prompt is a recency gesture, not a wake,
-                            // so it must not clear `archived_at` /
-                            // `snoozed_until` / `idle_dormant_since` a peer
-                            // wrote after this daemon's snapshot (#3465).
+                            // Monotone max, never `touch_last_accessed()`.
                             inst.last_accessed_at =
                                 inst.last_accessed_at.max(mirrored.last_accessed_at);
                         }
@@ -1502,9 +1443,8 @@ impl SessionService {
         let store = Arc::clone(&self.acp_event_store);
         let cache = Arc::clone(&self.acp_control_cache);
         let sid = id.to_string();
-        // The hydrate closure runs under the cache's per-session lock and does
-        // a locking SQLite scan, so the whole thing goes off the runtime rather
-        // than just the scan.
+        // The hydrate closure runs under the cache's per-session lock and does a locking
+        // SQLite scan, so the whole thing goes off the runtime rather than just the scan.
         tokio::task::spawn_blocking(move || {
             cache.get_or_hydrate(&sid.clone(), || {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
@@ -1518,9 +1458,7 @@ impl SessionService {
         })
         .await
         .unwrap_or_else(|_| {
-            // The blocking pool panicked or shut down. An empty state reads as
-            // "idle", which would let both prompt dispatch and the queue drain
-            // push into whatever turn is running, so hand back one that parks.
+            // The blocking pool panicked or shut down.
             let mut fallback =
                 AcpState::new(AcpSessionId(id.to_string()), AgentName(String::new()), None);
             fallback.turn_active = true;
@@ -1566,8 +1504,7 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        // Non-vivifying, for the same reason as the pending-initial drain
-        // (#3687).
+        // Non-vivifying, for the same reason as the pending-initial drain.
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
         };
@@ -1600,12 +1537,9 @@ impl SessionService {
             (caller, agent_key, queue)
         };
 
-        // `Status::Idle` above is a mirror the broadcast listener applies one
-        // serial task behind every session's events, so it still reads Idle for
-        // as long as that task is behind. Prompt dispatch reads the live fold
-        // instead, which is why a prompt can be parked as `turn_active` and
-        // then drained into that very turn a moment later. Ask the same
-        // authority dispatch asked before delivering; the next tick retries.
+        // `Status::Idle` above is a mirror the broadcast listener applies one serial task
+        // behind every session's events, so it still reads Idle for as long as that task is
+        // behind.
         if self.fold_control_state(id).await.turn_active {
             return;
         }
@@ -1614,11 +1548,10 @@ impl SessionService {
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
         let sent_ids: Vec<String> = sub.iter().map(|e| e.id.clone()).collect();
-        // Reload every buffered attachment blob for the batch, in queue order,
-        // so a queued screenshot/file is forwarded with the text (matches the
-        // client's old `snapshot.flatMap(q => q.attachments)`). Bytes live in
-        // the pending-attachment store keyed by prompt id; a locking SQLite
-        // read, so do it off the runtime.
+        // Reload every buffered attachment blob for the batch, in queue order, so a queued
+        // screenshot/file is forwarded with the text (matches the client's old
+        // `snapshot.flatMap(q => q.attachments)`). Bytes live in the pending-attachment
+        // store keyed by prompt id; a locking SQLite read, so do it off the runtime.
         let attachments: Vec<crate::acp::event_store::AttachmentBlob> = {
             let store = Arc::clone(&self.acp_event_store);
             let session_id = id.to_string();
@@ -1632,20 +1565,7 @@ impl SessionService {
             .await
             .unwrap_or_default()
         };
-        // An attachment-only batch has empty combined text but real blobs. A
-        // batch with neither cannot be delivered at all, and must be retired
-        // rather than left queued.
-        //
-        // This guard used to `return`, which wedged the session: the batch
-        // stayed at the head of the queue, the drain retried it on every
-        // reconciler tick, nothing behind it ever drained, and
-        // `reap_idle_workers` (which skips a session holding a queue) kept the
-        // agent subprocess alive forever. Two routes reach the state, so
-        // guarding the entry points is not enough on its own: an attachment-only
-        // prompt whose buffered bytes the 24h `PENDING_ATTACHMENT_TTL` sweep
-        // reclaimed, and (before it was rejected) an edit that blanked a
-        // text-only row. There is nothing left to send by this point, so the
-        // rows are husks; log loudly and clear them.
+        // An attachment-only batch has empty combined text but real blobs.
         if combined.trim().is_empty() && attachments.is_empty() {
             tracing::warn!(
                 target: "acp.queue",
@@ -1658,9 +1578,7 @@ impl SessionService {
             return;
         }
 
-        // Deliver as a fresh turn on the live worker. `send_turn` re-records the
-        // blobs under the real `UserPromptSent` seq. On failure leave the rows
-        // (and their buffered blobs) queued; the next tick retries.
+        // Deliver as a fresh turn on the live worker.
         if let Err(e) = self
             .send_turn(
                 &caller,
@@ -1850,8 +1768,7 @@ impl SessionService {
         let guard = self.prompt_submission(id).await;
         if let Err(e) = self.admits_turn(caller, id).await {
             drop(guard);
-            // Only for a vanished session: forgetting a live one's entry
-            // would hand the next waiter a different mutex.
+            // Only for a vanished session.
             if matches!(e, TurnAdmissionError::SessionNotFound) {
                 self.forget_prompt_lock(id).await;
             }
@@ -2638,10 +2555,9 @@ mod tests {
             Err(SendTurnError::SessionNotFound)
         ));
 
-        // The owner passes the gate; these terminal-view test sessions fail
-        // at a LATER stage (resume snapshot or worker capacity, both
-        // environment dependent), proving the denials above came from the
-        // ownership check specifically.
+        // The owner passes the gate; these terminal-view test sessions fail at a LATER
+        // stage (resume snapshot or worker capacity, both environment dependent), proving
+        // the denials above came from the ownership check specifically.
         assert!(!matches!(
             service
                 .send_turn(
@@ -2687,11 +2603,7 @@ mod tests {
             .session_service
             .clone();
 
-        // No pending turn: returns without touching the supervisor. Missing
-        // session: same. Both must release the per-session claim so a later
-        // drain can run (the second call would return early if the first
-        // leaked its claim, which this test cannot distinguish from a no-op,
-        // so assert on the claim set directly).
+        // No pending turn.
         service.drain_pending_initial_turn("sess-drain").await;
         service.drain_pending_initial_turn("sess-missing").await;
         assert!(
@@ -2731,14 +2643,12 @@ mod tests {
         let mut mid_turn = Instance::new("mid", "/tmp/aoe-queue-mid-turn");
         mid_turn.id = "sess-mid-turn".to_string();
         mid_turn.view = crate::session::View::Structured;
-        // The lagging mirror: a turn is running, but the listener has not
-        // applied its `UserPromptSent` yet, so the row still says Idle.
+        // The lagging mirror.
         mid_turn.status = crate::session::Status::Idle;
         let state = crate::server::test_support::build_test_app_state(vec![idle, mid_turn]);
         let service = state.session_service.clone();
 
-        // Publish through the real choke point: that is what folds the live
-        // projection the drain now reads.
+        // Publish through the real choke point.
         let sink = crate::acp::supervisor::ChannelSink {
             tx: state.acp_events_tx.clone(),
             event_store: Arc::clone(&state.acp_event_store),
@@ -3012,18 +2922,7 @@ mod tests {
             "a drain for an id that no longer exists must not vivify an entry"
         );
 
-        // Window two: the drain cleared the existence check and then parked
-        // reaching the registry, so it vivifies its entry after the delete's
-        // own `forget_prompt_lock` (a no-op here: no entry existed yet) and
-        // only the post-acquisition check can retire it.
-        //
-        // The claim tap is what pins the drain to that state. A timer plus
-        // `!is_finished()` would only say the task had not returned, which is
-        // equally true of a drain that had not been polled at all and would
-        // then decline at the first check, quietly collapsing this case into
-        // window one. Holding the registry write guard is the other half: the
-        // tap fires immediately before `prompt_locks` is read, so the drain
-        // cannot advance past it while the guard is held.
+        // Window two.
         let mut claims = service.watch_submission_claims();
         let registry = service.prompt_locks.write().await;
         let drain = tokio::spawn({
@@ -3210,8 +3109,7 @@ mod tests {
             .expect("session on disk")
             .queued_prompts;
         assert_eq!(persisted.len(), 32, "every enqueue reaches disk");
-        // The disk-side check is the one that fails on finding 8: re-deriving
-        // `seq` per copy let two rows persist the same one.
+        // The disk-side check is the one that fails on finding 8.
         let mut disk_seqs: Vec<u64> = persisted.iter().map(|q| q.seq).collect();
         disk_seqs.sort_unstable();
         disk_seqs.dedup();
@@ -3495,8 +3393,7 @@ mod tests {
             .session_service
             .clone();
 
-        // Enqueue two: seqs are assigned monotonically and the snapshot is
-        // ordered by seq.
+        // Enqueue two.
         let a = service
             .enqueue_prompt("sess-q", "a".into(), "first".into(), vec![], None)
             .await
@@ -3512,8 +3409,7 @@ mod tests {
             ["first", "second"]
         );
 
-        // Re-enqueue by the same id is an idempotent update, not a duplicate:
-        // an optimistic client retry cannot double-queue.
+        // Re-enqueue by the same id is an idempotent update, not a duplicate.
         let a2 = service
             .enqueue_prompt("sess-q", "a".into(), "first edited".into(), vec![], None)
             .await
@@ -3534,10 +3430,7 @@ mod tests {
                 .await,
             EditQueuedOutcome::NotFound
         );
-        // Blanking a text-only row is refused and leaves the text intact. The
-        // drain can neither deliver nor retire such a row, so accepting the
-        // edit would wedge the queue behind it (and pin the worker alive,
-        // since the idle reaper skips a session that has one).
+        // Blanking a text-only row is refused and leaves the text intact.
         for blank in ["", "   ", "\n\t "] {
             assert_eq!(
                 service
@@ -3611,8 +3504,7 @@ mod tests {
         assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["c"]);
         assert_eq!(combined, "/clear");
 
-        // No clear anywhere: the whole queue combines and empty-text rows are
-        // skipped (so no stray blank-line separators).
+        // No clear anywhere.
         let q = vec![
             entry("a", 0, "one"),
             entry("b", 1, ""),

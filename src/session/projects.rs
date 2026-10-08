@@ -367,10 +367,7 @@ pub fn unpopulated_projects(
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for p in registered {
-        // Only pinned projects surface as empty headers. An unpinned entry is
-        // saved (Projects view / wizard) but not forced into the sidebar; check
-        // it before `seen.insert` so an unpinned entry never consumes the slot
-        // a pinned entry for the same path would. See #2208.
+        // Only pinned projects surface as empty headers.
         if !p.pinned {
             continue;
         }

@@ -25,13 +25,10 @@ fn install_live_for_first_session(env: &mut TestEnv) -> String {
         .expect("test env has no sessions; use install_live_orphan instead");
     let inst = env.view.get_instance(&id).unwrap().clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    // CI runs the e2e suite in the same `cargo test` invocation,
-    // which populates the global tmux session cache. The drift
-    // check then sees our fake test session name as "not in tmux"
-    // (Some(false)) and clears live_send mid-test. Pre-inject the
-    // name so the cache reports Some(true) for it; orphan tests
-    // (install_live_orphan) deliberately skip this and let the
-    // instance-missing branch fire instead.
+    // CI runs the e2e suite in the same `cargo test` invocation, which populates the global
+    // tmux session cache, so the drift check would see this fake name as not in tmux and
+    // clear live_send mid-test. Pre-inject it; orphan tests skip this so the
+    // instance-missing branch fires instead.
     crate::tmux::test_inject_session_into_cache(&tmux_name);
     env.view.live_send = Some(LiveSendState {
         session_id: inst.id.clone(),
@@ -71,14 +68,16 @@ fn degraded_snapshot_closes_live_send_without_disconnecting_sidebar() {
     let _command_driver = env.view.session_feed.terminal_driver_for_test();
     env.view
         .session_feed
-        .publish_for_test(super::session_feed_tests::daemon_snapshot(&id, "Running"));
+        .publish_for_test(super::session_feed_tests::daemon_snapshot(
+            &env.view, &id, "Running",
+        ));
     env.view.apply_session_feed();
     assert!(env.view.session_feed.native_interaction_available());
     install_live_for_first_session(&mut env);
     assert!(env.view.live_send.is_some());
 
     let SessionFeedResult::Snapshot(snapshot) =
-        super::session_feed_tests::daemon_snapshot(&id, "Running")
+        super::session_feed_tests::daemon_snapshot(&env.view, &id, "Running")
     else {
         unreachable!()
     };
@@ -212,10 +211,9 @@ fn page_keys_in_live_mode() {
 #[test]
 #[serial]
 fn drift_check_auto_exits_when_session_renamed() {
-    // A rename that carried the tmux session with it: the worker now holds
-    // a name tmux no longer has, so the next keystroke should auto-exit.
-    // Force the cache to the post-rename state (only the new name live) so
-    // the id-anchored resolution has nothing stale to adopt.
+    // A rename that carried the tmux session with it leaves the worker holding a name tmux
+    // no longer has, so the next keystroke auto-exits. Force the cache to the post-rename
+    // state so the id-anchored resolution has nothing stale to adopt.
     let mut env = create_test_env_with_sessions(1);
     let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = install_live_for_first_session(&mut env);
@@ -236,10 +234,9 @@ fn drift_check_auto_exits_when_session_renamed() {
 #[test]
 #[serial]
 fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
-    // #3157: smart rename moves the title but the tmux session keeps the
-    // name it was created under. The worker still holds THIS session's
-    // pane, so that is not drift and live mode must survive; auto-exiting
-    // here would kick the user out of a pane that is still correct.
+    // #3157: smart rename moves the title while the tmux session keeps its created name.
+    // The worker still holds this session's pane, so that is not drift and auto-exiting
+    // would kick the user out of a correct pane.
     let mut env = create_test_env_with_sessions(1);
     let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = install_live_for_first_session(&mut env);
@@ -289,6 +286,7 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
                 pane: crate::session::PaneObservation {
                     state: crate::session::PanePresence::Alive,
                     tmux_session: Some("tool".into()),
+                    legacy_tool: None,
                 },
             });
     });
@@ -369,10 +367,9 @@ fn tab_enters_live_send_only_for_a_selected_session() {
 #[test]
 #[serial]
 fn tab_does_not_start_live_send_for_acp_session() {
-    // Acp sessions are not tmux-backed, so live-send has no valid
-    // target. Tab must refuse with a visible "no tmux pane" toast
-    // (a silent no-op reads as a broken key) and must never
-    // enqueue an Action::EnterLiveSend that would fail downstream.
+    // Acp sessions are not tmux-backed, so Tab must refuse with a visible "no tmux pane"
+    // toast (a silent no-op reads as a broken key) and never enqueue an EnterLiveSend that
+    // would fail downstream.
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
     env.view.update_selected();
@@ -405,12 +402,9 @@ fn tab_does_not_start_live_send_for_acp_session() {
 #[test]
 #[serial]
 fn has_non_live_send_overlay_false_in_pure_live_mode() {
-    // Regression for the dead-fast-path bug: `has_dialog()` returns
-    // true when live-send is active, which would gate off the
-    // preview-only fast path (added in #1495) — the very thing it
-    // was supposed to enable. `has_non_live_send_overlay()` is the
-    // helper the fast-path gates use; in pure live mode with no
-    // other dialog open, it must be false so the fast path can run.
+    // `has_dialog()` is true while live-send is active, which would gate off the
+    // preview-only fast path (#1495) it was meant to enable. `has_non_live_send_overlay()`
+    // is what the fast path gates on, and in pure live mode it must be false.
     let mut env = create_test_env_with_sessions(1);
     install_live_for_first_session(&mut env);
     assert!(env.view.has_dialog(), "has_dialog includes live_send");
@@ -665,6 +659,7 @@ fn warm_predicates_stay_cold_without_a_live_pane() {
                 pane: crate::session::PaneObservation {
                     state,
                     tmux_session: Some("host".into()),
+                    legacy_tool: None,
                 },
             }];
         });
@@ -679,12 +674,10 @@ fn warm_predicates_stay_cold_without_a_live_pane() {
 #[test]
 #[serial]
 fn passive_preview_sync_ignores_one_frame_toast_geometry() {
-    // The EnterLiveSend / SendMessage handlers draw exactly one frame with
-    // a transient toast up; its bottom bar makes the preview output rect
-    // one row shorter for that frame only. The passive sync must not chase
-    // it: pre-debounce it resized the agent's pane down and back up ~30ms
-    // apart, and the double SIGWINCH made claude's bottom-anchored input
-    // box (and cursor) visibly jump right as live mode opened.
+    // The handlers draw one frame with a transient toast whose bottom bar makes the output
+    // rect a row shorter for that frame only. The passive sync must not chase it:
+    // pre-debounce it resized the agent's pane down and back ~30ms apart, and the double
+    // SIGWINCH made bottom-anchored agent UIs jump as live mode opened.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -755,9 +748,8 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
         );
     }
 
-    // The fixture sessions have no tmux panes, so the worker declines
-    // each intent. Once the declines are adopted, the same epoch must not
-    // re-queue them.
+    // The fixture sessions have no tmux panes, so the worker declines each intent, and once
+    // the declines are adopted the same epoch must not re-queue them.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         env.view
@@ -798,9 +790,9 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
         );
     }
 
-    // Moving the selection is NOT an epoch: the armed key is pure
-    // geometry, so switching the excluded session must not re-arm, and
-    // the previously excluded session fires on the same refresh.
+    // Moving the selection is not an epoch: the armed key is pure geometry, so switching the
+    // excluded session must not re-arm, and the previously excluded one fires on the same
+    // refresh.
     let armed_before = env.view.passive_fleet_armed.clone();
     env.view.selected_session = Some(ids[1].clone());
     env.view
@@ -832,9 +824,8 @@ fn fleet_reconcile_reasserts_after_external_resize() {
     env.view
         .reconcile_passive_fleet(inner, false, Some(&selected));
 
-    // Pretend ids[1]'s resize was applied at its wanted geometry (read
-    // back from the armed epoch so the fixture can't drift from the real
-    // layout math).
+    // Pretend ids[1]'s resize was applied at its wanted geometry, read back from the armed
+    // epoch so the fixture can't drift from the real layout math.
     let (cols, rows) = env
         .view
         .passive_fleet_armed
@@ -874,14 +865,11 @@ fn fleet_reconcile_reasserts_after_external_resize() {
 #[test]
 #[serial]
 fn stale_observation_published_after_adoption_does_not_invalidate() {
-    // The cache boundary of the timestamp race: a `list-panes` that read
-    // the pane BEFORE our resize can finish publishing AFTER the resize's
-    // adoption. The snapshot's time is the observation instant (captured
-    // pre-fork), so the pre-resize sizes it carries must read as older
-    // than the adoption and leave the synced entry alone. Re-stamping
-    // `cache.time` at publication would make this observation look
-    // fresher than the adoption and turns this test red (the injector
-    // routes through the real publication path).
+    // The cache boundary of the timestamp race: a `list-panes` that read the pane before our
+    // resize can publish after its adoption. The snapshot's time is the observation instant,
+    // captured pre-fork, so the pre-resize sizes must read as older than the adoption and
+    // leave the synced entry alone. Re-stamping `cache.time` at publication turns this
+    // test red.
     let _cache_guard = crate::tmux::PaneMetaCacheGuard::capture();
     let mut env = create_test_env_with_sessions(2);
     let ids: Vec<String> = env
@@ -958,9 +946,9 @@ fn fleet_reconcile_retries_expired_declines() {
         .map(|&(_, cols, rows)| (cols, rows))
         .expect("armed epoch covers ids[1]");
 
-    // A decline older than the retry window reads as absent, so the
-    // session recovers once its blocking attach or size owner may have
-    // gone away, instead of staying parked until a geometry change.
+    // A decline older than the retry window reads as absent, so the session recovers once
+    // its blocking attach or size owner may have gone, instead of staying parked until a
+    // geometry change.
     let expired = std::time::Instant::now()
         .checked_sub(
             crate::tui::home::render::PASSIVE_DECLINE_RETRY + std::time::Duration::from_secs(1),
@@ -986,10 +974,9 @@ fn fleet_reconcile_retries_expired_declines() {
 #[test]
 #[serial]
 fn fleet_reconcile_is_single_tui_only() {
-    // With two aoe TUIs alive, each would treat the other's fleet
-    // resizes as external (observed-size invalidation) and re-assert its
-    // own geometry, oscillating every open pane. The presence count gates
-    // the whole fleet pass; only the selected-session sync stays on.
+    // With two TUIs alive, each would treat the other's fleet resizes as external and
+    // re-assert its own geometry, oscillating every open pane. The presence count gates the
+    // whole fleet pass; only the selected-session sync stays on.
     let mut env = create_test_env_with_sessions(2);
     let ids: Vec<String> = env
         .view
@@ -1026,12 +1013,10 @@ fn fleet_reconcile_is_single_tui_only() {
 #[test]
 #[serial]
 fn refresh_terminal_cache_overwrites_on_empty_capture() {
-    // Counterpart to `refresh_preserves_cache_when_live_capture_fails`:
-    // only the agent path carries the live-send kill switch. The terminal
-    // path must overwrite to empty so the preview surfaces "session looks
-    // gone". With the worker as the ONLY capture source, the empty frame
-    // arrives through the mailbox (the worker forwards empties for
-    // terminal panes); paint applies it without any synchronous fork.
+    // Counterpart to `refresh_preserves_cache_when_live_capture_fails`: only the agent path
+    // carries the live-send kill switch, so the terminal path must overwrite to empty and
+    // surface "session looks gone". The empty frame arrives through the mailbox, since the
+    // worker forwards empties for terminal panes, and paint applies it without a fork.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -1220,7 +1205,7 @@ fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
     let mut reserved = env.view.get_instance(&id).cloned().expect("instance");
     assert!(
         reserved
-            .start_tool_with_size_in("probe", None, &storage)
+            .start_tool_with_size_in("probe", None, &storage, None, None)
             .is_err(),
         "a reserved purge admitted a tool"
     );
@@ -1233,7 +1218,7 @@ fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
         .unwrap();
     let mut released = env.view.get_instance(&id).cloned().expect("instance");
     released
-        .start_tool_with_size_in("probe", None, &storage)
+        .start_tool_with_size_in("probe", None, &storage, None, None)
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !fresh_marker.exists() {

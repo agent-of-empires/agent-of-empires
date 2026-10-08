@@ -74,7 +74,6 @@ mod types;
 
 pub(crate) use accessors::resolved_agent_for;
 pub use flags::{is_valid_session_color, SessionBucket, StartBlocked, SESSION_COLORS};
-pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 #[cfg(test)]
@@ -116,15 +115,16 @@ pub(crate) enum TerminalContextResume {
     PreviousFailure,
 }
 pub use types::{
-    AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence, PluginCreateIdempotency,
-    SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity, PaneObservation,
+    PanePresence, PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo,
+    WorkspaceRepo, WorktreeInfo,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
     SessionSidecarSource,
 };
 
-// Re-exported so each submodule can reach its siblings through `use super::*`.
+// Sibling items the submodules reach through `use super::*`.
 use hooks::status_hook_env_prefix;
 pub(crate) use hooks::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,

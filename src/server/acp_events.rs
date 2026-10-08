@@ -56,11 +56,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         };
 
-        // Detect wake-fire: a `UserPromptSent` arriving at-or-after a
-        // `WakeupScheduled`'s `at` timestamp means the agent's pending
-        // wake just fired. Push opt-in to the user's phone so /loop
-        // dynamic runs don't need them to keep checking the dashboard.
-        // See #1091.
+        // Detect wake-fire.
         if matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::UserPromptSent { .. }
@@ -217,14 +213,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
 
-        // Smart-rename defer: fire the one-shot only on a clean
-        // `prompt_complete` `Event::Stopped`, so it never races the live worker
-        // for the same provider API. Fast-path on the event variant BEFORE
-        // touching the two sync mutexes so high-volume streaming-delta frames
-        // (`AgentMessageChunk`, `ToolCallStarted`, `ThinkingStarted`, ...) skip
-        // the locks entirely; the pure predicate then applies the reason
-        // allowlist + the two per-session `contains()` checks. See #2348 and
-        // the post-merge review nit on #2651.
+        // Smart-rename defer.
         let should_rename = matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::Stopped { .. }
@@ -284,11 +273,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
 
-        // Conversation-summary defer: same clean-turn-boundary discipline as
-        // smart-rename. Fast-path on the event variant before the inflight
-        // lock so streaming frames skip it; the spawned task re-checks the
-        // setting, eligibility, and the byte/turn delta threshold (all of
-        // which need config + the event store). See #2808.
+        // Conversation-summary defer.
         let should_summarize = matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::Stopped { .. }
@@ -603,13 +588,7 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         };
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            // At startup the on-disk event log is the whole truth: nothing
-            // is racing the apply, unlike the live stream. If the latest
-            // lifecycle event shows a turn was in flight when the previous
-            // daemon died, a stale persisted Stopped must not trap the dot
-            // grey, so clear it before the Running/Waiting intent applies.
-            // A latest Idle/Error (clean or deliberate stop) is left as
-            // Stopped by apply_status_intent's guard. See #2248.
+            // At startup the on-disk event log is the whole truth.
             if inst.status == Status::Stopped
                 && matches!(intent, StatusIntent::Set(Status::Running | Status::Waiting))
             {
@@ -655,14 +634,7 @@ pub(crate) fn apply_status_intent(
     }
     let target = match intent {
         StatusIntent::Set(s) => {
-            // A Stopped session must not be woken by a trailing worker
-            // event: acp events keep arriving for a few ticks after a
-            // Stop, and a deliberate Stop must keep showing Stopped. Only
-            // a fresh worker-epoch signal (HealError below) lifts Stopped;
-            // the live UserPromptSent that follows the respawn then drives
-            // Running. Without this, the chain Stopped -> (trailing prompt)
-            // Running -> (trailing stop) Idle would strand a deliberate
-            // Stop on Idle.
+            // A Stopped session must not be woken by a trailing worker event.
             if inst.status == Status::Stopped {
                 return;
             }
@@ -683,11 +655,8 @@ pub(crate) fn apply_status_intent(
             }
             s
         }
-        // HealError comes only from AcpSessionAssigned / RateLimitAuto
-        // Resumed, both emitted when a fresh worker attaches and never as
-        // trailing post-stop events. So heal a sticky Error AND wake a
-        // session out of a stale Stopped (idle-reap or manual stop, then
-        // re-prompt): the live worker is provably back. See #2248.
+        // HealError comes only from AcpSessionAssigned / RateLimitAuto Resumed, both
+        // emitted when a fresh worker attaches and never as trailing post-stop events.
         StatusIntent::HealError => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
@@ -708,11 +677,7 @@ pub(crate) fn apply_status_intent(
     let prev = inst.status;
     inst.status = target;
     let now = chrono::Utc::now();
-    // last_accessed_at is deliberately NOT stamped here (#3465 residual):
-    // the value relays through SessionFeed into TUI memory, and
-    // save()'s merge_from_tui monotone max persists it ungated, so the
-    // touched arm of merge_user_action_diff wiped concurrent archives.
-    // Structured rows take real touches from user prompts instead.
+    // last_accessed_at is deliberately NOT stamped here (#3465 residual).
     inst.idle_entered_at = if target == Status::Idle {
         Some(now)
     } else {
@@ -903,32 +868,18 @@ pub(super) fn apply_acp_session_change(
     }
     match change? {
         AcpSessionChange::Assigned(new_id) => {
-            // A worker just initialized (session/new or session/load), so the
-            // session is by definition no longer idle-dormant. Clear any
-            // marker now: a stale one left by a non-user respawn (e.g. the
-            // build-stale respawn #1754, which brings the worker back without
-            // a user wake) otherwise makes the reconciler's
-            // `!is_idle_dormant()` resume filter refuse to bring the session
-            // back after this worker later dies, deadlocking a queued prompt
-            // that the client parked waiting for a worker that never returns.
-            // See #2237.
+            // A worker just initialized (session/new or session/load), so the session is by
+            // definition no longer idle-dormant.
             let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
             let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
-            // #2276: clear import_pending only when the assigned id matches the
-            // imported one, i.e. the import's session/load actually landed and
-            // its replay is now in the event store. A fallback session/new (or
-            // a stale worker) reports a different id; consuming the marker then
-            // would block a later retry from re-seeding the transcript.
+            // #2276.
             let cleared_import_pending = if same_acp_session {
                 inst.import_pending.take().unwrap_or(false)
             } else {
                 false
             };
             if same_acp_session {
-                // Same id (a reattach / session/load reuses it). Only persist
-                // if we actually cleared a stale dormant marker or the import
-                // flag; otherwise the id is already on disk and there is
-                // nothing to rewrite.
+                // Same id (a reattach / session/load reuses it).
                 if cleared_stale_dormant || cleared_import_pending {
                     tracing::info!(
                         target: "acp.event_listener",
@@ -947,16 +898,9 @@ pub(super) fn apply_acp_session_change(
                 "persisting agent-assigned ACP session id"
             );
             inst.acp_session_id = Some(new_id.clone());
-            // A structured fork sets fork_pending + import_pending together at
-            // creation and does not pre-pin acp_session_id, so the adapter's
-            // new forked id arrives on THIS different-id path. Consume both
-            // one-shot markers together: a restart resumes the child via
-            // session/load instead of re-forking the parent, and leaving
-            // import_pending set would make that resume re-seed the transcript
-            // into an already-populated store (duplicate-key corruption, the
-            // #2276 class). Gate the import clear on fork_pending having been
-            // set, so a non-fork different-id assignment leaves import_pending
-            // alone for its own retry.
+            // A structured fork sets fork_pending + import_pending together at creation and
+            // does not pre-pin acp_session_id, so the adapter's new forked id arrives on
+            // THIS different-id path.
             if inst.fork_pending.take().is_some() {
                 inst.import_pending = None;
             }
@@ -969,13 +913,8 @@ pub(super) fn apply_acp_session_change(
                 "clearing stored ACP session id after a context reset (session/load or session/fork failure)"
             );
             inst.acp_session_id = None;
-            // A structured fork that failed (or was refused by a resume-only
-            // agent) reaches here via SessionContextReset. Clear the one-shot
-            // fork marker so the reconciler stops re-issuing the same failing
-            // `session/fork` on every reattach, and drop the paired
-            // import_pending the same way the success path does so the fallback
-            // spawn is a clean session/new. A session/load-failure reset has no
-            // fork pending, so this is a no-op there.
+            // A structured fork that failed (or was refused by a resume-only agent) reaches
+            // here via SessionContextReset.
             if inst.fork_pending.take().is_some() {
                 inst.import_pending = None;
             }
@@ -986,19 +925,10 @@ pub(super) fn apply_acp_session_change(
                 session = %session_id,
                 "clearing stored ACP session id after a user /clear"
             );
-            // For a profile that forwards its clear alias, AoE never learns the
-            // adapter's post-clear conversation id, so the only way to stop a
-            // restart from resurrecting the pre-clear conversation via
-            // session/load is to drop the stored id now and force a fresh
-            // session/new. That leaves the post-clear conversation
-            // unresumable, which is why the profiles whose adapters withhold
-            // the new id drive the reset themselves instead
-            // (`clear_requires_driven_reset`); on that path this arm still
-            // runs, but the driven burst ends in `AcpSessionAssigned`, which
-            // re-pins the id the adapter just minted. Clear the paired
-            // fork/import markers unconditionally too: a /clear issued before
-            // a pending fork/import resolves must still restart clean, not
-            // re-session/fork the parent. See #3080.
+            // For a profile that forwards its clear alias, AoE never learns the adapter's
+            // post-clear conversation id, so the only way to stop a restart from
+            // resurrecting the pre-clear conversation via session/load is to drop the
+            // stored id now and force a fresh session/new.
             inst.acp_session_id = None;
             inst.fork_pending = None;
             inst.import_pending = None;
@@ -1086,12 +1016,8 @@ pub(crate) fn derive_acp_status(
         Event::UserPromptSent { .. }
         | Event::ApprovalResolved { .. }
         | Event::ElicitationResolved { .. } => Some(StatusIntent::Set(Status::Running)),
-        // Agent transcript output means a turn is live even when no
-        // UserPromptSent preceded it. A fired ScheduleWakeup or a background
-        // TaskOutput notification resumes the turn agent-side, streaming only
-        // these events; aoe never publishes a prompt for them, so without this
-        // the sidebar dot stayed grey through real work. apply_status_intent's
-        // guards keep a deliberate Stopped grey and no-op once already Running.
+        // Agent transcript output means a turn is live even when no UserPromptSent preceded
+        // it.
         Event::ThinkingStarted
         | Event::AgentMessageChunk { .. }
         | Event::ToolCallStarted { .. } => Some(StatusIntent::Set(Status::Running)),
@@ -1109,12 +1035,7 @@ pub(crate) fn derive_acp_status(
         Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
             Some(StatusIntent::Set(Status::Waiting))
         }
-        // All Stopped reasons surface as Idle, including the
-        // rate-limit park: the worker is not crashed, the user just
-        // hit a provider quota and the session is waiting for reset
-        // (or for the user to switch to another ACP backend). The
-        // dedicated RateLimit banner carries the reset time, so the
-        // sidebar pill staying grey is the right signal. See #1281.
+        // All Stopped reasons surface as Idle, including the rate-limit park.
         //
         // Unless something is still busy after this `Stopped`: a background
         // sub-agent keeps working past its parent (#4001), and the cache can
@@ -1143,15 +1064,9 @@ pub(crate) fn derive_acp_status(
             },
         )),
         Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
-        // A successful session/new or session/load means the agent
-        // is alive. Heal a sticky Error banner so the sidebar dot
-        // reverts from red to grey; do NOT clobber an in-progress
-        // Running/Waiting turn (a respawn during an active turn
-        // would otherwise stop the spinner mid-stream).
+        // A successful session/new or session/load means the agent is alive.
         Event::AcpSessionAssigned { .. } => Some(StatusIntent::HealError),
-        // Auto-resume after a rate-limit park: the worker is coming back.
-        // Heal any sticky error so the sidebar dot recovers; the imminent
-        // fresh spawn emits AcpSessionAssigned and live events right after.
+        // Auto-resume after a rate-limit park.
         Event::RateLimitAutoResumed { .. } => Some(StatusIntent::HealError),
         _ => None,
     }
@@ -1339,8 +1254,7 @@ mod tests {
         inst.source_profile = owning.to_string();
         let id = inst.id.clone();
         seed_profile_store(owning, vec![inst.clone()]);
-        // The profile the row is *not* in. Created empty, so the write there
-        // succeeds while matching nothing.
+        // The profile the row is *not* in.
         seed_profile_store("acp-unread-stale", Vec::new());
 
         let instances = RwLock::new(vec![inst]);
@@ -1445,15 +1359,13 @@ mod tests {
 
         let profile = "acp-unread-lag-replay";
 
-        // The turn ended while the listener was lagged: memory still says
-        // Running, the log already has the Stopped we never saw.
+        // The turn ended while the listener was lagged.
         let mut missed = Instance::new("acp-missed", "/tmp/acp");
         missed.view = crate::session::View::Structured;
         missed.source_profile = profile.to_string();
         missed.status = Status::Running;
 
-        // Already reconciled: the Stopped was observed, so there is no
-        // transition left to apply and no second mark to make.
+        // Already reconciled.
         let mut already = Instance::new("acp-already-idle", "/tmp/acp");
         already.view = crate::session::View::Structured;
         already.source_profile = profile.to_string();
@@ -2875,12 +2787,7 @@ mod tests {
 
     #[test]
     fn relayed_intent_stamp_wipes_concurrent_archive() {
-        // Full #3465 residual chain on structured rows:
-        // apply_status_intent stamps daemon memory, save()'s
-        // merge_from_tui folds that memory into disk with an ungated
-        // monotone max, and a writer holding a pre snapshot from before
-        // the stamp loses its archive to merge_user_action_diff's
-        // touched arm. Dropping the intent stamp breaks this chain.
+        // Full #3465 residual chain on structured rows.
         let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
 
         let mut daemon_row = stopped_structured_instance();

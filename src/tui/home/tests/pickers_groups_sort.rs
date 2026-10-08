@@ -1,6 +1,522 @@
 //! Pickers, settings entry, group management, layout, and sort.
 
 use super::*;
+pub(super) fn receipt_cursor(headers: &axum::http::HeaderMap) -> crate::daemon::RuntimeCursor {
+    crate::daemon::RuntimeCursor {
+        epoch: headers[crate::daemon::RUNTIME_EPOCH_HEADER]
+            .to_str()
+            .unwrap()
+            .into(),
+        revision: headers[crate::daemon::RUNTIME_REVISION_HEADER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    }
+}
+
+pub(super) async fn settle_namespace(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    expected: crate::daemon::NamespaceMutation,
+    action: impl FnOnce(&mut HomeView) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use crate::daemon::{MutationReceipt, NamespaceMutation, NamespaceOutcome};
+    fn wire(request: &NamespaceMutation) -> (&'static str, &'static str, serde_json::Value) {
+        match request {
+            NamespaceMutation::CollapseGroup(body) => (
+                "PATCH",
+                "/api/groups/collapse",
+                serde_json::to_value(body).unwrap(),
+            ),
+            NamespaceMutation::MoveGroup(body) => {
+                ("PATCH", "/api/groups", serde_json::to_value(body).unwrap())
+            }
+            NamespaceMutation::DeleteGroup(body) => {
+                ("DELETE", "/api/groups", serde_json::to_value(body).unwrap())
+            }
+            NamespaceMutation::Reorder(body) => {
+                ("POST", "/api/reorder", serde_json::to_value(body).unwrap())
+            }
+            _ => panic!("group/reorder fixture received an unsupported namespace command"),
+        }
+    }
+    let before_rows = serde_json::to_value(view.cloned_instances()).unwrap();
+    let before_groups = serde_json::to_value(view.all_groups()).unwrap();
+    let mut respond = view.session_feed.namespace_driver_for_test();
+    action(view)?;
+    let boundary_destination = match &view.pending_namespace_intent {
+        Some(super::super::NamespaceIntent::ReorderSession {
+            continuation_destination,
+            ..
+        }) => continuation_destination.clone(),
+        _ => None,
+    };
+    assert_eq!(
+        serde_json::to_value(view.cloned_instances()).unwrap(),
+        before_rows
+    );
+    assert_eq!(
+        serde_json::to_value(view.all_groups()).unwrap(),
+        before_groups
+    );
+    let (method, path, body) = wire(&expected);
+    let (status, headers, value) = request_with_headers(state, method, path, body.clone()).await;
+    if !status.is_success() {
+        assert!(
+            status.is_client_error(),
+            "fixture must not convert an unknown commit into rejection: {status} {value}"
+        );
+        let error = value.to_string();
+        let captured = respond(Err(error.clone())).expect("namespace command admitted");
+        assert_eq!(wire(&captured), (method, path, body));
+        view.apply_session_feed();
+        anyhow::bail!("{error}");
+    }
+    let outcome = match &expected {
+        NamespaceMutation::DeleteGroup(_) => {
+            NamespaceOutcome::DeletedGroup(serde_json::from_value(value).unwrap())
+        }
+        NamespaceMutation::Reorder(_) => {
+            NamespaceOutcome::Reordered(serde_json::from_value(value).unwrap())
+        }
+        _ => NamespaceOutcome::Committed,
+    };
+    let receipt = MutationReceipt {
+        cursor: receipt_cursor(&headers),
+        outcome,
+    };
+    let captured = respond(Ok(receipt)).expect("namespace command admitted");
+    assert_eq!(wire(&captured), (method, path, body));
+    // The successful reply alone must never splice daemon data into HomeView.
+    view.apply_session_feed();
+    assert_eq!(
+        serde_json::to_value(view.cloned_instances()).unwrap(),
+        before_rows
+    );
+    assert_eq!(
+        serde_json::to_value(view.all_groups()).unwrap(),
+        before_groups
+    );
+    apply_published(view, state).await;
+    // AtEdge is a completed sibling reorder; Home may now submit a canonical
+    // cross-group continuation. Keep its original driver alive through that command.
+    if view.pending_namespace_intent.is_some() {
+        if let NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
+            id,
+            profile,
+            source_group,
+            direction,
+            ..
+        }) = &expected
+        {
+            let destination = boundary_destination.expect("captured continuation target");
+            let next = NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
+                id: id.clone(),
+                profile: profile.clone(),
+                source_group: source_group.clone(),
+                direction: *direction,
+                destination: Some(destination),
+            });
+            let (method, path, body) = wire(&next);
+            let (status, headers, value) =
+                request_with_headers(state, method, path, body.clone()).await;
+            assert!(status.is_success(), "{status}: {value}");
+            let receipt = MutationReceipt {
+                cursor: receipt_cursor(&headers),
+                outcome: NamespaceOutcome::Reordered(serde_json::from_value(value).unwrap()),
+            };
+            let captured = respond(Ok(receipt)).expect("boundary continuation admitted");
+            assert_eq!(wire(&captured), (method, path, body));
+            view.apply_session_feed();
+            apply_published(view, state).await;
+        } else {
+            panic!("unexpected namespace continuation");
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn settle_row_command(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    id: &str,
+    expected: crate::tui::session_feed::SessionRequest,
+    action: impl FnOnce(&mut HomeView) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use crate::daemon::MutationReceipt;
+    use crate::tui::session_feed::{SessionCommandOutcome, SessionRequest};
+    fn wire(id: &str, request: &SessionRequest) -> (&'static str, String, serde_json::Value) {
+        let base = format!("/api/sessions/{id}");
+        match request {
+            SessionRequest::Rename(body) => ("PATCH", base, serde_json::to_value(body).unwrap()),
+            SessionRequest::Trash(body) => (
+                "POST",
+                format!("{base}/trash"),
+                serde_json::to_value(body).unwrap(),
+            ),
+            SessionRequest::Purge(body) => ("DELETE", base, serde_json::to_value(body).unwrap()),
+            SessionRequest::Restore => ("POST", format!("{base}/restore"), serde_json::json!({})),
+            SessionRequest::SetWorktreeName(body) => (
+                "PATCH",
+                format!("{base}/worktree-name"),
+                serde_json::to_value(body).unwrap(),
+            ),
+            SessionRequest::AttachProject(body) => (
+                "POST",
+                format!("{base}/projects"),
+                serde_json::to_value(body).unwrap(),
+            ),
+            _ => panic!("typed edit fixture received a non-edit command"),
+        }
+    }
+    let before_rows = serde_json::to_value(view.cloned_instances()).unwrap();
+    let mut respond = view.session_feed.request_driver_for_test();
+    action(view)?;
+    assert_eq!(
+        serde_json::to_value(view.cloned_instances()).unwrap(),
+        before_rows
+    );
+    let (method, path, body) = wire(id, &expected);
+    let (status, headers, value) = request_with_headers(state, method, &path, body.clone()).await;
+    if !status.is_success() {
+        assert!(
+            status.is_client_error(),
+            "unknown commit is not rejection: {status} {value}"
+        );
+        let error = value.to_string();
+        let (captured_id, captured) = respond(Err(error.clone())).expect("typed request admitted");
+        assert_eq!(captured_id, id);
+        assert_eq!(wire(id, &captured), (method, path, body));
+        view.apply_session_feed();
+        apply_published(view, state).await;
+        assert!(
+            view.session_feed.can_submit(id),
+            "canonical rejection releases row admission while the fixture driver is live"
+        );
+        anyhow::bail!("{error}");
+    }
+    let cursor = receipt_cursor(&headers);
+    let outcome = match expected {
+        SessionRequest::Rename(_) => SessionCommandOutcome::Renamed(MutationReceipt {
+            cursor,
+            outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+        }),
+        SessionRequest::Trash(_) => SessionCommandOutcome::Trashed(MutationReceipt {
+            cursor,
+            outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+        }),
+        SessionRequest::Purge(_) => SessionCommandOutcome::Purged(MutationReceipt {
+            cursor,
+            outcome: serde_json::from_value(value).unwrap(),
+        }),
+        SessionRequest::Restore => SessionCommandOutcome::Restored(MutationReceipt {
+            cursor,
+            outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+        }),
+        SessionRequest::SetWorktreeName(_) => {
+            SessionCommandOutcome::WorktreeEdited(MutationReceipt {
+                cursor,
+                outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+            })
+        }
+        SessionRequest::AttachProject(_) => {
+            SessionCommandOutcome::ProjectAttached(MutationReceipt {
+                cursor,
+                outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+            })
+        }
+        _ => unreachable!("wire rejected non-edit command"),
+    };
+    let (captured_id, captured) = respond(Ok(outcome)).expect("typed request admitted");
+    assert_eq!(captured_id, id);
+    assert_eq!(wire(id, &captured), (method, path, body));
+    view.apply_session_feed();
+    assert_eq!(
+        serde_json::to_value(view.cloned_instances()).unwrap(),
+        before_rows
+    );
+    apply_published(view, state).await;
+    assert!(
+        view.session_feed.can_submit(id),
+        "canonical completion releases row admission while the fixture driver is live"
+    );
+    Ok(())
+}
+
+pub(super) async fn settle_rename(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    title: &str,
+    group: Option<&str>,
+    profile: Option<&str>,
+    branch: bool,
+) -> anyhow::Result<()> {
+    let id = view.selected_session.clone().expect("selected rename row");
+    let expected =
+        crate::tui::session_feed::SessionRequest::Rename(crate::daemon::RenameSessionBody {
+            title: (!title.is_empty()).then(|| title.to_owned()),
+            group: group.map(str::to_owned),
+            profile: profile.map(str::to_owned),
+            rename_branch: branch,
+        });
+    settle_row_command(state, view, &id, expected, |view| {
+        view.rename_selected(title, group, profile, branch)
+    })
+    .await
+}
+
+pub(super) async fn settle_delete_group(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+) -> anyhow::Result<()> {
+    let path = view.selected_group.clone().expect("selected group");
+    let profile = view
+        .profile_for_cursor(view.cursor)
+        .expect("selected group profile");
+    let has_members = view.instances().any(|row| {
+        row.source_profile == profile
+            && (row.group_path == path || row.group_path.starts_with(&format!("{path}/")))
+    });
+    let expected = crate::daemon::NamespaceMutation::DeleteGroup(crate::daemon::DeleteGroupBody {
+        group: crate::daemon::GroupLocation { profile, path },
+        mode: if has_members {
+            crate::daemon::DeleteGroupMode::KeepSessions
+        } else {
+            crate::daemon::DeleteGroupMode::EmptyOnly
+        },
+        cleanup: Default::default(),
+    });
+    settle_namespace(state, view, expected, HomeView::delete_selected_group).await
+}
+
+pub(super) async fn settle_rename_group(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    name: Option<&str>,
+    profile: Option<&str>,
+) -> anyhow::Result<()> {
+    let context = view
+        .group_rename_context
+        .as_ref()
+        .expect("group rename context");
+    let new_path = name.unwrap_or(&context.old_path).to_owned();
+    let new_profile = profile.unwrap_or(&context.old_profile).to_owned();
+    if new_path == context.old_path && new_profile == context.old_profile {
+        return view.rename_selected_group(name, profile);
+    }
+    let mutation = crate::daemon::NamespaceMutation::MoveGroup(crate::daemon::MoveGroupBody {
+        source: crate::daemon::GroupLocation {
+            profile: context.old_profile.clone(),
+            path: context.old_path.clone(),
+        },
+        target: crate::daemon::GroupLocation {
+            profile: new_profile,
+            path: new_path,
+        },
+    });
+    settle_namespace(state, view, mutation, |view| {
+        view.rename_selected_group(name, profile)
+    })
+    .await
+}
+
+pub(super) async fn cross_then_peer_collapse(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    id: &str,
+    destination: &str,
+) {
+    let row = view.get_instance(id).unwrap();
+    let profile = row.source_profile.clone();
+    let body = serde_json::json!({ "target": "session", "id": id, "profile": profile,
+        "source_group": row.group_path, "direction": "down", "destination": destination });
+    view.selected_session = Some(id.into());
+    view.selected_group = None;
+    let mut respond = view.session_feed.namespace_driver_for_test();
+    view.submit_session_reorder(id, 1, Some(destination.to_owned()))
+        .unwrap();
+    let (status, headers, outcome) =
+        request_with_headers(state, "POST", "/api/reorder", body).await;
+    assert!(status.is_success());
+    let receipt = crate::daemon::MutationReceipt {
+        cursor: receipt_cursor(&headers),
+        outcome: crate::daemon::NamespaceOutcome::Reordered(
+            serde_json::from_value(outcome).unwrap(),
+        ),
+    };
+    let (status, _, _) = request_with_headers(
+        state,
+        "PATCH",
+        "/api/groups/collapse",
+        serde_json::json!({
+            "group": { "profile": profile, "path": destination }, "collapsed": true,
+        }),
+    )
+    .await;
+    assert!(status.is_success());
+    assert!(matches!(
+        respond(Ok(receipt)),
+        Some(crate::daemon::NamespaceMutation::Reorder(_))
+    ));
+    view.apply_session_feed();
+    apply_published(view, state).await;
+}
+
+pub(in crate::tui::home) async fn settle_reorder(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    delta: isize,
+    crossing: bool,
+) -> anyhow::Result<()> {
+    use crate::daemon::{GroupLocation, MoveDirection, NamespaceMutation, ReorderBody};
+    let direction = if delta < 0 {
+        MoveDirection::Up
+    } else {
+        MoveDirection::Down
+    };
+    let request = if let Some(path) = view.selected_group.clone() {
+        let profile = view.canonical_group_location(&path)?.profile;
+        ReorderBody::Group {
+            group: GroupLocation { profile, path },
+            direction,
+        }
+    } else {
+        let id = view.selected_session.clone().expect("selected session");
+        let row = view.get_instance(&id).unwrap();
+        let destination = if crossing {
+            let mut paths = Vec::<String>::new();
+            for item in &view.flat_items {
+                let path = match item {
+                    Item::Group { path, profile, .. }
+                        if profile.as_deref().is_none_or(|p| p == row.source_profile) =>
+                    {
+                        Some(path.clone())
+                    }
+                    Item::Session { id, .. } => view
+                        .get_instance(id)
+                        .filter(|peer| {
+                            peer.source_profile == row.source_profile
+                                && !peer.is_archived()
+                                && !peer.is_trashed()
+                        })
+                        .map(|peer| peer.group_path.clone()),
+                    _ => None,
+                };
+                if let Some(path) = path {
+                    if !crate::session::is_within_archived_section(&path)
+                        && !crate::session::is_within_trash_section(&path)
+                        && !paths.contains(&path)
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+            let at = paths
+                .iter()
+                .position(|path| path == &row.group_path)
+                .unwrap();
+            at.checked_add_signed(delta)
+                .and_then(|at| paths.get(at))
+                .cloned()
+        } else {
+            None
+        };
+        ReorderBody::Session {
+            id,
+            profile: row.source_profile.clone(),
+            source_group: row.group_path.clone(),
+            direction,
+            destination,
+        }
+    };
+    let destination = match &request {
+        ReorderBody::Session { destination, .. } => destination.clone(),
+        ReorderBody::Group { .. } => None,
+    };
+    settle_namespace(state, view, NamespaceMutation::Reorder(request), |view| {
+        if crossing {
+            let id = view.selected_session.clone().unwrap();
+            view.submit_session_reorder(&id, delta, destination)
+        } else {
+            view.handle_key(
+                KeyEvent::new(
+                    if delta < 0 {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    },
+                    KeyModifiers::CONTROL,
+                ),
+                None,
+            );
+            Ok(())
+        }
+    })
+    .await
+}
+pub(super) async fn refresh_native_fixture(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+) {
+    let mut rows = Vec::new();
+    for profile in crate::session::list_profiles().unwrap() {
+        let mut profile_rows = Storage::open_unwatched(&profile)
+            .unwrap()
+            .load_complete_with_groups()
+            .unwrap()
+            .0;
+        for row in &mut profile_rows {
+            row.source_profile = profile.clone();
+        }
+        rows.extend(profile_rows);
+    }
+    *state.instances.write().await = rows;
+    crate::server::test_support::refresh_canonical_metadata_for_test(state).await;
+    apply_published(view, state).await;
+}
+
+pub(super) async fn settle_trash(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    id: &str,
+) {
+    settle_row_command(
+        state,
+        view,
+        id,
+        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
+            kill_pane: true,
+        }),
+        |view| {
+            view.trash_session_by_id(id);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+}
+pub(super) async fn settle_restore(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    id: &str,
+) {
+    view.select_session_by_id(id);
+    settle_row_command(
+        state,
+        view,
+        id,
+        crate::tui::session_feed::SessionRequest::Restore,
+        HomeView::toggle_archive_at_cursor,
+    )
+    .await
+    .unwrap();
+}
+pub(super) fn fixture_trash(view: &mut HomeView, id: &str) {
+    view.mutate_instance(id, Instance::trash);
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+}
 
 #[test]
 #[serial]
@@ -157,10 +673,12 @@ fn retarget_same_session_tool_clears_previous_pane_content() {
 
 /// Trashing and restoring through the view's own actions keeps the group header count in
 /// step with the rows, since both rebuild from the same predicate.
-#[test]
+#[tokio::test]
 #[serial]
-fn group_header_count_tracks_trash_and_restore() {
+async fn group_header_count_tracks_trash_and_restore() {
     let mut env = create_test_env_with_group_sessions();
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     env.view.trashed_section_collapsed = false;
 
     let work_count = |env: &TestEnv| -> usize {
@@ -189,7 +707,7 @@ fn group_header_count_tracks_trash_and_restore() {
         .map(|i| i.id.clone())
         .expect("a direct work session");
 
-    env.view.trash_session_by_id(&target);
+    super::pickers_groups_sort::settle_trash(&state, &mut env.view, &target).await;
     assert_eq!(
         work_count(&env),
         2,
@@ -197,9 +715,7 @@ fn group_header_count_tracks_trash_and_restore() {
     );
 
     env.view.select_session_by_id(&target);
-    with_canonical_archive(&mut env, |env| {
-        env.view.toggle_archive_at_cursor().unwrap();
-    });
+    super::pickers_groups_sort::settle_restore(&state, &mut env.view, &target).await;
     assert_eq!(work_count(&env), 3, "restored session returns to the count");
 }
 
@@ -258,10 +774,13 @@ fn test_group_has_managed_worktrees_and_containers() {
     assert!(!view.group_has_containers("work", "work/", None));
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_delete_selected_group_updates_groups_field() {
+async fn test_delete_selected_group_updates_groups_field() {
     let mut env = create_test_env_with_group_sessions();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
 
     // Select the "work" group
     for (i, item) in env.view.flat_items.iter().enumerate() {
@@ -283,7 +802,7 @@ fn test_delete_selected_group_updates_groups_field() {
         .group_exists("work"));
 
     // Delete the group (this moves sessions to default)
-    env.view.delete_selected_group().unwrap();
+    settle_delete_group(&state, &mut env.view).await.unwrap();
 
     // Verify the group is removed from group_tree
     assert!(!env
@@ -458,9 +977,9 @@ fn test_prompt_archive_selected_group() {
     assert!(env.view.confirm_dialog.is_none());
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_delete_group_with_sessions_updates_groups_field() {
+async fn test_delete_group_with_sessions_updates_groups_field() {
     use crate::tui::dialogs::GroupDeleteOptions;
 
     let temp = TempDir::new().unwrap();
@@ -507,6 +1026,8 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
+    let state = native_state(&["test", "other"]).await;
+    apply_published(&mut view, &state).await;
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -536,37 +1057,58 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         delete_containers: false,
         force_delete_worktrees: false,
     };
-    view.delete_group_with_sessions(&options).unwrap();
-    view.save().unwrap();
-    let during_delete = storage.load().unwrap();
-    assert_eq!(during_delete.len(), 1);
-    assert_ne!(
-        during_delete[0].status,
-        Status::Deleting,
-        "save persisted the transient Deleting status"
-    );
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !view.apply_deletion_results() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mutation = || {
+        crate::daemon::NamespaceMutation::DeleteGroup(crate::daemon::DeleteGroupBody {
+            group: crate::daemon::GroupLocation {
+                profile: "test".into(),
+                path: "work".into(),
+            },
+            mode: crate::daemon::DeleteGroupMode::DeleteSessions,
+            cleanup: crate::daemon::DeleteSessionBody {
+                keep_scratch: false,
+                ..Default::default()
+            },
+        })
+    };
+    let before = payload_bytes("test");
+    settle_namespace(&state, &mut view, mutation(), |view| {
+        view.delete_group_with_sessions(&options)
+    })
+    .await
+    .expect_err("a fresh reservation rejects the entire group transaction");
+    assert_eq!(payload_bytes("test"), before);
     assert!(
         view.info_dialog.is_some(),
-        "busy purge result was not delivered"
+        "the definitive busy rejection is surfaced"
     );
-
-    let persisted = storage.load().unwrap();
-    assert_eq!(persisted.len(), 1);
-    assert!(persisted[0].group_path.is_empty());
-    assert_ne!(persisted[0].status, Status::Deleting);
+    let rejected = storage.load().unwrap();
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].group_path, "work/projects");
+    assert!(view.group_trees["test"].group_exists("work"));
+    assert!(view.group_trees["test"].group_exists("work/projects"));
+    assert_ne!(rejected[0].status, Status::Deleting);
+    // A subsequent operator action can run once the real lifecycle claim ended.
     storage
         .update(|instances, _| {
-            instances.clear();
+            instances[0].lifecycle_reservation = None;
             Ok(())
         })
         .unwrap();
+    refresh_native_fixture(&state, &mut view).await;
+    view.info_dialog = None;
+    view.selected_group = Some("work".into());
+    view.selected_group_profile = Some("test".into());
+    settle_namespace(&state, &mut view, mutation(), |view| {
+        view.delete_group_with_sessions(&options)
+    })
+    .await
+    .unwrap();
+    assert!(
+        storage.load().unwrap().is_empty(),
+        "unclaimed trashed member is actually purged"
+    );
 
-    view.reload().unwrap();
+    refresh_native_fixture(&state, &mut view).await;
     let tree = view.group_trees.get("test").unwrap();
     assert!(!tree.group_exists("work"));
     assert!(!tree.group_exists("work/projects"));
@@ -593,17 +1135,16 @@ fn test_delete_group_with_sessions_updates_groups_field() {
     view.selected_group_profile = Some("test".to_string());
     view.info_dialog = None;
 
-    view.delete_group_with_sessions(&options).unwrap();
+    let before = payload_bytes("test");
+    view.delete_group_with_sessions(&options)
+        .expect_err("creating member refuses deletion");
+    assert_eq!(payload_bytes("test"), before);
     assert_eq!(view.selected_group.as_deref(), Some("creating"));
-    assert_eq!(
-        view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Creation in progress")
-    );
 
     view.mutate_instance(&creating_id, |instance| {
         instance.status = Status::Deleting;
     });
-    view.save().unwrap();
+    assert_eq!(payload_bytes("test"), before);
     assert!(!storage
         .load()
         .unwrap()
@@ -611,10 +1152,13 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         .any(|instance| instance.id == creating_id));
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_group_collapsed_state_persists_across_reload() {
+async fn test_group_collapsed_state_persists_across_reload() {
     let mut env = create_test_env_with_groups();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
 
     let (group_idx, group_path) = env
         .view
@@ -634,7 +1178,23 @@ fn test_group_collapsed_state_persists_across_reload() {
 
     env.view.cursor = group_idx;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
+    settle_namespace(
+        &state,
+        &mut env.view,
+        crate::daemon::NamespaceMutation::CollapseGroup(crate::daemon::CollapseGroupBody {
+            group: crate::daemon::GroupLocation {
+                profile: "test".into(),
+                path: group_path.clone(),
+            },
+            collapsed: true,
+        }),
+        |view| {
+            view.handle_key(key(KeyCode::Enter), None);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(*collapsed, "group should be collapsed after Enter");
     }
@@ -906,81 +1466,157 @@ fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
 /// `git worktree add` plus a fetch and submodule init on the render thread froze the UI for
 /// the whole attach. A second dispatch for the same session is refused, since it would race
 /// the first one's worktree creation and worker bounce.
-#[test]
+#[tokio::test]
 #[serial]
-fn add_project_dispatches_to_the_poller_and_refuses_a_second_attach() {
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-
-    let dispatched = env
-        .view
-        .add_project_to_session(&id, std::path::Path::new("/tmp/some-repo"));
-    assert!(dispatched.is_ok(), "dispatch must not block on the attach");
-    assert!(
-        env.view.attach_project_in_flight.contains(&id),
-        "the in-flight marker is what suppresses a concurrent attach"
-    );
-    assert!(
-        env.view
-            .get_instance(&id)
-            .is_some_and(|i| i.all_repos().is_empty()),
-        "nothing is recorded until the worker reports back"
-    );
-
-    let second = env
-        .view
-        .add_project_to_session(&id, std::path::Path::new("/tmp/other-repo"));
-    assert!(second.is_err(), "a second attach must be refused");
-    assert!(format!("{:#}", second.unwrap_err()).contains("already running"));
+async fn add_project_admission_refuses_second_attach_until_canonical_completion() {
+    for succeeds in [false, true] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (main, _main_repo) = crate::git::test_support::init_repo();
+        let (incoming, _incoming_repo) = crate::git::test_support::init_repo();
+        let row = Instance::new("feature", main.path().to_str().unwrap());
+        let id = row.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("attach", vec![row]);
+        let state = native_state(&["attach"]).await;
+        let mut view = HomeView::new_for_test(
+            Some("attach".into()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        let before = payload_bytes("attach");
+        let project = if succeeds {
+            incoming.path()
+        } else {
+            main.path()
+        };
+        let expected = crate::tui::session_feed::SessionRequest::AttachProject(
+            crate::daemon::AttachProjectBody {
+                project: project.to_string_lossy().into_owned(),
+                attach_existing_branch: false,
+            },
+        );
+        let result = super::pickers_groups_sort::settle_row_command(
+            &state,
+            &mut view,
+            &id,
+            expected,
+            |view| {
+                view.add_project_to_session(&id, project)?;
+                assert!(view.add_project_to_session(&id, incoming.path()).is_err());
+                assert_eq!(payload_bytes("attach"), before);
+                assert!(view.get_instance(&id).unwrap().all_repos().is_empty());
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result.is_ok(), succeeds);
+        assert!(
+            !view.session_feed.any_pending(),
+            "completion consumes attach admission (the live-lane assertion ran inside settle_row_command)"
+        );
+        let stored = crate::server::test_support::load_instances_from_disk_for_test("attach")
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        if succeeds {
+            assert!(stored
+                .all_repos()
+                .iter()
+                .any(|repo| std::path::Path::new(&repo.main_repo_path) == incoming.path()));
+            for repo in stored.all_repos() {
+                assert!(std::path::Path::new(&repo.worktree_path)
+                    .join(".git")
+                    .exists());
+            }
+            assert_eq!(
+                serde_json::to_value(view.get_instance(&id).unwrap().workspace_info.clone())
+                    .unwrap(),
+                serde_json::to_value(stored.workspace_info).unwrap()
+            );
+        } else {
+            assert_eq!(payload_bytes("attach"), before);
+            assert!(stored.all_repos().is_empty());
+            assert!(view.info_dialog.is_some());
+        }
+    }
 }
 
 /// The completion path clears the marker and replaces the progress dialog for both
 /// outcomes; without the clear, one failed attach would leave the session permanently
 /// unattachable.
-#[test]
+#[tokio::test]
 #[serial]
-fn apply_attach_project_results_reports_and_clears_the_marker() {
-    for outcome in [
-        Ok("Attached 'frontend' on branch 'feature/abc'.".to_string()),
-        Err("branch 'feature/abc' already exists in the repo being attached".to_string()),
-    ] {
-        let expect_ok = outcome.is_ok();
-        let mut env = create_test_env_with_sessions(1);
-        let id = env.view.instance_at(0).id.clone();
-        env.view.attach_project_in_flight.insert(id.clone());
-        env.view.attach_project_poller =
-            crate::tui::attach_project_poller::AttachProjectPoller::with_result_for_test(
-                crate::tui::attach_project_poller::AttachProjectResult {
-                    session_id: id.clone(),
-                    outcome,
-                },
-            );
+async fn attach_project_receipts_publish_real_git_and_release_admission() {
+    for succeeds in [false, true] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (main, _main_repo) = crate::git::test_support::init_repo();
+        let (incoming, _incoming_repo) = crate::git::test_support::init_repo();
+        let row = Instance::new("feature", main.path().to_str().unwrap());
+        let id = row.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("attach", vec![row]);
+        let state = native_state(&["attach"]).await;
+        let mut view = HomeView::new_for_test(
+            Some("attach".into()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        let before = payload_bytes("attach");
+        let project = if succeeds {
+            incoming.path()
+        } else {
+            main.path()
+        };
+        let expected = crate::tui::session_feed::SessionRequest::AttachProject(
+            crate::daemon::AttachProjectBody {
+                project: project.to_string_lossy().into_owned(),
+                attach_existing_branch: false,
+            },
+        );
+        let result = super::pickers_groups_sort::settle_row_command(
+            &state,
+            &mut view,
+            &id,
+            expected,
+            |view| {
+                view.add_project_to_session(&id, project)?;
 
+                assert_eq!(payload_bytes("attach"), before);
+                assert!(view.get_instance(&id).unwrap().all_repos().is_empty());
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result.is_ok(), succeeds);
         assert!(
-            env.view.apply_attach_project_results(),
-            "a delivered result has to repaint"
+            !view.session_feed.any_pending(),
+            "completion consumes attach admission"
         );
-        assert!(
-            !env.view.attach_project_in_flight.contains(&id),
-            "the marker must clear, or the session stays unattachable forever"
-        );
-        let dialog = env
-            .view
-            .info_dialog
-            .as_ref()
-            .expect("the outcome must be visible, not a silent no-op");
-        if expect_ok {
-            assert!(
-                dialog.title().contains("Attached"),
-                "got {}",
-                dialog.title()
+        let stored = crate::server::test_support::load_instances_from_disk_for_test("attach")
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        if succeeds {
+            assert!(stored
+                .all_repos()
+                .iter()
+                .any(|repo| std::path::Path::new(&repo.main_repo_path) == incoming.path()));
+            for repo in stored.all_repos() {
+                assert!(std::path::Path::new(&repo.worktree_path)
+                    .join(".git")
+                    .exists());
+            }
+            assert_eq!(
+                serde_json::to_value(view.get_instance(&id).unwrap().workspace_info.clone())
+                    .unwrap(),
+                serde_json::to_value(stored.workspace_info).unwrap()
             );
         } else {
-            assert!(
-                dialog.title().contains("Could Not Attach"),
-                "got {}",
-                dialog.title()
-            );
+            assert_eq!(payload_bytes("attach"), before);
+            assert!(stored.all_repos().is_empty());
+            assert!(view.info_dialog.is_some());
         }
     }
 }
@@ -1030,13 +1666,16 @@ fn test_shift_o_opens_sort_picker_in_strict_mode() {
     assert!(env.view.send_message_dialog.is_none());
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_strict_mode_h_collapses_group() {
+async fn test_strict_mode_h_collapses_group() {
     // The help overlay lists "h/←" for Collapse group in strict mode, so bare `h` must walk
     // through dispatch and collapse the cursor's group, mirroring `l`/Right. Without the
     // explicit `Char('h')` arm it would fall into the typing-guard and open compose.
     let mut env = create_test_env_with_groups();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.strict_hotkeys = true;
 
     let group_idx = env
@@ -1052,7 +1691,24 @@ fn test_strict_mode_h_collapses_group() {
     env.view.cursor = group_idx;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('h')), None);
+    let group = env
+        .view
+        .canonical_group_location(env.view.selected_group.as_deref().unwrap())
+        .unwrap();
+    settle_namespace(
+        &state,
+        &mut env.view,
+        crate::daemon::NamespaceMutation::CollapseGroup(crate::daemon::CollapseGroupBody {
+            group,
+            collapsed: true,
+        }),
+        |view| {
+            view.handle_key(key(KeyCode::Char('h')), None);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
 
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(
@@ -1066,9 +1722,9 @@ fn test_strict_mode_h_collapses_group() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_non_strict_h_snoozes_only_in_attention_sort() {
+async fn test_non_strict_h_snoozes_only_in_attention_sort() {
     // Snooze is Attention-only: there `h` toggles snooze on the cursor's session and the
     // group below stays expanded, while every other sort falls through to the unconditional
     // `Left | Char('h')` collapse. Before the gate, snooze caught first in non-strict mode
@@ -1076,6 +1732,9 @@ fn test_non_strict_h_snoozes_only_in_attention_sort() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_groups();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.strict_hotkeys = false;
 
     // Attention sort flattens groups, so seed a cursor-on-session scenario and assert that
@@ -1112,7 +1771,24 @@ fn test_non_strict_h_snoozes_only_in_attention_sort() {
         .expect("setup should produce a group in Newest sort");
     env.view.cursor = group_idx;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Char('h')), None);
+    let group = env
+        .view
+        .canonical_group_location(env.view.selected_group.as_deref().unwrap())
+        .unwrap();
+    settle_namespace(
+        &state,
+        &mut env.view,
+        crate::daemon::NamespaceMutation::CollapseGroup(crate::daemon::CollapseGroupBody {
+            group,
+            collapsed: true,
+        }),
+        |view| {
+            view.handle_key(key(KeyCode::Char('h')), None);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(
             *collapsed,
@@ -1704,12 +2380,15 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
 
 /// Ctrl+Down and Ctrl+Up move a session within its group under the Custom sort, and the move
 /// survives a rebuild because it is stored on the session rather than recomputed.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_ctrl_arrows_move_a_session_under_custom_sort() {
+async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_mixed_sessions();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     // Set the order directly: `o` cycles from whatever the previous serial test persisted.
     env.view.apply_sort_order(SortOrder::Custom);
     let original: Vec<String> = work_group_titles(&env.view)
@@ -1743,8 +2422,9 @@ fn test_ctrl_arrows_move_a_session_under_custom_sort() {
     env.view.cursor = first;
     env.view.update_selected();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
     let moved: Vec<String> = work_group_titles(&env.view)
         .into_iter()
         .map(str::to_string)
@@ -1765,8 +2445,9 @@ fn test_ctrl_arrows_move_a_session_under_custom_sort() {
         "order is persisted, not recomputed"
     );
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, -1, false)
+        .await
+        .unwrap();
     assert_eq!(work_group_titles(&env.view), original);
 }
 
@@ -1848,12 +2529,10 @@ fn test_alt_arrows_jump_between_just_finished_sessions() {
         (1, Status::Idle, Some(stale)),
         (2, Status::Running, None),
     ] {
-        env.view
-            .apply_user_action(&ids[idx], |inst| {
-                inst.status = status;
-                inst.idle_entered_at = entered;
-            })
-            .unwrap();
+        env.view.mutate_instance(&ids[idx], |inst| {
+            inst.status = status;
+            inst.idle_entered_at = entered;
+        });
     }
     env.view.rebuild_flat_items();
     env.view.cursor = 0;
@@ -1878,12 +2557,15 @@ fn test_alt_arrows_jump_between_just_finished_sessions() {
 
 /// A session at the edge of its group keeps going into the neighbouring group, landing
 /// against the boundary it crossed rather than at a far end.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
+async fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_mixed_sessions();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
 
     let work_ids: Vec<String> = env
@@ -1914,8 +2596,9 @@ fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
     env.view.update_selected();
 
     // Above "work" sits the ungrouped bucket, so moving up leaves the group.
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, -1, false)
+        .await
+        .unwrap();
     assert_eq!(
         env.view.get_instance(&top).map(|i| i.group_path.clone()),
         Some(String::new()),
@@ -1923,8 +2606,9 @@ fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
     );
 
     // And back again, landing at the top of the group it re-enters.
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
     assert_eq!(
         env.view.get_instance(&top).map(|i| i.group_path.clone()),
         Some("work".to_string())
@@ -1938,9 +2622,9 @@ fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
 
 /// Ctrl+Down on a group header moves that group past its sibling, and the new order is what
 /// the list shows on the next rebuild.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_ctrl_arrows_move_a_group_among_its_siblings() {
+async fn test_ctrl_arrows_move_a_group_among_its_siblings() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -1949,6 +2633,9 @@ fn test_ctrl_arrows_move_a_group_among_its_siblings() {
         instance_in("c1", "/tmp/c1", "gamma"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
 
     let group_names = |view: &HomeView| -> Vec<String> {
@@ -1973,8 +2660,9 @@ fn test_ctrl_arrows_move_a_group_among_its_siblings() {
     env.view.update_selected();
     assert_eq!(env.view.selected_group.as_deref(), Some("alpha"));
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
     assert_eq!(group_names(&env.view), ["beta", "alpha", "gamma"]);
 
     env.view.rebuild_flat_items();
@@ -1987,9 +2675,9 @@ fn test_ctrl_arrows_move_a_group_among_its_siblings() {
 
 /// The last row of the last group has nowhere to go: Archived and Trash are sinks a session
 /// reaches by being archived or trashed, never by being moved into them.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_ctrl_down_stops_at_the_last_group() {
+async fn test_ctrl_down_stops_at_the_last_group() {
     use crate::session::config::SortOrder;
 
     let mut archived = instance_in("gone", "/tmp/gone", "alpha");
@@ -2000,6 +2688,9 @@ fn test_ctrl_down_stops_at_the_last_group() {
         archived,
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
     assert!(
         env.view
@@ -2028,8 +2719,9 @@ fn test_ctrl_down_stops_at_the_last_group() {
     env.view.update_selected();
 
     for _ in 0..3 {
-        env.view
-            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        settle_reorder(&state, &mut env.view, 1, false)
+            .await
+            .unwrap();
     }
 
     assert_eq!(
@@ -2061,12 +2753,10 @@ fn test_alt_arrows_leave_live_send_before_jumping() {
         .collect();
     assert!(ids.len() >= 3);
 
-    env.view
-        .apply_user_action(&ids[2], |inst| {
-            inst.status = Status::Idle;
-            inst.idle_entered_at = Some(Utc::now() - ChronoDuration::minutes(1));
-        })
-        .unwrap();
+    env.view.mutate_instance(&ids[2], |inst| {
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(Utc::now() - ChronoDuration::minutes(1));
+    });
     env.view.rebuild_flat_items();
     env.view.cursor = 0;
     env.view.update_selected();
@@ -2138,9 +2828,9 @@ fn test_row_moves_are_refused_outside_manual_grouping() {
 
 /// A group that exists only because a session names it has no `groups.json` row yet. Moving
 /// it must still persist the new order, or the next load rebuilds the original one.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_moving_a_group_without_a_stored_row_persists() {
+async fn test_moving_a_group_without_a_stored_row_persists() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -2148,6 +2838,9 @@ fn test_moving_a_group_without_a_stored_row_persists() {
         instance_in("b1", "/tmp/b1", "beta"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     // The seeder writes a row per group; drop them so the groups exist only through the
     // sessions that name them, which is what the group PATCH endpoint leaves behind.
     Storage::open_unwatched("test")
@@ -2167,8 +2860,9 @@ fn test_moving_a_group_without_a_stored_row_persists() {
         .expect("alpha header");
     env.view.cursor = header;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
 
     let (_, stored) = Storage::open_unwatched("test")
         .unwrap()
@@ -2180,9 +2874,9 @@ fn test_moving_a_group_without_a_stored_row_persists() {
 
 /// A peer can delete a group while this view holds a tree that still lists it. The move must
 /// be computed from what the store holds, or writing the stale tree back resurrects it.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
+async fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -2190,6 +2884,9 @@ fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
         instance_in("b1", "/tmp/b1", "beta"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
 
     // A peer removes "gamma" (present on disk and in this view's tree) behind our back.
@@ -2206,7 +2903,7 @@ fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    refresh_native_fixture(&state, &mut env.view).await;
     Storage::open_unwatched("test")
         .unwrap()
         .update(|_, groups| {
@@ -2223,8 +2920,9 @@ fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
         .expect("alpha header");
     env.view.cursor = header;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
 
     let (_, stored) = Storage::open_unwatched("test")
         .unwrap()
@@ -2286,9 +2984,9 @@ fn test_cursor_restore_keeps_the_group_profile() {
 
 /// A single-profile view leaves a header's profile unset. An empty or collapsed neighbour is
 /// still a destination: skipping it would carry the session past it into the group beyond.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_cross_group_move_lands_in_an_empty_neighbour() {
+async fn test_cross_group_move_lands_in_an_empty_neighbour() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -2296,6 +2994,9 @@ fn test_cross_group_move_lands_in_an_empty_neighbour() {
         instance_in("c1", "/tmp/c1", "gamma"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     // "beta" sits between them with no sessions of its own.
     Storage::open_unwatched("test")
         .unwrap()
@@ -2313,7 +3014,7 @@ fn test_cross_group_move_lands_in_an_empty_neighbour() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    refresh_native_fixture(&state, &mut env.view).await;
     env.view.apply_sort_order(SortOrder::Custom);
 
     let moving = env
@@ -2338,8 +3039,9 @@ fn test_cross_group_move_lands_in_an_empty_neighbour() {
     env.view.cursor = at;
     env.view.update_selected();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
 
     assert_eq!(
         env.view.get_instance(&moving).map(|i| i.group_path.clone()),
@@ -2365,9 +3067,9 @@ fn test_cross_group_move_lands_in_an_empty_neighbour() {
 /// A peer reorders the same group between this view's read and its write. Computing the
 /// permutation from the locked rows keeps the indices a permutation of 0..n; computing it
 /// from a stale snapshot leaves two rows sharing one.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_a_peer_swap_does_not_leave_duplicate_indices() {
+async fn test_a_peer_swap_does_not_leave_duplicate_indices() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -2376,6 +3078,8 @@ fn test_a_peer_swap_does_not_leave_duplicate_indices() {
         instance_in("c1", "/tmp/c1", "work"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
 
     let by_title = |view: &HomeView, title: &str| -> String {
@@ -2408,7 +3112,7 @@ fn test_a_peer_swap_does_not_leave_duplicate_indices() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    refresh_native_fixture(&state, &mut env.view).await;
 
     // A peer swaps b and c behind this view's back; the view still believes 0/1/2.
     Storage::open_unwatched("test")
@@ -2431,8 +3135,9 @@ fn test_a_peer_swap_does_not_leave_duplicate_indices() {
         .expect("a1 row");
     env.view.cursor = at;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
 
     let (rows, _) = Storage::open_unwatched("test")
         .unwrap()
@@ -2465,9 +3170,9 @@ fn custom_order_id_of(view: &HomeView, title: &str) -> String {
 /// its write. The destination is checked against the locked rows, so the move is dropped:
 /// writing the membership blind would make the next tree rebuild synthesize the group back
 /// from its new member and undo the deletion.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_a_move_does_not_resurrect_a_group_a_peer_deleted() {
+async fn test_a_move_does_not_resurrect_a_group_a_peer_deleted() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -2475,6 +3180,16 @@ fn test_a_move_does_not_resurrect_a_group_a_peer_deleted() {
         instance_in("b1", "/tmp/b1", "bbb"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|_, groups| {
+            groups.push(Group::new("ccc", "ccc"));
+            Ok(())
+        })
+        .unwrap();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
     let a = custom_order_id_of(&env.view, "a1");
     let b = custom_order_id_of(&env.view, "b1");
@@ -2501,8 +3216,9 @@ fn test_a_move_does_not_resurrect_a_group_a_peer_deleted() {
         .expect("a1 row");
     env.view.cursor = at;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
 
     let (rows, groups) = Storage::open_unwatched("test")
         .unwrap()
@@ -2520,18 +3236,29 @@ fn test_a_move_does_not_resurrect_a_group_a_peer_deleted() {
         "and the deleted group is not written back"
     );
     assert!(
+        groups.iter().any(|g| g.path == "ccc"),
+        "the surviving neighbour remains untouched"
+    );
+    assert!(
+        env.view.pending_namespace_intent.is_none(),
+        "no retargeted continuation is pending"
+    );
+    assert!(
         env.view.get_instance(&b).is_none(),
         "the list is refreshed instead, dropping the peer's deleted row"
     );
-    assert!(env.view.status_flash.is_some(), "the refresh is explained");
+    assert_eq!(env.view.selected_session.as_deref(), Some(a.as_str()));
+    assert!(
+        matches!(env.view.flat_items.get(env.view.cursor), Some(Item::Session { id, .. }) if id == &a)
+    );
 }
 
 /// A peer moves the cursor's session to another group first. The anchor no longer sits where
 /// the list drew it, so the move is dropped and the list refreshed: taken as an edge instead,
 /// it would push the row into whichever group the stale list showed next.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
+async fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -2540,6 +3267,9 @@ fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
         instance_in("c1", "/tmp/c1", "zzz"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
     let a = custom_order_id_of(&env.view, "a1");
     let x = custom_order_id_of(&env.view, "x1");
@@ -2556,7 +3286,7 @@ fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    refresh_native_fixture(&state, &mut env.view).await;
 
     // The peer moves a1 out of work behind this view's back.
     Storage::open_unwatched("test")
@@ -2577,8 +3307,9 @@ fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
         .expect("a1 row");
     env.view.cursor = at;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, 1, false)
+        .await
+        .unwrap();
 
     let (rows, _) = Storage::open_unwatched("test")
         .unwrap()
@@ -2604,64 +3335,61 @@ fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
 /// The move is stored before the destination group is expanded, so a failed expansion write
 /// still leaves the row in its new group on disk. The list is rebuilt either way: returning
 /// early would leave the cursor on a row the store places elsewhere.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_a_failed_expansion_still_settles_the_list() {
-    use crate::session::config::SortOrder;
-
+async fn test_failed_native_reorder_keeps_source_rows_and_explains_uncertainty() {
     let instances = [
         instance_in("a1", "/tmp/a1", "aaa"),
         instance_in("b1", "/tmp/b1", "bbb"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
-    env.view.apply_sort_order(SortOrder::Custom);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
+    env.view
+        .apply_sort_order(crate::session::config::SortOrder::Custom);
     let a = custom_order_id_of(&env.view, "a1");
-
-    // What a committed cross-group move leaves behind, before the expansion write is tried.
-    Storage::open_unwatched("test")
-        .unwrap()
-        .update(|rows, _| {
-            if let Some(row) = rows.iter_mut().find(|r| r.id == a) {
-                row.group_path = "bbb".to_string();
-            }
-            Ok(())
-        })
+    env.view.cursor = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { id, .. } if id == &a))
         .unwrap();
-    if let Some(row) = env.view.instances.get_mut(&a) {
-        row.group_path = "bbb".to_string();
-    }
-
-    env.view.after_committed_cross_group_move(
-        &a,
-        "bbb",
-        Err(anyhow::anyhow!("groups.json write failed")),
-    );
-
-    let header = env
-        .view
-        .flat_items
-        .iter()
-        .position(|i| matches!(i, Item::Group { path, .. } if path == "bbb"))
-        .expect("bbb header");
-    let row = env
-        .view
-        .flat_items
-        .iter()
-        .position(|i| matches!(i, Item::Session { id, .. } if *id == a))
-        .expect("a1 row");
-    assert!(
-        row > header,
-        "the list is rebuilt around the stored move: a1 at {row}, bbb header at {header}"
-    );
-    assert!(env.view.status_flash.is_some(), "the failure is explained");
+    env.view.update_selected();
+    let responder = env.view.session_feed.namespace_driver_for_test();
+    env.view
+        .submit_session_reorder(&a, 1, Some("bbb".into()))
+        .unwrap();
+    let storage = Storage::open_unwatched("test").unwrap();
+    let rows_before = std::fs::read(storage.sessions_path()).unwrap();
+    std::fs::write(storage.sessions_path().with_file_name("groups.json"), b"{").unwrap();
+    let (status, _, _) = request_with_headers(
+        &state,
+        "POST",
+        "/api/reorder",
+        serde_json::json!({
+            "target": "session", "id": a, "profile": "test", "source_group": "aaa",
+            "direction": "down", "destination": "bbb",
+        }),
+    )
+    .await;
+    assert!(status.is_server_error());
+    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), rows_before);
+    // A missing response is unknown, never a fabricated definitive rejection.
+    drop(responder);
+    env.view.apply_session_feed();
+    assert_eq!(env.view.get_instance(&a).unwrap().group_path, "aaa");
+    assert_eq!(env.view.selected_session.as_deref(), Some(a.as_str()));
+    assert!(env.view.namespace_unknown_message.is_some());
+    assert!(env.view.confirm_dialog.is_some());
 }
 
 /// The boundary half of a move runs in a second transaction, after the first has reported
 /// the row against the edge of its group. A peer that regroups the row in between must not
 /// have its change overwritten by a membership decided from the earlier read.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_a_boundary_move_rechecks_the_anchor_against_the_store() {
+async fn test_a_boundary_move_rechecks_the_anchor_against_the_store() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -2669,6 +3397,9 @@ fn test_a_boundary_move_rechecks_the_anchor_against_the_store() {
         instance_in("c1", "/tmp/c1", "zzz"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
     let a = custom_order_id_of(&env.view, "a1");
 
@@ -2682,8 +3413,10 @@ fn test_a_boundary_move_rechecks_the_anchor_against_the_store() {
         })
         .unwrap();
 
-    env.view
-        .move_session_across_groups(&a, 1)
+    env.view.selected_session = Some(a.clone());
+    env.view.selected_group = None;
+    settle_reorder(&state, &mut env.view, 1, true)
+        .await
         .expect("the boundary move is dropped, not failed");
 
     let (rows, _) = Storage::open_unwatched("test")
@@ -2713,9 +3446,9 @@ fn stored_group_order(profile: &str) -> Vec<String> {
 /// A unified view over a single profile draws its headers unqualified, and a stored group with
 /// no sessions has no member to infer an owner from. Without the sole store resolved
 /// explicitly the move had no profile to write to and did nothing at all.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
+async fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
     use crate::session::config::SortOrder;
 
     let (temp, guard) = test_home();
@@ -2739,6 +3472,9 @@ fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
         .unwrap();
 
     let mut view = test_view(None);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut view, &state).await;
     assert!(view.active_profile.is_none(), "a unified view");
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.apply_sort_order(SortOrder::Custom);
@@ -2754,11 +3490,11 @@ fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
     view.update_selected();
     assert_eq!(view.selected_group.as_deref(), Some("beta"));
     assert!(
-        view.selected_group_profile.is_none(),
-        "an empty group's header carries no profile, which is the case under test"
+        matches!(&view.flat_items[at], Item::Group { profile: None, .. }),
+        "the displayed header is unqualified"
     );
 
-    view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut view, -1, false).await.unwrap();
 
     assert_eq!(
         stored_group_order("test"),
@@ -2770,9 +3506,9 @@ fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
 /// When the destination stays collapsed because its expansion write failed, the moved row is
 /// not drawn. Leaving the selection on it would point the cursor at a session the list does
 /// not show, so it falls back to the header the row went under.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_a_hidden_destination_moves_the_selection_to_its_header() {
+async fn test_a_hidden_destination_moves_the_selection_to_its_header() {
     use crate::session::config::SortOrder;
 
     let instances = [
@@ -2780,38 +3516,14 @@ fn test_a_hidden_destination_moves_the_selection_to_its_header() {
         instance_in("b1", "/tmp/b1", "bbb"),
     ];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
     let a = custom_order_id_of(&env.view, "a1");
 
-    // What a committed cross-group move leaves behind when the destination is folded and the
-    // write that would have opened it failed.
-    Storage::open_unwatched("test")
-        .unwrap()
-        .update(|rows, groups| {
-            if let Some(row) = rows.iter_mut().find(|r| r.id == a) {
-                row.group_path = "bbb".to_string();
-            }
-            for group in groups.iter_mut() {
-                if group.path == "bbb" {
-                    group.collapsed = true;
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
-    if let Some(row) = env.view.instances.get_mut(&a) {
-        row.group_path = "bbb".to_string();
-    }
-    if let Some(tree) = env.view.group_trees.get_mut("test") {
-        tree.set_collapsed("bbb", true);
-    }
-    env.view.selected_session = Some(a.clone());
-
-    env.view.after_committed_cross_group_move(
-        &a,
-        "bbb",
-        Err(anyhow::anyhow!("groups.json write failed")),
-    );
+    // A later authoritative peer collapse hides a successfully moved row.
+    cross_then_peer_collapse(&state, &mut env.view, &a, "bbb").await;
 
     assert!(
         !env.view
@@ -2855,12 +3567,10 @@ fn test_ctrl_alt_arrows_do_not_jump_out_of_live_send() {
     assert!(ids.len() >= 3);
 
     // The same fixture the Alt+Down jump lands on, so a jump here would be unmistakable.
-    env.view
-        .apply_user_action(&ids[2], |inst| {
-            inst.status = Status::Idle;
-            inst.idle_entered_at = Some(Utc::now() - ChronoDuration::minutes(1));
-        })
-        .unwrap();
+    env.view.mutate_instance(&ids[2], |inst| {
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(Utc::now() - ChronoDuration::minutes(1));
+    });
     env.view.rebuild_flat_items();
     env.view.cursor = 0;
     env.view.update_selected();
@@ -2887,13 +3597,16 @@ fn test_ctrl_alt_arrows_do_not_jump_out_of_live_send() {
 /// `parent`, because it draws every ancestor of a member's path, so Ctrl+Up has to be able to
 /// land the row there. Counting only exact members took `parent` for a deleted group, refreshed
 /// into the same tree, and the row never moved however often the key was pressed.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_a_session_moves_up_into_an_implicit_parent_group() {
+async fn test_a_session_moves_up_into_an_implicit_parent_group() {
     use crate::session::config::SortOrder;
 
     let instances = [instance_in("c1", "/tmp/c1", "parent/child")];
     let mut env = seeded_env(test_home(), &instances, true);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     Storage::open_unwatched("test")
         .unwrap()
         .update(|_rows, groups| {
@@ -2901,7 +3614,7 @@ fn test_a_session_moves_up_into_an_implicit_parent_group() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    refresh_native_fixture(&state, &mut env.view).await;
     env.view.apply_sort_order(SortOrder::Custom);
     let stored_groups = || {
         Storage::open_unwatched("test")
@@ -2937,8 +3650,9 @@ fn test_a_session_moves_up_into_an_implicit_parent_group() {
         .position(|i| matches!(i, Item::Session { id: row, .. } if *row == id))
         .expect("c1 row");
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+    settle_reorder(&state, &mut env.view, -1, false)
+        .await
+        .unwrap();
 
     let (rows, _) = Storage::open_unwatched("test")
         .unwrap()
@@ -2961,7 +3675,7 @@ fn test_a_session_moves_up_into_an_implicit_parent_group() {
         "and it is drawn under the cursor"
     );
 
-    env.view.reload_storage_only().unwrap();
+    refresh_native_fixture(&state, &mut env.view).await;
     assert_eq!(
         env.view
             .get_instance(&id)
@@ -2975,9 +3689,9 @@ fn test_a_session_moves_up_into_an_implicit_parent_group() {
 /// Two profiles can hold groups with the same path. When the expansion write fails and the
 /// selection falls back to the destination's header, that has to be the header in the moving
 /// row's own profile: matching the path alone picks whichever profile is drawn first.
-#[test]
+#[tokio::test]
 #[serial]
-fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile() {
+async fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile() {
     use crate::session::config::SortOrder;
 
     let (temp, guard) = test_home();
@@ -2991,6 +3705,9 @@ fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile() {
         ],
     );
     let mut view = test_view(None);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut view, &state).await;
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.apply_sort_order(SortOrder::Custom);
     view.flat_items = view.build_flat_items();
@@ -3007,35 +3724,8 @@ fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile() {
         "alpha's bbb is drawn first, so matching the path alone would land there"
     );
 
-    // What a committed move of b1 into beta's bbb leaves behind when the write that would have
-    // opened the folded group failed.
-    Storage::open_unwatched("beta")
-        .unwrap()
-        .update(|rows, groups| {
-            if let Some(row) = rows.iter_mut().find(|r| r.id == b1) {
-                row.group_path = "bbb".to_string();
-            }
-            for group in groups.iter_mut() {
-                if group.path == "bbb" {
-                    group.collapsed = true;
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
-    if let Some(row) = view.instances.get_mut(&b1) {
-        row.group_path = "bbb".to_string();
-    }
-    if let Some(tree) = view.group_trees.get_mut("beta") {
-        tree.set_collapsed("bbb", true);
-    }
-    view.selected_session = Some(b1.clone());
-
-    view.after_committed_cross_group_move(
-        &b1,
-        "bbb",
-        Err(anyhow::anyhow!("groups.json write failed")),
-    );
+    // A later authoritative peer collapse hides a successfully moved row.
+    cross_then_peer_collapse(&state, &mut view, &b1, "bbb").await;
 
     assert_eq!(view.selected_group.as_deref(), Some("bbb"));
     assert_eq!(

@@ -376,9 +376,9 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
         match tok.to_ascii_lowercase().as_str() {
             "ctrl" | "control" => ctrl = true,
             "shift" => shift = true,
-            // Unsupported modifiers and a second key token are rejected rather
-            // than silently remapped: `Alt+K` must not collapse to a bare `k`
-            // that hijacks core navigation.
+            // Unsupported modifiers and a second key token are rejected rather than
+            // silently remapped: `Alt+K` must not collapse to a bare `k` that hijacks core
+            // navigation.
             "alt" | "option" | "meta" | "super" | "cmd" => return None,
             _ if key.is_none() => key = Some(tok),
             _ => return None,
@@ -386,9 +386,9 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
     }
     let key = key?;
     let code = if key.len() == 1 {
-        // Match the table's convention: bare letters are lowercase chars, Shift
-        // is encoded as the uppercase char (terminals deliver Ctrl+k as a
-        // lowercase Char with the CONTROL modifier, Shift+d as Char('D')).
+        // Match the table's convention: bare letters are lowercase chars and Shift is the
+        // uppercase char, since terminals deliver Ctrl+k as a lowercase Char with the
+        // CONTROL modifier and Shift+d as Char('D').
         let c = key.chars().next().unwrap();
         let c = if shift {
             c.to_ascii_uppercase()
@@ -456,9 +456,9 @@ fn format_chord(c: &Chord) -> String {
 // one (search-cycle vs new, etc.) come first so they win when their guard holds.
 pub static BINDINGS: &[Binding] = &[
     // --- search cycle (only while matches are active; both modes) ---
-    // Only bare `n` cycles (forward, wrapping). `N`/Shift+N stays a new-session
-    // key in every state so a committed search never shadows it (#3038); the
-    // forward wrap keeps every match reachable, so there is no reverse binding.
+    // Only bare `n` cycles, forward and wrapping, so every match stays reachable with no
+    // reverse binding; `N` stays a new-session key in every state so a committed search
+    // never shadows it (#3038).
     Binding {
         id: ActionId::SearchNext,
         non_strict: &[k('n')],
@@ -873,13 +873,10 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Settings,
         }),
     },
-    // Pin toggle shares `p` (Shift+P in strict) with Projects, but only fires
-    // when a project header is selected, so it must precede the Projects
-    // binding. On a project header `p` pins/unpins; everywhere else `p` still
-    // opens the projects dialog. The help desc names that gate ("group header
-    // only", the same idiom the Attention section uses) because the `?` overlay
-    // has no notion of context and lists both `p` rows unconditionally, which
-    // is what made the shared key look ambiguous in #3133.
+    // Pin toggle shares `p` (Shift+P in strict) with Projects but fires only on a project
+    // header, so it must precede the Projects binding. The help desc names that gate
+    // ("group header only") because the `?` overlay has no notion of context and lists both
+    // `p` rows unconditionally, which is what made the shared key look ambiguous in #3133.
     Binding {
         id: ActionId::ToggleProjectPin,
         non_strict: &[k('p')],
@@ -938,12 +935,9 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
-    // `U` toggles read/unread, pinned to Shift+u in BOTH modes (matches the
-    // macOS Mail "mark unread" muscle memory and keeps the key stable). It does
-    // NOT participate in the strict relocation: `U` is already a modified key,
-    // so it satisfies strict mode's "no bare action letters" rule as-is.
-    // `u` updates (when available) and relocates the usual way: bare `u` in
-    // non-strict, `Ctrl+u` in strict.
+    // `U` toggles read/unread, pinned to Shift+u in both modes (matching macOS Mail muscle
+    // memory). It does not relocate under strict mode: a modified key already satisfies the
+    // "no bare action letters" rule. `u` updates and relocates the usual way.
     Binding {
         id: ActionId::ToggleUnread,
         non_strict: &[k('U')],
@@ -1046,10 +1040,9 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Views,
         }),
     },
-    // Tips overlay. No key chords: it's reached from the palette, the badge,
-    // and the `?` help screen, so it never shadows a typing-guard key. `help`
-    // is None because the help overlay skips keyless rows; it gets a bespoke
-    // row in `components/help.rs` instead.
+    // Tips overlay. No key chords: it is reached from the palette, the badge and the `?`
+    // screen, so it never shadows a typing-guard key. `help` is None because the overlay
+    // skips keyless rows and gives it a bespoke row in `components/help.rs`.
     Binding {
         id: ActionId::Tips,
         non_strict: &[],
@@ -1090,9 +1083,9 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Settings,
         }),
     },
-    // Palette-only: Shift+F collides with strict-mode ToggleFavorite under
-    // Attention sort and the home keyspace is saturated, so fork is reached
-    // from the command palette and the context menu only.
+    // Palette-only: Shift+F collides with strict-mode ToggleFavorite under Attention sort
+    // and the home keyspace is saturated, so fork is reached from the palette and the
+    // context menu.
     Binding {
         id: ActionId::Fork,
         non_strict: &[],
@@ -1105,9 +1098,9 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
-    // The mnemonic keys (a/A, n/N, r/R, t/T) are all taken and the home
-    // keyspace is saturated (see Fork above), so "Auto-name now" lands on the
-    // free v/V pair. Gated to a still-default-named session inside the handler.
+    // The mnemonic keys (a/A, n/N, r/R, t/T) are taken and the home keyspace is saturated
+    // (see Fork), so "Auto-name now" lands on the free v/V pair. Gated to a
+    // still-default-named session inside the handler.
     Binding {
         id: ActionId::AutoName,
         non_strict: &[k('v')],
@@ -1336,9 +1329,8 @@ mod tests {
         }
     }
 
-    // #3038: a committed search must never shadow Shift+N. Only bare `n` cycles
-    // (forward); every `N`/Shift+N chord stays a new-session action whether or
-    // not a search is committed.
+    // #3038: a committed search must never shadow Shift+N. Only bare `n` cycles; every
+    // `N` chord stays a new-session action.
     #[test]
     fn committed_search_cycles_n_but_never_shadows_shift_new_session() {
         let mut c = ctx();

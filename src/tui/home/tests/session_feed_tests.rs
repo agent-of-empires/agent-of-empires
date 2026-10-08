@@ -11,6 +11,7 @@ fn structured_row(env: &mut TestEnv, status: Status) -> String {
     inst.status = status;
     let id = inst.id.clone();
     env.view.add_instance(inst);
+    seed_profile("test", &env.view.cloned_instances());
     id
 }
 
@@ -24,8 +25,11 @@ fn pending_daemon_approvals() -> Vec<crate::daemon::PendingApproval> {
     }]
 }
 
-fn update(id: &str, status: Status) -> crate::daemon::SessionResponse {
-    daemon_row(id, &format!("{status:?}"))
+fn update(view: &HomeView, id: &str, status: Status) -> crate::daemon::SessionResponse {
+    daemon_row(
+        view.get_instance(id).expect("fixture row"),
+        &format!("{status:?}"),
+    )
 }
 
 #[test]
@@ -35,7 +39,7 @@ fn daemon_status_moves_a_structured_row_off_idle() {
     let id = structured_row(&mut env, Status::Idle);
 
     env.view
-        .apply_daemon_status_update(&update(&id, Status::Running));
+        .apply_daemon_status_update(&update(&env.view, &id, Status::Running));
 
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
@@ -47,14 +51,13 @@ fn daemon_status_moves_a_structured_row_off_idle() {
 #[test]
 #[serial]
 fn daemon_status_carries_the_waiting_state_for_a_pending_approval() {
-    // `derive_acp_status` maps ApprovalRequested/ElicitationRequested to
-    // Waiting; the whole point of the yellow pill is spotting a session
-    // blocked on you from the home list without opening it.
+    // `derive_acp_status` maps ApprovalRequested/ElicitationRequested to Waiting; the
+    // yellow pill exists to spot a session blocked on you from the home list.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Running);
 
     env.view
-        .apply_daemon_status_update(&update(&id, Status::Waiting));
+        .apply_daemon_status_update(&update(&env.view, &id, Status::Waiting));
 
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
@@ -65,10 +68,7 @@ fn daemon_status_carries_the_waiting_state_for_a_pending_approval() {
 #[test]
 #[serial]
 fn daemon_status_clears_a_stale_error_message() {
-    // The pre-fix sandbox-dead branch left sandboxed structured rows at
-    // Idle with a phantom "Container is not running" hanging off them. The
-    // daemon's own `last_error` is authoritative, so applying it clears the
-    // leftover rather than letting it sit on the row for the session's life.
+    // Canonical last_error replaces stale pane diagnostics.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Error);
     env.view.mutate_instance(&id, |inst| {
@@ -76,7 +76,7 @@ fn daemon_status_clears_a_stale_error_message() {
     });
 
     env.view
-        .apply_daemon_status_update(&update(&id, Status::Idle));
+        .apply_daemon_status_update(&update(&env.view, &id, Status::Idle));
 
     let inst = env.view.get_instance(&id).expect("row still present");
     assert_eq!(inst.status, Status::Idle);
@@ -89,8 +89,9 @@ fn daemon_status_ignores_an_unknown_session_id() {
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Idle);
 
-    env.view
-        .apply_daemon_status_update(&update("not-a-session", Status::Running));
+    let mut unknown = update(&env.view, &id, Status::Running);
+    unknown.id = "not-a-session".into();
+    env.view.apply_daemon_status_update(&unknown);
 
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
@@ -98,23 +99,12 @@ fn daemon_status_ignores_an_unknown_session_id() {
     );
 }
 
-pub(super) fn daemon_row(id: &str, status: &str) -> crate::daemon::SessionResponse {
-    serde_json::from_value(serde_json::json!({
-        "id": id,
-        "status": status,
-        "view": "structured",
-    }))
-    .unwrap()
-}
-
-fn daemon_row_in(profile: &str, id: &str, status: &str) -> crate::daemon::SessionResponse {
-    serde_json::from_value(serde_json::json!({
-        "id": id,
-        "profile": profile,
-        "status": status,
-        "view": "structured",
-    }))
-    .unwrap()
+fn daemon_row(instance: &Instance, status: &str) -> crate::daemon::SessionResponse {
+    let mut row = crate::daemon::SessionResponse::from_instance(instance, false);
+    row.status = status.into();
+    row.last_error = None;
+    row.pane_dead_observed = false;
+    row
 }
 
 /// A `default`-profile row held by the view, returned whole so a test can also
@@ -129,37 +119,36 @@ fn local_row(env: &mut TestEnv, title: &str, path: &str) -> Instance {
     inst
 }
 
-pub(super) fn daemon_snapshot(id: &str, status: &str) -> SessionFeedResult {
-    snapshot_of(vec![daemon_row(id, status)])
+pub(super) fn daemon_snapshot(view: &HomeView, id: &str, status: &str) -> SessionFeedResult {
+    let mut sessions = vec![daemon_row(
+        view.get_instance(id).expect("fixture target"),
+        status,
+    )];
+    sessions.extend(
+        view.instances()
+            .filter(|instance| instance.id != id)
+            .map(|instance| crate::daemon::SessionResponse::from_instance(instance, false)),
+    );
+    SessionFeedResult::Snapshot(Arc::new(fixture_snapshot(
+        sessions,
+        "test",
+        "test",
+        view.session_feed.next_revision_for_test(),
+    )))
 }
 
-pub(super) fn archived_daemon_snapshot(id: &str) -> SessionFeedResult {
-    let mut row = daemon_row(id, "Stopped");
-    row.archived_at = Some(chrono::Utc::now().to_rfc3339());
-    snapshot_of(vec![row])
+pub(super) fn archived_daemon_snapshot(view: &HomeView, id: &str) -> SessionFeedResult {
+    let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(view, id, "Stopped") else {
+        unreachable!()
+    };
+    Arc::make_mut(&mut snapshot).contents.sessions[0].archived_at =
+        Some(chrono::Utc::now().to_rfc3339());
+    SessionFeedResult::Snapshot(snapshot)
 }
 
-/// A snapshot whose rows carry their profile, which is what decides whether
-/// this view may act on them.
+/// Explicit membership snapshots, including peer-created and removed rows.
 fn snapshot_of(sessions: Vec<crate::daemon::SessionResponse>) -> SessionFeedResult {
-    SessionFeedResult::Snapshot(std::sync::Arc::new(crate::daemon::RuntimeSnapshot {
-        cursor: crate::daemon::RuntimeCursor {
-            epoch: "test".into(),
-            revision: 1,
-        },
-        contents: crate::daemon::RuntimeContents {
-            health: crate::daemon::RuntimeHealth::Healthy,
-            capabilities: crate::daemon::RuntimeCapabilities {
-                mutations: true,
-                native_interaction: true,
-            },
-            default_profile: "test".into(),
-            sessions,
-            profiles: vec![],
-            workspace_ordering: vec![],
-            global_projects: vec![],
-        },
-    }))
+    SessionFeedResult::Snapshot(Arc::new(fixture_snapshot(sessions, "test", "test", 1)))
 }
 
 #[test]
@@ -193,7 +182,8 @@ fn native_attachment_never_survives_a_cancelled_context() {
         let other = env.view.instance_at(1).id.clone();
         env.view.select_session_by_id(&id);
         let mut respond = env.view.session_feed.terminal_driver_for_test();
-        let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&id, "Stopped") else {
+        let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Stopped")
+        else {
             unreachable!()
         };
         let target = AuxiliaryTarget::Host { index: 0 };
@@ -204,6 +194,7 @@ fn native_attachment_never_survives_a_cancelled_context() {
                 pane: crate::session::PaneObservation {
                     state: PanePresence::Alive,
                     tmux_session: Some("daemon-owned-target".into()),
+                    legacy_tool: None,
                 },
             });
         env.view
@@ -235,6 +226,7 @@ fn native_attachment_never_survives_a_cancelled_context() {
             }
             Change::Profile => {
                 let original = env.view.active_profile.clone();
+                seed_profile("native-other", &[]);
                 env.view
                     .switch_profile(Some("native-other".into()))
                     .unwrap();
@@ -273,7 +265,7 @@ fn native_attachment_never_survives_a_cancelled_context() {
                     tmux_session: "daemon-owned-target".into(),
                     status: TerminalTargetStatus::Exists,
                     lifecycle_generation: 0,
-                    profile: String::new(),
+                    profile: "test".into(),
                 },
             })
         });
@@ -283,9 +275,8 @@ fn native_attachment_never_survives_a_cancelled_context() {
             matches!(change, Change::None),
             "{change:?}"
         );
-        assert_eq!(
+        assert!(
             env.view.session_feed.can_submit(&id),
-            true,
             "known completion frees the row after UX cancellation: {change:?}"
         );
         if matches!(change, Change::Rejected) {
@@ -316,8 +307,8 @@ fn a_snapshot_row_this_view_never_saw_is_loaded_from_storage() {
         .unwrap();
 
     env.view.session_feed.publish_for_test(snapshot_of(vec![
-        daemon_row_in("test", &local_id, "Idle"),
-        daemon_row_in("test", &peer_id, "Running"),
+        daemon_row(&local, "Idle"),
+        daemon_row(&peer, "Running"),
     ]));
 
     assert!(
@@ -341,41 +332,59 @@ fn a_snapshot_row_this_view_never_saw_is_loaded_from_storage() {
     );
 }
 
-/// The snapshot can list rows this view must not adopt: another profile's, or
-/// one the disk does not have. Neither may disturb the rows on screen.
+/// Off-profile rows stay out of this filtered view; missing local metadata must keep the cursor unapplied.
 #[test]
 #[serial]
 fn a_snapshot_row_outside_the_local_view_is_not_adopted() {
     let mut env = create_test_env_empty();
     let local = local_row(&mut env, "local session", "/tmp/local");
-    let local_id = local.id.clone();
-    Storage::new_unwatched("test")
-        .unwrap()
-        .update(|rows, _| {
-            rows.push(local.clone());
-            Ok(())
-        })
-        .unwrap();
-
+    seed_profile("test", std::slice::from_ref(&local));
+    let mut elsewhere = Instance::new("elsewhere", "/tmp/elsewhere");
+    elsewhere.source_profile = "other-profile".into();
+    seed_profile("other-profile", std::slice::from_ref(&elsewhere));
+    let _driver = env.view.session_feed.command_driver_for_test();
     env.view.session_feed.publish_for_test(snapshot_of(vec![
-        daemon_row_in("test", &local_id, "Running"),
-        daemon_row_in("test", "phantom", "Running"),
-        daemon_row_in("other-profile", "elsewhere", "Running"),
+        daemon_row(&local, "Running"),
+        daemon_row(&elsewhere, "Running"),
     ]));
-    assert!(env.view.apply_session_feed());
-
+    env.view.apply_session_feed();
     assert_eq!(
-        env.view.get_instance(&local_id).map(|inst| inst.status),
-        Some(Status::Running),
-        "the applied status survives the reload a phantom row triggers"
+        env.view.get_instance(&local.id).unwrap().status,
+        Status::Running
     );
-    assert!(
-        env.view.get_instance("phantom").is_none(),
-        "a row the disk does not have is never invented"
+    assert!(env.view.get_instance(&elsewhere.id).is_none());
+    assert!(env
+        .view
+        .session_feed
+        .receipt_applied(&crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 1
+        }));
+
+    let mut phantom = Instance::new("metadata unavailable", "/tmp/missing");
+    phantom.source_profile = "test".into();
+    // This complete daemon row has not reached the read-only local metadata mirror.
+    let snapshot = fixture_snapshot(
+        vec![
+            daemon_row(&local, "Stopped"),
+            daemon_row(&phantom, "Running"),
+        ],
+        "test",
+        "test",
+        2,
     );
-    assert!(
-        env.view.get_instance("elsewhere").is_none(),
-        "another profile's row stays out of this view"
+    let cursor = snapshot.cursor.clone();
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(Arc::new(snapshot)));
+    env.view.apply_session_feed();
+    assert!(!env.view.session_feed.receipt_applied(&cursor));
+    assert!(!env.view.session_feed.current_snapshot_applied());
+    assert!(env.view.get_instance(&phantom.id).is_none());
+    assert_eq!(
+        env.view.get_instance(&local.id).unwrap().status,
+        Status::Running,
+        "a failed canonical apply cannot partially replace displayed rows"
     );
 }
 
@@ -391,7 +400,8 @@ fn session_feed_result_selects_the_sidebar_source() {
     env.view.sidebar_source = SidebarSource::Disconnected;
     let id = structured_row(&mut env, Status::Idle);
     assert_eq!(env.view.sidebar_source, SidebarSource::Disconnected);
-    env.view.session_feed = SessionFeed::seeded_for_test(daemon_snapshot(&id, "Running"));
+    env.view.session_feed =
+        SessionFeed::seeded_for_test(daemon_snapshot(&env.view, &id, "Running"));
 
     assert!(
         env.view.apply_session_feed(),
@@ -438,7 +448,7 @@ fn disconnected_runtime_hides_session_content_until_a_fresh_snapshot() {
     });
     env.view
         .session_feed
-        .publish_for_test(daemon_snapshot(&id, "Running"));
+        .publish_for_test(daemon_snapshot(&env.view, &id, "Running"));
     env.view.apply_session_feed();
     assert!(render_home_to_string(&mut env.view, 120, 40).contains("offline-sensitive-session"));
 
@@ -458,7 +468,7 @@ fn disconnected_runtime_hides_session_content_until_a_fresh_snapshot() {
 
     env.view
         .session_feed
-        .publish_for_test(daemon_snapshot(&id, "Stopped"));
+        .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
     env.view.apply_session_feed();
     assert!(render_home_to_string(&mut env.view, 120, 40).contains("offline-sensitive-session"));
 }
@@ -470,7 +480,8 @@ fn terminal_status_follows_canonical_snapshots_across_stop_and_disconnect() {
     let id = env.view.instance_at(0).id.clone();
     env.view
         .mutate_instance(&id, |instance| instance.status = Status::Stopped);
-    let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&id, "Running") else {
+    let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Running")
+    else {
         unreachable!()
     };
     std::sync::Arc::make_mut(&mut snapshot).contents.sessions[0].view =
@@ -517,7 +528,7 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
             pane: PaneObservation::default(),
         }];
     });
-    let SessionFeedResult::Snapshot(snapshot) = daemon_snapshot(&id, "Idle") else {
+    let SessionFeedResult::Snapshot(snapshot) = daemon_snapshot(&env.view, &id, "Idle") else {
         unreachable!()
     };
     let snapshot = {
@@ -573,13 +584,15 @@ fn canonical_favorite_reorder_keeps_cursor_on_selected_session() {
     let selected = ids.last().unwrap().clone();
     env.view.select_session_by_id(&selected);
     let old_cursor = env.view.cursor;
-    let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&selected, "Stopped") else {
+    let SessionFeedResult::Snapshot(mut snapshot) =
+        daemon_snapshot(&env.view, &selected, "Stopped")
+    else {
         unreachable!()
     };
     std::sync::Arc::make_mut(&mut snapshot).contents.sessions = ids
         .iter()
         .map(|id| {
-            let mut row = daemon_row(id, "Stopped");
+            let mut row = daemon_row(env.view.get_instance(id).unwrap(), "Stopped");
             row.view = crate::session::View::Terminal;
             if id == &selected {
                 row.favorited = true;
@@ -624,7 +637,7 @@ fn applied_feed_result_is_consumed_exactly_once() {
 
     env.view
         .session_feed
-        .publish_for_test(daemon_snapshot(&id, "Running"));
+        .publish_for_test(daemon_snapshot(&env.view, &id, "Running"));
     assert!(
         env.view.apply_session_feed(),
         "a fresh publication asks for a redraw"
@@ -644,7 +657,7 @@ fn applied_feed_result_is_consumed_exactly_once() {
     // A new publication after the completed apply is picked up again.
     env.view
         .session_feed
-        .publish_for_test(daemon_snapshot(&id, "Stopped"));
+        .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
     assert!(env.view.apply_session_feed());
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
@@ -664,7 +677,7 @@ fn daemon_status_lifts_a_locally_stopped_structured_row() {
     let id = structured_row(&mut env, Status::Stopped);
 
     env.view
-        .apply_daemon_status_update(&update(&id, Status::Running));
+        .apply_daemon_status_update(&update(&env.view, &id, Status::Running));
 
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
@@ -683,7 +696,7 @@ fn daemon_status_stopped_leaves_a_stopped_row_alone() {
     let id = structured_row(&mut env, Status::Stopped);
 
     env.view
-        .apply_daemon_status_update(&update(&id, Status::Stopped));
+        .apply_daemon_status_update(&update(&env.view, &id, Status::Stopped));
 
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
@@ -701,8 +714,8 @@ fn canonical_status_changes_never_persist_from_the_tui() {
         let mut env = create_test_env_empty();
         let id = structured_row(&mut env, Status::Idle);
         env.view.mutate_instance(&id, |row| row.view = view);
-        env.view.save().expect("seed the durable row");
-        let mut observed = update(&id, Status::Running);
+        seed_profile("test", &env.view.cloned_instances());
+        let mut observed = update(&env.view, &id, Status::Running);
         observed.view = view;
         env.view.apply_daemon_status_update(&observed);
         assert_eq!(
@@ -735,13 +748,11 @@ fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Running);
-    env.view
-        .save()
-        .expect("seed the structured row on disk as read/Running");
+    seed_profile("test", &env.view.cloned_instances());
 
     // A finished turn (Running -> Idle).
     env.view
-        .apply_daemon_status_update(&update(&id, Status::Idle));
+        .apply_daemon_status_update(&update(&env.view, &id, Status::Idle));
 
     let inst = env.view.get_instance(&id).expect("row still present");
     assert_eq!(inst.status, Status::Idle, "the turn-end still applies");
@@ -784,7 +795,7 @@ fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
         env.view
             .mutate_instance(&id, |inst| inst.last_error = Some(seeded.to_string()));
 
-        let mut u = update(&id, status);
+        let mut u = update(&env.view, &id, status);
         u.last_error = incoming.map(str::to_string);
         env.view.apply_daemon_status_update(&u);
 
@@ -806,7 +817,7 @@ fn daemon_status_applies_to_a_snoozed_structured_row() {
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
 
     env.view
-        .apply_daemon_status_update(&update(&id, Status::Running));
+        .apply_daemon_status_update(&update(&env.view, &id, Status::Running));
 
     assert_eq!(
         env.view.get_instance(&id).map(|i| i.status),
@@ -835,7 +846,7 @@ fn daemon_update_clears_cached_approvals_when_a_row_is_sunk() {
         });
 
         env.view
-            .apply_daemon_status_update(&update(&id, Status::Idle));
+            .apply_daemon_status_update(&update(&env.view, &id, Status::Idle));
 
         assert!(
             !env.view.structured_pending_approvals.contains_key(&id),
@@ -876,7 +887,7 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
     });
     // The daemon publishes the stop: Stopped + pane_dead_observed with both
     // pane seeds flipped to Dead.
-    let SessionFeedResult::Snapshot(snapshot) = daemon_snapshot(&id, "Stopped") else {
+    let SessionFeedResult::Snapshot(snapshot) = daemon_snapshot(&env.view, &id, "Stopped") else {
         unreachable!()
     };
     let snapshot = {
@@ -970,7 +981,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     );
 
     // Outcome-side: the canonical snapshot, not a local write, flips the row.
-    let mut stopped = daemon_row(&id, "Stopped");
+    let mut stopped = daemon_row(env.view.get_instance(&id).unwrap(), "Stopped");
     stopped.last_error = None;
     env.view.apply_daemon_status_update(&stopped);
     let inst = env.view.get_instance(&id).expect("row still present");
@@ -1032,12 +1043,13 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
         env.view.select_session_by_id(&id);
-        let mut row = daemon_row_in("test", &id, "Running");
+        let mut row = daemon_row(env.view.get_instance(&id).unwrap(), "Running");
         row.view = crate::session::View::Terminal;
         row.lifecycle_generation = 4;
         row.agent_pane = PaneObservation {
             state: PanePresence::Alive,
             tmux_session: Some("restarted-agent".into()),
+            legacy_tool: None,
         };
         let SessionFeedResult::Snapshot(mut snapshot) = snapshot_of(vec![row]) else {
             unreachable!()
@@ -1070,7 +1082,7 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
                 target: Some(TerminalTarget {
                     tmux_session: "restarted-agent".into(),
                     status: TerminalTargetStatus::Restarted,
-                    lifecycle_generation: 0,
+                    lifecycle_generation: 5,
                     profile: String::new(),
                 }),
             },
@@ -1106,26 +1118,15 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
     }
 }
 
-/// A runtime row carrying the full durable projection, as the daemon sends
-/// it. Minimal test rows (id/status only) deliberately skip metadata
-/// comparison in the view.
+/// A complete runtime row, with deliberate canonical changes for the scenario.
 fn canonical_row(
-    instance: &crate::session::Instance,
+    instance: &Instance,
     overrides: serde_json::Value,
 ) -> crate::daemon::SessionResponse {
-    let mut value = serde_json::json!({
-        "id": instance.id,
-        "title": instance.title,
-        "project_path": instance.project_path,
-        "profile": instance.source_profile,
-        "group_path": instance.group_path,
-        "tool": instance.tool,
-        "view": instance.view,
-        "status": format!("{:?}", instance.status),
-        "has_managed_worktree": instance.worktree_info.is_some(),
-        "branch": instance.worktree_info.as_ref().map(|worktree| worktree.branch.clone()),
-        "base_branch_override": instance.base_branch_override,
-    });
+    let mut value = serde_json::to_value(crate::daemon::SessionResponse::from_instance(
+        instance, false,
+    ))
+    .unwrap();
     let object = value.as_object_mut().expect("an object row");
     for (key, item) in overrides.as_object().expect("object overrides") {
         object.insert(key.clone(), item.clone());
@@ -1139,27 +1140,11 @@ fn publish_canonical_snapshot(
     ordering: Vec<String>,
     revision: u64,
 ) {
-    let snapshot = crate::daemon::RuntimeSnapshot {
-        cursor: crate::daemon::RuntimeCursor {
-            epoch: "test".into(),
-            revision,
-        },
-        contents: crate::daemon::RuntimeContents {
-            health: crate::daemon::RuntimeHealth::Healthy,
-            capabilities: crate::daemon::RuntimeCapabilities {
-                mutations: true,
-                native_interaction: true,
-            },
-            default_profile: "test".into(),
-            sessions: rows,
-            profiles: vec![],
-            workspace_ordering: ordering,
-            global_projects: vec![],
-        },
-    };
+    let mut snapshot = fixture_snapshot(rows, "test", "test", revision);
+    snapshot.contents.workspace_ordering = ordering;
     env.view
         .session_feed
-        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+        .publish_for_test(SessionFeedResult::Snapshot(Arc::new(snapshot)));
     env.view.apply_session_feed();
 }
 
@@ -1169,7 +1154,7 @@ fn canonical_revision_reloads_renames_moves_and_view_changes() {
     let mut env = create_test_env_empty();
     let instance = local_row(&mut env, "alpha", "/tmp/repo");
     let id = instance.id.clone();
-    env.view.save().expect("seed the durable row");
+    seed_profile("test", &env.view.cloned_instances());
 
     let mut renamed = instance.clone();
     renamed.title = "renamed".into();
@@ -1219,7 +1204,7 @@ fn canonical_revision_drops_a_row_the_daemon_removed() {
     let mut env = create_test_env_empty();
     let kept = local_row(&mut env, "kept", "/tmp/kept");
     let removed = local_row(&mut env, "removed", "/tmp/removed");
-    env.view.save().expect("seed both rows");
+    seed_profile("test", &env.view.cloned_instances());
     Storage::new_unwatched("test")
         .unwrap()
         .update(|rows, _| {
@@ -1247,7 +1232,7 @@ fn canonical_revision_drops_a_row_the_daemon_removed() {
 fn canonical_revision_reconciles_metadata_across_workspace_reordering() {
     let mut env = create_test_env_empty();
     let instance = local_row(&mut env, "alpha", "/tmp/repo");
-    env.view.save().expect("seed the durable row");
+    seed_profile("test", &env.view.cloned_instances());
     crate::session::update_workspace_ordering(|ordering| {
         ordering.order = vec!["/tmp/repo::feature".into()];
         Ok(())
@@ -1290,7 +1275,7 @@ fn failed_snapshot_reload_retries_without_publication_and_acknowledges_order_onl
     for change in ["rename", "add", "remove", "ordering"] {
         let mut env = create_test_env_empty();
         let instance = local_row(&mut env, "alpha", "/tmp/repo");
-        env.view.save().unwrap();
+        seed_profile("test", &env.view.cloned_instances());
         let mut respond = env.view.session_feed.command_driver_for_test();
         publish_canonical_snapshot(
             &mut env,
@@ -1394,7 +1379,7 @@ fn a_newer_snapshot_supersedes_a_failed_reload_and_unavailable_discards_its_retr
     for disconnect in [false, true] {
         let mut env = create_test_env_empty();
         let instance = local_row(&mut env, "original", "/tmp/repo");
-        env.view.save().unwrap();
+        seed_profile("test", &env.view.cloned_instances());
         let _driver = env.view.session_feed.command_driver_for_test();
         publish_canonical_snapshot(
             &mut env,
@@ -1455,6 +1440,162 @@ fn a_newer_snapshot_supersedes_a_failed_reload_and_unavailable_discards_its_retr
 
 #[test]
 #[serial]
+fn legacy_stop_confirmation_retains_the_original_exact_row_and_pane() {
+    use crate::session::{
+        AuxiliaryObservation, AuxiliaryTarget, LegacyToolIdentity, PaneObservation, PanePresence,
+    };
+    let mut env = create_test_env_empty();
+    let instance = local_row(&mut env, "Row", "/tmp/repo");
+    let id = instance.id.clone();
+    seed_profile("test", &env.view.cloned_instances());
+    let target = AuxiliaryTarget::Tool {
+        tool_name: "probe".into(),
+    };
+    let pane = PaneObservation {
+        state: PanePresence::Unknown,
+        tmux_session: Some("captured-tool".into()),
+        legacy_tool: Some(LegacyToolIdentity {
+            session_id: "$42".into(),
+            pane_id: "%42".into(),
+            pane_pid: 4242,
+        }),
+    };
+    let row = canonical_row(
+        &instance,
+        serde_json::json!({"auxiliary":[AuxiliaryObservation { target:target.clone(),pane:pane.clone() }],"lifecycle_generation":7}),
+    );
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    publish_canonical_snapshot(&mut env, vec![row], vec![], 1);
+    env.view.select_session_by_id(&id);
+    env.view.view_mode = ViewMode::Tool("probe".into());
+    env.view.stop_selected();
+    let captured = env.view.pending_stop_auxiliary.as_ref().unwrap().1.clone();
+    assert_eq!(
+        captured.adoption.as_ref().unwrap().identity,
+        pane.legacy_tool.unwrap()
+    );
+    assert_eq!(captured.adoption.as_ref().unwrap().profile, "test");
+    assert_eq!(captured.adoption.as_ref().unwrap().lifecycle_generation, 7);
+    let replacement = PaneObservation {
+        state: PanePresence::Unknown,
+        tmux_session: Some("replacement-tool".into()),
+        legacy_tool: Some(LegacyToolIdentity {
+            session_id: "$43".into(),
+            pane_id: "%43".into(),
+            pane_pid: 4343,
+        }),
+    };
+    let row = canonical_row(
+        &instance,
+        serde_json::json!({"auxiliary":[AuxiliaryObservation { target, pane:replacement }],"lifecycle_generation":7}),
+    );
+    publish_canonical_snapshot(&mut env, vec![row], vec![], 2);
+    env.view.dispatch_confirm_submit("stop_auxiliary");
+    let (sent_id, mutation) = respond(Err("captured identity changed".into())).unwrap();
+    assert_eq!(sent_id, id);
+    let crate::daemon::SessionMutation::StopAuxiliary(sent) = mutation else {
+        panic!("wrong mutation")
+    };
+    assert_eq!(sent.adoption, captured.adoption);
+}
+
+#[test]
+#[serial]
+fn legacy_attach_live_send_and_send_require_confirmation_and_keep_its_capture() {
+    use crate::session::{
+        AuxiliaryObservation, AuxiliaryTarget, LegacyToolIdentity, PaneObservation, PanePresence,
+    };
+    use crate::tui::home::live_send::LiveSendTarget;
+    use crate::tui::home::panes::{NativePane, PaneIntent};
+    for intent in 0..3 {
+        for cancel in [false, true] {
+            let mut env = create_test_env_empty();
+            let instance = local_row(&mut env, "Row", "/tmp/repo");
+            let id = instance.id.clone();
+            seed_profile("test", &env.view.cloned_instances());
+            let target = AuxiliaryTarget::Tool {
+                tool_name: "probe".into(),
+            };
+            let pane = PaneObservation {
+                state: PanePresence::Unknown,
+                tmux_session: Some("captured-tool".into()),
+                legacy_tool: Some(LegacyToolIdentity {
+                    session_id: "$42".into(),
+                    pane_id: "%42".into(),
+                    pane_pid: 4242,
+                }),
+            };
+            let expected = crate::session::LegacyToolAdoption {
+                tmux_session: "captured-tool".into(),
+                identity: pane.legacy_tool.clone().unwrap(),
+                profile: "test".into(),
+                lifecycle_generation: 7,
+            };
+            let row = canonical_row(
+                &instance,
+                serde_json::json!({"auxiliary":[AuxiliaryObservation { target:target.clone(),pane:pane.clone() }],"lifecycle_generation":7}),
+            );
+            let mut respond = env.view.session_feed.legacy_tool_driver_for_test();
+            publish_canonical_snapshot(&mut env, vec![row], vec![], 1);
+            env.view.select_session_by_id(&id);
+            env.view.view_mode = ViewMode::Tool("probe".into());
+            let continuation = match intent {
+                0 => PaneIntent::Attach,
+                1 => PaneIntent::LiveSend(LiveSendTarget::Tool("probe".into())),
+                _ => PaneIntent::Send {
+                    message: "must wait for confirmation".into(),
+                    target: LiveSendTarget::Tool("probe".into()),
+                },
+            };
+            env.view
+                .prepare_native_attachment(
+                    &id,
+                    NativePane::Auxiliary(target.clone()),
+                    None,
+                    continuation,
+                )
+                .unwrap();
+            assert!(env.view.confirm_dialog.is_some());
+            assert!(env.view.pending_native_attachment.is_none());
+            assert!(env.view.session_feed.can_submit(&id));
+            if cancel {
+                env.view
+                    .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None);
+                assert!(env.view.pending_legacy_tool_preparation.is_none());
+                assert!(env.view.pending_native_attachment.is_none());
+                assert!(env.view.session_feed.can_submit(&id));
+                continue;
+            }
+            let replacement = PaneObservation {
+                state: PanePresence::Unknown,
+                tmux_session: Some("replacement-tool".into()),
+                legacy_tool: Some(LegacyToolIdentity {
+                    session_id: "$43".into(),
+                    pane_id: "%43".into(),
+                    pane_pid: 4343,
+                }),
+            };
+            let row = canonical_row(
+                &instance,
+                serde_json::json!({"auxiliary":[AuxiliaryObservation { target,pane:replacement }],"lifecycle_generation":7}),
+            );
+            publish_canonical_snapshot(&mut env, vec![row], vec![], 2);
+            env.view.confirm_dialog = None;
+            env.view.dispatch_confirm_submit("adopt_legacy_tool");
+            respond(&expected);
+            env.view.apply_session_feed();
+            assert!(env.view.take_native_attachment().is_none());
+            assert!(env.view.live_send.is_none());
+            assert!(
+                env.view.info_dialog.is_some(),
+                "stale identity rejection is visible"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn cancelled_attach_live_send_and_send_settle_without_a_continuation_in_either_receipt_order() {
     use crate::daemon::{MutationReceipt, RuntimeCursor, TerminalTarget, TerminalTargetStatus};
     use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence};
@@ -1466,7 +1607,9 @@ fn cancelled_attach_live_send_and_send_settle_without_a_continuation_in_either_r
             let id = env.view.instance_at(0).id.clone();
             env.view.select_session_by_id(&id);
             let mut respond = env.view.session_feed.terminal_driver_for_test();
-            let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&id, "Stopped") else {
+            let SessionFeedResult::Snapshot(mut snapshot) =
+                daemon_snapshot(&env.view, &id, "Stopped")
+            else {
                 unreachable!()
             };
             let target = AuxiliaryTarget::Host { index: 0 };
@@ -1476,6 +1619,7 @@ fn cancelled_attach_live_send_and_send_settle_without_a_continuation_in_either_r
                     pane: PaneObservation {
                         state: PanePresence::Alive,
                         tmux_session: Some("owned-pane".into()),
+                        legacy_tool: None,
                     },
                 }];
             env.view

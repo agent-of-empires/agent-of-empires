@@ -140,10 +140,19 @@ recovery, and stop requests are refused rather than guessing an owner.
 
 If a TUI runtime change loses its acknowledgement, its session stays blocked because the outcome is unknown. Check the current daemon state before choosing **Unlock**; resolution does not replay the lost change. **Keep Blocked** leaves the quarantine intact. Reopen the prompt with `Ctrl+K`, then **Resolve unknown runtime change**, even if the session has disappeared from the list. A failed resolution remains blocked until a healthy, current daemon snapshot has been applied.
 
-New tool panes record their full session ID and configured tool name in
-tmux. Panes created by older versions without this identity must be closed
-manually before AoE can recreate them. Renaming a session does not transfer
-ownership to another tool whose generated name happens to match.
+New tool panes record their full session ID and raw configured tool name in
+tmux. Older unmarked panes are never adopted by name alone. The TUI offers an
+ownership confirmation before attaching, entering live-send mode, sending,
+or stopping one. It identifies the full row ID, profile, lifecycle generation,
+and exact tmux session and pane IDs. Confirm only if that pane belongs to that
+tool and row. Stop confirms adoption and then stops only that tool.
+
+The daemon stamps ownership only while that exact pane is still unmarked.
+Changing owners, replacing or respawning the pane, or changing its name while
+the confirmation is open makes the request fail visibly without affecting a
+replacement or agent pane. Invalid owners and ambiguous names across profiles
+or configured raw tool names are refused, not overwritten. Session retitles
+alone do not transfer ownership to another tool.
 
 Tool sessions are automatically killed when their parent agent session
 is removed (`aoe remove <id>`, "Remove session" in the TUI, or delete

@@ -420,13 +420,7 @@ impl AppState {
             }
         }
         let mut guard = self.idempotency_locks.write().await;
-        // Drop keys nobody is using. A strong count of 1 means the map holds
-        // the only reference, so no request is mid-flight on that key and the
-        // created session's persisted `idempotency_key` is now the durable
-        // dedup record; a later retry re-creates a fresh mutex and re-reads
-        // that record, which is equivalent. A waiter can only clone the `Arc`
-        // while holding this same write lock, so pruning cannot race one away.
-        // Mirrors the prune-under-write-lock shape in `changed_files_cached`.
+        // Drop keys nobody is using.
         guard.retain(|_, lock| Arc::strong_count(lock) > 1);
         guard
             .entry(key.to_string())
@@ -489,8 +483,7 @@ mod tests {
     async fn idempotency_lock_prunes_unreferenced_keys() {
         let state = test_support::build_test_app_state(vec![]);
 
-        // A key acquired and released leaves nothing behind: the next miss on
-        // a different key prunes it.
+        // A key acquired and released leaves nothing behind.
         drop(state.idempotency_lock("released-key").await);
         let _other = state.idempotency_lock("other-key").await;
         assert!(

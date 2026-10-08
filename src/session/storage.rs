@@ -371,13 +371,7 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
 
     let regular = |mode| mode & libc::S_IFMT == libc::S_IFREG;
 
-    // Stat the name on the descriptor first. Opening is not free of side
-    // effects on every file type a container can plant: a character device
-    // arms on open, and `O_NONBLOCK` only covers a fifo parking the open until
-    // a peer shows up. This stat is not what makes the read safe, so do not
-    // read it as the check-then-open shape this function exists to replace:
-    // the open still decides, and the identity check below pins the descriptor
-    // to the entry stat'd here, so a swap in between yields nothing.
+    // Reject devices before opening, then verify the descriptor still names that entry.
     let Ok(before) = fstatat(&dir, file_name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
         return Ok(None);
     };
@@ -643,28 +637,28 @@ impl StorageTransition {
         storage.update_snapshot_under_transition(f)
     }
 
-    pub(crate) fn move_instances_with_snapshot<F>(
+    pub(crate) fn move_instances_with_effect_snapshot<F, B>(
         &self,
         source: &Storage,
         target: &Storage,
         changes: &[(Instance, Instance)],
-        group_move: &GroupMovePlan,
+        profile: ProfileMovePlan<'_>,
         validate_target: F,
+        before_commit: B,
     ) -> Result<ProfileMoveCommit>
     where
         F: FnOnce(&[Instance], &mut [Instance]) -> Result<()>,
+        B: FnOnce(&[Instance]) -> Result<()>,
     {
         source.move_instances_to_inner(
             target,
             changes,
             MoveTransactionPlan {
-                group_move,
-                merge_complete_post: false,
+                profile,
                 transition: Some(self),
-                account_swap: false,
             },
             validate_target,
-            |_| Ok(()),
+            before_commit,
             sync_resolved_parent_directory,
         )
     }
@@ -716,9 +710,7 @@ fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn same_filesystem_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    // Portable metadata exposes no stable file identity. Canonical path equality
-    // still catches direct aliases, but junctions or reparse points may bypass
-    // these guards on non-Unix platforms.
+    // Non-Unix alias checks use paths; reparse points lack portable stable identity.
     false
 }
 
@@ -918,11 +910,7 @@ pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlo
     )
 }
 
-// Test-only crash injection for the profile-move transaction (#3459). Tests
-// arm a named point and `move_instances_to_inner` panics when it is reached,
-// unwinding through the rollback paths exactly like a process death would.
-// Thread-local so concurrent test threads can never trip each other's
-// armed points.
+// Thread-local crash injection isolates concurrent transaction tests.
 #[cfg(test)]
 thread_local! {
     static TEST_CRASH_POINTS: std::cell::RefCell<Vec<String>> =
@@ -987,9 +975,7 @@ fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
 fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
     path.parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
-    // Rust exposes no portable directory flush outside Unix. The file content
-    // was already synced before rename; do not turn every profile move into a
-    // post-publication error on platforms that cannot open directories as files.
+    // Rust exposes no portable directory flush outside Unix.
     Ok(())
 }
 
@@ -1080,6 +1066,11 @@ pub(crate) type SessionMutation<'a> =
 #[derive(Debug, thiserror::Error)]
 #[error("runtime state is unavailable")]
 pub(crate) struct NativeStoreUnavailable;
+
+/// The durable write succeeded; only canonical adoption failed.
+#[derive(Debug, thiserror::Error)]
+#[error("session metadata was committed but canonical adoption failed")]
+pub(crate) struct SessionCommitApplied;
 
 pub(crate) trait SessionStore: Send + Sync {
     fn storage(&self) -> &Storage;
@@ -1427,13 +1418,6 @@ pub(crate) struct ProfileMoveRejected(&'static str);
 pub(crate) struct ProfileMoveCommit {
     pub(crate) source: (Vec<Instance>, Vec<Group>),
     pub(crate) target: (Vec<Instance>, Vec<Group>),
-    moved_start: usize,
-}
-
-impl ProfileMoveCommit {
-    fn into_moved(mut self) -> Vec<Instance> {
-        self.target.0.split_off(self.moved_start)
-    }
 }
 
 struct MoveDataFile<'a> {
@@ -1505,12 +1489,16 @@ impl GroupMovePlan {
     }
 }
 
+pub(crate) struct ProfileMovePlan<'a> {
+    pub(crate) group_move: &'a GroupMovePlan,
+    pub(crate) merge_complete_post: bool,
+    /// Preserve the conversation for an account-only tool swap.
+    pub(crate) account_swap: bool,
+}
+
 struct MoveTransactionPlan<'a> {
-    group_move: &'a GroupMovePlan,
-    merge_complete_post: bool,
+    profile: ProfileMovePlan<'a>,
     transition: Option<&'a StorageTransition>,
-    /// Whether an account-only tool swap should preserve the conversation.
-    account_swap: bool,
 }
 
 fn apply_group_move(
@@ -1568,15 +1556,7 @@ fn apply_group_move(
         }
     }
 
-    // Re-tree both sides so a group implied only by a moved instance's path
-    // materialises as an explicit row. This is order-stable, not a renormalise:
-    // `new_with_groups` seeds `insertion_order` from the passed groups verbatim
-    // and only appends paths that were missing, and `get_all_groups` replays
-    // that order, so when the input already covers every referenced group the
-    // output is byte-identical to the input. That is what keeps
-    // `source_groups_changed` (a byte comparison at the call site) a true
-    // semantic-change signal, so an unchanged source is never rewritten or
-    // fsynced. See `apply_group_move_is_byte_stable_without_semantic_change`.
+    // Preserve insertion order so unchanged group JSON is not rewritten.
     *source_groups =
         super::GroupTree::new_with_groups(source_instances, source_groups).get_all_groups();
     *target_groups =
@@ -2156,66 +2136,6 @@ impl Storage {
     }
 
     /// Move one session after validating its final identity under both store locks.
-    pub(crate) fn move_instance_to_with_effect<F, B>(
-        &self,
-        target: &Storage,
-        before: &Instance,
-        after: &Instance,
-        account_swap: bool,
-        validate_target: F,
-        before_commit: B,
-    ) -> Result<Instance>
-    where
-        F: FnOnce(&[Instance], &Instance) -> Result<()>,
-        B: FnOnce(&Instance) -> Result<()>,
-    {
-        let changes = [(before.clone(), after.clone())];
-        let group_move = GroupMovePlan::single(&before.group_path, &after.group_path);
-        let mut moved = self
-            .move_instances_to_inner(
-                target,
-                &changes,
-                MoveTransactionPlan {
-                    group_move: &group_move,
-                    merge_complete_post: true,
-                    transition: None,
-                    account_swap,
-                },
-                |instances, candidates| validate_target(instances, &candidates[0]),
-                |candidates| before_commit(&candidates[0]),
-                sync_resolved_parent_directory,
-            )?
-            .into_moved();
-        Ok(moved.remove(0))
-    }
-
-    /// Move a batch with target-first publication and a durable recovery journal.
-    pub(crate) fn move_instances_to<F>(
-        &self,
-        target: &Storage,
-        changes: &[(Instance, Instance)],
-        group_move: &GroupMovePlan,
-        validate_target: F,
-    ) -> Result<Vec<Instance>>
-    where
-        F: FnOnce(&[Instance], &[Instance]) -> Result<()>,
-    {
-        self.move_instances_to_inner(
-            target,
-            changes,
-            MoveTransactionPlan {
-                group_move,
-                merge_complete_post: false,
-                transition: None,
-                account_swap: false,
-            },
-            |existing, candidates| validate_target(existing, candidates),
-            |_| Ok(()),
-            sync_resolved_parent_directory,
-        )
-        .map(ProfileMoveCommit::into_moved)
-    }
-
     fn move_instances_to_inner<F, B, S>(
         &self,
         target: &Storage,
@@ -2385,36 +2305,36 @@ impl Storage {
                 return Err(ProfileMoveRejected("Session already exists in target profile").into());
             }
             let mut candidate = source.clone();
-            if plan.merge_complete_post {
-                candidate.merge_profile_move_diff(before, after, plan.account_swap);
+            if plan.profile.merge_complete_post {
+                candidate.merge_profile_move_diff(before, after, plan.profile.account_swap);
             } else {
-                candidate.merge_user_action_diff(before, after);
+                candidate.merge_profile_move_user_action_diff(before, after);
             }
             candidate.source_profile.clone_from(&target.profile);
             target_instances.push(candidate);
         }
-        if plan.group_move.move_subtree {
-            let source_prefix = format!("{}/", plan.group_move.source_path);
+        if plan.profile.group_move.move_subtree {
+            let source_prefix = format!("{}/", plan.profile.group_move.source_path);
             let locked_members: std::collections::HashSet<&str> = source_instances
                 .iter()
                 .filter(|instance| {
-                    instance.group_path == plan.group_move.source_path
+                    instance.group_path == plan.profile.group_move.source_path
                         || instance.group_path.starts_with(&source_prefix)
                 })
                 .map(|instance| instance.id.as_str())
                 .collect();
             if locked_members.is_empty()
                 && !source_groups.iter().any(|group| {
-                    group.path == plan.group_move.source_path
+                    group.path == plan.profile.group_move.source_path
                         || group.path.starts_with(&source_prefix)
                 })
             {
                 return Err(ProfileMoveRejected("Source group no longer exists").into());
             }
-            if plan.group_move.source_path != plan.group_move.target_path {
-                let target_prefix = format!("{}/", plan.group_move.target_path);
+            if plan.profile.group_move.source_path != plan.profile.group_move.target_path {
+                let target_prefix = format!("{}/", plan.profile.group_move.target_path);
                 let matches_target = |path: &str| {
-                    path == plan.group_move.target_path || path.starts_with(&target_prefix)
+                    path == plan.profile.group_move.target_path || path.starts_with(&target_prefix)
                 };
                 if target_groups
                     .iter()
@@ -2451,7 +2371,7 @@ impl Storage {
         let source_instances_before = serde_json::to_vec_pretty(&source_instances)?;
         source_instances.retain(|instance| !ids.contains(instance.id.as_str()));
         apply_group_move(
-            plan.group_move,
+            plan.profile.group_move,
             &source_instances,
             &mut source_groups,
             &target_instances,
@@ -2476,9 +2396,9 @@ impl Storage {
             target_profile: target.profile.clone(),
             source_sessions_path: self.sessions_path.clone(),
             target_sessions_path: target.sessions_path.clone(),
-            group_move_source_path: plan.group_move.source_path.clone(),
-            group_move_target_path: plan.group_move.target_path.clone(),
-            group_move_subtree: plan.group_move.move_subtree,
+            group_move_source_path: plan.profile.group_move.source_path.clone(),
+            group_move_target_path: plan.profile.group_move.target_path.clone(),
+            group_move_subtree: plan.profile.group_move.move_subtree,
             created_at_epoch_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -2690,16 +2610,11 @@ impl Storage {
         Ok(ProfileMoveCommit {
             source: (source_instances, source_groups),
             target: (target_instances, target_groups),
-            moved_start,
         })
     }
 }
 
-// Workspace ordering is stored at the app-data root, not per-profile:
-// `list_sessions` returns sessions across all profiles, so the sidebar
-// is a single global view and a per-profile file would only fragment
-// the user's chosen layout. Workspace ids derive from `repoPath::branch`
-// (or `repoPath::__session__::session_id`) and are profile-independent.
+// Workspace ordering is stored at the app-data root, not per-profile.
 fn workspace_ordering_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("workspace-ordering.json"))
 }
@@ -2743,12 +2658,9 @@ fn save_workspace_ordering(ordering: &WorkspaceOrdering) -> Result<()> {
     Ok(())
 }
 
-// Recent projects is a global most-recently-used store, written when a
-// session is deleted so the project it lived in survives in the new-session
-// wizard's Recent tab after its last session is gone (#2141). Live projects
-// still come from the session list directly; this file is only the tombstone
-// + recency for projects that no longer have any session. Stored at the
-// app-data root for the same cross-profile reason as workspace ordering.
+// Recent projects is a global most-recently-used store, written when a session is deleted so the
+// project it lived in survives in the new-session wizard's Recent tab after its last session is
+// gone.
 const RECENT_PROJECTS_LOCK_FILENAME: &str = ".recent-projects.lock";
 const RECENT_PROJECTS_CAP: usize = 20;
 
@@ -2793,9 +2705,6 @@ pub fn recent_project_entry_for(inst: &Instance) -> Option<RecentProjectEntry> {
         .unwrap_or(inst.project_path.as_str());
     let trimmed = raw.trim_end_matches(['/', '\\']);
     let path = if trimmed.is_empty() { "/" } else { trimmed };
-    // `file_name` resolves the basename with the host platform's separator
-    // rules, so a Windows path like `C:\repo\proj` yields `proj` rather than
-    // the whole string. Falls back to the path itself for roots (`/`, `C:\`).
     let display_name = std::path::Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -2928,9 +2837,8 @@ fn file_mtime_epoch_ms(path: &Path) -> Option<u64> {
 pub(crate) fn detect_duplicate_ids<'a>(
     loaded: impl IntoIterator<Item = (&'a str, &'a [Instance])>,
 ) -> Vec<String> {
-    // Counts occurrences across every profile; an id repeated even within
-    // one profile is ambiguous the same way (corrupt file or writer bug) and
-    // must surface, not silently fail closed.
+    // Counts occurrences across every profile; an id repeated even within one profile is ambiguous
+    // the same way (corrupt file or writer bug) and must surface, not silently fail closed.
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (_, instances) in loaded {
@@ -3073,8 +2981,7 @@ pub(crate) fn reconcile_profile_duplicates(
         let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (path, entry) in valid_entries {
             if entry.ids.iter().any(|id| blocked_ids.contains(id)) {
-                // Shadowing is transitive across a multi-id batch: if X blocks
-                // this X+Y entry, Y must also block still-older evidence.
+                // Shadowing is transitive across a multi-id batch.
                 blocked_ids.extend(entry.ids.iter().cloned());
                 tracing::debug!(
                     target: "session.store",
@@ -3142,8 +3049,6 @@ pub(crate) fn reconcile_profile_duplicates(
         }
     }
     if !outcome.repaired {
-        // Nothing changed on disk: build reports from the caller's fresh
-        // load instead of re-reading every profile again.
         outcome.reports = duplicate_reports(&normalized, storages);
         return outcome;
     }
@@ -3187,7 +3092,7 @@ fn reports_after_repair(
 /// Build one report per duplicated id with per-copy profile, store path, and
 /// mtime. `loaded` must be sorted deterministically or first-seen order is
 /// used as-is; reports follow `detect_duplicate_ids` order.
-fn duplicate_reports(
+pub(crate) fn duplicate_reports(
     loaded: &[(&str, &[Instance])],
     storages: &[(&str, &Storage)],
 ) -> Vec<DuplicateIdReport> {
@@ -3415,9 +3320,8 @@ where
         }
     }
 
-    // App-global identity lock first, then sorted title/lifecycle locks, then
-    // the per-profile storage flocks taken inside `Storage::update`. This is
-    // the same global-to-local order every other identity mutation uses.
+    // App-global identity lock first, then sorted title/lifecycle locks, then the
+    // per-profile storage flocks taken inside `Storage::update`.
     let _identity_lock = acquire_session_identity_lock()?;
     let mut ids_sorted = entry.ids.clone();
     ids_sorted.sort();
@@ -3451,9 +3355,7 @@ where
             target_path: entry.group_move_target_path.clone(),
             move_subtree: entry.group_move_subtree,
         };
-        // Automatic arbitration requires one valid row on each side. If
-        // either profile already contains repeated rows for this id, preserve
-        // every copy and the journal so duplicate surfacing stays in control.
+        // Preserve duplicate evidence instead of auto-arbitrating an ambiguous move.
         if entry.ids.iter().any(|id| {
             source_instances.iter().filter(|row| &row.id == id).count() > 1
                 || target_instances.iter().filter(|row| &row.id == id).count() > 1
@@ -3504,9 +3406,8 @@ fn sync_repaired_profile_durably<S>(storage: &Storage, mut sync: S) -> Result<()
 where
     S: FnMut(&Path) -> Result<()>,
 {
-    // The two files normally share a profile directory, but supported
-    // symlinks may resolve them into different directories. Verify both rename
-    // parents before journal removal can become durable.
+    // The two files normally share a profile directory, but supported symlinks may resolve
+    // them into different directories.
     sync(storage.sessions_path()).context("repaired sessions directory was not made durable")?;
     sync(&storage.sessions_path().with_file_name("groups.json"))
         .context("repaired groups directory was not made durable")
@@ -3517,9 +3418,7 @@ where
 /// and only narrows the race window; the identity/title/lifecycle locks held
 /// by the caller already exclude every lifecycle-mutating surface.
 fn target_still_holds(target_sessions_path: &Path, losers: &[String]) -> Result<bool> {
-    // Two-phase parse mirroring `Storage::load`: a single corrupt row is
-    // skipped, not a whole-file failure, so a quarantined-row file cannot
-    // wedge the repair into retrying forever.
+    // Skip malformed rows without discarding valid profile entries.
     let content = match fs::read_to_string(target_sessions_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -3773,9 +3672,7 @@ fn reconcile_groups_after_repair(
             .iter()
             .any(|instance| group_path_covers(path, &instance.group_path))
     };
-    // Mirror apply_group_move's non-subtree branch: an explicitly created
-    // child under the moved path keeps the parent row alive (removing it
-    // would orphan the surviving child below a nonexistent ancestor).
+    // A surviving child keeps its explicit parent.
     let existing_paths: Vec<String> = groups.iter().map(|group| group.path.clone()).collect();
     let has_explicit_descendant = |path: &str| {
         let prefix = format!("{path}/");
@@ -4417,30 +4314,98 @@ mod tests {
         assert!(err.contains("too deep"), "got: {err}");
     }
 
+    fn seed_storage_rows(storage: &Storage, instances: &[Instance]) -> Result<()> {
+        storage.update(|rows, groups| {
+            *rows = instances.to_vec();
+            *groups = GroupTree::new_with_groups(instances, &[]).get_all_groups();
+            Ok(())
+        })
+    }
+
     #[test]
     #[serial]
-    fn test_storage_roundtrip() -> Result<()> {
+    fn storage_round_trips_sessions_and_groups() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-
         let storage = Storage::new_unwatched("test-profile")?;
+        let peer = Storage::new_unwatched("profile-beta")?;
+        seed_storage_rows(&peer, &[Instance::new("peer sentinel", "/repo/peer")])?;
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
 
-        let instances = vec![
-            Instance::new("test1", "/tmp/test1"),
-            Instance::new("test2", "/tmp/test2"),
-        ];
+        assert!(storage.load()?.is_empty(), "missing file loads empty");
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        for blank in ["", "   \n  \t  "] {
+            fs::write(&storage.sessions_path, blank)?;
+            assert!(storage.load()?.is_empty());
+        }
+        fs::write(&storage.sessions_path, "{ invalid json }")?;
+        assert!(storage.load().is_err());
 
-        storage.update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+        // `update` reads before it writes, so clear the corrupt file first.
+        fs::write(&storage.sessions_path, "[]")?;
+        seed_storage_rows(&storage, &[])?;
+        assert_eq!(fs::read_to_string(&storage.sessions_path)?.trim(), "[]");
+
+        let mut instance = Instance::new("Test Project", "/home/user/project");
+        instance.tool = "opencode".to_string();
+        instance.command = "opencode --config test".to_string();
+        instance.group_path = "work/clients".to_string();
+        for i in 0..5 {
+            let second = Instance::new(&format!("iter{i}"), "/tmp/test");
+            seed_storage_rows(&storage, &[instance.clone(), second])?;
+        }
+        let loaded = storage.load()?;
+        assert_eq!(loaded.len(), 2);
+        let first = &loaded[0];
+        assert_eq!(
+            (
+                &*first.title,
+                &*first.project_path,
+                &*first.tool,
+                &*first.command
+            ),
+            (
+                "Test Project",
+                "/home/user/project",
+                "opencode",
+                "opencode --config test"
+            )
+        );
+        assert_eq!(first.group_path, "work/clients");
+        assert_eq!(loaded[1].title, "iter4");
+        let entries: Vec<_> = fs::read_dir(storage.sessions_path.parent().unwrap())?
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            entries.iter().all(|e| !e.contains(".tmp")),
+            "atomic_write leaked temp files: {entries:?}"
+        );
+
+        assert!(entries.iter().any(|entry| entry == "sessions.json"));
+        let (instances, groups) = storage.load_with_groups()?;
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].group_path, "work/clients");
+        assert!(groups.iter().any(|group| group.path == "work/clients"));
+
+        fs::write(&groups_path, "   ")?;
+        let (instances, groups) = storage.load_with_groups()?;
+        assert_eq!(instances.len(), 2);
+        assert!(groups.is_empty());
+
+        fs::remove_file(&groups_path)?;
+        let (instances, groups) = storage.load_with_groups()?;
+        assert_eq!(instances.len(), 2);
+        assert!(groups.is_empty());
+
+        storage.update(|_, groups| {
+            groups.push(Group::new("projects", "work/projects"));
             Ok(())
         })?;
-        let loaded = storage.load()?;
-
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].title, "test1");
-        assert_eq!(loaded[1].title, "test2");
-
+        let (_, groups) = storage.load_with_groups()?;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "projects");
+        assert_eq!(groups[0].path, "work/projects");
+        assert_eq!(peer.load()?[0].title, "peer sentinel");
         Ok(())
     }
 
@@ -4610,166 +4575,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_storage_new_with_custom_profile() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("custom-profile")?;
-        assert_eq!(storage.profile(), "custom-profile");
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_load_nonexistent_file() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-empty")?;
-        let loaded = storage.load()?;
-
-        assert!(loaded.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_load_empty_file() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-empty-file")?;
-
-        // Create empty file
-        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
-        fs::write(&storage.sessions_path, "")?;
-
-        let loaded = storage.load()?;
-        assert!(loaded.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_load_whitespace_only_file() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-whitespace")?;
-
-        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
-        fs::write(&storage.sessions_path, "   \n  \t  ")?;
-
-        let loaded = storage.load()?;
-        assert!(loaded.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_save_leaves_no_temp_files() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-no-debris")?;
-
-        for i in 0..5 {
-            let instances = vec![Instance::new(&format!("iter{i}"), "/tmp/test")];
-            storage.update(|i, g| {
-                *i = instances.to_vec();
-                *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-                Ok(())
-            })?;
-        }
-
-        let dir = storage.sessions_path.parent().unwrap();
-        let entries: Vec<_> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-
-        for entry in &entries {
-            assert!(
-                !entry.contains(".tmp"),
-                "atomic_write must not leak temp files; found {}",
-                entry
-            );
-        }
-        assert!(entries.contains(&"sessions.json".to_string()));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_save_empty_array() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-empty-save")?;
-        {
-            let xs: Vec<Instance> = vec![];
-            storage.update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })?
-        };
-
-        let content = fs::read_to_string(&storage.sessions_path)?;
-        assert_eq!(content.trim(), "[]");
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_load_with_groups_no_groups_file() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-no-groups")?;
-
-        let instances = vec![Instance::new("test", "/tmp/test")];
-        storage.update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })?;
-
-        let (loaded_instances, loaded_groups) = storage.load_with_groups()?;
-        assert_eq!(loaded_instances.len(), 1);
-        assert!(loaded_groups.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_save_and_load_with_groups() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-with-groups")?;
-
-        let mut instances = vec![Instance::new("test", "/tmp/test")];
-        instances[0].group_path = "work/projects".to_string();
-
-        let groups = vec![Group::new("projects", "work/projects")];
-        let group_tree = GroupTree::new_with_groups(&instances, &groups);
-
-        storage.update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })?;
-
-        let (loaded_instances, loaded_groups) = storage.load_with_groups()?;
-        assert_eq!(loaded_instances.len(), 1);
-        assert_eq!(loaded_instances[0].group_path, "work/projects");
-        assert!(!loaded_groups.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
     fn test_load_with_groups_skips_corrupt_row_and_quarantines() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
@@ -4883,155 +4688,43 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_storage_load_invalid_json() -> Result<()> {
+    fn workspace_ordering_round_trips_and_serializes_updates() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
 
-        let storage = Storage::new_unwatched("test-invalid")?;
-
-        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
-        fs::write(&storage.sessions_path, "{ invalid json }")?;
-
-        let result = storage.load();
-        assert!(result.is_err());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_preserves_instance_fields() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-fields")?;
-
-        let mut instance = Instance::new("Test Project", "/home/user/project");
-        instance.tool = "opencode".to_string();
-        instance.command = "opencode --config test".to_string();
-        instance.group_path = "work/clients".to_string();
-
-        {
-            let xs: Vec<Instance> = vec![instance.clone()];
-            storage.update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })?
-        };
-        let loaded = storage.load()?;
-
-        assert_eq!(loaded.len(), 1);
-        let loaded_instance = &loaded[0];
-        assert_eq!(loaded_instance.title, "Test Project");
-        assert_eq!(loaded_instance.project_path, "/home/user/project");
-        assert_eq!(loaded_instance.tool, "opencode");
-        assert_eq!(loaded_instance.command, "opencode --config test");
-        assert_eq!(loaded_instance.group_path, "work/clients");
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_profile_accessor() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        // Verify profiles are correctly named
-        let storage1 = Storage::new_unwatched("profile-alpha")?;
-        let storage2 = Storage::new_unwatched("profile-beta")?;
-
-        assert_eq!(storage1.profile(), "profile-alpha");
-        assert_eq!(storage2.profile(), "profile-beta");
-
-        // Verify they use different paths (implying isolation)
-        assert_ne!(storage1.sessions_path, storage2.sessions_path);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_storage_groups_file_empty() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-empty-groups")?;
-
-        // Save sessions
-        {
-            let xs: Vec<Instance> = vec![Instance::new("test", "/tmp/test")];
-            storage.update(|i, g| {
-                *i = xs.to_vec();
-                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
-                Ok(())
-            })?
-        };
-
-        // Create empty groups file
-        let groups_path = storage.sessions_path.with_file_name("groups.json");
-        fs::write(&groups_path, "   ")?;
-
-        let (instances, groups) = storage.load_with_groups()?;
-        assert_eq!(instances.len(), 1);
-        assert!(groups.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_workspace_ordering_roundtrip() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        // Empty by default.
-        let empty = load_workspace_ordering()?;
-        assert!(empty.order.is_empty());
-
-        let saved = WorkspaceOrdering {
-            order: vec![
-                "/repo/a::main".to_string(),
-                "/repo/b::feature/x".to_string(),
-                "/repo/c::__session__::abc123".to_string(),
-            ],
-        };
-        save_workspace_ordering(&saved)?;
-
-        let loaded = load_workspace_ordering()?;
-        assert_eq!(loaded.order, saved.order);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_workspace_ordering_overwrites_on_save() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        save_workspace_ordering(&WorkspaceOrdering {
-            order: vec!["a".to_string(), "b".to_string()],
-        })?;
-        save_workspace_ordering(&WorkspaceOrdering {
-            order: vec!["b".to_string()],
-        })?;
-
-        let loaded = load_workspace_ordering()?;
-        assert_eq!(loaded.order, vec!["b".to_string()]);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_workspace_ordering_handles_empty_file() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
+        assert!(load_workspace_ordering()?.order.is_empty());
         let path = workspace_ordering_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        fs::create_dir_all(path.parent().unwrap())?;
         fs::write(&path, "   ")?;
+        assert!(load_workspace_ordering()?.order.is_empty());
 
+        let order = |items: &[&str]| WorkspaceOrdering {
+            order: items.iter().map(|s| s.to_string()).collect(),
+        };
+        let initial = order(&[
+            "/repo/a::main",
+            "/repo/b::feature/x",
+            "/repo/c::__session__::abc123",
+        ]);
+        save_workspace_ordering(&initial)?;
+        assert_eq!(load_workspace_ordering()?.order, initial.order);
+        save_workspace_ordering(&order(&["b"]))?;
+        assert_eq!(load_workspace_ordering()?.order, ["b"]);
+
+        std::thread::scope(|scope| {
+            for tid in 0..16 {
+                scope.spawn(move || {
+                    update_workspace_ordering(|ord| {
+                        ord.order.push(format!("ws-{tid}"));
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
         let loaded = load_workspace_ordering()?;
-        assert!(loaded.order.is_empty());
+        assert_eq!(loaded.order.len(), 17);
+        assert!((0..16).all(|tid| loaded.order.contains(&format!("ws-{tid}"))));
         Ok(())
     }
 
@@ -5213,113 +4906,28 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_workspace_ordering_update_serializes() -> Result<()> {
+    fn update_error_leaves_both_files_untouched() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-
-        update_workspace_ordering(|ord| {
-            ord.order.clear();
-            Ok(())
-        })?;
-
-        let n_threads = 16usize;
-        std::thread::scope(|scope| {
-            for tid in 0..n_threads {
-                scope.spawn(move || {
-                    update_workspace_ordering(|ord| {
-                        ord.order.push(format!("ws-{tid}"));
-                        Ok(())
-                    })
-                    .unwrap();
-                });
-            }
-        });
-
-        let loaded = load_workspace_ordering()?;
-        assert_eq!(loaded.order.len(), n_threads);
-        for tid in 0..n_threads {
-            assert!(
-                loaded.order.contains(&format!("ws-{tid}")),
-                "missing ws-{tid}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_profile_lock_registry_returns_same_arc_for_same_profile() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let s1 = Storage::new_unwatched("test-registry-shared")?;
-        let s2 = Storage::new_unwatched("test-registry-shared")?;
-        assert!(Arc::ptr_eq(&s1.save_lock, &s2.save_lock));
-
-        let s3 = Storage::new_unwatched("test-registry-distinct")?;
-        assert!(!Arc::ptr_eq(&s1.save_lock, &s3.save_lock));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_update_writes_both_sessions_and_groups_files() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-update-both-files")?;
+        let storage = Storage::new_unwatched("test-update-err")?;
         storage.update(|i, g| {
-            *i = [].to_vec();
-            *g = GroupTree::new_with_groups(&[], &[]).get_all_groups();
+            *i = vec![Instance::new("seed", "/tmp/seed")];
+            g.push(Group::new("seed-group", "work/seed"));
             Ok(())
         })?;
-
-        storage.update(|instances, groups| {
-            instances.push(Instance::new("inst", "/tmp/inst"));
-            groups.push(Group::new("projects", "work/projects"));
-            Ok(())
-        })?;
-
         let groups_path = storage.sessions_path.with_file_name("groups.json");
-        assert!(groups_path.exists(), "groups.json should exist");
-
-        let (loaded_instances, loaded_groups) = storage.load_with_groups()?;
-        assert_eq!(loaded_instances.len(), 1);
-        assert_eq!(loaded_groups.len(), 1);
-        assert_eq!(loaded_groups[0].name, "projects");
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_update_closure_err_leaves_both_files_untouched() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        let storage = Storage::new_unwatched("test-update-err-untouched")?;
-        let seed = vec![Instance::new("seed", "/tmp/seed")];
-        let seed_groups = vec![Group::new("seed-group", "work/seed")];
-        let mut tree = GroupTree::new_with_groups(&seed, &seed_groups);
-        tree.create_group("work/seed");
-        storage.update(|i, g| {
-            *i = seed.to_vec();
-            *g = tree.get_all_groups();
-            Ok(())
-        })?;
-
-        let groups_path = storage.sessions_path.with_file_name("groups.json");
-        let sessions_before = fs::read(&storage.sessions_path)?;
-        let groups_before = fs::read(&groups_path)?;
+        let before = (fs::read(&storage.sessions_path)?, fs::read(&groups_path)?);
 
         let outcome: Result<()> = storage.update(|instances, groups| {
-            instances.push(Instance::new("doomed-inst", "/tmp/doomed"));
+            instances.push(Instance::new("doomed", "/tmp/doomed"));
             groups.push(Group::new("doomed-group", "doomed/path"));
             Err(anyhow!("forced abort"))
         });
         assert!(outcome.is_err());
-
-        assert_eq!(fs::read(&storage.sessions_path)?, sessions_before);
-        assert_eq!(fs::read(&groups_path)?, groups_before);
+        assert_eq!(
+            (fs::read(&storage.sessions_path)?, fs::read(&groups_path)?),
+            before
+        );
         Ok(())
     }
 
@@ -5567,19 +5175,34 @@ mod tests {
             (second.clone(), second_after.clone()),
         ];
         let group_move = GroupMovePlan::subtree("", "moved");
-        let rejected =
-            source.move_instances_to(&target, &changes, &group_move, |existing, candidates| {
-                if candidates.iter().any(|candidate| {
-                    existing.iter().any(|row| {
-                        row.title == candidate.title
-                            && row.project_path.trim_end_matches('/')
-                                == candidate.project_path.trim_end_matches('/')
-                    })
-                }) {
-                    return Err(anyhow!("duplicate"));
-                }
-                Ok(())
-            });
+        let rejected = source
+            .move_instances_to_inner(
+                &target,
+                &changes,
+                MoveTransactionPlan {
+                    profile: ProfileMovePlan {
+                        group_move: &group_move,
+                        merge_complete_post: false,
+                        account_swap: false,
+                    },
+                    transition: None,
+                },
+                |existing, candidates| {
+                    if candidates.iter().any(|candidate| {
+                        existing.iter().any(|row| {
+                            row.title == candidate.title
+                                && row.project_path.trim_end_matches('/')
+                                    == candidate.project_path.trim_end_matches('/')
+                        })
+                    }) {
+                        return Err(anyhow!("duplicate"));
+                    }
+                    Ok(())
+                },
+                |_| Ok(()),
+                sync_resolved_parent_directory,
+            )
+            .map(|commit| commit.target.0);
         assert!(rejected.is_err());
         assert_eq!(source.load()?.len(), 2);
         assert_eq!(target.load()?.len(), 1);
@@ -5596,12 +5219,23 @@ mod tests {
                 .unread = true;
             Ok(())
         })?;
-        let moved = source.move_instances_to(
-            &target,
-            &changes,
-            &group_move,
-            |_existing, _candidates| Ok(()),
-        )?;
+        let moved = source
+            .move_instances_to_inner(
+                &target,
+                &changes,
+                MoveTransactionPlan {
+                    profile: ProfileMovePlan {
+                        group_move: &group_move,
+                        merge_complete_post: false,
+                        account_swap: false,
+                    },
+                    transition: None,
+                },
+                |_existing, _candidates| Ok(()),
+                |_| Ok(()),
+                sync_resolved_parent_directory,
+            )
+            .map(|commit| commit.target.0)?;
         assert_eq!(moved.len(), 2);
         let moved_first = moved
             .iter()
@@ -5634,25 +5268,34 @@ mod tests {
         })?;
         let effect_ran = std::cell::Cell::new(false);
 
-        let result = source.move_instance_to_with_effect(
+        let result = source.move_instances_to_inner(
             &target,
-            &before,
-            &before,
-            false,
-            |instances, candidate| {
-                if instances.iter().any(|row| {
-                    row.title == candidate.title
-                        && row.project_path.trim_end_matches('/')
-                            == candidate.project_path.trim_end_matches('/')
-                }) {
-                    return Err(anyhow!("duplicate"));
-                }
-                Ok(())
+            &[((before).clone(), (before).clone())],
+            MoveTransactionPlan {
+                profile: ProfileMovePlan {
+                    group_move: &GroupMovePlan::single(&before.group_path, &before.group_path),
+                    merge_complete_post: true,
+                    account_swap: false,
+                },
+                transition: None,
+            },
+            |existing, candidates| {
+                (|instances: &[Instance], candidate: &Instance| {
+                    if instances.iter().any(|row| {
+                        row.title == candidate.title
+                            && row.project_path.trim_end_matches('/')
+                                == candidate.project_path.trim_end_matches('/')
+                    }) {
+                        return Err(anyhow!("duplicate"));
+                    }
+                    Ok(())
+                })(existing, &candidates[0])
             },
             |_| {
                 effect_ran.set(true);
                 Ok(())
             },
+            sync_resolved_parent_directory,
         );
 
         assert!(result.is_err());
@@ -5680,15 +5323,26 @@ mod tests {
         })?;
         target.update(|_instances, _groups| Ok(()))?;
 
-        let moved = source.move_instances_to(
-            &target,
-            &[],
-            &GroupMovePlan::subtree("empty", "renamed"),
-            |_existing, candidates| {
-                assert!(candidates.is_empty());
-                Ok(())
-            },
-        )?;
+        let moved = source
+            .move_instances_to_inner(
+                &target,
+                &[],
+                MoveTransactionPlan {
+                    profile: ProfileMovePlan {
+                        group_move: &GroupMovePlan::subtree("empty", "renamed"),
+                        merge_complete_post: false,
+                        account_swap: false,
+                    },
+                    transition: None,
+                },
+                |_existing, candidates| {
+                    assert!(candidates.is_empty());
+                    Ok(())
+                },
+                |_| Ok(()),
+                sync_resolved_parent_directory,
+            )
+            .map(|commit| commit.target.0)?;
 
         assert!(moved.is_empty());
         assert!(source
@@ -5752,7 +5406,23 @@ mod tests {
                 .iter()
                 .map(fs::read)
                 .collect::<std::io::Result<Vec<_>>>()?;
-            let result = source.move_instances_to(&target, &[], &plan, |_, _| Ok(()));
+            let result = source
+                .move_instances_to_inner(
+                    &target,
+                    &[],
+                    MoveTransactionPlan {
+                        profile: ProfileMovePlan {
+                            group_move: &plan,
+                            merge_complete_post: false,
+                            account_swap: false,
+                        },
+                        transition: None,
+                    },
+                    |_, _| Ok(()),
+                    |_| Ok(()),
+                    sync_resolved_parent_directory,
+                )
+                .map(|commit| commit.target.0);
             assert!(result.is_err(), "accepted {fault}");
             for (path, bytes) in paths.iter().zip(before) {
                 assert_eq!(fs::read(path)?, bytes, "changed {}", path.display());
@@ -5788,12 +5458,22 @@ mod tests {
             Ok(())
         })?;
         let error = source
-            .move_instances_to(
+            .move_instances_to_inner(
                 &target,
                 &[(before, after)],
-                &GroupMovePlan::subtree("team", "moved"),
+                MoveTransactionPlan {
+                    profile: ProfileMovePlan {
+                        group_move: &GroupMovePlan::subtree("team", "moved"),
+                        merge_complete_post: false,
+                        account_swap: false,
+                    },
+                    transition: None,
+                },
                 |_existing, _candidates| Ok(()),
+                |_| Ok(()),
+                sync_resolved_parent_directory,
             )
+            .map(|commit| commit.target.0)
             .expect_err("fresh subtree membership must be revalidated under lock");
 
         assert!(error.to_string().contains("group membership changed"));
@@ -5841,10 +5521,12 @@ mod tests {
             &target,
             &[(before.clone(), before.clone())],
             MoveTransactionPlan {
-                group_move: &GroupMovePlan::single("work", "work"),
-                merge_complete_post: true,
+                profile: ProfileMovePlan {
+                    group_move: &GroupMovePlan::single("work", "work"),
+                    merge_complete_post: true,
+                    account_swap: false,
+                },
                 transition: None,
-                account_swap: false,
             },
             |_existing, _candidates| Ok(()),
             |_| Ok(()),
@@ -5897,10 +5579,12 @@ mod tests {
             &target,
             &[(before.clone(), after)],
             MoveTransactionPlan {
-                group_move: &plan,
-                merge_complete_post: true,
+                profile: ProfileMovePlan {
+                    group_move: &plan,
+                    merge_complete_post: true,
+                    account_swap: false,
+                },
                 transition: None,
-                account_swap: false,
             },
             |_existing, _candidates| Ok(()),
             |_| Ok(()),
@@ -5951,10 +5635,12 @@ mod tests {
             &target,
             &[(before.clone(), after)],
             MoveTransactionPlan {
-                group_move: &plan,
-                merge_complete_post: true,
+                profile: ProfileMovePlan {
+                    group_move: &plan,
+                    merge_complete_post: true,
+                    account_swap: false,
+                },
                 transition: None,
-                account_swap: false,
             },
             |_existing, _candidates| Ok(()),
             |_moved| {
@@ -6053,13 +5739,20 @@ mod tests {
         fs::hard_link(&source_lock, &target_lock)?;
 
         source
-            .move_instance_to_with_effect(
+            .move_instances_to_inner(
                 &target,
-                &before,
-                &before,
-                false,
-                |_instances, _candidate| Ok(()),
+                &[((before).clone(), (before).clone())],
+                MoveTransactionPlan {
+                    profile: ProfileMovePlan {
+                        group_move: &GroupMovePlan::single(&before.group_path, &before.group_path),
+                        merge_complete_post: true,
+                        account_swap: false,
+                    },
+                    transition: None,
+                },
+                |_, _| Ok(()),
                 |_| Ok(()),
+                sync_resolved_parent_directory,
             )
             .expect_err("shared lock inode must be rejected before either flock can self-deadlock");
 
@@ -6074,16 +5767,23 @@ mod tests {
         fs::hard_link(&source_groups, &target_groups)?;
         let effect_ran = std::cell::Cell::new(false);
         source
-            .move_instance_to_with_effect(
+            .move_instances_to_inner(
                 &target,
-                &before,
-                &before,
-                false,
-                |_instances, _candidate| Ok(()),
+                &[((before).clone(), (before).clone())],
+                MoveTransactionPlan {
+                    profile: ProfileMovePlan {
+                        group_move: &GroupMovePlan::single(&before.group_path, &before.group_path),
+                        merge_complete_post: true,
+                        account_swap: false,
+                    },
+                    transition: None,
+                },
+                |_, _| Ok(()),
                 |_| {
                     effect_ran.set(true);
                     Ok(())
                 },
+                sync_resolved_parent_directory,
             )
             .expect_err("shared groups inode must be rejected before external effects");
         assert!(!effect_ran.get());
@@ -6210,10 +5910,12 @@ mod tests {
                 target,
                 &[(before, after)],
                 MoveTransactionPlan {
-                    group_move: &GroupMovePlan::single("work", "moved"),
-                    merge_complete_post: true,
+                    profile: ProfileMovePlan {
+                        group_move: &GroupMovePlan::single("work", "moved"),
+                        merge_complete_post: true,
+                        account_swap: false,
+                    },
                     transition: None,
-                    account_swap: false,
                 },
                 |_existing, _candidates| Ok(()),
                 |_| Ok(()),
@@ -6913,10 +6615,12 @@ mod tests {
                 &target,
                 &[(before, after)],
                 MoveTransactionPlan {
-                    group_move: &GroupMovePlan::single("work", "moved"),
-                    merge_complete_post: true,
+                    profile: ProfileMovePlan {
+                        group_move: &GroupMovePlan::single("work", "moved"),
+                        merge_complete_post: true,
+                        account_swap: false,
+                    },
                     transition: None,
-                    account_swap: false,
                 },
                 |_existing, _candidates| Ok(()),
                 |_| {

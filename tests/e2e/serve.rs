@@ -278,6 +278,7 @@ async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profil
                         path: path.into(),
                     },
                     mode,
+                    cleanup: Default::default(),
                 },
                 &epoch,
             )
@@ -1725,6 +1726,8 @@ async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() 
         delete_sandbox: true,
         force_delete: true,
         keep_scratch: false,
+        use_cleanup_defaults: false,
+        expected_trash: false,
     })
     .unwrap();
     let request = format!("DELETE /api/sessions/{id} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}: {epoch}\r\nContent-Length: {}\r\n\r\n{body}",

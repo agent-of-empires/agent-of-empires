@@ -156,10 +156,8 @@ fn watcher_refresh_stashes_global_theme_not_profile_override() {
 #[test]
 #[serial]
 fn preview_info_follows_flag_and_never_auto_shows_in_live() {
-    // Info-header visibility is purely the persisted `show_preview_info` toggle
-    // (driven by `i` in the TUI). Live mode must NOT change it: if the user
-    // hid the header, it stays hidden when they go live, and a shown header
-    // stays shown. Nothing magically re-shows it.
+    // Info-header visibility is purely the persisted `show_preview_info` toggle, so live
+    // mode must not change it in either direction.
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
@@ -377,10 +375,9 @@ fn ctrl_c_flash_renders_in_live_footer() {
 #[serial]
 fn preview_visible_rows_equal_output_area_with_info_shown() {
     // With the info header shown, the Agent branch sizes the pane to
-    // `PreviewLayout::compute(..).output` (header + banner removed once) and the
-    // renderer paints into the same rect. `preview_visible_rows` must equal
-    // `preview_pane_area.height`; the historical bugs all came from a second,
-    // drifting derivation of this number, now consolidated into one layout.
+    // `PreviewLayout::compute(..).output` and the renderer paints into the same rect, so
+    // `preview_visible_rows` must equal `preview_pane_area.height`. The historical bugs all
+    // came from a second, drifting derivation of that number.
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -609,9 +606,8 @@ fn stop_in_terminal_view_does_not_target_agent_session() {
     env.view.confirm_dialog = None;
     env.view.pending_stop_session = None;
 
-    // Terminal view: Stop must never touch the agent session. With no live
-    // terminal in the test env the terminal-kill path no-ops, but the critical
-    // invariant is that no agent stop was armed and the stop-session confirm
+    // Terminal view: Stop must never touch the agent session. With no live terminal the
+    // kill path no-ops, but the invariant is that no agent stop was armed and the confirm
     // never opened.
     env.view.view_mode = ViewMode::Terminal;
     env.view.stop_selected();
@@ -655,6 +651,7 @@ fn second_stop_key_press_confirms_the_stop() {
                     pane: crate::session::PaneObservation {
                         state: crate::session::PanePresence::Alive,
                         tmux_session: Some("host".into()),
+                        legacy_tool: None,
                     },
                 }];
             });
@@ -716,18 +713,20 @@ fn native_unread_respects_visits_and_canonical_feedback() {
     };
     let publish = |env: &mut TestEnv, revision, a_unread, b_unread| {
         let SessionFeedResult::Snapshot(mut snapshot) =
-            super::session_feed_tests::daemon_snapshot(&a, "Idle")
+            super::session_feed_tests::daemon_snapshot(&env.view, &a, "Idle")
         else {
             unreachable!()
         };
         let canonical = std::sync::Arc::make_mut(&mut snapshot);
         canonical.cursor = cursor(revision);
-        let template = canonical.contents.sessions[0].clone();
         canonical.contents.sessions = [(&a, a_unread), (&b, b_unread)]
             .into_iter()
             .map(|(id, unread)| {
-                let mut row = template.clone();
-                row.id = id.clone();
+                let mut row = crate::daemon::SessionResponse::from_instance(
+                    env.view.get_instance(id).unwrap(),
+                    false,
+                );
+                row.status = "Idle".into();
                 row.view = crate::session::View::Terminal;
                 row.unread = unread;
                 row
@@ -874,7 +873,7 @@ fn manual_unread_hold_lasts_one_visit() {
     };
     let publish = |env: &mut TestEnv, revision, a_unread| {
         let SessionFeedResult::Snapshot(mut snapshot) =
-            super::session_feed_tests::daemon_snapshot(&a, "Idle")
+            super::session_feed_tests::daemon_snapshot(&env.view, &a, "Idle")
         else {
             unreachable!()
         };
@@ -992,9 +991,8 @@ fn test_q_returns_quit_action() {
 #[test]
 #[serial]
 fn test_ctrl_q_does_not_quit_home() {
-    // #1569: Ctrl+Q is a live-mode-exit habit; on the home view it must
-    // not quit aoe. (The app-level handler swallows it; the home view
-    // itself must also never treat it as a quit.)
+    // #1569: Ctrl+Q is a live-mode-exit habit and must not quit aoe on the home view. The
+    // app-level handler swallows it, and the home view must not treat it as a quit either.
     let mut env = create_test_env_empty();
     let action = env.view.handle_key(
         KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),

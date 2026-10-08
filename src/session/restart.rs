@@ -63,11 +63,9 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     let tool = instance.tool.clone();
     let before = instance.clone();
 
-    // With `bound_hooks`, honor the on_launch / before_start hook timeout the
-    // startup-recovery worker installs (`run_recovery_for_instance`), so a
-    // hanging hook (e.g. a `mint` script waiting on the network) cannot wedge
-    // this serial worker. Enter and new-session launches opt out to keep their
-    // hooks unbounded; a hang there stalls later restarts until the hook exits.
+    // With `bound_hooks`, honor the on_launch / before_start hook timeout the startup-recovery
+    // worker installs (`run_recovery_for_instance`), so a hanging hook (e.g. a `mint` script
+    // waiting on the network) cannot wedge this serial worker.
     let outcome = {
         let _scope = bound_hooks.then(|| {
             crate::session::recovery::HookTimeoutScope::new(
@@ -84,9 +82,9 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
             .map_err(|e| e.to_string())
     };
 
-    // On a successful restart, send the wake-up keys on a detached thread so
-    // the result (and the row's status update) propagate back immediately
-    // rather than waiting out the up-to-3s pane-readiness probe.
+    // On a successful restart, send the wake-up keys on a detached thread so the result (and the
+    // row's status update) propagate back immediately rather than waiting out the up-to-3s
+    // pane-readiness probe.
     let should_wake = launched_agent(&outcome);
     if should_wake && !wake_message.is_empty() {
         spawn_wake_worker(session_id.clone(), title, tool, wake_message, None);

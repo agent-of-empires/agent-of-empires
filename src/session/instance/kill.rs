@@ -154,20 +154,19 @@ impl Instance {
         Ok(())
     }
 
-    pub(crate) fn kill_clean(&self) -> Result<u64> {
-        let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
+    pub(crate) fn kill_clean_in(&self, storage: &dyn crate::session::SessionStore) -> Result<u64> {
+        storage.check_available()?;
         let _lifecycle_lock = storage
+            .storage()
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
         let mut lifecycle = self.clone();
         let generation =
-            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+            lifecycle.acquire_lifecycle_reservation(storage, LifecycleOperation::Stop, None)?;
         match self.kill_clean_locked() {
             Ok(()) => {
                 lifecycle.commit_lifecycle_status(
-                    &storage,
+                    storage,
                     LifecycleOperation::Stop,
                     generation,
                     Status::Stopped,
@@ -176,7 +175,7 @@ impl Instance {
             }
             Err(error) => {
                 let _ = lifecycle.commit_lifecycle_status(
-                    &storage,
+                    storage,
                     LifecycleOperation::Stop,
                     generation,
                     Status::Error,

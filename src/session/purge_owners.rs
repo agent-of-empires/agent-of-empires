@@ -92,10 +92,6 @@ impl RunnerCapture {
         };
         anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
     }
-
-    fn serialized(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("runner capture is serializable")
-    }
 }
 
 fn peer_pid_for(session_id: &str) -> Result<Option<u32>> {
@@ -137,10 +133,6 @@ fn capture_runner(session_id: &str) -> RunnerCapture {
             error: format!("{error:#}"),
         },
     }
-}
-
-pub(crate) fn capture_runner_json(session_id: &str) -> serde_json::Value {
-    capture_runner(session_id).serialized()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -226,17 +218,8 @@ fn decode(content: Option<&str>) -> Result<Journal> {
     Ok(journal)
 }
 
-/// Decode the journal for a SIBLING reader that only needs to know which
-/// sessions other namespaces still have in flight, treating an ABSENT file as
-/// an empty one. A namespace created before v036 never had a journal and
-/// genuinely has no pending owners, so its absence is not corruption and must
-/// not fail the whole pass — the store reclaim would otherwise orphan every
-/// store on an install that predates the migration. A journal that exists but
-/// does not parse is still refused, so corruption stays fail-closed.
-///
-/// Deliberately NOT used by [`protection`] or [`recovery_plans`]: those drive
-/// destructive cleanup and recovery, where "the journal is gone" is not proof
-/// that nothing is in flight, so a missing file must keep failing them.
+/// Sibling namespace scans accept an absent journal but refuse malformed ownership.
+/// Destructive cleanup and recovery use the strict decoder instead.
 fn decode_sibling(content: Option<&str>) -> Result<Journal> {
     match content {
         Some(_) => decode(content),
@@ -245,10 +228,6 @@ fn decode_sibling(content: Option<&str>) -> Result<Journal> {
             owners: Vec::new(),
         }),
     }
-}
-
-pub(crate) fn validate_serialized(content: &str) -> Result<()> {
-    decode(Some(content)).map(|_| ())
 }
 
 fn save(file: &ResolvedDataFile, journal: &Journal) -> Result<()> {

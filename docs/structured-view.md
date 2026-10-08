@@ -121,11 +121,11 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 - **Web wizard:** defaults to the structured view (set [`acp.default_new_session_view`](guides/configuration.md) to change it); turn off **Use structured view** to get the terminal view.
 - **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
-- Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (needs a running `aoe serve` daemon; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
+- Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (requires a healthy runtime; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
 
 Non-ACP tools always run in the terminal view, with no toggle.
 
-The local TUI ensures a native core daemon at startup without opening a web listener. It reuses an existing daemon and leaves it running on exit. Structured sidebar statuses arrive through the runtime WebSocket; when that connection is unavailable, the session view is masked as unavailable rather than presenting the last daemon-owned values, and reconnecting restores live state.
+See the [local Core workflow](quick-start.md#launch-the-tui) for startup, shutdown, and recovery. Structured sidebar statuses arrive through the runtime WebSocket. Reconnecting restores live state.
 
 ### Launch command and session naming
 

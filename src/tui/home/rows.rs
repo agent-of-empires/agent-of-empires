@@ -2,6 +2,7 @@
 //! tree, project, and org groupings.
 
 use super::*;
+use std::collections::HashSet;
 
 /// The GroupTree identity key for a session in project mode. Worktree sessions
 /// key on `main_repo_path` (so all branches of a repo group together); other
@@ -69,7 +70,7 @@ impl HomeView {
     ) -> indexmap::IndexMap<String, Instance> {
         let mut map: indexmap::IndexMap<String, Instance> =
             indexmap::IndexMap::with_capacity(all_instances.len());
-        let mut duplicate_ids = std::collections::HashSet::new();
+        let mut duplicate_ids = HashSet::new();
         for inst in all_instances {
             if duplicate_ids.contains(&inst.id) {
                 continue;

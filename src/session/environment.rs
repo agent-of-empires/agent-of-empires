@@ -596,10 +596,8 @@ pub(crate) fn collect_environment(
     let mut seen_keys = std::collections::HashSet::new();
     let mut result = Vec::new();
 
-    // When per-session extra_env is present, it is the authoritative env list
-    // (the TUI seeds it from config.sandbox.environment and the user may have
-    // added, edited, or removed entries). Fall back to config only when no
-    // per-session overrides exist.
+    // When per-session extra_env is present, it is the authoritative env list (the TUI seeds it
+    // from config.sandbox.environment and the user may have added, edited, or removed entries).
     let entries: &[String] = sandbox_info
         .extra_env
         .as_deref()
@@ -651,82 +649,63 @@ pub(crate) fn collect_environment(
     }
 
     for entry in entries {
-        let key = entry.split_once('=').map(|(key, _)| key).unwrap_or(entry);
+        let (key, value) = match entry.split_once('=') {
+            Some((key, value)) => (key, Some(value)),
+            None => (entry.as_str(), None),
+        };
         if !is_valid_env_key(key) {
             tracing::warn!(target: "session.create", "invalid sandbox environment key '{}'; skipping", key);
             continue;
         }
-        if let Some((key, value)) = entry.split_once('=') {
-            if seen_keys.insert(key.to_string()) {
-                if let Some(rest) = value.strip_prefix("$$") {
-                    // Escaped literal $, e.g. KEY=$$FOO -> KEY=$FOO
-                    let literal = format!("${}", rest);
-                    result.push(EnvEntry::Literal {
+        if !seen_keys.insert(key.to_string()) {
+            continue;
+        }
+        if let Some(value) = value {
+            if let Some(rest) = value.strip_prefix("$$") {
+                result.push(EnvEntry::Literal {
+                    key: key.to_string(),
+                    value: format!("${rest}"),
+                });
+            } else if value.starts_with('$') {
+                if let Some(resolved) = resolve_env_value(value) {
+                    result.push(EnvEntry::Inherit {
                         key: key.to_string(),
-                        value: literal,
-                    });
-                } else if value.starts_with('$') {
-                    // Host env reference, e.g. GH_TOKEN=$GH_TOKEN
-                    if let Some(resolved) = resolve_env_value(value) {
-                        result.push(EnvEntry::Inherit {
-                            key: key.to_string(),
-                            value: resolved,
-                        });
-                    }
-                } else {
-                    // Literal value, e.g. TERM=xterm-256color
-                    result.push(EnvEntry::Literal {
-                        key: key.to_string(),
-                        value: value.to_string(),
+                        value: resolved,
                     });
                 }
+            } else {
+                result.push(EnvEntry::Literal {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
             }
         } else {
-            // Bare key -- pass through from host
-            if seen_keys.insert(entry.clone()) {
-                match std::env::var(entry) {
-                    Ok(val) => {
-                        result.push(EnvEntry::Inherit {
-                            key: entry.clone(),
-                            value: val,
-                        });
-                    }
-                    Err(_) => {
-                        tracing::warn!(target: "session.create",
-                            "Environment variable {} is not set on host, skipping",
-                            entry
-                        );
-                    }
-                }
+            match std::env::var(key) {
+                Ok(value) => result.push(EnvEntry::Inherit {
+                    key: key.to_string(),
+                    value,
+                }),
+                Err(_) => tracing::warn!(
+                    target: "session.create",
+                    "Environment variable {} is not set on host, skipping",
+                    entry
+                ),
             }
         }
     }
 
-    // Git's safe-directory check fails when the container user (root) does not
-    // match the file owner (host UID 1000, shown as "ubuntu" inside the
-    // aoe-dev-sandbox image). Bind-mounted repos trigger:
-    //   fatal: detected dubious ownership in repository at '...'
-    // We inject safe.directory=* via Git's env-var config API (Git 2.31+),
-    // which overrides the check without modifying any files.
-    // Placed after the user entries loop so caller-provided GIT_CONFIG_*
-    // values take precedence (first-wins deduplication via seen_keys).
-    if seen_keys.insert("GIT_CONFIG_COUNT".to_string()) {
-        result.push(EnvEntry::Literal {
-            key: "GIT_CONFIG_COUNT".to_string(),
-            value: "1".to_string(),
-        });
-    }
-    if seen_keys.insert("GIT_CONFIG_KEY_0".to_string()) {
-        result.push(EnvEntry::Literal {
-            key: "GIT_CONFIG_KEY_0".to_string(),
-            value: "safe.directory".to_string(),
-        });
-    }
-    if seen_keys.insert("GIT_CONFIG_VALUE_0".to_string()) {
-        result.push(EnvEntry::Literal {
-            key: "GIT_CONFIG_VALUE_0".to_string(),
-            value: "*".to_string(),
-        });
+    // Caller-provided GIT_CONFIG_* values win independently for each key.
+    for (key, value) in [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "safe.directory"),
+        ("GIT_CONFIG_VALUE_0", "*"),
+    ] {
+        if seen_keys.insert(key.to_string()) {
+            result.push(EnvEntry::Literal {
+                key: key.to_string(),
+                value: value.to_string(),
+            });
+        }
     }
 
     result

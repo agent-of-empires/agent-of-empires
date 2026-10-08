@@ -27,6 +27,7 @@ pub use status_detection::{
 };
 pub use terminal_session::{ContainerTerminalSession, TerminalSession};
 pub use tool_session::ToolSession;
+pub(crate) use tool_session::{LegacyToolScope, LegacyToolUnavailable};
 pub use utils::{attach_return_hint, first_pane_id, tmux_prefix_display};
 
 pub(crate) use session_kind::{append_session_kind_args, SessionKind};
@@ -149,14 +150,7 @@ fn tmux_socket() -> Option<TmuxSocket> {
 fn build_isolation_socket() -> Option<PathBuf> {
     #[cfg(test)]
     {
-        // Per-process socket, not a fixed name. The resolution is cached once
-        // per process so the path stays stable for this test binary (a later
-        // test must not have the socket pulled from under it), while the pid
-        // keeps it from colliding with a concurrent unit-test process (a second
-        // `cargo test`, a serve-vs-default shard, or a server left over from a
-        // prior run) that would otherwise share one tmux server and interfere.
-        // The collision bites hardest as root, where `/tmp` is shared across
-        // every same-uid run.
+        // Per-process so concurrent test binaries never share a server.
         return Some(
             std::env::temp_dir().join(format!("aoe-unit-test-tmux-{}.sock", std::process::id())),
         );
@@ -222,11 +216,8 @@ pub(crate) fn tmux_command() -> Command {
         }
         None => {}
     }
-    // Attach/switch-client calls run from inside `IgnoreSignalsGuard`'s
-    // window (`src/tui/app.rs`), which ignores SIGINT/SIGQUIT on aoe
-    // itself while the terminal is handed to tmux. `SIG_IGN` survives
-    // exec, so without this every `tmux` child would silently inherit
-    // that ignore too, leaving no way to Ctrl+C out of a hung attach.
+    // Attach runs while aoe ignores SIGINT/SIGQUIT, and SIG_IGN survives exec;
+    // restore defaults so Ctrl+C still works in a hung tmux child.
     #[cfg(unix)]
     crate::process::reset_signals_on_exec(&mut cmd);
     cmd
@@ -322,6 +313,9 @@ pub enum ToolPaneOwner {
 /// Pre-fetched pane metadata from a single `tmux list-panes -a` call.
 #[derive(Debug, Clone)]
 pub struct PaneMetadata {
+    pub session_id: String,
+    pub pane_id: String,
+    pub session_kind: Option<String>,
     pub tool_owner: ToolPaneOwner,
     pub pane_dead: bool,
     pub pane_current_command: Option<String>,
@@ -514,10 +508,7 @@ pub enum SessionCacheRefresh {
     Unknown,
 }
 
-// Field separator for the fixed tmux -F head. Must be printable ASCII and
-// absent from sanitize_session_name output (which preserves [A-Za-z0-9_-]
-// and replaces everything else with _). C0 bytes are reserved for the tail,
-// whose parser handles tmux 3.4's octal escaping explicitly.
+// Printable and absent from sanitized names; C0 bytes are reserved for the tail.
 const FIELD_SEP: char = '|';
 /// Separator for the two trailing fields. pane_start_command may itself
 /// contain FIELD_SEP, which is why it was last in the original format. A C0
@@ -576,10 +567,7 @@ fn publish_session_cache(
     if refresh_id <= cache.refresh_id {
         return cache.outcome;
     }
-    // An unexpected refresh failure says nothing about the last successful
-    // session list. Keep that list for display-only lookups while exposing the
-    // failed outcome to authoritative lifecycle callers. A populated response
-    // replaces it, and a recognized no-server response clears it.
+    // An unexpected failure keeps the last good list for display lookups.
     if outcome != SessionCacheRefresh::Unknown {
         cache.data = data;
     }
@@ -736,8 +724,7 @@ pub fn refresh_session_cache() -> SessionCacheRefresh {
         }
     };
 
-    // Trace, not debug: the TUI status poller calls this every ~2s, so
-    // at debug it dominates the idle log. Errors above still log at warn.
+    // Trace: the TUI polls this every ~2s.
     let sessions = new_data.as_ref().map(|m| m.len()).unwrap_or(0);
     tracing::trace!(
         target: "tmux.cache",
@@ -800,9 +787,7 @@ pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyho
 /// The rename half of [`rekey_session`]: resolves the live session for `id`
 /// and moves it to the name derived from `new_title`.
 fn rekey_session_name(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
-    // Name resolution is cache-backed. Force an authoritative scan first so a
-    // process-local snapshot from before another writer's rename cannot point
-    // this mutation at the old title-derived name.
+    // Force a fresh scan so a stale snapshot cannot target the old name.
     let initial_refresh = refresh_session_cache();
     let session = Session::new(id, old_title)?;
     match resolved_agent_existence(id, &session, initial_refresh) {
@@ -823,11 +808,8 @@ fn rekey_session_name(id: &str, old_title: &str, new_title: &str) -> anyhow::Res
         Err(error) => error,
     };
 
-    // Another process may have rekeyed this id between our scan and
-    // rename-session. Refresh and resolve by the immutable id suffix, then
-    // retry once only when that same live session is confirmed under a newer
-    // name. A transient query failure is not evidence the pane disappeared,
-    // so preserve the original rename error in that case.
+    // Another process may have rekeyed meanwhile: re-resolve by id suffix and
+    // retry once. A failed query keeps the original rename error.
     let retry_refresh = refresh_session_cache();
     let refreshed = Session::new(id, old_title)?;
     match resolved_agent_existence(id, &refreshed, retry_refresh) {
@@ -1172,14 +1154,8 @@ pub(crate) fn resolve_session_name<'a>(
     let mut ambiguous = false;
     let mut derived_is_live = false;
     for (name, marker) in live {
-        // Test `derived` on its own rather than through the shape: an
-        // unmarked session whose sanitized title lands under another kind's
-        // prefix fails the shape, and a live derived name must still win over
-        // an older session rather than be filtered out of its own match. A
-        // session that SAYS it is another kind is the exception: a title moved
-        // across an auxiliary prefix leaves a paired terminal holding what is
-        // now the agent's derived name, and adopting it points the operation
-        // at the wrong pane.
+        // A live derived name wins even if it fails the shape, unless it is marked
+        // as another kind.
         if name == derived {
             derived_is_live = SessionKind::from_marker(marker.unwrap_or_default())
                 .is_none_or(|kind| kind == shape.kind);
@@ -1306,9 +1282,7 @@ fn resolve_session_name_from_snapshot(
     let Some(sessions) = sessions else {
         return derived.to_string();
     };
-    // Fast path only when the live derived name is also this kind: a session
-    // marked as another kind has to go through the scan, which looks for the
-    // one this shape is actually asking for.
+    // The fast path requires the live derived name to be this kind.
     if sessions
         .get(derived)
         .is_some_and(|session| session.kind.is_none_or(|kind| kind == shape.kind))
@@ -1412,7 +1386,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         "-F",
         // Tail fields use TAIL_SEP because commands and titles may contain pipes.
         concat!(
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
+            "#{session_name}|#{session_id}|#{pane_id}|#{@aoe_kind}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
             "|#{pane_current_command}",
             "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{@aoe_tool_owner}\x1f#{pane_title}"
         ),
@@ -1447,9 +1421,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         }
     };
 
-    // Trace, not debug: paired with refresh_session_cache in the TUI
-    // status poll loop (~every 2s). Debug-level here would dominate the
-    // idle log.
+    // Trace: polled every ~2s.
     tracing::trace!(
         target: "tmux.pane",
         sessions = result.as_ref().map(|m| m.len()).unwrap_or(0),
@@ -1576,9 +1548,12 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         };
         let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
         let pane_title = pane_title.unwrap_or("");
-        let mut parts = line.splitn(7, FIELD_SEP);
+        let mut parts = line.splitn(10, FIELD_SEP);
         let (
             Some(session_name),
+            Some(session_id),
+            Some(pane_id),
+            Some(session_kind),
             Some(pane_index),
             Some(pane_dead),
             Some(window_width),
@@ -1593,20 +1568,31 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
             parts.next(),
             parts.next(),
             parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
         )
         else {
             continue;
         };
+        if !session_id
+            .strip_prefix('$')
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit()))
+            || !pane_id
+                .strip_prefix('%')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit()))
+        {
+            continue;
+        }
         let window_size = window_width
             .parse::<u16>()
             .ok()
             .zip(window_height.parse::<u16>().ok());
-        // The start command may itself contain the separator, so the pid is
-        // split off the tail rather than the command off the head.
-        let (pane_start_command, pane_pid) = match rest.rsplit_once(FIELD_SEP) {
-            Some((command, pid)) => (command, pid.trim().parse().ok()),
-            None => (rest, None),
+        // The start command may contain the separator, so split the pid off the end.
+        let Some((pane_start_command, pane_pid)) = rest.rsplit_once(FIELD_SEP) else {
+            continue;
         };
+        let pane_pid = pane_pid.trim().parse().ok();
         if !session_name.starts_with(SESSION_PREFIX) {
             continue;
         }
@@ -1625,6 +1611,9 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         map.insert(
             session_name.to_string(),
             PaneMetadata {
+                session_id: session_id.to_owned(),
+                pane_id: pane_id.to_owned(),
+                session_kind: (!session_kind.is_empty()).then(|| session_kind.to_owned()),
                 tool_owner,
                 pane_dead: pane_dead == "1",
                 pane_pid,
@@ -1695,6 +1684,9 @@ pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: I
         map.insert(
             name.to_string(),
             PaneMetadata {
+                session_id: "$42".into(),
+                pane_id: "%42".into(),
+                session_kind: None,
                 tool_owner: ToolPaneOwner::Unmarked,
                 pane_dead: false,
                 pane_current_command: None,
@@ -2552,11 +2544,7 @@ pub fn spawn_snapshot_poller() {
                     "display snapshot poller cycle panicked; retrying"
                 );
             }
-            // Half the TTL, not the TTL: the refresh work itself takes time
-            // and the timestamps are stamped when each query lands, so a
-            // full-TTL period would guarantee an expired-snapshot window
-            // every cycle. Half keeps each snapshot fresh across the whole
-            // cycle at one extra bounded fork pair per ~1s.
+            // Half the TTL so a snapshot never expires within a cycle.
             std::thread::park_timeout(CACHE_TTL / 2);
         });
     if let Err(error) = spawn_result {
@@ -2856,10 +2844,7 @@ pub struct AvailableTools {
 
 impl AvailableTools {
     pub fn detect() -> Self {
-        // One batched, memoized probe for the whole roster: at most one login
-        // shell, and every later per-agent caller (the settings pickers) reads
-        // the memo this warms. Per-agent login shells made TUI startup scale
-        // at ~1-2.5s per not-installed agent.
+        // One batched probe warms the memo for later per-agent callers.
         let agents = crate::agents::AGENTS;
         let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
         let found = probe_agents_available(&refs);
@@ -2869,8 +2854,7 @@ impl AvailableTools {
             .map(|a| a.name.to_string())
             .collect();
 
-        // Append user-defined custom agents (always considered available since the
-        // command may target a remote host or a wrapper script).
+        // Custom agents always count as available (they may target a wrapper).
         if let Ok(config) = crate::session::config::Config::load() {
             config.session.warn_custom_agent_issues();
             let mut custom: Vec<_> = config
@@ -3770,6 +3754,9 @@ mod tests {
                     (
                         n.to_string(),
                         PaneMetadata {
+                            session_id: "$42".into(),
+                            pane_id: "%42".into(),
+                            session_kind: None,
                             tool_owner: ToolPaneOwner::Unmarked,
                             pane_dead: false,
                             pane_current_command: None,
@@ -3821,6 +3808,9 @@ mod tests {
 
     fn dead_pane_meta(dead: bool) -> PaneMetadata {
         PaneMetadata {
+            session_id: "$42".into(),
+            pane_id: "%42".into(),
+            session_kind: None,
             tool_owner: ToolPaneOwner::Unmarked,
             pane_dead: dead,
             pane_current_command: None,
@@ -4303,7 +4293,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
-        let output = format!("{P}my_proj_abc12345|0|0|190|52|claude|claude|4242\n");
+        let output = format!("{P}my_proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
@@ -4311,13 +4301,16 @@ mod tests {
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
         assert_eq!(meta.pane_pid, Some(4242));
+        assert_eq!(meta.session_id, "$42");
+        assert_eq!(meta.pane_id, "%42");
+        assert_eq!(meta.session_kind, None);
         assert_eq!(meta.window_size, Some((190, 52)));
     }
 
     #[test]
     fn test_parse_pane_metadata_reads_the_tail_fields() {
         let output = format!(
-            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}{TAIL_SEP}✶ Working\n"
+            "{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242{TAIL_SEP}1770000000{TAIL_SEP}{TAIL_SEP}✶ Working\n"
         );
         let meta = parse_pane_metadata(&output)
             .remove(&format!("{P}proj_abc12345"))
@@ -4328,7 +4321,7 @@ mod tests {
         // tmux 3.4 renders the control separators as unescaped octal tokens.
         // A doubled backslash belongs to the title and must not split it.
         let escaped_output = format!(
-            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            "{P}proj_escaped_abc12345|$42|%42||0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
             char::from(92),
             char::from(92),
             char::from(10)
@@ -4343,7 +4336,9 @@ mod tests {
             Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
         );
 
-        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}{TAIL_SEP}\n");
+        let odd = format!(
+            "{P}proj_def67890|$42|%42||0|0|||claude|claude|4242{TAIL_SEP}{TAIL_SEP}{TAIL_SEP}\n"
+        );
         let meta = parse_pane_metadata(&odd)
             .remove(&format!("{P}proj_def67890"))
             .unwrap();
@@ -4354,7 +4349,7 @@ mod tests {
         let name = ToolSession::generate_name(id, "T", "git|log");
         let owner = serde_json::to_string(&(id, "git|log")).unwrap();
         for separator in ["\x1f", ESCAPED_TAIL_SEP] {
-            let output = format!("{name}|0|0|80|24|sh|sh|4242{separator}1770000000{separator}{owner}{separator}title\n");
+            let output = format!("{name}|$42|%42|tool|0|0|80|24|sh|sh|4242{separator}1770000000{separator}{owner}{separator}title\n");
             let panes = parse_pane_metadata(&output);
             assert_eq!(
                 ToolSession::from_snapshot(id, "renamed", "git|log", &panes)
@@ -4369,8 +4364,8 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
         let output = format!(
-            "{P}protected_abc12345|0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
-             {P}interactive_def67890|0|0|190|52|sh|sh\n"
+            "{P}protected_abc12345|$42|%42||0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'|4242\n\
+             {P}interactive_def67890|$42|%42||0|0|190|52|sh|sh|4242\n"
         );
         let map = parse_pane_metadata(&output);
 
@@ -4393,7 +4388,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_dead_pane() {
-        let output = format!("{P}proj_abc12345|0|1|190|52|bash|bash\n");
+        let output = format!("{P}proj_abc12345|$42|%42||0|1|190|52|bash|bash|4242\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_dead);
@@ -4402,7 +4397,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_filters_non_aoe_sessions() {
         let output = format!(
-            "user_session|0|0|190|52|bash|bash\n{P}proj_abc12345|0|0|190|52|claude|claude\nmy_tmux|0|0|190|52|vim|vim\n"
+            "user_session|$42|%42||0|0|190|52|bash|bash|4242\n{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\nmy_tmux|$42|%42||0|0|190|52|vim|vim|4242\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
@@ -4412,7 +4407,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_filters_non_zero_panes() {
         let output = format!(
-            "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|1|0|190|52|bash|bash\n"
+            "{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n{P}proj_abc12345|$42|%42||1|0|190|52|bash|bash|4242\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
@@ -4424,7 +4419,7 @@ mod tests {
     fn test_parse_pane_metadata_first_window_wins() {
         // Two windows both have pane 0, first window's data should be kept
         let output = format!(
-            "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|0|1|190|52|bash|bash\n"
+            "{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n{P}proj_abc12345|$42|%42||0|1|190|52|bash|bash|4242\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
@@ -4440,14 +4435,15 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_malformed_lines() {
-        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|190|52|claude|claude\n\n");
+        let output =
+            format!("too|few|fields\n{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn test_parse_pane_metadata_empty_command() {
-        let output = format!("{P}proj_abc12345|0|0|190|52||sh\n");
+        let output = format!("{P}proj_abc12345|$42|%42||0|0|190|52||sh|4242\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_current_command.is_none());
@@ -4456,7 +4452,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_multiple_sessions() {
         let output = format!(
-            "{P}proj_a_abc12345|0|0|190|52|claude|claude\n{P}proj_b_def67890|0|0|190|52|opencode|opencode\n{P}proj_c_ghi11111|0|1|190|52|bash|bash\n"
+            "{P}proj_a_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n{P}proj_b_def67890|$42|%42||0|0|190|52|opencode|opencode|4242\n{P}proj_c_ghi11111|$42|%42||0|1|190|52|bash|bash|4242\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 3);

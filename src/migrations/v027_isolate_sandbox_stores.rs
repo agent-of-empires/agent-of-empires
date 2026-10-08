@@ -913,11 +913,9 @@ fn run_pass(
                 }
                 continue;
             }
-            // A parked row does not defer retirement globally: it becomes a
-            // `Hold` target, and `all_ready` refuses to retire any root that
-            // carries one. Setting the pass-wide flag here would block every
-            // unrelated root too, so no store on a machine with a single
-            // archived session would ever be reclaimed.
+            // Parked defers per root, through the `Hold` target `all_ready`
+            // refuses to retire under. The pass-wide flag would block every
+            // unrelated root on a machine with one archived session.
             let parked = row_is_parked(row) && only != Some(id.as_str());
             let Some(tool) = row.get("tool").and_then(Value::as_str) else {
                 defer_source_retirement = true;
@@ -1060,11 +1058,10 @@ fn run_pass(
             .or_default()
             .push(target);
     }
-    // Scoping demotes; it never removes. A cohort not named by this pass keeps
-    // every member and every member keeps its place in the liveness fold, so
-    // the gate still asks about sessions this pass will not touch. Dropping
-    // them instead is what let an earlier revision copy a store out from under
-    // a live peer.
+    // Scoping demotes, never removes: an unnamed cohort keeps every member in
+    // the liveness fold, so the gate still asks about sessions this pass will
+    // not touch. Dropping them is what let an earlier revision copy a store
+    // out from under a live peer.
     if let Some(wanted) = only {
         let selected: BTreeSet<PathBuf> = cohorts
             .iter()
@@ -1075,10 +1072,9 @@ fn run_pass(
             if selected.contains(shared) {
                 continue;
             }
-            // Another session's cohort: it still holds its shared source.
-            // Demoting its members to `Hold` is what protects it, through
-            // `all_ready`; the pass-wide flag would also strand the cohort
-            // this pass just emptied.
+            // Another cohort still holds its shared source. `Hold` protects
+            // it through `all_ready`; the pass-wide flag would also strand the
+            // cohort this pass just emptied.
             for target in cohort.iter_mut() {
                 target.disposition = Disposition::Hold;
             }
@@ -1092,10 +1088,9 @@ fn run_pass(
         .filter(|target| target.disposition == Disposition::Move)
         .map(|target| (target.registry, target.row))
         .collect();
-    // Reporting only. `affected_rows` excludes held rows by construction, so
-    // without this the completion notice subtracts them from nothing and tells
-    // a user the transition finished while parked sessions are still on the
-    // shared store.
+    // Reporting only: `affected_rows` excludes held rows, so without this the
+    // completion notice claims the transition finished while parked sessions
+    // are still on the shared store.
     let held_row_count = cohorts
         .values()
         .flatten()
@@ -1229,11 +1224,10 @@ fn run_pass(
         }
     }
 
-    // The copies below run without the transition and registry locks, so a
-    // root's transition is serialised by its own lock instead. Tried, not
-    // waited for: see `cohort_lock_name`. A busy root is another process's
-    // transition in flight; it stays pending here, and a pass scoped to a row
-    // under it waits for that process and looks again.
+    // The copies below run without the transition and registry locks, so each
+    // root's own lock serialises it. Tried, not waited for (see
+    // `cohort_lock_name`): a busy root is another process's transition, which
+    // stays pending here, and a scoped pass waits for it and looks again.
     let mut copy_roots: BTreeSet<PathBuf> = cohorts
         .values()
         .flatten()
@@ -1506,12 +1500,11 @@ fn run_pass(
         }
     }
 
-    // Remove stopped containers only after every store for the row is durable.
-    // `force=false` makes a concurrent start fail the transition rather than
-    // stopping a container that became live after the probe. A runtime that
-    // cannot be asked defers the row instead, so its legacy source survives for
-    // the pass that can finish it. Keyed by id to reap once, but carrying every
-    // row naming it: two profiles can hold one instance and all must be held.
+    // Only once every store for the row is durable. `force=false` makes a
+    // concurrent start fail the transition rather than stopping a container
+    // that came alive after the probe, and a runtime that cannot be asked
+    // defers the row. Keyed by id to reap once, but carrying every row naming
+    // it, since two profiles can hold one instance.
     let mut ready_ids: BTreeMap<String, BTreeSet<(usize, usize)>> = BTreeMap::new();
     for &(registry, row) in &ready_rows {
         if let Some(id) = registries[registry]
@@ -1923,10 +1916,7 @@ pub(super) fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
 
 fn registry_file_exists(path: &Path) -> Result<bool> {
     match fs::metadata(path) {
-        Ok(metadata) => {
-            anyhow::ensure!(metadata.is_file(), "session registry is not a regular file");
-            Ok(true)
-        }
+        Ok(metadata) => Ok(metadata.is_file()),
         Err(error)
             if matches!(
                 error.kind(),
@@ -2064,12 +2054,10 @@ fn publish_store(
     }
     fs::set_permissions(stage, fs::symlink_metadata(source)?.permissions())?;
     sync_tree(stage)?;
-    // One barrier for the whole tree, in place of a full drive flush per
-    // file. Everything above reached the drive as it was written; this orders
-    // all of it ahead of the rename below, so a crash can lose the publish
-    // but cannot expose a published store whose bytes never reached the
-    // media. The parent sync after the rename is what makes the publish
-    // itself durable.
+    // One barrier for the whole tree instead of a flush per file: it orders
+    // every write ahead of the rename, so a crash can lose the publish but
+    // cannot expose a store whose bytes never reached the media. The parent
+    // sync after the rename is what makes the publish durable.
     super::store_fs::barrier(&fs::File::open(stage)?)?;
 
     let destination_exists = match fs::symlink_metadata(destination) {

@@ -597,8 +597,7 @@ struct FrameDeflater {
 impl FrameDeflater {
     fn new() -> Self {
         Self {
-            // Raw deflate, no zlib wrapper: the browser inflates with
-            // `DecompressionStream("deflate-raw")`.
+            // Raw deflate, no zlib wrapper.
             stream: flate2::Compress::new(flate2::Compression::fast(), false),
             input: Vec::new(),
         }
@@ -912,17 +911,15 @@ async fn handle_live_ws_inner(
         "live-{}",
         LIVE_CLIENT_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    // Wakes the capture loop out of its inter-capture sleep: after
-    // dispatched input (echo latency) and after cadence/window changes.
+    // Wakes the capture loop out of its inter-capture sleep.
     let nudge = Arc::new(tokio::sync::Notify::new());
 
     #[cfg(unix)]
     let config = crate::session::config::Config::load_or_warn();
     #[cfg(unix)]
     let clipboard_forward = clipboard_forward_enabled(config.tmux.clipboard, read_only);
-    // The agent surface renders from the shared VT grid when one arms (the
-    // native TUI preview shares it). Arming forks tmux and waits for the
-    // forwarder, so it runs off the async runtime.
+    // The agent surface renders from the shared VT grid when one arms (the native TUI
+    // preview shares it).
     #[cfg(unix)]
     let vt = if transport == LiveTransport::Grid && config.tmux.vt_live {
         let name = tmux_name.clone();
@@ -938,8 +935,7 @@ async fn handle_live_ws_inner(
     };
     #[cfg(not(unix))]
     let _ = transport;
-    // Snapshot surfaces keep OSC 52 through a raw observer that builds no
-    // grid. `pipe-pane` is exclusive, so it is only armed when no grid is.
+    // Snapshot surfaces keep OSC 52 through a raw observer that builds no grid.
     #[cfg(unix)]
     let osc52 = if clipboard_forward && vt.is_none() {
         crate::tmux::vt::Osc52Channel::acquire(&tmux_name)
@@ -953,8 +949,7 @@ async fn handle_live_ws_inner(
     // the only writer on the socket.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(8);
 
-    // Capture loop: fork capture-pane (+cursor) off the async runtime,
-    // dedup, publish.
+    // Capture loop.
     let capture_settings = Arc::clone(&settings);
     let capture_nudge = Arc::clone(&nudge);
     let capture_tx = out_tx.clone();
@@ -973,16 +968,11 @@ async fn handle_live_ws_inner(
             .map_or(0, |source| source.clipboard_sequence());
         #[cfg(unix)]
         let mut vt_clipboard_seen = capture_vt.as_ref().map_or(0, |ch| ch.clipboard_sequence());
-        // This connection's own change receiver: every viewer of the shared
-        // grid gets one, so a change wakes all of them.
+        // This connection's own change receiver.
         #[cfg(unix)]
         let mut vt_rx = capture_vt.as_ref().map(|ch| ch.subscribe());
-        // Pane count of the window, re-probed at most once per
-        // PANE_COUNT_PROBE_INTERVAL while the grid path is in use.
-        // `None` until tmux answers. An unprobed count must not read as a
-        // single pane: the grid holds pane 0 alone, so believing that of a
-        // split window would drop every other pane from the view. Unknown
-        // takes the composited capture path, which is right for any count.
+        // Pane count of the window, re-probed at most once per PANE_COUNT_PROBE_INTERVAL
+        // while the grid path is in use.
         #[cfg(unix)]
         let mut pane_count: (Option<u16>, Instant) =
             (None, Instant::now() - PANE_COUNT_PROBE_INTERVAL);
@@ -992,8 +982,7 @@ async fn handle_live_ws_inner(
         // Announced on the first frame and whenever it flips, so a client can
         // report the transport rather than infer it.
         let mut announced_grid: Option<bool> = None;
-        // Patch baseline: rows of the last message the client applied and its
-        // scrollback depth, plus the running sequence number.
+        // Patch baseline.
         let mut last_sent: Option<(Vec<String>, u32)> = None;
         let mut seq: u64 = 0;
         let mut stats = LiveStats::default();
@@ -1015,10 +1004,7 @@ async fn handle_live_ws_inner(
             // a split window is composited from capture-pane.
             #[cfg(unix)]
             let live_grid = capture_vt.as_ref().filter(|ch| ch.is_alive()).cloned();
-            // A resize whose reseed did not land left the parser at the old
-            // geometry. Resolve it on a throttle, before this cycle's frame is
-            // timed; until it lands the frames come from capture-pane, which
-            // reads the resized pane itself.
+            // A resize whose reseed did not land left the parser at the old geometry.
             #[cfg(unix)]
             if last_grid_resync.elapsed() >= GRID_RESYNC_RETRY
                 && live_grid
@@ -1034,33 +1020,26 @@ async fn handle_live_ws_inner(
                     retry_pending_resync(&name, &who, is_owner, ch.as_deref(), &deadline);
                 })
                 .await;
-                // Throttle from the end of the attempt: a reseed forks
-                // capture-pane and can take most of the interval.
+                // Throttle from the end of the attempt.
                 last_grid_resync = Instant::now();
             }
 
             let sample_started = std::time::Instant::now();
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
 
-            // Fetch tmux's authoritative rendered cells. A position-unreliable
-            // cursor is treated as "no cursor" because the web frame has no
-            // reliability channel and its renderer maps the row onto content.
+            // Fetch tmux's authoritative rendered cells.
             let outcome: CaptureOutcome;
             #[cfg(unix)]
             let mut grid_frame = false;
-            // Set from the sample itself, not from a later hold check: only the
-            // sampler knows whether the payload it assembled is a half-drawn
-            // synchronized-output frame.
+            // Set from the sample itself, not from a later hold check.
             #[cfg(unix)]
             let mut grid_incomplete = false;
             #[cfg(unix)]
             {
                 if live_grid.is_some() && pane_count.1.elapsed() >= PANE_COUNT_PROBE_INTERVAL {
                     let name = capture_tmux.clone();
-                    // Advance the probe clock even on failure, or a tmux that
-                    // cannot answer would be re-forked on every capture cycle
-                    // instead of once a second. A failed probe keeps the last
-                    // answer, which is `None` until one arrives.
+                    // Advance the probe clock even on failure, or a tmux that cannot answer
+                    // would be re-forked on every capture cycle instead of once a second.
                     let probed =
                         tokio::task::spawn_blocking(move || window_pane_count(&name)).await;
                     pane_count = (probed.ok().flatten().or(pane_count.0), Instant::now());
@@ -1179,17 +1158,7 @@ async fn handle_live_ws_inner(
                                 .await;
                         }
                     }
-                    // Auto-reclaim: a non-owner viewer re-CLAIMS (never
-                    // steals) the lock once it goes vacant or stale, so when
-                    // the current holder lets go (the TUI exits live mode,
-                    // another web viewer disconnects) this client resumes
-                    // ownership and its grid without the user re-tapping
-                    // "take over". Gated to the fast cadence, i.e. a visible
-                    // client at the live edge: a backgrounded PWA or a
-                    // scrolled-up reader must not grab sizing the moment a
-                    // desktop user releases it. While a live holder
-                    // heartbeats, the claim fails cheaply; the throttle keeps
-                    // that probe to one per heartbeat interval.
+                    // Auto-reclaim.
                     else if !capture_settings.is_owner.load(Ordering::Relaxed)
                         && capture_settings.fast.load(Ordering::Relaxed)
                         && last_reclaim.elapsed() >= SIZE_OWNER_HEARTBEAT
@@ -1233,13 +1202,7 @@ async fn handle_live_ws_inner(
                             }
                         }
                     }
-                    // Only the owner drives the window size. Another writer
-                    // (most commonly the TUI's preview sync) can resize the
-                    // window out from under this viewer; the owner's capture
-                    // lines then exceed its grid and render clipped, so the
-                    // owner re-asserts. Non-owners render best-effort instead
-                    // (the client hard-wraps drifted frames). Rate-limited as
-                    // a guard against an unknown third writer.
+                    // Only the owner drives the window size.
                     if capture_settings.is_owner.load(Ordering::Relaxed) {
                         if let Some(c) = cursor.as_ref() {
                             let want_cols =
@@ -1256,14 +1219,7 @@ async fn handle_live_ws_inner(
                                 pane_cols: c.pane_width,
                                 pane_rows: c.pane_height,
                             };
-                            // Re-assert only for a genuine, not-yet-proven-stuck
-                            // drift. Once a target proves unreachable (the pane
-                            // didn't move after the last re-assert of the same
-                            // geometry) the guard suppresses the repeat, so an
-                            // off-by-one that survives the resize can't spin the
-                            // 2s repaint loop forever (#2766). A real geometry
-                            // change is a new tuple and re-asserts at once; the
-                            // pane reaching target resets the guard below.
+                            // Re-assert only for a genuine, not-yet-proven-stuck drift.
                             if drifted
                                 && last_reassert.elapsed() >= REASSERT_MIN_INTERVAL
                                 && reassert_guard.should_reassert(geom, std::time::Instant::now())
@@ -1279,11 +1235,7 @@ async fn handle_live_ws_inner(
                                     want_rows,
                                     "pane drifted from live owner's grid; re-asserting"
                                 );
-                                // Verified resize: the local is_owner flag is
-                                // stale for up to a heartbeat after a steal,
-                                // and a drift seen in that window IS the new
-                                // owner's grid. Resizing unverified here would
-                                // stomp it; instead demote on the spot.
+                                // Verified resize.
                                 let name = capture_tmux.clone();
                                 let who = capture_owner.clone();
                                 #[cfg(unix)]
@@ -1342,8 +1294,7 @@ async fn handle_live_ws_inner(
                             }
                         }
                     }
-                    // Post-resize settle: hold frames still at the old
-                    // geometry so the client sees one clean repaint.
+                    // Post-resize settle.
                     let settle_until = capture_settings
                         .resize_settle_until_ms
                         .load(Ordering::Relaxed);
@@ -1373,19 +1324,8 @@ async fn handle_live_ws_inner(
                             .resize_settle_until_ms
                             .store(0, Ordering::Relaxed);
                     }
-                    // Mid-bracket grid (the app is inside a synchronized-output
-                    // repaint, or a reseed just copied tmux's half-drawn cells):
-                    // wait for the close, which wakes the loop. The hold expires
-                    // on its own if the app never closes the bracket. A sample
-                    // that reports itself half-drawn is held whatever the hold
-                    // now says: it can have expired, or its bracket closed,
-                    // since the payload was assembled.
-                    // The parser has not been rebuilt at the geometry the pane
-                    // was resized to, so its cells are laid out for a size the
-                    // pane no longer has. Withhold rather than switch transport:
-                    // the reseed lands in a frame or two, and flipping the
-                    // client between two serializations of the same screen for
-                    // that long costs it a repaint it does not need.
+                    // Mid-bracket grid (the app is inside a synchronized-output repaint, or
+                    // a reseed just copied tmux's half-drawn cells).
                     #[cfg(unix)]
                     if grid_frame
                         && capture_vt
@@ -1419,9 +1359,7 @@ async fn handle_live_ws_inner(
                         .await;
                         continue;
                     }
-                    // First publish from a freshly seeded grid: wait for the
-                    // repaint the seed may have caught mid-flight to land and
-                    // settle, so the opening frame is whole.
+                    // First publish from a freshly seeded grid.
                     #[cfg(unix)]
                     if grid_frame && last_published.is_none() {
                         let fresh = capture_vt
@@ -1448,13 +1386,8 @@ async fn handle_live_ws_inner(
                     #[cfg(unix)]
                     if announced_grid != Some(grid_frame) {
                         announced_grid = Some(grid_frame);
-                        // The two transports serialize the same screen from
-                        // different sources, and carry their own scrollback
-                        // depth with it. Patching across the switch would apply
-                        // rows (and a history shift) computed against the other
-                        // one's frame, which lands the cursor rows away from the
-                        // line it belongs on. Drop the baseline so the first
-                        // frame after a switch is a whole one.
+                        // The two transports serialize the same screen from different
+                        // sources, and carry their own scrollback depth with it.
                         last_sent = None;
                         if capture_tx
                             .send(Message::Text(transport_json(grid_frame).into()))
@@ -1465,9 +1398,7 @@ async fn handle_live_ws_inner(
                         }
                     }
                     let frame = (content, cursor);
-                    // A resync republishes even when the frame is unchanged:
-                    // the client dropped a patch and is showing a stale window
-                    // it cannot recover from on its own.
+                    // A resync republishes even when the frame is unchanged.
                     let force_full = capture_settings.force_full.swap(false, Ordering::Relaxed);
                     if force_full || last_published.as_ref() != Some(&frame) {
                         seq += 1;
@@ -1504,10 +1435,7 @@ async fn handle_live_ws_inner(
                             Some(d) => match d.frame(&json) {
                                 Some(bytes) => Message::Binary(bytes.into()),
                                 None => {
-                                    // Corrupt compressor state (not expected):
-                                    // degrade to text frames for the rest of
-                                    // the connection; every client accepts
-                                    // them regardless of caps.
+                                    // Corrupt compressor state (not expected).
                                     deflater = None;
                                     capture_settings.deflate.store(false, Ordering::Relaxed);
                                     Message::Text(json.into())
@@ -1942,11 +1870,7 @@ async fn wait_for_next(
 fn frame_meta(
     cursor: Option<&crate::tmux::PaneCursor>,
 ) -> serde_json::Map<String, serde_json::Value> {
-    // The cursor is pane relative while composited content uses the window
-    // grid. Emit window-relative coordinates and carry the same origin for
-    // the client's inverse pointer mapping. Translating before emission also
-    // keeps cursor painting correct in older clients that ignore the origin;
-    // only their pointer mapping degrades. No pane rectangle means identity.
+    // The cursor is pane relative while composited content uses the window grid.
     let pane0 = cursor.and_then(|c| c.composite_pane0);
     let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
     let cursor_value = match cursor {
@@ -1966,9 +1890,8 @@ fn frame_meta(
         cursor.map(|c| c.history_size).unwrap_or(0).into(),
     );
     map.insert("cursor".into(), cursor_value);
-    // Full-screen (alternate-screen) mouse apps have no capturable
-    // scrollback; the client forwards the wheel to the app instead of
-    // widening the capture window. `mouseSgr` picks the wire encoding.
+    // Full-screen (alternate-screen) mouse apps have no capturable scrollback; the client
+    // forwards the wheel to the app instead of widening the capture window.
     map.insert(
         "altScreen".into(),
         cursor.map(|c| c.alternate_on).unwrap_or(false).into(),
@@ -2131,7 +2054,7 @@ mod tests {
             g.should_reassert(stuck, t0 + STUCK_REASSERT_RETRY + Duration::from_secs(1)),
             "stuck target retries after the window"
         );
-        // Reaching target resets the guard, so a later drift fires immediately.
+        // Without the reset, t0+35s sits inside the window opened by that retry.
         g.reset();
         // Without reset, t0+35s is 4s after the t0+31s re-assert (inside the
         // 30s window) and would be suppressed; reset clears it so it fires.
@@ -2141,10 +2064,9 @@ mod tests {
     #[test]
     fn frame_json_includes_geometry_and_cursor() {
         let cases = [
-            // Unsplit: `pane0` is null and the cursor is untouched.
+            // Unsplit: `pane0` is null and the cursor needs no offset.
             (None, (3, 7), serde_json::Value::Null),
-            // Composited with pane 0 at the corner (a borderless split):
-            // identity translation, but `pane0` rides with zero origin.
+            // Composited with pane 0 at the corner (a borderless split).
             (
                 Some(crate::tmux::PaneGeom {
                     left: 0,
@@ -2160,8 +2082,8 @@ mod tests {
                     "top": 0,
                 }),
             ),
-            // Composited with pane-border-status top: move the wire cursor
-            // onto the window grid by pane 0's origin.
+            // Composited with pane-border-status top: the pane-relative cursor is
+            // shifted onto the window grid the content is composited into.
             (
                 Some(crate::tmux::PaneGeom {
                     left: 2,
@@ -2331,8 +2253,7 @@ mod tests {
             .map(|i| format!("\x1b[38;5;208mline {i} with some agent output text\x1b[0m\n"))
             .collect();
         let frame1 = frame_json(&screen, None, 1);
-        // Frame 2: same screen scrolled by one line, the shape a scroll burst
-        // produces. Nearly all of its content already sits in the dictionary.
+        // Frame 2.
         let scrolled = format!(
             "{}\x1b[38;5;208mline 50 with some agent output text\x1b[0m\n",
             screen.split_once('\n').unwrap().1
@@ -2345,9 +2266,7 @@ mod tests {
 
         let records = inflate_records(&[&c1, &c2]);
         assert_eq!(records, vec![frame1.clone(), frame2.clone()]);
-        // The cross-frame dictionary is the point: the second frame must
-        // compress far below what standalone compression of ~repeated text
-        // achieves. 10x is a loose floor; in practice it is much higher.
+        // The cross-frame dictionary is the point.
         assert!(
             c2.len() < frame2.len() / 10,
             "no dictionary gain: {} vs {}",
@@ -2384,8 +2303,7 @@ mod tests {
                 0,
                 Some(vec![(1, "B")]),
             ),
-            // History grew by one: the window slid up, only the new tail row
-            // is different once aligned.
+            // History grew by one.
             (
                 &["a", "b", "c", "d"],
                 &["b", "c", "d", "e"],
@@ -2418,9 +2336,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pane_input_bytes_translates_cursor_keys_for_an_output_only_live_grid() {
-        // tmux < 3.8 arms output-only channels, so input takes `send-keys -H`,
-        // which is as literal as the socket: the DECCKM re-encoding must still
-        // happen, driven by the live grid's mode.
+        // tmux < 3.8 arms output-only channels, so input takes `send-keys -H`, which is as
+        // literal as the socket.
         let name = format!("aoe_test_ws_cursor_{}", std::process::id());
         let dir = tempfile::tempdir().expect("tempdir");
         let _channel = crate::tmux::vt::register_live_for_test(&name, dir.path(), false, true);

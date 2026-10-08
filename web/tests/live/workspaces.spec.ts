@@ -149,7 +149,7 @@ test("attaching a project over the daemon converts the session into a workspace"
   });
   type AttachResponse = {
     attached: { name: string; branch: string; branch_created: boolean; moved_to: string | null };
-    worker: string;
+    worker: { status: string; message?: string };
   };
   const attach = async (
     handle: ServeHandle,
@@ -166,7 +166,7 @@ test("attaching a project over the daemon converts the session into a workspace"
   const attachOk = async (...args: Parameters<typeof attach>) => {
     const { status, text } = await attach(...args);
     if (status !== 200) throw new Error(`POST projects failed: ${status} ${text}`);
-    return JSON.parse(text) as AttachResponse;
+    return (JSON.parse(text) as { outcome: AttachResponse }).outcome;
   };
 
   const created = await fetch(`${serve.baseUrl}/api/sessions`, {
@@ -187,7 +187,7 @@ test("attaching a project over the daemon converts the session into a workspace"
   expect(attached.attached.name).toBe("frontend");
   expect(attached.attached.branch).toBe("feature/attach-live");
   expect(attached.attached.branch_created).toBe(true);
-  expect(attached.worker).toBe("not_running");
+  expect(attached.worker.status).toBe("not_running");
 
   // The worktree session converts into a workspace directory holding both repos.
   const workspaceDir = attached.attached.moved_to;

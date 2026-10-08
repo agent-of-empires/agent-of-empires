@@ -173,12 +173,7 @@ impl Instance {
                 self.settle_archived_status();
             }
         }
-        // Launch-config fields are TUI-authoritative and only mutated after
-        // creation by the restart dialog (engine / command / args swap). They
-        // have no peer writer, so a plain copy is safe. Syncing them here is
-        // required: `reconcile_from_disk`'s `*self = disk` reload runs on every
-        // launch, so a swap that never reached disk is silently reverted and
-        // the session respawns with its original tool. See #switching-tools.
+        // Apply changed launch configuration without overwriting concurrent runtime state.
         self.tool = src.tool.clone();
         self.command = src.command.clone();
         self.extra_args = src.extra_args.clone();
@@ -324,10 +319,7 @@ impl Instance {
         self.lifecycle_generation = patch.lifecycle_generation;
         self.status = patch.status;
         self.idle_entered_at = patch.idle_entered_at;
-        // A patch decided from a pane observed before a concurrent archive
-        // landed is stale by construction: the archive tore the tmux down.
-        // Writing its Running/Waiting verbatim would resurrect the frozen
-        // pending-permission row the archived poll guard settles.
+        // Ignore pane observations captured before a concurrent archive.
         if self.is_archived() {
             self.settle_archived_status();
         }
@@ -357,7 +349,7 @@ impl Instance {
     /// this deciding for itself, so the row that lands matches the swap the
     /// restart already planned its transcript copy for.
     pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self, account_swap: bool) {
-        self.merge_user_action_diff(pre, post);
+        self.merge_profile_move_user_action_diff(pre, post);
         if pre.tool != post.tool {
             // Apply the requested transition to the freshly locked disk row.
             // The TUI post snapshot can carry parked session ids captured
@@ -368,12 +360,8 @@ impl Instance {
                 self.swap_tool(&post.tool);
             }
         }
-        if pre.command != post.command {
-            self.command = post.command.clone();
-        }
-        if pre.extra_args != post.extra_args {
-            self.extra_args = post.extra_args.clone();
-        }
+        splice(&mut self.command, &pre.command, &post.command);
+        splice(&mut self.extra_args, &pre.extra_args, &post.extra_args);
     }
 
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
@@ -381,8 +369,8 @@ impl Instance {
     /// survive even when the field is in the user-action set.
     /// `last_accessed_at` is monotone-max (no diff guard).
     /// `source_profile` is excluded from this splice. Same-profile actions call
-    /// this directly; cross-profile moves call it through
-    /// `merge_profile_move_diff` and assign `source_profile` separately.
+    /// this directly; cross-profile moves use `merge_profile_move_user_action_diff`
+    /// and assign `source_profile` separately in the storage transaction.
     /// Post-splice rules enforce the same cross-field invariants the
     /// per-mutation methods enforce (archive XOR favorite, touch unarchives)
     /// so concurrent peer writes cannot violate them.
@@ -391,6 +379,12 @@ impl Instance {
             pre.source_profile, post.source_profile,
             "apply_user_action must not change source_profile; cross-profile moves go through mutate_instance"
         );
+        self.merge_profile_move_user_action_diff(pre, post);
+    }
+
+    /// Merge the user-action delta for a locked profile-move candidate.
+    /// Profile reassignment remains exclusively owned by the storage transaction.
+    pub(crate) fn merge_profile_move_user_action_diff(&mut self, pre: &Self, post: &Self) {
         if pre.title != post.title {
             self.title = post.title.clone();
         }
@@ -478,33 +472,26 @@ impl Instance {
             self.archived_at = None;
             self.snoozed_until = None;
         }
-        // touch_last_accessed(): clears archived + snoozed + idle-dormant.
-        // Does NOT clear favorite or pin (both are explicit user-surfacing
-        // signals, not sink states). Mirrors touch_last_accessed() so the
-        // wake-from-dormancy invariant holds on the concurrent-writer merge
-        // path too, not just direct touches (#1689).
+        // Viewing clears sink states, not explicit favorite/pin signals.
         if touched {
             self.archived_at = None;
             self.snoozed_until = None;
             self.idle_dormant_since = None;
         }
-        // Final-state invariant: archive is the strongest dismiss and
-        // wins over snooze. The per-mutation rules above clear other
-        // flags on the change side, but the diff can also leave disk
-        // archived (pre-existing) AND snoozed (added by post); without
-        // this check the row would persist both and the web sidebar's
-        // tier comparator (which assumes exactly one active triage
-        // state) would render contradictory chips. See #1581.
+        // Archive takes precedence over snooze.
         if self.archived_at.is_some() {
             self.snoozed_until = None;
         }
-        // archive(): a row whose tmux archive tore down (#1868) cannot hold a
-        // live-interaction status. `status` has no splice arm above, so the
-        // Idle that `archive()` settled on `post` never travels here on its
-        // own; settle disk's own copy instead, whichever writer archived it.
+        // Archived rows cannot retain live-interaction status.
         if self.is_archived() {
             self.settle_archived_status();
         }
+    }
+}
+
+fn splice<T: PartialEq + Clone>(dst: &mut T, pre: &T, post: &T) {
+    if pre != post {
+        dst.clone_from(post);
     }
 }
 

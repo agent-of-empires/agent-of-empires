@@ -4301,14 +4301,22 @@
       ]
     },
     {
-      "id": "projects.served-profile-registry",
+      "id": "projects.served-profile-registry.unit",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/hooks/__tests__/useProjects.test.tsx"],
       "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"]
     },
     {
-      "id": "wizard.served-profile-scope",
+      "id": "projects.served-profile-registry",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/served-profile-browser.spec.ts"],
+      "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"],
+      "notes": "Browser: focus refresh retains the acknowledged registry on failure and closes writes on served-profile change."
+    },
+    {
+      "id": "wizard.served-profile-scope.unit",
       "kind": "vitest",
       "risk": "high",
       "specs": [
@@ -4325,7 +4333,20 @@
       ]
     },
     {
-      "id": "connectivity.poll-abort-deadline",
+      "id": "wizard.served-profile-scope",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/served-profile-browser.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
+      ],
+      "notes": "Browser: wizard retries failed about without guessing the machine default or overwriting dirty fields; wizard switching explicit Beta back to unresolved Server default resets Beta defaults after about retry."
+    },
+    {
+      "id": "connectivity.poll-abort-deadline.unit",
       "kind": "vitest",
       "risk": "high",
       "specs": [
@@ -4343,7 +4364,21 @@
       ]
     },
     {
-      "id": "sidebar.canonical-settings-receipts",
+      "id": "connectivity.poll-abort-deadline",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/hooks/useSessions.ts",
+        "web/src/hooks/useProjects.ts",
+        "web/src/lib/api.ts",
+        "web/src/lib/connectionState.ts",
+        "web/src/components/TopBar.tsx"
+      ],
+      "notes": "Browser: valid stale same epoch polls restore online state without admitting stale rows or settings; valid stale abandoned epoch polls restore online state without admitting stale rows or settings; a hung sessions poll aborts at its deadline and the next canonical poll restores online controls."
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts.unit",
       "kind": "vitest",
       "risk": "high",
       "specs": [
@@ -4360,6 +4395,36 @@
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
       ]
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "Browser: color cancellation installs a held lower receipt after another row ACK and accepts the next canonical writer; notifications cancellation installs a held lower receipt after another row ACK and accepts the next canonical writer. Revisions exceed Number.MAX_SAFE_INTEGER."
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts.live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for color and notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
     }
   ]
 }

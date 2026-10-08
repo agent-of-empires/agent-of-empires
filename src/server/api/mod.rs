@@ -31,7 +31,7 @@ pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove
 
 pub use client_log::post_client_log;
 pub use git::{clone_repo, is_git_repo, list_branches};
-pub use groups::{collapse_group, create_group, delete_group, move_group};
+pub use groups::{collapse_group, create_group, delete_group, move_group, reorder};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use plugin_settings::resolve_options;
@@ -195,12 +195,11 @@ pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Respon
 /// the JSON error surface so the dashboard's generic `.message` handling and
 /// `.error` discrimination both keep working.
 pub(super) fn session_not_found() -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-    (
+    api_error(
         axum::http::StatusCode::NOT_FOUND,
-        axum::Json(serde_json::json!({ "error": "not_found", "message": "Session not found" })),
+        "not_found",
+        "Session not found",
     )
-        .into_response()
 }
 
 /// Canonical 403 body for `aoe serve --read-only`.
@@ -270,15 +269,11 @@ pub(crate) async fn agent_policy() -> crate::acp::agent_policy::AgentPolicy {
 /// This is a caller-visible "session no longer exists", not a persist
 /// failure, so it must not surface as a 500.
 pub(super) fn session_gone_after_persist() -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-    (
+    api_error(
         axum::http::StatusCode::NOT_FOUND,
-        axum::Json(serde_json::json!({
-            "error": "not_found",
-            "message": "Session was removed while the update was being applied"
-        })),
+        "not_found",
+        "Session was removed while the update was being applied",
     )
-        .into_response()
 }
 
 const SHELL_METACHARACTERS: &[char] = &[

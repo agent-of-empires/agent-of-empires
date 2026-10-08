@@ -12,6 +12,7 @@ pub use runtime::{
     RuntimeContents, RuntimeCursor, RuntimeFrame, RuntimeHealth, RuntimeInfo, RuntimeSnapshot,
     SessionMutation, RUNTIME_EPOCH_HEADER, RUNTIME_PROTOCOL_VERSION, RUNTIME_REVISION_HEADER,
 };
+pub(crate) use runtime::{NamespaceMutation, NamespaceOutcome};
 pub use runtime_connection::{RuntimeConnection, RuntimeConnectionError, RuntimeEvent};
 pub(crate) mod transport;
 pub(crate) mod websocket;
@@ -26,19 +27,21 @@ use reqwest::{StatusCode, Url};
 use thiserror::Error;
 
 pub use wire::{
-    AbandonPurgeBody, AcpWorkerState, CleanupDefaults, CollapseGroupBody,
-    ContextResumeAvailability, ContextResumeIndeterminateReason, ContextResumeUnavailableReason,
-    CreateProfileBody, CreateProjectBody, CreateSessionBody, CreationTrustFingerprint,
-    CreationTrustRequest, CreationTrustReview, DefaultProfileBody, DeleteGroupBody,
-    DeleteGroupMode, DeleteGroupOutcome, DeleteProfileQuery, DeleteSessionBody, EnsureToolBody,
-    GroupLocation, GroupSessionOutcome, ListSessionsQuery, MoveGroupBody, PendingApproval,
-    PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
-    RenameProfileBody, RepoBaseInput, RestartOutcome, RestartSessionBody, SessionResponse,
-    SessionsEnvelope, StartSessionBody, TerminalSize, TerminalTarget, TerminalTargetStatus,
-    TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate, UpdateArchiveBody,
-    UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
-    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary,
+    AbandonPurgeBody, AcpWorkerState, AttachProjectBody, AttachProjectOutcome, AttachedProject,
+    AttachedWorkerOutcome, CleanupDefaults, CollapseGroupBody, ContextResumeAvailability,
+    ContextResumeIndeterminateReason, ContextResumeUnavailableReason, CreateProfileBody,
+    CreateProjectBody, CreateSessionBody, CreationTrustFingerprint, CreationTrustRequest,
+    CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
+    DeleteProfileQuery, DeleteSessionBody, EnsureToolBody, GroupLocation, GroupSessionFailure,
+    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
+    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
+    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
+    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
+    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
+    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -323,11 +326,106 @@ impl DaemonClient {
             SessionMutation::Restart(body) => self.http.post(url).json(body),
             SessionMutation::AbandonPurge(body) => self.http.post(url).json(body),
             SessionMutation::StopAuxiliary(target) => self.http.post(url).json(target),
-            SessionMutation::Stop | SessionMutation::Restore => self.http.post(url),
+            SessionMutation::Stop => self.http.post(url),
             SessionMutation::Access => self.http.patch(url),
             _ => self.http.patch(url).json(mutation),
         };
         self.request_mutation(request, epoch).await
+    }
+
+    pub async fn restore_session(
+        &self,
+        session_id: &str,
+        epoch: &str,
+    ) -> Result<MutationReceipt<RestoreOutcome>, DaemonClientError> {
+        let url = format!(
+            "{}/{}/restore",
+            self.sessions_url,
+            transport::path_segment(session_id)?
+        );
+        #[derive(serde::Deserialize)]
+        struct Body {
+            outcome: RestoreOutcome,
+        }
+        let receipt: MutationReceipt<Body> = self
+            .request_mutation_with_outcome(self.http.post(url), epoch)
+            .await?;
+        Ok(MutationReceipt {
+            cursor: receipt.cursor,
+            outcome: receipt.outcome.outcome,
+        })
+    }
+
+    pub async fn rename_session(
+        &self,
+        session_id: &str,
+        body: &RenameSessionBody,
+        epoch: &str,
+    ) -> Result<MutationReceipt<RenameOutcome>, DaemonClientError> {
+        let url = format!(
+            "{}/{}",
+            self.sessions_url,
+            transport::path_segment(session_id)?
+        );
+        #[derive(serde::Deserialize)]
+        struct Body {
+            outcome: RenameOutcome,
+        }
+        let receipt: MutationReceipt<Body> = self
+            .request_mutation_with_outcome(self.http.patch(url).json(body), epoch)
+            .await?;
+        Ok(MutationReceipt {
+            cursor: receipt.cursor,
+            outcome: receipt.outcome.outcome,
+        })
+    }
+
+    pub async fn set_worktree_name(
+        &self,
+        session_id: &str,
+        body: &SetWorktreeNameBody,
+        epoch: &str,
+    ) -> Result<MutationReceipt<WorktreeEditOutcome>, DaemonClientError> {
+        let url = format!(
+            "{}/{}/worktree-name",
+            self.sessions_url,
+            transport::path_segment(session_id)?
+        );
+        #[derive(serde::Deserialize)]
+        struct Body {
+            outcome: WorktreeEditOutcome,
+        }
+        let receipt: MutationReceipt<Body> = self
+            .request_mutation_with_outcome(self.http.patch(url).json(body), epoch)
+            .await?;
+        Ok(MutationReceipt {
+            cursor: receipt.cursor,
+            outcome: receipt.outcome.outcome,
+        })
+    }
+
+    pub async fn attach_session_project(
+        &self,
+        session_id: &str,
+        body: &AttachProjectBody,
+        epoch: &str,
+    ) -> Result<MutationReceipt<AttachProjectOutcome>, DaemonClientError> {
+        let url = format!(
+            "{}/{}/projects",
+            self.sessions_url,
+            transport::path_segment(session_id)?
+        );
+        #[derive(serde::Deserialize)]
+        struct Body {
+            outcome: AttachProjectOutcome,
+        }
+        let receipt: MutationReceipt<Body> = self
+            .request_mutation_with_outcome(self.http.post(url).json(body), epoch)
+            .await?;
+        Ok(MutationReceipt {
+            cursor: receipt.cursor,
+            outcome: receipt.outcome.outcome,
+        })
     }
 
     pub async fn trash_session(
@@ -454,6 +552,19 @@ impl DaemonClient {
             .join("groups")
             .map_err(|_| DaemonClientError::Transport)?;
         self.request_mutation(self.http.patch(url).json(body), epoch)
+            .await
+    }
+
+    pub async fn reorder(
+        &self,
+        body: &ReorderBody,
+        epoch: &str,
+    ) -> Result<MutationReceipt<ReorderOutcome>, DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("reorder")
+            .map_err(|_| DaemonClientError::Transport)?;
+        self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
             .await
     }
 

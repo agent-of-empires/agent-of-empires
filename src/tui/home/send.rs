@@ -24,14 +24,8 @@ impl HomeView {
 
     /// Mark a user interaction.
     ///
-    /// The daemon owns `last_accessed_at` for every row it publishes: it
-    /// stamps the column the activity rendering and `jump-to-finished` read,
-    /// and the next snapshot applies its value over this mirror. Both an
-    /// ordinary gesture and a gesture that un-sinks a row therefore request
-    /// the stamp the same way, because a local `save()` cannot carry it once
-    /// the runtime is authoritative: `save()` skips the write rather than
-    /// refusing, so a local touch would leave the row claiming a recency the
-    /// runtime never committed.
+    /// The daemon stamps the canonical access time; gestures never save a
+    /// local row/group mirror, including gestures that unsink a row.
     pub fn stamp_last_accessed(&mut self, id: &str) {
         // A session with a change in flight is stamped by that change's own
         // commit, so a second stamp is both redundant and refused by the

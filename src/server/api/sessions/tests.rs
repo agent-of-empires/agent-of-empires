@@ -234,6 +234,7 @@ async fn tool_ensure_refuses_restricted_or_degraded_runtime() {
             Ok(Json(crate::daemon::EnsureToolBody {
                 tool_name: "probe".into(),
                 size: None,
+                adoption: None,
             })),
         )
         .await
@@ -1816,8 +1817,13 @@ fn notification_patch_distinguishes_omitted_from_null() {
 
 fn build_rename_test_state(
     persisted: Vec<Instance>,
-    cached: Vec<Instance>,
+    mut cached: Vec<Instance>,
 ) -> (Storage, std::sync::Arc<crate::server::AppState>) {
+    for row in &mut cached {
+        if row.source_profile.is_empty() {
+            row.source_profile = "default".into();
+        }
+    }
     let storage = Storage::new_unwatched("default").unwrap();
     storage
         .update(|instances, _groups| {
@@ -1850,11 +1856,14 @@ async fn rename_session_rejects_duplicates_and_preserves_newer_cache() {
         let (storage, state) =
             build_rename_test_state(vec![existing, target], vec![stale_existing, stale_target]);
 
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let response = rename_session(
             State(state.clone()),
             Path(target_id.clone()),
             Ok(Json(RenameSessionBody {
-                title: "main branch".to_string(),
+                title: Some("main branch".to_string()),
+                group: None,
+                profile: None,
                 rename_branch: false,
             })),
         )
@@ -1886,9 +1895,17 @@ async fn rename_session_rejects_duplicates_and_preserves_newer_cache() {
                 Ok(())
             })
             .unwrap();
-        // A user action can advance the live cache while the disk snapshot still
-        // has the older row, so publication must patch only rename-owned identity
-        // fields.
+        // An unrelated durable user action must survive the complete canonical
+        // publication; the cache is not a second session metadata authority.
+        storage
+            .update(|rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == target_id)
+                    .unwrap()
+                    .favorite();
+                Ok(())
+            })
+            .unwrap();
         state
             .instances
             .write()
@@ -1897,11 +1914,14 @@ async fn rename_session_rejects_duplicates_and_preserves_newer_cache() {
             .find(|instance| instance.id == target_id)
             .unwrap()
             .favorite();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let response = rename_session(
             State(state.clone()),
             Path(target_id.clone()),
             Ok(Json(RenameSessionBody {
-                title: "main branch".to_string(),
+                title: Some("main branch".to_string()),
+                group: None,
+                profile: None,
                 rename_branch: false,
             })),
         )
@@ -1936,11 +1956,14 @@ async fn rename_session_rejects_duplicates_and_preserves_newer_cache() {
             vec![existing, drifted],
         );
 
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let response = rename_session(
             State(state),
             Path(drifted_id),
             Ok(Json(RenameSessionBody {
-                title: "main branch".to_string(),
+                title: Some("main branch".to_string()),
+                group: None,
+                profile: None,
                 rename_branch: false,
             })),
         )
@@ -1970,19 +1993,25 @@ async fn concurrent_renames_commit_only_one_same_identity_pair() {
         .unwrap();
     let state = crate::server::test_support::build_test_app_state(vec![first, second]);
 
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let first_rename = rename_session(
         State(state.clone()),
         Path(first_id),
         Ok(Json(RenameSessionBody {
-            title: "shared title".to_string(),
+            title: Some("shared title".to_string()),
+            group: None,
+            profile: None,
             rename_branch: false,
         })),
     );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let second_rename = rename_session(
         State(state.clone()),
         Path(second_id),
         Ok(Json(RenameSessionBody {
-            title: "shared title".to_string(),
+            title: Some("shared title".to_string()),
+            group: None,
+            profile: None,
             rename_branch: false,
         })),
     );
@@ -3176,11 +3205,9 @@ fn trash_body_default_keeps_kill_pane_true() {
 }
 
 // Regression for #2363: a multi-repo workspace session carries
-// `workspace_info` and no `worktree_info`. The DTO must report
-// `has_cleanable_worktree: true` so the web delete dialog shows the
-// "Delete worktree" checkbox, while keeping `has_managed_worktree: false`
-// so worktree-only actions (sidebar "Edit workdir name", tie overlay) stay
-// hidden for workspace sessions.
+// `workspace_info` and no `worktree_info`, so the DTO must report
+// `has_cleanable_worktree: true` for the delete dialog's checkbox while keeping
+// `has_managed_worktree: false` so worktree-only actions stay hidden.
 #[test]
 fn from_instance_reports_managed_worktree_for_workspace_session() {
     let mut inst = make_test_instance();
@@ -3216,10 +3243,9 @@ fn from_instance_reports_managed_worktree_for_workspace_session() {
 #[test]
 #[serial_test::serial(hook_base)]
 fn from_instance_surfaces_hook_urgent_flag() {
-    // #1640: the web Attention sort needs `Instance::is_urgent()` on the
-    // wire. Write the hook-side attention.json the agent would emit and
-    // confirm it round-trips onto the response, then confirm a session
-    // with no hook file reports urgent: false.
+    // #1640: the web Attention sort needs `Instance::is_urgent()` on the wire.
+    // Write the hook-side attention.json the agent would emit and confirm it
+    // round-trips, then that a session with no hook file reports urgent: false.
     let (_g, _, _tmp_base) = crate::hooks::test_support::BaseGuard::ready();
     let inst = make_test_instance();
     let dir = crate::hooks::ensure_instance_dir_path(&inst.id)
@@ -3324,8 +3350,7 @@ fn session_response_dormant_reflects_shown_dormant() {
     inst.mark_idle_dormant();
     assert!(SessionResponse::from_instance(&inst, false).dormant);
 
-    // Deliberate stop (marker set AND Stopped): reports NOT dormant so the
-    // dashboard keeps the neutral Stopped dot. See #2250.
+    // A deliberate stop keeps the neutral Stopped dot rather than dormant (#2250).
     inst.status = Status::Stopped;
     assert!(!SessionResponse::from_instance(&inst, false).dormant);
 }
@@ -3354,8 +3379,8 @@ fn resolve_diff_base_prefers_override_then_worktree_then_config_then_auto() {
         resolve_diff_base(None, None, Some("develop"), tmp.path()),
         "develop"
     );
-    // Auto-detect when nothing is set. The tmp dir is not a repo so
-    // `get_default_base_ref` returns Err -> "main" fallback.
+    // Auto-detect when nothing is set: the tmp dir is not a repo, so
+    // `get_default_base_ref` errors and falls back to "main".
     assert_eq!(resolve_diff_base(None, None, None, tmp.path()), "main");
 }
 
@@ -3509,70 +3534,6 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
     );
 }
 
-/// #3411: a title-only rename must not clobber a newer cached path and branch;
-/// a tied rename publishes the path and branch it owns.
-#[test]
-fn rename_cache_patch_publishes_only_rename_owned_fields() {
-    {
-        let mut cached = make_test_instance();
-        cached.title = "Old title".to_string();
-        cached.project_path = "/tmp/worktrees/concurrent".to_string();
-        cached.worktree_info = Some(worktree("concurrent-branch", "/tmp/repo".to_string(), None));
-
-        apply_session_rename_cache_patch(
-            &mut cached,
-            SessionRenameCachePatch {
-                title: "New title",
-                initial_path: "/tmp/worktrees/initial",
-                initial_branch: Some("initial-branch"),
-                authoritative_path: "/tmp/worktrees/earlier-snapshot",
-                authoritative_branch: Some("earlier-snapshot-branch"),
-                renamed_path: None,
-                renamed_branch: None,
-            },
-        );
-
-        assert_eq!(cached.title, "New title");
-        assert_eq!(cached.project_path, "/tmp/worktrees/concurrent");
-        assert_eq!(
-            cached
-                .worktree_info
-                .as_ref()
-                .map(|worktree| worktree.branch.as_str()),
-            Some("concurrent-branch")
-        );
-        let response = SessionResponse::from_instance(&cached, false);
-        assert_eq!(response.title, "New title");
-    }
-    {
-        let mut cached = make_test_instance();
-        cached.project_path = "/tmp/worktrees/concurrent".to_string();
-        cached.worktree_info = Some(worktree("concurrent-branch", "/tmp/repo".to_string(), None));
-
-        apply_session_rename_cache_patch(
-            &mut cached,
-            SessionRenameCachePatch {
-                title: "New title",
-                initial_path: "/tmp/worktrees/initial",
-                initial_branch: Some("initial-branch"),
-                authoritative_path: "/tmp/worktrees/renamed",
-                authoritative_branch: Some("renamed-branch"),
-                renamed_path: Some("/tmp/worktrees/renamed"),
-                renamed_branch: Some("renamed-branch"),
-            },
-        );
-
-        assert_eq!(cached.title, "New title");
-        assert_eq!(cached.project_path, "/tmp/worktrees/renamed");
-        assert_eq!(
-            cached
-                .worktree_info
-                .as_ref()
-                .map(|worktree| worktree.branch.as_str()),
-            Some("renamed-branch")
-        );
-    }
-}
 #[tokio::test]
 #[serial_test::serial]
 async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
@@ -3628,11 +3589,14 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
 
     // The title changes, but its slug already matches both the cwd leaf
     // and branch. Even with the branch toggle armed, this is title-only.
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let title_response = rename_session(
         State(state.clone()),
         Path(title_id.clone()),
         Ok(Json(RenameSessionBody {
-            title: "My Session!".to_string(),
+            title: Some("My Session!".to_string()),
+            group: None,
+            profile: None,
             rename_branch: true,
         })),
     )
@@ -3662,11 +3626,14 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
         );
     }
 
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let branch_response = rename_session(
         State(state.clone()),
         Path(branch_id.clone()),
         Ok(Json(RenameSessionBody {
-            title: "Branch Only".to_string(),
+            title: Some("Branch Only".to_string()),
+            group: None,
+            profile: None,
             rename_branch: true,
         })),
     )
@@ -3754,11 +3721,14 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
             state.acp_supervisor.test_insert_worker(case.id).await;
 
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let _ = rename_session(
                 State(state.clone()),
                 Path(case.id.to_string()),
                 Ok(Json(RenameSessionBody {
-                    title: case.new_title.to_string(),
+                    title: Some(case.new_title.to_string()),
+                    group: None,
+                    profile: None,
                     rename_branch: false,
                 })),
             )
@@ -3857,6 +3827,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
             state.acp_supervisor.test_insert_worker(case.id).await;
 
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let _ = set_worktree_name(
                 State(state.clone()),
                 Path(case.id.to_string()),
@@ -3887,12 +3858,10 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
 #[test]
 #[serial_test::serial]
 fn apply_post_restart_sync_propagates_agent_session_id() {
-    // Models the rapid double-restart case: in-memory state is stale
-    // (agent_session_id = None) because the 2s status poller hasn't
-    // refreshed yet, while the just-finished restart produced a Claude
-    // UUID via acquire_session_id. The sync must propagate that ID so a
-    // second ensure_session within the poller window doesn't generate a
-    // fresh UUID and orphan the persisted Claude conversation.
+    // The rapid double-restart case: in-memory state is stale because the 2s
+    // poller has not refreshed, while the just-finished restart produced a
+    // Claude UUID. The sync must propagate it, or a second ensure_session inside
+    // the poller window mints a fresh UUID and orphans the conversation.
     let mut live = make_test_instance();
     live.status = Status::Stopped;
     live.last_error = Some("prior failure".to_string());
@@ -4682,7 +4651,9 @@ async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
                 State(std::sync::Arc::clone(&state)),
                 Path(id.clone()),
                 Ok(Json(RenameSessionBody {
-                    title: "new title".to_string(),
+                    title: Some("new title".to_string()),
+                    group: None,
+                    profile: None,
                     rename_branch: false,
                 })),
             )
@@ -5869,29 +5840,418 @@ fn plan_summary_counts_done_and_picks_the_first_non_done_step() {
         assert_eq!(s.current_step_title.as_deref(), current);
     }
 }
+#[tokio::test]
+#[serial_test::serial]
+async fn composed_rename_receipt_contains_complete_source_and_target_profiles() -> anyhow::Result<()>
+{
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut moving = Instance::new("Before", "/tmp/rename-moving");
+    moving.source_profile = "rename-source".into();
+    moving.group_path = "old".into();
+    moving.status = Status::Stopped;
+    let id = moving.id.clone();
+    let source_peer = Instance::new("source peer", "/tmp/rename-source-peer");
+    let source_peer_id = source_peer.id.clone();
+    let target_peer = Instance::new("target peer", "/tmp/rename-target-peer");
+    let target_peer_id = target_peer.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![moving.clone()]);
+    let source = Storage::new("rename-source", state.file_watch.clone())?;
+    source.update(|rows, _| {
+        *rows = vec![moving, source_peer];
+        Ok(())
+    })?;
+    let target = Storage::new("rename-target", state.file_watch.clone())?;
+    target.update(|rows, _| {
+        *rows = vec![target_peer];
+        Ok(())
+    })?;
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let response = rename_session(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(RenameSessionBody {
+            title: Some("After".into()),
+            group: Some("parent/destination".into()),
+            profile: Some("rename-target".into()),
+            rename_branch: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let epoch = response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER]
+        .to_str()?
+        .to_owned();
+    let revision: u64 = response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+        .to_str()?
+        .parse()?;
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(body["title"], "After");
+    assert_eq!(body["profile"], "rename-target");
+    assert_eq!(body["outcome"]["warnings"], serde_json::json!([]));
+    assert!(!source.load()?.iter().any(|row| row.id == id));
+    let target_rows = target.load()?;
+    let moved = target_rows.iter().find(|row| row.id == id).unwrap();
+    assert_eq!(moved.title, "After");
+    assert_eq!(moved.group_path, "parent/destination");
+    let snapshot = state.runtime.snapshot(&state).await?;
+    assert_eq!(snapshot.value.cursor.epoch, epoch);
+    assert!(snapshot.value.cursor.revision >= revision);
+    for peer in [&source_peer_id, &target_peer_id] {
+        assert!(snapshot
+            .value
+            .contents
+            .sessions
+            .iter()
+            .any(|row| &row.id == peer));
+    }
+    let published = snapshot
+        .value
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(published.title, "After");
+    assert_eq!(published.profile, "rename-target");
+    let target_profile = snapshot
+        .value
+        .contents
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "rename-target")
+        .unwrap();
+    assert!(target_profile
+        .groups
+        .iter()
+        .any(|group| group.path == "parent"));
+    assert!(target_profile
+        .groups
+        .iter()
+        .any(|group| group.path == "parent/destination"));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn composed_group_only_rename_preserves_authoritative_title_and_peer_fields(
+) -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut stale = Instance::new("stale title", "/tmp/rename-authoritative");
+    stale.source_profile = "default".into();
+    let id = stale.id.clone();
+    let mut durable = stale.clone();
+    durable.title = "durable title".into();
+    durable.favorite();
+    let (storage, state) = build_rename_test_state(vec![durable], vec![stale]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let response = rename_session(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(RenameSessionBody {
+            title: None,
+            group: Some("assigned".into()),
+            profile: None,
+            rename_branch: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(row.title, "durable title");
+    assert_eq!(row.group_path, "assigned");
+    assert!(row.is_favorited());
+    let snapshot = state.runtime.snapshot(&state).await?;
+    let published = snapshot
+        .value
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(published.title, "durable title");
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tied_rename_persist_failure_reports_actual_git_effects_without_rollback(
+) -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+    let root = tempfile::tempdir()?;
+    let main = root.path().join("main");
+    let old = root.path().join("old");
+    let new = root.path().join("new");
+    let repo = git2::Repository::init(&main)?;
+    let signature = git2::Signature::now("Test", "test@example.com")?;
+    let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+    repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])?;
+    crate::git::GitWorktree::new(main.clone())?.create_worktree("old", &old, true, None)?;
+    std::fs::write(old.join("uncommitted"), b"preserved")?;
+    let mut row = Instance::new("Old", old.to_str().unwrap());
+    row.source_profile = "default".into();
+    row.status = Status::Stopped;
+    row.worktree_info = Some(worktree("old", main.to_string_lossy().into_owned(), None));
+    let id = row.id.clone();
+    let (mut storage, state) = build_rename_test_state(vec![row.clone()], vec![row]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let _failure = storage.fail_writes_for_test();
+    let response = rename_session(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(RenameSessionBody {
+            title: Some("New".into()),
+            group: None,
+            profile: None,
+            rename_branch: true,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(body["error"], "persist_failed");
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("not rolled back"));
+    assert!(!old.exists());
+    assert_eq!(std::fs::read(new.join("uncommitted"))?, b"preserved");
+    assert_eq!(git2::Repository::open(&new)?.head()?.shorthand()?, "new");
+    let durable = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(durable.title, "Old");
+    assert_eq!(durable.project_path, old.to_string_lossy());
+    assert_ne!(
+        *state.canonical_health.read().await,
+        crate::daemon::RuntimeHealth::Healthy
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn composed_tied_rename_validates_target_before_git_and_publishes_actual_path(
+) -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+    let root = tempfile::tempdir()?;
+    let main = root.path().join("main");
+    let old = root.path().join("old");
+    let new = root.path().join("new");
+    let repo = git2::Repository::init(&main)?;
+    let signature = git2::Signature::now("Test", "test@example.com")?;
+    let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+    repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])?;
+    crate::git::GitWorktree::new(main.clone())?.create_worktree("old", &old, true, None)?;
+    std::fs::write(old.join("uncommitted"), b"retained")?;
+    let mut moving = Instance::new("Old", old.to_str().unwrap());
+    moving.source_profile = "rename-source".into();
+    moving.status = Status::Stopped;
+    moving.worktree_info = Some(worktree("old", main.to_string_lossy().into_owned(), None));
+    let id = moving.id.clone();
+    let duplicate = Instance::new("New", new.to_str().unwrap());
+    let duplicate_id = duplicate.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![moving.clone()]);
+    let source = Storage::new("rename-source", state.file_watch.clone())?;
+    source.update(|rows, _| {
+        rows.push(moving);
+        Ok(())
+    })?;
+    let target = Storage::new("rename-target", state.file_watch.clone())?;
+    target.update(|rows, _| {
+        rows.push(duplicate);
+        Ok(())
+    })?;
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let request = || RenameSessionBody {
+        title: Some("New".into()),
+        group: Some("destination".into()),
+        profile: Some("rename-target".into()),
+        rename_branch: true,
+    };
+    let rejected = rename_session(State(state.clone()), Path(id.clone()), Ok(Json(request())))
+        .await
+        .into_response();
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert!(old.exists());
+    assert!(!new.exists());
+    assert_eq!(git2::Repository::open(&old)?.head()?.shorthand()?, "old");
+    assert_eq!(
+        source
+            .load()?
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .title,
+        "Old"
+    );
+    target.update(|rows, _| {
+        rows.retain(|row| row.id != duplicate_id);
+        Ok(())
+    })?;
+    let response = rename_session(State(state.clone()), Path(id.clone()), Ok(Json(request())))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!old.exists());
+    assert_eq!(std::fs::read(new.join("uncommitted"))?, b"retained");
+    assert_eq!(git2::Repository::open(&new)?.head()?.shorthand()?, "new");
+    assert!(!source.load()?.iter().any(|row| row.id == id));
+    let rows = target.load()?;
+    let moved = rows.iter().find(|row| row.id == id).unwrap();
+    assert_eq!(moved.title, "New");
+    assert_eq!(moved.project_path, new.to_string_lossy());
+    assert_eq!(moved.group_path, "destination");
+    assert_eq!(moved.worktree_info.as_ref().unwrap().branch, "new");
+    let snapshot = state.runtime.snapshot(&state).await?;
+    let published = snapshot
+        .value
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(published.project_path, new.to_string_lossy());
+    assert_eq!(published.profile, "rename-target");
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn attach_receipt_preserves_added_repo_metadata_and_complete_peer_publication(
+) -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let root = tempfile::tempdir()?;
+    let main = root.path().join("main");
+    let added = root.path().join("frontend");
+    for path in [&main, &added] {
+        let repo = git2::Repository::init(path)?;
+        let signature = git2::Signature::now("Test", "test@example.com")?;
+        let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])?;
+    }
+    let old = root.path().join("primary-worktree");
+    crate::git::GitWorktree::new(main.clone())?.create_worktree(
+        "attach-branch",
+        &old,
+        true,
+        None,
+    )?;
+    let mut row = Instance::new("Attach receipt", old.to_str().unwrap());
+    row.source_profile = "default".into();
+    row.status = Status::Stopped;
+    row.worktree_info = Some(worktree(
+        "attach-branch",
+        main.to_string_lossy().into_owned(),
+        None,
+    ));
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("default", state.file_watch.clone())?;
+    let peer = Instance::new("peer", "/tmp/attach-receipt-peer");
+    let peer_id = peer.id.clone();
+    storage.update(|rows, _| {
+        *rows = vec![row, peer];
+        Ok(())
+    })?;
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let response = attach_session_project(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(AttachProjectBody {
+            project: added.to_string_lossy().into_owned(),
+            attach_existing_branch: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .headers()
+        .contains_key(crate::daemon::RUNTIME_EPOCH_HEADER));
+    assert!(response
+        .headers()
+        .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    let outcome = &body["outcome"];
+    assert_eq!(outcome["attached"]["name"], "frontend");
+    assert_eq!(outcome["attached"]["branch"], "attach-branch");
+    assert_eq!(outcome["attached"]["branch_created"], true);
+    assert_eq!(outcome["worker"]["status"], "not_running");
+    let new_path = outcome["attached"]["moved_to"].as_str().unwrap();
+    assert_eq!(body["project_path"], new_path);
+    assert!(std::path::Path::new(outcome["attached"]["worktree_path"].as_str().unwrap()).exists());
+    let durable = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(durable.project_path, new_path);
+    assert_eq!(durable.workspace_info.as_ref().unwrap().repos.len(), 2);
+    assert!(durable.worktree_info.is_none());
+    let snapshot = state.runtime.snapshot(&state).await?;
+    assert!(snapshot
+        .value
+        .contents
+        .sessions
+        .iter()
+        .any(|row| row.id == peer_id));
+    assert_eq!(
+        snapshot
+            .value
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .project_path,
+        new_path
+    );
+    Ok(())
+}
+
 // --- persist_session_update (the persist-first contract from #1589) ---
 //
-// The five session-mutation PATCH handlers route every write through
-// this helper and only touch memory after it returns `Ok`, so disk and
-// memory cannot diverge on a write failure. Full-handler coverage is
-// impractical (AppState has no test constructor), so these lock the
-// helper's two guarantees directly: a success durably writes, and every
-// storage failure surfaces as `Err`.
+// The session-mutation PATCH handlers route every write through this helper and
+// only touch memory after it returns `Ok`. Full-handler coverage is impractical
+// (AppState has no test constructor), so these lock its two guarantees: a
+// success durably writes, and every storage failure surfaces as `Err`.
 
-#[test]
+#[tokio::test]
 #[serial_test::serial]
-fn rename_persistence_reports_missing_authoritative_row() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let _ = crate::session::get_app_dir().expect("isolated app dir");
-    let storage = Storage::new_unwatched("rename-missing").unwrap();
-
-    let outcome = persist_rename_metadata(&storage, "missing-id", "New title", None, None).unwrap();
-    assert_eq!(outcome, RenamePersistOutcome::Missing);
-    assert!(
-        storage.load().unwrap().is_empty(),
-        "a missing row must not be synthesized by rename persistence"
-    );
+async fn rename_rejects_missing_authoritative_row_without_synthesizing_it() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let stale = Instance::new("Old title", "/tmp/missing-authoritative");
+    let id = stale.id.clone();
+    let (storage, state) = build_rename_test_state(Vec::new(), vec![stale]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let response = rename_session(
+        State(state),
+        Path(id),
+        Ok(Json(RenameSessionBody {
+            title: Some("New title".into()),
+            group: None,
+            profile: None,
+            rename_branch: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(storage.load().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -5917,10 +6277,9 @@ async fn persist_session_update_surfaces_storage_error() {
     assert!(result.is_err(), "a storage failure must surface as Err");
 }
 
-// Group edit (#1726): the persisted instance's group_path is the only
-// thing that changes; the groups Vec is left alone (the group list is
-// derived from instance group_path, exactly like create_session). Set
-// and clear both round-trip to disk.
+// Group edit (#1726): only the persisted instance's group_path changes; the
+// groups Vec is left alone, since the group list is derived from instance
+// group_path exactly as in create_session.
 #[tokio::test]
 #[serial_test::serial]
 async fn group_edit_set_and_clear_round_trip_to_disk() {
@@ -6213,10 +6572,9 @@ fn resolve_hook_plan_refuses_nothing_without_untrusted_repo_hooks() {
 #[test]
 #[serial_test::serial]
 fn resolve_hook_plan_inherits_trust_across_worktrees() {
-    // Secondary half of #2066: hook trust is keyed on the main repo
-    // (check_repo_trust resolves a worktree path back to it), so a worktree
-    // created from an already-trusted repo inherits that trust without a
-    // fresh prompt, even with trust_hooks: false.
+    // Secondary half of #2066: hook trust is keyed on the main repo, so a
+    // worktree created from an already-trusted repo inherits that trust without
+    // a fresh prompt, even with trust_hooks: false.
     let temp_home = tempfile::tempdir().unwrap();
     let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
     let _app_dir = crate::session::get_app_dir().expect("isolated app dir");

@@ -72,12 +72,7 @@ pub(super) async fn build_disk_watch_entry(
             );
         },
     );
-    // Test-only barrier: when armed, signals `entered` after the
-    // subscription is built and parks on `release`. The enclosing
-    // `add_profile_disk_watch` / `rename_profile_disk_watch` hold `disk_watch_handles` through the
-    // build, so a task parked here also holds that lock; this lets a
-    // controlled-ordering test drive a concurrent same-profile remove
-    // against a known mid-build state.
+    // Test-only barrier.
     #[cfg(any(test, debug_assertions))]
     {
         let armed = disk_watch_build_barrier().lock().unwrap().clone();
@@ -439,16 +434,8 @@ mod tests {
         assert_eq!(state.file_watch.subscriber_count(), 0);
     }
 
-    // Concurrent same-profile add and remove must converge to the
-    // last-completed call's intent. The barrier inside
-    // `build_disk_watch_entry` lets the test pin task A mid-build
-    // while A still holds `disk_watch_handles`, so B's remove blocks
-    // until A finishes installing. Once A releases the lock, B's
-    // remove wins because it ran strictly after A's install: the
-    // final map is empty. If `disk_watch_handles` were not held
-    // across the build, B could acquire the lock during A's parked
-    // window, observe an empty map, and let A install a stale entry
-    // on resume.
+    // Concurrent same-profile add and remove must converge to the last-completed call's
+    // intent.
     #[tokio::test]
     #[serial_test::serial]
     async fn add_profile_disk_watch_resists_resurrection_under_concurrent_remove() {
@@ -473,32 +460,23 @@ mod tests {
             add_profile_disk_watch(&s_a, "race-fix").await;
         });
 
-        // Wait deterministically until A is parked inside the
-        // barrier. No fixed sleep: the `entered` notification is
-        // sent strictly after `subscribe_channel` returns and the
-        // forwarder is spawned, which is the build-vs-install
-        // boundary the test wants to exercise.
+        // Wait deterministically until A is parked inside the barrier.
         barrier.entered.notified().await;
 
         let s_b = state.clone();
         let barrier_b = barrier.clone();
         let task_b = tokio::spawn(async move {
-            // Signal "B is about to call remove" so the test can
-            // proceed to release A without a fixed-time sleep. The
-            // notify lands one executor tick before B's `lock().await`
-            // registers as a waiter; A still holds the lock so B
-            // parks behind A regardless of relative scheduling.
+            // Signal "B is about to call remove" so the test can proceed to release A
+            // without a fixed-time sleep.
             barrier_b.armed.notify_one();
             remove_profile_disk_watch(&s_b, "race-fix").await;
         });
 
-        // Deterministic happens-before for B's lock attempt: replaces
-        // the prior bounded sleep that flaked on heavily-loaded CI.
+        // Deterministic happens-before for B's lock attempt.
         barrier.armed.notified().await;
         tokio::task::yield_now().await;
 
-        // Release A; it finishes building, installs the entry, and
-        // releases the lock. B then acquires and removes.
+        // Release A; it finishes building, installs the entry, and releases the lock.
         barrier.release.notify_one();
 
         task_a.await.expect("join A");
@@ -519,13 +497,8 @@ mod tests {
         );
     }
 
-    // Writes that land during init's per-profile iteration, before
-    // their profile has been subscribed, must still be reconciled
-    // once init returns. The hook fires after each install; the
-    // test uses it to seed a write to a profile not yet reached by
-    // the loop. The bootstrap notify at init's end wakes the
-    // consumer, which then loads from disk and surfaces both the
-    // pre-init seed and the mid-iteration seed.
+    // Writes that land during init's per-profile iteration, before their profile has been
+    // subscribed, must still be reconciled once init returns.
     #[tokio::test]
     #[serial_test::serial]
     async fn init_disk_watch_subscriptions_reconciles_writes_landing_during_iteration() {
@@ -548,11 +521,8 @@ mod tests {
 
         init_disk_watch_subscriptions_with_hook(state.clone(), |profile| {
             if profile == "init-gap-p1" {
-                // Write to P2 at the precise moment when P1 has just
-                // been subscribed but P2 has not. The watcher path
-                // cannot deliver this event for P2 (no subscription
-                // exists yet); only the bootstrap wake plus a reload
-                // can reconcile it.
+                // Write to P2 at the precise moment when P1 has just been subscribed but P2
+                // has not.
                 let storage = crate::session::Storage::new_unwatched("init-gap-p2").expect("p2");
                 storage
                     .update(|i, _| {
@@ -571,8 +541,7 @@ mod tests {
         .await
         .expect("bootstrap wake must fire after init returns");
 
-        // Invariant 8: capture the epoch BEFORE the disk read, the order every
-        // production caller uses.
+        // Invariant 8.
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -606,14 +575,11 @@ mod tests {
         );
     }
 
-    // A reloader reads `sessions.json`, then does slow work (the poll loop's
-    // tmux scrape, which blocks for seconds when the tmux server is
-    // unreachable) before folding the snapshot into `state.instances`. A
-    // delete committing inside that window used to come straight back, because
-    // the merge rebuilds `state.instances` wholesale from the stale snapshot.
-    // Observed as a live Playwright failure: DELETE returned 200, the sidebar
-    // row went away, and the very next `GET /api/sessions` listed the session
-    // again with its pre-delete status. See invariant 8.
+    // A reloader reads `sessions.json`, then does slow work (the poll loop's tmux scrape,
+    // which blocks for seconds when the tmux server is unreachable) before folding the
+    // snapshot into `state.instances`. A delete committing inside that window used to come
+    // straight back, because the merge rebuilds `state.instances` wholesale from the stale
+    // snapshot.
     #[tokio::test]
     async fn a_reload_predating_a_delete_does_not_resurrect_the_removed_row() {
         let doomed = Instance::new("doomed", "/tmp/doomed");
@@ -623,8 +589,7 @@ mod tests {
         let read_epoch = 0;
 
         let state = test_support::build_test_app_state(vec![survivor.clone()]);
-        // The delete already committed: `doomed` is gone from memory, and the
-        // epoch moved to say so.
+        // The delete already committed.
         state
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -657,16 +622,8 @@ mod tests {
         assert_eq!(titles, vec!["survivor".to_string()]);
     }
 
-    // The mirror image of the delete case, and the reason `mutation_epoch` is
-    // not named `delete_epoch`. `create_session` persists the new row to
-    // `sessions.json` and only then upserts it into `state.instances`
-    // (`upsert_instance`). A poll tick whose disk read STARTED before that
-    // persist carries a `fresh` without the new row, and since the merge
-    // rebuilds `state.instances` exclusively from `fresh`, the wholesale
-    // replace drops the session the create just inserted. `GET /api/sessions`
-    // then loses it until the next tick re-reads disk 2s later. Observed as a
-    // live Playwright failure: `wizard-scratch-launch` polled until the
-    // session appeared, and the very next `GET /api/sessions` returned `[]`.
+    // The mirror image of the delete case, and the reason `mutation_epoch` is not named
+    // `delete_epoch`.
     #[tokio::test]
     async fn a_reload_predating_a_create_does_not_drop_the_new_row() {
         let existing = Instance::new("existing", "/tmp/existing");
@@ -674,8 +631,7 @@ mod tests {
         // What a reloader read from disk before the create persisted.
         let stale_snapshot = vec![existing.clone()];
 
-        // The create already committed: `created` is in memory (and on disk),
-        // and the epoch moved to say so.
+        // The create already committed.
         let state = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
         state
             .mutation_epoch
@@ -740,16 +696,8 @@ mod tests {
         );
     }
 
-    // The epoch comparison has to be atomic against the delete, not merely
-    // ordered by `SeqCst`. Comparing before taking the `instances` write lock
-    // leaves a check-then-act race: a reload passes the check, parks on the
-    // lock, a delete takes the lock and removes the row, and the reload then
-    // wakes and writes its stale snapshot over the removal.
-    //
-    // This drives that exact interleaving. The test holds the write lock so
-    // the spawned reload is guaranteed to be parked on it, bumps the epoch
-    // while it waits (standing in for the delete), then releases. On a
-    // first-Pending observation makes the ordering independent of scheduling.
+    // The epoch comparison has to be atomic against the delete, not merely ordered by
+    // `SeqCst`.
     #[tokio::test]
     async fn a_reload_parked_on_the_instances_lock_still_sees_a_delete_that_won_the_race() {
         let doomed = Instance::new("doomed", "/tmp/doomed");
@@ -783,8 +731,7 @@ mod tests {
         tokio::pin!(reload);
         assert!(futures_util::poll!(&mut reload).is_pending());
 
-        // The delete commits while the reload is parked: row out, epoch up.
-        // Both happen before the lock is released, mirroring the real purge.
+        // The delete commits while the reload is parked.
         state
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

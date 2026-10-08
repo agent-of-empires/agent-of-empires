@@ -34,13 +34,32 @@ pub enum PanePresence {
     Unknown,
 }
 
-/// Native handoff requires Alive and the same name as the preparation receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyToolIdentity {
+    pub session_id: String,
+    pub pane_id: String,
+    pub pane_pid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyToolAdoption {
+    pub tmux_session: String,
+    pub identity: LegacyToolIdentity,
+    pub profile: String,
+    pub lifecycle_generation: u64,
+}
+
+/// Native handoff requires Alive without a pending ownership adoption.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneObservation {
     #[serde(default)]
     pub state: PanePresence,
     #[serde(default)]
     pub tmux_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_tool: Option<LegacyToolIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,13 +3,19 @@
 
 use anyhow::{bail, Result};
 
-use super::utils::{
-    append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
-    append_window_size_args, is_pane_dead, sanitize_session_name,
-};
+use super::utils::{append_session_setup_args, is_pane_dead, sanitize_session_name};
 use super::{refresh_session_cache, TOOL_PREFIX};
 use crate::cli::truncate_id;
-use crate::process;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LegacyToolScope {
+    pub rows: Vec<(String, String, String)>, // profile, full ID, derived agent name
+    pub tools: Vec<(String, String)>,        // raw tool name, sanitized name prefix
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Legacy tool ownership cannot be adopted: {0}")]
+pub(crate) struct LegacyToolUnavailable(pub &'static str);
 
 pub struct ToolSession {
     name: String,
@@ -128,6 +134,201 @@ impl ToolSession {
         })
     }
 
+    pub(crate) fn legacy_metadata_in<'a>(
+        id: &str,
+        _title: &str,
+        tool_name: &str,
+        profile: &str,
+        panes: &'a std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+        scope: &LegacyToolScope,
+    ) -> Result<Option<(&'a str, &'a crate::tmux::PaneMetadata)>> {
+        use crate::tmux::ToolPaneOwner;
+        let prefix = Self::name_prefix(tool_name);
+        let suffix = format!("_{}", truncate_id(id, 8));
+        let shape = crate::tmux::NameShape {
+            prefix: &prefix,
+            suffix: &suffix,
+            kind: crate::tmux::SessionKind::Tool,
+        };
+        {
+            let mut found = None;
+            for (name, metadata) in panes.iter().filter(|(name, _)| shape.matches(name)) {
+                match &metadata.tool_owner {
+                    ToolPaneOwner::Invalid => bail!(LegacyToolUnavailable("invalid owner marker")),
+                    ToolPaneOwner::Named { .. } => {
+                        bail!(LegacyToolUnavailable(
+                            "named owner conflicts with legacy adoption"
+                        ));
+                    }
+                    ToolPaneOwner::Unmarked => {
+                        anyhow::ensure!(
+                            found.is_none(),
+                            LegacyToolUnavailable("ambiguous legacy panes")
+                        );
+                        found = Some((name.as_str(), metadata));
+                    }
+                }
+            }
+            let Some((name, metadata)) = found else {
+                return Ok(None);
+            };
+            Self::validate_identity(metadata)?;
+            anyhow::ensure!(
+                metadata
+                    .session_kind
+                    .as_deref()
+                    .is_none_or(|kind| kind == "tool"),
+                LegacyToolUnavailable("candidate has a non-tool kind marker")
+            );
+            anyhow::ensure!(
+                !scope.rows.iter().any(|(_, _, agent)| agent == name),
+                LegacyToolUnavailable("candidate is an agent session")
+            );
+            let mut matched = false;
+            for (owner_profile, owner_id, _) in &scope.rows {
+                if name.rsplit_once('_').map(|(_, suffix)| suffix) != Some(truncate_id(owner_id, 8))
+                {
+                    continue;
+                }
+                for (raw_tool, prefix) in &scope.tools {
+                    let matches = name.starts_with(prefix);
+                    if matches {
+                        anyhow::ensure!(
+                            !matched
+                                && owner_profile == profile
+                                && owner_id == id
+                                && raw_tool == tool_name,
+                            LegacyToolUnavailable("ambiguous row or raw tool name across profiles")
+                        );
+                        matched = true;
+                    }
+                }
+            }
+            anyhow::ensure!(
+                matched,
+                LegacyToolUnavailable("owner missing from complete catalogue")
+            );
+            Ok(Some((name, metadata)))
+        }
+    }
+
+    fn validate_identity(metadata: &crate::tmux::PaneMetadata) -> Result<u32> {
+        anyhow::ensure!(
+            metadata
+                .session_id
+                .strip_prefix('$')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit()))
+                && metadata
+                    .pane_id
+                    .strip_prefix('%')
+                    .is_some_and(|id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit())),
+            LegacyToolUnavailable("immutable tmux IDs unavailable")
+        );
+        let pane_pid = metadata
+            .pane_pid
+            .filter(|pid| *pid != 0)
+            .ok_or(LegacyToolUnavailable("pane process identity unavailable"))?;
+        Ok(pane_pid)
+    }
+
+    pub(crate) fn legacy_identity(
+        metadata: &crate::tmux::PaneMetadata,
+    ) -> Result<crate::session::LegacyToolIdentity> {
+        let pane_pid = Self::validate_identity(metadata)?;
+        Ok(crate::session::LegacyToolIdentity {
+            session_id: metadata.session_id.clone(),
+            pane_id: metadata.pane_id.clone(),
+            pane_pid,
+        })
+    }
+
+    fn snapshot_condition(
+        name: &str,
+        identity: &crate::session::LegacyToolIdentity,
+        owner: &str,
+    ) -> String {
+        let literal = crate::tmux::Session::tmux_format_literal;
+        let session_id = literal(&identity.session_id);
+        let pane_id = literal(&identity.pane_id);
+        let name = literal(name);
+        let kind = "#{||:#{==:#{@aoe_kind},},#{==:#{@aoe_kind},tool}}";
+        let owner = literal(owner);
+        let pid = identity.pane_pid;
+        format!("#{{&&:#{{&&:#{{==:#{{session_id}},{session_id}}},#{{==:#{{pane_id}},{pane_id}}}}},#{{&&:#{{&&:#{{==:#{{session_name}},{name}}},#{{==:#{{pane_pid}},{pid}}}}},#{{&&:#{{==:#{{@aoe_tool_owner}},{owner}}},{kind}}}}}}}")
+    }
+
+    pub(crate) fn adopt_legacy_snapshot(
+        id: &str,
+        title: &str,
+        tool_name: &str,
+        profile: &str,
+        adoption: &crate::session::LegacyToolAdoption,
+        panes: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+        scope: &LegacyToolScope,
+    ) -> Result<(Self, crate::session::LegacyToolIdentity)> {
+        let (name, metadata) =
+            Self::legacy_metadata_in(id, title, tool_name, profile, panes, scope)?
+                .ok_or(LegacyToolUnavailable("captured legacy pane is absent"))?;
+        anyhow::ensure!(
+            name == adoption.tmux_session
+                && metadata.session_id == adoption.identity.session_id
+                && metadata.pane_id == adoption.identity.pane_id
+                && metadata.pane_pid == Some(adoption.identity.pane_pid),
+            LegacyToolUnavailable("captured pane was replaced")
+        );
+        let owner = serde_json::to_string(&(id, tool_name))?;
+        let condition = Self::snapshot_condition(name, &adoption.identity, "");
+        let quote = crate::tmux::Session::tmux_command_string_literal;
+        let session_target = quote(&adoption.identity.session_id);
+        let replacement = format!("set-option -t {session_target} @aoe_tool_owner {} ; set-option -t {session_target} @aoe_kind tool ; display-message -p aoe-tool-adopted", quote(&owner));
+        Self::run_snapshot_command(
+            &adoption.identity.pane_id,
+            &condition,
+            &replacement,
+            "aoe-tool-adopted",
+        )?;
+        Ok((
+            Self {
+                name: name.to_owned(),
+            },
+            adoption.identity.clone(),
+        ))
+    }
+
+    fn run_snapshot_command(
+        pane_id: &str,
+        condition: &str,
+        effect: &str,
+        success: &str,
+    ) -> Result<()> {
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", pane_id, "-F", condition, effect]);
+        let output = crate::tmux::TmuxCommandDeadline::new().run(&mut command)?;
+        anyhow::ensure!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.trim() == success),
+            LegacyToolUnavailable("captured identity or owner changed before tmux effect")
+        );
+        Ok(())
+    }
+
+    pub(crate) fn kill_verified(
+        &self,
+        id: &str,
+        tool_name: &str,
+        identity: &crate::session::LegacyToolIdentity,
+    ) -> Result<()> {
+        let owner = serde_json::to_string(&(id, tool_name))?;
+        let condition = Self::snapshot_condition(&self.name, identity, &owner);
+        let target = crate::tmux::Session::tmux_command_string_literal(&identity.session_id);
+        let effect = format!("kill-session -t {target} ; display-message -p aoe-tool-stopped");
+        Self::run_snapshot_command(&identity.pane_id, &condition, &effect, "aoe-tool-stopped")?;
+        refresh_session_cache();
+        Ok(())
+    }
+
     /// Purely derive the sub-session name, with no reference to what is live.
     /// Callers wanting the session's CURRENT name want [`Self::new`].
     pub fn generate_name(session_id: &str, session_title: &str, tool_name: &str) -> String {
@@ -140,7 +341,7 @@ impl ToolSession {
     }
 
     /// `aoe_tool_<tool>_`: everything before the (movable) title.
-    fn name_prefix(tool_name: &str) -> String {
+    pub(crate) fn name_prefix(tool_name: &str) -> String {
         format!("{TOOL_PREFIX}{}_", sanitize_session_name(tool_name))
     }
 
@@ -167,29 +368,27 @@ impl ToolSession {
     ) -> Result<()> {
         let config = crate::tmux::tmux_option_config(profile);
 
-        let mut args = vec![
-            "new-session".to_string(),
-            "-d".to_string(),
-            "-s".to_string(),
-            self.name.clone(),
-            "-c".to_string(),
-            working_dir.to_string(),
-        ];
+        let mut args = Vec::from(
+            [
+                "new-session",
+                "-d",
+                "-s",
+                self.name.as_str(),
+                "-c",
+                working_dir,
+            ]
+            .map(str::to_owned),
+        );
 
         if let Some((width, height)) = size {
-            args.push("-x".to_string());
-            args.push(width.to_string());
-            args.push("-y".to_string());
-            args.push(height.to_string());
+            args.extend(["-x".to_string(), width.to_string()]);
+            args.extend(["-y".to_string(), height.to_string()]);
         }
 
         args.push(command.to_string());
 
         let target = format!("={}:", self.name);
-        append_remain_on_exit_args(&mut args, &target);
-        append_pane_base_index_args(&mut args, &target);
-        append_window_size_args(&mut args, &target);
-        append_tmux_setting_args(&mut args, &target, &config);
+        append_session_setup_args(&mut args, &target, &config, None);
         args.extend([
             ";".into(),
             "set-option".into(),
@@ -206,17 +405,6 @@ impl ToolSession {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("Failed to create tool session '{}': {}", self.name, stderr);
         }
-
-        refresh_session_cache();
-        Ok(())
-    }
-
-    pub fn kill(&self) -> Result<()> {
-        if let Some(pane_pid) = self.get_pane_pid() {
-            process::kill_process_tree(pane_pid);
-        }
-
-        super::utils::kill_session_if_present(&self.name)?;
 
         refresh_session_cache();
         Ok(())
@@ -257,10 +445,6 @@ impl ToolSession {
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
         super::Session::from_name(&self.name).capture_pane(lines)
     }
-
-    fn get_pane_pid(&self) -> Option<u32> {
-        process::get_pane_pid(&self.name)
-    }
 }
 
 #[cfg(test)]
@@ -271,12 +455,364 @@ mod tests {
     /// A session id long enough that `truncate_id(.., 8)` truncates.
     const ID: &str = "abc12345deadbeef";
 
+    fn legacy_metadata() -> crate::tmux::PaneMetadata {
+        crate::tmux::PaneMetadata {
+            session_id: "$42".into(),
+            pane_id: "%42".into(),
+            session_kind: None,
+            tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
+            pane_dead: false,
+            pane_current_command: Some("sleep".into()),
+            pane_start_command_is_protected: false,
+            pane_pid: Some(4242),
+            pane_title: None,
+            window_activity: None,
+            window_size: Some((80, 24)),
+        }
+    }
+
+    fn legacy_scope(id: &str, tool: &str) -> LegacyToolScope {
+        LegacyToolScope {
+            rows: vec![(
+                "work".into(),
+                id.into(),
+                crate::tmux::Session::generate_name(id, "Row"),
+            )],
+            tools: vec![(tool.into(), ToolSession::name_prefix(tool))],
+        }
+    }
+
+    #[test]
+    fn legacy_candidates_are_explicit_and_reject_ambiguous_or_invalid_ownership() {
+        let name = ToolSession::generate_name(ID, "Old title", "yazi");
+        let scope = legacy_scope(ID, "yazi");
+        let panes = std::collections::HashMap::from([(name.clone(), legacy_metadata())]);
+        assert!(ToolSession::from_snapshot(ID, "New title", "yazi", &panes).is_err());
+        assert_eq!(
+            ToolSession::legacy_metadata_in(ID, "New title", "yazi", "work", &panes, &scope)
+                .unwrap()
+                .unwrap()
+                .0,
+            name
+        );
+        for owner in [
+            crate::tmux::ToolPaneOwner::Invalid,
+            crate::tmux::ToolPaneOwner::Named {
+                instance_id: ID.into(),
+                tool_name: "other".into(),
+            },
+            crate::tmux::ToolPaneOwner::Named {
+                instance_id: "abc12345different".into(),
+                tool_name: "yazi".into(),
+            },
+        ] {
+            let mut bad = panes.clone();
+            bad.get_mut(&name).unwrap().tool_owner = owner;
+            assert!(matches!(
+                ToolSession::legacy_metadata_in(ID, "Old title", "yazi", "work", &bad, &scope),
+                Err(_) | Ok(None)
+            ));
+        }
+        let mut duplicate = panes.clone();
+        duplicate.insert(
+            ToolSession::generate_name(ID, "Other title", "yazi"),
+            legacy_metadata(),
+        );
+        assert!(ToolSession::legacy_metadata_in(
+            ID,
+            "New title",
+            "yazi",
+            "work",
+            &duplicate,
+            &scope
+        )
+        .is_err());
+        for kind in ["agent", "term", "cterm", "broken"] {
+            let mut bad = panes.clone();
+            bad.get_mut(&name).unwrap().session_kind = Some(kind.into());
+            assert!(
+                ToolSession::legacy_metadata_in(ID, "New title", "yazi", "work", &bad, &scope)
+                    .is_err()
+            );
+        }
+        let mut no_ids = panes.clone();
+        no_ids.get_mut(&name).unwrap().pane_id.clear();
+        assert!(
+            ToolSession::legacy_metadata_in(ID, "New title", "yazi", "work", &no_ids, &scope)
+                .is_err()
+        );
+        let mut no_pid = panes;
+        no_pid.get_mut(&name).unwrap().pane_pid = None;
+        assert!(
+            ToolSession::legacy_metadata_in(ID, "New title", "yazi", "work", &no_pid, &scope)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_candidates_check_all_profile_ids_and_raw_tool_name_shapes() {
+        for (requested, raw_names, title) in [
+            ("git|log", vec!["git|log", "git_log"], "T"),
+            ("git", vec!["git", "git_log"], "log_T"),
+        ] {
+            let name = ToolSession::generate_name(ID, title, requested);
+            let panes = std::collections::HashMap::from([(name, legacy_metadata())]);
+            let mut scope = legacy_scope(ID, requested);
+            scope.tools = raw_names
+                .into_iter()
+                .map(|name| (name.to_owned(), ToolSession::name_prefix(name)))
+                .collect();
+            assert!(
+                ToolSession::legacy_metadata_in(ID, title, requested, "work", &panes, &scope)
+                    .is_err()
+            );
+        }
+        let name = ToolSession::generate_name(ID, "Old title", "yazi");
+        let panes = std::collections::HashMap::from([(name.clone(), legacy_metadata())]);
+        for other_id in ["abc12345different", ID] {
+            let mut scope = legacy_scope(ID, "yazi");
+            scope.rows.push((
+                "other-profile".into(),
+                other_id.into(),
+                crate::tmux::Session::generate_name(other_id, "Other"),
+            ));
+            assert!(ToolSession::legacy_metadata_in(
+                ID,
+                "New title",
+                "yazi",
+                "work",
+                &panes,
+                &scope
+            )
+            .is_err());
+        }
+        let mut scope = legacy_scope(ID, "yazi");
+        scope.rows[0].2 = name;
+        assert!(
+            ToolSession::legacy_metadata_in(ID, "New title", "yazi", "work", &panes, &scope)
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_adoption_and_verified_stop_fence_replacement_owner_and_pane_races() {
+        use crate::tmux::test_helpers::{pane_field, wait_for_pane_command};
+        if !tmux_available() {
+            return;
+        }
+        let unique = TmuxTestSession::new("legacy_cas");
+        let id = format!("{:08x}legacy", std::process::id());
+        let name = ToolSession::generate_name(&id, unique.name(), "probe");
+        let _guard = TmuxTestSession::from_name(&name);
+        let agent_name = crate::tmux::Session::generate_name(&id, "Agent");
+        let _agent = TmuxTestSession::from_name(&agent_name);
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                &agent_name,
+                "sleep 600"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let scope = legacy_scope(&id, "probe");
+        for race in [
+            "none",
+            "owner",
+            "kind",
+            "rename",
+            "respawn",
+            "replacement",
+            "after_stamp",
+        ] {
+            assert!(crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &name, "sleep 600"])
+                .status()
+                .unwrap()
+                .success());
+            let panes = crate::tmux::batch_pane_metadata().unwrap();
+            let metadata = panes.get(&name).unwrap();
+            let adoption = crate::session::LegacyToolAdoption {
+                tmux_session: name.clone(),
+                identity: ToolSession::legacy_identity(metadata).unwrap(),
+                profile: "work".into(),
+                lifecycle_generation: 0,
+            };
+            let pane = adoption.identity.pane_id.as_str();
+            match race {
+                "owner" => {
+                    let other = serde_json::to_string(&("other-full-id", "other")).unwrap();
+                    assert!(crate::tmux::tmux_command()
+                        .args([
+                            "set-option",
+                            "-t",
+                            &adoption.identity.session_id,
+                            "@aoe_tool_owner",
+                            &other
+                        ])
+                        .status()
+                        .unwrap()
+                        .success());
+                }
+                "kind" => {
+                    assert!(crate::tmux::tmux_command()
+                        .args([
+                            "set-option",
+                            "-t",
+                            &adoption.identity.session_id,
+                            "@aoe_kind",
+                            "agent"
+                        ])
+                        .status()
+                        .unwrap()
+                        .success());
+                }
+                "rename" => {
+                    let renamed = format!("{name}_renamed");
+                    let _rename_guard = TmuxTestSession::from_name(&renamed);
+                    assert!(crate::tmux::tmux_command()
+                        .args([
+                            "rename-session",
+                            "-t",
+                            &adoption.identity.session_id,
+                            &renamed
+                        ])
+                        .status()
+                        .unwrap()
+                        .success());
+                    assert!(ToolSession::adopt_legacy_snapshot(
+                        &id,
+                        unique.name(),
+                        "probe",
+                        "work",
+                        &adoption,
+                        &panes,
+                        &scope
+                    )
+                    .is_err());
+                    assert_eq!(pane_field(pane, "#{@aoe_tool_owner}"), "");
+                    assert!(crate::tmux::tmux_command()
+                        .args(["rename-session", "-t", &adoption.identity.session_id, &name])
+                        .status()
+                        .unwrap()
+                        .success());
+                }
+                "respawn" => {
+                    assert!(crate::tmux::tmux_command()
+                        .args(["respawn-pane", "-k", "-t", pane, "sleep 600"])
+                        .status()
+                        .unwrap()
+                        .success());
+                    wait_for_pane_command(pane, "sleep");
+                    assert_ne!(
+                        pane_field(pane, "#{pane_pid}"),
+                        adoption.identity.pane_pid.to_string()
+                    );
+                }
+                "replacement" => {
+                    assert!(crate::tmux::tmux_command()
+                        .args(["kill-session", "-t", &adoption.identity.session_id])
+                        .status()
+                        .unwrap()
+                        .success());
+                    assert!(crate::tmux::tmux_command()
+                        .args(["new-session", "-d", "-s", &name, "sleep 600"])
+                        .status()
+                        .unwrap()
+                        .success());
+                }
+                _ => {}
+            }
+            if race == "rename" {
+                // The restored name is now the same identity; only the stale renamed attempt above was refused.
+            } else if matches!(race, "none" | "after_stamp") {
+                let (tool, verified) = ToolSession::adopt_legacy_snapshot(
+                    &id,
+                    unique.name(),
+                    "probe",
+                    "work",
+                    &adoption,
+                    &panes,
+                    &scope,
+                )
+                .unwrap();
+                let stamped = serde_json::to_string(&(&id, "probe")).unwrap();
+                assert_eq!(pane_field(pane, "#{@aoe_tool_owner}"), stamped);
+                assert!(
+                    ToolSession::adopt_legacy_snapshot(
+                        &id,
+                        unique.name(),
+                        "probe",
+                        "work",
+                        &adoption,
+                        &panes,
+                        &scope
+                    )
+                    .is_err(),
+                    "another stale unmarked claimant must not restamp"
+                );
+                if race == "after_stamp" {
+                    assert!(crate::tmux::tmux_command()
+                        .args(["kill-session", "-t", &adoption.identity.session_id])
+                        .status()
+                        .unwrap()
+                        .success());
+                    assert!(crate::tmux::tmux_command()
+                        .args(["new-session", "-d", "-s", &name, "sleep 600"])
+                        .status()
+                        .unwrap()
+                        .success());
+                    assert!(tool.kill_verified(&id, "probe", &verified).is_err());
+                    assert_eq!(pane_field(&name, "#{@aoe_tool_owner}"), "");
+                } else {
+                    tool.kill_verified(&id, "probe", &verified).unwrap();
+                }
+            } else {
+                assert!(
+                    ToolSession::adopt_legacy_snapshot(
+                        &id,
+                        unique.name(),
+                        "probe",
+                        "work",
+                        &adoption,
+                        &panes,
+                        &scope
+                    )
+                    .is_err(),
+                    "{race}"
+                );
+                if race != "owner" {
+                    assert_eq!(pane_field(&name, "#{@aoe_tool_owner}"), "");
+                }
+            }
+            assert!(
+                crate::tmux::tmux_command()
+                    .args(["has-session", "-t", &agent_name])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "agent survives {race}"
+            );
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &name])
+                .output();
+        }
+    }
+
     #[test]
     fn snapshot_resolution_rejects_other_tool_ownership_but_keeps_retitles() {
         let sibling = ToolSession::generate_name(ID, "T", "git_log");
         let mut panes = std::collections::HashMap::from([(
             sibling.clone(),
             crate::tmux::PaneMetadata {
+                session_id: "$42".into(),
+                pane_id: "%42".into(),
+                session_kind: None,
                 tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
                 pane_dead: false,
                 pane_current_command: None,
@@ -321,11 +857,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn new_adopts_a_retitled_tool_session_but_not_another_tools() {
+    fn new_resolves_retitled_transport_without_assigning_ownership() {
         // #3157 for tool sub-sessions: the title moved, the tool's tmux session
-        // kept the name it was created under. Reopening lazygit must reattach to
-        // the running pane rather than spawn a second one, and must never adopt
-        // a different tool's pane, which the tool name in the prefix guarantees.
+        // kept the name it was created under. This transport-only constructor
+        // locates its existing name; ownership authorization belongs to the
+        // verified snapshot or explicit legacy-adoption path.
         let guard = crate::tmux::SessionCacheGuard::capture();
         let stale_lazygit = ToolSession::generate_name(ID, "Vikings", "lazygit");
         guard.force_present(&[stale_lazygit.as_str()]);
@@ -340,7 +876,7 @@ mod tests {
             .to_string();
         assert!(
             yazi.starts_with(&format!("{TOOL_PREFIX}yazi_")),
-            "yazi must not adopt lazygit's pane: {yazi}"
+            "yazi must not resolve lazygit's transport name: {yazi}"
         );
         assert!(yazi.contains("Refactor_billing"));
     }

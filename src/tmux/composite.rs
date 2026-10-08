@@ -200,15 +200,8 @@ pub(crate) fn composite_window(
 ) -> String {
     let mut out = String::new();
     for row in 0..window_height {
-        // An unclaimed cell is a border only where it actually separates two
-        // panes, and which glyph depends on the direction it separates them
-        // in: a pane directly above or below makes it part of a horizontal
-        // rule, a pane to the left or right makes it part of a vertical one.
-        // A cell with no pane on any side is void (the dead corner beside a
-        // short pane) and stays blank rather than drawing a border to nowhere,
-        // UNLESS a pane touches it diagonally, which only happens where a
-        // horizontal and a vertical rule cross. Those cells used to render as a
-        // hole in the middle of an otherwise unbroken rule.
+        // A gap is a horizontal rule next to a pane above/below, vertical next to one
+        // left/right, a cross where only a diagonal touches, and blank otherwise.
         let covered = |r: u16, c: u16| panes.iter().any(|p| p.geom.covers(r, c));
         let gap_fill = |col: u16| -> char {
             let up = row.checked_sub(1);
@@ -232,10 +225,7 @@ pub(crate) fn composite_window(
 
         let mut line = String::new();
         let mut col = 0u16;
-        // Whether the last thing written was pane content, whose SGR state may
-        // still be live. `capture_rows_padded` only resets when it actually pads,
-        // so a pane row whose fill runs to its own right edge leaves the colour
-        // set and would paint the border glyph beside it in that background.
+        // Pane content may leave its SGR live; reset before drawing a border.
         let mut sgr_live = false;
         while col < window_width {
             let hit = panes

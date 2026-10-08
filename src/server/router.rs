@@ -48,8 +48,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),
         )
-        // Atomic multi-session workspace delete (#2536): one call replaces the
-        // web client's N-call fan-out over DELETE /api/sessions/{id}.
+        // Atomic multi-session workspace delete.
         .route("/api/workspaces", delete(api::delete_workspace))
         // Unified MCP management surface (#1996)
         .route("/api/mcp/servers", get(api::get_mcp_servers))
@@ -97,9 +96,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/send", post(api::send_message))
         .route(
             "/api/sessions/{id}/paste-image",
-            // A base64 screenshot blows past the global 1 MiB cap. 8 MiB
-            // leaves headroom for the 5 MiB decoded cap (enforced in the
-            // handler) plus base64's ~33% overhead and JSON framing.
+            // A base64 screenshot blows past the global 1 MiB cap.
             post(api::paste_image).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route("/api/sessions/{id}/output", get(api::read_output))
@@ -192,6 +189,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .delete(api::delete_group),
         )
         .route("/api/groups/collapse", patch(api::collapse_group))
+        .route("/api/reorder", post(api::reorder))
         .route(
             "/api/projects",
             get(api::list_projects).post(api::create_project),
@@ -209,15 +207,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
         .route("/api/settings/resolved", get(api::get_settings_resolved))
-        // The CityHall config bundle an admin hands to CityHall. Blocked inside
-        // a CityHall workspace by the handler itself (reads bypass
-        // `cityhall_gate`).
+        // The CityHall config bundle an admin hands to CityHall.
         .route("/api/cityhall/bundle", get(api::get_cityhall_bundle))
         .route("/api/tips", get(api::get_tips))
         .route("/api/tips/show", post(api::set_show_tips))
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
-        // Plugin management. The enable/disable toggle gates on read-only +
-        // elevation inside the handler.
+        // Plugin management.
         .route("/api/plugins", get(api::list_plugins))
         .route("/api/plugins/{id}/icon", get(api::serve_plugin_icon))
         .route("/api/plugins/commands", get(api::plugin_commands))
@@ -281,8 +276,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
         .route("/api/theme/current", get(api::get_current_theme))
-        // Dedicated, non-elevated global-theme write: a cosmetic theme change
-        // must not trip the passphrase wall on `PATCH /api/settings`.
+        // Dedicated, non-elevated global-theme write.
         .route("/api/theme", patch(api::update_theme))
         .route("/api/sounds", get(api::list_sounds))
         .route("/api/sounds/file/{name}", get(api::serve_sound_file))
@@ -307,8 +301,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/login/sessions/{id}",
             delete(login::revoke_session_handler),
         )
-        // Devices: the connected-devices view is backed by persisted
-        // login sessions (#1235), not the old IP/UA request tracker.
+        // Devices.
         .route("/api/devices", get(login::devices_handler))
         // About (version, auth status, read-only state)
         .route("/api/about", get(api::get_about))
@@ -358,12 +351,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/acp/prompt",
-            // Prompt bodies carry inline base64 attachments, which blow
-            // past the global 1 MiB cap. Raise the limit on this route
-            // only; the server-side decoded-size caps in
-            // `validate_attachments` are the real guard. 28 MiB leaves
-            // headroom for the 20 MiB total decoded cap plus base64's
-            // ~33% overhead and JSON framing. See #1000 / #965.
+            // Prompt bodies carry inline base64 attachments, which blow past the global 1
+            // MiB cap.
             post(api::acp_prompt).layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024)),
         )
         .route(
@@ -418,8 +407,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/acp/option-catalog", get(api::get_option_catalog))
         .route("/api/claude-sessions", get(api::list_claude_sessions));
 
-    // Dashboard bundle (Vite build output) plus the SPA fallback. Without
-    // `web` the daemon still answers `/api/*`; browser paths 404.
+    // Dashboard bundle (Vite build output) plus the SPA fallback.
     #[cfg(feature = "web")]
     let app = if state.core_only {
         app
@@ -687,11 +675,9 @@ mod tests {
             }
         }
 
-        // The cases above pin the middleware itself; this pins its position in
-        // the real stack, where a template exists only because axum routes the
-        // request before any `Router::layer` middleware runs. The token in the
-        // query string is wrong, so auth rejects it: exactly the 4xx a triager
-        // greps for, and the one request shape that carries a secret.
+        // The cases above pin the middleware itself; this pins its position in the real
+        // stack, where a template exists only because axum routes the request before any
+        // `Router::layer` middleware runs.
         let state = test_support::build_test_app_state_with_policy(
             Vec::new(),
             vecs(&["localhost"]),
@@ -719,10 +705,8 @@ mod tests {
             );
         }
 
-        // `request_id` is client-supplied, and it lands on the same line as
-        // `path`, so it is held to the same rule. `HeaderValue::to_str`
-        // admits spaces and `=`, so an unfiltered header forges fields on
-        // the line #3402 added for triage. (header value, echoed verbatim?)
+        // `request_id` is client-supplied, and it lands on the same line as `path`, so it
+        // is held to the same rule.
         let overlong = "x".repeat(MAX_CLIENT_REQUEST_ID + 1);
         let ids: [(&str, bool); 3] = [
             ("forged status=200 path=/pwned", false),

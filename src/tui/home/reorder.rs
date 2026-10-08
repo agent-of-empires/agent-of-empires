@@ -6,64 +6,22 @@
 use super::*;
 use crate::session::config::{GroupByMode, SortOrder};
 
-/// Whether `member` is `group` or sits beneath it, compared on whole path components so `ab` is
-/// not taken for a child of `a`. A group with no stored row still exists while a live session sits
-/// in it or anywhere under it, because the tree draws every ancestor of a member's path.
-fn group_contains(group: &str, member: &str) -> bool {
-    member == group
-        || member
-            .strip_prefix(group)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// What a move attempt found once it held the lock.
-enum MoveOutcome {
-    /// The rows were renumbered and the view reconciled with them.
-    Moved,
-    /// The row is already against the edge of its group, so a caller may cross the boundary.
-    AtEdge,
-    /// The rows this move was aimed at have changed underneath the list: the anchor is gone,
-    /// a peer moved it to another group, or the destination group no longer exists.
-    Stale,
-}
-
-/// The same three answers for a group header, carrying the reordered groups when there are
-/// any to publish.
-enum GroupMoveOutcome {
-    Moved(Vec<Group>),
-    AtEdge,
-    Stale,
-}
-
 impl HomeView {
     /// Move the cursor's row one slot in `delta` (-1 up, 1 down). A session moves among the
     /// sessions of its own group and profile; a group header moves among the groups sharing
     /// its parent. Refuses where a move would be discarded or would write a membership the
     /// list is not showing.
     pub(super) fn move_row_at_cursor(&mut self, delta: isize) -> anyhow::Result<()> {
-        // Every path below renumbers `sort_index` on disk or rewrites the stored group
-        // order, and neither rides the wire: `SessionResponse` carries `group_path` and
-        // nothing more, so a runtime that owns these rows never learns this process
-        // reordered them and republishes the order it still holds. The local gate is
-        // therefore the only barrier here, and it belongs before the move is computed:
-        // `sort_order` is read from the store, and the list is rebuilt from it after.
-        if let Some(reason) = self.local_write_block() {
-            self.refuse_local_write(reason);
-            return Ok(());
-        }
         if self.sort_order != SortOrder::Custom {
             self.flash_status("Press o for the Custom sort to arrange rows by hand");
             return Ok(());
         }
         if self.group_by != GroupByMode::Manual {
-            // Project and Org headers are derived from repo paths, and their rows carry a
-            // rewritten `group_path` for display. Moving one would save a manual membership
-            // the user cannot see, so the mutation is refused rather than guessed at.
             self.flash_status("Rows are arranged by hand in Manual grouping only (g)");
             return Ok(());
         }
-        if let Some(group_path) = self.selected_group.clone() {
-            self.move_group_row(&group_path, delta)?;
+        if let Some(path) = self.selected_group.clone() {
+            self.move_group_row(&path, delta)?;
         } else if let Some(id) = self.selected_session.clone() {
             self.move_session_row(&id, delta)?;
         }
@@ -71,173 +29,74 @@ impl HomeView {
     }
 
     fn move_session_row(&mut self, id: &str, delta: isize) -> anyhow::Result<()> {
-        match self.apply_move(id, delta, None)? {
-            MoveOutcome::Moved => {
-                self.rebuild_flat_items_keeping_cursor();
-                Ok(())
-            }
-            // Already at the edge of its own group: carry on into the neighbouring one.
-            MoveOutcome::AtEdge => self.move_session_across_groups(id, delta),
-            MoveOutcome::Stale => self.refresh_after_stale_move(),
-        }
+        self.submit_session_reorder(id, delta, None)
+    }
+
+    pub(super) fn submit_session_reorder(
+        &mut self,
+        id: &str,
+        delta: isize,
+        destination: Option<String>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(delta == -1 || delta == 1, "Invalid row direction");
+        let row = self
+            .instances
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("The selected row changed elsewhere"))?;
+        let profile = row.source_profile.clone();
+        let source_group = row.group_path.clone();
+        let crossing = destination.is_some();
+        let continuation_destination = if crossing {
+            None
+        } else {
+            let groups = self.displayed_group_order(Some(&profile));
+            groups
+                .iter()
+                .position(|group| *group == source_group)
+                .and_then(|at| at.checked_add_signed(delta))
+                .and_then(|at| groups.get(at))
+                .map(|path| (*path).to_owned())
+        };
+        let mutation =
+            crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
+                id: id.to_owned(),
+                profile: profile.clone(),
+                source_group: source_group.clone(),
+                direction: if delta < 0 {
+                    crate::daemon::MoveDirection::Up
+                } else {
+                    crate::daemon::MoveDirection::Down
+                },
+                destination,
+            });
+        self.submit_namespace_intent(
+            mutation,
+            NamespaceIntent::ReorderSession {
+                id: id.to_owned(),
+                profile,
+                source_group,
+                delta,
+                crossing,
+                continuation_destination,
+            },
+        )
     }
 
     /// Drop a move aimed at rows that have since changed and show the current list instead.
     /// Repeating the keystroke then acts on what is on screen.
-    fn refresh_after_stale_move(&mut self) -> anyhow::Result<()> {
-        self.reload_storage_only()?;
+    pub(super) fn refresh_after_stale_move(&mut self) -> anyhow::Result<()> {
+        self.rebuild_flat_items_keeping_cursor();
+        self.update_selected();
         self.flash_status("Rows changed elsewhere, list refreshed");
         Ok(())
-    }
-
-    /// Move `id` by `delta` inside its group, or into `target_group` when crossing a
-    /// boundary, and renumber the whole destination sibling set — all computed from the rows
-    /// the store holds under the lock. Reading the order beforehand and writing a diff lets a
-    /// peer's concurrent swap survive alongside this one, leaving two rows sharing an index.
-    /// The anchor and the destination are checked against those same locked rows, so a move
-    /// decided from the drawn list cannot write a membership a peer has since removed.
-    fn apply_move(
-        &mut self,
-        id: &str,
-        delta: isize,
-        target_group: Option<String>,
-    ) -> anyhow::Result<MoveOutcome> {
-        let Some(anchor) = self.instances.get(id) else {
-            return Ok(MoveOutcome::Stale);
-        };
-        let profile = anchor.source_profile.clone();
-        let source_group = anchor.group_path.clone();
-        let Some(storage) = self.storages.get(&profile) else {
-            return Ok(MoveOutcome::Stale);
-        };
-
-        let moved: Option<Vec<(String, u32, Option<String>)>> =
-            storage.update(|instances, groups| {
-                // The drawn row is a copy taken before the lock. If the store's row has since been
-                // archived, trashed, deleted or regrouped, every position computed from the list is
-                // about a layout that no longer exists.
-                let anchor_is_current = instances.iter().any(|i| {
-                    i.id == id
-                        && i.source_profile == profile
-                        && i.group_path == source_group
-                        && !i.is_archived()
-                        && !i.is_trashed()
-                });
-                if !anchor_is_current {
-                    return Ok(None);
-                }
-                if let Some(destination) = &target_group {
-                    // The ungrouped bucket is always there; any other destination has to be a
-                    // group the store still holds, either declared or standing for live members.
-                    // Writing the membership blind would let the next tree rebuild synthesize a
-                    // group a peer has just deleted.
-                    let destination_exists = destination.is_empty()
-                        || groups.iter().any(|g| g.path == *destination)
-                        || instances.iter().any(|i| {
-                            group_contains(destination, &i.group_path)
-                                && i.source_profile == profile
-                                && !i.is_archived()
-                                && !i.is_trashed()
-                        });
-                    if !destination_exists {
-                        return Ok(None);
-                    }
-                }
-                let group = target_group.clone().unwrap_or_else(|| source_group.clone());
-                let mut siblings: Vec<&Instance> = instances
-                    .iter()
-                    .filter(|i| {
-                        i.group_path == group
-                            && i.source_profile == profile
-                            && !i.is_archived()
-                            && !i.is_trashed()
-                            && i.id != id
-                    })
-                    .collect();
-                siblings.sort_by_key(|i| {
-                    (
-                        i.sort_index.unwrap_or(u32::MAX),
-                        std::cmp::Reverse(i.created_at),
-                    )
-                });
-                let mut order: Vec<String> = siblings.iter().map(|i| i.id.to_string()).collect();
-
-                match &target_group {
-                    // Crossing a boundary: land against the edge that was crossed.
-                    Some(_) if delta < 0 => order.push(id.to_string()),
-                    Some(_) => order.insert(0, id.to_string()),
-                    None => {
-                        // Within the group, the anchor's own position is read under the lock too.
-                        let mut own = instances
-                            .iter()
-                            .filter(|i| {
-                                i.group_path == group
-                                    && i.source_profile == profile
-                                    && !i.is_archived()
-                                    && !i.is_trashed()
-                            })
-                            .collect::<Vec<_>>();
-                        own.sort_by_key(|i| {
-                            (
-                                i.sort_index.unwrap_or(u32::MAX),
-                                std::cmp::Reverse(i.created_at),
-                            )
-                        });
-                        let Some(at) = own.iter().position(|i| i.id == id) else {
-                            return Ok(None);
-                        };
-                        let Some(to) = at.checked_add_signed(delta).filter(|t| *t < own.len())
-                        else {
-                            // A genuine edge, told apart from staleness by the anchor check above.
-                            return Ok(Some(Vec::new()));
-                        };
-                        order = own.iter().map(|i| i.id.to_string()).collect();
-                        order.swap(at, to);
-                    }
-                }
-
-                let mut applied = Vec::with_capacity(order.len());
-                for (position, sibling) in order.iter().enumerate() {
-                    let position = position as u32;
-                    if let Some(row) = instances.iter_mut().find(|i| i.id == *sibling) {
-                        row.sort_index = Some(position);
-                        if row.id == id {
-                            if let Some(group) = &target_group {
-                                row.group_path = group.clone();
-                            }
-                        }
-                        applied.push((row.id.clone(), position, target_group.clone()));
-                    }
-                }
-                Ok(Some(applied))
-            })?;
-
-        let Some(moved) = moved else {
-            return Ok(MoveOutcome::Stale);
-        };
-        if moved.is_empty() {
-            return Ok(MoveOutcome::AtEdge);
-        }
-        // Reconcile the view with what the store now holds.
-        for (row_id, position, group) in &moved {
-            if let Some(row) = self.instances.get_mut(row_id) {
-                row.sort_index = Some(*position);
-                if row_id == id {
-                    if let Some(group) = group {
-                        row.group_path = group.clone();
-                    }
-                }
-            }
-        }
-        Ok(MoveOutcome::Moved)
     }
 
     /// Group paths in the order the list shows them, restricted to `profile`, including the
     /// ungrouped bucket that `flatten_tree` puts first. The synthetic Archived and Trash
     /// sections are left out: they are sinks a row reaches by being archived or trashed,
     /// never by being moved.
-    fn displayed_group_order(&self, profile: Option<&str>) -> Vec<String> {
-        let mut order: Vec<String> = Vec::new();
+    fn displayed_group_order(&self, profile: Option<&str>) -> Vec<&str> {
+        let mut order: Vec<&str> = Vec::new();
         for item in &self.flat_items {
             let path = match item {
                 Item::Group {
@@ -245,14 +104,10 @@ impl HomeView {
                     profile: row_profile,
                     ..
                 } => {
-                    // Single-profile flattening leaves a header's profile unset, so an
-                    // unqualified row belongs to the view's only profile; comparing it
-                    // against `Some(profile)` would drop every header and leave only the
-                    // groups recovered from visible sessions, skipping empty or collapsed
-                    // neighbours.
+                    // Single-profile headers omit their shared profile.
                     match (profile, row_profile.as_deref()) {
                         (Some(want), Some(have)) if want != have => continue,
-                        _ => path.clone(),
+                        _ => path.as_str(),
                     }
                 }
                 Item::Session { id, .. } => match self.get_instance(id) {
@@ -261,13 +116,13 @@ impl HomeView {
                             && !inst.is_trashed()
                             && profile.is_none_or(|p| inst.source_profile == p) =>
                     {
-                        inst.group_path.clone()
+                        inst.group_path.as_str()
                     }
                     _ => continue,
                 },
             };
-            if crate::session::is_within_archived_section(&path)
-                || crate::session::is_within_trash_section(&path)
+            if crate::session::is_within_archived_section(path)
+                || crate::session::is_within_trash_section(path)
             {
                 continue;
             }
@@ -278,379 +133,208 @@ impl HomeView {
         order
     }
 
-    /// Move a session out of its group into the neighbour in `delta`'s direction, landing
-    /// against the boundary it crossed: at the bottom of the group above, the top of the
-    /// group below, so a held key walks the row through the list. The neighbour is looked up
-    /// inside the row's own profile, so a move never lands it in another profile's group.
-    pub(super) fn move_session_across_groups(
+    /// Follow only the acknowledged original row, using transactionally revealed destination.
+    pub(super) fn follow_committed_reorder(
         &mut self,
         id: &str,
-        delta: isize,
-    ) -> anyhow::Result<()> {
-        // A second entry point of its own: a move that lands on a group boundary runs
-        // its own transaction from here, so the same gate is consulted at the same point
-        // rather than relying on the caller above.
-        if let Some(reason) = self.local_write_block() {
-            self.refuse_local_write(reason);
-            return Ok(());
-        }
-        let Some((current, profile)) = self
-            .instances
-            .get(id)
-            .map(|i| (i.group_path.clone(), i.source_profile.clone()))
-        else {
-            return Ok(());
-        };
-        let groups = self.displayed_group_order(Some(&profile));
-        let Some(at) = groups.iter().position(|g| *g == current) else {
-            return Ok(());
-        };
-        let Some(target) = at
-            .checked_add_signed(delta)
-            .and_then(|idx| groups.get(idx))
-            .cloned()
-        else {
-            return Ok(());
-        };
-
-        match self.apply_move(id, delta, Some(target.clone()))? {
-            MoveOutcome::Moved => {}
-            MoveOutcome::AtEdge => return Ok(()),
-            MoveOutcome::Stale => return self.refresh_after_stale_move(),
-        }
-        // A collapsed destination would hide the row it just received: the cursor could not
-        // follow it, and the next move would act on a session that is no longer on screen.
-        let revealed = self.reveal_group(&profile, &target);
-        self.after_committed_cross_group_move(id, &target, revealed);
-        Ok(())
-    }
-
-    /// Settle the list after a move that is already stored. The row has changed group on disk
-    /// whatever the expansion write did, so the list is rebuilt either way: returning early on
-    /// that error would leave the cursor on a row the store places elsewhere.
-    pub(super) fn after_committed_cross_group_move(
-        &mut self,
-        id: &str,
-        target: &str,
-        revealed: anyhow::Result<()>,
+        destination: Option<&crate::daemon::GroupLocation>,
     ) {
         self.rebuild_flat_items_keeping_cursor();
-        let Err(error) = revealed else {
-            return;
-        };
-        tracing::warn!(
-            target: "tui.reorder",
-            error = %error,
-            "expanding the destination group failed after a move"
-        );
-        self.flash_status("Moved, but the destination group stayed collapsed");
-        // The row went into a group that never opened, so the selection is on a session the
-        // list is not drawing: follow it as far as the header it went under.
-        if self
+        if let Some(at) = self
             .flat_items
             .iter()
-            .any(|item| matches!(item, Item::Session { id: row, .. } if row == id))
+            .position(|item| matches!(item, Item::Session { id: row, .. } if row == id))
         {
-            return;
-        }
-        let row_profile = self.instances.get(id).map(|row| row.source_profile.clone());
-        if let Some(at) = self.flat_items.iter().position(|item| {
-            matches!(item, Item::Group { path, profile, .. }
-                if path == target
-                    && profile.as_deref().is_none_or(|header| Some(header) == row_profile.as_deref()))
-        }) {
             self.cursor = at;
             self.update_selected();
+            return;
         }
-    }
-
-    /// The one profile in play, when there is only one. A unified view over a single profile
-    /// draws its headers unqualified, and an empty group has no member session to infer an
-    /// owner from, so without this a stored group with no rows could not be moved at all.
-    fn sole_storage_profile(&self) -> Option<String> {
-        match self.storages.len() {
-            1 => self.storages.keys().next().cloned(),
-            _ => None,
-        }
-    }
-
-    /// Expand `path` and its ancestors so a row moved into them stays visible.
-    fn reveal_group(&mut self, profile: &str, path: &str) -> anyhow::Result<()> {
-        let mut wanted: Vec<String> = Vec::new();
-        let mut walk = path;
-        loop {
-            wanted.push(walk.to_string());
-            match walk.rsplit_once('/') {
-                Some((parent, _)) if !parent.is_empty() => walk = parent,
-                _ => break,
+        if let Some(destination) = destination {
+            if let Some(at) = self.flat_items.iter().position(|item| matches!(item, Item::Group { path, profile, .. }
+                if path == &destination.path && profile.as_deref().is_none_or(|name| name == destination.profile))) {
+                self.cursor = at;
+                self.update_selected();
             }
         }
-        let collapsed_now: Vec<String> = self
-            .group_trees
-            .get(profile)
-            .map(|tree| {
-                tree.get_all_groups()
-                    .into_iter()
-                    .filter(|g| g.collapsed && wanted.contains(&g.path))
-                    .map(|g| g.path)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if collapsed_now.is_empty() {
-            return Ok(());
-        }
-        if let Some(storage) = self.storages.get(profile) {
-            storage.update(|_instances, groups| {
-                for group in groups.iter_mut() {
-                    if collapsed_now.contains(&group.path) {
-                        group.collapsed = false;
-                    }
-                }
-                Ok(())
-            })?;
-        }
-        if let Some(tree) = self.group_trees.get_mut(profile) {
-            for path in &collapsed_now {
-                tree.set_collapsed(path, false);
-            }
-        }
-        Ok(())
     }
 
     fn move_group_row(&mut self, group_path: &str, delta: isize) -> anyhow::Result<()> {
-        // The header under the cursor carries its own profile; `active_profile` is only the
-        // fallback, and picking any storage key would reorder a different profile's groups.
-        let Some(profile) = self
-            .selected_group_profile
-            .clone()
-            .or_else(|| self.active_profile.clone())
-            .or_else(|| self.sole_storage_profile())
-        else {
-            return Ok(());
-        };
-        let Some(storage) = self.storages.get(&profile) else {
-            return Ok(());
-        };
-        // Collapsed state is the view's, not the store's: rebuilding the tree from disk
-        // inside the transaction would otherwise re-expand what the user folded.
-        let collapsed: HashMap<String, bool> = self
-            .group_trees
-            .get(&profile)
-            .map(|t| {
-                t.get_all_groups()
-                    .into_iter()
-                    .map(|g| (g.path, g.collapsed))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Build the tree from what the store actually holds, inside the lock. Moving the
-        // in-memory tree and writing that back would resurrect a group a peer deleted while
-        // this view was open, and drop metadata the peer changed.
-        let moved: GroupMoveOutcome = storage.update(|instances, disk_groups| {
-            let mut tree = GroupTree::new_with_groups(instances, disk_groups);
-            if !tree.get_all_groups().iter().any(|g| g.path == group_path) {
-                // The header under the cursor was drawn from an older read; a peer has since
-                // deleted the group or emptied it.
-                return Ok(GroupMoveOutcome::Stale);
-            }
-            if !tree.move_group(group_path, delta) {
-                return Ok(GroupMoveOutcome::AtEdge);
-            }
-            let mut groups = tree.get_all_groups();
-            for g in &mut groups {
-                if let Some(state) = collapsed.get(&g.path) {
-                    g.collapsed = *state;
-                }
-            }
-            *disk_groups = groups.clone();
-            Ok(GroupMoveOutcome::Moved(groups))
-        })?;
-
-        let groups = match moved {
-            GroupMoveOutcome::Moved(groups) => groups,
-            GroupMoveOutcome::AtEdge => return Ok(()),
-            GroupMoveOutcome::Stale => return self.refresh_after_stale_move(),
-        };
-        let instances = self.cloned_instances_for_profile(&profile);
-        self.group_trees
-            .insert(profile, GroupTree::new_with_groups(&instances, &groups));
-        self.rebuild_flat_items_keeping_cursor();
-        Ok(())
+        anyhow::ensure!(delta == -1 || delta == 1, "Invalid row direction");
+        let group = self.canonical_group_location(group_path)?;
+        self.submit_namespace_intent(
+            crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Group {
+                group,
+                direction: if delta < 0 {
+                    crate::daemon::MoveDirection::Up
+                } else {
+                    crate::daemon::MoveDirection::Down
+                },
+            }),
+            NamespaceIntent::ReorderGroup,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::group_contains;
     use super::*;
-    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
-    use crate::session::{GroupTree, Storage};
-    use crate::tmux::AvailableTools;
-    use crate::tui::dialogs::InfoDialog;
-    use crate::tui::session_feed::SidebarSource;
-    use serial_test::serial;
-    use tempfile::TempDir;
+    use crate::tui::home::tests::{
+        apply_published, native_state, payload_bytes, published_snapshot, request_with_headers,
+    };
 
-    /// A one-profile view whose rows and groups are already on disk, with the
-    /// runtime attached the way a feed's first snapshot attaches it: that
-    /// transition is what makes the runtime the owner of these rows. The temp
-    /// dir and its guard are held by the fixture, because every storage write
-    /// under test has to land inside them.
-    struct AttachedRuntime {
-        _temp: TempDir,
-        _guard: AppDirGuard,
-        view: HomeView,
-        /// The seeded rows' ids, in the order they were written.
-        ids: Vec<String>,
-    }
-
-    /// Seed `labels` as rows numbered by their position, each filed under
-    /// `groups[at % groups.len()]`, and hand back a view arranging them by hand.
-    fn attached_runtime_view(labels: &[&str], groups: &[&str]) -> AttachedRuntime {
-        let temp = TempDir::new().unwrap();
-        let guard = isolate_app_dir_at(temp.path());
-        let instances: Vec<Instance> = labels
-            .iter()
-            .enumerate()
-            .map(|(at, label)| {
-                let mut inst = Instance::new(label, &format!("/tmp/{label}"));
-                inst.group_path = groups[at % groups.len()].to_string();
-                inst.sort_index = Some(at as u32);
-                inst
-            })
-            .collect();
-        let disk_groups = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-        Storage::new_unwatched("test")
-            .unwrap()
-            .update(|rows, disk| {
-                *rows = instances.clone();
-                *disk = disk_groups.clone();
+    async fn native_move(group: bool, snapshot_first: bool) {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let mut one = Instance::new("one", "/tmp/one");
+        one.group_path = "aaa".into();
+        one.sort_index = Some(0);
+        let mut two = Instance::new("two", "/tmp/two");
+        two.group_path = if group { "bbb" } else { "aaa" }.into();
+        two.sort_index = Some(1);
+        let id = one.id.clone();
+        storage
+            .update(|rows, groups| {
+                *rows = vec![one.clone(), two.clone()];
+                *groups = vec![crate::session::Group::new("aaa", "aaa")];
+                if group {
+                    groups.push(crate::session::Group::new("bbb", "bbb"));
+                }
                 Ok(())
             })
             .unwrap();
-
+        let state = native_state(&["reorder"]).await;
         let mut view = HomeView::new_for_test(
-            Some("test".to_string()),
-            AvailableTools::with_tools(&["claude"]),
+            Some("reorder".into()),
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        // `new_for_test` labels the source Daemon without going through the
-        // transition, so drive the transition a real connection drives. The
-        // feed is never connected here: this is a runtime that published rows
-        // and does not take mutations back.
-        view.set_sidebar_source(SidebarSource::Disconnected, Some("fixture"));
-        view.set_sidebar_source(SidebarSource::Daemon, None);
+        apply_published(&mut view, &state).await;
         view.sort_order = SortOrder::Custom;
         view.group_by = GroupByMode::Manual;
         view.flat_items = view.build_flat_items();
-        AttachedRuntime {
-            _temp: temp,
-            _guard: guard,
-            ids: instances.iter().map(|i| i.id.clone()).collect(),
-            view,
+        if group {
+            view.cursor = view
+                .flat_items
+                .iter()
+                .position(|item| matches!(item, Item::Group { path, .. } if path == "aaa"))
+                .unwrap();
+            view.update_selected();
+        } else {
+            view.select_session_by_id(&id);
+        }
+        let before = payload_bytes("reorder");
+        let before_ids = view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut respond = view.session_feed.namespace_driver_for_test();
+        view.move_row_at_cursor(1).unwrap();
+        assert_eq!(payload_bytes("reorder"), before);
+        let body = if group {
+            serde_json::json!({"target":"group","group":{"profile":"reorder","path":"aaa"},"direction":"down"})
+        } else {
+            serde_json::json!({"target":"session","id":id,"profile":"reorder","source_group":"aaa","direction":"down"})
+        };
+        let (status, headers, value) =
+            request_with_headers(&state, "POST", "/api/reorder", body).await;
+        assert!(status.is_success(), "{status}: {value}");
+        let receipt = crate::daemon::MutationReceipt {
+            cursor: crate::daemon::RuntimeCursor {
+                epoch: headers[crate::daemon::RUNTIME_EPOCH_HEADER]
+                    .to_str()
+                    .unwrap()
+                    .into(),
+                revision: headers[crate::daemon::RUNTIME_REVISION_HEADER]
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            },
+            outcome: crate::daemon::NamespaceOutcome::Reordered(
+                serde_json::from_value(value).unwrap(),
+            ),
+        };
+        let snapshot = published_snapshot(&state).await;
+        if snapshot_first {
+            view.session_feed.publish_for_test(
+                crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(
+                    snapshot.clone(),
+                )),
+            );
+            view.apply_session_feed();
+        }
+        assert!(matches!(
+            respond(Ok(receipt)),
+            Some(crate::daemon::NamespaceMutation::Reorder(_))
+        ));
+        view.apply_session_feed();
+        if !snapshot_first {
+            assert_eq!(
+                view.flat_items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Session { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                before_ids
+            );
+            view.session_feed.publish_for_test(
+                crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(
+                    snapshot,
+                )),
+            );
+            view.apply_session_feed();
+        }
+        let (rows, groups) = storage.load_with_groups().unwrap();
+        if group {
+            assert_eq!(
+                groups
+                    .iter()
+                    .map(|group| group.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["bbb", "aaa"]
+            );
+            assert_eq!(view.selected_group.as_deref(), Some("aaa"));
+            assert!(
+                matches!(view.flat_items.get(view.cursor), Some(Item::Group { path, .. }) if path == "aaa")
+            );
+        } else {
+            assert!(
+                rows.iter().find(|row| row.id == id).unwrap().sort_index
+                    > rows.iter().find(|row| row.id == two.id).unwrap().sort_index
+            );
+            assert_eq!(view.selected_session.as_deref(), Some(id.as_str()));
+            let displayed = view
+                .flat_items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Session { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(displayed, [two.id.as_str(), id.as_str()]);
+        }
+        assert!(view.info_dialog.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_row_move_is_receipt_fenced_while_the_runtime_owns_the_rows() {
+        for snapshot_first in [false, true] {
+            native_move(false, snapshot_first).await;
         }
     }
-
-    /// What `sessions.json` carries: each row's id against its stored index.
-    fn disk_order() -> Vec<(String, Option<u32>)> {
-        let mut rows: Vec<(String, Option<u32>)> = Storage::new_unwatched("test")
-            .unwrap()
-            .load()
-            .unwrap()
-            .into_iter()
-            .map(|inst| (inst.id, inst.sort_index))
-            .collect();
-        rows.sort();
-        rows
-    }
-
-    /// The stored group order, which `groups.json` keeps as creation order.
-    fn disk_group_paths() -> Vec<String> {
-        Storage::new_unwatched("test")
-            .unwrap()
-            .load_with_groups()
-            .unwrap()
-            .1
-            .into_iter()
-            .map(|group| group.path)
-            .collect()
-    }
-
-    fn refusal(view: &HomeView) -> &InfoDialog {
-        view.info_dialog
-            .as_ref()
-            .expect("the refusal reaches the operator")
-    }
-
-    /// A row's position is `sort_index`, and it rides on no mutation: the wire
-    /// carries `group_path` alone, and the rows are reloaded from the store
-    /// rather than from the projection. A runtime that owns them therefore
-    /// never sees a mirror reorder, and republishes the order it still holds —
-    /// so the local gate is the only thing between `Ctrl+Down` and a
-    /// second writer, exactly as it is for the favorite row.
-    #[test]
-    #[serial]
-    fn a_row_move_is_refused_while_the_runtime_owns_the_rows() {
-        let mut fixture =
-            attached_runtime_view(&["alpha-one", "beta-two", "gamma-three"], &["work"]);
-        fixture.view.selected_group = None;
-        fixture.view.selected_session = Some(fixture.ids[1].clone());
-        let before = disk_order();
-
-        fixture.view.move_row_at_cursor(1).unwrap();
-
-        assert_eq!(
-            disk_order(),
-            before,
-            "sessions.json was renumbered behind the runtime"
-        );
-        assert_eq!(refusal(&fixture.view).title(), "Read-only");
-        assert_eq!(
-            refusal(&fixture.view).message(),
-            "The runtime is read-only or unreachable, so this process may not write session or group data locally"
-        );
-    }
-
-    /// The same gate on the group header: a group's position in `groups.json`
-    /// is this process's too, and the runtime publishes its own.
-    #[test]
-    #[serial]
-    fn a_group_move_is_refused_while_the_runtime_owns_the_rows() {
-        let mut fixture = attached_runtime_view(&["a1", "b1"], &["aaa", "bbb"]);
-        fixture.view.selected_session = None;
-        fixture.view.selected_group = Some("aaa".to_string());
-        assert_eq!(
-            disk_group_paths(),
-            ["aaa", "bbb"],
-            "the fixture must start on a group a move can displace"
-        );
-        let before = disk_group_paths();
-
-        fixture.view.move_row_at_cursor(1).unwrap();
-
-        assert_eq!(
-            disk_group_paths(),
-            before,
-            "groups.json was reordered behind the runtime"
-        );
-        assert_eq!(refusal(&fixture.view).title(), "Read-only");
-    }
-
-    /// Membership is decided on whole path components: a session in `ab` does not keep a
-    /// deleted `a` alive, while one in `a/b` does.
-    #[test]
-    fn a_group_contains_its_members_and_its_descendants_only() {
-        assert!(group_contains("a", "a"));
-        assert!(group_contains("a", "a/b"));
-        assert!(group_contains("a", "a/b/c"));
-        assert!(group_contains("a/b", "a/b/c"));
-        assert!(
-            !group_contains("a", "ab"),
-            "a shared prefix is not a parent"
-        );
-        assert!(!group_contains("a/b", "a"), "an ancestor is not a member");
-        assert!(!group_contains("a/b", "a/bc"));
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_group_move_is_receipt_fenced_while_the_runtime_owns_the_rows() {
+        for snapshot_first in [false, true] {
+            native_move(true, snapshot_first).await;
+        }
     }
 }

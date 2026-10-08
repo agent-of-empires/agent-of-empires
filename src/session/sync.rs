@@ -1932,9 +1932,8 @@ mod tests {
         }
     }
 
-    // The sidecar names the pane, so a conversation started inside it with
-    // `/new` is this session's and replaces the anchor. The store scan is what
-    // may not, and the guard is how the drain tells them apart.
+    // The sidecar names the pane, so a conversation started inside it with `/new` is this session's
+    // and replaces the anchor.
     #[test]
     #[serial]
     fn pi_accepts_a_sidecar_retarget_and_keeps_its_poller() {

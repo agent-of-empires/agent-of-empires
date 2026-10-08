@@ -45,10 +45,10 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             } else {
                 None
             };
-            // Archived sessions are sunk and not live; their wakeup/monitor
-            // badge is meaningless, so skip the per-poll SQLite lookups for
-            // them. Unarchiving restores the queries. latest_plan stays
-            // ungated: a collapsed archived row may still show a plan summary.
+            // An archived session is sunk, so its wakeup/monitor badge is
+            // meaningless and the per-poll SQLite lookups are skipped.
+            // latest_plan stays ungated: a collapsed archived row may still
+            // show a plan summary.
             let structured_live = inst.is_structured() && !inst.is_archived() && !inst.is_trashed();
             let (next_wakeup_at, next_wakeup_reason) = if structured_live {
                 match state.acp_event_store.latest_pending_wakeup(&inst.id) {
@@ -77,12 +77,10 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 active_monitor,
             );
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
-                // Gate on a live worker: the invariant (supervisor.rs) is that
-                // a pending nonce only exists on a running worker, and
-                // `spawn`/`attach` sweep orphaned nonces out of the durable
-                // log. Projecting a non-running row would surface a phantom
-                // approval the resolver can only 404 on. Also skips the
-                // per-session SQLite scan for every non-running structured row.
+                // Gate on a live worker: a pending nonce only exists on a
+                // running worker, and spawn/attach sweep orphaned nonces out of
+                // the durable log, so projecting a non-running row would surface
+                // a phantom approval the resolver can only 404 on.
                 session.pending_approvals = state
                     .acp_event_store
                     .pending_approval_requests(&inst.id)
@@ -105,18 +103,17 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
 
     // Share resolved config between the ACP-capability and smart-rename
     // overlays, halving disk reads when a profile/project pair repeats in the
-    // 3s sidebar poll. See #2603.
-    // Monotonic, so the delta below is this request's own count and no reset
-    // can race a concurrent request on the same state.
+    // 3s sidebar poll (#2603). Monotonic, so the delta below is this request's
+    // own count and no reset can race a concurrent request.
     let misses_before = state
         .list_sessions_resolver_misses
         .load(std::sync::atomic::Ordering::Relaxed);
     let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
     let mut project_override_cache = ProjectRegistryCache::new();
 
-    // Overlay custom-agent ACP capability (built-ins were resolved in the
-    // constructor). Distinct `(profile, project_path)` pairs each resolve
-    // once via the shared cache above.
+    // Overlay custom-agent ACP capability; built-ins were resolved in the
+    // constructor. Distinct `(profile, project_path)` pairs resolve once via
+    // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
         if resp.acp_capable {
             continue;
@@ -161,8 +158,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     };
 
     // Overlay the per-profile tie setting (#1927) so the sidebar can collapse
-    // the standalone workdir action for tied worktree sessions. Resolved once
-    // per distinct profile, not per session.
+    // the standalone workdir action. Resolved once per distinct profile.
     {
         use std::collections::HashMap;
         let mut tie_cache: HashMap<String, bool> = HashMap::new();
@@ -179,9 +175,9 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         }
     }
 
-    // Inputs for the rate-limit park overlay below, snapshotted here so the
-    // blocking batch can run once the registry read lock is released. A live
-    // worker is never parked, so only workerless sessions pay for the probe.
+    // Inputs for the rate-limit park overlay, snapshotted so the blocking
+    // batch can run once the registry read lock is released. A live worker is
+    // never parked, so only workerless sessions pay for the probe.
     let park_probes: Vec<(usize, String, String, bool)> = sessions
         .iter()
         .zip(scoped_instances.iter().copied())
@@ -198,10 +194,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         .collect();
 
     // Overlay the smart-rename indicator. `Running` comes from the live
-    // in-flight set; `Pending` from the shared eligibility predicate, so the
-    // indicator cannot drift from the runtime gate. Config is projected from
-    // the shared `session_cfg_cache` above so a repo-local override resolves
-    // once per unique `(profile, project_path)` across both overlays.
+    // in-flight set, `Pending` from the shared eligibility predicate, so the
+    // indicator cannot drift from the runtime gate.
     {
         use crate::session::smart_rename::{
             check_eligible_resolved, resolve_smart_rename_config, SmartRenameState,
@@ -223,8 +217,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 resp.smart_rename = SmartRenameState::Running;
                 continue;
             }
-            // A session whose one-shot already ran (and failed, since the name
-            // is still default) will not retry, so it is not pending either.
+            // A session whose one-shot already ran, and failed since the name
+            // is still default, will not retry, so it is not pending either.
             if attempted.contains(&inst.id) {
                 continue;
             }
@@ -266,8 +260,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         "list_sessions resolved session config once per unique profile/project pair"
     );
 
-    // The park probe touches config files and SQLite; run it with the
-    // session registry unlocked so writers are not held behind it.
+    // The park probe touches config files and SQLite, so it runs with the
+    // session registry unlocked rather than holding writers behind it.
     drop(scoped_instances);
     drop(instances);
     if !park_probes.is_empty() {
@@ -607,6 +601,7 @@ mod workspace_ordering_tests {
             title: id.to_string(),
             project_path: project_path.to_string(),
             artifact_dir: String::new(),
+            agent_session_id: None,
             group_path: String::new(),
             tool: "claude".to_string(),
             command: String::new(),
@@ -618,6 +613,7 @@ mod workspace_ordering_tests {
             idle_dormant_since: None,
             pane_dead_observed: false,
             yolo_mode: false,
+            sort_index: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             last_accessed_at: None,
             idle_entered_at: None,

@@ -18,13 +18,9 @@ pub(super) async fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
         // snapshot). `Delay` avoids a burst of catch-up ticks after a stall.
         let mut interval = tokio::time::interval(crate::telemetry::snapshot_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Sample the live session list more often than we send, folding each
-        // sample into a window aggregate so short-lived sessions' agent/model
-        // mix and the concurrency peak survive into the periodic snapshot (#1870).
-        // Both tickers share this one task, so a sample tick and a flush tick
-        // never run concurrently: the aggregate needs no locking and a plain
-        // reset after a confirmed send is race-free. `Skip` so a long suspend
-        // does not fire a run of catch-up samples on wake.
+        // Sample the live session list more often than we send, folding each sample into a
+        // window aggregate so short-lived sessions' agent/model mix and the concurrency
+        // peak survive into the periodic snapshot.
         let mut sample = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
         sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
@@ -266,9 +262,7 @@ pub(super) async fn build_serve_snapshot(
         Some(state.serve_mode),
         &acp,
     )?;
-    // Layer the per-form-factor was-seen maps onto the snapshot. They are serve
-    // only (the browser surfaces), so the pure builder leaves them empty and the
-    // daemon fills them here from its client counters.
+    // Layer the per-form-factor was-seen maps onto the snapshot.
     snapshot.web_clients_seen = web_clients.seen_map();
     snapshot.structured_clients_seen = structured_clients.seen_map();
     snapshot.peak_concurrent_sessions = aggregator.peak_concurrent_sessions();

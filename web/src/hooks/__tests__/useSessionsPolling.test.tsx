@@ -133,6 +133,40 @@ describe("useSessions polling", () => {
   });
 });
 
+describe("connectivity independently of canonical admission", () => {
+  it.each(["boot", "previous"])(
+    "clears offline on a valid stale %s response without regressing state",
+    async (staleEpoch) => {
+      vi.mocked(fetchSessions)
+        .mockResolvedValueOnce(envelope(["A", "B"], 10n, "previous"))
+        .mockResolvedValue(envelope(["A", "B"]));
+      const { result } = renderHook(() => useSessions());
+      await settle();
+      await settle(GAP);
+      act(() =>
+        result.current.applySessionMutation({
+          session: { ...result.current.sessions[1]!, color: "green" },
+          cursor: cursor(12n),
+        }),
+      );
+      vi.mocked(fetchSessions).mockResolvedValueOnce(null);
+      await settle(GAP);
+      expect(result.current.error).toBe(true);
+      expect(isServerDown()).toBe(true);
+      vi.mocked(fetchSessions).mockResolvedValueOnce(
+        envelope(["B", "A"], staleEpoch === "boot" ? 11n : 99n, staleEpoch),
+      );
+      await settle(GAP);
+      expect(result.current.error).toBe(false);
+      expect(isServerDown()).toBe(false);
+      expect(ids(result)).toEqual(["A", "B"]);
+      expect(result.current.workspaceOrdering).toEqual(["A", "B"]);
+      expect(result.current.observedById).toEqual({ A: cursor(10n), B: cursor(12n) });
+      expect(result.current.sessions[1]!.color).toBe("green");
+    },
+  );
+});
+
 describe("canonical session receipts", () => {
   it("installs A11 after B12, fences stale GET/order, and publishes per-id rows and observations atomically", async () => {
     vi.mocked(fetchSessions).mockResolvedValue(envelope(["A", "B"]));

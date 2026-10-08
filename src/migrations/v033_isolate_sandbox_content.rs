@@ -17,6 +17,37 @@ const RECEIPTS: &str = "sandbox-content-receipts";
 pub(crate) const RECOVERY: &str = ".aoe-sandbox-recovery";
 pub(crate) const CONTENT_POLICY: u8 = 1;
 
+#[cfg(test)]
+pub(super) struct TestReconcileGuard {
+    content: Option<TestReconcileProbes>,
+    layout: Option<layout::TestReconcileProbes>,
+}
+
+#[cfg(test)]
+impl Drop for TestReconcileGuard {
+    fn drop(&mut self) {
+        TEST_RECONCILE_PROBES.set(self.content);
+        layout::TEST_RECONCILE_PROBES.set(self.layout);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_test_reconcile_probes(
+    running: fn(&str) -> Result<bool>,
+    reap: fn(&str) -> Result<bool>,
+    exposure: fn(&str) -> Result<Vec<PathBuf>>,
+) -> TestReconcileGuard {
+    TestReconcileGuard {
+        content: TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
+            running,
+            reap,
+            exposure,
+        })),
+        layout: layout::TEST_RECONCILE_PROBES
+            .replace(Some(layout::TestReconcileProbes { running, reap })),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContentRoot {
     pub(crate) path: PathBuf,
@@ -2817,34 +2848,6 @@ mod tests {
         assert_eq!(identity(parent.path()).unwrap(), identity(&nested).unwrap());
         parent.create_child(Path::new("stage/tree/nested")).unwrap();
         assert!(nested.join("stage/tree/nested").is_dir());
-    }
-
-    struct TestReconcileGuard {
-        content: Option<TestReconcileProbes>,
-        layout: Option<layout::TestReconcileProbes>,
-    }
-
-    impl Drop for TestReconcileGuard {
-        fn drop(&mut self) {
-            TEST_RECONCILE_PROBES.set(self.content);
-            layout::TEST_RECONCILE_PROBES.set(self.layout);
-        }
-    }
-
-    fn install_test_reconcile_probes(
-        running: fn(&str) -> Result<bool>,
-        reap: fn(&str) -> Result<bool>,
-        exposure: fn(&str) -> Result<Vec<PathBuf>>,
-    ) -> TestReconcileGuard {
-        TestReconcileGuard {
-            content: TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
-                running,
-                reap,
-                exposure,
-            })),
-            layout: layout::TEST_RECONCILE_PROBES
-                .replace(Some(layout::TestReconcileProbes { running, reap })),
-        }
     }
 
     /// The same-kernel mount proof runs only for a running container on a

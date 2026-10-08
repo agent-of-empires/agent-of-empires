@@ -678,10 +678,13 @@ fn changing_session_clears_preview_selection() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn click_on_group_row_toggles_collapsed() {
+async fn click_on_group_row_toggles_collapsed() {
     let mut env = create_test_env_with_mixed_sessions();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
     setup_inner(&mut env);
 
     // Find the first group row in flat_items; record initial collapsed.
@@ -709,11 +712,27 @@ fn click_on_group_row_toggles_collapsed() {
         })
         .unwrap();
 
-    let action = env.view.handle_click(5, click_row);
-    assert!(
-        action.is_none(),
-        "single click on a group should not activate"
-    );
+    let group = crate::daemon::GroupLocation {
+        profile: env.view.profile_for_cursor(group_idx).unwrap(),
+        path: group_path.clone(),
+    };
+    super::pickers_groups_sort::settle_namespace(
+        &state,
+        &mut env.view,
+        crate::daemon::NamespaceMutation::CollapseGroup(crate::daemon::CollapseGroupBody {
+            group,
+            collapsed: !was_collapsed,
+        }),
+        |view| {
+            assert!(
+                view.handle_click(5, click_row).is_none(),
+                "single click on a group should not activate"
+            );
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
 
     let now_collapsed = env
         .view

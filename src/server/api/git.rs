@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use super::AppState;
+use super::{api_error, AppState};
 
 // --- Clone repository ---
 
@@ -55,8 +55,8 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 ///   ssh://git@host/user/repo               -> repo
 ///   ssh://git@host:2222/user/repo.git      -> repo
 fn repo_name_from_url(url: &str) -> Option<String> {
-    // For scheme-based URLs (https://, ssh://, git://), take the last path segment.
-    // For scp-style (git@host:path), split on ':' and take the last segment of the path.
+    // Scheme-based URLs take the last path segment; scp-style splits on ':'
+    // and takes the last segment of the path.
     let last_segment = if url.contains("://") {
         url.rsplit_once('/')?.1
     } else if let Some((_host, path)) = url.split_once(':') {
@@ -80,8 +80,8 @@ pub async fn clone_repo(
     if state.read_only {
         return super::read_only_response();
     }
-    // Cloning writes to $HOME and fetches from the network; the CityHall "Clone
-    // URL" action is hidden in the UI, so close the endpoint too.
+    // Cloning writes to $HOME and fetches from the network; the CityHall
+    // "Clone URL" action is hidden, so close the endpoint too.
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
@@ -92,29 +92,27 @@ pub async fn clone_repo(
 
     let url = body.url.trim().to_string();
     if url.is_empty() {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({"error": "validation_failed", "message": "URL cannot be empty"}),
-            ),
-        )
-            .into_response();
+            "validation_failed",
+            "URL cannot be empty",
+        );
     }
 
     if !looks_like_git_url(&url) {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": "URL does not look like a git repository URL"})),
-        )
-            .into_response();
+            "validation_failed",
+            "URL does not look like a git repository URL",
+        );
     }
 
     if body.bare && body.shallow {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": "Cannot use both bare and shallow options"})),
-        )
-            .into_response();
+            "validation_failed",
+            "Cannot use both bare and shallow options",
+        );
     }
 
     // Resolve destination path
@@ -138,10 +136,10 @@ pub async fn clone_repo(
         }
     };
 
-    // Security: destination must be within the home directory
+    // Destination must be within the home directory.
     if let Some(home) = dirs::home_dir() {
         let canonical_home = home.canonicalize().unwrap_or(home);
-        // For new paths that don't exist yet, check the parent
+        // A path that does not exist yet is checked via its parent.
         let check_path = if destination.exists() {
             destination.canonicalize().unwrap_or(destination.clone())
         } else {
@@ -152,18 +150,18 @@ pub async fn clone_repo(
                 .unwrap_or(destination.clone())
         };
         if !check_path.starts_with(&canonical_home) {
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": "Destination must be within the home directory"})),
-            )
-                .into_response();
+                "validation_failed",
+                "Destination must be within the home directory",
+            );
         }
     }
 
     let dest_display = destination.display().to_string();
 
-    // Return an actionable error if the destination already exists, before
-    // spawning the blocking task, so the user knows to pick a different name.
+    // Report an existing destination before spawning the blocking task, so the
+    // user knows to pick a different name.
     if destination.exists() {
         return (
             StatusCode::CONFLICT,
@@ -198,19 +196,15 @@ pub async fn clone_repo(
         Ok(Err(e)) => {
             let msg = e.to_string();
             tracing::warn!(target: "http.api.git", "Clone failed for {dest_display}: {msg}");
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "clone_failed", "message": msg})),
-            )
-                .into_response()
+            api_error(StatusCode::BAD_REQUEST, "clone_failed", msg)
         }
         Err(e) => {
             tracing::error!(target: "http.api.git", "Clone task panicked: {e}");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -239,8 +233,8 @@ pub async fn list_branches(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BranchesQuery>,
 ) -> impl IntoResponse {
-    // Probes an arbitrary filesystem path for git branches; not reachable from
-    // the CityHall name-only wizard, so close it to crafted requests too.
+    // Probes an arbitrary filesystem path for git branches, and is not
+    // reachable from the CityHall name-only wizard.
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
@@ -296,16 +290,8 @@ pub async fn list_branches(
             Json(serde_json::to_value(branches).unwrap()),
         )
             .into_response(),
-        Ok(Err(msg)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "not_a_repo", "message": msg})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(msg)) => api_error(StatusCode::BAD_REQUEST, "not_a_repo", msg),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -324,8 +310,8 @@ pub async fn is_git_repo(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<IsRepoQuery>,
 ) -> impl IntoResponse {
-    // Probes an arbitrary filesystem path; not reachable from the CityHall
-    // name-only wizard, so close it to crafted requests too.
+    // Probes an arbitrary filesystem path, and is not reachable from the
+    // CityHall name-only wizard.
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
@@ -340,11 +326,7 @@ pub async fn is_git_repo(
             Json(serde_json::json!({ "is_git_repo": is_git_repo })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 

@@ -7,14 +7,14 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{
-    live_send, DragKind, HomeView, PermissionResponseTarget, PreviewSelection, TerminalMode,
-    ViewMode,
+    live_send, DragKind, HomeView, NamespaceIntent, PermissionResponseTarget, PreviewSelection,
+    TerminalMode, ViewMode,
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
 };
-use crate::session::{list_profiles_for_display, Item, Status};
+use crate::session::{list_profiles_for_display, Item, LifecycleOperation, Status};
 use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
@@ -1007,17 +1007,36 @@ impl HomeView {
         match action {
             "delete_group" => {
                 if let Err(e) = self.delete_selected_group() {
-                    tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
+                    self.info_dialog =
+                        Some(InfoDialog::new("Could Not Delete Group", &e.to_string()));
                 }
                 None
             }
             "archive_group" => {
                 if let Err(e) = self.archive_selected_group() {
-                    tracing::error!(target: "tui.input", "Failed to archive group: {}", e);
+                    self.info_dialog =
+                        Some(InfoDialog::new("Could Not Archive Group", &e.to_string()));
                 }
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
+            "resolve_namespace_indeterminate" => {
+                match self.session_feed.resolve_namespace_indeterminate() {
+                    Ok(()) => {
+                        self.namespace_unknown_message = None;
+                        self.promote_next_indeterminate();
+                    }
+                    Err(error) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Namespace Quarantine Retained",
+                            &format!(
+                                "{error}\n\nReopen with Ctrl+K: Resolve unknown runtime change."
+                            ),
+                        ))
+                    }
+                }
+                None
+            }
             "resolve_indeterminate" => {
                 if let Some(id) = self.pending_indeterminate_resolution.take() {
                     if let Err(error) = self.session_feed.resolve_indeterminate(&id) {
@@ -1038,6 +1057,15 @@ impl HomeView {
                 self.promote_next_indeterminate();
                 None
             }
+            "adopt_legacy_tool" => {
+                if let Err(error) = self.confirm_legacy_tool_preparation() {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Legacy Tool Adoption Failed",
+                        &error.to_string(),
+                    ));
+                }
+                None
+            }
             "stop_auxiliary" => {
                 // Stopping an auxiliary target is a lifecycle mutation, so it
                 // goes through the runtime like every other one; this process
@@ -1053,9 +1081,12 @@ impl HomeView {
                 None
             }
             "force_remove_session" => {
-                if let Some(session_id) = self.pending_force_remove_session.take() {
-                    if let Err(e) = self.force_remove_session(&session_id) {
-                        tracing::error!(target: "tui.input", "Failed to force remove session: {}", e);
+                if let Some((session_id, generation)) = self.pending_force_remove_session.take() {
+                    if let Err(error) = self.force_remove_session(&session_id, generation) {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Could Not Forget Purge",
+                            &error.to_string(),
+                        ));
                     }
                 }
                 None
@@ -1210,12 +1241,15 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.unified_delete_dialog = None;
                     }
-                    DialogResult::Submit(options) => {
-                        self.unified_delete_dialog = None;
-                        if let Err(e) = self.delete_selected(&options) {
-                            tracing::error!(target: "tui.input", "Failed to delete session: {}", e);
+                    DialogResult::Submit(options) => match self.delete_selected(&options) {
+                        Ok(()) => self.unified_delete_dialog = None,
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Could Not Delete Session",
+                                &error.to_string(),
+                            ))
                         }
-                    }
+                    },
                 }
                 return true;
             }
@@ -1345,6 +1379,7 @@ impl HomeView {
                         self.pending_indeterminate_resolution = None;
                         self.pending_stop_session = None;
                         self.pending_stop_auxiliary = None;
+                        self.pending_legacy_tool_preparation = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
@@ -1494,13 +1529,19 @@ impl HomeView {
                         self.group_delete_options_dialog = None;
                     }
                     DialogResult::Submit(options) => {
-                        self.group_delete_options_dialog = None;
-                        if options.delete_sessions {
-                            if let Err(e) = self.delete_group_with_sessions(&options) {
-                                tracing::error!(target: "tui.input", "Failed to delete group with sessions: {}", e);
+                        let result = if options.delete_sessions {
+                            self.delete_group_with_sessions(&options)
+                        } else {
+                            self.delete_selected_group()
+                        };
+                        match result {
+                            Ok(()) => self.group_delete_options_dialog = None,
+                            Err(error) => {
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Could Not Delete Group",
+                                    &error.to_string(),
+                                ))
                             }
-                        } else if let Err(e) = self.delete_selected_group() {
-                            tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
                         }
                     }
                 }
@@ -2119,6 +2160,7 @@ impl HomeView {
                     self.pending_indeterminate_resolution = None;
                     self.pending_stop_session = None;
                     self.pending_stop_auxiliary = None;
+                    self.pending_legacy_tool_preparation = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
@@ -2144,12 +2186,15 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
                 }
-                DialogResult::Submit(options) => {
-                    self.unified_delete_dialog = None;
-                    if let Err(e) = self.delete_selected(&options) {
-                        tracing::error!(target: "tui.input", "Failed to delete session: {}", e);
+                DialogResult::Submit(options) => match self.delete_selected(&options) {
+                    Ok(()) => self.unified_delete_dialog = None,
+                    Err(error) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Could Not Delete Session",
+                            &error.to_string(),
+                        ))
                     }
-                }
+                },
             }
             return None;
         }
@@ -2161,13 +2206,19 @@ impl HomeView {
                     self.group_delete_options_dialog = None;
                 }
                 DialogResult::Submit(options) => {
-                    self.group_delete_options_dialog = None;
-                    if options.delete_sessions {
-                        if let Err(e) = self.delete_group_with_sessions(&options) {
-                            tracing::error!(target: "tui.input", "Failed to delete group with sessions: {}", e);
+                    let result = if options.delete_sessions {
+                        self.delete_group_with_sessions(&options)
+                    } else {
+                        self.delete_selected_group()
+                    };
+                    match result {
+                        Ok(()) => self.group_delete_options_dialog = None,
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Could Not Delete Group",
+                                &error.to_string(),
+                            ))
                         }
-                    } else if let Err(e) = self.delete_selected_group() {
-                        tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
                     }
                 }
             }
@@ -2183,25 +2234,21 @@ impl HomeView {
                     self.group_rename_context = None;
                 }
                 DialogResult::Submit(data) => {
-                    self.rename_dialog = None;
-                    match mode {
-                        RenameMode::Session => {
-                            if let Err(e) = self.rename_selected(
-                                &data.title,
-                                data.group.as_deref(),
-                                data.profile.as_deref(),
-                                data.rename_branch,
-                            ) {
-                                tracing::error!(target: "tui.input", "Failed to rename session: {}", e);
-                            }
-                        }
-                        RenameMode::Group => {
-                            if let Err(e) = self.rename_selected_group(
-                                data.group.as_deref(),
-                                data.profile.as_deref(),
-                            ) {
-                                tracing::error!(target: "tui.input", "Failed to rename group: {}", e);
-                            }
+                    let result = match mode {
+                        RenameMode::Session => self.rename_selected(
+                            &data.title,
+                            data.group.as_deref(),
+                            data.profile.as_deref(),
+                            data.rename_branch,
+                        ),
+                        RenameMode::Group => self
+                            .rename_selected_group(data.group.as_deref(), data.profile.as_deref()),
+                    };
+                    match result {
+                        Ok(()) => self.rename_dialog = None,
+                        Err(error) => {
+                            self.info_dialog =
+                                Some(InfoDialog::new("Could Not Rename", &error.to_string()))
                         }
                     }
                 }
@@ -2216,14 +2263,14 @@ impl HomeView {
                     self.worktree_name_dialog = None;
                 }
                 DialogResult::Submit(data) => {
-                    self.worktree_name_dialog = None;
-                    if let Err(e) =
-                        self.set_worktree_name_for_selected(&data.name, data.rename_branch)
-                    {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Edit Workdir Name Failed",
-                            &format!("Could not edit the workdir name: {e}"),
-                        ));
+                    match self.set_worktree_name_for_selected(&data.name, data.rename_branch) {
+                        Ok(()) => self.worktree_name_dialog = None,
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Edit Workdir Name Failed",
+                                &error.to_string(),
+                            ))
+                        }
                     }
                 }
             }
@@ -2371,49 +2418,41 @@ impl HomeView {
                         }
                     }
                     ProfilePickerAction::Created(name) => {
-                        // Profile creation and deletion are not in the runtime's
-                        // CityHall mutation policy, so a client this process
-                        // serves must not perform them on disk either.
-                        if let Some(reason) = self.local_write_block() {
-                            self.profile_picker_dialog = None;
-                            self.refuse_local_write(reason);
-                            return None;
-                        }
-                        self.profile_picker_dialog = None;
-                        match crate::session::create_profile(&name) {
-                            Ok(()) => {
-                                if let Err(e) = self.switch_profile(Some(name)) {
-                                    tracing::error!(target: "tui.input", "Failed to switch to new profile: {}", e);
-                                }
-                            }
-                            Err(e) => {
+                        let result = self.submit_namespace_intent(
+                            crate::daemon::NamespaceMutation::Profile(
+                                crate::daemon::ProfileMutation::Create(
+                                    crate::daemon::CreateProfileBody { name: name.clone() },
+                                ),
+                            ),
+                            NamespaceIntent::ProfileCreated(name),
+                        );
+                        match result {
+                            Ok(()) => self.profile_picker_dialog = None,
+                            Err(error) => {
                                 self.info_dialog = Some(InfoDialog::new(
-                                    "Error",
-                                    &format!("Failed to create profile: {}", e),
-                                ));
+                                    "Could Not Create Profile",
+                                    &error.to_string(),
+                                ))
                             }
                         }
                     }
                     ProfilePickerAction::Deleted(name) => {
-                        // Deleting a profile is a write this process performs
-                        // on disk, so it is refused under the same policy as
-                        // creating one.
-                        if let Some(reason) = self.local_write_block() {
-                            self.profile_picker_dialog = None;
-                            self.refuse_local_write(reason);
-                            return None;
-                        }
-                        match crate::session::delete_profile(&name) {
-                            Ok(()) => {
-                                self.rewire_after_profile_delete(&name);
-                                self.show_profile_picker();
-                            }
-                            Err(e) => {
-                                self.profile_picker_dialog = None;
+                        let result = self.submit_namespace_intent(
+                            crate::daemon::NamespaceMutation::Profile(
+                                crate::daemon::ProfileMutation::Delete {
+                                    name: name.clone(),
+                                    query: Default::default(),
+                                },
+                            ),
+                            NamespaceIntent::ProfileDeleted(name),
+                        );
+                        match result {
+                            Ok(()) => self.profile_picker_dialog = None,
+                            Err(error) => {
                                 self.info_dialog = Some(InfoDialog::new(
-                                    "Error",
-                                    &format!("Failed to delete profile: {}", e),
-                                ));
+                                    "Could Not Delete Profile",
+                                    &error.to_string(),
+                                ))
                             }
                         }
                     }
@@ -2748,7 +2787,9 @@ impl HomeView {
         match id {
             ActionId::Quit => return Some(Action::Quit),
             ActionId::ResolveIndeterminate => {
-                if self.pending_indeterminate_queue.is_empty() {
+                if self.pending_indeterminate_queue.is_empty()
+                    && !self.session_feed.namespace_indeterminate()
+                {
                     self.flash_status("No unknown runtime changes to resolve");
                 } else {
                     self.promote_next_indeterminate();
@@ -2845,7 +2886,7 @@ impl HomeView {
                 if self.selected_group.is_some() {
                     self.prompt_archive_selected_group();
                 } else if let Err(e) = self.toggle_archive_at_cursor() {
-                    tracing::error!("toggle_archive_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Archive not changed", &e.to_string()));
                 }
             }
             id @ (ActionId::JumpPrevFinished | ActionId::JumpNextFinished) => {
@@ -2859,7 +2900,7 @@ impl HomeView {
             id @ (ActionId::MoveRowUp | ActionId::MoveRowDown) => {
                 let delta = if id == ActionId::MoveRowUp { -1 } else { 1 };
                 if let Err(e) = self.move_row_at_cursor(delta) {
-                    tracing::error!("move_row_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Order not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleFavorite => {
@@ -3386,7 +3427,13 @@ impl HomeView {
             TerminalMode::Host => crate::session::AuxiliaryTarget::Host { index: 0 },
             TerminalMode::Container => crate::session::AuxiliaryTarget::Container { index: 0 },
         };
-        self.pending_stop_auxiliary = Some((session_id, target));
+        self.pending_stop_auxiliary = Some((
+            session_id,
+            crate::daemon::StopAuxiliaryBody {
+                target,
+                adoption: None,
+            },
+        ));
         self.confirm_dialog = Some(
             self.confirm_by_repeating(ActionId::Stop, "Kill Terminal", &message, "stop_auxiliary")
                 .buttons("Kill", "Cancel"),
@@ -3401,19 +3448,51 @@ impl HomeView {
         let Some(inst) = self.get_instance(&session_id) else {
             return;
         };
-        let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-        if !tool_session.exists() || tool_session.is_pane_dead() {
+        let target = crate::session::AuxiliaryTarget::Tool {
+            tool_name: tool_name.to_owned(),
+        };
+        let Some(pane) = inst
+            .auxiliary
+            .iter()
+            .find(|observation| observation.target == target)
+            .map(|observation| &observation.pane)
+        else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Kill Tool",
+                "Tool ownership has not been observed yet. Wait for the runtime snapshot.",
+            ));
+            return;
+        };
+        if pane.state == crate::session::PanePresence::Absent {
             return;
         }
-        let message = format!(
-            "Are you sure you want to kill {} for '{}'?",
-            tool_name, inst.title
-        );
+        let adoption =
+            pane.legacy_tool
+                .as_ref()
+                .map(|identity| crate::session::LegacyToolAdoption {
+                    tmux_session: pane.tmux_session.clone().expect("legacy observation name"),
+                    identity: identity.clone(),
+                    profile: inst.source_profile.clone(),
+                    lifecycle_generation: inst.lifecycle_generation,
+                });
+        if pane.state == crate::session::PanePresence::Unknown && adoption.is_none() {
+            self.info_dialog = Some(InfoDialog::new("Kill Tool", "Tool ownership is unavailable, invalid, or ambiguous. No tool or agent was stopped."));
+            return;
+        }
+        let message = if let Some(adoption) = &adoption {
+            format!("Adopt and kill legacy tool '{}' for '{}'\nRow: {} / {} / generation {}\nTmux: {} ({} / {}, PID {})\nThis confirmation assigns this exact unmarked pane to this tool before stopping it.",
+                tool_name, inst.title, inst.source_profile, inst.id, inst.lifecycle_generation,
+                adoption.tmux_session, adoption.identity.session_id, adoption.identity.pane_id,
+                adoption.identity.pane_pid)
+        } else {
+            format!(
+                "Are you sure you want to kill {} for '{}'?",
+                tool_name, inst.title
+            )
+        };
         self.pending_stop_auxiliary = Some((
             session_id,
-            crate::session::AuxiliaryTarget::Tool {
-                tool_name: tool_name.to_owned(),
-            },
+            crate::daemon::StopAuxiliaryBody { target, adoption },
         ));
         self.confirm_dialog = Some(
             self.confirm_by_repeating(ActionId::Stop, "Kill Tool", &message, "stop_auxiliary")
@@ -4260,24 +4339,39 @@ impl HomeView {
             self.save_org_group_collapsed();
             return;
         }
-        // Route to the correct profile's GroupTree
-        let profile = self.profile_for_cursor(self.cursor);
-        if let Some(profile) = profile {
-            if let Some(tree) = self.group_trees.get_mut(&profile) {
-                tree.toggle_collapsed(path);
-            }
-        }
-        self.rebuild_flat_items();
-        // The runtime owns the session rows, so `save()` is now a no-op for a
-        // collapse: the toggle would look like it worked and never persist.
-        // Say so rather than dropping the user's click, until the collapse is
-        // submitted as `SessionMutation::Group` like the other group writes.
-        if let Some(reason) = self.local_write_block() {
-            self.refuse_local_write(reason);
-            return;
-        }
-        if let Err(e) = self.save() {
-            tracing::error!(target: "tui.input", "Failed to save group state: {}", e);
+        let result = (|| -> anyhow::Result<()> {
+            let group = self.canonical_group_location(path)?;
+            let collapsed = self
+                .session_feed
+                .applied_snapshot()
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .contents
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.name == group.profile)
+                })
+                .and_then(|profile| {
+                    profile
+                        .groups
+                        .iter()
+                        .find(|candidate| candidate.path == path)
+                })
+                .is_some_and(|candidate| candidate.collapsed);
+            self.submit_namespace_intent(
+                crate::daemon::NamespaceMutation::CollapseGroup(crate::daemon::CollapseGroupBody {
+                    group,
+                    collapsed: !collapsed,
+                }),
+                NamespaceIntent::Plain,
+            )
+        })();
+        if let Err(error) = result {
+            self.info_dialog = Some(InfoDialog::new(
+                "Could Not Collapse Group",
+                &error.to_string(),
+            ));
         }
     }
 
@@ -5214,12 +5308,18 @@ impl HomeView {
                     return;
                 }
                 if inst.status == Status::Deleting {
-                    let message = format!(
-                        "'{}' is stuck deleting. Force remove it from the session list? \
-                         (the sandbox container is torn down; worktrees and branches will not be cleaned up)",
-                        inst.title
-                    );
-                    self.pending_force_remove_session = Some(session_id.clone());
+                    let expected_generation = self
+                        .session_feed
+                        .applied_session(session_id)
+                        .and_then(|row| row.lifecycle_reservation.as_ref())
+                        .filter(|reservation| reservation.op == LifecycleOperation::Purge)
+                        .and_then(|reservation| std::num::NonZeroU64::new(reservation.generation));
+                    let Some(generation) = expected_generation else {
+                        self.info_dialog = Some(InfoDialog::new("Cannot Forget Purge", "No canonical purge owner is available. Wait for current runtime state and reopen this action."));
+                        return;
+                    };
+                    let message = format!("'{}' has a pending purge. Forget this exact purge owner? Runtime cleanup will be scheduled; worktrees and branches are not cleaned up by this action.", inst.title);
+                    self.pending_force_remove_session = Some((session_id.clone(), generation));
                     self.confirm_dialog = Some(ConfirmDialog::new(
                         "Force Remove",
                         &message,

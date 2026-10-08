@@ -29,9 +29,7 @@ pub fn apply_status_bar(
     sandbox: Option<&SandboxDisplay>,
     theme: &Theme,
 ) -> Result<()> {
-    // Re-enable the status line explicitly: a web attach turns it off
-    // for that session (the dashboard renders its own chrome), and the
-    // TUI/CLI attach experience wants the themed bar + detach hint back.
+    // A web attach turns the status line off for the session.
     set_session_option(session_name, "status", "on")?;
 
     // Set the session title as a tmux user option
@@ -54,7 +52,7 @@ pub fn apply_status_bar(
     let sandbox_color = color_to_tmux(theme.sandbox);
     let hint = color_to_tmux(theme.dimmed);
 
-    // Format: "aoe: Title | branch | [container] | 14:30"
+    // "aoe: Title | branch | [container] | 14:30"
     let status_format = format!(
         " #[fg={accent},bold]aoe#[fg={fg},nobold]: \
          #{{@aoe_title}}\
@@ -73,11 +71,8 @@ pub fn apply_status_bar(
         "status-left",
         &status_left_format(prefix, &accent, &fg, &hint),
     )?;
-    // Sized past the longest name aoe generates rather than to this one: `#S`
-    // expands when tmux paints, so a session renamed after this write (smart
-    // rename is on by default) outgrows an exact fit and the hint is cut
-    // again. tmux only trims at this cap and never pads, so over-sizing is
-    // free. See #3445.
+    // `#S` expands at paint time and a later rename can lengthen it; tmux only
+    // trims at this cap, so over-sizing is free.
     set_session_option(session_name, "status-left-length", "200")?;
 
     Ok(())
@@ -178,25 +173,15 @@ pub fn apply_all_tmux_options(
     let config = crate::tmux::tmux_option_config(profile);
 
     if resolve_tmux_setting(TmuxSetting::StatusBar, &config) == TmuxSettingAction::Apply {
-        // Theme is a global preference; match the TUI's empty-name fallback
-        // (`default`) so the status bar can't paint a different theme.
-        let theme_name = crate::session::config::resolve_theme_name();
-        // Always use truecolor here: tmux receives hex color values (#rrggbb)
-        // and manages its own escape-sequence rendering via TERM/terminfo.
-        // Palette mode only affects the TUI's direct terminal output.
-        let theme = load_theme(&theme_name);
+        // tmux takes hex colors itself, so palette mode does not apply here.
+        let theme = load_theme(&crate::session::config::resolve_theme_name());
 
         if let Err(e) = apply_status_bar(session_name, title, branch, sandbox, &theme) {
             tracing::debug!(target: "tmux.status", "Failed to apply tmux status bar: {}", e);
         }
     } else {
-        // aoe's bar is not ours to paint, whether by `disabled` or by `auto`
-        // deferring to the user's own tmux config. Both land here because a
-        // status bar has no "off" aoe could write that would not also override
-        // their config; see `TmuxSettingAction`. A web attach may have set the
-        // session-scoped `status off`, and a previously enabled aoe bar leaves
-        // its session-scoped visual overrides behind; unset them all so the
-        // user's own global config governs again in real terminals.
+        // Not ours to paint: clear any session-scoped overrides (an earlier aoe
+        // bar, a web attach's `status off`) so the user's global config governs.
         for option in [
             "status",
             "status-left",
@@ -216,11 +201,8 @@ pub fn apply_all_tmux_options(
                 tracing::debug!(target: "tmux.status", "Failed to apply tmux mouse option: {}", e);
             }
         }
-        // "Leave the user's own `mouse` in charge" has to mean actively
-        // clearing a session-scoped value aoe set earlier, not just declining
-        // to write one: sessions created before #3207 carry `mouse on`, and a
-        // session option outranks the global one forever. Same reasoning as the
-        // status-bar unset above. A no-op on a session that has none.
+        // A session option outranks the global one, so leaving it to the user
+        // means clearing any value aoe set earlier.
         TmuxSettingAction::LeaveToUser => {
             let _ = set_session_option_unset(session_name, "mouse");
         }
@@ -238,33 +220,17 @@ pub struct SessionInfo {
 /// Returns structured session info for use in user's custom tmux status bar.
 pub fn get_session_info_for_current() -> Option<SessionInfo> {
     let session_name = crate::tmux::get_current_session_name()?;
-
-    // Check if this is an aoe session
-    if !session_name.starts_with(crate::tmux::SESSION_PREFIX) {
-        return None;
-    }
-
-    // Try to get the aoe title from tmux user option
+    let name_without_prefix = session_name.strip_prefix(crate::tmux::SESSION_PREFIX)?;
     let title = get_session_option(&session_name, "@aoe_title").unwrap_or_else(|| {
-        // Fallback: extract title from session name
-        // Session names are: aoe_<title>_<id>
-        let name_without_prefix = session_name
-            .strip_prefix(crate::tmux::SESSION_PREFIX)
-            .unwrap_or(&session_name);
-        if let Some(last_underscore) = name_without_prefix.rfind('_') {
-            name_without_prefix[..last_underscore].to_string()
-        } else {
-            name_without_prefix.to_string()
-        }
+        name_without_prefix
+            .rsplit_once('_')
+            .map_or(name_without_prefix, |(title, _)| title)
+            .to_owned()
     });
-
-    let branch = get_session_option(&session_name, "@aoe_branch");
-    let sandbox = get_session_option(&session_name, "@aoe_sandbox");
-
     Some(SessionInfo {
         title,
-        branch,
-        sandbox,
+        branch: get_session_option(&session_name, "@aoe_branch"),
+        sandbox: get_session_option(&session_name, "@aoe_sandbox"),
     })
 }
 
@@ -302,13 +268,11 @@ fn get_session_option(session_name: &str, option: &str) -> Option<String> {
         .output()
         .ok()?;
 
-    if output.status.success() {
-        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !value.is_empty() {
-            return Some(value);
-        }
+    if !output.status.success() {
+        return None;
     }
-    None
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!value.is_empty()).then_some(value)
 }
 
 #[cfg(test)]

@@ -74,7 +74,16 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false, None)
+        self.orchestrate_resume_launch(
+            size,
+            skip_on_launch,
+            false,
+            ResumeLaunchOptions {
+                resume_policy,
+                restart: true,
+                conversation_carry: None,
+            },
+        )
     }
 
     /// Restart, first removing the sandbox container when `discard_sandbox_container`
@@ -92,10 +101,12 @@ impl Instance {
         self.orchestrate_resume_launch(
             size,
             skip_on_launch,
-            ResumeAttemptPolicy::HonorAutoResumeSetting,
-            true,
             discard_sandbox_container,
-            conversation_carry,
+            ResumeLaunchOptions {
+                resume_policy: ResumeAttemptPolicy::HonorAutoResumeSetting,
+                restart: true,
+                conversation_carry,
+            },
         )
     }
 
@@ -201,38 +212,64 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false, false, None)
+        self.orchestrate_resume_launch(
+            size,
+            skip_on_launch,
+            false,
+            ResumeLaunchOptions {
+                resume_policy,
+                restart: false,
+                conversation_carry: None,
+            },
+        )
     }
 
     fn orchestrate_resume_launch(
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
-        resume_policy: ResumeAttemptPolicy,
-        restart: bool,
         discard_sandbox_container: bool,
-        conversation_carry: Option<ConversationCarry>,
+        options: ResumeLaunchOptions,
+    ) -> Result<StartOutcome> {
+        let profile = self.effective_profile();
+        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+            .context("failed to open lifecycle lock storage")?;
+        self.orchestrate_resume_launch_in(
+            &storage,
+            size,
+            skip_on_launch,
+            discard_sandbox_container,
+            options,
+        )
+    }
+
+    pub(crate) fn orchestrate_resume_launch_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        discard_sandbox_container: bool,
+        options: ResumeLaunchOptions,
     ) -> Result<StartOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
         if self.is_structured() {
             return Ok(StartOutcome::Fresh);
         }
-        let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
+        storage.check_available()?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
             .context("failed to acquire instance start title lock")?;
         let lifecycle_lock = storage
+            .storage()
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance start lock")?;
-        self.reconcile_from_store(&storage)?;
+        self.reconcile_from_store(storage)?;
         if self.is_structured() {
             return Ok(StartOutcome::Fresh);
         }
         self.ensure_startable()?;
-        if !restart && self.tmux_session()?.exists() {
+        if !options.restart && self.tmux_session()?.exists() {
             return Ok(StartOutcome::Fresh);
         }
         if self.status == Status::Error {
@@ -241,18 +278,18 @@ impl Instance {
             self.last_error_check = None;
         }
         let generation = self.acquire_lifecycle_reservation(
-            &storage,
+            storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
-                self.fail_reserved_launch(&storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, false);
                 return Err(error);
             }
         }
         self.resume_reserved_launch(
-            &storage,
+            storage,
             size,
             skip_on_launch,
             LaunchReservation {
@@ -260,11 +297,7 @@ impl Instance {
                 title_lock,
                 lifecycle_lock,
             },
-            ResumeLaunchOptions {
-                resume_policy,
-                restart,
-                conversation_carry,
-            },
+            options,
         )
     }
 
@@ -902,7 +935,7 @@ mod tests {
         let outcome = instance.restart_discarding_sandbox_container(None, true, false, Some(carry));
         instance.stop_and_flush_poller();
         let observed = std::fs::read_to_string(&record).unwrap();
-        instance.kill_clean().unwrap();
+        instance.kill_clean_in(&storage).unwrap();
         assert!(outcome.is_ok(), "{outcome:?}");
         // Line 0 is the launched CLAUDE_CONFIG_DIR; the remaining lines are
         // the argv.
@@ -1356,7 +1389,7 @@ mod tests {
                 assert_eq!(outcome, StartOutcome::Fresh);
                 assert_ne!(inst.agent_session_id.as_deref(), Some(sid));
             }
-            inst.kill_clean().unwrap();
+            inst.kill_clean_in(&storage).unwrap();
         }
     }
 
@@ -1423,7 +1456,7 @@ mod tests {
         // tree this reproduces the reported bug (identical `ResumeFailed`
         // forever). The fix must instead skip the resume attempt and
         // start fresh.
-        inst.kill_clean().unwrap();
+        inst.kill_clean_in(&storage).unwrap();
         let second = inst
             .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
             .unwrap();

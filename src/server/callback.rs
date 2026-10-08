@@ -228,9 +228,7 @@ pub fn validate_callback_url(raw: &str) -> Result<(), String> {
 async fn resolve_vetted_addrs(url: &reqwest::Url) -> Option<Vec<std::net::SocketAddr>> {
     let host = strip_ipv6_brackets(url.host_str()?);
     let port = url.port_or_known_default().unwrap_or(80);
-    // Bounded by RESOLVE_TIMEOUT: a hung resolver would otherwise hold this
-    // task's dispatch permit indefinitely. Both the timeout and the lookup
-    // itself fail closed to `None`.
+    // Bounded by RESOLVE_TIMEOUT.
     let addrs: Vec<std::net::SocketAddr> =
         tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
             .await
@@ -329,9 +327,7 @@ async fn handle_status_change(
         let Some(callback_url) = callback_url else {
             return;
         };
-        // Re-check the CURRENT status (not the event's `new`): the debounce
-        // window may have let a further transition land, so only fire for
-        // whatever fire-worthy status the session is actually in right now.
+        // Re-check the CURRENT status (not the event's `new`).
         if !is_fire_worthy(current_status) {
             return;
         }
@@ -403,16 +399,13 @@ mod tests {
             "http://10.0.0.5/hook",                    // private
             "http://192.168.1.1/hook",                 // private
             "http://0.0.0.0/hook",                     // unspecified
-            // IPv4-mapped IPv6 forms. `Ipv6Addr::is_loopback()` only matches
-            // `::1`, so without canonicalization these cleared every check
-            // while the OS still dialed the v4 target.
+            // IPv4-mapped IPv6 forms.
             "http://[::ffff:127.0.0.1]/hook",
             "http://[::ffff:169.254.169.254]/latest/meta-data",
             "http://[::ffff:10.0.0.5]/hook",
             "http://[::ffff:192.168.1.1]/hook",
-            // Other v6 forms carrying an embedded v4 that also has to be
-            // judged by the IPv4 rules, or the metadata service stays
-            // reachable through them.
+            // Other v6 forms carrying an embedded v4 that also has to be judged by the IPv4
+            // rules, or the metadata service stays reachable through them.
             "http://[64:ff9b::169.254.169.254]/latest/meta-data", // NAT64
             "http://[64:ff9b::127.0.0.1]/hook",                   // NAT64 loopback
             "http://[::169.254.169.254]/latest/meta-data",        // IPv4-compatible
@@ -428,11 +421,9 @@ mod tests {
         let cases = [
             "https://dispatcher.example.com/hook",
             "http://203.0.113.5/hook",
-            // A mapped *public* address stays allowed: unwrapping must not
-            // over-block, only reclassify.
+            // A mapped *public* address stays allowed.
             "http://[::ffff:203.0.113.5]/hook",
-            // 100.64.0.0/10 is CGNAT, but 100.63/100.128 are ordinary public
-            // space: the mask must not swallow the neighbours.
+            // 100.64.0.0/10 is CGNAT, but 100.63/100.128 are ordinary public space.
             "http://100.63.255.255/hook",
             "http://100.128.0.1/hook",
             // A genuine global v6 address is untouched by the embedded-v4 paths.

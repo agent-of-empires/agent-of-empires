@@ -11,6 +11,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::daemon::{AttachProjectBody, RenameSessionBody, SetWorktreeNameBody};
 use crate::daemon::{
     CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
     ContextResumeUnavailableReason, CreateSessionBody, DeleteSessionBody, ListSessionsQuery,

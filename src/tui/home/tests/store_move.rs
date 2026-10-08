@@ -21,10 +21,12 @@ fn seed_result(view: &mut HomeView, id: &str, outcome: Result<bool, String>) {
 /// A moved store, or a container that was already up, hands the deferred
 /// attach back; a store that is still shared after the move, or a failed
 /// move, explains itself in a dialog and hands nothing back.
-#[test]
+#[tokio::test]
 #[serial]
-fn a_finished_move_resumes_or_explains() {
+async fn a_finished_move_resumes_or_explains() {
     let mut env = create_test_env_with_sessions(1);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     let id = env.view.instance_at(0).id.clone();
 
     in_flight(&mut env.view, "session0");
@@ -69,7 +71,7 @@ fn a_finished_move_resumes_or_explains() {
             Ok(())
         })
         .unwrap();
-    env.view.reload().unwrap();
+    super::pickers_groups_sort::refresh_native_fixture(&state, &mut env.view).await;
     assert!(env.view.sandbox_store_move_pending(&id));
     in_flight(&mut env.view, "session0");
     seed_result(&mut env.view, &id, Ok(true));

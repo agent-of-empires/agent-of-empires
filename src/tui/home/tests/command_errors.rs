@@ -38,6 +38,15 @@ fn cancelled_or_failed_resolution_keeps_the_real_quarantine_recoverable() {
     );
 
     let mut reconnected = env.view.session_feed.command_driver_for_test();
+    let mut unapplied = (*env.view.session_feed.applied_snapshot().unwrap()).clone();
+    unapplied.cursor.revision = env.view.session_feed.next_revision_for_test();
+    let unapplied_cursor = unapplied.cursor.clone();
+    env.view
+        .session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            std::sync::Arc::new(unapplied),
+        ));
+    assert!(!env.view.session_feed.receipt_applied(&unapplied_cursor));
     reopen_resolution(&mut env, &first);
     env.view.confirm_dialog = None;
     env.view.dispatch_confirm_submit("resolve_indeterminate");

@@ -156,7 +156,9 @@ fn rejected_archive_drops_only_its_pending_cursor_and_ignores_late_transition() 
     // id-scoped cleanup in status handling.
     env.view
         .session_feed
-        .publish_for_test(super::session_feed_tests::archived_daemon_snapshot(&id));
+        .publish_for_test(super::session_feed_tests::archived_daemon_snapshot(
+            &env.view, &id,
+        ));
     assert!(env.view.apply_session_feed());
     assert!(env.view.pending_archive_cursor.is_none());
 }
@@ -479,27 +481,31 @@ fn restart_selected_session_skips_when_already_in_flight() {
 /// Deleting a row whose restart cascade is still running would fire docker
 /// commands against the container the worker is mid-creating. The delete must
 /// be refused (and surfaced) rather than racing the restart worker.
-#[test]
+#[tokio::test]
 #[serial]
-fn delete_selected_refused_during_restart() {
+async fn delete_selected_refused_during_restart() {
     use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions};
 
     let mut env = create_test_env_with_sessions(1);
+    let state = native_state(&["test"]).await;
+    let mut respond = env.view.session_feed.namespace_driver_for_test();
+    apply_published(&mut env.view, &state).await;
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view.restart_in_flight.insert(id.clone());
 
+    let before = payload_bytes("test");
     let result = env.view.delete_selected(&DeleteOptions::default());
     assert!(result.is_ok());
     assert_ne!(
         env.view.instance_at(0).status,
-        crate::session::Status::Deleting,
-        "delete must be refused while a restart is in flight"
+        crate::session::Status::Deleting
     );
     assert!(
         env.view.info_dialog.is_some(),
-        "the refused delete must surface a dialog, not silently no-op"
+        "the refused row delete must be surfaced"
     );
+    assert_eq!(payload_bytes("test"), before);
     {
         let storage = env.view.storages.get("test").unwrap();
         storage
@@ -514,32 +520,31 @@ fn delete_selected_refused_during_restart() {
             })
             .unwrap();
     }
+    super::pickers_groups_sort::refresh_native_fixture(&state, &mut env.view).await;
     env.view.selected_session = None;
     env.view.selected_group = Some("work".to_string());
     env.view.selected_group_profile = Some("test".to_string());
     env.view.info_dialog = None;
-
-    env.view
-        .delete_group_with_sessions(&GroupDeleteOptions {
-            delete_sessions: true,
-            delete_worktrees: false,
-            delete_branches: false,
-            delete_containers: false,
-            force_delete_worktrees: false,
-        })
-        .unwrap();
-
+    let options = GroupDeleteOptions {
+        delete_sessions: true,
+        delete_worktrees: false,
+        delete_branches: false,
+        delete_containers: false,
+        force_delete_worktrees: false,
+    };
+    let before = payload_bytes("test");
+    assert!(env.view.delete_group_with_sessions(&options).is_err());
+    assert!(respond(Err("unexpected admission".into())).is_none());
+    assert_eq!(payload_bytes("test"), before);
     assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-    assert_eq!(
-        env.view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Restart in progress")
-    );
-    let (instances, groups) = Storage::open_unwatched("test")
+    assert_eq!(env.view.selected_group_profile.as_deref(), Some("test"));
+    assert_eq!(env.view.get_instance(&id).unwrap().group_path, "work");
+    assert!(env
+        .view
+        .group_trees
+        .get("test")
         .unwrap()
-        .load_with_groups()
-        .unwrap();
-    assert_eq!(instances[0].group_path, "work");
-    assert!(groups.iter().any(|group| group.path == "work"));
+        .group_exists("work"));
     env.view.restart_in_flight.remove(&id);
     {
         let storage = env.view.storages.get("test").unwrap();
@@ -554,22 +559,20 @@ fn delete_selected_refused_during_restart() {
             })
             .unwrap();
     }
+    super::pickers_groups_sort::refresh_native_fixture(&state, &mut env.view).await;
+    env.view.selected_session = None;
+    env.view.selected_group = Some("work".to_string());
+    env.view.selected_group_profile = Some("test".to_string());
     env.view.info_dialog = None;
-
-    env.view
-        .delete_group_with_sessions(&GroupDeleteOptions {
-            delete_sessions: true,
-            delete_worktrees: false,
-            delete_branches: false,
-            delete_containers: false,
-            force_delete_worktrees: false,
-        })
-        .unwrap();
-
+    let before = payload_bytes("test");
+    assert!(env.view.delete_group_with_sessions(&options).is_err());
+    assert!(respond(Err("unexpected admission".into())).is_none());
+    assert_eq!(payload_bytes("test"), before);
     assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    assert_eq!(env.view.get_instance(&id).unwrap().group_path, "work");
     assert_eq!(
-        env.view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Creation in progress")
+        env.view.get_instance(&id).unwrap().status,
+        crate::session::Status::Creating
     );
     let (instances, groups) = Storage::open_unwatched("test")
         .unwrap()
@@ -579,11 +582,6 @@ fn delete_selected_refused_during_restart() {
     assert_eq!(instances[0].status, crate::session::Status::Creating);
     assert!(groups.iter().any(|group| group.path == "work"));
 }
-
-/// `build_flat_items_by_org` must group sessions by each repo's resolved
-/// remote owner (any hosted git remote, not just GitHub), and fall a
-/// session with no resolvable owner into the synthetic "No organization"
-/// bucket.
 #[test]
 #[serial]
 fn build_flat_items_by_org_groups_by_resolved_owner() {
@@ -938,7 +936,9 @@ fn p_key_pins_project_on_header() {
     env.view.update_selected();
 
     assert!(!env.view.is_project_label_pinned("alpha"));
-    env.view.handle_key(key(KeyCode::Char('p')), None);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('p')), None);
+    });
     assert!(
         env.view.is_project_label_pinned("alpha"),
         "p on a project header should pin it"
@@ -952,10 +952,11 @@ fn p_key_pins_project_on_header() {
         "a successful pin must not raise an info dialog"
     );
 
-    // Unpinning (a second toggle) clears the pin but KEEPS the saved project,
-    // so the entry stays in the registry (only an explicit remove deletes it).
-    // See #2208.
-    env.view.toggle_project_pin_at_cursor();
+    // A second toggle unpins but keeps the saved project, so the entry stays in the
+    // registry; only an explicit remove deletes it. See #2208.
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.toggle_project_pin_at_cursor();
+    });
     assert!(!env.view.is_project_label_pinned("alpha"));
     // A successful unpin is likewise quiet.
     assert!(
@@ -1005,10 +1006,9 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
     use crate::session::projects::canonical_key;
     use crate::session::SCRATCH_GROUP_PATH;
 
-    // (case, has a real repo named `scratch`, has a synthetic scratch session,
-    //  a pre-existing registry entry for `/repos/scratch` and its pin flag,
-    //  the path of the header this case targets, the pin gate opens on it, and
-    //  whether it is pinned after `p`)
+    // (case, has a real repo named `scratch`, has a synthetic scratch session, a
+    //  pre-existing registry entry for `/repos/scratch` and its pin flag, the path of the
+    //  header this case targets, whether the pin gate opens, and whether `p` pins it)
     let cases = [
         // The reporter's setup: a plain repo at `~/scratch`, no scratch sessions.
         ("real repo only", true, false, None, "scratch", true, true),
@@ -1022,9 +1022,8 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             false,
             false,
         ),
-        // The real repo and the synthetic bucket now render as two separate
-        // headers (#3237). This case targets the real repo header, which backs a
-        // pinnable project; the bucket's own header is covered by
+        // The real repo and the synthetic bucket render as separate headers (#3237). This
+        // case targets the real repo header; the bucket's own is covered by
         // `synthetic_scratch_bucket_is_distinct_from_real_repo`.
         (
             "real repo plus scratch session",
@@ -1035,9 +1034,8 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             true,
             true,
         ),
-        // A saved-but-unpinned repo named `scratch` surfaces no header of its
-        // own (only pinned empties do), so the synthetic bucket is the only
-        // `scratch` header and `p` must keep its global meaning.
+        // A saved-but-unpinned repo named `scratch` surfaces no header of its own, so the
+        // synthetic bucket is the only `scratch` header and `p` keeps its global meaning.
         (
             "saved unpinned repo plus scratch session",
             false,
@@ -1120,7 +1118,9 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             "{case}: pin gate"
         );
 
-        view.handle_key(key(KeyCode::Char('p')), None);
+        with_authenticated_local_project_registry(&mut view, |view| {
+            view.handle_key(key(KeyCode::Char('p')), None);
+        });
 
         assert_eq!(
             view.is_project_label_pinned("scratch"),
@@ -1193,9 +1193,8 @@ fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
     view.group_by = GroupByMode::Project;
     view.flat_items = view.build_flat_items();
 
-    // Two headers on distinct identity paths, one session each rather than a
-    // pooled count of two. The repo header keeps its basename; the bucket
-    // renders the capitalized system label.
+    // Two headers on distinct identity paths, one session each rather than a pooled count.
+    // The repo header keeps its basename; the bucket renders the system label.
     let scratch_headers: Vec<(&str, &str, usize)> = view
         .flat_items
         .iter()
@@ -1352,9 +1351,8 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
     let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
-    // A live session in another project, plus an ARCHIVED session whose repo
-    // basename is "otari" but whose recorded path differs from the registry
-    // entry below (repo deleted/moved, so neither canonicalizes).
+    // A live session in another project, plus an archived one whose repo basename is
+    // "otari" but whose recorded path differs from the registry entry below.
     let mut alpha = Instance::new("alpha-running", "/repos/alpha");
     alpha.status = Status::Running;
     let mut orphan = Instance::new("otari-old", "/old/home/otari");
@@ -1414,7 +1412,9 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
     // 3. `p` on the header routes to the unpin branch and clears it.
     view.cursor = otari_idx.unwrap();
     view.update_selected();
-    view.toggle_project_pin_at_cursor();
+    with_authenticated_local_project_registry(&mut view, |view| {
+        view.toggle_project_pin_at_cursor();
+    });
 
     let still_there = view.flat_items.iter().any(|i| {
         matches!(i, Item::Group { name, path, .. }
@@ -1459,7 +1459,9 @@ fn pinned_project_survives_losing_last_session() {
         .expect("alpha header present");
     env.view.cursor = alpha_idx;
     env.view.update_selected();
-    env.view.toggle_project_pin_at_cursor();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.toggle_project_pin_at_cursor();
+    });
     assert!(env.view.is_project_label_pinned("alpha"));
 
     // Drop every alpha session, then rebuild as a reload would. The registry
@@ -1517,14 +1519,13 @@ fn same_basename_repos_pin_independently() {
         .iter()
         .position(|i| matches!(i, Item::Group { name, .. } if name == "api"))
         .expect("api header present");
-    // The header's repo (/other/api) is not registered, so it is NOT pinned,
-    // even though a same-basename repo (/work/api) is. The old basename match
-    // would have reported pinned here.
+    // The header's repo (/other/api) is not registered, so it is not pinned even though
+    // /work/api is; the old basename match reported pinned here.
     assert!(!env.view.is_project_label_pinned("api"));
 
-    // Pinning this header would register under the basename "api", which the
-    // registry already holds for /work/api, so the registry's name-uniqueness
-    // surfaces a conflict rather than silently toggling the unrelated entry.
+    // Pinning this header would register under the basename "api", which the registry
+    // already holds for /work/api, so name-uniqueness surfaces a conflict rather than
+    // silently toggling the unrelated entry.
     env.view.cursor = api_idx;
     env.view.update_selected();
     env.view.toggle_project_pin_at_cursor();
@@ -1678,7 +1679,9 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
         .expect("lonely header present in all-profiles project view");
     view.cursor = idx;
     view.update_selected();
-    view.toggle_project_pin_at_cursor();
+    with_authenticated_local_project_registry(&mut view, |view| {
+        view.toggle_project_pin_at_cursor();
+    });
 
     assert!(
         !view.is_project_label_pinned("lonely"),
@@ -1749,7 +1752,9 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
     env.view.update_selected();
 
     // One press must fully unpin.
-    env.view.toggle_project_pin_at_cursor();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.toggle_project_pin_at_cursor();
+    });
 
     assert!(
         !env.view.is_project_label_pinned("dual"),
@@ -1873,72 +1878,45 @@ fn group_by_toggle_preserves_selected_session() {
 
 /// A profile move commits the source-group removal with the row transfer, so
 /// reloading cannot resurrect metadata from the source profile.
-#[test]
+#[tokio::test]
 #[serial]
-fn profile_move_group_metadata_survives_reload() {
+async fn profile_move_group_metadata_survives_reload() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-
-    {
-        let mut view = HomeView::new_for_test(
-            None,
-            tools.clone(),
-            crate::file_watch::FileWatchService::noop(),
-        )
+    let mut moved = Instance::new("moved", "/tmp/moved");
+    moved.id = "moved".into();
+    moved.group_path = "work".into();
+    seed_profile("alpha", &[moved]);
+    seed_profile("beta", &[]);
+    let mut view = test_view(None);
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut view, &state).await;
+    view.selected_session = Some("moved".into());
+    super::pickers_groups_sort::settle_rename(&state, &mut view, "", None, Some("beta"), false)
+        .await
         .unwrap();
-        let moved = {
-            let mut inst = Instance::new("moved", "/tmp/moved");
-            inst.id = "moved".to_string();
-            inst.source_profile = "alpha".to_string();
-            inst.group_path = "work".to_string();
-            inst
-        };
-        view.instances.insert(moved.id.clone(), moved);
-        view.pending_added
-            .entry("alpha".to_string())
-            .or_default()
-            .insert("moved".to_string());
-        view.group_trees.insert(
-            "alpha".to_string(),
-            GroupTree::new_with_groups(&view.cloned_instances(), &[]),
-        );
-        view.save().unwrap();
-
-        view.group_trees
-            .entry("beta".to_string())
-            .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
-        let requested = view.instances["moved"].clone();
-        view.move_to_profile_with_effect("moved", "beta", requested, None, false, |_| Ok(()))
-            .unwrap();
-    }
-
-    let reloaded =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    assert!(
-        reloaded.group_trees.contains_key("alpha"),
-        "alpha tree must still load after the move"
-    );
-    assert!(
-        !reloaded.group_trees["alpha"].group_exists("work"),
-        "pruned 'work' must stay gone after save+reload, not get re-seeded from disk"
-    );
-    assert!(
-        reloaded.group_trees["beta"].group_exists("work"),
-        "target group metadata must be committed with the moved row"
-    );
-    let (_, source_groups) = Storage::new_unwatched("alpha")
+    assert_eq!(view.get_instance("moved").unwrap().source_profile, "beta");
+    super::pickers_groups_sort::refresh_native_fixture(&state, &mut view).await;
+    assert!(!view.group_trees["alpha"].group_exists("work"));
+    assert!(view.group_trees["beta"].group_exists("work"));
+    let (_, source_groups) = Storage::open_unwatched("alpha")
         .unwrap()
         .load_with_groups()
         .unwrap();
-    let (_, target_groups) = Storage::new_unwatched("beta")
+    let (target_rows, target_groups) = Storage::open_unwatched("beta")
         .unwrap()
         .load_with_groups()
         .unwrap();
     assert!(!source_groups.iter().any(|group| group.path == "work"));
     assert!(target_groups.iter().any(|group| group.path == "work"));
+    assert_eq!(
+        target_rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        ["moved"]
+    );
 }
 
 /// The favorite mark sits in a left gutter that shows only where favorites pin (Attention
@@ -2184,12 +2162,14 @@ fn archived_section_nests_by_project_in_project_mode() {
             .find(|i| i.title == "beta-error")
             .map(|i| i.id.clone())
             .unwrap();
-        env.view
-            .apply_user_action(&alpha_id, |inst| inst.archive())
-            .unwrap();
-        env.view
-            .apply_user_action(&beta_id, |inst| inst.archive())
-            .unwrap();
+        env.view.mutate_instance(&alpha_id, |row| {
+            row.archive();
+            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+        });
+        env.view.mutate_instance(&beta_id, |row| {
+            row.archive();
+            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        });
         env.view.archived_section_collapsed = false;
         env.view.flat_items = env.view.build_flat_items();
 
@@ -2301,12 +2281,14 @@ fn archived_section_nests_by_project_in_project_mode() {
             .unwrap();
         // Archive alpha first, then beta. archived_at is `Utc::now()` at the
         // moment of `archive()`, so beta is strictly more recent than alpha.
-        env.view
-            .apply_user_action(&alpha_id, |inst| inst.archive())
-            .unwrap();
-        env.view
-            .apply_user_action(&beta_id, |inst| inst.archive())
-            .unwrap();
+        env.view.mutate_instance(&alpha_id, |row| {
+            row.archive();
+            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+        });
+        env.view.mutate_instance(&beta_id, |row| {
+            row.archive();
+            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        });
         env.view.archived_section_collapsed = false;
 
         let first_sub_folder = |env: &TestEnv| -> Option<String> {
@@ -2369,12 +2351,14 @@ fn archived_section_nests_by_project_in_project_mode() {
             .find(|i| i.title == "beta-error")
             .map(|i| i.id.clone())
             .unwrap();
-        env.view
-            .apply_user_action(&alpha_id, |inst| inst.archive())
-            .unwrap();
-        env.view
-            .apply_user_action(&beta_id, |inst| inst.archive())
-            .unwrap();
+        env.view.mutate_instance(&alpha_id, |row| {
+            row.archive();
+            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+        });
+        env.view.mutate_instance(&beta_id, |row| {
+            row.archive();
+            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        });
         env.view.archived_section_collapsed = false;
         // Collapse only alpha's archived sub-folder.
         env.view
@@ -2423,9 +2407,10 @@ fn archived_section_nests_by_project_in_project_mode() {
             .find(|i| i.title == "alpha-running")
             .map(|i| i.id.clone())
             .unwrap();
-        env.view
-            .apply_user_action(&alpha_id, |inst| inst.archive())
-            .unwrap();
+        env.view.mutate_instance(&alpha_id, |row| {
+            row.archive();
+            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+        });
         env.view.archived_section_collapsed = true;
         env.view.flat_items = env.view.build_flat_items();
 
@@ -2482,6 +2467,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                 pane: crate::session::PaneObservation {
                     state: PanePresence::Alive,
                     tmux_session: Some("host".into()),
+                    legacy_tool: None,
                 },
             },
             AuxiliaryObservation {
@@ -2491,6 +2477,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                 pane: crate::session::PaneObservation {
                     state: PanePresence::Alive,
                     tmux_session: Some("tool".into()),
+                    legacy_tool: None,
                 },
             },
         ];
@@ -2569,12 +2556,11 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
             );
         }
 
-        // Error and Deleting punch through the sink mask in Structured only.
-        // There the seed carries ICON_ERROR + theme.error, so a failed Empty
-        // Trash stays distinguishable from a healthy trash row. The pane views
-        // seed from terminal liveness and have no error affordance, so
-        // punching through would paint a bright animated "still alive" row
-        // inside the Archived shelf while signalling nothing about the failure.
+        // Error and Deleting punch through the sink mask in Structured only, where the
+        // seed carries ICON_ERROR + theme.error so a failed Empty Trash stays
+        // distinguishable. The pane views seed from terminal liveness and have no error
+        // affordance, so punching through would paint a bright "still alive" row in the
+        // shelf while signalling nothing.
         for status in [Status::Error, Status::Deleting] {
             env.view.mutate_instance(&id, |inst| {
                 inst.status = status;
@@ -2625,10 +2611,9 @@ fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
     ];
     for mode in modes {
         env.view.view_mode = mode.clone();
-        // Cache states: (session snapshot, pane snapshot). "Cold boot" is the
-        // never-refreshed state; "absent" is fresh but without our session;
-        // "expired" is populated but past CACHE_TTL. All three used to make
-        // paint refresh synchronously.
+        // Cache states: (session snapshot, pane snapshot). "Cold boot" is never refreshed,
+        // "absent" is fresh without our session, "expired" is populated past CACHE_TTL. All
+        // three used to make paint refresh synchronously.
         let states = [("cold-boot", 0), ("fresh-absent", 1), ("expired", 2)];
         for (label, state) in states {
             match state {
@@ -2736,9 +2721,8 @@ fn preview_rejects_frames_from_previous_generation() {
     env.view
         .sync_preview_capture_worker(Some("aoe_test_new_target".to_string()));
     if let Some(worker) = env.view.preview_capture_worker.as_ref() {
-        // Idle the real capture thread before injection, so it cannot
-        // overwrite the synthetic stale frame and make the test pass by
-        // accident even if the consumer guard is deleted.
+        // Idle the real capture thread before injection, so it cannot overwrite the
+        // synthetic stale frame and pass the test by accident.
         worker.set_target(String::new());
         worker.inject_stale_generation_frame_for_test(40, "previous pane bytes");
     }
@@ -2893,9 +2877,9 @@ fn stalled_preview_worker_restarts_and_retarget_resets_heartbeat() {
 /// hands it to `ReconcilePoller`, so the repair lands through
 /// `apply_reconcile_results` instead. This row needs only a pointer repair, so
 /// the sweep reaches durable state without git.
-#[test]
+#[tokio::test]
 #[serial]
-fn trashed_row_healing_lands_through_the_reconcile_poller() {
+async fn trashed_row_healing_lands_through_the_native_daemon_snapshot() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let project = TempDir::new().unwrap();
@@ -2921,22 +2905,32 @@ fn trashed_row_healing_lands_through_the_reconcile_poller() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
 
-    let mut applied = false;
-    for _ in 0..100 {
-        if view.apply_reconcile_results() {
-            applied = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(applied, "the reconcile poller never reported its sweep");
+    let state = native_state(&["test"]).await;
+    apply_published(&mut view, &state).await;
+    let failed = crate::server::api::sessions::reconcile_trashed_worktrees(&state).await;
+    assert!(failed.is_empty());
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        recorded.to_string_lossy()
+    );
+    apply_published(&mut view, &state).await;
+    assert_eq!(
+        storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .project_path,
+        holding.to_string_lossy()
+    );
     assert_eq!(
         view.get_instance(&id).unwrap().project_path,
         holding.to_string_lossy(),
@@ -2944,358 +2938,7 @@ fn trashed_row_healing_lands_through_the_reconcile_poller() {
     );
 }
 
-/// the reconcile sweep's reload must respect the same live-send
-/// gate every other storage reload uses, and the worker's verdict must survive
-/// being skipped rather than being drained and dropped.
-#[test]
-#[serial]
-fn reconcile_reload_waits_for_live_send_to_finish() {
-    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
-
-    let mut env = create_test_env_empty();
-    env.view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
-    env.view.live_send = Some(LiveSendState {
-        session_id: "s".to_string(),
-        title: "s".to_string(),
-        tmux_name: "aoe_test_live".to_string(),
-        target: LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
-
-    assert!(
-        !env.view.apply_reconcile_results(),
-        "a reload must not interrupt a paste in progress"
-    );
-
-    env.view.live_send = None;
-    assert!(
-        env.view.apply_reconcile_results(),
-        "the skipped verdict must still be waiting once live-send ends"
-    );
-}
-
-/// startup auto-recovery launches from `project_path` and records
-/// each attempt in a boot-scoped ledger that is not retried, so it must not run
-/// until the reconcile sweep has had its chance to repoint a row whose worktree
-/// moved outside aoe (#2002). `HomeView::new` therefore arms the gate instead of
-/// starting recovery, and `apply_reconcile_results` releases it exactly once,
-/// whether or not the sweep changed anything.
-#[test]
-#[serial]
-fn startup_recovery_waits_for_the_first_reconcile_sweep() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-    let mut view = HomeView::new(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-
-    assert!(
-        view.startup_recovery_gate.is_some(),
-        "construction must arm the gate rather than recover from unrepaired paths"
-    );
-
-    // Observe completion directly, rather than mistaking gate expiry for a sweep.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let result = loop {
-        match view.reconcile_poller.try_recv_result() {
-            Ok(result) => break result,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                panic!("startup worker disconnected")
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "startup sweep did not complete"
-                );
-                std::thread::yield_now();
-            }
-        }
-    };
-    assert!(!result.changed, "empty storage needs no repair");
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(result.changed);
-    assert!(!view.apply_reconcile_results());
-    assert!(
-        view.startup_recovery_gate.is_none(),
-        "the sweep landing must release the recovery gate"
-    );
-
-    // Released exactly once, so later ticks cannot re-run recovery.
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
-    assert!(!view.apply_reconcile_results());
-    assert!(view.startup_recovery_gate.is_none());
-}
-
-/// the gate cannot outlive its deadline.
-/// `Storage::update` blocks on a contended profile flock with no timeout, so a
-/// peer holding that lock leaves the sweep worker neither delivering a result
-/// nor disconnecting. Gating recovery on that forever would trade "recovery
-/// used a stale path" for "recovery never ran", which is the worse failure.
-#[test]
-#[serial]
-fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
-    {
-        let temp = TempDir::new().unwrap();
-        let _guard = setup_test_home(&temp);
-        let _storage = Storage::new_unwatched("test").unwrap();
-        let mut view = HomeView::new_for_test(
-            Some("test".to_string()),
-            AvailableTools::with_tools(&["claude"]),
-            crate::file_watch::FileWatchService::noop(),
-        )
-        .unwrap();
-        // No request is queued: only the gate deadline can release recovery.
-        view.reconcile_poller = crate::tui::reconcile_poller::ReconcilePoller::new();
-        view.startup_recovery_gate = Some(std::time::Instant::now());
-
-        assert!(!view.apply_reconcile_results());
-        assert!(
-            view.startup_recovery_gate.is_some(),
-            "an un-landed sweep inside the deadline must still hold the gate"
-        );
-
-        view.startup_recovery_gate =
-            Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
-        assert!(!view.apply_reconcile_results());
-        assert!(
-            view.startup_recovery_gate.is_none(),
-            "past the deadline recovery must start without the sweep"
-        );
-    }
-    // A long paste must not strand recovery either.
-    {
-        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
-
-        let temp = TempDir::new().unwrap();
-        let _guard = setup_test_home(&temp);
-        let _storage = Storage::new_unwatched("test").unwrap();
-        let mut view = HomeView::new_for_test(
-            Some("test".to_string()),
-            AvailableTools::with_tools(&["claude"]),
-            crate::file_watch::FileWatchService::noop(),
-        )
-        .unwrap();
-        view.live_send = Some(LiveSendState {
-            session_id: "s".to_string(),
-            title: "s".to_string(),
-            tmux_name: "aoe_test_live".to_string(),
-            target: LiveSendTarget::Agent,
-            exit_chords: Vec::new(),
-            leader: None,
-        });
-        view.startup_recovery_gate =
-            Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
-
-        assert!(!view.apply_reconcile_results());
-        assert!(
-            view.startup_recovery_gate.is_none(),
-            "a long paste must not strand recovery either"
-        );
-    }
-}
-
-/// The live-send case of the same rule: the reload is postponed, so the result
-/// must be preserved and the gate must stay armed even past the deadline.
-#[test]
-#[serial]
-fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
-    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut seed = Instance::new("row", "/tmp/stale-path");
-    seed.source_profile = "test".to_string();
-    let id = seed.id.clone();
-    storage
-        .update(|instances, _groups| {
-            instances.push(seed);
-            Ok(())
-        })
-        .unwrap();
-
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    storage
-        .update(|instances, _groups| {
-            instances[0].project_path = "/tmp/repaired-path".to_string();
-            Ok(())
-        })
-        .unwrap();
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
-    view.startup_recovery_gate =
-        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
-    view.live_send = Some(LiveSendState {
-        session_id: "s".to_string(),
-        title: "s".to_string(),
-        tmux_name: "aoe_test_live".to_string(),
-        target: LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
-
-    assert!(
-        !view.apply_reconcile_results(),
-        "the reload waits for live-send"
-    );
-    assert!(
-        view.startup_recovery_gate.is_some(),
-        "an unapplied repair must hold the gate shut past the deadline"
-    );
-
-    // The result is preserved, not dropped, and lands once the paste ends.
-    view.live_send = None;
-    assert!(view.apply_reconcile_results());
-    assert_eq!(
-        view.get_instance(&id).unwrap().project_path,
-        "/tmp/repaired-path"
-    );
-    assert!(view.startup_recovery_gate.is_none());
-}
-
-/// a failed reload must keep the repair pending and the gate shut.
-/// Clearing the flag before the fallible call dropped the repair and released
-/// recovery against stale rows, which is the failure the gate exists to prevent.
-#[test]
-#[serial]
-fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
-    {
-        let temp = TempDir::new().unwrap();
-        let _guard = setup_test_home(&temp);
-        let storage = Storage::new_unwatched("test").unwrap();
-        let mut seed = Instance::new("row", "/tmp/stale-path");
-        seed.source_profile = "test".to_string();
-        let id = seed.id.clone();
-        storage
-            .update(|instances, _groups| {
-                instances.push(seed);
-                Ok(())
-            })
-            .unwrap();
-
-        let mut view = HomeView::new_for_test(
-            Some("test".to_string()),
-            AvailableTools::with_tools(&["claude"]),
-            crate::file_watch::FileWatchService::noop(),
-        )
-        .unwrap();
-        storage
-            .update(|instances, _groups| {
-                instances[0].project_path = "/tmp/repaired-path".to_string();
-                Ok(())
-            })
-            .unwrap();
-        view.reconcile_poller =
-            crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
-
-        view.startup_recovery_gate = Some(std::time::Instant::now());
-
-        // A groups.json that is a directory makes `load_with_groups` fail.
-        let groups = crate::session::get_app_dir()
-            .unwrap()
-            .join("profiles")
-            .join("test")
-            .join("groups.json");
-        std::fs::remove_file(&groups).ok();
-        std::fs::create_dir(&groups).unwrap();
-
-        assert!(
-            !view.apply_reconcile_results(),
-            "the reload failed, so no refresh"
-        );
-        assert!(
-            view.startup_recovery_gate.is_some(),
-            "a dropped repair must not open the gate onto stale rows"
-        );
-        assert_eq!(
-            view.get_instance(&id).unwrap().project_path,
-            "/tmp/stale-path",
-            "the in-memory row is still the stale one"
-        );
-
-        // The repair is retried, not lost, once storage is readable. Let the backoff elapse
-        // as a later tick would; the next block covers the throttle.
-        std::fs::remove_dir(&groups).unwrap();
-        std::fs::write(&groups, "[]").unwrap();
-        view.reconcile_reload_retry_at = Some(std::time::Instant::now());
-        assert!(
-            view.apply_reconcile_results(),
-            "the retry must land the repair"
-        );
-        assert_eq!(
-            view.get_instance(&id).unwrap().project_path,
-            "/tmp/repaired-path"
-        );
-        assert!(view.startup_recovery_gate.is_none());
-    }
-    // The retry is throttled.
-    {
-        let temp = TempDir::new().unwrap();
-        let _guard = setup_test_home(&temp);
-        let storage = Storage::new_unwatched("test").unwrap();
-        let mut seed = Instance::new("row", "/tmp/stale-path");
-        seed.source_profile = "test".to_string();
-        storage
-            .update(|instances, _groups| {
-                instances.push(seed);
-                Ok(())
-            })
-            .unwrap();
-        let mut view = HomeView::new_for_test(
-            Some("test".to_string()),
-            AvailableTools::with_tools(&["claude"]),
-            crate::file_watch::FileWatchService::noop(),
-        )
-        .unwrap();
-        view.reconcile_poller =
-            crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
-
-        let groups = crate::session::get_app_dir()
-            .unwrap()
-            .join("profiles")
-            .join("test")
-            .join("groups.json");
-        std::fs::remove_file(&groups).ok();
-        std::fs::create_dir(&groups).unwrap();
-
-        assert!(!view.apply_reconcile_results(), "the first attempt fails");
-        let armed = view
-            .reconcile_reload_retry_at
-            .expect("a failed reload must arm the backoff");
-
-        // Storage is readable again, but the backoff has not elapsed, so the next
-        // tick must not touch it.
-        std::fs::remove_dir(&groups).unwrap();
-        std::fs::write(&groups, "[]").unwrap();
-        assert!(!view.apply_reconcile_results(), "still inside the backoff");
-        assert_eq!(
-            view.reconcile_reload_retry_at,
-            Some(armed),
-            "a skipped attempt must not re-arm the backoff"
-        );
-        assert!(view.pending_reconcile_reload, "the repair is still pending");
-
-        // Once it elapses the retry lands.
-        view.reconcile_reload_retry_at = Some(std::time::Instant::now());
-        assert!(view.apply_reconcile_results(), "the retry must land");
-        assert!(view.reconcile_reload_retry_at.is_none());
-        assert!(!view.pending_reconcile_reload);
-    }
-}
-
-/// #4116: the send dialog and live-send entry refuse an archived or trashed agent, even with its
+/// The send dialog and live-send entry refuse an archived or trashed agent, even with its
 /// pane still live, with the CLI and web wording, and leave the session shelved.
 #[test]
 #[serial]
@@ -3312,7 +2955,7 @@ fn tui_send_refuses_a_shelved_live_pane() {
         for live_send in [false, true] {
             let mut env = create_test_env_with_sessions(1);
             let inst = env.view.instance_at(0).clone();
-            env.view.apply_user_action(&inst.id, shelve).unwrap();
+            env.view.mutate_instance(&inst.id, shelve);
             let pane = crate::tmux::Session::generate_name(&inst.id, &inst.title);
             let created = crate::tmux::tmux_command()
                 .args(["new-session", "-d", "-s", &pane, "sleep", "60"])

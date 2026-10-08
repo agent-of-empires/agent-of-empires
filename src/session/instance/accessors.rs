@@ -561,7 +561,7 @@ impl Instance {
     /// resolve the directory of the tool it is moving to as well as the one it
     /// is moving from.
     pub(crate) fn declared_agent_config_dir_for(&self, tool: &str) -> Option<std::path::PathBuf> {
-        let home = self.resolved_host_home()?;
+        let home = super::hooks::host_home(&self.resolved_host_environment())?;
         crate::session::config::profile_config::resolve_config_or_warn(&self.effective_profile())
             .session
             .agent_config_dir_for(tool, &home)

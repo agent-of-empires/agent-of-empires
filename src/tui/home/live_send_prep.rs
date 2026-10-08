@@ -75,9 +75,8 @@ impl HomeView {
         if pane.width > 0 && pane.height > 0 {
             Some((pane.width, pane.height))
         } else {
-            // A zero-dimension terminal size is as unusable as no size at all;
-            // drop it so the start path keeps tmux's default instead of being
-            // handed `-x 0`/`-y 0`.
+            // A zero-dimension terminal size is as unusable as none, so drop it and let
+            // the start path keep tmux's default rather than be handed `-x 0`.
             crate::terminal::get_size().filter(|(cols, rows)| *cols > 0 && *rows > 0)
         }
     }
@@ -134,15 +133,11 @@ impl HomeView {
             // Drop worker first so its queued resizes (if any) drain
             // against the old session before we reset its sizing.
             self.live_send_worker = None;
-            // The capture worker is retargeted by the render reconcile, not
-            // here; but drop the previous session's cached previews so the
-            // first frames after the switch don't paint session A's content
-            // under session B's header while B's capture worker spins up.
-            // (The synchronous path got this for free via its cross-session
-            // kill-switch branch; the worker path applies content lazily,
-            // so clear it explicitly here.) All targets are cleared because
-            // a live-send switch can retarget to Terminal / ContainerTerminal
-            // too, and the view can be flipped to any of them right after.
+            // The render reconcile retargets the capture worker, but drop the previous
+            // session's cached previews here so the first frames after the switch don't
+            // paint session A's content under session B's header while B's worker spins up.
+            // All targets are cleared, since a switch can retarget to Terminal or
+            // ContainerTerminal and the view can flip to any of them right after.
             self.preview_cache = PreviewCache::default();
             self.terminal_preview_cache = PreviewCache::default();
             self.container_terminal_preview_cache = PreviewCache::default();
@@ -151,20 +146,15 @@ impl HomeView {
                 crate::tmux::Session::from_name(name).reset_size_to_latest_client();
             }
         }
-        // Parse the configured exit-chord list now so the per-keystroke
-        // dispatch path doesn't re-parse on every event. Config edits
-        // during live mode aren't possible (settings_view participates
-        // in has_dialog and lives in its own takeover), so a snapshot
-        // at entry time is sufficient.
+        // Parse the configured exit-chord list now so the per-keystroke path doesn't
+        // re-parse on every event. Config cannot be edited during live mode (settings_view
+        // participates in has_dialog), so an entry-time snapshot is sufficient.
         let resolved_config = resolve_config_or_warn(&self.config_profile());
         let exit_chord_spec = resolved_config.session.live_send_exit_chord;
         let exit_chords = live_send::parse_chord_list(&exit_chord_spec);
-        // The leader is a single chord, not a list. An empty configured
-        // value disables it (so every key, including the default `C-b`,
-        // passes straight through). A non-empty but unparseable value is
-        // treated as a typo and falls back to the default leader rather
-        // than silently dropping the feature, mirroring how the exit
-        // chord recovers from a bad spec.
+        // The leader is a single chord, not a list. An empty value disables it, so every
+        // key passes through; an unparseable value is treated as a typo and falls back to
+        // the default rather than silently dropping the feature, like the exit chord.
         let leader_spec = resolved_config.session.live_send_leader;
         let leader = if leader_spec.trim().is_empty() {
             None
@@ -189,22 +179,18 @@ impl HomeView {
         // Entering live-send means the user is now viewing this session, so
         // clear any unread marker.
         self.clear_unread_on_view(&inst.id);
-        // Ensure the long-lived preview capture worker exists so we can hand
-        // its waker to the send worker below. The worker isn't otherwise
-        // spawned here (it follows the displayed pane for every view, not
-        // just agent live-send, and is (re)targeted and retuned by
-        // `sync_preview_capture_worker` on the next render); but it's already
-        // running whenever a session was previewed before live-send entry,
-        // which is the common path. Spawning it now closes the rare cold gap.
+        // Ensure the long-lived preview capture worker exists so its waker can go to the
+        // send worker below. It is not otherwise spawned here (it follows the displayed pane
+        // for every view and is retargeted by `sync_preview_capture_worker` on the next
+        // render), but it is already running whenever a session was previewed before entry;
+        // spawning now closes the rare cold gap.
         if self.preview_capture_worker.is_none() {
             self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
                 self.preview_wake.clone(),
             ));
         }
-        // Nudge the capture worker right after each dispatched keystroke
-        // batch so typed echo is captured immediately instead of waiting up
-        // to a full fast-cadence cycle. This keeps echo latency tied to
-        // actual input rather than the background capture phase.
+        // Nudge the capture worker after each dispatched batch so typed echo is captured
+        // immediately rather than a full fast-cadence cycle later.
         let capture_wake = self
             .preview_capture_worker
             .as_ref()
@@ -227,9 +213,8 @@ impl HomeView {
         // size-owning worker, even when a prior session used the same size.
         self.live_send_last_resize = None;
         self.live_send_resize_retry_at = None;
-        // Live mode takes over the pane's size from here; drop the non-live
-        // resize bookkeeping so exiting re-asserts the preview geometry
-        // cleanly.
+        // Live mode takes over the pane's size from here, so drop the non-live resize
+        // bookkeeping and let exiting re-assert the preview geometry cleanly.
         self.clear_preview_pane_sync(session_id);
         self.stamp_last_accessed(session_id);
         Ok(())

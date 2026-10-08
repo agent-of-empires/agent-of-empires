@@ -11,17 +11,19 @@ const ATTACH_URL = "/api/sessions/sess-9/projects";
 
 function attachOk(worker: string, extra: Record<string, unknown> = {}) {
   return {
-    session: null,
-    attached: {
-      name: "frontend",
-      branch: "feature/abc",
-      branch_created: true,
-      moved_to: "/src/feature-abc-workspace-abcd1234",
+    ...makeSession({ id: "sess-9" }),
+    outcome: {
+      attached: {
+        name: "frontend",
+        worktree_path: "/src/workspace/frontend",
+        branch: "feature/abc",
+        branch_created: true,
+        moved_to: "/src/feature-abc-workspace-abcd1234",
+      },
+      warnings: [],
+      worker: { status: worker },
+      ...extra,
     },
-    warnings: [],
-    worker,
-    worker_message: null,
-    ...extra,
   };
 }
 
@@ -116,7 +118,11 @@ describe("AddProjectModal", () => {
   });
 
   it("reports the new working directory and a failed restart", async () => {
-    mockAttach(() => jsonResponse(attachOk("restart_failed", { worker_message: "worker respawn failed: boom" })));
+    mockAttach(() =>
+      jsonResponse(
+        attachOk("restart_failed", { worker: { status: "restart_failed", message: "worker respawn failed: boom" } }),
+      ),
+    );
     await submit("frontend");
     const result = await waitFor(() => screen.getByTestId("add-project-modal-result"));
     expect(result.textContent).toContain("frontend");

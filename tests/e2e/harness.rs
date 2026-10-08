@@ -68,10 +68,7 @@ impl HomeGuard {
     pub fn new(home: &Path) -> Self {
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: env mutation. Every caller is #[serial] on the default key,
-        // which serial_test never runs concurrently with the #[parallel]
-        // (default key) tests that make up the rest of this binary, so no
-        // concurrent reader/writer exists.
+        // SAFETY: callers are default-key #[serial], so no concurrent env reader exists.
         unsafe { std::env::set_var("HOME", home) };
         unsafe { std::env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
         Self {
@@ -86,8 +83,7 @@ impl Drop for HomeGuard {
         /// Restores `key` to its prior value, or removes it if it was
         /// previously unset.
         fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
-            // SAFETY: same invariant as HomeGuard::new; the caller being #[serial]
-            // on the default key guards this.
+            // SAFETY: same invariant as HomeGuard::new.
             unsafe {
                 match prev {
                     Some(v) => std::env::set_var(key, v),
@@ -481,11 +477,7 @@ last_seen_version = "{}"
             render_log_offset: std::cell::Cell::new(0),
             recording,
             cast_path: None,
-            // Pin the spawned aoe to the same tmux socket the harness drives
-            // and inspects. aoe now routes every tmux call through an explicit
-            // `-S <socket>` (#2608) instead of inheriting `$TMUX`, so without
-            // this it would land on its own app-dir socket and the harness
-            // would see none of its sessions.
+            // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
             extra_env: vec![("AOE_TMUX_SOCKET".to_string(), tmux_socket_env)],
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
@@ -1192,59 +1184,40 @@ last_seen_version = "{}"
         );
     }
 
-    /// Run `aoe <args>` as a subprocess (not in tmux) with the same env
-    /// isolation. Returns the `Output` (stdout, stderr, status).
-    ///
-    /// Clears `AGENT_OF_EMPIRES_DEBUG` and `AOE_LOG_LEVEL` from the inherited
-    /// env so tests run with a deterministic logging configuration. (aoe
-    /// itself appends to `debug.log` now rather than truncating, but a
-    /// child that opts in to file logging would still emit a marker line
-    /// and an "aoe started" event under the test fixture, perturbing
-    /// content-sensitive assertions.)
-    pub fn run_cli(&self, args: &[&str]) -> Output {
-        Command::new(&self.binary_path)
+    fn cli_command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.binary_path);
+        command
             .args(args)
             .env("HOME", self.home_dir.path())
             .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
             .env("PATH", self.env_path())
             .env_remove("AGENT_OF_EMPIRES_DEBUG")
             .env_remove("AOE_LOG_LEVEL")
-            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        command
+    }
+
+    /// Run a subprocess with isolated HOME/PATH and inherited file logging disabled.
+    pub fn run_cli(&self, args: &[&str]) -> Output {
+        self.cli_command(args)
             .output()
             .expect("failed to run aoe CLI")
     }
 
-    /// Like [`Self::run_cli`], but spawns `aoe <args>` in the background
-    /// instead of blocking for exit. For a long-running command like `acp
-    /// tail`, which streams until killed rather than returning.
+    /// Spawn a long-running CLI command with stdout/stderr available to the test.
     pub fn spawn_cli(&self, args: &[&str]) -> std::process::Child {
-        Command::new(&self.binary_path)
-            .args(args)
-            .env("HOME", self.home_dir.path())
-            .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
-            .env("PATH", self.env_path())
-            .env_remove("AGENT_OF_EMPIRES_DEBUG")
-            .env_remove("AOE_LOG_LEVEL")
-            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        self.cli_command(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("failed to spawn aoe CLI")
     }
 
-    /// Like [`Self::run_cli`], but writes `stdin` to the child before
-    /// collecting output. Used by the plugin-worker tests, which speak
-    /// ndjson JSON-RPC on stdio and exit on EOF.
+    /// Write the supplied stdin, close it, then collect the child's output.
     pub fn run_cli_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
         use std::io::Write;
-        let mut child = Command::new(&self.binary_path)
-            .args(args)
-            .env("HOME", self.home_dir.path())
-            .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
-            .env("PATH", self.env_path())
-            .env_remove("AGENT_OF_EMPIRES_DEBUG")
-            .env_remove("AOE_LOG_LEVEL")
-            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        let mut child = self
+            .cli_command(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1256,7 +1229,6 @@ last_seen_version = "{}"
             .expect("piped stdin")
             .write_all(stdin.as_bytes())
             .expect("write stdin");
-        // Dropping stdin closes the pipe; the worker exits on EOF.
         child.wait_with_output().expect("collect aoe CLI output")
     }
 

@@ -14,6 +14,128 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
+use crate::server::{test_support, AppState};
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use std::sync::Arc;
+use tower::ServiceExt;
+
+pub(super) async fn native_state(profiles: &[&str]) -> Arc<AppState> {
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    let mut rows = Vec::new();
+    for profile in profiles {
+        let mut loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        for row in &mut loaded {
+            row.source_profile = (*profile).into();
+        }
+        rows.extend(loaded);
+    }
+    let state = test_support::build_test_app_state_with_policy(
+        rows,
+        vec!["localhost".into()],
+        Vec::new(),
+        None,
+    );
+    test_support::refresh_canonical_metadata_for_test(&state).await;
+    state
+}
+
+pub(super) async fn request_with_headers(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+    let before = state.runtime.publish(state).await.unwrap();
+    let response = test_support::build_router_for_test(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header(
+                    crate::daemon::RUNTIME_EPOCH_HEADER,
+                    &before.value.cursor.epoch,
+                )
+                .extension(axum::extract::ConnectInfo(
+                    crate::server::peer::ConnectionPeer::UnixOwner {
+                        uid: nix::unistd::geteuid().as_raw(),
+                    },
+                ))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, headers, body)
+}
+
+pub(super) async fn request(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let (status, headers, mut body) = request_with_headers(state, method, path, body).await;
+    if let Some(epoch) = headers.get(crate::daemon::RUNTIME_EPOCH_HEADER) {
+        let cursor = crate::daemon::RuntimeCursor {
+            epoch: epoch.to_str().unwrap().into(),
+            revision: headers[crate::daemon::RUNTIME_REVISION_HEADER]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        };
+        body["cursor"] = serde_json::to_value(cursor).unwrap();
+    }
+    (status, body)
+}
+
+pub(super) async fn published_snapshot(state: &Arc<AppState>) -> crate::daemon::RuntimeSnapshot {
+    state.runtime.publish(state).await.unwrap().value.clone()
+}
+
+pub(super) async fn apply_published(view: &mut HomeView, state: &Arc<AppState>) {
+    let snapshot = Arc::new(published_snapshot(state).await);
+    view.session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            snapshot.clone(),
+        ));
+    view.apply_session_feed();
+    assert!(view.session_feed.receipt_applied(&snapshot.cursor));
+}
+
+pub(super) fn payload_bytes(profile: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    fn bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+        match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("fixture payload read: {error}"),
+        }
+    }
+    let path = crate::session::get_app_dir()
+        .unwrap()
+        .join("profiles")
+        .join(profile);
+    (
+        bytes(&path.join("sessions.json")),
+        bytes(&path.join("groups.json")),
+    )
+}
+
 fn observed_fork_parent(agent: &str) -> Instance {
     let mut instance = Instance::new("parent", "/tmp/repo");
     instance.source_profile = "test".into();
@@ -38,6 +160,31 @@ fn observed_fork_parent(agent: &str) -> Instance {
         None,
     );
     instance
+}
+
+fn with_authenticated_local_project_registry(
+    view: &mut HomeView,
+    action: impl FnOnce(&mut HomeView),
+) {
+    let _transport = view.session_feed.namespace_driver_for_test();
+    assert!(view.session_feed.mutations_available());
+    action(view);
+    // Publish the actual registry transaction while retaining every canonical row.
+    let mut snapshot = (*view.session_feed.applied_snapshot().unwrap()).clone();
+    snapshot.cursor.revision = view.session_feed.next_revision_for_test();
+    snapshot.contents.profiles = fixture_profiles();
+    snapshot.contents.global_projects = crate::session::projects::load_global()
+        .unwrap()
+        .into_iter()
+        .map(crate::daemon::ProjectResponse::from)
+        .collect();
+    let cursor = snapshot.cursor.clone();
+    view.session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            std::sync::Arc::new(snapshot),
+        ));
+    view.apply_session_feed();
+    assert!(view.session_feed.receipt_applied(&cursor));
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -78,6 +225,67 @@ mod store_move;
 
 fn setup_test_home(temp: &TempDir) -> AppDirGuard {
     isolate_app_dir_at(temp.path())
+}
+
+pub(super) fn fixture_profiles() -> Vec<crate::daemon::ProfileSnapshot> {
+    crate::session::list_profiles()
+        .unwrap()
+        .into_iter()
+        .map(|name| {
+            let path = crate::session::get_app_dir()
+                .unwrap()
+                .join("profiles")
+                .join(&name)
+                .join("groups.json");
+            let groups = match std::fs::read(path) {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => panic!("fixture group metadata: {error}"),
+            };
+            crate::daemon::ProfileSnapshot {
+                description: crate::session::load_profile_config(&name)
+                    .unwrap()
+                    .description,
+                projects: crate::session::projects::load_profile(&name)
+                    .unwrap()
+                    .into_iter()
+                    .map(crate::daemon::ProjectResponse::from)
+                    .collect(),
+                name,
+                groups,
+            }
+        })
+        .collect()
+}
+
+pub(super) fn fixture_snapshot(
+    sessions: Vec<crate::daemon::SessionResponse>,
+    default_profile: &str,
+    epoch: &str,
+    revision: u64,
+) -> crate::daemon::RuntimeSnapshot {
+    crate::daemon::RuntimeSnapshot {
+        cursor: crate::daemon::RuntimeCursor {
+            epoch: epoch.into(),
+            revision,
+        },
+        contents: crate::daemon::RuntimeContents {
+            health: crate::daemon::RuntimeHealth::Healthy,
+            capabilities: crate::daemon::RuntimeCapabilities {
+                mutations: true,
+                native_interaction: true,
+            },
+            default_profile: default_profile.into(),
+            sessions,
+            profiles: fixture_profiles(),
+            workspace_ordering: crate::session::load_workspace_ordering().unwrap().order,
+            global_projects: crate::session::projects::load_global()
+                .unwrap()
+                .into_iter()
+                .map(crate::daemon::ProjectResponse::from)
+                .collect(),
+        },
+    }
 }
 
 struct TestEnv {
@@ -175,9 +383,7 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let profile_name = "<global>";
-    // `<` and `>` are outside the create grammar, so lay the directory down
-    // directly: a legacy profile of this shape still opens, and that is what
-    // the key must keep apart from the app-wide subscription.
+    // Outside the create grammar, so lay the legacy directory down directly.
     let profile_dir = crate::session::get_app_dir()
         .unwrap()
         .join("profiles")
@@ -649,6 +855,7 @@ struct CreationTestEnv {
 fn setup_creation_test_env() -> CreationTestEnv {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
+    seed_profile("default", &[]);
 
     let project_dir = temp.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -929,49 +1136,20 @@ fn with_canonical_group_archive(env: &mut TestEnv, action: impl FnOnce(&mut Test
 fn publish_canonical_rows(env: &mut TestEnv, stamps: &[(String, bool)], revision: u64) {
     use crate::tui::session_feed::SessionFeedResult;
     let now = chrono::Utc::now().to_rfc3339();
-    let sessions: Vec<crate::daemon::SessionResponse> = env
+    let sessions = env
         .view
         .instances()
-        .map(|inst| {
-            let archived_at = stamps
-                .iter()
-                .find(|(id, _)| id == &inst.id)
-                .map(|(_, archived)| archived.then(|| now.clone()))
-                .unwrap_or_else(|| inst.archived_at.map(|at| at.to_rfc3339()));
-            serde_json::from_value(serde_json::json!({
-                "id": inst.id,
-                "title": inst.title,
-                "project_path": inst.project_path,
-                "profile": inst.source_profile,
-                "tool": inst.tool,
-                "status": format!("{:?}", inst.status),
-                "view": if inst.is_structured() { "structured" } else { "terminal" },
-                "group_path": inst.group_path,
-                "archived_at": archived_at,
-            }))
-            .expect("a canonical row")
+        .map(|instance| {
+            let mut row = crate::daemon::SessionResponse::from_instance(instance, false);
+            if let Some((_, archived)) = stamps.iter().find(|(id, _)| id == &instance.id) {
+                row.archived_at = archived.then(|| now.clone());
+            }
+            row
         })
         .collect();
-    let snapshot = crate::daemon::RuntimeSnapshot {
-        cursor: crate::daemon::RuntimeCursor {
-            epoch: "test".into(),
-            revision,
-        },
-        contents: crate::daemon::RuntimeContents {
-            health: crate::daemon::RuntimeHealth::Healthy,
-            capabilities: crate::daemon::RuntimeCapabilities {
-                mutations: true,
-                native_interaction: true,
-            },
-            default_profile: "test".into(),
-            sessions,
-            profiles: Vec::new(),
-            workspace_ordering: Vec::new(),
-            global_projects: Vec::new(),
-        },
-    };
+    let snapshot = fixture_snapshot(sessions, "test", "test", revision);
     env.view
         .session_feed
-        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+        .publish_for_test(SessionFeedResult::Snapshot(Arc::new(snapshot)));
     env.view.apply_session_feed();
 }

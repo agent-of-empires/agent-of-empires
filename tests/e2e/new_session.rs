@@ -290,10 +290,8 @@ fn test_new_session_enters_live_mode_when_configured() {
     h.type_text(project.to_str().unwrap());
     submit_new_session_dialog(&h);
 
-    // After creation, the home view stays mounted with the LIVE banner in
-    // the footer. A tmux-attach dispatch would replace the entire TUI
-    // screen with whatever the agent is rendering, so the banner is the
-    // load-bearing tell that the setting was respected.
+    // A tmux-attach dispatch would replace the whole screen, so the footer
+    // banner plus the home chrome is the tell that live mode was used.
     h.wait_for_timeout("LIVE", Duration::from_secs(10));
     // Sanity: the home view's title chrome is still on screen, meaning
     // the dispatch didn't flip into the tmux attach view.

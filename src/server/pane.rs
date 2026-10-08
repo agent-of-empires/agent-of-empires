@@ -7,11 +7,64 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 
 use super::AppState;
 
+pub(super) fn legacy_tool_scope(
+    rows: &[crate::session::Instance],
+    raw_tools: &std::collections::HashMap<String, Vec<String>>,
+) -> crate::tmux::LegacyToolScope {
+    let mut tool_names: Vec<_> = raw_tools.values().flatten().cloned().collect();
+    tool_names.extend(rows.iter().flat_map(|row| {
+        row.auxiliary
+            .iter()
+            .filter_map(|observation| match &observation.target {
+                crate::session::AuxiliaryTarget::Tool { tool_name } => Some(tool_name.clone()),
+                _ => None,
+            })
+    }));
+    tool_names.sort_unstable();
+    tool_names.dedup();
+    crate::tmux::LegacyToolScope {
+        rows: rows
+            .iter()
+            .map(|row| {
+                (
+                    row.source_profile.clone(),
+                    row.id.clone(),
+                    crate::tmux::Session::generate_name(&row.id, &row.title),
+                )
+            })
+            .collect(),
+        tools: tool_names
+            .into_iter()
+            .map(|name| {
+                let prefix = crate::tmux::ToolSession::name_prefix(&name);
+                (name, prefix)
+            })
+            .collect(),
+    }
+}
+
+pub(super) fn legacy_tool_scope_for_panes(
+    rows: &[crate::session::Instance],
+    raw_tools: &std::collections::HashMap<String, Vec<String>>,
+    panes: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
+) -> Option<crate::tmux::LegacyToolScope> {
+    let panes = panes?;
+    panes
+        .iter()
+        .any(|(name, pane)| {
+            name.starts_with(crate::tmux::TOOL_PREFIX)
+                && matches!(pane.tool_owner, crate::tmux::ToolPaneOwner::Unmarked)
+        })
+        .then(|| legacy_tool_scope(rows, raw_tools))
+}
+
 pub(super) fn observe_auxiliary(
     id: &str,
     title: &str,
     target: &crate::session::AuxiliaryTarget,
     panes: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
+    profile: &str,
+    legacy_scope: Option<&crate::tmux::LegacyToolScope>,
 ) -> crate::session::PaneObservation {
     use crate::session::{AuxiliaryTarget, PaneObservation};
     let Some(panes) = panes else {
@@ -25,7 +78,23 @@ pub(super) fn observe_auxiliary(
             crate::tmux::ContainerTerminalSession::metadata_in(id, title, *index, panes)
         }
         AuxiliaryTarget::Tool { tool_name } => {
-            crate::tmux::ToolSession::metadata_in(id, title, tool_name, panes)
+            let owned = crate::tmux::ToolSession::metadata_in(id, title, tool_name, panes);
+            if owned.is_err() {
+                if let Some(scope) = legacy_scope {
+                    if let Ok(Some((name, metadata))) = crate::tmux::ToolSession::legacy_metadata_in(
+                        id, title, tool_name, profile, panes, scope,
+                    ) {
+                        if let Ok(identity) = crate::tmux::ToolSession::legacy_identity(metadata) {
+                            return PaneObservation {
+                                state: crate::session::PanePresence::Unknown,
+                                tmux_session: Some(name.to_owned()),
+                                legacy_tool: Some(identity),
+                            };
+                        }
+                    }
+                }
+            }
+            owned
         }
     };
     observe_metadata(metadata)
@@ -43,10 +112,12 @@ fn observe_metadata(
                 PanePresence::Alive
             },
             tmux_session: Some(name.into_owned()),
+            legacy_tool: None,
         },
         Ok(None) => PaneObservation {
             state: PanePresence::Absent,
             tmux_session: None,
+            legacy_tool: None,
         },
         Err(_) => PaneObservation::default(),
     }
@@ -73,6 +144,7 @@ pub(super) fn sample_panes(
     instance: &mut crate::session::Instance,
     tools: &[String],
     panes: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
+    legacy_scope: Option<&crate::tmux::LegacyToolScope>,
 ) {
     use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
     instance.agent_pane = observe_agent(instance, panes);
@@ -104,8 +176,14 @@ pub(super) fn sample_panes(
         }
     }
     for observation in &mut instance.auxiliary {
-        observation.pane =
-            observe_auxiliary(&instance.id, &instance.title, &observation.target, panes);
+        observation.pane = observe_auxiliary(
+            &instance.id,
+            &instance.title,
+            &observation.target,
+            panes,
+            &instance.source_profile,
+            legacy_scope,
+        );
     }
     instance.auxiliary.retain(|observation| {
         observation.pane.state != PanePresence::Absent
@@ -116,6 +194,25 @@ pub(super) fn sample_panes(
                 _ => false,
             }
     });
+}
+pub(super) async fn seed_initial_observations(state: &Arc<AppState>) -> anyhow::Result<()> {
+    let panes = tokio::task::spawn_blocking(crate::tmux::batch_pane_metadata).await?;
+    if let Err(error) = &panes {
+        tracing::warn!(target: "server.status", %error, "initial pane observations are unavailable");
+    }
+    let metadata = state.canonical_metadata.read().await;
+    let mut rows = state.instances.write().await;
+    let legacy_scope =
+        legacy_tool_scope_for_panes(&rows, &metadata.raw_tool_names, panes.as_ref().ok());
+    for row in &mut *rows {
+        let tools = metadata
+            .auxiliary_tools
+            .get(&row.source_profile)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        sample_panes(row, tools, panes.as_ref().ok(), legacy_scope.as_ref());
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,7 +233,14 @@ fn sample_auxiliary_after_ensure(
         crate::session::LifecycleReservationError::Superseded
     );
     let panes = crate::tmux::batch_pane_metadata();
-    let pane = observe_auxiliary(&instance.id, &instance.title, &target, panes.as_ref().ok());
+    let pane = observe_auxiliary(
+        &instance.id,
+        &instance.title,
+        &target,
+        panes.as_ref().ok(),
+        &instance.source_profile,
+        None,
+    );
     let state = pane.state;
     native.adopt_auxiliary_observations(
         instance,
@@ -191,7 +295,7 @@ pub(super) async fn publish_auxiliary_after_ensure(
 }
 
 pub(super) enum AuxiliaryStopRequest {
-    Target(crate::session::AuxiliaryTarget),
+    Target(crate::daemon::StopAuxiliaryBody),
     PairedTerminals { index: u32 },
 }
 
@@ -205,14 +309,23 @@ pub(super) async fn stop_native_auxiliary(
         SessionStore,
     };
     let paired = matches!(request, AuxiliaryStopRequest::PairedTerminals { .. });
-    let targets = match request {
-        AuxiliaryStopRequest::Target(target) => [Some(target), None],
+    let (targets, adoption) = match request {
+        AuxiliaryStopRequest::Target(body) => {
+            anyhow::ensure!(
+                body.adoption.is_none() || matches!(&body.target, AuxiliaryTarget::Tool { .. }),
+                AuxiliaryTargetUnavailable
+            );
+            ([Some(body.target), None], body.adoption)
+        }
         AuxiliaryStopRequest::PairedTerminals { index } => {
             anyhow::ensure!(index > 0, AuxiliaryTargetUnavailable);
-            [
-                Some(AuxiliaryTarget::Host { index }),
-                Some(AuxiliaryTarget::Container { index }),
-            ]
+            (
+                [
+                    Some(AuxiliaryTarget::Host { index }),
+                    Some(AuxiliaryTarget::Container { index }),
+                ],
+                None,
+            )
         }
     };
     for target in targets.iter().flatten() {
@@ -276,6 +389,21 @@ pub(super) async fn stop_native_auxiliary(
                 AuxiliaryTarget::Host { .. } => {}
             }
         }
+        let legacy_scope = if let Some(adoption) = &adoption {
+            anyhow::ensure!(
+                adoption.profile == instance.source_profile
+                    && adoption.lifecycle_generation == instance.lifecycle_generation,
+                LifecycleReservationError::Superseded
+            );
+            let loaded = super::reload::load_all_profiles(&worker_state.file_watch)
+                .map_err(|error| error.source.context(crate::session::NativeStoreUnavailable))?;
+            Some(legacy_tool_scope(
+                &loaded.instances,
+                &loaded.metadata.raw_tool_names,
+            ))
+        } else {
+            None
+        };
         instance.acquire_lifecycle_reservation(&native, LifecycleOperation::Stop, None)?;
         let effect = (|| -> anyhow::Result<()> {
             let panes = crate::tmux::batch_pane_metadata()?;
@@ -300,14 +428,32 @@ pub(super) async fn stop_native_auxiliary(
                         .map_err(|error| error.context(AuxiliaryTargetUnavailable))?
                         .kill()
                     }
-                    AuxiliaryTarget::Tool { tool_name } => crate::tmux::ToolSession::from_snapshot(
-                        &instance.id,
-                        &instance.title,
-                        tool_name,
-                        &panes,
-                    )
-                    .map_err(|error| error.context(AuxiliaryTargetUnavailable))?
-                    .kill(),
+                    AuxiliaryTarget::Tool { tool_name } => {
+                        let (tool, identity) = if let Some(adoption) = &adoption {
+                            crate::tmux::ToolSession::adopt_legacy_snapshot(
+                                &instance.id,
+                                &instance.title,
+                                tool_name,
+                                &instance.source_profile,
+                                adoption,
+                                &panes,
+                                legacy_scope.as_ref().expect("adoption scope"),
+                            )?
+                        } else {
+                            let tool = crate::tmux::ToolSession::from_snapshot(
+                                &instance.id,
+                                &instance.title,
+                                tool_name,
+                                &panes,
+                            )
+                            .map_err(|error| error.context(AuxiliaryTargetUnavailable))?;
+                            let Some(metadata) = panes.get(tool.session_name()) else {
+                                continue;
+                            };
+                            (tool, crate::tmux::ToolSession::legacy_identity(metadata)?)
+                        };
+                        tool.kill_verified(&instance.id, tool_name, &identity)
+                    }
                 }?;
             }
             Ok(())
@@ -318,8 +464,14 @@ pub(super) async fn stop_native_auxiliary(
         native.adopt_auxiliary_observations(
             &instance,
             targets.into_iter().flatten().map(|target| {
-                let pane =
-                    observe_auxiliary(&instance.id, &instance.title, &target, panes.as_ref().ok());
+                let pane = observe_auxiliary(
+                    &instance.id,
+                    &instance.title,
+                    &target,
+                    panes.as_ref().ok(),
+                    &instance.source_profile,
+                    legacy_scope.as_ref(),
+                );
                 all_absent &= pane.state == crate::session::PanePresence::Absent;
                 AuxiliaryObservation { target, pane }
             }),
@@ -675,6 +827,83 @@ async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_observation_is_confirmable_but_never_ready_until_owned() {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        use crate::tmux::{LegacyToolScope, PaneMetadata, ToolPaneOwner, ToolSession};
+        let id = "abc12345deadbeef";
+        let target = AuxiliaryTarget::Tool {
+            tool_name: "yazi".into(),
+        };
+        let name = ToolSession::generate_name(id, "Before rename", "yazi");
+        let scope = LegacyToolScope {
+            rows: vec![(
+                "work".into(),
+                id.into(),
+                crate::tmux::Session::generate_name(id, "After rename"),
+            )],
+            tools: vec![("yazi".into(), ToolSession::name_prefix("yazi"))],
+        };
+        let metadata = PaneMetadata {
+            session_id: "$42".into(),
+            pane_id: "%42".into(),
+            session_kind: None,
+            tool_owner: ToolPaneOwner::Unmarked,
+            pane_dead: false,
+            pane_current_command: Some("sleep".into()),
+            pane_start_command_is_protected: false,
+            pane_pid: Some(4242),
+            pane_title: None,
+            window_activity: None,
+            window_size: Some((80, 24)),
+        };
+        let mut panes = std::collections::HashMap::from([(name.clone(), metadata)]);
+        let legacy = observe_auxiliary(
+            id,
+            "After rename",
+            &target,
+            Some(&panes),
+            "work",
+            Some(&scope),
+        );
+        assert_eq!(legacy.state, PanePresence::Unknown);
+        assert_eq!(legacy.tmux_session.as_deref(), Some(name.as_str()));
+        let identity = legacy.legacy_tool.unwrap();
+        assert_eq!(identity.session_id, "$42");
+        assert_eq!(identity.pane_id, "%42");
+        assert_eq!(identity.pane_pid, 4242);
+        panes.get_mut(&name).unwrap().tool_owner = ToolPaneOwner::Invalid;
+        let invalid = observe_auxiliary(
+            id,
+            "After rename",
+            &target,
+            Some(&panes),
+            "work",
+            Some(&scope),
+        );
+        assert_eq!(invalid.state, PanePresence::Unknown);
+        assert!(invalid.legacy_tool.is_none());
+        let metadata = panes.get_mut(&name).unwrap();
+        metadata.tool_owner = ToolPaneOwner::Named {
+            instance_id: id.into(),
+            tool_name: "yazi".into(),
+        };
+        metadata.session_kind = Some("tool".into());
+        let owned = observe_auxiliary(
+            id,
+            "After rename",
+            &target,
+            Some(&panes),
+            "work",
+            Some(&scope),
+        );
+        assert_eq!(owned.state, PanePresence::Alive);
+        assert!(owned.legacy_tool.is_none());
+        let missing = observe_auxiliary(id, "After rename", &target, None, "work", Some(&scope));
+        assert_eq!(missing.state, PanePresence::Unknown);
+        assert!(missing.legacy_tool.is_none());
+    }
 
     #[test]
     fn parse_pane_dead_empty_is_not_ready() {

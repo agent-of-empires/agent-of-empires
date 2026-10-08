@@ -1,432 +1,319 @@
-//! The local-write gate: once a daemon snapshot has been applied, the runtime
-//! owns the session and group rows, so this process must not write them
-//! straight to disk behind the runtime's back.
-
 use super::super::GroupRenameContext;
-use super::{setup_test_home, HomeView};
-use crate::session::{GroupTree, Instance, Storage};
-use crate::tmux::AvailableTools;
-use crate::tui::dialogs::InfoDialog;
-use crossterm::event::{KeyCode, KeyEvent};
-use serial_test::serial;
-use tempfile::TempDir;
+use super::*;
 
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
-}
-
-/// The plain fixture: one profile, one row, the runtime already attached.
-fn view_with_attached_runtime() -> HomeView {
-    attached_runtime_view(|_| {}).0
-}
-
-/// A view over one profile holding the group under test, with the runtime
-/// already attached: `set_sidebar_source(Daemon)` is what a feed's first
-/// snapshot does. Returns the fixture row's id. The row is adjusted before
-/// it reaches disk, for the paths that only act on a row in one particular
-/// durable state.
-fn attached_runtime_view(adjust: impl FnOnce(&mut Instance)) -> (HomeView, String) {
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut instances = [Instance::new("alpha", "/tmp/work")];
-    adjust(&mut instances[0]);
-    let mut tree = GroupTree::new_with_groups(&instances, &[]);
-    tree.create_group("work");
-    let groups = tree.get_all_groups();
-    assert!(
-        groups.iter().any(|group| group.path == "work"),
-        "the fixture must start with the group under test"
-    );
-    storage
-        .update(|disk_instances, disk_groups| {
-            *disk_instances = instances.to_vec();
-            *disk_groups = groups;
-            Ok(())
-        })
-        .unwrap();
-
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    // `new_for_test` labels the source Daemon without going through the
-    // transition, so drive the transition a real connection drives.
-    view.set_sidebar_source(
-        crate::tui::session_feed::SidebarSource::Disconnected,
-        Some("fixture"),
-    );
-    view.set_sidebar_source(crate::tui::session_feed::SidebarSource::Daemon, None);
-    (view, instances[0].id.clone())
-}
-
-fn disk_group_paths() -> Vec<String> {
-    Storage::new_unwatched("test")
-        .unwrap()
-        .load_with_groups()
-        .unwrap()
-        .1
-        .into_iter()
-        .map(|group| group.path)
-        .collect()
-}
-
-/// Ids of the rows on disk, in file order.
-fn disk_session_ids() -> Vec<String> {
-    Storage::new_unwatched("test")
-        .unwrap()
-        .load()
-        .unwrap()
-        .into_iter()
-        .map(|instance| instance.id)
-        .collect()
-}
-
-/// Ids of the rows `sessions.json` currently carries a trash marker for.
-fn disk_trashed_ids() -> Vec<String> {
-    Storage::new_unwatched("test")
-        .unwrap()
-        .load()
-        .unwrap()
-        .into_iter()
-        .filter(|instance| instance.is_trashed())
-        .map(|instance| instance.id)
-        .collect()
-}
-
-/// Rename the selected group through the public entry point, the way a
-/// confirmed rename dialog does.
-fn rename_selected_group_to(view: &mut HomeView, new_path: &str) {
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.selected_group = Some("work".to_string());
+fn rename_group(view: &mut HomeView) -> anyhow::Result<()> {
     view.group_rename_context = Some(GroupRenameContext {
-        old_path: "work".to_string(),
-        old_profile: "test".to_string(),
+        old_path: "work".into(),
+        old_profile: "test".into(),
     });
-    view.rename_selected_group(Some(new_path), None).unwrap();
+    view.rename_selected_group(Some("renamed"), None)
 }
 
-fn info_title(view: &HomeView) -> Option<&str> {
-    view.info_dialog.as_ref().map(InfoDialog::title)
-}
-
-/// A runtime that does not own mutations must leave `groups.json` untouched
-/// rather than diverge from the canonical snapshot it published.
-#[test]
+#[tokio::test]
 #[serial]
-fn read_only_runtime_refuses_a_local_group_write() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let mut view = view_with_attached_runtime();
-    let before = disk_group_paths();
-
-    rename_selected_group_to(&mut view, "renamed");
-
-    assert_eq!(disk_group_paths(), before, "disk was rewritten");
-    assert!(
-        info_title(&view).is_some(),
-        "the refusal must be visible to the operator"
-    );
-}
-
-/// A CityHall client keeps its structured sessions mutable, but its policy does
-/// not extend to this process writing group data on its behalf.
-#[test]
-#[serial]
-fn cityhall_runtime_refuses_a_local_group_write() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let mut view = view_with_attached_runtime();
-    let _driver = view.session_feed.command_driver_for_test();
-    view.session_feed.set_cityhall_for_test(true);
-    let before = disk_group_paths();
-
-    rename_selected_group_to(&mut view, "renamed");
-
-    // The runtime itself still grants mutations: the refusal comes from the
-    // policy this process must honor, not from a degraded runtime.
-    assert!(view.session_feed.mutations_available());
-    assert_eq!(disk_group_paths(), before, "disk was rewritten");
-    assert_eq!(info_title(&view), Some("Read-only"));
-}
-
-/// A runtime that goes away still owns the rows it published: the mirror must
-/// not become a second writer just because the connection dropped.
-#[test]
-#[serial]
-fn lost_runtime_refuses_the_mirror_save() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let mut view = view_with_attached_runtime();
-    {
-        let _driver = view.session_feed.command_driver_for_test();
-        assert!(view.session_feed.mutations_available());
+async fn native_group_rpc_admission_waits_for_real_commit_and_applied_snapshot() {
+    for snapshot_first in [false, true] {
+        let (_temp, _guard) = test_home();
+        let mut row = instance_in("alpha", "/tmp/work", "work");
+        row.source_profile = "test".into();
+        row.status = Status::Stopped;
+        seed_profile("test", std::slice::from_ref(&row));
+        let state = native_state(&["test"]).await;
+        let mut view = test_view(Some("test"));
+        let mut drive = view.session_feed.namespace_driver_for_test();
+        apply_published(&mut view, &state).await;
+        let before = payload_bytes("test");
+        rename_group(&mut view).unwrap();
+        assert_eq!(payload_bytes("test"), before);
+        assert_eq!(view.get_instance(&row.id).unwrap().group_path, "work");
+        let (status, reply) = request(&state,"PATCH","/api/groups",serde_json::json!({"source":{"profile":"test","path":"work"},"target":{"profile":"test","path":"renamed"}})).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let committed = payload_bytes("test");
+        assert_ne!(committed, before);
+        assert_eq!(
+            Storage::new_unwatched("test").unwrap().load().unwrap()[0].group_path,
+            "renamed"
+        );
+        if snapshot_first {
+            apply_published(&mut view, &state).await;
+        }
+        let submitted = drive(Ok(crate::daemon::MutationReceipt {
+            cursor: serde_json::from_value(reply["cursor"].clone()).unwrap(),
+            outcome: crate::daemon::NamespaceOutcome::Committed,
+        }))
+        .expect("admitted group move");
+        let crate::daemon::NamespaceMutation::MoveGroup(body) = submitted else {
+            panic!("expected group move")
+        };
+        assert_eq!(body.source.profile, "test");
+        assert_eq!(body.source.path, "work");
+        assert_eq!(body.target.profile, "test");
+        assert_eq!(body.target.path, "renamed");
+        view.apply_session_feed();
+        if !snapshot_first {
+            assert_eq!(view.get_instance(&row.id).unwrap().group_path, "work");
+            apply_published(&mut view, &state).await;
+        }
+        assert_eq!(view.get_instance(&row.id).unwrap().group_path, "renamed");
+        assert!(view.pending_namespace_intent.is_none());
+        view.reload().unwrap();
+        assert_eq!(payload_bytes("test"), committed);
     }
-    assert!(!view.session_feed.mutations_available());
-    let before = disk_group_paths();
-
-    rename_selected_group_to(&mut view, "renamed");
-    view.save().unwrap();
-
-    assert_eq!(disk_group_paths(), before, "disk was rewritten");
 }
 
-/// The gate must not fire for the local process that owns the files: a view
-/// that never received a runtime snapshot writes them itself.
-#[test]
+#[tokio::test]
 #[serial]
-fn local_owner_still_writes() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    let storage = Storage::new_unwatched("test").unwrap();
-    storage
-        .update(|_, disk_groups| {
-            disk_groups.push(crate::session::Group::new("work", "work"));
-            Ok(())
-        })
-        .unwrap();
-    view.reload().unwrap();
+async fn local_unapplied_readonly_and_lost_authority_never_write_rows_or_groups() {
+    for mode in ["local", "unapplied", "readonly", "lost"] {
+        for action in ["group", "workdir", "attach", "trash"] {
+            if mode == "unapplied" && action != "group" {
+                continue;
+            }
+            let (_temp, _guard) = test_home();
+            let mut row = instance_in("alpha", "/tmp/work", "work");
+            row.source_profile = "test".into();
+            row.status = Status::Stopped;
+            seed_profile("test", std::slice::from_ref(&row));
+            let state = native_state(&["test"]).await;
+            let mut view = test_view(Some("test"));
+            let mut namespace =
+                (action == "group").then(|| view.session_feed.namespace_driver_for_test());
+            let mut session =
+                (action != "group").then(|| view.session_feed.request_driver_for_test());
+            if mode != "local" && mode != "unapplied" {
+                apply_published(&mut view, &state).await;
+            }
+            if mode == "unapplied" {
+                let snapshot = state.runtime.publish(&state).await.unwrap();
+                view.session_feed.publish_for_test(
+                    crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(
+                        snapshot.value.clone(),
+                    )),
+                );
+            }
+            if mode == "local" {
+                view.session_feed.set_mutation_permission_for_test(false);
+            }
+            if mode == "readonly" {
+                view.session_feed.set_mutation_permission_for_test(false);
+                let snapshot = state.runtime.publish(&state).await.unwrap();
+                let mut snapshot = snapshot.value.clone();
+                snapshot.cursor.revision += 1;
+                snapshot.contents.capabilities.mutations = false;
+                view.session_feed.publish_for_test(
+                    crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(
+                        snapshot,
+                    )),
+                );
+                view.apply_session_feed();
+            }
+            if mode == "lost" {
+                view.session_feed.set_mutation_permission_for_test(false);
+                view.session_feed.publish_for_test(
+                    crate::tui::session_feed::SessionFeedResult::Unavailable("offline".into()),
+                );
+                view.apply_session_feed();
+            }
+            let before = payload_bytes("test");
+            view.selected_session = Some(row.id.clone());
+            match action {
+                "group" => assert!(rename_group(&mut view).is_err(), "{mode}"),
+                "workdir" => assert!(
+                    view.set_worktree_name_for_selected("renamed", false)
+                        .is_err(),
+                    "{mode}"
+                ),
+                "attach" => assert!(
+                    view.add_project_to_session(&row.id, std::path::Path::new("/tmp/other"))
+                        .is_err(),
+                    "{mode}"
+                ),
+                "trash" => view.trash_session_by_id(&row.id),
+                _ => unreachable!(),
+            }
+            if let Some(driver) = session.as_mut() {
+                assert!(
+                    driver(Err("unexpected admission".into())).is_none(),
+                    "{mode}:{action}"
+                );
+            }
+            if let Some(driver) = namespace.as_mut() {
+                assert!(
+                    driver(Err("unexpected admission".into())).is_none(),
+                    "{mode}:{action}"
+                );
+            }
+            assert!(!view.get_instance(&row.id).unwrap().is_trashed());
+            assert_eq!(view.get_instance(&row.id).unwrap().group_path, "work");
+            assert_eq!(payload_bytes("test"), before, "{mode}");
+            view.reload().unwrap();
+            assert_eq!(payload_bytes("test"), before, "{mode}");
+        }
+    }
+}
 
-    rename_selected_group_to(&mut view, "renamed");
-    view.save().unwrap();
-
-    let after = disk_group_paths();
-    assert!(
-        after.contains(&"renamed".to_string()) && !after.contains(&"work".to_string()),
-        "{after:?}"
+#[tokio::test]
+#[serial]
+async fn readonly_trash_restore_bulk_purge_and_force_remove_leave_persisted_owner_intact() {
+    let (_temp, _guard) = test_home();
+    let mut row = instance_in("alpha", "/tmp/work", "work");
+    row.source_profile = "test".into();
+    row.status = Status::Stopped;
+    row.trash();
+    row.lifecycle_generation = 9;
+    row.lifecycle_reservation = Some(LifecycleReservation {
+        op: LifecycleOperation::Purge,
+        generation: 9,
+        at: chrono::Utc::now(),
+    });
+    seed_profile("test", std::slice::from_ref(&row));
+    let state = native_state(&["test"]).await;
+    let mut view = test_view(Some("test"));
+    let mut drive = view.session_feed.request_driver_for_test();
+    view.session_feed.set_mutation_permission_for_test(false);
+    view.session_feed.set_native_permission_for_test(false);
+    let mut snapshot = state.runtime.publish(&state).await.unwrap().value.clone();
+    snapshot.contents.capabilities.mutations = false;
+    view.session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            std::sync::Arc::new(snapshot),
+        ));
+    view.apply_session_feed();
+    view.selected_session = Some(row.id.clone());
+    let before = payload_bytes("test");
+    view.restore_selected_from_trash();
+    view.empty_trash_all();
+    assert!(view
+        .force_remove_session(&row.id, std::num::NonZeroU64::new(9).unwrap())
+        .is_err());
+    assert!(drive(Err("unexpected admission".into())).is_none());
+    assert!(view.get_instance(&row.id).unwrap().is_trashed());
+    assert_eq!(
+        view.get_instance(&row.id).unwrap().lifecycle_reservation,
+        row.lifecycle_reservation
     );
-    assert!(view.info_dialog.is_none());
+    assert_eq!(payload_bytes("test"), before);
 }
 
-/// With a healthy runtime attached, the same rename goes through: the gate
-/// costs nothing when the runtime does allow local writes.
-#[test]
+#[tokio::test]
 #[serial]
-fn healthy_runtime_still_writes() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let mut view = view_with_attached_runtime();
-    let _driver = view.session_feed.command_driver_for_test();
-
-    rename_selected_group_to(&mut view, "renamed");
-    view.save().unwrap();
-
-    let after = disk_group_paths();
-    assert!(
-        after.contains(&"renamed".to_string()) && !after.contains(&"work".to_string()),
-        "{after:?}"
+async fn cityhall_refuses_profile_creation_without_creating_a_directory() {
+    let (_temp, _guard) = test_home();
+    seed_profile("test", &[]);
+    let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+        Vec::new(),
+        vec!["localhost".into()],
+        Vec::new(),
+        None,
+        |state| state.cityhall_mode = true,
     );
-    assert!(view.info_dialog.is_none());
-}
-
-/// Profile creation is not in the runtime's CityHall mutation policy, so the
-/// TUI must not perform it on disk for such a client.
-#[test]
-#[serial]
-fn cityhall_refuses_profile_creation_on_disk() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let mut view = view_with_attached_runtime();
-    let _driver = view.session_feed.command_driver_for_test();
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let mut view = test_view(Some("test"));
+    let mut drive = view.session_feed.namespace_driver_for_test();
+    apply_published(&mut view, &state).await;
     view.session_feed.set_cityhall_for_test(true);
     view.show_profile_picker();
-
     view.handle_key(key(KeyCode::Char('n')), None);
     for character in "cityhall-target".chars() {
         view.handle_key(key(KeyCode::Char(character)), None);
     }
     view.handle_key(key(KeyCode::Enter), None);
-
-    assert_eq!(
-        info_title(&view),
-        Some("Read-only"),
-        "a refused creation is a policy refusal, not a filesystem error"
-    );
-    assert!(view.profile_picker_dialog.is_none());
-    assert!(!crate::session::list_profiles()
+    let path = crate::session::get_app_dir()
         .unwrap()
-        .contains(&"cityhall-target".to_string()));
-    assert!(!crate::session::get_app_dir()
-        .unwrap()
-        .join("profiles")
-        .join("cityhall-target")
-        .exists());
+        .join("profiles/cityhall-target");
+    assert!(!path.exists());
+    let (status, reply) = request(
+        &state,
+        "POST",
+        "/api/profiles",
+        serde_json::json!({"name":"cityhall-target"}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    let submitted =
+        drive(Err(reply.to_string())).expect("profile RPC admitted without local side effects");
+    let crate::daemon::NamespaceMutation::Profile(crate::daemon::ProfileMutation::Create(body)) =
+        submitted
+    else {
+        panic!("expected create profile")
+    };
+    assert_eq!(body.name, "cityhall-target");
+    view.apply_session_feed();
+    assert!(!path.exists());
+    assert!(view.info_dialog.is_some());
 }
 
-/// Forgetting a stuck deletion record tears the row's tmux session and
-/// container down off-thread, so the row has to be gone from disk *first*.
-/// Under the gate the write cannot happen, which would leave the row on the
-/// runtime's next snapshot with its resources already destroyed. The whole
-/// operation must therefore refuse before it touches the row.
-#[test]
+#[tokio::test]
 #[serial]
-fn force_remove_refuses_while_the_runtime_owns_the_rows() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let (mut view, id) = attached_runtime_view(|_| {});
-
-    view.force_remove_session(&id).unwrap();
-
-    assert_eq!(
-        view.pending_deletions
-            .get("test")
-            .map_or(0, |tombstones| tombstones.len()),
-        0,
-        "a refused force-remove must not even stage the row for deletion"
-    );
-    assert!(
-        view.get_instance(&id).is_some(),
-        "the row the refusal protects must still be listed"
-    );
-    assert_eq!(
-        disk_session_ids(),
-        vec![id.clone()],
-        "sessions.json was rewritten behind the runtime's back"
-    );
-    assert_eq!(info_title(&view), Some("Read-only"));
-}
-
-/// Trashing stamps `trashed_at` with a plain storage write, so a guarded
-/// process that stamped it anyway would publish a trash marker the runtime
-/// never sent, and the row would come back untrashed on the next snapshot.
-#[test]
-#[serial]
-fn trash_refuses_while_the_runtime_owns_the_rows() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let (mut view, id) = attached_runtime_view(|_| {});
-
-    view.trash_session_by_id(&id);
-
-    assert!(
-        disk_trashed_ids().is_empty(),
-        "sessions.json carries a trash marker the runtime never published"
-    );
-    assert!(
-        view.get_instance(&id).is_some_and(|row| !row.is_trashed()),
-        "the row must not flip to trashed in the view either"
-    );
-    assert_eq!(info_title(&view), Some("Read-only"));
-}
-
-/// Restoring clears `trashed_at` under the same per-instance flock, so a
-/// guarded process that ran it anyway would un-trash a row the runtime still
-/// considers trashed, leaving the two views disagreeing about the row's
-/// bucket.
-#[test]
-#[serial]
-fn restore_refuses_while_the_runtime_owns_the_rows() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let (mut view, id) = attached_runtime_view(|row| row.trash());
-    view.selected_session = Some(id.clone());
-    assert!(
-        view.get_instance(&id).is_some_and(|row| row.is_trashed()),
-        "the fixture must start with a trashed row a restore could act on"
-    );
-
-    view.restore_selected_from_trash();
-
-    assert_eq!(
-        disk_trashed_ids(),
-        vec![id.clone()],
-        "the durable trash marker was cleared behind the runtime's back"
-    );
-    assert!(
-        view.get_instance(&id).is_some_and(|row| row.is_trashed()),
-        "the row must stay trashed in the view"
-    );
-    assert_eq!(info_title(&view), Some("Read-only"));
-}
-
-/// Renaming a workdir moves a real git worktree and discards the session's
-/// container before it writes `project_path`, so the guard has to fire before
-/// any of that runs. Without it the directory moves and the row is rewritten
-/// while the runtime declares itself unable to mutate.
-#[test]
-#[serial]
-fn workdir_rename_refuses_while_the_runtime_owns_the_rows() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let workdir = temp.path().join("wt").display().to_string();
-    let (mut view, id) = attached_runtime_view(|row| {
-        row.project_path = workdir.clone();
-        row.worktree_info = Some(crate::session::WorktreeInfo {
-            branch: "feature/foo".to_string(),
-            main_repo_path: temp.path().display().to_string(),
-            managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
-            base_branch: None,
+async fn cityhall_group_policy_rejects_nonstructured_or_cross_profile_but_allows_structured_same_profile(
+) {
+    for (structured, cross_profile, expected) in [
+        (false, false, axum::http::StatusCode::FORBIDDEN),
+        (true, true, axum::http::StatusCode::FORBIDDEN),
+        (true, false, axum::http::StatusCode::OK),
+    ] {
+        let (_temp, _guard) = test_home();
+        let mut row = instance_in("alpha", "/tmp/work", "work");
+        row.source_profile = "test".into();
+        row.status = Status::Stopped;
+        if structured {
+            row.view = crate::session::View::Structured;
+        }
+        seed_profile("test", std::slice::from_ref(&row));
+        seed_profile("target", &[]);
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            vec![row.clone()],
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.cityhall_mode = true,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut view = test_view(Some("test"));
+        let mut drive = view.session_feed.namespace_driver_for_test();
+        view.session_feed.set_cityhall_for_test(true);
+        apply_published(&mut view, &state).await;
+        let before = (payload_bytes("test"), payload_bytes("target"));
+        let target = if cross_profile { "target" } else { "test" };
+        view.group_rename_context = Some(GroupRenameContext {
+            old_path: "work".into(),
+            old_profile: "test".into(),
         });
-    });
-    view.selected_session = Some(id.clone());
-
-    view.set_worktree_name_for_selected("renamed", false)
-        .unwrap();
-
-    assert_eq!(
-        view.get_instance(&id).map(|row| row.project_path.clone()),
-        Some(workdir.clone()),
-        "project_path was rewritten behind the runtime's back"
-    );
-    assert_eq!(info_title(&view), Some("Read-only"));
-}
-
-/// Attaching a repo runs `git worktree add`, a fetch and a submodule init on a
-/// worker, and that worker commits the row through its own storage handle. Once
-/// dispatched it cannot be unwound from the view, so the refusal belongs at the
-/// entry point rather than after the enqueue.
-#[test]
-#[serial]
-fn project_attach_refuses_while_the_runtime_owns_the_rows() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let (mut view, id) = attached_runtime_view(|_| {});
-
-    let error = view
-        .add_project_to_session(&id, &temp.path().join("other"))
-        .expect_err("the attach must be refused");
-
-    assert!(
-        error.to_string().contains("may not write"),
-        "the refusal must name the read-only runtime, got: {error}"
-    );
-    assert!(
-        view.attach_project_in_flight.is_empty(),
-        "a worker was dispatched for a row the runtime owns"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn empty_trash_refuses_while_the_runtime_owns_the_rows() {
-    // Emptying the trash builds its own deletion requests instead of going
-    // through `delete_selected`, so it needs the guard of its own: without it
-    // the action still purges a canonical session the guard declares read-only.
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let (mut view, id) = attached_runtime_view(|row| row.trash());
-
-    view.empty_trash_all();
-
-    assert_eq!(
-        disk_trashed_ids(),
-        vec![id.clone()],
-        "the durable row must still be marked trashed"
-    );
-    assert!(
-        view.get_instance(&id).is_some_and(|row| row.is_trashed()),
-        "the row must stay trashed in the view"
-    );
-    assert_eq!(
-        info_title(&view),
-        Some("Read-only"),
-        "a refused bulk purge must say so, not purge quietly"
-    );
+        view.rename_selected_group(Some("renamed"), Some(target))
+            .unwrap();
+        assert_eq!((payload_bytes("test"), payload_bytes("target")), before);
+        let (status, reply) = request(&state,"PATCH","/api/groups",serde_json::json!({"source":{"profile":"test","path":"work"},"target":{"profile":target,"path":"renamed"}})).await;
+        assert_eq!(status, expected);
+        let result = if status.is_success() {
+            Ok(crate::daemon::MutationReceipt {
+                cursor: serde_json::from_value(reply["cursor"].clone()).unwrap(),
+                outcome: crate::daemon::NamespaceOutcome::Committed,
+            })
+        } else {
+            Err(reply.to_string())
+        };
+        let submitted = drive(result).unwrap();
+        let crate::daemon::NamespaceMutation::MoveGroup(body) = submitted else {
+            panic!("expected group move")
+        };
+        assert_eq!(body.source.profile, "test");
+        assert_eq!(body.source.path, "work");
+        assert_eq!(body.target.profile, target);
+        assert_eq!(body.target.path, "renamed");
+        view.apply_session_feed();
+        if status.is_success() {
+            assert_eq!(
+                Storage::new_unwatched("test").unwrap().load().unwrap()[0].group_path,
+                "renamed"
+            );
+            let committed = (payload_bytes("test"), payload_bytes("target"));
+            apply_published(&mut view, &state).await;
+            assert_eq!(view.get_instance(&row.id).unwrap().group_path, "renamed");
+            assert_eq!((payload_bytes("test"), payload_bytes("target")), committed);
+        } else {
+            assert_eq!((payload_bytes("test"), payload_bytes("target")), before);
+            assert!(view.group_trees["test"].group_exists("work"));
+            assert!(view.info_dialog.is_some());
+        }
+    }
 }

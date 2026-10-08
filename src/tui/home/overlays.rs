@@ -1,6 +1,9 @@
 //! Which overlay is up, and what it takes over from the list view.
 
 use super::*;
+use std::time::{Duration, Instant};
+
+const FLASH_WINDOW: Duration = Duration::from_secs(3);
 
 impl HomeView {
     /// Expire the settings view's transient "Settings saved" toast when its
@@ -9,8 +12,7 @@ impl HomeView {
     pub fn tick_settings_status(&mut self) -> bool {
         self.settings_view
             .as_mut()
-            .map(|view| view.tick_status())
-            .unwrap_or(false)
+            .is_some_and(|view| view.tick_status())
     }
 
     /// Tick dialog animations/timers and drain hook progress.
@@ -89,8 +91,6 @@ impl HomeView {
     /// gate off the fast path it's supposed to enable — that's why the
     /// fast path needs this method instead.
     pub(in crate::tui) fn has_non_live_send_overlay(&self) -> bool {
-        let serve_open = self.serve_view.is_some();
-
         self.show_help
             || self.search_active
             || self.new_dialog.is_some()
@@ -122,7 +122,7 @@ impl HomeView {
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
             || self.tips_dialog.is_some()
-            || serve_open
+            || self.serve_view.is_some()
             || self.settings_view.is_some()
             || self.diff_view.is_some()
     }
@@ -140,15 +140,14 @@ impl HomeView {
     /// time a Ctrl+C is forwarded to the agent in live mode so the reminder
     /// re-shows on every press (#2894).
     pub(in crate::tui) fn flash_ctrl_c_hint(&mut self) {
-        self.live_send_ctrl_c_flash_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        self.live_send_ctrl_c_flash_until = Some(Instant::now() + FLASH_WINDOW);
     }
 
     /// Whether the "Ctrl+C sent to agent" footer flash is currently within
     /// its display window.
     pub(in crate::tui) fn live_send_ctrl_c_flash_active(&self) -> bool {
         self.live_send_ctrl_c_flash_until
-            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+            .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     /// Show `text` in the status bar for a few seconds. For feedback on an
@@ -156,17 +155,14 @@ impl HomeView {
     /// Matches the Ctrl+C hint's window so the two read as the same kind of
     /// thing.
     pub(in crate::tui) fn flash_status(&mut self, text: impl Into<String>) {
-        self.status_flash = Some((
-            text.into(),
-            std::time::Instant::now() + std::time::Duration::from_secs(3),
-        ));
+        self.status_flash = Some((text.into(), Instant::now() + FLASH_WINDOW));
     }
 
     /// The flash text while it is still within its window.
     pub(in crate::tui) fn status_flash_text(&self) -> Option<&str> {
         self.status_flash
             .as_ref()
-            .filter(|(_, deadline)| std::time::Instant::now() < *deadline)
+            .filter(|(_, deadline)| Instant::now() < *deadline)
             .map(|(text, _)| text.as_str())
     }
 
@@ -176,7 +172,7 @@ impl HomeView {
         if self
             .status_flash
             .as_ref()
-            .is_some_and(|(_, deadline)| std::time::Instant::now() >= *deadline)
+            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
         {
             self.status_flash = None;
             return true;

@@ -26,7 +26,7 @@ fn migrate_config_file(path: &Path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
             tracing::warn!(
-                target: "migration.v038",
+                target: "migrations.v038",
                 path = %path.display(),
                 %error,
                 "Could not read config for the canonical sidebar migration; skipping"
@@ -50,7 +50,7 @@ fn migrate_config_file(path: &Path) {
     })();
     if let Err(error) = migration {
         tracing::warn!(
-            target: "migration.v038",
+            target: "migrations.v038",
             path = %path.display(),
             %error,
             "Skipping the canonical sidebar migration for an unreadable config"

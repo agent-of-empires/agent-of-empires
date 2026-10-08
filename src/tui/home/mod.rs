@@ -37,7 +37,7 @@ mod watchers;
 // detail of the home module. Tests that need to install it directly
 // go through the `super::live_send::LiveSendState` path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use ratatui::prelude::Rect;
 use tui_input::Input;
@@ -50,7 +50,6 @@ use crate::session::{
 };
 use crate::tmux::AvailableTools;
 
-use super::deletion_poller::DeletionPoller;
 use super::dialogs::ServeView;
 use super::dialogs::{
     AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
@@ -63,7 +62,6 @@ use super::dialogs::{
 use super::diff::DiffView;
 use super::settings::SettingsView;
 
-use self::creation::SessionMutationGuards;
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
     ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN,
@@ -145,6 +143,21 @@ pub(super) struct PendingArchiveCursor {
     pub(super) successor: Option<String>,
 }
 
+pub(super) enum NamespaceIntent {
+    Plain,
+    ProfileCreated(String),
+    ProfileDeleted(String),
+    ReorderSession {
+        id: String,
+        profile: String,
+        source_group: String,
+        delta: isize,
+        crossing: bool,
+        continuation_destination: Option<String>,
+    },
+    ReorderGroup,
+}
+
 pub(super) enum CreationConfirmation {
     Receipt(crate::daemon::MutationReceipt<crate::daemon::SessionResponse>),
     Canonical(crate::daemon::SessionResponse),
@@ -177,17 +190,6 @@ pub(super) struct PassiveSynced {
     pub(super) adopted_at: std::time::Instant,
 }
 
-/// Result delivered by a startup-recovery worker back to the TUI tick.
-struct RecoveryUpdate {
-    instance_id: String,
-    title: String,
-    /// Updated `Instance` snapshot (post-cascade), so the TUI can replace
-    /// its in-memory copy without a disk reload that would lose the
-    /// freshly-set `last_start_time` (which is `#[serde(skip)]`).
-    instance: Box<crate::session::Instance>,
-    result: Result<crate::session::StartOutcome, String>,
-}
-
 pub(in crate::tui) struct ReadyNativeAttachment {
     pub id: String,
     pub tmux_name: String,
@@ -200,19 +202,6 @@ pub struct HomeView {
     pub(super) storages: HashMap<String, Storage>,
     pub(super) active_profile: Option<String>,
     instances: indexmap::IndexMap<String, Instance>,
-    /// Per-profile tombstones for ids removed since last `save`. Drained
-    /// on Ok return so the next save retries on transient failure.
-    pending_deletions: HashMap<String, HashSet<String>>,
-    /// Per-profile tombstones for group paths removed since last `save`.
-    /// Mirrors `pending_deletions` for groups so concurrent peer-added
-    /// groups (e.g. `aoe add --group X`) survive the next save.
-    pending_group_deletions: HashMap<String, HashSet<String>>,
-    /// Per-profile ids added via `add_instance` since last save. In
-    /// `save()`, only ids present here are pushed when the disk row is
-    /// missing; TUI rows absent from disk AND absent from this set are
-    /// treated as peer-deleted (CLI/`aoe serve`) and dropped from the
-    /// in-memory mirror. Drained on Ok save.
-    pending_added: HashMap<String, HashSet<String>>,
     /// The persisted manual workspace order as this view last observed it.
     /// The runtime publishes a merged view of it (unknown workspaces
     /// appended), so this is what detects a peer's reorder.
@@ -517,7 +506,8 @@ pub struct HomeView {
     /// Session to stop after the confirmation dialog is accepted
     pub(super) pending_stop_session: Option<String>,
     /// Target captured when the auxiliary stop confirmation opens.
-    pub(super) pending_stop_auxiliary: Option<(String, crate::session::AuxiliaryTarget)>,
+    pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,
+    pending_legacy_tool_preparation: Option<panes::PendingLegacyToolPreparation>,
     /// Sandbox image to pull after the "image update available" confirm dialog
     /// is accepted. Carries the image through the generic `ConfirmDialog`,
     /// which only knows its action string.
@@ -546,8 +536,8 @@ pub struct HomeView {
     /// The last frame painted the mounted structured transcript into the preview, so
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,
-    /// Session to force-remove after the confirmation dialog is accepted
-    pub(super) pending_force_remove_session: Option<String>,
+    /// Exact canonical purge owner captured when Force Remove confirmation opens.
+    pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
     /// Session to trash after the `session.confirm_delete` dialog is accepted
     pub(super) pending_trash_session: Option<String>,
     /// Action emitted by a mouse-click on a modal dialog (e.g. clicking
@@ -582,43 +572,19 @@ pub struct HomeView {
     pub(super) system_health_discovered: bool,
 
     // Canonical subscription and native command lane.
-    pub(super) session_feed: super::session_feed::SessionFeed,
     pub(super) sidebar_source: super::session_feed::SidebarSource,
-    /// Set once a daemon snapshot has been applied. From that point the
-    /// runtime, not this process's mirror, owns the session and group rows, so
-    /// `local_write_block` starts refusing local writes. It never resets: a
-    /// later disconnect must not reopen a write path the runtime still owns.
-    pub(super) runtime_authoritative: bool,
+    runtime_failure_message: Option<String>,
+    pub(super) session_feed: super::session_feed::SessionFeed,
+    pending_namespace_intent: Option<NamespaceIntent>,
+    namespace_unknown_message: Option<String>,
+    runtime_outcome_messages: Vec<String>,
+    /// Independent project-registry policy remembers runtime attachment, not row-write authority.
+    project_registry_authoritative: bool,
     // Structured (ACP) rows also surface their pending approval nonces from
     // the daemon; the home permission dialog resolves them. See
     // `structured_approval_poller`.
     pub(super) structured_pending_approvals: HashMap<String, Vec<crate::daemon::PendingApproval>>,
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
-
-    // Performance: background deletion
-    pub(super) deletion_poller: DeletionPoller,
-
-    // Container teardown and worktree moves run off the render thread.
-    pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
-    /// Load-time healing (trashed-worktree relocation, worktree paths moved
-    /// outside aoe) kicked once from `HomeView::new` so it never delays the
-    /// first frame; `apply_reconcile_results` reloads when it lands. See #3611.
-    pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,
-    /// When the startup-recovery gate was armed, held until the first reconcile
-    /// sweep lands so auto-recovery runs against repaired paths rather than the
-    /// stale ones the sweep is about to fix. Carries the arming instant, not a
-    /// bare flag, so a sweep that never lands cannot strand recovery for the
-    /// whole boot. See `release_startup_recovery_gate`.
-    pub(super) startup_recovery_gate: Option<std::time::Instant>,
-    /// A landed sweep whose repair has not reached `instances` yet, because
-    /// live-send is holding the reload. Keeps the recovery gate armed until the
-    /// repair is applied. See `apply_reconcile_results`.
-    pub(super) pending_reconcile_reload: bool,
-    /// Earliest retry for a reconcile reload that failed. The tick calls
-    /// `apply_reconcile_results` ~30 times a second, so an unreadable store
-    /// would otherwise spin on storage and flood the log. See
-    /// `RECONCILE_RELOAD_RETRY_INTERVAL`.
-    pub(super) reconcile_reload_retry_at: Option<std::time::Instant>,
 
     // Daemon start reservations: the daemon runs the start and its canonical
     // snapshot drives the row; see `apply_restart_results`.
@@ -634,14 +600,6 @@ pub struct HomeView {
     /// goes ahead on the shared store instead of deferring to another move,
     /// which would find the same container and hand the launch back again.
     store_move_bypass: Option<String>,
-
-    // Performance: background attach-a-project (#3103). `git worktree add`, an
-    // optional fetch and submodule init, the worker bounce and the container
-    // removal all shell out, so an inline attach froze the UI for its duration.
-    pub(super) attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller,
-    /// Sessions whose attach is in flight. One at a time per session: a second
-    /// attach would race the first one's worktree creation and its worker bounce.
-    pub(super) attach_project_in_flight: std::collections::HashSet<String>,
 
     // Performance: background session creation (for sandbox)
     /// The creation this view submitted to the daemon and still displays. The
@@ -897,20 +855,6 @@ pub struct HomeView {
     /// rarely-used shelf.
     // ponytail: in-memory only; persist to app_state if users ask for it.
     pub(super) trashed_section_collapsed: bool,
-
-    /// Channel that startup-recovery workers send results back on. `None`
-    /// when no recovery was attempted at construction (live tmux, daemon
-    /// owns recovery, lock contended, or no candidates). Drained on every
-    /// tick by `apply_recovery_updates`.
-    recovery_rx: Option<std::sync::mpsc::Receiver<RecoveryUpdate>>,
-    /// Lock guard kept alive for the recovery pass so a peer (a daemon
-    /// that starts after the TUI) cannot duplicate cascades. Released
-    /// when the field is set to `None` after the last worker has
-    /// reported back.
-    recovery_lock: Option<crate::session::recovery::RecoveryLock>,
-
-    /// Sessions awaiting startup-recovery worker results.
-    recovery_in_flight: std::collections::HashSet<String>,
 
     /// Spam-debounce for the `e` / `E` / `F5` restart keybind: maps
     /// session id to the wall-clock instant of the last restart attempt.

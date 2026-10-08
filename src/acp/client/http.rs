@@ -148,15 +148,39 @@ impl HttpClient {
         decode_replay(res).await
     }
 
-    /// Page through replay history from `since`, accumulating every
-    /// frame into one `ReplayResponse`. Each request is bounded to
-    /// `page_size` so the daemon never buffers the whole history at once.
-    ///
-    /// The loop is capped at the first page's `highest_seq`: events
-    /// appended after replay began arrive over the live WS channel and
-    /// are deduped by the reducer, so chasing them here would never
-    /// converge on a busy session. Stops early and propagates `lost` if
-    /// any page reports a retention gap, leaving the caller to reset.
+    /// Fold replay pages through the first page's snapshot window. Lost pages
+    /// are consumed before stopping, so callers can reset using the same data.
+    async fn replay_pages(
+        &self,
+        session_id: &str,
+        since: u64,
+        page_size: u64,
+        view_rows: bool,
+        mut consume: impl FnMut(ReplayResponse),
+    ) -> Result<(u64, Option<u64>, bool), HttpError> {
+        let mut cursor = since;
+        let mut target = None;
+        loop {
+            let page = if view_rows {
+                self.replay_rows_page(session_id, cursor, page_size).await?
+            } else {
+                self.replay_page(session_id, cursor, page_size).await?
+            };
+            let cap = *target.get_or_insert(page.highest_seq);
+            let (highest_seq, lowest_seq, lost) = (page.highest_seq, page.lowest_seq, page.lost);
+            let (next_cursor, has_more) = (page.next_cursor, page.has_more);
+            consume(page);
+            match next_cursor {
+                Some(next) if !lost && has_more && next > cursor && next < cap => {
+                    cursor = next;
+                }
+                _ => return Ok((highest_seq, lowest_seq, lost)),
+            }
+        }
+    }
+
+    /// Accumulate raw frames inside the first page's snapshot window. Events
+    /// appended later arrive over the live WS; a retention gap stops replay.
     pub async fn replay_paged(
         &self,
         session_id: &str,
@@ -164,32 +188,11 @@ impl HttpClient {
         page_size: u64,
     ) -> Result<ReplayResponse, HttpError> {
         let mut frames = Vec::new();
-        let mut cursor = since;
-        let mut target: Option<u64> = None;
-        let mut lost = false;
-        // Assigned every iteration before the post-loop read; the loop
-        // always runs at least once.
-        let mut highest_seq;
-        let mut lowest_seq;
-        loop {
-            let page = self.replay_page(session_id, cursor, page_size).await?;
-            highest_seq = page.highest_seq;
-            lowest_seq = page.lowest_seq;
-            let cap = *target.get_or_insert(page.highest_seq);
-            frames.extend(page.frames);
-            if page.lost {
-                lost = true;
-                break;
-            }
-            match page.next_cursor {
-                // Keep paging only while the cursor advances and stays
-                // within the snapshot window captured on the first page.
-                Some(next) if page.has_more && next > cursor && next < cap => {
-                    cursor = next;
-                }
-                _ => break,
-            }
-        }
+        let (highest_seq, lowest_seq, lost) = self
+            .replay_pages(session_id, since, page_size, false, |page| {
+                frames.extend(page.frames);
+            })
+            .await?;
         Ok(ReplayResponse {
             frames,
             lost,
@@ -201,10 +204,8 @@ impl HttpClient {
         })
     }
 
-    /// `GET /api/sessions/{id}/acp/replay?since=N&limit=L&view=rows`. One
-    /// page of the server-folded transcript rows (`TranscriptRow[]` in
-    /// `rows`, `frames` empty), same pagination metadata as the raw
-    /// projection.
+    /// Fetch one page of server-folded transcript rows through the same
+    /// authenticated, path-encoded and deadline-bounded path as raw replay.
     async fn replay_rows_page(
         &self,
         session_id: &str,
@@ -223,42 +224,24 @@ impl HttpClient {
         decode_replay(res).await
     }
 
-    /// Page through the server-folded transcript rows from `since`,
-    /// accumulating every page's `rows` in order and reconciling by row id
-    /// (the server folds each page in isolation, so a `tool_start` split
-    /// across a page seam can repeat under one id; last non-sparse wins).
-    /// The transcript twin of [`replay_paged`](Self::replay_paged): same
-    /// snapshot-window cap and retention-gap (`lost`) handling. Returns the
-    /// merged rows plus whether a page reported a gap.
+    /// Reconcile server-folded rows by ID across page seams, using the same
+    /// snapshot cap and retention-gap handling as raw replay.
     pub async fn replay_rows_paged(
         &self,
         session_id: &str,
         since: u64,
         page_size: u64,
     ) -> Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), HttpError> {
-        let mut rows: Vec<crate::acp::transcript::TranscriptRow> = Vec::new();
-        let mut cursor = since;
-        let mut target: Option<u64> = None;
-        let mut lost = false;
-        loop {
-            let page = self.replay_rows_page(session_id, cursor, page_size).await?;
-            let cap = *target.get_or_insert(page.highest_seq);
-            if let Some(page_rows) = page.rows {
-                for row in page_rows {
-                    crate::acp::transcript::upsert_transcript_row(&mut rows, row);
+        let mut rows = Vec::new();
+        let (_, _, lost) = self
+            .replay_pages(session_id, since, page_size, true, |page| {
+                if let Some(page_rows) = page.rows {
+                    for row in page_rows {
+                        crate::acp::transcript::upsert_transcript_row(&mut rows, row);
+                    }
                 }
-            }
-            if page.lost {
-                lost = true;
-                break;
-            }
-            match page.next_cursor {
-                Some(next) if page.has_more && next > cursor && next < cap => {
-                    cursor = next;
-                }
-                _ => break,
-            }
-        }
+            })
+            .await?;
         Ok((rows, lost))
     }
 
@@ -1293,9 +1276,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn no_credential_without_token_or_passphrase() {
-        // --auth=none: neither a token nor a passphrase resolves, so the
-        // request must go out exactly as built, matching pre-passphrase
-        // behavior.
         let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
         let request = credentialed(&client, "http://127.0.0.1:8080/api/sessions").await;
@@ -1304,19 +1284,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_bearer_token_wins_over_a_passphrase() {
-        let dir = tempfile::tempdir().unwrap();
-        let passphrase_path = dir.path().join("serve.passphrase");
-        std::fs::write(&passphrase_path, "hunter2").unwrap();
-        let client = HttpClient::new(
-            DaemonEndpoint::new(
-                "http://127.0.0.1:8080".into(),
-                Some("tok".into()),
-                Source::LocalDaemon,
-            )
-            .with_local_passphrase_path(passphrase_path),
-        )
-        .unwrap();
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "hunter2")]);
+        let client = HttpClient::new(endpoint("http://127.0.0.1:8080", Some("tok"))).unwrap();
 
         let request = credentialed(&client, "http://127.0.0.1:8080/api/sessions").await;
         assert_eq!(
@@ -1329,15 +1301,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_cached_passphrase_session_rides_as_a_cookie() {
-        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
-        let dir = tempfile::tempdir().unwrap();
-        let passphrase_path = dir.path().join("serve.passphrase");
-        std::fs::write(&passphrase_path, "hunter2").unwrap();
-        let client = HttpClient::new(
-            DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::LocalDaemon)
-                .with_local_passphrase_path(passphrase_path),
-        )
-        .unwrap();
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "hunter2")]);
+        let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
         client
             .passphrase_session
             .set_for_test(passphrase_session::PassphraseSession {

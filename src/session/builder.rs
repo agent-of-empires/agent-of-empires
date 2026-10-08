@@ -310,9 +310,8 @@ pub(crate) fn resolve_repo_base_selectors(
 pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
     crate::session::projects::load_merged(profile)
         .unwrap_or_else(|e| {
-            // Don't fork worktrees from the wrong base in silence: if the
-            // registry can't be read, log it so the missing per-project
-            // defaults are explainable instead of mysterious.
+            // Don't fork worktrees from the wrong base in silence: if the registry can't be read,
+            // log it so the missing per-project defaults are explainable instead of mysterious.
             tracing::warn!(
                 target: "session.create",
                 "Failed to load project registry for base-branch defaults; \
@@ -418,9 +417,7 @@ fn plan_workspace(
     let workspace_path =
         primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
 
-    // (canonicalized path, resolved base branch) for the primary repo followed
-    // by every extra repo. The primary path is left as the caller passed it;
-    // extras are canonicalized to match how they are stored/compared.
+    // (canonicalized path, resolved base branch) for the primary repo followed by every extra repo.
     let all_repos: Vec<(PathBuf, Option<String>)> =
         std::iter::once((primary.path.clone(), primary.base_branch.clone()))
             .chain(extra_repos.iter().map(|r| {
@@ -724,19 +721,15 @@ pub(crate) fn plan_instance(
             let global_default = config.worktree.default_base_branch.as_deref();
             let project_bases = project_base_branches(profile);
 
-            // An explicit per-repo base outranks every shared layer, which is
-            // the point: one repo forks from develop while the others fork from
-            // their own epic branches. See #3329.
+            // An explicit per-repo base outranks every shared layer, which is the point: one repo
+            // forks from develop while the others fork from their own epic branches.
             let mut all_paths = vec![primary_path.clone()];
             all_paths.extend(params.extra_repo_paths.iter().map(PathBuf::from));
             let per_repo = resolve_repo_base_selectors(&all_paths, &params.repo_base_branches)?;
             let base_for = |path: &PathBuf| {
                 per_repo.get(path).cloned().or_else(|| {
-                    // Every repo, including the launch repo, otherwise forks
-                    // from its own registered per-project default when no
-                    // explicit session base is given. Keyed by repo root so a
-                    // launch path inside a subdirectory still matches a
-                    // root-registered project.
+                    // Every repo, including the launch repo, otherwise forks from its own
+                    // registered per-project default when no explicit session base is given.
                     resolve_repo_base_branch(path, session_base, &project_bases, global_default)
                 })
             };
@@ -772,11 +765,8 @@ pub(crate) fn plan_instance(
         } else {
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
-                // Typed error (not a bare `bail!` string) so the web handler's
-                // whitelist forwards an actionable message instead of the
-                // opaque "Failed to create session". The context keeps the
-                // fuller tip for callers that surface the anyhow chain (CLI,
-                // TUI).
+                // Typed error (not a bare `bail!` string) so the web handler's whitelist forwards
+                // an actionable message instead of the opaque "Failed to create session".
                 return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
                     "Worktree mode requires a git repository, but this path is not one: {}\n\
                      Tip: start an in-place session (no worktree) here, or point at a git repository.",
@@ -839,17 +829,13 @@ pub(crate) fn plan_instance(
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
                 }
 
-                // One repo, so a per-repo base can only name this one. Resolved
-                // anyway rather than ignored, so a typo'd selector fails loudly
-                // instead of quietly forking from the wrong base.
+                // One repo, so a per-repo base can only name this one.
                 let per_repo = resolve_repo_base_selectors(
                     std::slice::from_ref(&main_repo_path),
                     &params.repo_base_branches,
                 )?;
-                // The launch repo otherwise forks from its registered
-                // per-project default when no explicit session base is given
-                // (then global/profile, then auto-detect). Keyed by repo root
-                // via the shared helper.
+                // The launch repo otherwise forks from its registered per-project default when no
+                // explicit session base is given (then global/profile, then auto-detect).
                 let project_bases = project_base_branches(profile);
                 let base = per_repo.get(&main_repo_path).cloned().or_else(|| {
                     resolve_repo_base_branch(
@@ -932,10 +918,7 @@ pub(crate) fn plan_instance(
     }
 
     if params.sandbox {
-        // Surface env-resolution warnings up-front. `collect_environment`
-        // silently drops entries whose host source var is unset (typo,
-        // shell sourcing gap, daemon's frozen env). Without this check
-        // the value is missing in the container with no UI signal.
+        // Surface env-resolution warnings up-front.
         let effective_env: &[String] = if params.extra_env.is_empty() {
             &config.sandbox.environment
         } else {
@@ -993,9 +976,9 @@ pub(crate) fn plan_instance(
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
             } => {
-                // Structured fork: force the structured view, seed the parent
-                // for the ACP session/fork handshake, and replay history into
-                // the (empty) event store on first connect.
+                // Structured fork: force the structured view, seed the parent for the ACP
+                // session/fork handshake, and replay history into the (empty) event store on first
+                // connect.
                 instance.view = crate::session::View::Structured;
                 instance.fork_pending = Some(parent_acp_session_id);
                 instance.import_pending = Some(true);
@@ -1251,9 +1234,8 @@ pub mod structured {
             return;
         }
         instance.view = crate::session::View::Structured;
-        // Pin the per-agent default model so the composer shows it and the
-        // session stays on it (mirrors the CLI and web create paths). The
-        // wizard sets no explicit model, so the default is the only input.
+        // Pin the per-agent default model so the composer shows it and the session stays on it
+        // (mirrors the CLI and web create paths).
         let defaults = config.acp.acp_defaults_for(&instance.tool);
         instance.agent_model = crate::session::config::resolve_spawn_model_effort(
             defaults,
@@ -1343,11 +1325,9 @@ fn resolve_worktree_branch(
     }
     Some(
         match worktree_branch.map(str::trim).filter(|b| !b.is_empty()) {
-            // Defense-in-depth: even if the frontend slug missed a forbidden
-            // char (or the caller is a CLI/API user typing a title-shaped
-            // string into the branch field), sanitise here so libgit2 never
-            // sees a value it'll reject with InvalidSpec. `/` is preserved
-            // since it's the legal namespace separator in git refs.
+            // Defense-in-depth: even if the frontend slug missed a forbidden char (or the caller is
+            // a CLI/API user typing a title-shaped string into the branch field), sanitise here so
+            // libgit2 never sees a value it'll reject with InvalidSpec.
             Some(b) => BranchSource::Explicit(git_sanitize_branch_name(b)),
             None => BranchSource::Derived(branch_name_from_title(final_title)),
         },
@@ -1378,10 +1358,9 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     }
     // Disallowed multi-char sequences: ".." and "@{".
     let mut out = out.replace("..", "-").replace("@{", "-");
-    // Strip the ".lock" suffix from every slash-separated component, not
-    // just the last one; git-check-ref-format(1) rejects any component
-    // ending in ".lock" (e.g. `foo.lock/bar` is just as invalid as
-    // `foo.lock`).
+    // Strip the ".lock" suffix from every slash-separated component, not just the last one;
+    // git-check-ref-format(1) rejects any component ending in ".lock" (e.g. `foo.lock/bar` is just
+    // as invalid as `foo.lock`).
     out = out
         .split('/')
         .map(|mut seg| {
@@ -1470,11 +1449,8 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
     let mut last_was_dash = false;
 
     let mut push_processed = |ch: char| {
-        // Preserve '/' as git's namespace separator (so a title like
-        // `jacob/feature-1` yields a branch `jacob/feature-1`). The worktree
-        // folder leaf is sanitized separately via `sanitize_branch_name`, so
-        // the slash never reaches a path. Never emit a leading, trailing, or
-        // doubled slash; trim any pending dash before it.
+        // Preserve '/' as git's namespace separator (so a title like `jacob/feature-1` yields a
+        // branch `jacob/feature-1`).
         if ch == '/' {
             while branch.ends_with('-') {
                 branch.pop();

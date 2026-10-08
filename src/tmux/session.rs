@@ -9,10 +9,7 @@ use std::time::{Duration, Instant};
 use super::{
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
-    utils::{
-        append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
-        append_window_size_args, is_pane_dead, is_pane_running_shell, PANE_ENV_FILE_PREFIX,
-    },
+    utils::{append_session_setup_args, is_pane_dead, is_pane_running_shell, PANE_ENV_FILE_PREFIX},
     SessionExistence, SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
@@ -465,14 +462,7 @@ impl Session {
             return Ok(());
         }
 
-        // tmux does not error when `-c <dir>` points at a missing directory;
-        // it silently falls back to the server's own `$HOME`, which for a
-        // long-running daemon/TUI process is wherever *it* was launched from,
-        // not this session's `project_path`. Callers (`Instance::start_with_size_opts`)
-        // already reload `project_path` from disk immediately before this call,
-        // so a missing directory here means the worktree/project itself is
-        // gone or not yet materialized, not a stale in-memory value. Fail
-        // loudly instead of silently spawning in the wrong place. See #3265.
+        // tmux silently falls back to $HOME for a missing `-c` directory.
         let working_dir_path = std::path::Path::new(working_dir);
         if !working_dir_path.is_dir() {
             bail!(
@@ -502,11 +492,7 @@ impl Session {
 
         let config = super::tmux_option_config(profile);
 
-        // Forward the inherited host env (DISPLAY, XDG_*, DBUS, ... plus every
-        // other var when `session.inherit_host_environment` is on) so an agent
-        // and any browser it launches, e.g. for OIDC, can reach the user's
-        // desktop. tmux otherwise carries only its narrow `update-environment`
-        // set plus the server's frozen base env (#3075, #3262).
+        // Forward the host desktop env so agents and browsers they open reach it.
         let inherited_env = crate::session::environment::inherited_host_env(profile);
         let mut protected_env = Vec::new();
         let mut tmux_env: Vec<(&str, &str)> = inherited_env
@@ -539,18 +525,12 @@ impl Session {
             size,
         );
         let target = format!("={}:", self.name);
-        append_remain_on_exit_args(&mut args, &target);
-        append_pane_base_index_args(&mut args, &target);
-        append_window_size_args(&mut args, &target);
-        append_tmux_setting_args(&mut args, &target, &config);
+        append_session_setup_args(&mut args, &target, &config, None);
         crate::tmux::append_session_kind_args(&mut args, &target, crate::tmux::SessionKind::Agent);
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
-        // With -d, tmux can accept a session even when the pane command will
-        // fail. Never log the full argv: the pane command can contain legacy
-        // user-configured credentials even though current launches reject or
-        // transport them out of band.
+        // Never log argv: the pane command can contain legacy credentials.
         tracing::debug!(
             target: "tmux.command",
             session = %self.name,
@@ -563,12 +543,9 @@ impl Session {
             bail!("Failed to create tmux session: {}", stderr);
         }
 
-        // Unlinking the channel is the pane's acknowledgement that it sourced
-        // the protected values and command. Keep parent cleanup ownership until
-        // then: tmux's detached create can return success before the wrapper
-        // runs.
+        // The pane unlinking the file acknowledges it; tmux `-d` can return first.
         if !env_file.wait_until_consumed(Duration::from_secs(5)) {
-            super::refresh_session_cache();
+            refresh_session_cache();
             let _ = self.kill();
             bail!("Pane did not consume its protected launch script");
         }
@@ -966,8 +943,7 @@ impl Session {
             &pane0,
             "-p",
             "-e",
-            // Trailing bg fills stay, matching the VT path (#3336); see
-            // capture_pane_with_cursor.
+            // Keep trailing bg fills, matching the VT path.
             "-N",
             "-S",
             &format!("-{}", lines),
@@ -985,10 +961,7 @@ impl Session {
             return Ok((String::new(), None));
         }
 
-        // Consume the sentinel-tagged preamble line by line; the first line
-        // that carries neither sentinel is where the capture starts. Either
-        // probe going missing costs only its own information, never a row of
-        // pane content.
+        // The first line carrying neither sentinel starts the capture.
         let raw = String::from_utf8_lossy(&output.stdout);
         let mut rest: &str = &raw;
         let mut dims: Option<(u16, u16, u16)> = None;
@@ -1167,8 +1140,7 @@ impl Session {
                 target,
                 "-p".to_string(),
                 "-e".to_string(),
-                // Trailing bg fills stay, matching the VT path (#3336); see
-                // `capture_pane_with_cursor`.
+                // Keep trailing bg fills, matching the VT path.
                 "-N".to_string(),
             ]);
         }
@@ -1195,12 +1167,7 @@ impl Session {
         if panes.is_empty() {
             return None;
         }
-        // Backstop for the zoom guard in `capture_window_composited_with_cursor`
-        // and `probe_pane_count`: if any overlapping layout still reaches here,
-        // keep the first pane of each overlapping set rather than handing the
-        // compositor a non-tiling layout it would paint as border garbage. Pane 0
-        // comes first, so the pane that survives is always the one receiving
-        // input, and the frame degrades to "pane 0 plus empty space".
+        // Backstop for zoomed layouts: keep the first of each overlapping set.
         let mut kept: Vec<CapturedPane> = Vec::with_capacity(panes.len());
         for pane in panes.drain(..) {
             if !kept.iter().any(|k| k.geom.overlaps(&pane.geom)) {
@@ -1300,10 +1267,7 @@ impl Session {
             &target,
             "-p",
             "-e",
-            // Preserve trailing spaces: a bg-styled fill running to the
-            // right edge is content the VT path keeps (row_last_col),
-            // and dropping it here makes the preview flicker whenever the
-            // two capture sources alternate (#3336).
+            // Keep trailing bg fills, matching the VT path.
             "-N",
             "-S",
             &start,
@@ -1857,7 +1821,7 @@ impl Session {
         self.refresh_owner_at_with_deadline(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id, deadline)
     }
 
-    fn tmux_format_literal(value: &str) -> String {
+    pub(super) fn tmux_format_literal(value: &str) -> String {
         let mut escaped = String::with_capacity(value.len());
         for ch in value.chars() {
             if matches!(ch, ',' | '#' | '}') {
@@ -1868,7 +1832,7 @@ impl Session {
         escaped
     }
 
-    fn tmux_command_string_literal(value: &str) -> String {
+    pub(super) fn tmux_command_string_literal(value: &str) -> String {
         let mut quoted = String::with_capacity(value.len() + 2);
         quoted.push('"');
         for ch in value.chars() {
@@ -2349,9 +2313,7 @@ impl Session {
             .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // paste-buffer's `-d` only deletes on success; on failure the
-            // buffer survives, so clean it up explicitly. Ignore errors
-            // from the cleanup so the original failure isn't masked.
+            // `-d` only deletes on success.
             let _ = crate::tmux::tmux_command()
                 .args(["delete-buffer", "-b", &buf_name])
                 .output();
@@ -2510,10 +2472,7 @@ impl EphemeralEnvFile {
         writeln!(file, "{launch}")?;
         file.flush()?;
 
-        // tmux hands its pane command to the user's configured shell. Keep that
-        // boundary to one short script invocation. The protected file contains
-        // both exports and the potentially large launch body, so neither
-        // secrets nor command contents enter tmux argv.
+        // One short script invocation; exports and the command body stay in the file.
         Ok(format!(
             "exec {} {}",
             crate::session::environment::shell_escape(&shell),
@@ -2610,11 +2569,7 @@ pub(crate) fn build_create_args(
         working_dir.to_string(),
     ];
 
-    // Explicit per-session environment (`-e KEY=VAL`). `new-session -e`
-    // requires tmux 3.2+; aoe already assumes newer tmux elsewhere (clipboard
-    // passthrough needs 3.3, the VT channel 3.4), so no extra gate is added.
-    // Set so a pane never inherits a stale value from the shared tmux server's
-    // frozen base environment; see the host-terminal call site for why.
+    // `-e` needs tmux 3.2+, already assumed elsewhere.
     for (key, value) in env {
         args.push("-e".to_string());
         args.push(format!("{key}={value}"));
@@ -2636,6 +2591,8 @@ pub(crate) fn build_create_args(
 
 #[cfg(test)]
 mod tests {
+    use crate::tmux::utils::{append_pane_base_index_args, append_remain_on_exit_args};
+
     use super::super::test_helpers::{
         only_pane_id, pane_field, wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,
     };

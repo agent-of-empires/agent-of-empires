@@ -66,9 +66,11 @@ export function jsonResponse(body: unknown, status = 200) {
 
 /** Stubs `fetch` with a spy answering `{ id: "s1" }`; call from `beforeEach` and unstub globals after. */
 export function stubFetch() {
-  const spy = vi.fn<typeof fetch>(async (_url, init) =>
-    jsonResponse(makeSession(init?.body ? JSON.parse(init.body as string) : {})),
-  );
+  const spy = vi.fn<typeof fetch>(async (url, init) => {
+    const session = makeSession(init?.body ? JSON.parse(init.body as string) : {});
+    const typedEdit = /\/api\/sessions\/[^/]+(?:\/worktree-name)?$/.test(String(url));
+    return jsonResponse(typedEdit ? { ...session, outcome: { warnings: [] } } : session);
+  });
   vi.stubGlobal("fetch", spy);
   return spy;
 }

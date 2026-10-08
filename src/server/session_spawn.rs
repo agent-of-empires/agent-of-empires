@@ -324,26 +324,16 @@ pub(crate) async fn spawn_structured_session(
                 instance.agent_name.as_deref(),
             );
             let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
-            // Preserve the explicit request model separately (trimmed to match
-            // the resolver's normalization) so a terminal fallback below can
-            // keep it while dropping any ACP-derived default; agent_model is
-            // ACP-only.
+            // Preserve the explicit request model separately (trimmed to match the
+            // resolver's normalization) so a terminal fallback below can keep it while
+            // dropping any ACP-derived default; agent_model is ACP-only.
             let explicit_model = agent_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            // A profile pin wins, else the explicit request, else the per-agent
-            // default; effort is keyed on the resolved model. Same single-source
-            // resolver the spawn path uses; persist the model here so the
-            // composer shows it and the session stays on it. See
-            // resolve_spawn_model_effort.
-            // Persist only an EXPLICIT effort, never the resolved default:
-            // `acp_effort` is a pin, and `None` means "inherit whatever the
-            // configured default resolves to at spawn time". Snapshotting the
-            // default here would freeze the session on today's value and make a
-            // later config change invisible to it. The resolved effort still
-            // reaches this session's first spawn below.
+            // A profile pin wins, else the explicit request, else the per-agent default;
+            // effort is keyed on the resolved model.
             let explicit_effort = agent_effort
                 .as_deref()
                 .map(str::trim)
@@ -357,10 +347,7 @@ pub(crate) async fn spawn_structured_session(
                 );
             instance.agent_model = resolved_model;
             instance.acp_effort = explicit_effort;
-            // Don't trust the client's capability decision. Re-resolve
-            // whether this agent can actually run in structured view; a custom
-            // agent without an `agent_acp_cmd` (or any non-ACP tool)
-            // falls back to tmux here rather than erroring at spawn time.
+            // Don't trust the client's capability decision.
             if instance.is_structured() {
                 let resolved = instance
                     .agent_name
@@ -368,22 +355,15 @@ pub(crate) async fn spawn_structured_session(
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
                 let resolved_session = &resolved_config.session;
-                // Check the resolved agent key AND the raw tool, the same pair
-                // `aoe add`'s precondition uses. Checking only `tool` for the
-                // `agent_acp_cmd` / inheritance legs downgraded a session that
-                // `agent_is_acp_capable` had already accepted as Structured,
-                // whenever `agent_name` differed from `tool` (a custom agent,
-                // or a wrapper inheriting a registry base), and the downgrade
-                // also cleared its pending markers.
+                // Check the resolved agent key AND the raw tool, the same pair `aoe add`'s
+                // precondition uses.
                 let acp_capable_key = |key: &str| {
                     acp_registry.get(key).is_some()
                         || resolved_session
                             .agent_acp_cmd
                             .get(key)
                             .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(key, cmd).is_ok())
-                        // A custom agent that inherits a registry-backed base
-                        // (e.g. a Claude wrapper) is structured-capable through
-                        // the base adapter; keep the requested Structured view.
+                        // A custom agent that inherits a registry-backed base (e.g.
                         || crate::acp::inherited_acp_base(key, &resolved_session.agent_detect_as)
                             .is_some()
                 };
@@ -392,11 +372,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.view = crate::session::View::Structured;
                 } else {
                     instance.view = crate::session::View::Terminal;
-                    // A non-ACP tool cannot run the structured session/fork
-                    // handshake. If a malformed request seeded a structured
-                    // fork (fork_pending/import_pending set by the builder),
-                    // drop those markers so a later switch-to-structured does
-                    // not fire an unexpected session/fork against the parent.
+                    // A non-ACP tool cannot run the structured session/fork handshake.
                     instance.fork_pending = None;
                     instance.import_pending = None;
                 }
@@ -686,9 +662,7 @@ pub(crate) async fn spawn_structured_session(
             };
             let response_instance = instance.clone();
 
-            // Count the create for the opt-in telemetry trend counter. Bounded
-            // accumulator, read-and-decremented by the snapshot loop; no-op for
-            // opted-out installs (the snapshot is never built / sent).
+            // Count the create for the opt-in telemetry trend counter.
             service
                 .telemetry_session_creates
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

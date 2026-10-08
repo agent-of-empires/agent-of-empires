@@ -254,45 +254,22 @@ pub fn resolve_conflict(
         return Ok(ResolveStatus::Stale);
     }
 
-    // Phase 1, under the store lock: re-verify the snapshot still holds the
-    // previous side the caller resolved against (closing the window between the
-    // caller's reconcile and this write), re-baseline it, and report whether the
-    // AoE side must still be promoted to global.
-    enum Decision {
-        Stale,
-        Applied { promote: Option<ProjectMcpServer> },
-    }
+    // Recheck and rebaseline under the sidecar lock. None is stale; Some(None)
+    // means a native win, while Some(Some(def)) promotes the previous AoE value.
     let decision = with_locked_state(|state| {
-        let Some(snap) = state
-            .native_snapshots
-            .get(&conflict.agent)
-            .and_then(|m| m.get(&name))
-        else {
-            return Decision::Stale;
-        };
-        if snap != &conflict.previous {
-            return Decision::Stale;
-        }
-        let promote = match winner {
-            ConflictWinner::Aoe => Some(snap.clone()),
-            ConflictWinner::Native => None,
-        };
-        // Re-baseline to the native definition so subsequent diffs compare
-        // against the now-known state and the conflict does not re-surface.
-        state
-            .native_snapshots
-            .get_mut(&conflict.agent)
-            .expect("snapshot present: looked up above under the same lock")
-            .insert(name.clone(), conflict.current.clone());
-        Decision::Applied { promote }
+        let snapshot = state.native_snapshots.get_mut(&conflict.agent)?;
+        let previous = snapshot
+            .get(&name)
+            .filter(|previous| *previous == &conflict.previous)?;
+        let promote = (winner == ConflictWinner::Aoe).then(|| previous.clone());
+        snapshot.insert(name.clone(), conflict.current.clone());
+        Some(promote)
     })?;
 
     match decision {
-        Decision::Stale => Ok(ResolveStatus::Stale),
-        Decision::Applied { promote } => {
-            // Promote AoE's definition into the global mcp.json (a separate
-            // locked file) only after the snapshot re-baseline committed, so a
-            // stale resolution never writes global.
+        None => Ok(ResolveStatus::Stale),
+        Some(promote) => {
+            // Publish globally only after the locked snapshot write commits.
             if let Some(def) = promote {
                 super::mcp_overrides::upsert_global_server(&def)?;
             }

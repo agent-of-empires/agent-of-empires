@@ -500,9 +500,7 @@ impl Instance {
         {
             return Some(ResumeStaticUnavailable::Command);
         }
-        // Copilot publishes no identity in any environment, so a sandbox has
-        // nothing of its own to resume. An explicit pin still names a
-        // conversation and is attempted against this instance's own store.
+        // Copilot publishes no identity, so only an explicit pin names a sandbox conversation.
         if agent.name == "copilot"
             && self.is_sandboxed()
             && !matches!(self.resume_intent, ResumeIntent::Use(_))
