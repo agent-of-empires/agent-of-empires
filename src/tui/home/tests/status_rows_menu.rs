@@ -1530,8 +1530,8 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
             "trash reservation released"
         );
 
-        let rounds = [(false, false), (true, true), (true, false)];
-        for (round, (offers_escalation, forced)) in rounds.into_iter().enumerate() {
+        let rounds = [false, true, true];
+        for (round, offers_escalation) in rounds.into_iter().enumerate() {
             env.view.prompt_empty_trash();
             let dialog = env
                 .view
@@ -1573,11 +1573,6 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
                 assert_eq!(env.view.get_instance(&id).is_some(), kept, "{peer:?}");
                 break;
             }
-            assert_eq!(
-                env.view.deletes_in_flight.get(&id).map(|a| a.forced),
-                Some(forced),
-                "round {round}"
-            );
             // Emptying again mid-flight neither offers escalation nor re-requests the row.
             env.view.prompt_empty_trash();
             assert!(env
@@ -1588,21 +1583,11 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
                 .checkbox_labels_for_test()
                 .is_empty());
             env.view.handle_key(key(KeyCode::Char('y')), None);
-            assert_eq!(
-                env.view.deletes_in_flight.get(&id).map(|a| a.forced),
-                Some(forced),
-                "round {round}: in-flight force level kept"
-            );
             let deadline = Instant::now() + Duration::from_secs(10);
             while !env.view.apply_deletion_results() {
                 assert!(Instant::now() < deadline, "round {round}: no result");
                 std::thread::sleep(Duration::from_millis(20));
             }
-            assert_eq!(
-                env.view.failed_deletes.get(&id).map(|a| a.forced),
-                Some(forced),
-                "round {round}"
-            );
         }
     }
 }

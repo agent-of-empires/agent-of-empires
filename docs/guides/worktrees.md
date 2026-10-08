@@ -74,6 +74,8 @@ Once teardown is quiescent, Trash relocates the managed checkout into a sibling 
 
 Checkout relocation and destructive cleanup require proof that the recorded runner process groups have exited. A `Stopped` row, a terminal-view selection, or a missing worker registry is not that proof. When teardown is pending, aoe retains the session and checkout; retry after the recorded executions exit. Cancelling your own pending Trash request does not move the checkout. Force does not bypass the quiescence guard.
 
+TUI Force Remove and removal-without-cleanup retries run independently of queued deletions. They are not immediate sidebar removal: original physical storage and confirmed teardown are still required, and refusal retains the session.
+
 Cleanup checks every physical profile for sessions using the same checkout or an overlapping workspace, including readable aliases to stores outside the profiles directory. Both ancestor and descendant claims retain a checkout, so deleting a child beneath another session's workspace is conservative. Aliases to missing targets own no rows; unreadable ownership data retains the checkout rather than assuming it is unused.
 
 Checkout ownership uses the required identity, path and lifecycle-claim fields, not display metadata. A malformed title or status does not hide a checkout. Duplicate session IDs contribute the union of their claims and cannot be excluded as the owner being deleted; unreadable or ambiguous claim fields retain the checkout.

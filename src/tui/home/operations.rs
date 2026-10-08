@@ -959,20 +959,28 @@ impl HomeView {
     }
 
     pub(super) fn request_deletion(&mut self, request: DeletionRequest) {
-        self.deletes_in_flight.insert(
-            request.session_id.clone(),
-            super::DeleteAttempt {
-                forced: request.force_delete,
-                trashed_at: request.instance.trashed_at,
-            },
-        );
-        self.deletion_poller.request_deletion(request);
+        let pending = match super::PendingDeletion::capture(&request.instance, request.force_delete)
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new("Delete refused", &format!("{error:#}")));
+                return;
+            }
+        };
+        let request_id = self.deletion_poller.request_deletion(request);
+        self.deletes_in_flight.insert(request_id, pending);
+    }
+
+    fn has_delete_in_flight(&self, session_id: &str) -> bool {
+        self.deletes_in_flight
+            .values()
+            .any(|pending| pending.session_id == session_id)
     }
 
     /// Whether a trashed row's last delete was forced, when it failed in the row's current
     /// trash lifecycle and no other delete for it is in flight.
     pub(super) fn failed_delete_forced(&self, inst: &Instance) -> Option<bool> {
-        if self.deletes_in_flight.contains_key(&inst.id) {
+        if self.has_delete_in_flight(&inst.id) {
             return None;
         }
         self.failed_deletes
@@ -983,15 +991,16 @@ impl HomeView {
 
     /// Retain filesystem artifacts while the canonical Purge worker settles the original.
     fn drop_failed_trashed_session(&mut self, inst: &Instance) {
-        self.deletes_in_flight.insert(
-            inst.id.clone(),
-            super::DeleteAttempt {
-                forced: true,
-                trashed_at: inst.trashed_at,
-            },
-        );
+        let pending = match super::PendingDeletion::capture(inst, true) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new("Delete refused", &format!("{error:#}")));
+                return;
+            }
+        };
         self.set_instance_status(&inst.id, Status::Deleting);
-        self.deletion_poller.request_drop(inst.clone());
+        let request_id = self.deletion_poller.request_drop(inst.clone());
+        self.deletes_in_flight.insert(request_id, pending);
     }
 
     pub(super) fn group_has_managed_worktrees(
@@ -2404,11 +2413,8 @@ impl HomeView {
         }
         for inst in trashed {
             let id = inst.id.clone();
-            // A restart cascade still on the worker would race the teardown against the
-            // container it is creating; skip the row, as `delete_selected` does. A second
-            // delete would also overwrite the force level tracked for the first.
-            if self.restart_in_flight.contains_key(&id) || self.deletes_in_flight.contains_key(&id)
-            {
+            // Do not race teardown with a restart or another pending delete.
+            if self.restart_in_flight.contains_key(&id) || self.has_delete_in_flight(&id) {
                 continue;
             }
             let force_delete = match self.failed_delete_forced(&inst) {

@@ -6,16 +6,46 @@ impl HomeView {
     pub fn apply_deletion_results(&mut self) -> bool {
         use crate::session::deletion::DeletionDisposition;
         use crate::session::Status;
-        use std::sync::mpsc::TryRecvError;
 
         match self.deletion_poller.try_recv_result() {
-            Ok(result) => {
-                let attempt = self.deletes_in_flight.remove(&result.session_id);
+            Some(Ok(done)) => {
+                let Some(pending) = self.deletes_in_flight.remove(&done.request_id) else {
+                    return false;
+                };
+                let result = done.result;
+                if result.session_id != pending.session_id {
+                    return true;
+                }
+                let current_matches =
+                    self.instances
+                        .get(&pending.session_id)
+                        .is_some_and(|current| {
+                            pending.matches(current)
+                                || (pending.created_at == current.created_at
+                                    && current.storage_origin.as_ref().is_some_and(|storage| {
+                                        pending.origin.storage.same_origin_as(storage)
+                                    })
+                                    && result.retained_release_matches(current))
+                        });
+                if !current_matches {
+                    return true;
+                }
+                let still_pending = self
+                    .deletes_in_flight
+                    .values()
+                    .any(|other| other.session_id == pending.session_id);
+                if still_pending
+                    && matches!(
+                        result.disposition,
+                        DeletionDisposition::Failed | DeletionDisposition::Busy
+                    )
+                {
+                    tracing::warn!(target: "tui.home", session = %pending.session_id, errors = ?result.errors, "delete result retained while another original request is pending");
+                    return true;
+                }
                 if result.disposition == DeletionDisposition::Failed {
-                    if let Some(attempt) = attempt {
-                        self.failed_deletes
-                            .insert(result.session_id.clone(), attempt);
-                    }
+                    self.failed_deletes
+                        .insert(result.session_id.clone(), pending.attempt);
                 } else {
                     self.failed_deletes.remove(&result.session_id);
                 }
@@ -87,14 +117,24 @@ impl HomeView {
                 }
                 true
             }
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                let stuck: Vec<String> = self
-                    .instances
-                    .values()
-                    .filter(|instance| instance.status == Status::Deleting)
-                    .map(|instance| instance.id.clone())
-                    .collect();
+            None => false,
+            Some(Err(ids)) => {
+                let mut stuck = Vec::new();
+                for request_id in ids {
+                    let Some(pending) = self.deletes_in_flight.remove(&request_id) else {
+                        continue;
+                    };
+                    if !self
+                        .deletes_in_flight
+                        .values()
+                        .any(|other| other.session_id == pending.session_id)
+                        && self.instances.get(&pending.session_id).is_some_and(|row| {
+                            pending.matches(row) && row.status == Status::Deleting
+                        })
+                    {
+                        stuck.push(pending.session_id);
+                    }
+                }
                 if stuck.is_empty() {
                     return false;
                 }

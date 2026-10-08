@@ -5263,8 +5263,8 @@ impl HomeView {
                 }
                 if inst.status == Status::Deleting {
                     let message = format!(
-                        "'{}' is stuck deleting. Force remove it from the session list? \
-                         (the sandbox container is torn down; worktrees and branches will not be cleaned up)",
+                        "Retry force removal of '{}' independently of queued deletions? \
+                         Worktrees and branches are kept. Removal still requires confirmed agent teardown.",
                         inst.title
                     );
                     self.pending_force_remove_session = Some(session_id.clone());

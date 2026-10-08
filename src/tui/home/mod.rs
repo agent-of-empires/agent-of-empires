@@ -90,6 +90,36 @@ pub(super) struct DeleteAttempt {
     pub(super) trashed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+pub(super) struct PendingDeletion {
+    session_id: String,
+    attempt: DeleteAttempt,
+    origin: RequestOrigin,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PendingDeletion {
+    fn capture(instance: &Instance, forced: bool) -> anyhow::Result<Self> {
+        Ok(Self {
+            session_id: instance.id.clone(),
+            attempt: DeleteAttempt {
+                forced,
+                trashed_at: instance.trashed_at,
+            },
+            origin: RequestOrigin {
+                storage: instance.original_storage()?,
+                generation: instance.lifecycle_generation,
+            },
+            created_at: instance.created_at,
+        })
+    }
+
+    fn matches(&self, instance: &Instance) -> bool {
+        self.session_id == instance.id
+            && self.created_at == instance.created_at
+            && self.origin.matches(instance)
+    }
+}
+
 pub(super) struct GroupRenameContext {
     pub(super) old_path: String,
     pub(super) old_profile: String,
@@ -320,7 +350,7 @@ pub struct HomeView {
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 
     pub(super) deletion_poller: DeletionPoller,
-    pub(super) deletes_in_flight: HashMap<String, DeleteAttempt>,
+    pub(super) deletes_in_flight: HashMap<u64, PendingDeletion>,
     /// Each session's last failed deletion, so Empty Trash can escalate: a failed delete
     /// is offered a forced retry, a failed forced delete removal from aoe without cleanup.
     pub(super) failed_deletes: HashMap<String, DeleteAttempt>,
