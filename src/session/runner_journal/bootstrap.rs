@@ -400,29 +400,37 @@ mod tests {
                 fences[1].as_fd(),
                 fences[2].as_fd(),
             ],
-        )?;
-        let [received_profile, workspace, identity, lifecycle] = receive_descriptors(&receiver)?;
+        )
+        .context("sending original descriptors")?;
+        let [received_profile, workspace, identity, lifecycle] =
+            receive_descriptors(&receiver).context("receiving original descriptors")?;
         assert_eq!(
             DirectoryIdentity::from_metadata(&File::from(received_profile).metadata()?),
             DirectoryIdentity::from_metadata(&profile.metadata()?)
         );
         for fd in [&workspace, &identity, &lifecycle] {
-            assert!(nix::fcntl::FdFlag::from_bits_truncate(nix::fcntl::fcntl(
-                fd,
-                nix::fcntl::FcntlArg::F_GETFD
-            )?)
+            assert!(nix::fcntl::FdFlag::from_bits_truncate(
+                nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD)
+                    .context("reading received descriptor flags")?
+            )
             .contains(nix::fcntl::FdFlag::FD_CLOEXEC));
         }
         drop([workspace, identity, lifecycle]);
         for name in ["workspace", "identity", "lifecycle"] {
             assert!(
-                crate::session::try_acquire_storage_flock(directory.path(), name)?.is_none(),
+                crate::session::try_acquire_storage_flock(directory.path(), name)
+                    .context("checking retained issuer fence")?
+                    .is_none(),
                 "received close must not unlock the issuer's OFD"
             );
         }
         drop(fences);
         for name in ["workspace", "identity", "lifecycle"] {
-            assert!(crate::session::try_acquire_storage_flock(directory.path(), name)?.is_some());
+            assert!(
+                crate::session::try_acquire_storage_flock(directory.path(), name)
+                    .context("checking released issuer fence")?
+                    .is_some()
+            );
         }
 
         let (transferred, mut peer) = UnixStream::pair()?;
@@ -433,12 +441,15 @@ mod tests {
             &[ControlMessage::ScmRights(&descriptors)],
             MsgFlags::empty(),
             None,
-        )?;
+        )
+        .context("sending oversized descriptor transfer")?;
         drop(transferred);
         assert!(receive_descriptors(&receiver).is_err());
-        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .context("setting close-witness deadline")?;
         assert_eq!(
-            peer.read(&mut [0])?,
+            peer.read(&mut [0])
+                .context("reading rejected-transfer close witness")?,
             0,
             "rejected SCM_RIGHTS must leave no socket descriptor open"
         );
