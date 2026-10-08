@@ -327,7 +327,7 @@ async function handlePrompt(params, client) {
     if (cursor === 0) {
       await notify({
         sessionUpdate: "usage_update", used: 1234, size: 200000,
-        _meta: { "_claude/rateLimit": { status: "rejected", resetsAt: Math.floor(Date.now() / 1000) - 60 } },
+        _meta: { "_claude/rateLimit": { status: "rejected", resetsAt: Math.floor(Date.now() / 1000) + 10 } },
       });
       throw acp.RequestError.internalError({ errorKind: "rate_limit" }, "usage limit reached");
     }
