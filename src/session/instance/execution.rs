@@ -291,6 +291,10 @@ impl NativeExecution {
         command
             .current_dir(&self.inputs.cwd)
             .env_clear()
+            .envs(
+                std::env::vars_os()
+                    .filter(|(key, value)| key.to_str().is_none() || value.to_str().is_none()),
+            )
             .envs(&self.inputs.environment);
         for (key, value) in &self.routing {
             if let Some(value) = value {

@@ -7,8 +7,7 @@
 //! environment and reaped once the fork returns, and the id it mints has to
 //! reach the launch command line.
 //!
-//! Isolated fake frontends also check that login startup cannot change the
-//! selected generation or the captured environment.
+//! Isolated frontends check login parity and managed conversation snapshots.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -357,11 +356,27 @@ fn opencode_store_fork_refuses_rather_than_starting_unforked() {
 
 #[test]
 #[parallel]
-fn opencode_launch_retains_frozen_environment_after_login_startup() {
+fn opencode_host_launch_preserves_login_or_managed_environment() {
     require_tmux!();
     require_python3!();
-    for mode in ["current", "legacy", "wrapper"] {
-        let mut h = TuiTestHarness::new("opencode_frozen_environment");
+    use std::os::unix::ffi::OsStrExt;
+    for (mode, managed) in [
+        ("current", false),
+        ("legacy", false),
+        ("external", false),
+        ("current", true),
+        ("legacy", true),
+        ("wrapper", true),
+    ] {
+        let mut h = TuiTestHarness::new("opencode_host_environment");
+        if managed {
+            let database = h.home_path().join("store.db");
+            rusqlite::Connection::open(&database).unwrap();
+            h.set_env("OPENCODE_DB", database.as_os_str());
+        } else {
+            h.set_env("OPENCODE_DB", "");
+            h.set_env("OPENCODE_DISABLE_CHANNEL_DB", "0");
+        }
         h.append_config(
             "[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false",
         );
@@ -383,6 +398,11 @@ fn opencode_launch_retains_frozen_environment_after_login_startup() {
         h.set_env("BASH_FUNC_aoe_probe%%", "() { :; }");
         h.set_env("TMUX_PANE", "%parent");
         h.set_env("OPENCODE_PERMISSION", "captured-user-policy");
+        h.set_env("AOE_RAW_VALUE", std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+        h.set_env(
+            std::ffi::OsStr::from_bytes(b"AOE_RAW_\xff"),
+            std::ffi::OsStr::from_bytes(b"\xfe\xfd"),
+        );
         for directory in [&bin, &wrong] {
             let legacy = (mode == "legacy") != (directory == &wrong);
             let help = if legacy { "--fork" } else { "--auto" };
@@ -394,7 +414,7 @@ if sys.argv[1:] == ['--help']:
 def opened(fd):
     try: os.fstat(fd); return True
     except OSError: return False
-record = dict(program=os.path.abspath(__file__), cwd=os.getcwd(), argv=sys.argv[1:], environment=dict(os.environ), tty=os.isatty(0), descriptors=[opened(3), opened(4)])
+record = dict(program=os.path.abspath(__file__), cwd=os.getcwd(), argv=sys.argv[1:], environment=dict((k,v) for k,v in os.environ.items() if not k.startswith('AOE_RAW')), raw=[os.environb.get(b'AOE_RAW_VALUE', b'').hex(), os.environb.get(b'AOE_RAW_\xff', b'').hex()], tty=os.isatty(0), descriptors=[opened(3), opened(4)])
 with open({output:?}, 'w') as f: json.dump(record, f)
 for line in sys.stdin: pass
 "#,
@@ -409,10 +429,10 @@ for line in sys.stdin: pass
             }
         }
         fs::write(h.home_path().join(".bash_profile"), format!(
-            "export PATH={}:{}\nexport LOGIN_GENERATION=wrong\nexport {added}=added\nexport PRIVATE_EXEC_TOKEN=wrong\nexport LOGIN_ENGINE={}\ncd /\n",
+            "export PATH={}:{}\nexport LOGIN_GENERATION=login\nexport {added}=added\nexport OPENAI_API_KEY=dummy-login-key\nexport SSH_AUTH_SOCK=/login/agent.sock\nexport HTTPS_PROXY=http://login.invalid\nexport PRIVATE_EXEC_TOKEN=login-secret\nexport LOGIN_ENGINE={}\ncd /\n",
             wrong.display(), std::env::var("PATH").unwrap_or_default(), wrong.join("engine").display(),
         )).unwrap();
-        let command = if mode == "wrapper" {
+        let command = if mode == "external" {
             "opencode --session external"
         } else {
             "opencode"
@@ -442,15 +462,32 @@ for line in sys.stdin: pass
                 .unwrap()
         );
         let env = &record["environment"];
-        assert_eq!(env["LOGIN_GENERATION"], "captured");
-        assert_eq!(env["PRIVATE_EXEC_TOKEN"], "dummy-frozen-secret");
-        assert_eq!(env["AOE.test-key"], "line1\nline2 '\"$");
-        assert_eq!(env["BASH_FUNC_aoe_probe%%"], "() { :; }");
-        assert!(env.get(&added).is_none());
+        if managed {
+            assert_eq!(env["LOGIN_GENERATION"], "captured");
+            assert_eq!(env["PRIVATE_EXEC_TOKEN"], "dummy-frozen-secret");
+            assert_eq!(env["AOE.test-key"], "line1\nline2 '\"$");
+            assert_eq!(env["BASH_FUNC_aoe_probe%%"], "() { :; }");
+            assert!(env.get(&added).is_none());
+            assert_eq!(record["raw"], serde_json::json!(["fffe", "fefd"]));
+        } else {
+            assert_eq!(env["LOGIN_GENERATION"], "login");
+            assert_eq!(env["PRIVATE_EXEC_TOKEN"], "login-secret");
+            assert_eq!(env["OPENAI_API_KEY"], "dummy-login-key");
+            assert_eq!(env["SSH_AUTH_SOCK"], "/login/agent.sock");
+            assert_eq!(env["HTTPS_PROXY"], "http://login.invalid");
+            assert_eq!(env[&added], "added");
+            assert!(env["PATH"]
+                .as_str()
+                .unwrap()
+                .starts_with(wrong.to_str().unwrap()));
+            assert_eq!(record["raw"][0], "fffe");
+        }
         assert_ne!(env["TMUX_PANE"], "%parent");
         assert!(env["TMUX_PANE"].as_str().unwrap().starts_with('%'));
         assert_eq!(record["tty"], true);
-        assert_eq!(record["descriptors"], serde_json::json!([false, false]));
+        if managed {
+            assert_eq!(record["descriptors"], serde_json::json!([false, false]));
+        }
         let argv = record["argv"].as_array().unwrap();
         assert_eq!(argv.iter().any(|arg| arg == "--auto"), mode != "legacy");
         if mode == "legacy" {
@@ -458,7 +495,7 @@ for line in sys.stdin: pass
         } else {
             assert_eq!(env["OPENCODE_PERMISSION"], "captured-user-policy");
         }
-        if mode == "wrapper" {
+        if mode == "external" {
             assert_eq!(
                 record["argv"],
                 serde_json::json!(["--session", "external", "--auto"])

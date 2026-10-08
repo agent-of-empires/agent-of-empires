@@ -405,17 +405,17 @@ fn wrap_bound_opencode_command(
     script.push_str("stty susp undef\nset --");
     let mut environment = Vec::with_capacity(snapshot.get_envs().size_hint().0);
     for (key, value) in snapshot.get_envs() {
-        let key = key
-            .to_str()
-            .context("OpenCode environment key is not UTF-8")?;
-        if crate::process::LIVE_PANE_ENV_KEYS.contains(&key) {
+        if crate::process::LIVE_PANE_ENV_KEYS
+            .iter()
+            .any(|live| key == std::ffi::OsStr::new(live))
+        {
             continue;
         }
         if let Some(value) = value {
-            let value = value
-                .to_str()
-                .context("OpenCode environment value is not UTF-8")?;
-            environment.push((key, value));
+            environment.push((
+                crate::process::frozen_environment_value(key),
+                crate::process::frozen_environment_value(value),
+            ));
         }
     }
     // These values belong to the new pane, not the process preparing it.
@@ -434,7 +434,8 @@ fn wrap_bound_opencode_command(
         environment,
     })?;
     let delimiter = heredoc_delimiter(&payload, "AOE_FROZEN_ENV");
-    let executable = std::env::current_exe()?;
+    let executable = crate::process::executable_for_native_launch()
+        .context("resolving AoE executable for native launch")?;
     let executable = executable
         .to_str()
         .context("AoE executable path is not UTF-8")?;
@@ -1200,7 +1201,10 @@ impl Instance {
                         raw_command
                     };
                     Ok(LaunchCommandParts {
-                        command: if let Some(snapshot) = host_command.as_ref() {
+                        command: if let Some(snapshot) = host_command
+                            .as_ref()
+                            .filter(|_| execution.is_some() || self.agent_session_id.is_some())
+                        {
                             Some(wrap_bound_opencode_command(
                                 &command,
                                 &self.project_path,
@@ -1269,7 +1273,10 @@ impl Instance {
                 raw_command
             };
             Ok(LaunchCommandParts {
-                command: if let Some(snapshot) = host_command.as_ref() {
+                command: if let Some(snapshot) = host_command
+                    .as_ref()
+                    .filter(|_| execution.is_some() || self.agent_session_id.is_some())
+                {
                     Some(wrap_bound_opencode_command(
                         &command,
                         &self.project_path,

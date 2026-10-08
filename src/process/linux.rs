@@ -6,18 +6,31 @@ use std::fs;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-pub(super) fn close_frozen_payload() -> std::io::Result<()> {
-    nix::unistd::close(4).map_err(std::io::Error::from)
-}
-
-pub(super) fn exec_command(command: &mut Command) -> std::io::Error {
-    use std::os::unix::process::CommandExt;
-    command.exec()
-}
-
 pub(super) use super::unix::{
-    configure_process_group, kill_process_group, terminate_process_group,
+    close_frozen_payload, configure_process_group, exec_command, kill_process_group,
+    restore_environment_value, terminate_process_group,
 };
+
+pub(super) fn launch_executable(
+    executable: std::path::PathBuf,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if executable.try_exists()? {
+        return Ok(executable);
+    }
+    let replacement = executable
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(b" (deleted)")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "AoE executable is unavailable",
+            )
+        })?;
+    which::which(Path::new(std::ffi::OsStr::from_bytes(replacement)))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))
+}
 pub(super) fn rename_exclusive(
     source_dir: &std::os::fd::OwnedFd,
     source: &std::ffi::OsStr,
@@ -411,6 +424,23 @@ impl super::SleepInhibit for SystemdInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_executable_recovers_only_deleted_paths_with_a_live_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("aoe");
+        let deleted = directory.path().join("aoe (deleted)");
+        assert!(launch_executable(deleted.clone()).is_err());
+        fs::write(&installed, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(launch_executable(deleted.clone()).unwrap(), installed);
+        fs::write(&deleted, "#!/bin/sh\n").unwrap();
+        assert_eq!(launch_executable(deleted.clone()).unwrap(), deleted);
+        fs::remove_file(&deleted).unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(launch_executable(deleted).is_err());
+    }
 
     #[test]
     fn test_parse_stat_field() {
