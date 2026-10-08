@@ -328,6 +328,14 @@ mod tests {
                 ],
             ),
             (
+                "progress during compaction keeps floor",
+                vec![
+                    At(0, L::CompactionStarted),
+                    At(S, L::Progress),
+                    Off(Some(K::Compaction)),
+                ],
+            ),
+            (
                 "terminal usage clears compaction floor",
                 vec![
                     At(0, L::CompactionStarted),

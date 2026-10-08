@@ -67,7 +67,11 @@ pub(super) fn classify_lifecycle_signal(update: &SessionUpdate) -> Option<Lifecy
         SessionUpdate::CompactionUpdate(u) => Some(match u.status {
             CompactionStatus::InProgress => LifecycleSignal::CompactionStarted,
             CompactionStatus::Completed => LifecycleSignal::CompactionCompleted,
-            _ => LifecycleSignal::CompactionFailed,
+            CompactionStatus::Failed | CompactionStatus::Cancelled => {
+                LifecycleSignal::CompactionFailed
+            }
+            // Custom and future statuses (`paused`) keep the compaction open.
+            _ => LifecycleSignal::Progress,
         }),
         SessionUpdate::AgentThoughtChunk(_)
         | SessionUpdate::Plan(_)
@@ -360,9 +364,10 @@ mod tests {
                 "CompactionFailed",
             ),
             (
-                compaction_update("c", "cancelled", none),
+                compaction_update("c", "cancelled", none.clone()),
                 "CompactionFailed",
             ),
+            (compaction_update("c", "paused", none), "Progress"),
             (compaction_chunk("c", "summary"), "Progress"),
         ];
         for (update, expected) in typed {

@@ -127,7 +127,15 @@ impl CompactionTracker {
                 }
                 CompactionFold::Pass
             }
-            SessionUpdate::CompactionUpdate(u) => {
+            // Custom and future statuses (`paused`) leave the compaction open.
+            SessionUpdate::CompactionUpdate(u)
+                if matches!(
+                    u.status,
+                    CompactionStatus::Completed
+                        | CompactionStatus::Failed
+                        | CompactionStatus::Cancelled
+                ) =>
+            {
                 if !self.terminal.insert(u.compaction_id.clone()) {
                     return compaction_summary_event(&u.compaction_id, &u.summary)
                         .map_or(CompactionFold::Skip, |e| CompactionFold::Patch(Box::new(e)));
@@ -823,6 +831,17 @@ mod tests {
                 vec![start(), compaction_update("a", "cancelled", none())],
                 started(&[]),
                 vec![],
+            ),
+            (
+                vec![
+                    start(),
+                    compaction_chunk("a", "one"),
+                    compaction_update("a", "paused", none()),
+                    compaction_chunk("a", " two"),
+                    done(none()),
+                ],
+                started(&ok),
+                vec!["one two"],
             ),
             (
                 vec![compaction_update("b", "completed", summary("kept"))],
