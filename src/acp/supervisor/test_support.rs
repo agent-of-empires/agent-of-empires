@@ -33,6 +33,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle).adopt_for_stop(session_id);
     }
 
+    pub(crate) async fn test_hold_worker_map(&self) -> impl Send + 'static {
+        self.workers.clone().lock_owned().await
+    }
+
     /// Reports each session a `wait_for_worker` call starts parking on.
     pub(crate) fn watch_worker_waits(&self) -> broadcast::Receiver<String> {
         self.worker_waits.subscribe()
@@ -600,6 +604,6 @@ pub(super) fn reserve(
 ) -> ResumeReservation {
     match outcome.expect("begin_resume must not error") {
         ResumeReservationOutcome::Reserved(r) => r,
-        ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        ResumeReservationOutcome::AlreadyPresent(_) => panic!("expected a fresh reservation"),
     }
 }

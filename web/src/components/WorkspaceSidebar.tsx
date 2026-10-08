@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
-import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "../lib/types";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
@@ -70,6 +70,7 @@ interface Props {
   onEditProject: (project: ProjectInfo) => void;
   onRemoveProject: (group: RepoGroup) => void;
   onSettings: () => void;
+  onApplySession: (session: SessionResponse) => void;
   onDeleteSession?: (sessionIds: string[]) => void;
   /** Receives every session id of the trashed workspace. */
   onRestoreSession?: (sessionIds: string[]) => void;
@@ -134,7 +135,7 @@ export function WorkspaceSidebar(props: Props) {
   const isOrgAxis = axis === "org";
 
   const allWorkspaces = useMemo(() => uniqueWorkspaces(groups), [groups]);
-  const triage = useSidebarTriage(allWorkspaces);
+  const triage = useSidebarTriage(allWorkspaces, props.onApplySession);
   const orderedIds = useMemo(
     () => renderedOrder(filteredGroups, hasFilter, sunkExpanded),
     [filteredGroups, hasFilter, sunkExpanded],

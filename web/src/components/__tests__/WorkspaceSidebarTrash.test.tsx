@@ -52,6 +52,7 @@ function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
     onEditProject: noop,
     onRemoveProject: noop,
     onSettings: noop,
+    onApplySession: vi.fn(),
     onRestoreSession: vi.fn(),
     onDeleteSession: vi.fn(),
     onEmptyTrash: vi.fn(),

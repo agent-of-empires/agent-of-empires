@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useRef, type ReactNode } from "react";
+import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { vi } from "vitest";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
@@ -91,10 +91,22 @@ interface RowOptions {
 
 /** A single unselected SessionRow wired to the real triage hook, as the sidebar wires it. */
 function Row({ ws, readOnly, isActive = false, onCreateSession }: RowOptions & { ws: Workspace }) {
-  const triage = useSidebarTriage(useMemo(() => [ws], [ws]));
+  const [current, setCurrent] = useState(ws);
+  const [tracked, setTracked] = useState(ws);
+  if (ws !== tracked) {
+    setTracked(ws);
+    setCurrent(ws);
+  }
+  const applySession = useCallback((session: SessionResponse) => {
+    setCurrent((prev) => ({ ...prev, sessions: prev.sessions.map((row) => (row.id === session.id ? session : row)) }));
+  }, []);
+  const triage = useSidebarTriage(
+    useMemo(() => [current], [current]),
+    applySession,
+  );
   return (
     <SessionRow
-      workspace={ws}
+      workspace={current}
       isActive={isActive}
       isSelected={false}
       onActivate={() => {}}

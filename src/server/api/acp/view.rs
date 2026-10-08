@@ -343,7 +343,7 @@ fn spawn_enabled_worker(
             Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => {
                 reservation
             }
-            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => return,
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(_)) => return,
             Err(error) => {
                 supervisor.publish_startup_error(&session_id, error.to_string());
                 return;

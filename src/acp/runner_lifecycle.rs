@@ -1315,6 +1315,15 @@ impl LifecycleTable {
             .flatten()
     }
 
+    pub(crate) fn present_admission(&self, id: &str) -> Option<(Lease, ExecutionAdmission)> {
+        let entry = self.entries.get(id)?;
+        matches!(
+            entry.phase,
+            Phase::Starting { .. } | Phase::Running { .. } | Phase::Respawning { .. }
+        )
+        .then(|| (self.lease(id, entry.epoch), entry.admission.clone()))
+    }
+
     pub fn phase(&self, session_id: &str) -> WorkerPhase {
         match self.entries.get(session_id).map(|e| &e.phase) {
             None => WorkerPhase::Absent,

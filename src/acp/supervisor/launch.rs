@@ -43,7 +43,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await?
         {
             ResumeReservationOutcome::Reserved(r) => self.spawn_inner(req, r).await,
-            ResumeReservationOutcome::AlreadyPresent => {
+            ResumeReservationOutcome::AlreadyPresent(_) => {
                 Err(SupervisorError::AlreadyRunning(req.session_id))
             }
         }
@@ -70,7 +70,32 @@ impl<S: BroadcastSink> Supervisor<S> {
             let lease = match table.admit(session_id, kind) {
                 Ok(lease) => lease,
                 Err(AdmitError::AlreadyPresent) => {
-                    return Ok(ResumeReservationOutcome::AlreadyPresent)
+                    let (lease, issued) = table
+                        .present_admission(session_id)
+                        .ok_or_else(|| SupervisorError::TeardownPending(session_id.to_owned()))?;
+                    let baseline = issued.original_baseline().ok_or_else(|| {
+                        launch_origin_error(anyhow::anyhow!(
+                            "present worker lost its original baseline"
+                        ))
+                    })?;
+                    if !baseline.same_scope(&origin)
+                        && !issued
+                            .origin()
+                            .is_some_and(|current| current.recognizes_published_snapshot(&origin))
+                    {
+                        return Err(launch_origin_error(anyhow::anyhow!(
+                            "present worker belongs to another original scope"
+                        )));
+                    }
+                    let custody = issued.begin_job();
+                    return Ok(ResumeReservationOutcome::AlreadyPresent(
+                        super::PresentResume {
+                            lease,
+                            issued,
+                            baseline,
+                            _custody: custody,
+                        },
+                    ));
                 }
                 Err(AdmitError::TeardownPending) => {
                     return Err(SupervisorError::TeardownPending(session_id.to_owned()))
@@ -102,12 +127,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let custody = Some(reservation.issued.begin_job());
                 (ResumeReservationOutcome::Reserved(reservation), custody)
             }
-            ResumeReservationOutcome::AlreadyPresent => (outcome, None),
+            present @ ResumeReservationOutcome::AlreadyPresent(_) => (present, None),
         });
         let mut observation = super::ResumeObservation(admitted.as_ref().ok().and_then(
             |(outcome, _)| match outcome {
                 ResumeReservationOutcome::Reserved(reservation) => Some(reservation.issued.clone()),
-                ResumeReservationOutcome::AlreadyPresent => None,
+                ResumeReservationOutcome::AlreadyPresent(_) => None,
             },
         ));
         let lifecycle = self.lifecycle.clone();
@@ -115,8 +140,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         async move {
             let driver = tokio::spawn(async move {
                 let (outcome, _custody) = admitted?;
-                let ResumeReservationOutcome::Reserved(reservation) = outcome else {
-                    return Ok(ResumeReservationOutcome::AlreadyPresent);
+                let reservation = match outcome {
+                    ResumeReservationOutcome::Reserved(reservation) => reservation,
+                    present @ ResumeReservationOutcome::AlreadyPresent(_) => return Ok(present),
                 };
                 if matches!(kind, ResumeKind::Spawn) {
                     let custody = reservation.issued.begin_job();
@@ -731,7 +757,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 )
                 .await
             }
-            ResumeReservationOutcome::AlreadyPresent => {
+            ResumeReservationOutcome::AlreadyPresent(_) => {
                 Err(SupervisorError::AlreadyRunning(session_id))
             }
         }
@@ -990,7 +1016,7 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
     true
 }
 
-fn launch_origin_error(error: anyhow::Error) -> SupervisorError {
+pub(super) fn launch_origin_error(error: anyhow::Error) -> SupervisorError {
     if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
         SupervisorError::Blocked(*blocked)
     } else if let Some(gone) =

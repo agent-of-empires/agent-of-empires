@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 
 use super::{is_resumable, query_store, resolve_per_profile, AppState};
@@ -101,38 +102,36 @@ pub(crate) enum ContinuationOutcome {
 /// publishes `AcpSessionAssigned`, which retires its own park.
 pub(crate) async fn install_rate_limit_continuation(
     state: &Arc<AppState>,
-    id: &str,
+    original: Arc<crate::session::LaunchOrigin>,
     _submission: tokio::sync::OwnedMutexGuard<()>,
-) -> ContinuationOutcome {
-    let Some(Some((text, attachments))) = query_store(
+) -> anyhow::Result<ContinuationOutcome> {
+    let id = original.session_id();
+    let interrupted = query_store(
         &state.acp_event_store,
         id,
         "rate-limit continuation",
         |s, id| s.rate_limited_turn_prompt(id),
     )
     .await
-    else {
-        return ContinuationOutcome::Stands;
-    };
+    .context("rate-limit continuation query failed")?;
     #[cfg(test)]
     state.session_service.await_install_barrier(id).await;
-    // A queued prompt publishes no event, so its row is the only record of a
-    // supersession. Only the mint times leave the read guard: a row carries its
-    // whole text, and copying that under the shared lock is not worth one
-    // timestamp.
-    let minted_at_ms: Vec<i64> = {
+    let latest_mint = {
         let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return ContinuationOutcome::Stands;
-        };
+        let inst = instances
+            .iter()
+            .find(|i| i.id == id)
+            .ok_or_else(|| anyhow::anyhow!("original continuation row disappeared"))?;
+        anyhow::ensure!(
+            original.recognizes_published_instance(inst),
+            "original continuation row was superseded"
+        );
         inst.queued_prompts
             .iter()
             .filter_map(row_minted_at_ms)
-            .collect()
+            .max()
     };
-    if !minted_at_ms.is_empty() {
-        // `None` covers a pruned limit row and a failed probe alike, and
-        // neither proves a supersession, so the continuation stands.
+    let superseded = if let (Some(latest_mint), Some(_)) = (latest_mint, &interrupted) {
         let limit_at_ms = query_store(
             &state.acp_event_store,
             id,
@@ -144,21 +143,50 @@ pub(crate) async fn install_rate_limit_continuation(
         )
         .await
         .flatten();
-        if queue_supersedes(&minted_at_ms, limit_at_ms) {
-            // A continuation an earlier cadence installed is no longer next.
-            // `/queue` never clears the slot the way `acp_prompt` does, so this
-            // is where a newer word takes it back. Only while the resume pass
-            // runs: it skips a session whose worker is already live, and that
-            // one drains the continuation ahead of the queue.
-            state.session_service.clear_pending_initial_turn(id).await;
-            return ContinuationOutcome::SupersededByQueue;
-        }
-    }
-    state
-        .session_service
-        .set_pending_initial_turn(id, text, attachments)
-        .await;
-    ContinuationOutcome::Stands
+        queue_supersedes(std::slice::from_ref(&latest_mint), limit_at_ms)
+    } else {
+        false
+    };
+    let turn = interrupted
+        .filter(|_| !superseded)
+        .map(|(text, attachments)| crate::session::PendingInitialTurn {
+            text,
+            attachments,
+            synthesized: true,
+        });
+    let instances = Arc::clone(&state.instances);
+    let epoch = Arc::clone(&state.mutation_epoch);
+    tokio::task::spawn_blocking(move || {
+        original.update_storage(
+            |_, row| {
+                let rows = instances.blocking_write();
+                let index = rows
+                    .iter()
+                    .position(|row| row.id == original.session_id())
+                    .ok_or_else(|| anyhow::anyhow!("original continuation view row disappeared"))?;
+                anyhow::ensure!(
+                    original.recognizes_published_instance(&rows[index]),
+                    "original continuation view row was superseded"
+                );
+                if superseded || row.pending_initial_turn.is_none() {
+                    row.pending_initial_turn = turn;
+                }
+                Ok((rows, index, row.clone()))
+            },
+            |(mut rows, index, emitted)| {
+                let slot = &mut rows[index];
+                *slot = crate::server::reload::merge_runtime_fields(slot, emitted);
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+    })
+    .await??;
+    Ok(if superseded {
+        ContinuationOutcome::SupersededByQueue
+    } else {
+        ContinuationOutcome::Stands
+    })
 }
 
 /// Releases rate-limit parks whose window elapsed: install the interrupted
@@ -318,7 +346,26 @@ pub(super) async fn reap_rate_limit_resumes(
             skip("a prompt submission owns the session");
             continue;
         };
-        let outcome = install_rate_limit_continuation(state, &id, submission).await;
+        let original = {
+            let rows = state.instances.read().await;
+            let Some(row) = rows.iter().find(|row| row.id == id) else {
+                continue;
+            };
+            match state.capture_operation_origin(row) {
+                Ok(original) => original,
+                Err(error) => {
+                    tracing::warn!(target: "acp.supervisor", session = %id, %error, "rate-limit original scope unavailable");
+                    continue;
+                }
+            }
+        };
+        let outcome = match install_rate_limit_continuation(state, original, submission).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error, "rate-limit continuation not saved; park retained");
+                continue;
+            }
+        };
         match outcome {
             ContinuationOutcome::Stands => {
                 state
@@ -831,18 +878,107 @@ mod tests {
             "the assignment must retire the park, or the case asserts nothing"
         );
 
-        let _outcome = install_rate_limit_continuation(
+        let original = state
+            .capture_operation_origin(&state.instances.read().await[0])
+            .unwrap();
+        let outcome = install_rate_limit_continuation(
             &state,
-            id,
+            original,
             state.session_service.prompt_submission(id).await,
         )
-        .await;
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ContinuationOutcome::Stands));
 
         assert_eq!(
-            pending_turn(&state, id).await,
-            Some(true),
-            "the interrupted prompt is still the work to continue"
+            state.instances.read().await[0]
+                .pending_initial_turn
+                .as_ref()
+                .map(|turn| turn.text.as_str()),
+            Some("run the nightly task"),
         );
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_continuation_refuses_a_replaced_profile_after_reading_its_prompt() {
+        for (id, has_prompt) in [
+            ("continuation-with-prompt", true),
+            ("continuation-without-prompt", false),
+        ] {
+            let (_home, state, project) = if has_prompt {
+                parked(id, 0).await
+            } else {
+                let fixture = test_state(id);
+                fixture
+                    .1
+                    .acp_event_store
+                    .record_at(
+                        id,
+                        1,
+                        &Event::RateLimit {
+                            info: crate::acp::state::RateLimitInfo {
+                                status: "limited".into(),
+                                resets_at: None,
+                                kind: "usage".into(),
+                            },
+                        },
+                        Utc::now().timestamp_millis(),
+                    )
+                    .unwrap();
+                fixture
+            };
+            assert_eq!(
+                state.acp_event_store.rate_limited_turn_prompt(id).is_some(),
+                has_prompt
+            );
+            let instance = state.instances.read().await[0].clone();
+            let original = state.capture_operation_origin(&instance).unwrap();
+            let directory = original
+                .storage()
+                .sessions_path()
+                .parent()
+                .unwrap()
+                .to_owned();
+            let mut barrier = state.session_service.arm_install_barrier();
+            let install = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move {
+                    let submission = state.session_service.prompt_submission(id).await;
+                    install_rate_limit_continuation(&state, original, submission).await
+                }
+            });
+            let (read_id, release) = tokio::time::timeout(Duration::from_secs(10), barrier.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_id, id);
+            std::fs::rename(&directory, project.path().join("original-profile")).unwrap();
+            let profile = instance.source_profile.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(&profile, vec![instance]);
+            let path = directory.join("sessions.json");
+            let replacement = std::fs::read(&path).unwrap();
+            let epoch = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            release.send(()).unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(10), install)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), replacement);
+            assert!(state.instances.read().await[0]
+                .pending_initial_turn
+                .is_none());
+            assert_eq!(
+                state
+                    .mutation_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                epoch
+            );
+            assert!(state.acp_event_store.rate_limit_park(id).is_some());
+            assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
+        }
     }
 
     /// A prompt submission owns the session, so the pass refuses rather than

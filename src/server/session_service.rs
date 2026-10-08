@@ -2019,7 +2019,7 @@ mod tests {
             .expect("begin_resume must not error under capacity")
         {
             ResumeReservationOutcome::Reserved(r) => r,
-            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+            ResumeReservationOutcome::AlreadyPresent(_) => panic!("expected a fresh reservation"),
         };
 
         let mut waits = service.acp_supervisor.watch_worker_waits();

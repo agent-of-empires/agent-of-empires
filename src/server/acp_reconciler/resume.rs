@@ -140,7 +140,7 @@ fn admit(
     async move {
         match driver.await {
             Ok(ResumeReservationOutcome::Reserved(r)) => Ok(r),
-            Ok(ResumeReservationOutcome::AlreadyPresent) => Err(ResumeOutcome::SpawnFinished),
+            Ok(ResumeReservationOutcome::AlreadyPresent(_)) => Err(ResumeOutcome::SpawnFinished),
             Err(e @ SupervisorError::CapacityFull { .. }) => Err(ResumeOutcome::CapacityDeferred {
                 message: e.to_string(),
             }),
@@ -549,7 +549,7 @@ pub(crate) async fn trigger_resume_background(
         .await?
     {
         ResumeReservationOutcome::Reserved(r) => r,
-        ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
+        ResumeReservationOutcome::AlreadyPresent(_) => return Ok(ResumeTrigger::AlreadyResuming),
     };
     let service = Arc::clone(service);
     crate::task_util::spawn_supervised(

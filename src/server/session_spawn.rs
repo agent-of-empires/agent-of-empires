@@ -531,7 +531,7 @@ pub(crate) async fn spawn_structured_session(
                         Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(
                             reservation,
                         )) => reservation,
-                        Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
+                        Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(_)) => {
                             return
                         }
                         Err(error) => {

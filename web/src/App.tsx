@@ -2378,6 +2378,7 @@ function AppContent({
               onEditProject={handleEditProject}
               onRemoveProject={handleRemoveProject}
               onSettings={handleOpenSettings}
+              onApplySession={applySession}
               onDeleteSession={handleDeleteSession}
               onRestoreSession={handleRestoreSession}
               onEmptyTrash={handleEmptyTrash}

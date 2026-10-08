@@ -17,6 +17,69 @@ use crate::acp::runner_lifecycle::WorkerPhase;
 use crate::acp::state::Event;
 
 impl<S: BroadcastSink> Supervisor<S> {
+    pub(crate) async fn wait_for_present_resume(
+        &self,
+        present: &super::PresentResume,
+    ) -> Result<Arc<crate::session::LaunchOrigin>, SupervisorError> {
+        let id = present.lease.session_id();
+        let deadline = tokio::time::Instant::now() + WORKER_READY_TIMEOUT;
+        loop {
+            let notified = self.worker_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            present
+                .issued
+                .check_active()
+                .map_err(super::launch::launch_origin_error)?;
+            let ready = {
+                let workers = self.workers.lock().await;
+                let table = lock_recover(&self.lifecycle);
+                let current = table
+                    .present_admission(id)
+                    .filter(|(lease, _)| *lease == present.lease)
+                    .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
+                if !current
+                    .1
+                    .original_baseline()
+                    .is_some_and(|baseline| Arc::ptr_eq(&baseline, &present.baseline))
+                {
+                    return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+                }
+                table
+                    .running(id)
+                    .is_some_and(|(lease, _)| lease == present.lease)
+                    && workers
+                        .get(id)
+                        .is_some_and(|handle| handle.lease == present.lease)
+                    && !lock_recover(&self.pending_context_resets).contains(id)
+            };
+            if ready {
+                super::launch::validate_launch_origin(&present.issued).await?;
+                let workers = self.workers.lock().await;
+                let table = lock_recover(&self.lifecycle);
+                if table
+                    .running(id)
+                    .is_some_and(|(lease, _)| lease == present.lease)
+                    && workers
+                        .get(id)
+                        .is_some_and(|handle| handle.lease == present.lease)
+                    && !lock_recover(&self.pending_context_resets).contains(id)
+                    && present.issued.check_active().is_ok()
+                {
+                    return present
+                        .issued
+                        .origin()
+                        .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()));
+                }
+                return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Err(SupervisorError::Acp(AcpError::Spawn(
+                    "original worker readiness timed out".into(),
+                )));
+            }
+        }
+    }
     /// Wait until the session's worker is installed; false once no resume is
     /// pending or `deadline` elapses.
     pub(super) async fn wait_for_worker(&self, session_id: &str, deadline: Duration) -> bool {
@@ -326,17 +389,33 @@ mod tests {
             "a reservation counts as running so the reconciler skips it"
         );
         assert_eq!(sup.worker_state("s-1748").await, AcpWorkerState::Resuming);
-        assert!(matches!(
-            sup.begin_resume(
+        let original = stored_origin("s-1748");
+        let present = match sup
+            .begin_resume(
                 "s-1748",
                 crate::acp::runner_lifecycle::NativeResume::Spawn,
-                stored_origin("s-1748"),
-                false
+                original.clone(),
+                false,
             )
             .await
-            .unwrap(),
-            ResumeReservationOutcome::AlreadyPresent
-        ));
+            .unwrap()
+        {
+            ResumeReservationOutcome::AlreadyPresent(present) => present,
+            ResumeReservationOutcome::Reserved(_) => {
+                panic!("must observe the existing reservation")
+            }
+        };
+        assert!(original.same_scope(&stored_origin("s-1748")));
+        {
+            let mut readiness = std::pin::pin!(sup.wait_for_present_resume(&present));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(readiness.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(present);
+        assert_eq!(sup.worker_state("s-1748").await, AcpWorkerState::Resuming);
 
         let mut entered = sup.watch_worker_waits();
         let waiter = {

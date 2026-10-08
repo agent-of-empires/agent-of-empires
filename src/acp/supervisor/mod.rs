@@ -140,8 +140,14 @@ impl From<WorkerPhase> for AcpWorkerState {
 
 pub(crate) enum ResumeReservationOutcome {
     Reserved(ResumeReservation),
-    /// The session is already running or mid-resume.
-    AlreadyPresent,
+    AlreadyPresent(PresentResume),
+}
+
+pub(crate) struct PresentResume {
+    lease: Lease,
+    issued: super::runner_lifecycle::ExecutionAdmission,
+    baseline: Arc<crate::session::LaunchOrigin>,
+    _custody: super::runner_lifecycle::ExecutionJob,
 }
 
 pub struct Supervisor<S: BroadcastSink> {

@@ -7,6 +7,7 @@ import { test, expect } from "./helpers/mockedTest";
 import { iPhone13 } from "./helpers/viewports";
 import { installSidebarMocks, threeSessionsInOneRepo, type MockSessionInput } from "./helpers/sidebarMocks";
 import { openMobileSidebar } from "./helpers/sidebar";
+import { sessionResponse } from "./helpers/sessions";
 
 const ROW = "[data-testid='sidebar-session-row']";
 const MENU = "[data-testid='sidebar-context-menu']";
@@ -139,14 +140,29 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
   test("mixed bulk archive retains the refused owner and its guidance", async ({ page }) => {
     await page.route("**/api/sessions/*/archive", (route) => {
       const id = new URL(route.request().url()).pathname.split("/").at(-2);
-      return id === "s-2"
-        ? route.fulfill({
-            status: 409,
-            json: { error: "lifecycle_busy", message: "Goths retained: original authority changed." },
-          })
-        : route.fulfill({ json: { id, archived_at: "2026-10-08T00:00:00Z" } });
+      if (id === "s-2")
+        return route.fulfill({
+          status: 409,
+          json: { error: "lifecycle_busy", message: "Goths retained: original authority changed." },
+        });
+      const source = THREE.find((session) => session.id === id);
+      if (!source) return route.fulfill({ status: 404 });
+      return route.fulfill({
+        json: sessionResponse({
+          ...source,
+          group_path: source.group,
+          status: "Idle",
+          pinned_at: null,
+          snoozed_until: null,
+          archived_at: "2026-10-08T00:00:00Z",
+        }),
+      });
     });
-    await openSidebar(page, THREE);
+    await openSidebar(
+      page,
+      THREE.map((session) => ({ ...session, fields: { status: "Running", pinned_at: "2026-01-01T00:00:00Z" } })),
+    );
+    await page.route("**/api/sessions", (route) => route.abort());
     await rows(page)
       .filter({ hasText: "Mongols" })
       .click({ modifiers: ["ControlOrMeta"] });
@@ -159,7 +175,12 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
       "original authority changed",
     );
     await expect(rows(page).filter({ hasText: "Goths" })).toBeVisible();
+    await page.getByTestId("sidebar-sunk-toggle").click();
     await expect(rows(page).filter({ hasText: "Mongols" }).getByLabel("Archived")).toBeVisible();
+    await expect(rows(page).filter({ hasText: "Mongols" }).getByLabel("Pinned")).toHaveCount(0);
+    await expect(rows(page).filter({ hasText: "Mongols" }).locator(".text-status-running")).toHaveCount(0);
+    await expect(rows(page).filter({ hasText: "Goths" }).getByLabel("Pinned")).toBeVisible();
+    await expect(rows(page).filter({ hasText: "Goths" }).locator(".text-status-running")).not.toHaveCount(0);
     await expect(rows(page).filter({ hasText: "Goths" }).getByLabel("Archived")).toHaveCount(0);
     await expect(rows(page).filter({ hasText: "Persians" }).getByLabel("Archived")).toHaveCount(0);
     await expect(rows(page).filter({ hasText: "Persians" })).toBeVisible();
@@ -173,7 +194,11 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
           .url()
           .match(/\/api\/sessions\/([^/]+)\/archive$/)?.[1] ?? "?";
       archived.push({ id, body: r.request().postDataJSON() });
-      return r.fulfill({ json: { id, archived_at: "now" } });
+      const source = THREE.find((session) => session.id === id);
+      if (!source) return r.fulfill({ status: 404 });
+      return r.fulfill({
+        json: sessionResponse({ ...source, group_path: source.group, archived_at: "2026-10-08T00:00:00Z" }),
+      });
     });
     await openSidebar(page, THREE);
     await expect(rows(page)).toHaveCount(3);

@@ -123,6 +123,7 @@ pub async fn spawn_acp(
                 .into_response()
         }
     };
+    let rate_limit_resume_resets_at = rate_limit_resume_probe(&state, &id).await;
     let reservation = match state
         .acp_supervisor
         .begin_resume(
@@ -134,8 +135,45 @@ pub async fn spawn_acp(
         .await
     {
         Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => reservation,
-        Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
-            return supervisor_error_response("spawn failed", &SupervisorError::AlreadyRunning(id))
+        Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(present)) => {
+            let Some(resets_at) = rate_limit_resume_resets_at else {
+                return supervisor_error_response(
+                    "spawn failed",
+                    &SupervisorError::AlreadyRunning(id),
+                );
+            };
+            drop(_guard);
+            let operation = tokio::spawn(async move {
+                if let Err(error) = state.acp_supervisor.wait_for_present_resume(&present).await {
+                    return supervisor_error_response("original worker is not ready", &error);
+                }
+                let instance_lock = state.instance_lock(&id).await;
+                let _instance_guard = instance_lock.lock_owned().await;
+                let original = match state.acp_supervisor.wait_for_present_resume(&present).await {
+                    Ok(original) => original,
+                    Err(error) => {
+                        return supervisor_error_response("original worker changed", &error)
+                    }
+                };
+                let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
+                if let Err(error) =
+                    install_rate_limit_continuation(&state, original, _submission).await
+                {
+                    return (StatusCode::CONFLICT, error.to_string()).into_response();
+                }
+                state
+                    .acp_supervisor
+                    .publish_rate_limit_auto_resumed(&id, resets_at, true);
+                Json(SpawnAcpResponse {
+                    session_id: id,
+                    agent,
+                    status: "running",
+                })
+                .into_response()
+            });
+            return operation.await.unwrap_or_else(|error| {
+                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            });
         }
         Err(error) => return supervisor_error_response("spawn failed", &error),
     };
@@ -159,7 +197,6 @@ pub async fn spawn_acp(
                 .into_response();
         }
     };
-    let rate_limit_resume_resets_at = rate_limit_resume_probe(&state, &id).await;
 
     let request = SpawnRequest {
         additional_dirs: req.additional_dirs,
@@ -171,16 +208,20 @@ pub async fn spawn_acp(
         model: req.model.or_else(|| instance.agent_model.clone()),
         ..spawn_request_for(&instance, agent.clone(), sandbox_info, origin)
     };
-    match state.acp_supervisor.spawn_inner(request, reservation).await {
-        Ok(()) => {}
-        Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
-        Err(e) => return supervisor_error_response("spawn failed", &e),
+    let launched = reservation.execution_admission();
+    if let Err(error) = state.acp_supervisor.spawn_inner(request, reservation).await {
+        return supervisor_error_response("spawn failed", &error);
     }
     if let Some(resets_at) = rate_limit_resume_resets_at {
-        // Continue the rate-limit-interrupted turn once the worker is live.
-        let _ = install_rate_limit_continuation(&state, &id, _submission).await;
-        // The manual breadcrumb is the budget's disarm step, so it fires
-        // whether or not a queued prompt superseded the continuation.
+        let Some(original) = launched.origin() else {
+            return supervisor_error_response(
+                "original worker authority disappeared",
+                &SupervisorError::SpawnCancelled(id),
+            );
+        };
+        if let Err(error) = install_rate_limit_continuation(&state, original, _submission).await {
+            return (StatusCode::CONFLICT, error.to_string()).into_response();
+        }
         state
             .acp_supervisor
             .publish_rate_limit_auto_resumed(&id, resets_at, true);
@@ -564,7 +605,7 @@ pub async fn switch_acp_agent(
             Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => {
                 reservation
             }
-            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(_)) => {
                 return (StatusCode::CONFLICT, "backend switch was superseded").into_response()
             }
             Err(error) => {
@@ -754,11 +795,8 @@ pub async fn switch_acp_provider(
     else {
         return session_not_found();
     };
-    // Held from the first read through the respawn, as `spawn_acp` takes it:
-    // between the shutdown and the persisted pick the reconciler would
-    // otherwise resume the worker off the old row, and win.
     let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
+    let _guard = inst_lock.lock_owned().await;
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
@@ -801,6 +839,7 @@ pub async fn switch_acp_provider(
     };
     let operation = tokio::spawn(async move {
         let _submission_guard = _submission;
+        let _instance_guard = _guard;
         let stop = match tokio::task::spawn_blocking(move || {
             crate::session::runner_journal::reserve_stop_from_origin(original, false)
         })
@@ -867,7 +906,7 @@ pub async fn switch_acp_provider(
             Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => {
                 reservation
             }
-            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(_)) => {
                 return (StatusCode::CONFLICT, "provider switch was superseded").into_response();
             }
             Err(error) => {
@@ -1234,6 +1273,102 @@ mod tests {
         assert_eq!(
             find_instance(&state, &id).await.unwrap().status,
             crate::session::Status::Stopped
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_provider_switch_keeps_its_instance_guard_until_original_refusal() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut instance =
+            crate::session::Instance::new("provider-cancel", "/tmp/aoe-provider-cancel");
+        instance.view = crate::session::View::Structured;
+        let id = instance.id.clone();
+        let generation = instance.lifecycle_generation;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let storage = crate::session::Storage::open_unwatched("default").unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        let held_workers = state.acp_supervisor.test_hold_worker_map().await;
+        let request = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                switch_acp_provider(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SwitchProviderRequest {
+                        provider: "vertex".into(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let storage = storage.clone();
+                let row_id = id.clone();
+                let reserved = tokio::task::spawn_blocking(move || {
+                    storage
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == row_id)
+                        .unwrap()
+                        .lifecycle_generation
+                        > generation
+                })
+                .await
+                .unwrap();
+                if reserved {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual Stop reservation must commit before cancellation");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let instance_lock = state.instance_lock(&id).await;
+        assert!(
+            instance_lock.try_lock().is_err(),
+            "owned switch must still exclude another instance mutation"
+        );
+        let original_dir = storage.sessions_path().parent().unwrap().to_owned();
+        std::fs::rename(
+            &original_dir,
+            original_dir.with_file_name("retained-provider-original"),
+        )
+        .unwrap();
+        let mut replacement =
+            crate::session::Instance::new("replacement", "/tmp/aoe-provider-peer");
+        replacement.id = id.clone();
+        replacement.view = crate::session::View::Structured;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![replacement]);
+        let replacement_storage = crate::session::Storage::open_unwatched("default").unwrap();
+        let expected = std::fs::read(replacement_storage.sessions_path()).unwrap();
+        drop(held_workers);
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.session_service.prompt_submission_for_session(&id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(completed);
+        assert!(instance_lock.try_lock().is_ok());
+        assert_eq!(
+            std::fs::read(replacement_storage.sessions_path()).unwrap(),
+            expected,
+            "rejected original must not mutate the replacement"
+        );
+        assert_eq!(
+            find_instance(&state, &id).await.unwrap().agent_provider,
+            None
         );
     }
 

@@ -45,12 +45,11 @@ impl std::fmt::Display for LifecycleReservationError {
 
 impl std::error::Error for LifecycleReservationError {}
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", content = "paths", rename_all = "snake_case")]
 pub enum WorktreePathClaims {
     None,
     Pending(Vec<std::path::PathBuf>),
-    #[default]
     Unknown,
 }
 

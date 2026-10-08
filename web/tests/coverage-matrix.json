@@ -11,15 +11,20 @@
         "web/src/App.tsx",
         "web/src/hooks/useSidebarTriage.ts",
         "web/src/components/sidebar/useSidebarSelection.ts",
-        "web/src/lib/sidebarBulk.ts"
+        "web/src/lib/sidebarBulk.ts",
+        "web/src/components/WorkspaceSidebar.tsx"
       ]
     },
     {
       "id": "session.lifecycle-refusal-preserves-authoritative-state",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/api.test.ts", "src/hooks/useAcpSession.test.ts"],
-      "components": ["web/src/lib/api.ts", "web/src/hooks/useAcpSession.ts"]
+      "specs": [
+        "src/lib/api.test.ts",
+        "src/hooks/useAcpSession.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx"
+      ],
+      "components": ["web/src/lib/api.ts", "web/src/hooks/useAcpSession.ts", "web/src/hooks/useSidebarTriage.ts"]
     },
     {
       "id": "session.workspace-delete-pending-preserves-running-before-retry",
