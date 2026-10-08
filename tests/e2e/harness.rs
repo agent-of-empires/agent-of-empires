@@ -423,11 +423,16 @@ last_seen_version = "{}"
             .unwrap_or(false)
     }
 
-    /// Tear the TUI's own tmux session down so a test can `spawn_tui` again and assert on
-    /// what a fresh start reads from disk.
+    /// Restart the TUI without retiring its isolated tmux server.
     pub fn kill_tui(&mut self) {
-        let name = self.session_name.clone();
-        self.tmux_kill_session(&name);
+        self.tmux_ok(
+            &["set-option", "-s", "exit-empty", "off"],
+            "retain tmux server for TUI restart",
+        );
+        self.tmux_ok(
+            &["kill-session", "-t", &self.session_name],
+            "kill TUI for restart",
+        );
         self.spawned = false;
     }
 
