@@ -29,6 +29,7 @@ mod status;
 mod store_move;
 #[cfg(test)]
 mod tests;
+mod todo;
 mod user_action;
 mod watchers;
 
@@ -152,6 +153,10 @@ pub struct HomeView {
     pub(super) selected_group: Option<String>,
     pub(super) selected_group_profile: Option<String>,
     pub(super) view_mode: ViewMode,
+    /// Open TODO panel (toggled with `Ctrl+Y`), or `None`. Module-private.
+    todo_panel: Option<todo::TodoPanel>,
+    /// Per-session TODO items, loaded from disk and saved on change.
+    session_todos: HashMap<String, Vec<todo::TodoItem>>,
     pub(super) sort_order: SortOrder,
     pub(super) group_by: GroupByMode,
     pub(super) row_tag_mode: crate::session::config::RowTagMode,

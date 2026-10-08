@@ -216,6 +216,8 @@ impl HomeView {
             selected_group: None,
             selected_group_profile: None,
             view_mode,
+            todo_panel: None,
+            session_todos: todo::load_store(),
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,

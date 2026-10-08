@@ -1755,6 +1755,18 @@ impl HomeView {
         // it would point at unrelated content. Covers the live-send branch below too.
         self.clear_preview_selection();
 
+        // The TODO panel owns the keyboard while open; Ctrl+Y toggles it (Ctrl+T
+        // is the strict-mode quick-attach). Both are handled ahead of the
+        // live-send relay so they work while attached to a session too.
+        if self.todo_panel.is_some() {
+            self.handle_todo_key(key);
+            return None;
+        }
+        if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_todo_panel();
+            return None;
+        }
+
         // Live-send capture normally wins over every other key handler: the home view is
         // a thin relay to the target pane, so dialog hotkeys, search and navigation
         // suspend until Ctrl+q. That holds while dialogs are keyboard-only, since
