@@ -69,6 +69,10 @@ pub async fn update_session_group(
         profile,
         "group update",
         state.file_watch.clone(),
+        crate::session::MetadataSelection::GroupAssignment {
+            identifier: id.clone().into(),
+            group: group.clone().into(),
+        },
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 apply_session_group(inst, persist_group);
@@ -137,24 +141,18 @@ where
     })
 }
 
-/// Persist a session mutation to its profile store before touching memory.
-///
-/// Runs `mutate` inside the storage `update` transaction on a blocking thread,
-/// collapsing store-open, write and join failures into `Err(())` after logging
-/// with `label`. Callers MUST treat `Err` as HTTP 500 and leave the in-memory
-/// instance untouched: persisting first is what keeps disk and memory in
-/// agreement, and stops archive/snooze side effects firing on a write that
-/// never landed (#1589).
+/// Commit selected metadata on a blocking worker; errors leave the cache unchanged.
 pub(crate) async fn persist_session_update<F>(
     profile: String,
     label: &'static str,
     file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    selection: crate::session::MetadataSelection<'static>,
     mutate: F,
 ) -> Result<(), ()>
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
-    persist_with(profile, label, file_watch, None, mutate).await
+    persist_with(profile, label, file_watch, None, selection, mutate).await
 }
 
 /// [`persist_session_update`] holding session `id`'s lifecycle lock across the write, which
@@ -164,12 +162,13 @@ pub(crate) async fn persist_session_update_locked<F>(
     label: &'static str,
     file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     id: String,
+    selection: crate::session::MetadataSelection<'static>,
     mutate: F,
 ) -> Result<(), ()>
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
-    persist_with(profile, label, file_watch, Some(id), mutate).await
+    persist_with(profile, label, file_watch, Some(id), selection, mutate).await
 }
 
 async fn persist_with<F>(
@@ -177,6 +176,7 @@ async fn persist_with<F>(
     label: &'static str,
     file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     lock_id: Option<String>,
+    selection: crate::session::MetadataSelection<'static>,
     mutate: F,
 ) -> Result<(), ()>
 where
@@ -194,7 +194,7 @@ where
         }
     };
     match tokio::task::spawn_blocking(move || {
-        persist_blocking(&storage, lock_id.as_deref(), mutate)
+        persist_blocking(&storage, lock_id.as_deref(), selection, mutate)
     })
     .await
     {
@@ -221,6 +221,7 @@ where
 pub(super) fn persist_blocking<F>(
     storage: &Storage,
     lock_id: Option<&str>,
+    selection: crate::session::MetadataSelection<'_>,
     mutate: F,
 ) -> anyhow::Result<()>
 where
@@ -229,7 +230,7 @@ where
     let _lifecycle_lock = lock_id
         .map(|id| storage.acquire_instance_lifecycle_lock(id))
         .transpose()?;
-    storage.update_metadata(|instances, _groups| {
+    storage.update_metadata(selection, |instances, _groups| {
         mutate(instances);
         Ok(())
     })
@@ -292,6 +293,7 @@ pub async fn update_session_notifications(
         profile,
         "notification update",
         state.file_watch.clone(),
+        crate::session::MetadataSelection::Session(id.clone().into()),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 apply(&mut inst.notify_on_waiting, waiting);
@@ -429,6 +431,7 @@ pub async fn update_session_diff_base(
         profile,
         "diff-base update",
         state.file_watch.clone(),
+        crate::session::MetadataSelection::Session(id.clone().into()),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 apply_diff_base_override(inst, persist_repo.as_deref(), persist_override);

@@ -106,8 +106,15 @@ impl HomeView {
             return Ok(MoveOutcome::Stale);
         };
 
-        let moved: Option<Vec<(String, u32, Option<String>)>> =
-            storage.update_metadata(|instances, groups| {
+        let moved: Option<Vec<(String, u32, Option<String>)>> = storage.update_metadata(
+            crate::session::MetadataSelection::Ordering {
+                anchor: std::borrow::Cow::Borrowed(id),
+                source: std::borrow::Cow::Borrowed(&source_group),
+                destination: std::borrow::Cow::Borrowed(
+                    target_group.as_deref().unwrap_or(&source_group),
+                ),
+            },
+            |instances, groups| {
                 // The drawn row is a copy taken before the lock. If the store's row has since been
                 // archived, trashed, deleted or regrouped, every position computed from the list is
                 // about a layout that no longer exists.
@@ -205,7 +212,8 @@ impl HomeView {
                     }
                 }
                 Ok(Some(applied))
-            })?;
+            },
+        )?;
 
         let Some(moved) = moved else {
             return Ok(MoveOutcome::Stale);
@@ -388,14 +396,19 @@ impl HomeView {
             return Ok(());
         }
         if let Some(storage) = self.storages.get(profile) {
-            storage.update_metadata(|_instances, groups| {
-                for group in groups.iter_mut() {
-                    if collapsed_now.contains(&group.path) {
-                        group.collapsed = false;
+            storage.update_metadata(
+                crate::session::MetadataSelection::Groups(std::borrow::Cow::Borrowed(
+                    &collapsed_now,
+                )),
+                |_instances, groups| {
+                    for group in groups.iter_mut() {
+                        if collapsed_now.contains(&group.path) {
+                            group.collapsed = false;
+                        }
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
         }
         if let Some(tree) = self.group_trees.get_mut(profile) {
             for path in &collapsed_now {
@@ -435,25 +448,31 @@ impl HomeView {
         // Build the tree from what the store actually holds, inside the lock. Moving the
         // in-memory tree and writing that back would resurrect a group a peer deleted while
         // this view was open, and drop metadata the peer changed.
-        let moved: GroupMoveOutcome = storage.update_metadata(|instances, disk_groups| {
-            let mut tree = GroupTree::new_with_groups(instances, disk_groups);
-            if !tree.get_all_groups().iter().any(|g| g.path == group_path) {
-                // The header under the cursor was drawn from an older read; a peer has since
-                // deleted the group or emptied it.
-                return Ok(GroupMoveOutcome::Stale);
-            }
-            if !tree.move_group(group_path, delta) {
-                return Ok(GroupMoveOutcome::AtEdge);
-            }
-            let mut groups = tree.get_all_groups();
-            for g in &mut groups {
-                if let Some(state) = collapsed.get(&g.path) {
-                    g.collapsed = *state;
+        let moved: GroupMoveOutcome = storage.update_metadata(
+            crate::session::MetadataSelection::GroupOrdering {
+                anchor: std::borrow::Cow::Borrowed(group_path),
+                overlays: &collapsed,
+            },
+            |instances, disk_groups| {
+                let mut tree = GroupTree::new_with_groups(instances, disk_groups);
+                if !tree.get_all_groups().iter().any(|g| g.path == group_path) {
+                    // The header under the cursor was drawn from an older read; a peer has since
+                    // deleted the group or emptied it.
+                    return Ok(GroupMoveOutcome::Stale);
                 }
-            }
-            *disk_groups = groups.clone();
-            Ok(GroupMoveOutcome::Moved(groups))
-        })?;
+                if !tree.move_group(group_path, delta) {
+                    return Ok(GroupMoveOutcome::AtEdge);
+                }
+                let mut groups = tree.get_all_groups();
+                for g in &mut groups {
+                    if let Some(state) = collapsed.get(&g.path) {
+                        g.collapsed = *state;
+                    }
+                }
+                *disk_groups = groups.clone();
+                Ok(GroupMoveOutcome::Moved(groups))
+            },
+        )?;
 
         let groups = match moved {
             GroupMoveOutcome::Moved(groups) => groups,

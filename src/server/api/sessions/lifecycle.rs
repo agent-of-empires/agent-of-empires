@@ -104,6 +104,7 @@ pub async fn update_session_pin(
         profile,
         "pin update",
         state.file_watch.clone(),
+        crate::session::MetadataSelection::Session(id.clone().into()),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 if pinned {
@@ -189,6 +190,7 @@ pub async fn update_session_color(
         profile,
         "color update",
         state.file_watch.clone(),
+        crate::session::MetadataSelection::Session(id.clone().into()),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 // Pre-validated above, so this cannot fail.
@@ -259,6 +261,7 @@ pub async fn update_session_archive(
             "unarchive update",
             state.file_watch.clone(),
             id.clone(),
+            crate::session::MetadataSelection::Session(id.clone().into()),
             move |instances| {
                 if let Some(row) = instances.iter_mut().find(|row| row.id == persist_id) {
                     row.unarchive();
@@ -1419,6 +1422,7 @@ pub async fn start_session(
             profile,
             "start session",
             state.file_watch.clone(),
+            crate::session::MetadataSelection::Session(id.clone().into()),
             move |instances| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                     let startable = inst.ensure_startable();
@@ -1644,6 +1648,7 @@ pub async fn update_session_snooze(
             profile,
             "snooze update",
             state.file_watch.clone(),
+            crate::session::MetadataSelection::Session(id.clone().into()),
             move |instances| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                     match minutes {
@@ -1766,6 +1771,7 @@ pub async fn update_session_unread(
             profile,
             "unread update",
             state.file_watch.clone(),
+            crate::session::MetadataSelection::Session(id.clone().into()),
             move |instances| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                     if mark_unread {

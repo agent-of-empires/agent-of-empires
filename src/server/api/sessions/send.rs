@@ -172,19 +172,24 @@ pub async fn send_message(
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
                 if let Ok(storage) = Storage::open(&profile, state.file_watch.clone()) {
-                    if let Err(e) = storage.update_metadata(|all, _groups| {
-                        if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
-                            if !outcome_already_alive {
-                                apply_post_restart_sync(
-                                    disk_inst,
-                                    &sync_base_for_save,
-                                    &started_for_save,
-                                );
+                    if let Err(e) = storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_for_save,
+                        )),
+                        |all, _groups| {
+                            if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
+                                if !outcome_already_alive {
+                                    apply_post_restart_sync(
+                                        disk_inst,
+                                        &sync_base_for_save,
+                                        &started_for_save,
+                                    );
+                                }
+                                disk_inst.touch_after_input();
                             }
-                            disk_inst.touch_after_input();
-                        }
-                        Ok(())
-                    }) {
+                            Ok(())
+                        },
+                    ) {
                         tracing::warn!(target: "http.api.sessions", "send_message: persist failed: {e}");
                     }
                 }

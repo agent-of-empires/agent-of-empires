@@ -71,10 +71,21 @@ pub(super) async fn flush_passive_transition_writes(
         let unread_ids_for_local = unread_ids.clone();
         let patch_count = patches.len();
         let unread_count = unread_ids.len();
+        let selected_ids: Vec<String> = patches
+            .keys()
+            .cloned()
+            .chain(
+                unread_ids
+                    .iter()
+                    .filter(|id| !patches.contains_key(*id))
+                    .cloned(),
+            )
+            .collect();
         let persisted = api::persist_session_update(
             profile.clone(),
             "passive-status",
             file_watch.clone(),
+            crate::session::MetadataSelection::Sessions(selected_ids.into()),
             move |insts| {
                 for inst in insts.iter_mut() {
                     if let Some((id, patch)) = patches.get_key_value(&inst.id) {

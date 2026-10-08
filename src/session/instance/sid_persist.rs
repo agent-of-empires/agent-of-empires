@@ -53,94 +53,101 @@ pub(crate) fn persist_session_to_storage(
         return SidWrite::Skipped;
     }
     let binding = observation.conversation_binding();
-    let result = storage.update_metadata(|instances, _groups| {
-        let Some(index) = instances
-            .iter()
-            .position(|instance| instance.id == instance_id)
-        else {
-            return Ok(SidWrite::Failed);
-        };
-        let instance = &instances[index];
-        if !expected.matches(instance)
-            || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
-        {
-            return Ok(SidWrite::Skipped);
-        }
-        match &observation.guard {
-            SessionIdGuard::OmpGeneration(generation)
-                if instance.omp_capture_generation.as_ref() != Some(generation) =>
+    let result = storage.update_metadata(
+        crate::session::MetadataSelection::AllSessions,
+        |instances, _groups| {
+            let Some(index) = instances
+                .iter()
+                .position(|instance| instance.id == instance_id)
+            else {
+                return Ok(SidWrite::Failed);
+            };
+            let instance = &instances[index];
+            if !expected.matches(instance)
+                || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
             {
-                return Ok(SidWrite::Skipped)
-            }
-            SessionIdGuard::OmpLegacy if instance.omp_capture_generation.is_some() => {
-                return Ok(SidWrite::Skipped)
-            }
-            _ => {}
-        }
-        // A pin to another conversation is a deliberate refusal, not a race:
-        // report it distinctly so teardown can proceed without touching the
-        // pin. Only the sid mismatch qualifies; a divergent execution binding
-        // for the pinned sid stays a namespace doubt (`Skipped`).
-        if let ResumeIntent::Use(pinned) = &instance.resume_intent {
-            if pinned != session_id {
-                return Ok(SidWrite::PinnedForeign);
-            }
-            if instance.resume_binding.as_ref().is_some_and(|target| {
-                target.execution.as_ref()
-                    != binding
-                        .as_ref()
-                        .and_then(|binding| binding.execution.as_ref())
-            }) {
                 return Ok(SidWrite::Skipped);
             }
-        }
-        if instance.is_capture_excluded(session_id, observation.source()) {
-            return Ok(SidWrite::Skipped);
-        }
-        let owns = |sid: Option<&str>, owner: Option<&ConversationBinding>| {
-            sid == Some(session_id)
-                && crate::session::capture::owner_excludes(observation.source(), owner, session_id)
-        };
-        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
-        let conflict = instances.iter().any(|peer| {
-            peer.id != instance_id
-                && (owns(
-                    peer.agent_session_id.as_deref(),
-                    peer.agent_session_binding.as_ref(),
-                ) || peer.prior_tool_session_ids.values().any(|parked| {
-                    owns(
-                        parked.agent_session_id.as_deref(),
-                        parked.agent_session_binding.as_ref(),
+            match &observation.guard {
+                SessionIdGuard::OmpGeneration(generation)
+                    if instance.omp_capture_generation.as_ref() != Some(generation) =>
+                {
+                    return Ok(SidWrite::Skipped)
+                }
+                SessionIdGuard::OmpLegacy if instance.omp_capture_generation.is_some() => {
+                    return Ok(SidWrite::Skipped)
+                }
+                _ => {}
+            }
+            // A pin to another conversation is a deliberate refusal, not a race:
+            // report it distinctly so teardown can proceed without touching the
+            // pin. Only the sid mismatch qualifies; a divergent execution binding
+            // for the pinned sid stays a namespace doubt (`Skipped`).
+            if let ResumeIntent::Use(pinned) = &instance.resume_intent {
+                if pinned != session_id {
+                    return Ok(SidWrite::PinnedForeign);
+                }
+                if instance.resume_binding.as_ref().is_some_and(|target| {
+                    target.execution.as_ref()
+                        != binding
+                            .as_ref()
+                            .and_then(|binding| binding.execution.as_ref())
+                }) {
+                    return Ok(SidWrite::Skipped);
+                }
+            }
+            if instance.is_capture_excluded(session_id, observation.source()) {
+                return Ok(SidWrite::Skipped);
+            }
+            let owns = |sid: Option<&str>, owner: Option<&ConversationBinding>| {
+                sid == Some(session_id)
+                    && crate::session::capture::owner_excludes(
+                        observation.source(),
+                        owner,
+                        session_id,
                     )
-                }))
-        });
-        if conflict {
-            // A pin confirmation is not a fresh claim: the row armed the pin and
-            // must be able to re-prove it, so it keeps the retryable outcome.
-            return Ok(if confirms_pin {
-                SidWrite::Skipped
-            } else {
-                SidWrite::OwnershipConflict
+            };
+            let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
+            let conflict = instances.iter().any(|peer| {
+                peer.id != instance_id
+                    && (owns(
+                        peer.agent_session_id.as_deref(),
+                        peer.agent_session_binding.as_ref(),
+                    ) || peer.prior_tool_session_ids.values().any(|parked| {
+                        owns(
+                            parked.agent_session_id.as_deref(),
+                            parked.agent_session_binding.as_ref(),
+                        )
+                    }))
             });
-        }
-        let pi_session_path = instance.observed_pi_session_path(observation);
-        let instance = &mut instances[index];
-        // A source-less observation of the id the row already holds is not
-        // evidence that a conversation qualified, nor that a failed resume now
-        // works; keep the binding and the loop breaker.
-        let establishes = binding.is_some();
-        let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
-        let binding = binding.or_else(|| instance.observed_binding(observation));
-        instance.set_agent_conversation(Some(session_id.into()), binding, pi_session_path);
-        if establishes || new_conversation {
-            instance.resume_probe_failed_sid = None;
-        }
-        if confirms_pin {
-            instance.resume_intent = ResumeIntent::Default;
-            instance.resume_binding = None;
-        }
-        Ok(SidWrite::Applied)
-    });
+            if conflict {
+                // A pin confirmation is not a fresh claim: the row armed the pin and
+                // must be able to re-prove it, so it keeps the retryable outcome.
+                return Ok(if confirms_pin {
+                    SidWrite::Skipped
+                } else {
+                    SidWrite::OwnershipConflict
+                });
+            }
+            let pi_session_path = instance.observed_pi_session_path(observation);
+            let instance = &mut instances[index];
+            // A source-less observation of the id the row already holds is not
+            // evidence that a conversation qualified, nor that a failed resume now
+            // works; keep the binding and the loop breaker.
+            let establishes = binding.is_some();
+            let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
+            let binding = binding.or_else(|| instance.observed_binding(observation));
+            instance.set_agent_conversation(Some(session_id.into()), binding, pi_session_path);
+            if establishes || new_conversation {
+                instance.resume_probe_failed_sid = None;
+            }
+            if confirms_pin {
+                instance.resume_intent = ResumeIntent::Default;
+                instance.resume_binding = None;
+            }
+            Ok(SidWrite::Applied)
+        },
+    );
     match result {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -218,118 +225,123 @@ impl Instance {
         let new_sid_for_closure = new_sid.clone();
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
         let mut cleared_holder_ids: Vec<String> = Vec::new();
-        let outcome = storage.update_metadata(|instances, _groups| {
-            let Some(index) = instances
-                .iter()
-                .position(|instance| instance.id == instance_id)
-            else {
-                return Ok(SidWrite::Failed);
-            };
-            if !expected.matches(&instances[index]) {
-                return Ok(SidWrite::Skipped);
-            }
-            if let Some(sid) = new_sid_for_closure.as_deref() {
-                let binding = self
-                    .agent_session_binding
-                    .as_ref()
-                    .filter(|binding| binding.session_id == sid);
-                let source = binding
-                    .filter(|binding| binding.provenance != ConversationProvenance::Unknown)
-                    .and_then(|binding| binding.execution.as_ref());
-                let owns = |id: Option<&str>, owner: Option<&ConversationBinding>| {
-                    id == Some(sid) && crate::session::capture::owner_excludes(source, owner, sid)
-                };
-                let consumed_pin = binding.is_some_and(|binding| {
-                    let Some(original) = expected.resume_binding.as_ref() else {
-                        return false;
-                    };
-                    if !binding.is_known() {
-                        return false;
-                    }
-                    match (&expected_prior_intent_for_closure, &self.resume_intent) {
-                        (ResumeIntent::Use(pinned), _) if pinned == sid => original == binding,
-                        (ResumeIntent::Use(pinned), ResumeIntent::Use(current)) => {
-                            current == sid
-                                && original.session_id == *pinned
-                                && original.is_known()
-                                && self.resume_binding.as_ref() == Some(binding)
-                                && binding
-                                    .execution
-                                    .as_ref()
-                                    .is_some_and(|execution| execution.agent == "hermes")
-                                && binding.execution == original.execution
-                                && binding.provenance == original.provenance
-                                && binding.transcript_path == original.transcript_path
-                        }
-                        _ => false,
-                    }
-                });
-                let refuses_transfer = |id: Option<&str>, owner: Option<&ConversationBinding>| {
-                    owns(id, owner)
-                        && (!consumed_pin
-                            || !owner
-                                .filter(|binding| binding.session_id == sid)
-                                .is_some_and(ConversationBinding::is_known))
-                };
-                if instances
+        let outcome = storage.update_metadata(
+            crate::session::MetadataSelection::AllSessions,
+            |instances, _groups| {
+                let Some(index) = instances
                     .iter()
-                    .filter(|peer| peer.id != instance_id)
-                    .any(|peer| {
-                        refuses_transfer(
-                            peer.agent_session_id.as_deref(),
-                            peer.agent_session_binding.as_ref(),
-                        ) || peer.prior_tool_session_ids.values().any(|parked| {
-                            refuses_transfer(
-                                parked.agent_session_id.as_deref(),
-                                parked.agent_session_binding.as_ref(),
-                            )
-                        })
-                    })
-                {
+                    .position(|instance| instance.id == instance_id)
+                else {
+                    return Ok(SidWrite::Failed);
+                };
+                if !expected.matches(&instances[index]) {
                     return Ok(SidWrite::Skipped);
                 }
-                for peer in instances.iter_mut().filter(|peer| peer.id != instance_id) {
-                    if owns(
-                        peer.agent_session_id.as_deref(),
-                        peer.agent_session_binding.as_ref(),
-                    ) {
-                        cleared_holder_ids.push(peer.id.clone());
-                        peer.set_agent_conversation(None, None, None);
-                        peer.resume_probe_failed_sid = None;
-                    }
-                    peer.prior_tool_session_ids.retain(|_, parked| {
-                        if owns(
-                            parked.agent_session_id.as_deref(),
-                            parked.agent_session_binding.as_ref(),
-                        ) {
-                            parked.agent_session_id = None;
-                            parked.agent_session_binding = None;
-                            parked.pi_session_path = None;
+                if let Some(sid) = new_sid_for_closure.as_deref() {
+                    let binding = self
+                        .agent_session_binding
+                        .as_ref()
+                        .filter(|binding| binding.session_id == sid);
+                    let source = binding
+                        .filter(|binding| binding.provenance != ConversationProvenance::Unknown)
+                        .and_then(|binding| binding.execution.as_ref());
+                    let owns = |id: Option<&str>, owner: Option<&ConversationBinding>| {
+                        id == Some(sid)
+                            && crate::session::capture::owner_excludes(source, owner, sid)
+                    };
+                    let consumed_pin = binding.is_some_and(|binding| {
+                        let Some(original) = expected.resume_binding.as_ref() else {
+                            return false;
+                        };
+                        if !binding.is_known() {
+                            return false;
                         }
-                        !parked.is_empty()
+                        match (&expected_prior_intent_for_closure, &self.resume_intent) {
+                            (ResumeIntent::Use(pinned), _) if pinned == sid => original == binding,
+                            (ResumeIntent::Use(pinned), ResumeIntent::Use(current)) => {
+                                current == sid
+                                    && original.session_id == *pinned
+                                    && original.is_known()
+                                    && self.resume_binding.as_ref() == Some(binding)
+                                    && binding
+                                        .execution
+                                        .as_ref()
+                                        .is_some_and(|execution| execution.agent == "hermes")
+                                    && binding.execution == original.execution
+                                    && binding.provenance == original.provenance
+                                    && binding.transcript_path == original.transcript_path
+                            }
+                            _ => false,
+                        }
                     });
+                    let refuses_transfer =
+                        |id: Option<&str>, owner: Option<&ConversationBinding>| {
+                            owns(id, owner)
+                                && (!consumed_pin
+                                    || !owner
+                                        .filter(|binding| binding.session_id == sid)
+                                        .is_some_and(ConversationBinding::is_known))
+                        };
+                    if instances
+                        .iter()
+                        .filter(|peer| peer.id != instance_id)
+                        .any(|peer| {
+                            refuses_transfer(
+                                peer.agent_session_id.as_deref(),
+                                peer.agent_session_binding.as_ref(),
+                            ) || peer.prior_tool_session_ids.values().any(|parked| {
+                                refuses_transfer(
+                                    parked.agent_session_id.as_deref(),
+                                    parked.agent_session_binding.as_ref(),
+                                )
+                            })
+                        })
+                    {
+                        return Ok(SidWrite::Skipped);
+                    }
+                    for peer in instances.iter_mut().filter(|peer| peer.id != instance_id) {
+                        if owns(
+                            peer.agent_session_id.as_deref(),
+                            peer.agent_session_binding.as_ref(),
+                        ) {
+                            cleared_holder_ids.push(peer.id.clone());
+                            peer.set_agent_conversation(None, None, None);
+                            peer.resume_probe_failed_sid = None;
+                        }
+                        peer.prior_tool_session_ids.retain(|_, parked| {
+                            if owns(
+                                parked.agent_session_id.as_deref(),
+                                parked.agent_session_binding.as_ref(),
+                            ) {
+                                parked.agent_session_id = None;
+                                parked.agent_session_binding = None;
+                                parked.pi_session_path = None;
+                            }
+                            !parked.is_empty()
+                        });
+                    }
                 }
-            }
-            let instance = &mut instances[index];
-            instance.set_agent_conversation(
-                new_sid_for_closure.clone(),
-                self.agent_session_binding.clone(),
-                self.pi_session_path.clone(),
-            );
-            instance.active_execution = self.active_execution.clone();
-            instance
-                .retroactive_capture_excludes
-                .clone_from(&self.retroactive_capture_excludes);
-            instance.resume_probe_failed_sid = None;
-            if promote_one_shot {
-                instance.resume_intent = ResumeIntent::Default;
-                instance.resume_binding = None;
-            } else {
-                instance.resume_intent = self.resume_intent.clone();
-                instance.resume_binding = self.resume_binding.clone();
-            }
-            Ok(SidWrite::Applied)
-        });
+                let instance = &mut instances[index];
+                instance.set_agent_conversation(
+                    new_sid_for_closure.clone(),
+                    self.agent_session_binding.clone(),
+                    self.pi_session_path.clone(),
+                );
+                instance.active_execution = self.active_execution.clone();
+                instance
+                    .retroactive_capture_excludes
+                    .clone_from(&self.retroactive_capture_excludes);
+                instance.resume_probe_failed_sid = None;
+                if promote_one_shot {
+                    instance.resume_intent = ResumeIntent::Default;
+                    instance.resume_binding = None;
+                } else {
+                    instance.resume_intent = self.resume_intent.clone();
+                    instance.resume_binding = self.resume_binding.clone();
+                }
+                Ok(SidWrite::Applied)
+            },
+        );
 
         match outcome {
             Ok(SidWrite::Applied) => {

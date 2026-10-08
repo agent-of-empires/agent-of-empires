@@ -458,15 +458,18 @@ impl HomeView {
             return;
         }
         let patch = crate::session::PassiveStatusPatch::from_instance(inst);
-        if let Err(e) = storage.update_metadata(|insts, _groups| {
-            if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                disk.merge_passive_status_patch(id, &patch);
-                if mark_unread {
-                    disk.mark_unread();
+        if let Err(e) = storage.update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(id)),
+            |insts, _groups| {
+                if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
+                    disk.merge_passive_status_patch(id, &patch);
+                    if mark_unread {
+                        disk.mark_unread();
+                    }
                 }
-            }
-            Ok(())
-        }) {
+                Ok(())
+            },
+        ) {
             // Passive persistence failure keeps the in-memory observation.
             tracing::warn!(
                 target: "session.store",

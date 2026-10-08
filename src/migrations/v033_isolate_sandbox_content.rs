@@ -268,28 +268,31 @@ pub(crate) fn prepare_terminal_launch_context(
     let generation = instance.lifecycle_generation;
     let storage = instance.original_storage()?;
     let (resets, notice, sid, sid_binding, pi_path, intent, resume_binding, floor, omp_generation) =
-        storage.update_metadata(|instances, _| {
-            let row = instances
-                .iter_mut()
-                .find(|row| row.id == instance.id)
-                .context("sandbox session disappeared before terminal launch")?;
-            if row.lifecycle_generation != generation || row.tool != instance.tool {
-                bail!("terminal content reset lost its launch scope");
-            }
-            let notice =
-                claim_context_reset(row, Some(agent), NativeContextView::Terminal, generation);
-            Ok((
-                row.sandbox_content_resets.clone(),
-                notice,
-                row.agent_session_id.clone(),
-                row.agent_session_binding.clone(),
-                row.pi_session_path.clone(),
-                row.resume_intent.clone(),
-                row.resume_binding.clone(),
-                row.capture_started_at,
-                row.omp_capture_generation.clone(),
-            ))
-        })?;
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&instance.id)),
+            |instances, _| {
+                let row = instances
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .context("sandbox session disappeared before terminal launch")?;
+                if row.lifecycle_generation != generation || row.tool != instance.tool {
+                    bail!("terminal content reset lost its launch scope");
+                }
+                let notice =
+                    claim_context_reset(row, Some(agent), NativeContextView::Terminal, generation);
+                Ok((
+                    row.sandbox_content_resets.clone(),
+                    notice,
+                    row.agent_session_id.clone(),
+                    row.agent_session_binding.clone(),
+                    row.pi_session_path.clone(),
+                    row.resume_intent.clone(),
+                    row.resume_binding.clone(),
+                    row.capture_started_at,
+                    row.omp_capture_generation.clone(),
+                ))
+            },
+        )?;
     instance.sandbox_content_resets = resets;
     if notice.is_some() {
         instance.agent_session_id = sid;
@@ -314,38 +317,41 @@ pub(crate) fn acknowledge_context_reset(
     if slots.is_empty() {
         return Ok(());
     }
-    crate::session::Storage::open_unwatched(profile)?.update_metadata(|instances, _| {
-        let instance = instances
-            .iter_mut()
-            .find(|instance| instance.id == id)
-            .context("sandbox session disappeared before context-reset acknowledgment")?;
-        if matches!(view, NativeContextView::Terminal)
-            && instance.lifecycle_generation != generation
-        {
-            bail!("sandbox context reset lost its terminal generation");
-        }
-        for slot in slots {
-            let reset = instance
-                .sandbox_content_resets
+    crate::session::Storage::open_unwatched(profile)?.update_metadata(
+        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(id)),
+        |instances, _| {
+            let instance = instances
                 .iter_mut()
-                .find(|reset| &reset.slot == slot)
-                .context("sandbox context-reset slot disappeared")?;
-            if reset.tool != instance.tool {
-                bail!("sandbox context reset lost its literal tool");
+                .find(|instance| instance.id == id)
+                .context("sandbox session disappeared before context-reset acknowledgment")?;
+            if matches!(view, NativeContextView::Terminal)
+                && instance.lifecycle_generation != generation
+            {
+                bail!("sandbox context reset lost its terminal generation");
             }
-            let lane = reset.lane(view);
-            if lane.generation != Some(generation) {
-                bail!("sandbox context reset lost its launch generation");
+            for slot in slots {
+                let reset = instance
+                    .sandbox_content_resets
+                    .iter_mut()
+                    .find(|reset| &reset.slot == slot)
+                    .context("sandbox context-reset slot disappeared")?;
+                if reset.tool != instance.tool {
+                    bail!("sandbox context reset lost its literal tool");
+                }
+                let lane = reset.lane(view);
+                if lane.generation != Some(generation) {
+                    bail!("sandbox context reset lost its launch generation");
+                }
+                lane.pending = false;
             }
-            lane.pending = false;
-        }
-        if matches!(view, NativeContextView::Structured) {
-            if let Some(sid) = assigned_id {
-                instance.acp_session_id = Some(sid.to_owned());
+            if matches!(view, NativeContextView::Structured) {
+                if let Some(sid) = assigned_id {
+                    instance.acp_session_id = Some(sid.to_owned());
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

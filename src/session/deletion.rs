@@ -1091,32 +1091,40 @@ fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> P
                 *seen |= *matches;
             }
         }
-        match storage.load_strict_for_worktree_ownership_locked() {
-            Ok(instances) => {
-                for instance in instances.iter().filter(|instance| {
-                    !owners
-                        .iter()
-                        .any(|(_, id, _, matches)| *matches && *id == instance.id)
-                }) {
-                    paths
-                        .established
-                        .extend(instance.durable_worktree_paths().map(PathBuf::from));
-                    match instance
-                        .lifecycle_reservation
-                        .as_ref()
-                        .map(|lease| &lease.path_claims)
+        match storage.load_path_owners_locked() {
+            Ok(document) => {
+                for (_, id, _, matches) in &owners {
+                    if *matches
+                        && document
+                            .owners
+                            .get(*id)
+                            .is_some_and(|slot| slot.count != 1 || slot.ambiguous)
                     {
-                        Some(crate::session::WorktreePathClaims::Pending(pending)) => {
-                            paths.pending.extend(pending.iter().cloned());
+                        return PathsInUse::Unknown(format!(
+                            "ambiguous path owner {id} cannot be excluded"
+                        ));
+                    }
+                }
+                for row in document.rows {
+                    if row.ids.iter().any(|id| {
+                        owners
+                            .iter()
+                            .any(|(_, excluded, _, matches)| *matches && *excluded == id)
+                    }) {
+                        continue;
+                    }
+                    paths.established.extend(row.paths);
+                    match row.pending {
+                        super::WorktreePathClaims::Pending(pending) => {
+                            paths.pending.extend(pending)
                         }
-                        Some(crate::session::WorktreePathClaims::Unknown) => {
+                        super::WorktreePathClaims::Unknown => {
                             return PathsInUse::Unknown(format!(
-                                "profile '{}' session '{}' has unknown filesystem intent",
-                                storage.profile(),
-                                instance.id
-                            ));
+                                "profile '{}' has unknown filesystem intent",
+                                storage.profile()
+                            ))
                         }
-                        _ => {}
+                        super::WorktreePathClaims::None => {}
                     }
                 }
             }
@@ -1149,10 +1157,102 @@ struct ClaimOwner {
     exclusive: bool,
 }
 
+pub(crate) struct PathOwnerEnvelope {
+    pub(crate) ids: Vec<String>,
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) pending: super::WorktreePathClaims,
+}
+
+pub(crate) struct WorktreeOwnerDocument {
+    pub(crate) owners: std::collections::HashMap<String, super::raw_document::OwnerSlot>,
+    pub(crate) rows: Vec<PathOwnerEnvelope>,
+}
+
+impl WorktreeOwnerDocument {
+    pub(crate) fn project(raw: super::raw_document::RawDocument) -> Result<Self> {
+        use super::raw_document::RawObject;
+        let owners = raw.owners("id");
+        let mut rows = Vec::with_capacity(raw.rows.len());
+        for raw in &raw.rows {
+            let object = RawObject::parse(raw).context("unreadable path owner envelope")?;
+            let ids = object
+                .values("id")
+                .map(|id| serde_json::from_str(id.get()))
+                .collect::<std::result::Result<Vec<String>, _>>()?;
+            anyhow::ensure!(!ids.is_empty(), "path owner has no identity");
+            let mut paths = vec![serde_json::from_str(
+                object
+                    .unique("project_path")?
+                    .context("path owner has no project path")?
+                    .get(),
+            )?];
+            if let Some(path) = object.unique("pre_trash_project_path")? {
+                if let Some(path) = serde_json::from_str::<Option<PathBuf>>(path.get())? {
+                    paths.push(path);
+                }
+            }
+            if let Some(workspace) = object
+                .unique("workspace_info")?
+                .filter(|workspace| workspace.get() != "null")
+            {
+                let workspace = RawObject::parse(workspace)?;
+                paths.push(serde_json::from_str(
+                    workspace
+                        .unique("workspace_dir")?
+                        .context("workspace owner has no directory")?
+                        .get(),
+                )?);
+                let repos: Vec<&serde_json::value::RawValue> = serde_json::from_str(
+                    workspace
+                        .unique("repos")?
+                        .context("workspace owner has no repository inventory")?
+                        .get(),
+                )?;
+                for repo in repos {
+                    let repo = RawObject::parse(repo)?;
+                    paths.push(serde_json::from_str(
+                        repo.unique("worktree_path")?
+                            .context("workspace repository has no worktree path")?
+                            .get(),
+                    )?);
+                }
+            }
+            let pending = if let Some(lease) = object
+                .unique("lifecycle_reservation")?
+                .filter(|lease| lease.get() != "null")
+            {
+                let lease = RawObject::parse(lease)?;
+                let _: LifecycleOperation = serde_json::from_str(
+                    lease
+                        .unique("op")?
+                        .context("filesystem intent has no operation")?
+                        .get(),
+                )?;
+                let claims = lease
+                    .unique("path_claims")?
+                    .context("filesystem intent has no path claims")?;
+                let fields = RawObject::parse(claims)?;
+                fields.unique("state")?;
+                fields.unique("paths")?;
+                serde_json::from_str(claims.get())?
+            } else {
+                super::WorktreePathClaims::None
+            };
+            rows.push(PathOwnerEnvelope {
+                ids,
+                paths,
+                pending,
+            });
+        }
+        Ok(Self { owners, rows })
+    }
+}
+
 /// A strict, physically keyed ownership snapshot for one fenced reconciliation pass.
 pub(crate) struct PathClaimIndex {
     claims: std::collections::BTreeMap<PathBuf, Vec<ClaimOwner>>,
     owned_paths: Vec<std::collections::HashMap<std::sync::Arc<str>, Vec<(PathBuf, bool)>>>,
+    ambiguous_owners: Vec<std::collections::HashSet<String>>,
     targets: Vec<(usize, usize, Vec<Instance>)>,
     profile_identities: Vec<std::fs::Metadata>,
     valid: bool,
@@ -1188,6 +1288,7 @@ impl PathClaimIndex {
             let mut result = Self {
                 claims: Default::default(),
                 owned_paths: Vec::new(),
+                ambiguous_owners: Vec::new(),
                 targets: Vec::new(),
                 profile_identities: Vec::new(),
                 valid: true,
@@ -1203,14 +1304,44 @@ impl PathClaimIndex {
                 }
                 let profile = profiles.len();
                 result.owned_paths.push(Default::default());
-                let rows = storage.load_strict_for_worktree_ownership_locked()?;
-                for row in &rows {
-                    result.update(profile, row);
+                let document = storage.load_path_owners_locked()?;
+                result.ambiguous_owners.push(
+                    document
+                        .owners
+                        .into_iter()
+                        .filter_map(|(id, slot)| (slot.count != 1 || slot.ambiguous).then_some(id))
+                        .collect(),
+                );
+                for row in &document.rows {
+                    let pending = match &row.pending {
+                        super::WorktreePathClaims::Pending(paths) => paths.as_slice(),
+                        super::WorktreePathClaims::Unknown => {
+                            result.valid = false;
+                            &[]
+                        }
+                        super::WorktreePathClaims::None => &[],
+                    };
+                    for id in &row.ids {
+                        result.add_claims(
+                            profile,
+                            id,
+                            row.paths
+                                .iter()
+                                .map(|path| (path.as_path(), false))
+                                .chain(pending.iter().map(|path| (path.as_path(), true))),
+                        );
+                    }
                 }
                 if let Some(target) = target_identities.iter().position(|target| {
                     crate::session::storage::same_filesystem_identity(target, &identity)
                 }) {
-                    result.targets.push((target, profile, rows));
+                    if lock_stores {
+                        result.targets.push((
+                            target,
+                            profile,
+                            storage.load_strict_for_worktree_ownership_locked()?,
+                        ));
+                    }
                 }
                 profiles.push(identity);
             }
@@ -1251,7 +1382,47 @@ impl PathClaimIndex {
             })
     }
 
+    fn add_claims<'a>(
+        &mut self,
+        profile: usize,
+        id: &str,
+        paths: impl Iterator<Item = (&'a Path, bool)>,
+    ) {
+        let id = self.owned_paths[profile]
+            .get_key_value(id)
+            .map(|(id, _)| std::sync::Arc::clone(id))
+            .unwrap_or_else(|| std::sync::Arc::from(id));
+        let previous = self.owned_paths[profile]
+            .entry(std::sync::Arc::clone(&id))
+            .or_default();
+        for (path, exclusive) in paths {
+            let Some(path) = resolve_claim_path(path) else {
+                self.valid = false;
+                continue;
+            };
+            if previous
+                .iter()
+                .any(|(known, held)| known == &path && *held == exclusive)
+            {
+                continue;
+            }
+            self.claims
+                .entry(path.clone())
+                .or_default()
+                .push(ClaimOwner {
+                    profile,
+                    id: std::sync::Arc::clone(&id),
+                    exclusive,
+                });
+            previous.push((path, exclusive));
+        }
+    }
+
     pub(crate) fn update(&mut self, profile: usize, row: &Instance) {
+        if self.ambiguous_owners[profile].contains(row.id.as_str()) {
+            self.valid = false;
+            return;
+        }
         let id = self.owned_paths[profile]
             .get_key_value(row.id.as_str())
             .map(|(id, _)| std::sync::Arc::clone(id))
@@ -1364,6 +1535,12 @@ impl PathClaimIndex {
         pending_only: bool,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(self.valid, "path ownership inventory is uncertain");
+        if let Some((profile, id)) = excluded_owner {
+            anyhow::ensure!(
+                !self.ambiguous_owners[profile].contains(id),
+                "ambiguous path owner cannot be excluded"
+            );
+        }
         let is_peer = |owners: &[ClaimOwner]| {
             owners.iter().any(|owner| {
                 (!pending_only || owner.exclusive)
@@ -2328,6 +2505,60 @@ mod tests {
         assert_eq!(persisted[0].created_at, original.created_at);
         assert_eq!(persisted[0].project_path, original.project_path);
         assert_eq!(std::fs::read(peer.sessions_path()).unwrap(), peer_before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn raw_path_inventory_unions_duplicate_owners_without_decoding_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let _home = isolate_app_dir_at(temp.path());
+        let target = Storage::new_unwatched("healthy")?;
+        let peer = Storage::new_unwatched("opaque-peer")?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let future = temp.path().join("future");
+        let peer_document = serde_json::json!([
+            {"id":"duplicate", "title":17,"project_path":first,"lifecycle_reservation":{"op":"launch","generation":"broken","at":false,"path_claims":{"state":"none"}}},
+            {"id":"duplicate", "project_path":second,"lifecycle_reservation":{"op":"attach","path_claims":{"state":"pending","paths":[future]}}}
+        ]);
+        std::fs::write(peer.sessions_path(), serde_json::to_vec(&peer_document)?)?;
+        let index = PathClaimIndex::load_for_writer(std::slice::from_ref(&target))?;
+        let profile = index.writer_profile(&target)?;
+        for path in [&first, &second, &future] {
+            assert!(index
+                .ensure_unclaimed(profile, "new-owner", std::slice::from_ref(path))
+                .is_err());
+        }
+        let peer_profile = index.writer_profile(&peer)?;
+        assert!(index
+            .ensure_unclaimed(peer_profile, "duplicate", &[])
+            .is_err());
+        assert!(matches!(
+            paths_in_use_except(&[SessionPathOwner {
+                profile: "opaque-peer",
+                session_id: "duplicate"
+            }]),
+            PathsInUse::Unknown(_)
+        ));
+        assert!(PathClaimIndex::load(std::slice::from_ref(&peer)).is_err());
+        let mut prepared =
+            Instance::new("healthy", temp.path().join("independent").to_str().unwrap());
+        let original_peer = std::fs::read(peer.sessions_path())?;
+        let intent = crate::session::builder::CreationIntent::reserve(&target, &mut prepared)?;
+        assert_eq!(intent.session_id(), prepared.id);
+        assert_eq!(
+            target
+                .load()?
+                .into_iter()
+                .find(|row| row.id == prepared.id)
+                .unwrap()
+                .lifecycle_reservation
+                .unwrap()
+                .op,
+            LifecycleOperation::Create
+        );
+        assert_eq!(std::fs::read(peer.sessions_path())?, original_peer);
+        Ok(())
     }
 
     #[test]

@@ -64,7 +64,10 @@ impl HomeView {
             if workspace_held {
                 storage.update_under_workspace_claim_lock(merge)
             } else {
-                storage.update_metadata(merge)
+                storage.update_metadata(
+                    crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(id)),
+                    merge,
+                )
             }
         } else {
             tracing::warn!(
@@ -198,17 +201,21 @@ impl HomeView {
                 .get(&profile)
                 .cloned()
                 .unwrap_or_default();
-            let res = storage.update_metadata(|insts, _groups| {
-                let mut missing: Vec<String> = Vec::new();
-                for (id, pre, post) in &items {
-                    if let Some(disk) = insts.iter_mut().find(|i| i.id == *id) {
-                        disk.merge_user_action_diff(pre, post);
-                    } else if !added.contains(id) {
-                        missing.push(id.clone());
+            let item_ids: Vec<String> = items.iter().map(|(id, _, _)| id.clone()).collect();
+            let res = storage.update_metadata(
+                crate::session::MetadataSelection::Sessions(std::borrow::Cow::Borrowed(&item_ids)),
+                |insts, _groups| {
+                    let mut missing: Vec<String> = Vec::new();
+                    for (id, pre, post) in &items {
+                        if let Some(disk) = insts.iter_mut().find(|i| i.id == *id) {
+                            disk.merge_user_action_diff(pre, post);
+                        } else if !added.contains(id) {
+                            missing.push(id.clone());
+                        }
                     }
-                }
-                Ok(missing)
-            });
+                    Ok(missing)
+                },
+            );
             match res {
                 Ok(missing) => peer_deleted.extend(missing),
                 Err(e) => {

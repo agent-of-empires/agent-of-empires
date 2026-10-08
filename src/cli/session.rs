@@ -428,12 +428,15 @@ async fn mark_session(
     apply: fn(&mut Instance),
 ) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update_metadata(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            apply(inst);
-            Ok(inst.title.clone())
-        })
-    })?;
+    let title = storage.update_metadata(
+        crate::session::MetadataSelection::Identifier(std::borrow::Cow::Borrowed(&args.identifier)),
+        |instances, _groups| {
+            super::patch_instance(instances, &args.identifier, |inst| {
+                apply(inst);
+                Ok(inst.title.clone())
+            })
+        },
+    )?;
     println!("{verb}: {title}");
     Ok(())
 }
@@ -446,13 +449,16 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
     };
 
     let storage = Storage::open_unwatched(profile)?;
-    let (title, color) = storage.update_metadata(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.set_color(new_color.clone())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok((inst.title.clone(), inst.color.clone()))
-        })
-    })?;
+    let (title, color) = storage.update_metadata(
+        crate::session::MetadataSelection::Identifier(std::borrow::Cow::Borrowed(&args.identifier)),
+        |instances, _groups| {
+            super::patch_instance(instances, &args.identifier, |inst| {
+                inst.set_color(new_color.clone())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                Ok((inst.title.clone(), inst.color.clone()))
+            })
+        },
+    )?;
 
     match color {
         Some(c) => println!("✓ Set color for '{}': {}", title, c),
@@ -821,24 +827,30 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     let minutes = raw_minutes as u32;
 
     let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update_metadata(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.snooze(minutes);
-            Ok(inst.title.clone())
-        })
-    })?;
+    let title = storage.update_metadata(
+        crate::session::MetadataSelection::Identifier(std::borrow::Cow::Borrowed(&args.identifier)),
+        |instances, _groups| {
+            super::patch_instance(instances, &args.identifier, |inst| {
+                inst.snooze(minutes);
+                Ok(inst.title.clone())
+            })
+        },
+    )?;
     println!("Snoozed for {}m: {}", minutes, title);
     Ok(())
 }
 
 async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update_metadata(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.unsnooze();
-            Ok(inst.title.clone())
-        })
-    })?;
+    let title = storage.update_metadata(
+        crate::session::MetadataSelection::Identifier(std::borrow::Cow::Borrowed(&args.identifier)),
+        |instances, _groups| {
+            super::patch_instance(instances, &args.identifier, |inst| {
+                inst.unsnooze();
+                Ok(inst.title.clone())
+            })
+        },
+    )?;
     println!("Woke: {}", title);
     Ok(())
 }
@@ -868,7 +880,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let _merge_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance start merge lock")?;
-    let landed = storage.update_metadata(|instances, _groups| {
+    let landed = storage.update_metadata(crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id)), |instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.merge_post_start(&working);
             Ok(true)
@@ -1136,12 +1148,15 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
             true,
         );
         let wid = working.id.clone();
-        storage.update_metadata(|instances, _groups| {
-            if let Some(stored) = instances.iter_mut().find(|i| i.id == wid) {
-                stored.merge_post_start(&working);
-            }
-            Ok(())
-        })?;
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&wid)),
+            |instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|i| i.id == wid) {
+                    stored.merge_post_start(&working);
+                }
+                Ok(())
+            },
+        )?;
         println!("✓ Started {}", working.title);
     }
     Ok(())
@@ -1294,7 +1309,8 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         }
     }
 
-    let orphaned: Vec<(String, String)> = storage.update_metadata(|instances, _groups| {
+    let restarted_ids: Vec<String> = restarted.iter().map(|row| row.id.clone()).collect();
+    let orphaned: Vec<(String, String)> = storage.update_metadata(crate::session::MetadataSelection::Sessions(std::borrow::Cow::Borrowed(&restarted_ids)), |instances, _groups| {
         let mut orphaned = Vec::new();
         for restarted_inst in restarted {
             if let Some(stored) = instances.iter_mut().find(|i| i.id == restarted_inst.id) {
@@ -1426,7 +1442,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let _merge_lock = storage
         .acquire_instance_lifecycle_lock(&session_id)
         .context("failed to acquire instance restart merge lock")?;
-    let landed = storage.update_metadata(|instances, _groups| {
+    let landed = storage.update_metadata(crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&session_id)), |instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
             stored.merge_post_restart(&working);
             if wake_succeeded {
@@ -2789,7 +2805,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     let lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&target_id)
         .context("failed to acquire instance resume-target lock")?;
-    let title = storage.update_metadata(|instances, _groups| {
+    let title = storage.update_metadata(crate::session::MetadataSelection::AllSessions, |instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
             inst.source_profile = storage.profile().to_string();
             if inst.is_structured() {
@@ -2951,29 +2967,32 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     };
 
     let repo_name = target.repo_name.clone();
-    storage.update_metadata(|instances, _groups| {
-        let stored = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
-        match repo_name.as_deref() {
-            Some(name) => {
-                let repo = stored
-                    .workspace_info
-                    .as_mut()
-                    .and_then(|ws| ws.repos.iter_mut().find(|r| r.name == name))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Repo '{}' is no longer part of this session; nothing was changed",
-                            name
-                        )
-                    })?;
-                repo.base_branch_override = new_value.clone();
+    storage.update_metadata(
+        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id)),
+        |instances, _groups| {
+            let stored = instances
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
+            match repo_name.as_deref() {
+                Some(name) => {
+                    let repo = stored
+                        .workspace_info
+                        .as_mut()
+                        .and_then(|ws| ws.repos.iter_mut().find(|r| r.name == name))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Repo '{}' is no longer part of this session; nothing was changed",
+                                name
+                            )
+                        })?;
+                    repo.base_branch_override = new_value.clone();
+                }
+                None => stored.base_branch_override = new_value.clone(),
             }
-            None => stored.base_branch_override = new_value.clone(),
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
 
     let label = match target.repo_name {
         Some(ref name) => format!("'{title}' / '{name}'"),

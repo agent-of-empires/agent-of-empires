@@ -3822,7 +3822,12 @@ fn archive_persist_waits_for_an_in_flight_send() {
     let archive = std::thread::spawn(move || {
         let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
         let storage = Storage::new_unwatched(profile).unwrap();
-        super::update::persist_blocking(&storage, Some(&id), |rows| rows[0].archive())
+        super::update::persist_blocking(
+            &storage,
+            Some(&id),
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id)),
+            |rows| rows[0].archive(),
+        )
     });
     contended_rx
         .recv_timeout(std::time::Duration::from_secs(10))
@@ -4042,6 +4047,7 @@ async fn persist_session_update_surfaces_storage_error() {
         profile.to_string(),
         "test",
         crate::file_watch::FileWatchService::noop(),
+        crate::session::MetadataSelection::AllSessions,
         |_instances| {},
     )
     .await;
@@ -4075,6 +4081,10 @@ async fn group_edit_set_and_clear_round_trip_to_disk() {
         profile.to_string(),
         "group update",
         crate::file_watch::FileWatchService::noop(),
+        crate::session::MetadataSelection::GroupAssignment {
+            identifier: id.clone().into(),
+            group: "team/alpha".into(),
+        },
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == set_id) {
                 apply_session_group(inst, "team/alpha".to_string());
@@ -4097,6 +4107,10 @@ async fn group_edit_set_and_clear_round_trip_to_disk() {
         profile.to_string(),
         "group update",
         crate::file_watch::FileWatchService::noop(),
+        crate::session::MetadataSelection::GroupAssignment {
+            identifier: id.clone().into(),
+            group: "".into(),
+        },
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == clear_id) {
                 apply_session_group(inst, String::new());

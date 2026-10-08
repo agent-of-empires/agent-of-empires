@@ -499,18 +499,23 @@ impl SessionService {
         if let Ok(storage) = crate::session::Storage::open(&profile, self.file_watch.clone()) {
             let id_clone = id.to_string();
             let outcome = tokio::task::spawn_blocking(move || {
-                storage.update_metadata(|instances, _groups| {
-                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
-                        return Ok(None);
-                    };
-                    // A peer (e.g. the CLI) may have archived or trashed the row since the
-                    // memory check; waking it here would clear that.
-                    if let Err(blocked) = inst.ensure_startable() {
-                        return Ok(Some(blocked));
-                    }
-                    apply_prompt_persist_to_disk(inst, wake);
-                    Ok(None)
-                })
+                storage.update_metadata(
+                    crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                        &id_clone,
+                    )),
+                    |instances, _groups| {
+                        let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                            return Ok(None);
+                        };
+                        // A peer (e.g. the CLI) may have archived or trashed the row since the
+                        // memory check; waking it here would clear that.
+                        if let Err(blocked) = inst.ensure_startable() {
+                            return Ok(Some(blocked));
+                        }
+                        apply_prompt_persist_to_disk(inst, wake);
+                        Ok(None)
+                    },
+                )
             })
             .await;
             match outcome {
@@ -729,12 +734,17 @@ impl SessionService {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update_metadata(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = None;
-                        }
-                        Ok(())
-                    })
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_persist,
+                        )),
+                        |instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                                inst.pending_initial_turn = None;
+                            }
+                            Ok(())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
@@ -784,12 +794,17 @@ impl SessionService {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update_metadata(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = Some(turn);
-                        }
-                        Ok(())
-                    })
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_persist,
+                        )),
+                        |instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                                inst.pending_initial_turn = Some(turn);
+                            }
+                            Ok(())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
@@ -828,12 +843,17 @@ impl SessionService {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update_metadata(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = None;
-                        }
-                        Ok(())
-                    })
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_persist,
+                        )),
+                        |instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                                inst.pending_initial_turn = None;
+                            }
+                            Ok(())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
@@ -902,17 +922,22 @@ impl SessionService {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
                     let _transaction = transaction;
-                    storage.update_metadata(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.queued_prompts = mirrored.queued_prompts;
-                            inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
-                            inst.idle_dormant_since = mirrored.idle_dormant_since;
-                            // Monotone max, never `touch_last_accessed()`.
-                            inst.last_accessed_at =
-                                inst.last_accessed_at.max(mirrored.last_accessed_at);
-                        }
-                        Ok(())
-                    })
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_persist,
+                        )),
+                        |instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                                inst.queued_prompts = mirrored.queued_prompts;
+                                inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
+                                inst.idle_dormant_since = mirrored.idle_dormant_since;
+                                // Monotone max, never `touch_last_accessed()`.
+                                inst.last_accessed_at =
+                                    inst.last_accessed_at.max(mirrored.last_accessed_at);
+                            }
+                            Ok(())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {

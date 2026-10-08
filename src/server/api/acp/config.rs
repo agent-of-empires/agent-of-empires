@@ -96,12 +96,15 @@ async fn persist_selector(
     };
     match crate::session::Storage::open(&profile, state.file_watch.clone()) {
         Ok(storage) => {
-            if let Err(e) = storage.update_metadata(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    selector.apply(inst, value.to_string());
-                }
-                Ok(())
-            }) {
+            if let Err(e) = storage.update_metadata(
+                crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(id)),
+                |instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                        selector.apply(inst, value.to_string());
+                    }
+                    Ok(())
+                },
+            ) {
                 tracing::error!(
                     target: "http.api.acp",
                     session = %id,

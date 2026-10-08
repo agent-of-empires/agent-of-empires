@@ -321,26 +321,29 @@ impl Instance {
             let storage = self.original_storage()?;
             storage.verify_profile_identity()?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
-            let generation = storage.update_metadata(|instances, _groups| {
-                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
-                else {
-                    anyhow::bail!("session disappeared before capture");
-                };
-                if stored.agent_session_id.is_some()
-                    || !stored.resume_intent.is_default()
-                    || matches!(stored.status, Status::Deleting | Status::Creating)
-                    || stored.effective_bucket() != SessionBucket::Active
-                {
-                    anyhow::bail!("session is no longer eligible for capture");
-                }
-                stored
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Capture,
-                        Self::LIFECYCLE_RESERVATION_TTL,
-                        Utc::now(),
-                    )
-                    .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
-            })?;
+            let generation = storage.update_metadata(
+                crate::session::MetadataSelection::Session(self.id.as_str().into()),
+                |instances, _groups| {
+                    let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                    else {
+                        anyhow::bail!("session disappeared before capture");
+                    };
+                    if stored.agent_session_id.is_some()
+                        || !stored.resume_intent.is_default()
+                        || matches!(stored.status, Status::Deleting | Status::Creating)
+                        || stored.effective_bucket() != SessionBucket::Active
+                    {
+                        anyhow::bail!("session is no longer eligible for capture");
+                    }
+                    stored
+                        .try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Capture,
+                            Self::LIFECYCLE_RESERVATION_TTL,
+                            Utc::now(),
+                        )
+                        .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
+                },
+            )?;
             Ok((storage, lifecycle_lock, generation))
         })();
         let Ok((storage, _lifecycle_lock, generation)) = ownership else {
@@ -353,13 +356,19 @@ impl Instance {
                 && persist_session_to_storage(&storage, &self.id, captured, &expected)
                     == SidWrite::Applied
         });
-        let released = storage.update_metadata(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
-            };
-            Ok(stored
-                .release_lifecycle_reservation_if_owned(LifecycleOperation::Capture, generation))
-        });
+        let released = storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    return Ok(false);
+                };
+                Ok(stored.release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Capture,
+                    generation,
+                ))
+            },
+        );
         if !matches!(released, Ok(true)) {
             tracing::warn!(
                 target: "session.sync",
@@ -730,22 +739,25 @@ impl Instance {
             }
         };
 
-        let outcome = storage.update_metadata(|instances, _groups| {
-            let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) else {
-                return Ok(SidWrite::Failed);
-            };
-            if inst.agent_session_id.as_deref() != Some(sid) {
-                tracing::warn!(target: "session.store",
-                    instance_id = %self.id,
-                    expected_sid = %sid,
-                    disk_sid = ?inst.agent_session_id,
-                    "sid CAS mismatch in resume-probe failure marker; skipping write"
-                );
-                return Ok(SidWrite::Skipped);
-            }
-            inst.resume_probe_failed_sid = Some(sid.to_string());
-            Ok(SidWrite::Applied)
-        });
+        let outcome = storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) else {
+                    return Ok(SidWrite::Failed);
+                };
+                if inst.agent_session_id.as_deref() != Some(sid) {
+                    tracing::warn!(target: "session.store",
+                        instance_id = %self.id,
+                        expected_sid = %sid,
+                        disk_sid = ?inst.agent_session_id,
+                        "sid CAS mismatch in resume-probe failure marker; skipping write"
+                    );
+                    return Ok(SidWrite::Skipped);
+                }
+                inst.resume_probe_failed_sid = Some(sid.to_string());
+                Ok(SidWrite::Applied)
+            },
+        );
 
         match outcome {
             Ok(write @ (SidWrite::Applied | SidWrite::Skipped)) => {

@@ -116,12 +116,17 @@ pub(super) async fn reap_idle_sessions(
                         if let Ok(storage) =
                             crate::session::Storage::open(&profile, file_watch_for_storage)
                         {
-                            let _ = storage.update_metadata(|instances, _groups| {
-                                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                                    inst.status = crate::session::Status::Error;
-                                }
-                                Ok(())
-                            });
+                            let _ = storage.update_metadata(
+                                crate::session::MetadataSelection::Session(
+                                    std::borrow::Cow::Borrowed(&id),
+                                ),
+                                |instances, _groups| {
+                                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                                        inst.status = crate::session::Status::Error;
+                                    }
+                                    Ok(())
+                                },
+                            );
                         }
                     })
                     .await;

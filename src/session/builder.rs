@@ -196,17 +196,10 @@ impl CreationIntent {
                 "creation identity is already owned"
             );
             if !paths.is_empty() {
-                let mut claims = super::deletion::PathClaimIndex::load_for_writer(
+                let claims = super::deletion::PathClaimIndex::load_for_writer(
                     std::slice::from_ref(storage),
                 )?;
-                let profile = claims
-                    .take_targets()
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("creation profile is absent from claim inventory")
-                    })?
-                    .1;
+                let profile = claims.writer_profile(storage)?;
                 claims.ensure_unclaimed(profile, &reserved.id, &paths)?;
             }
             rows.push(reserved.clone());
@@ -326,16 +319,21 @@ impl CreationIntent {
     }
 
     pub(crate) fn refresh_prepared(&self, prepared: &Instance) -> Result<()> {
-        self.storage.update_metadata(|rows, _groups| {
-            let row = rows
-                .iter_mut()
-                .find(|row| row.id == self.session_id())
-                .ok_or_else(|| anyhow::anyhow!("creation filesystem owner disappeared"))?;
-            let mut refreshed = self.prepared_row(row, prepared)?;
-            refreshed.status = super::Status::Creating;
-            *row = refreshed;
-            Ok(())
-        })
+        self.storage.update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                self.session_id(),
+            )),
+            |rows, _groups| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == self.session_id())
+                    .ok_or_else(|| anyhow::anyhow!("creation filesystem owner disappeared"))?;
+                let mut refreshed = self.prepared_row(row, prepared)?;
+                refreshed.status = super::Status::Creating;
+                *row = refreshed;
+                Ok(())
+            },
+        )
     }
 
     pub(crate) fn publish_under_workspace_claim_lock<F, R>(

@@ -419,17 +419,20 @@ impl Instance {
                     return false;
                 }
             };
-        let outcome = storage.update_metadata(|instances, _groups| {
-            let Some(instance) = instances.iter_mut().find(|instance| instance.id == self.id)
-            else {
-                return Ok(SidWrite::Failed);
-            };
-            if instance.omp_capture_generation.as_deref() != expected_prior {
-                return Ok(SidWrite::Skipped);
-            }
-            instance.omp_capture_generation = Some(generation.to_string());
-            Ok(SidWrite::Applied)
-        });
+        let outcome = storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(instance) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    return Ok(SidWrite::Failed);
+                };
+                if instance.omp_capture_generation.as_deref() != expected_prior {
+                    return Ok(SidWrite::Skipped);
+                }
+                instance.omp_capture_generation = Some(generation.to_string());
+                Ok(SidWrite::Applied)
+            },
+        );
         if matches!(outcome, Ok(SidWrite::Applied)) {
             self.omp_capture_generation = Some(generation.to_string());
             return true;

@@ -765,7 +765,7 @@ fn apply_terminal_title(
     let identity_lock = crate::session::acquire_session_identity_lock()?;
     let _session_title_lock = crate::session::storage::acquire_session_title_lock(&id)?;
     let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
-    let rekey = storage.update_metadata(|instances, _groups| {
+    let rekey = storage.update_metadata(crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id)), |instances, _groups| {
         let mut rekey = None;
         if let Some(index) = instances.iter().position(|instance| instance.id == id) {
             instances[index].smart_rename_attempted = true;
@@ -1209,7 +1209,7 @@ mod serve {
             let identity_lock = crate::session::acquire_session_identity_lock()?;
             let session_title_lock =
                 crate::session::storage::acquire_session_title_lock(&id_owned)?;
-            let wrote = storage.update_metadata(|instances, _groups| {
+            let wrote = storage.update_metadata(crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id_owned)), |instances, _groups| {
                 let Some(index) = instances
                     .iter()
                     .position(|instance| instance.id == id_owned)

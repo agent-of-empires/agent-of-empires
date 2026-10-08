@@ -84,16 +84,21 @@ impl HomeView {
                 // `retain` can empty this when every lock failed; writing then would
                 // rewrite sessions.json and notify subscribers for no change.
                 if !expired.is_empty() {
-                    let cleared = storage.update_metadata(|disk, _groups| {
-                        for id in &expired {
-                            if let Some(stored) =
-                                disk.iter_mut().find(|candidate| &candidate.id == id)
-                            {
-                                stored.clear_expired_lifecycle_reservation(ttl, now);
+                    let cleared = storage.update_metadata(
+                        crate::session::MetadataSelection::Sessions(std::borrow::Cow::Borrowed(
+                            &expired,
+                        )),
+                        |disk, _groups| {
+                            for id in &expired {
+                                if let Some(stored) =
+                                    disk.iter_mut().find(|candidate| &candidate.id == id)
+                                {
+                                    stored.clear_expired_lifecycle_reservation(ttl, now);
+                                }
                             }
-                        }
-                        Ok(())
-                    });
+                            Ok(())
+                        },
+                    );
                     if cleared.is_ok() {
                         for instance in &mut instances {
                             if expired.contains(&instance.id) {

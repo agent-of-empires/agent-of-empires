@@ -962,8 +962,213 @@ fn apply_group_move(
         super::GroupTree::new_with_groups(target_instances, target_groups).get_all_groups();
 }
 
+#[derive(Clone)]
+pub(crate) enum MetadataSelection<'a> {
+    Session(std::borrow::Cow<'a, str>),
+    Sessions(std::borrow::Cow<'a, [String]>),
+    Instances(&'a [Instance]),
+    Identifier(std::borrow::Cow<'a, str>),
+    Group(std::borrow::Cow<'a, str>),
+    Groups(std::borrow::Cow<'a, [String]>),
+    Subtree(std::borrow::Cow<'a, str>),
+    GroupAssignment {
+        identifier: std::borrow::Cow<'a, str>,
+        group: std::borrow::Cow<'a, str>,
+    },
+    Ordering {
+        anchor: std::borrow::Cow<'a, str>,
+        source: std::borrow::Cow<'a, str>,
+        destination: std::borrow::Cow<'a, str>,
+    },
+    GroupOrdering {
+        anchor: std::borrow::Cow<'a, str>,
+        overlays: &'a HashMap<String, bool>,
+    },
+    AllSessions,
+}
+
+struct MetadataAdmission<'a> {
+    sessions: std::collections::HashSet<&'a str>,
+    groups: std::collections::HashSet<&'a str>,
+}
+
+fn in_subtree(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|tail| tail.starts_with('/'))
+}
+
+fn admit_metadata_owner<'a>(
+    document: &'a super::raw_document::RowDocument,
+    id: &str,
+    selected: &mut std::collections::HashSet<&'a str>,
+) -> Result<()> {
+    document.admit(id)?;
+    if let Some((id, _)) = document.owners.get_key_value(id) {
+        selected.insert(id);
+    }
+    Ok(())
+}
+
+fn resolve_metadata_identifier<'a>(
+    document: &'a super::raw_document::RowDocument,
+    identifier: &str,
+) -> Result<&'a str> {
+    if let Some((id, _)) = document.owners.get_key_value(identifier) {
+        return Ok(id);
+    }
+    let mut prefixes = document
+        .owners
+        .keys()
+        .filter(|id| id.starts_with(identifier));
+    if let Some(id) = prefixes.next() {
+        anyhow::ensure!(
+            prefixes.next().is_none(),
+            "Ambiguous session identifier {identifier}"
+        );
+        return Ok(id);
+    }
+    for field in ["title", "project_path"] {
+        for raw in &document.raw.rows {
+            let Ok(object) = super::raw_document::RawObject::parse(raw) else {
+                continue;
+            };
+            if object.strings(field).any(|value| value == identifier) {
+                let id: String = serde_json::from_str(
+                    object
+                        .unique("id")?
+                        .context("matching row has no unique owner")?
+                        .get(),
+                )?;
+                return document
+                    .owners
+                    .get_key_value(&id)
+                    .map(|(id, _)| id.as_str())
+                    .context("matching owner is absent");
+            }
+        }
+    }
+    anyhow::bail!("Session not found: {identifier}")
+}
+
+impl MetadataSelection<'_> {
+    fn admit<'a>(
+        &self,
+        sessions: &'a super::raw_document::RowDocument,
+        groups: &'a super::raw_document::RowDocument,
+    ) -> Result<MetadataAdmission<'a>> {
+        let mut admitted = MetadataAdmission {
+            sessions: Default::default(),
+            groups: Default::default(),
+        };
+        let mut select_session =
+            |id: &str| admit_metadata_owner(sessions, id, &mut admitted.sessions);
+        match self {
+            Self::Session(id) => select_session(id)?,
+            Self::Sessions(ids) => {
+                for id in ids.iter() {
+                    select_session(id)?;
+                }
+            }
+            Self::Instances(rows) => {
+                for row in *rows {
+                    select_session(&row.id)?;
+                }
+            }
+            Self::Identifier(identifier) | Self::GroupAssignment { identifier, .. } => {
+                select_session(resolve_metadata_identifier(sessions, identifier)?)?
+            }
+            Self::AllSessions => {
+                sessions.admit_all()?;
+                for id in sessions.owners.keys() {
+                    admitted.sessions.insert(id);
+                }
+            }
+            Self::Ordering { anchor, .. } => select_session(anchor)?,
+            Self::Group(_) | Self::Groups(_) | Self::Subtree(_) | Self::GroupOrdering { .. } => {}
+        }
+        let member_matches = |path: &str| match self {
+            Self::Subtree(root) => in_subtree(path, root),
+            Self::Ordering {
+                source,
+                destination,
+                ..
+            } => path == source.as_ref() || path == destination.as_ref(),
+            _ => false,
+        };
+        if matches!(self, Self::Subtree(_) | Self::Ordering { .. }) {
+            for raw in &sessions.raw.rows {
+                let object = super::raw_document::RawObject::parse(raw)
+                    .context("unreadable group membership")?;
+                let field = object.unique("group_path")?;
+                let path: String = field
+                    .map(|value| serde_json::from_str(value.get()))
+                    .transpose()?
+                    .unwrap_or_default();
+                if member_matches(&path) {
+                    let id: String = serde_json::from_str(
+                        object
+                            .unique("id")?
+                            .context("group member has no owner identity")?
+                            .get(),
+                    )?;
+                    admit_metadata_owner(sessions, &id, &mut admitted.sessions)?;
+                }
+            }
+        }
+        let mut select_group =
+            |path: &str| admit_metadata_owner(groups, path, &mut admitted.groups);
+        match self {
+            Self::Group(path) | Self::GroupAssignment { group: path, .. } => {
+                for ancestor in path
+                    .match_indices('/')
+                    .map(|(end, _)| &path[..end])
+                    .chain(std::iter::once(path.as_ref()))
+                {
+                    select_group(ancestor)?;
+                }
+            }
+            Self::Groups(paths) => {
+                for path in paths.iter() {
+                    select_group(path)?;
+                }
+            }
+            Self::Subtree(root) => {
+                for path in groups.owners.keys().filter(|path| in_subtree(path, root)) {
+                    select_group(path)?;
+                }
+            }
+            Self::Ordering {
+                source,
+                destination,
+                ..
+            } => {
+                select_group(source)?;
+                select_group(destination)?;
+            }
+            Self::GroupOrdering { anchor, overlays } => {
+                select_group(anchor)?;
+                for path in overlays.keys() {
+                    select_group(path)?;
+                }
+                let parent = anchor.rsplit_once('/').map(|(parent, _)| parent);
+                for path in groups
+                    .owners
+                    .keys()
+                    .filter(|path| path.rsplit_once('/').map(|(parent, _)| parent) == parent)
+                {
+                    select_group(path)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(admitted)
+    }
+}
+
 enum StorageWriteScope<'a> {
-    Metadata,
+    Metadata(MetadataSelection<'a>),
     Geometry,
     FencedGeometry(&'a super::deletion::PathClaimIndex),
     CompletePaths {
@@ -1258,99 +1463,56 @@ impl Storage {
         Ok(instances)
     }
 
-    /// Read all rows for a destructive ownership check without lossy quarantine.
-    pub(crate) fn load_strict_for_worktree_ownership_locked(&self) -> Result<Vec<Instance>> {
-        // `sessions.corrupt.jsonl` is a write-only forensic sidecar: nothing ever reads it
-        // back, and no path truncates it, so its mere presence says nothing about the
-        // current inventory. The fail-closed guarantee lives in the row-by-row parse and
-        // duplicate-id check below: while the corrupt row is still in `sessions.json` the
-        // bail comes from that row, and once a later write dropped it the sidecar is stale
-        // and bailing on it would be a false positive.
-        // Only a genuinely absent file means "this profile owns nothing". A
-        // permission error answers `exists()` with `false` too, and treating
-        // that as an empty inventory would let a purge delete a peer's
-        // worktree, so every other error propagates.
+    fn load_raw_document_locked(&self, path: &Path) -> Result<super::raw_document::RawDocument> {
         self.verify_profile_identity()?;
-        let content = match fs::read_to_string(&self.sessions_path) {
+        let content = match fs::read_to_string(path) {
             Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.verify_profile_identity()?;
-                match fs::symlink_metadata(&self.sessions_path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(Vec::new());
+                match fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("inspecting {}", path.display()))
                     }
                     Ok(_) => anyhow::bail!(
-                        "ownership inventory {} exists but cannot be read safely",
-                        self.sessions_path.display()
+                        "canonical inventory {} exists but cannot be read safely",
+                        path.display()
                     ),
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("inspecting {}", self.sessions_path.display())
-                        });
-                    }
                 }
             }
-            Err(e) => {
-                return Err(e).with_context(|| format!("reading {}", self.sessions_path.display()))
-            }
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
         };
         self.verify_profile_identity()?;
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)
-            .with_context(|| format!("parsing {}", self.sessions_path.display()))?;
-        let mut ids = std::collections::HashSet::new();
-        let mut instances = Vec::with_capacity(rows.len());
+        super::raw_document::RawDocument::parse(&content)
+            .with_context(|| format!("parsing {}", path.display()))
+    }
+
+    pub(crate) fn load_path_owners_locked(&self) -> Result<super::deletion::WorktreeOwnerDocument> {
+        super::deletion::WorktreeOwnerDocument::project(
+            self.load_raw_document_locked(&self.sessions_path)?,
+        )
+    }
+
+    fn load_projected_sessions_locked(
+        &self,
+    ) -> Result<(super::raw_document::RowDocument, Vec<Instance>)> {
+        let raw = self.load_raw_document_locked(&self.sessions_path)?;
+        let (document, mut instances) =
+            super::raw_document::RowDocument::project::<Instance>(raw, "id")?;
         let origin = Arc::new(self.clone());
-        for (idx, row) in rows.into_iter().enumerate() {
-            let mut instance =
-                <Instance as serde::Deserialize>::deserialize(&row).with_context(|| {
-                    format!(
-                        "parsing session row {idx} in {}",
-                        self.sessions_path.display()
-                    )
-                })?;
-            if !ids.insert(instance.id.clone()) {
-                anyhow::bail!(
-                    "duplicate session id {} in ownership inventory",
-                    instance.id
-                );
-            }
-            // Same as `load`: a row read here belongs to this store, and the
-            // ownership scan excludes the caller by (profile, id). Leaving this
-            // blank made every inventoried row look like it had no owner.
+        for instance in &mut instances {
             instance.source_profile = self.profile.clone();
             instance.storage_origin = Some(origin.clone());
             instance.set_file_watch(self.file_watch.clone());
-            instances.push(instance);
         }
-        Ok(instances)
+        Ok((document, instances))
     }
 
-    fn load_strict_with_groups_locked(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
-        let instances = self.load_strict_for_worktree_ownership_locked()?;
-        let path = self.sessions_path.with_file_name("groups.json");
-        let groups = match fs::read_to_string(&path) {
-            Ok(content) if content.trim().is_empty() => Vec::new(),
-            Ok(content) => {
-                serde_json::from_str(&content).context("parsing canonical ownership groups")?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::symlink_metadata(&path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                    Err(error) => {
-                        return Err(error).context("inspecting canonical ownership groups")
-                    }
-                    Ok(_) => {
-                        anyhow::bail!("canonical ownership groups exist but cannot be read safely")
-                    }
-                }
-            }
-            Err(error) => return Err(error).context("reading canonical ownership groups"),
-        };
-        self.verify_profile_identity()?;
-        Ok((instances, groups))
+    /// Native owner inventories require every row to be uniquely decodable.
+    pub(crate) fn load_strict_for_worktree_ownership_locked(&self) -> Result<Vec<Instance>> {
+        let (document, instances) = self.load_projected_sessions_locked()?;
+        document.admit_all()?;
+        Ok(instances)
     }
 
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
@@ -1448,12 +1610,12 @@ impl Storage {
     }
 
     /// Metadata writes cannot change row ownership, paths or filesystem intent.
-    pub(crate) fn update_metadata<F, R>(&self, f: F) -> Result<R>
+    pub(crate) fn update_metadata<F, R>(&self, selection: MetadataSelection<'_>, f: F) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         self.verify_profile_identity()?;
-        self.update_under_storage_locks(f, StorageWriteScope::Metadata)
+        self.update_under_storage_locks(f, StorageWriteScope::Metadata(selection))
     }
 
     pub(crate) fn complete_path_claims_under_workspace_lock<F, R>(
@@ -1512,13 +1674,8 @@ impl Storage {
         candidates: &[&Path],
     ) -> Result<()> {
         self.verify_profile_identity()?;
-        let mut claims =
-            super::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(self))?;
-        let (_, _, rows) = claims
-            .take_targets()
-            .into_iter()
-            .next()
-            .context("original profile is absent from path inventory")?;
+        let claims = super::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(self))?;
+        let rows = self.load_strict_for_worktree_ownership_locked()?;
         let row = rows
             .iter()
             .find(|row| row.id == id)
@@ -1617,7 +1774,17 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        let (mut instances, mut groups) = self.load_strict_with_groups_locked()?;
+        let (session_document, mut instances) = self.load_projected_sessions_locked()?;
+        let raw_groups =
+            self.load_raw_document_locked(&self.sessions_path.with_file_name("groups.json"))?;
+        let (group_document, mut groups) =
+            super::raw_document::RowDocument::project::<Group>(raw_groups, "path")?;
+        let selected = match &scope {
+            StorageWriteScope::Metadata(selection) => {
+                Some(selection.admit(&session_document, &group_document)?)
+            }
+            _ => None,
+        };
         let before: HashMap<_, _> = instances
             .iter()
             .map(|row| (row.id.clone(), StoredWriteGeometry::capture(row)))
@@ -1655,7 +1822,7 @@ impl Storage {
         };
         let groups_before = groups.clone();
         let result = f(&mut instances, &mut groups)?;
-        let metadata_only = matches!(scope, StorageWriteScope::Metadata);
+        let metadata_only = matches!(scope, StorageWriteScope::Metadata(_));
         if metadata_only {
             anyhow::ensure!(
                 instances.len() == before.len(),
@@ -1723,18 +1890,13 @@ impl Storage {
             }
         }
         if !deltas.is_empty() {
-            let mut owned;
+            let owned;
             let (claims, profile) = if let StorageWriteScope::FencedGeometry(claims) = &scope {
                 (*claims, claims.writer_profile(self)?)
             } else {
                 owned =
                     super::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(self))?;
-                let profile = owned
-                    .take_targets()
-                    .into_iter()
-                    .next()
-                    .context("writer profile is absent from claim inventory")?
-                    .1;
+                let profile = owned.writer_profile(self)?;
                 (&owned, profile)
             };
             for (id, paths) in deltas {
@@ -1742,12 +1904,25 @@ impl Storage {
             }
         }
 
-        // Pre-serialise both buffers so a serde failure on either side
-        // aborts before any file is touched.
-        let instances_buf = serde_json::to_vec_pretty(&instances)?;
+        // Compose both documents before the first write, retaining opaque rows.
+        let instances_buf = session_document.render(
+            &instances,
+            |row| row.id.as_str(),
+            selected.as_ref().map(|selected| &selected.sessions),
+            HashMap::new(),
+        )?;
+        groups.retain(|group| {
+            !group_document.owners.contains_key(&group.path)
+                || group_document.baseline(&group.path).is_some()
+        });
         let groups_changed = groups != groups_before;
         let groups_buf = if groups_changed {
-            Some(serde_json::to_vec_pretty(&groups)?)
+            Some(group_document.render(
+                &groups,
+                |group| group.path.as_str(),
+                selected.as_ref().map(|selected| &selected.groups),
+                HashMap::new(),
+            )?)
         } else {
             None
         };
@@ -1908,8 +2083,22 @@ impl Storage {
             ));
         }
 
-        let (mut source_instances, mut source_groups) = self.load_strict_with_groups_locked()?;
-        let (mut target_instances, mut target_groups) = target.load_strict_with_groups_locked()?;
+        let (source_document, mut source_instances) = self.load_projected_sessions_locked()?;
+        let (target_document, mut target_instances) = target.load_projected_sessions_locked()?;
+        source_document.admit_all()?;
+        target_document.admit_all()?;
+        let (source_group_document, mut source_groups) =
+            super::raw_document::RowDocument::project::<Group>(
+                self.load_raw_document_locked(&source_groups_path)?,
+                "path",
+            )?;
+        let (target_group_document, mut target_groups) =
+            super::raw_document::RowDocument::project::<Group>(
+                target.load_raw_document_locked(&target_groups_path)?,
+                "path",
+            )?;
+        source_group_document.admit_all()?;
+        target_group_document.admit_all()?;
         let mut ids = std::collections::HashSet::with_capacity(changes.len());
         let mut moved = Vec::with_capacity(changes.len());
         for (before, after) in changes {
@@ -1943,19 +2132,10 @@ impl Storage {
             );
             moved.push(candidate);
         }
-        let mut claims =
+        let claims =
             super::deletion::PathClaimIndex::load_for_writer(&[self.clone(), target.clone()])?;
-        let inventories = claims.take_targets();
-        let source_profile = inventories
-            .iter()
-            .find(|(index, _, _)| *index == 0)
-            .context("source profile is absent from claim inventory")?
-            .1;
-        let target_profile = inventories
-            .iter()
-            .find(|(index, _, _)| *index == 1)
-            .context("target profile is absent from claim inventory")?
-            .1;
+        let source_profile = claims.writer_profile(self)?;
+        let target_profile = claims.writer_profile(target)?;
         for (before, candidate) in changes.iter().map(|(before, _)| before).zip(&moved) {
             let source = source_instances
                 .iter()
@@ -1990,11 +2170,10 @@ impl Storage {
         }
         validate_target(&target_instances, &moved)?;
 
-        let source_groups_before = serde_json::to_vec_pretty(&source_groups)?;
-        let target_instances_before = serde_json::to_vec_pretty(&target_instances)?;
-        let target_groups_before = serde_json::to_vec_pretty(&target_groups)?;
-
-        let source_instances_before = serde_json::to_vec_pretty(&source_instances)?;
+        let source_groups_before = serde_json::to_vec_pretty(&source_group_document.raw.rows)?;
+        let target_instances_before = serde_json::to_vec_pretty(&target_document.raw.rows)?;
+        let target_groups_before = serde_json::to_vec_pretty(&target_group_document.raw.rows)?;
+        let source_instances_before = serde_json::to_vec_pretty(&source_document.raw.rows)?;
         source_instances.retain(|instance| !ids.contains(instance.id.as_str()));
         target_instances.extend(moved.iter().cloned());
         apply_group_move(
@@ -2004,10 +2183,57 @@ impl Storage {
             &target_instances,
             &mut target_groups,
         );
-        let source_instances_after = serde_json::to_vec_pretty(&source_instances)?;
-        let source_groups_after = serde_json::to_vec_pretty(&source_groups)?;
-        let target_instances_after = serde_json::to_vec_pretty(&target_instances)?;
-        let target_groups_after = serde_json::to_vec_pretty(&target_groups)?;
+        let source_instances_after = source_document.render(
+            &source_instances,
+            |row| row.id.as_str(),
+            None,
+            HashMap::new(),
+        )?;
+        let source_groups_after = source_group_document.render(
+            &source_groups,
+            |row| row.path.as_str(),
+            None,
+            HashMap::new(),
+        )?;
+        let mut imported_rows = HashMap::with_capacity(moved.len());
+        for row in &moved {
+            imported_rows.insert(row.id.as_str(), source_document.compose_row(&row.id, row)?);
+        }
+        let target_instances_after = target_document.render(
+            &target_instances,
+            |row| row.id.as_str(),
+            None,
+            imported_rows,
+        )?;
+        let mut imported_groups = HashMap::new();
+        if plan.group_move.move_subtree
+            || plan.group_move.source_path == plan.group_move.target_path
+        {
+            for group in &target_groups {
+                if target_group_document.owners.contains_key(&group.path) {
+                    continue;
+                }
+                if let Some(suffix) = group
+                    .path
+                    .strip_prefix(&plan.group_move.target_path)
+                    .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+                {
+                    let source_path = format!("{}{suffix}", plan.group_move.source_path);
+                    if source_group_document.owners.contains_key(&source_path) {
+                        imported_groups.insert(
+                            group.path.as_str(),
+                            source_group_document.compose_row(&source_path, group)?,
+                        );
+                    }
+                }
+            }
+        }
+        let target_groups_after = target_group_document.render(
+            &target_groups,
+            |row| row.path.as_str(),
+            None,
+            imported_groups,
+        )?;
         let source_groups_changed = source_groups_after != source_groups_before;
         let target_groups_changed = target_groups_after != target_groups_before;
         let journal_entry = super::move_journal::MoveJournalEntry {
@@ -3713,6 +3939,104 @@ mod tests {
 
     #[test]
     #[serial]
+    fn scoped_metadata_preserves_opaque_rows_and_refuses_target_ambiguity() -> Result<()> {
+        use super::super::raw_document::{RawDocument, RawObject};
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("raw-metadata")?;
+        let mut healthy = Instance::new("healthy", temp.path().join("healthy").to_str().unwrap());
+        healthy.group_path = "opaque".into();
+        let mut corrupt = serde_json::to_value(Instance::new("corrupt", "/tmp/corrupt"))?;
+        corrupt["title"] = serde_json::json!(17);
+        let duplicate = Instance::new("duplicate", "/tmp/duplicate");
+        let extension = r#"{"same":1,"same":2,"huge":1234567890123456789012345678901234567890,"float":1e400,"escaped":"\u0061"}"#;
+        let healthy_json = serde_json::to_string(&healthy)?;
+        let healthy_json = format!(
+            "{},\"extension\":{extension}}}",
+            &healthy_json[..healthy_json.len() - 1]
+        );
+        let corrupt_json = serde_json::to_string(&corrupt)?;
+        let duplicate_json = serde_json::to_string(&duplicate)?;
+        let original =
+            format!("[{healthy_json},{corrupt_json},{duplicate_json},{duplicate_json},null]");
+        fs::write(&storage.sessions_path, &original)?;
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let opaque_group = format!(r#"{{"path":"opaque","name":7,"extension":{extension}}}"#);
+        fs::write(&groups_path, format!("[{opaque_group}]"))?;
+        storage.update_metadata(
+            MetadataSelection::Session(healthy.id.as_str().into()),
+            |rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == healthy.id)
+                    .unwrap()
+                    .pin();
+                Ok(())
+            },
+        )?;
+        assert!(storage
+            .load()?
+            .iter()
+            .find(|row| row.id == healthy.id)
+            .unwrap()
+            .is_pinned());
+        let after = RawDocument::parse(&fs::read_to_string(&storage.sessions_path)?)?;
+        assert_eq!(
+            RawObject::parse(&after.rows[0])?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            extension
+        );
+        for (index, expected) in [
+            (1, corrupt_json.as_str()),
+            (2, duplicate_json.as_str()),
+            (3, duplicate_json.as_str()),
+            (4, "null"),
+        ] {
+            assert_eq!(after.rows[index].get(), expected);
+        }
+        let ids = [
+            healthy.id.clone(),
+            corrupt["id"].as_str().unwrap().to_owned(),
+        ];
+        for selection in [
+            MetadataSelection::Sessions((&ids[..]).into()),
+            MetadataSelection::Session(duplicate.id.as_str().into()),
+            MetadataSelection::AllSessions,
+            MetadataSelection::Group("opaque".into()),
+        ] {
+            let before_sessions = fs::read(&storage.sessions_path)?;
+            let before_groups = fs::read(&groups_path)?;
+            let called = std::cell::Cell::new(false);
+            assert!(storage
+                .update_metadata(selection, |rows, _| {
+                    called.set(true);
+                    rows[0].unpin();
+                    Ok(())
+                })
+                .is_err());
+            assert!(
+                !called.get(),
+                "ambiguous targets must refuse before any mutation"
+            );
+            assert_eq!(fs::read(&storage.sessions_path)?, before_sessions);
+            assert_eq!(fs::read(&groups_path)?, before_groups);
+        }
+        storage.update_metadata(MetadataSelection::Group("new".into()), |rows, groups| {
+            let mut tree = GroupTree::new_with_groups(rows, groups);
+            tree.create_group("new");
+            *groups = tree.get_all_groups();
+            Ok(())
+        })?;
+        let groups = RawDocument::parse(&fs::read_to_string(&groups_path)?)?;
+        assert_eq!(groups.rows[0].get(), opaque_group);
+        assert!(groups.rows.iter().any(|raw| RawObject::parse(raw)
+            .is_ok_and(|row| row.strings("path").any(|path| path == "new"))));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
     fn open_unwatched_requires_existing_profile() {
         let temp = tempdir().unwrap();
         let guard = setup_test_home(temp.path());
@@ -4473,6 +4797,18 @@ mod tests {
             Ok(())
         })?;
         target.update(|_instances, _groups| Ok(()))?;
+        let groups_path = source.sessions_path.with_file_name("groups.json");
+        let groups_raw = fs::read_to_string(&groups_path)?;
+        let group_raw: Vec<Box<serde_json::value::RawValue>> = serde_json::from_str(&groups_raw)?;
+        let group_raw = group_raw[0].get();
+        let extension = r#"{"key":1,"key":2,"number":1e400,"escaped":"\u0061"}"#;
+        fs::write(
+            &groups_path,
+            format!(
+                "[{},\"extension\":{extension}}}]",
+                &group_raw[..group_raw.len() - 1]
+            ),
+        )?;
 
         let moved = source.move_instances_to(
             &target,
@@ -4498,6 +4834,16 @@ mod tests {
             .expect("explicit empty group metadata transferred");
         assert!(target_group.collapsed);
         assert!(target_group.archived_at.is_some());
+        let target_raw = super::super::raw_document::RawDocument::parse(&fs::read_to_string(
+            target.sessions_path.with_file_name("groups.json"),
+        )?)?;
+        assert_eq!(
+            super::super::raw_document::RawObject::parse(&target_raw.rows[0])?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            extension
+        );
         Ok(())
     }
 

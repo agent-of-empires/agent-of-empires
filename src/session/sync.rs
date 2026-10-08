@@ -343,31 +343,36 @@ fn drain_and_persist_session_ids_inner(
                 let storage = update.storage.clone();
                 storage.verify_profile_identity()?;
                 let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
-                let generation = storage.update_metadata(|instances, _groups| {
-                    let Some(instance) = instances
-                        .iter_mut()
-                        .find(|instance| instance.id == update.id)
-                    else {
-                        anyhow::bail!("session disappeared before capture");
-                    };
-                    anyhow::ensure!(
-                        instance.created_at == update.expected_created_at,
-                        "capture original row was replaced"
-                    );
-                    if instance.lifecycle_generation != update.expected_generation
-                        || !update.expected_prior.matches(instance)
-                    {
-                        return Ok(None);
-                    }
-                    instance
-                        .try_acquire_lifecycle_reservation(
-                            crate::session::LifecycleOperation::Capture,
-                            Instance::LIFECYCLE_RESERVATION_TTL,
-                            chrono::Utc::now(),
-                        )
-                        .map(Some)
-                        .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
-                })?;
+                let generation = storage.update_metadata(
+                    crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                        &update.id,
+                    )),
+                    |instances, _groups| {
+                        let Some(instance) = instances
+                            .iter_mut()
+                            .find(|instance| instance.id == update.id)
+                        else {
+                            anyhow::bail!("session disappeared before capture");
+                        };
+                        anyhow::ensure!(
+                            instance.created_at == update.expected_created_at,
+                            "capture original row was replaced"
+                        );
+                        if instance.lifecycle_generation != update.expected_generation
+                            || !update.expected_prior.matches(instance)
+                        {
+                            return Ok(None);
+                        }
+                        instance
+                            .try_acquire_lifecycle_reservation(
+                                crate::session::LifecycleOperation::Capture,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                chrono::Utc::now(),
+                            )
+                            .map(Some)
+                            .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
+                    },
+                )?;
                 Ok(Some((storage, lifecycle_lock, generation)))
             })()
         };
@@ -389,18 +394,21 @@ fn drain_and_persist_session_ids_inner(
             ),
         };
         if let Ok(Some((storage, _lifecycle_lock, Some(generation)))) = ownership {
-            let released = storage.update_metadata(|instances, _groups| {
-                let Some(instance) = instances
-                    .iter_mut()
-                    .find(|instance| instance.id == update.id)
-                else {
-                    return Ok(false);
-                };
-                Ok(instance.release_lifecycle_reservation_if_owned(
-                    crate::session::LifecycleOperation::Capture,
-                    generation,
-                ))
-            });
+            let released = storage.update_metadata(
+                crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&update.id)),
+                |instances, _groups| {
+                    let Some(instance) = instances
+                        .iter_mut()
+                        .find(|instance| instance.id == update.id)
+                    else {
+                        return Ok(false);
+                    };
+                    Ok(instance.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Capture,
+                        generation,
+                    ))
+                },
+            );
             match released {
                 Ok(true) => {
                     capture_generations.push((update.id.clone(), generation));

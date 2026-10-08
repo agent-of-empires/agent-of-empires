@@ -381,12 +381,15 @@ impl DiffView {
         let new_override = Some(self.base_branch.clone());
         let id_for_closure = session_id.clone();
         let new_override_for_closure = new_override.clone();
-        storage.update_metadata(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_closure) {
-                inst.base_branch_override = new_override_for_closure;
-            }
-            Ok(())
-        })?;
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id_for_closure)),
+            |instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_closure) {
+                    inst.base_branch_override = new_override_for_closure;
+                }
+                Ok(())
+            },
+        )?;
         self.pending_override = Some((session_id, new_override));
         Ok(())
     }

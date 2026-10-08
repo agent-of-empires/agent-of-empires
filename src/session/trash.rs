@@ -700,39 +700,42 @@ fn reconcile_trashed_batch(
     ownership: &mut crate::session::deletion::PathClaimIndex,
 ) -> anyhow::Result<Vec<Instance>> {
     let now = Utc::now();
-    let reserved = storage.update_metadata(|instances, _groups| {
-        let mut reserved: Vec<(u64, Instance)> = Vec::new();
-        for snapshot in batch {
-            let Some(stored) = instances
-                .iter_mut()
-                .find(|candidate| candidate.id == snapshot.id)
-            else {
-                continue;
-            };
-            // Keep the original inventory plan until the reservation CAS succeeds.
-            if !plan_inputs_unchanged(snapshot, stored) {
-                tracing::debug!(
-                    target: "session.trash",
-                    session = %snapshot.id,
-                    "trash reconciliation skipped: the row changed after it was scanned"
-                );
-                continue;
+    let reserved = storage.update_metadata(
+        crate::session::MetadataSelection::Instances(batch),
+        |instances, _groups| {
+            let mut reserved: Vec<(u64, Instance)> = Vec::new();
+            for snapshot in batch {
+                let Some(stored) = instances
+                    .iter_mut()
+                    .find(|candidate| candidate.id == snapshot.id)
+                else {
+                    continue;
+                };
+                // Keep the original inventory plan until the reservation CAS succeeds.
+                if !plan_inputs_unchanged(snapshot, stored) {
+                    tracing::debug!(
+                        target: "session.trash",
+                        session = %snapshot.id,
+                        "trash reconciliation skipped: the row changed after it was scanned"
+                    );
+                    continue;
+                }
+                match stored.try_acquire_lifecycle_reservation(
+                    crate::session::LifecycleOperation::Trash,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    now,
+                ) {
+                    Ok(generation) => reserved.push((generation, stored.clone())),
+                    Err(error) => tracing::debug!(
+                        target: "session.trash",
+                        session = %snapshot.id,
+                        "trash reconciliation deferred: {error}"
+                    ),
+                }
             }
-            match stored.try_acquire_lifecycle_reservation(
-                crate::session::LifecycleOperation::Trash,
-                Instance::LIFECYCLE_RESERVATION_TTL,
-                now,
-            ) {
-                Ok(generation) => reserved.push((generation, stored.clone())),
-                Err(error) => tracing::debug!(
-                    target: "session.trash",
-                    session = %snapshot.id,
-                    "trash reconciliation deferred: {error}"
-                ),
-            }
-        }
-        Ok(reserved)
-    })?;
+            Ok(reserved)
+        },
+    )?;
 
     let mut healed = Vec::new();
     for (generation, snapshot) in reserved {

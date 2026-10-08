@@ -368,26 +368,30 @@ impl Instance {
         observation: &crate::session::poller::SessionIdObservation,
         path: &str,
     ) -> Option<bool> {
-        match storage.update_metadata(|instances, _| {
-            #[cfg(test)]
-            anyhow::ensure!(
-                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
-                    && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
-                        let armed = fail.replace(false);
-                        if armed {
-                            FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(true));
-                        }
-                        armed
-                    }),
-                "injected transcript path write failure"
-            );
-            let row = instances
-                .iter_mut()
-                .find(|row| row.id == self.id && row.observation_is_current_pi_path(observation));
-            Ok(row
-                .map(|row| row.pi_session_path = Some(path.to_string()))
-                .is_some())
-        }) {
+        match storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _| {
+                #[cfg(test)]
+                anyhow::ensure!(
+                    !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
+                        && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
+                            let armed = fail.replace(false);
+                            if armed {
+                                FAIL_NEXT_PI_PATH_WRITE_CONSUMED
+                                    .with(|consumed| consumed.set(true));
+                            }
+                            armed
+                        }),
+                    "injected transcript path write failure"
+                );
+                let row = instances.iter_mut().find(|row| {
+                    row.id == self.id && row.observation_is_current_pi_path(observation)
+                });
+                Ok(row
+                    .map(|row| row.pi_session_path = Some(path.to_string()))
+                    .is_some())
+            },
+        ) {
             Ok(stored) => Some(stored),
             Err(error) => {
                 tracing::warn!(

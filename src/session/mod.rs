@@ -25,6 +25,7 @@ pub mod mcp;
 mod move_journal;
 pub mod poller;
 pub mod projects;
+pub(crate) mod raw_document;
 pub(crate) mod recovery;
 pub mod restart;
 pub(crate) mod runner_journal;
@@ -104,7 +105,7 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
-pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
+pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport, MetadataSelection};
 
 /// Check that every path a non-scratch session will use is present and inspectable.
 pub(crate) fn validate_managed_workspace(instance: &Instance) -> Result<(), String> {
@@ -817,9 +818,12 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
 
 fn ensure_profile_has_no_pending_paths(name: &str) -> Result<()> {
     let storage = Storage::open_unwatched(name)?;
-    let rows = storage.load_strict_for_worktree_ownership_locked()?;
+    let document = storage.load_path_owners_locked()?;
     anyhow::ensure!(
-        !rows.iter().any(Instance::has_pending_worktree_path_claims),
+        document
+            .rows
+            .iter()
+            .all(|row| matches!(row.pending, WorktreePathClaims::None)),
         "profile has unfinished or unknown filesystem intent"
     );
     Ok(())

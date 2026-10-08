@@ -1,7 +1,6 @@
 //! Legacy Attach leases have no recoverable candidate-path inventory.
 
 use anyhow::{Context, Result};
-use serde_json::Value;
 use std::fs;
 
 pub fn run() -> Result<()> {
@@ -40,44 +39,52 @@ pub fn run() -> Result<()> {
             }
             Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
         };
-        let mut document: Value = serde_json::from_str(&content)
+        let mut document = crate::session::raw_document::RawDocument::parse(&content)
             .with_context(|| format!("parsing {}", path.display()))?;
         if migrate_document(&mut document)
             .with_context(|| format!("migrating {}", path.display()))?
         {
             crate::session::backup_before_migration(&path)?;
-            crate::session::atomic_write(&path, &serde_json::to_vec_pretty(&document)?)?;
+            crate::session::atomic_write(&path, &serde_json::to_vec_pretty(&document.rows)?)?;
             crate::session::sync_parent_directory(&path)?;
         }
     }
     Ok(())
 }
 
-fn migrate_document(document: &mut Value) -> Result<bool> {
-    let rows = document
-        .as_array_mut()
-        .context("sessions document is not an array")?;
+fn migrate_document(document: &mut crate::session::raw_document::RawDocument) -> Result<bool> {
+    use crate::session::raw_document::{patch, Emission, RawObject};
     let mut changed = false;
-    for row in rows {
-        let Some(fields) = row.as_object_mut() else {
+    for row in &mut document.rows {
+        let Ok(fields) = RawObject::parse(row) else {
             continue;
         };
-        let Some(lease) = fields
-            .get_mut("lifecycle_reservation")
-            .and_then(Value::as_object_mut)
-        else {
+        let Ok(Some(lease)) = fields.unique("lifecycle_reservation") else {
             continue;
         };
-        if lease.contains_key("path_claims") {
+        let Ok(lease) = RawObject::parse(lease) else {
+            continue;
+        };
+        if !matches!(lease.unique("path_claims"), Ok(None)) {
             continue;
         }
-        let state = match lease.get("op").and_then(Value::as_str) {
-            Some("attach" | "create") => "unknown",
-            Some("launch" | "capture" | "stop" | "purge" | "restore" | "trash") => "none",
+        let Ok(Some(operation)) = lease.unique("op") else {
+            continue;
+        };
+        let Ok(operation) = serde_json::from_str::<String>(operation.get()) else {
+            continue;
+        };
+        let state = match operation.as_str() {
+            "attach" | "create" => "unknown",
+            "launch" | "capture" | "stop" | "purge" | "restore" | "trash" => "none",
             _ => continue,
         };
-        lease.insert("path_claims".into(), serde_json::json!({"state": state}));
-        changed = true;
+        let before = serde_json::json!({"lifecycle_reservation": {"op": operation}});
+        let after = serde_json::json!({"lifecycle_reservation": {"op": operation, "path_claims": {"state": state}}});
+        if let Emission::Changed(updated) = patch(row, &before, &after)? {
+            *row = updated;
+            changed = true;
+        }
     }
     Ok(changed)
 }
@@ -85,7 +92,34 @@ fn migrate_document(document: &mut Value) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::raw_document::RawDocument;
     use serde::Deserialize;
+    use serde_json::Value;
+
+    #[test]
+    fn migration_retains_literal_extensions_and_ambiguous_lease_fields() {
+        let extension = r#"{"same":1,"same":2,"big":1234567890123456789012345678901234567890,"float":1e400,"escaped":"\u0061"}"#;
+        let ambiguous = r#"{"id":"duplicated","lifecycle_reservation":{"op":"launch","op":"attach","generation":0},"extra":true}"#;
+        let first = format!(
+            r#"{{"id":"duplicated","title":42,"lifecycle_reservation":{{"op":"attach","generation":"broken","at":null,"extension":{extension}}},"extension":{extension}}}"#
+        );
+        let mut document = RawDocument::parse(&format!("[{first},{ambiguous}]")).unwrap();
+        assert!(migrate_document(&mut document).unwrap());
+        use crate::session::raw_document::RawObject;
+        let row = RawObject::parse(&document.rows[0]).unwrap();
+        assert_eq!(row.unique("extension").unwrap().unwrap().get(), extension);
+        let lease =
+            RawObject::parse(row.unique("lifecycle_reservation").unwrap().unwrap()).unwrap();
+        assert_eq!(lease.unique("extension").unwrap().unwrap().get(), extension);
+        assert_eq!(
+            lease.unique("path_claims").unwrap().unwrap().get(),
+            r#"{"state":"unknown"}"#
+        );
+        assert_eq!(document.rows[1].get(), ambiguous);
+        let before = serde_json::to_vec(&document.rows).unwrap();
+        assert!(!migrate_document(&mut document).unwrap());
+        assert_eq!(serde_json::to_vec(&document.rows).unwrap(), before);
+    }
 
     #[test]
     fn migration_preserves_intents_and_unrelated_corrupt_or_duplicate_rows() {
@@ -105,8 +139,10 @@ mod tests {
         rows[1]["lifecycle_reservation"] =
             serde_json::json!({"op": "stop", "generation": 2, "at": "2000-01-01T00:00:00Z"});
         rows[2]["lifecycle_reservation"] = serde_json::json!({"op": "attach", "generation": 0, "at": "2000-01-01T00:00:00Z", "path_claims": {"state": "pending", "paths": ["/tmp/future"]}});
-        let mut document = Value::Array(rows);
-        assert!(migrate_document(&mut document).unwrap());
+        let mut raw = RawDocument::parse(&serde_json::to_string(&rows).unwrap()).unwrap();
+        assert!(migrate_document(&mut raw).unwrap());
+        let document: Value =
+            serde_json::from_slice(&serde_json::to_vec(&raw.rows).unwrap()).unwrap();
         assert_eq!(
             document[0]["lifecycle_reservation"]["path_claims"]["state"],
             "unknown"
@@ -120,10 +156,12 @@ mod tests {
             document[2]["lifecycle_reservation"]["path_claims"]["paths"],
             serde_json::json!(["/tmp/future"])
         );
-        assert!(!migrate_document(&mut document).unwrap());
+        let original = serde_json::to_vec(&raw.rows).unwrap();
+        assert!(!migrate_document(&mut raw).unwrap());
+        assert_eq!(serde_json::to_vec(&raw.rows).unwrap(), original);
         let migrated = crate::session::Instance::deserialize(&document[0]).unwrap();
         assert!(migrated.has_active_lifecycle_reservation("2020-01-01T00:00:00Z".parse().unwrap()));
-        let mut retained = Value::Array(vec![
+        let retained = Value::Array(vec![
             document[0].clone(),
             document[0].clone(),
             Value::Null,
@@ -131,9 +169,10 @@ mod tests {
             serde_json::json!({"lifecycle_reservation": {"op": "unsupported"}}),
             serde_json::json!({"lifecycle_reservation": {"op": "attach", "path_claims": {"state": "broken"}}}),
         ]);
-        let before = retained.clone();
+        let mut retained = RawDocument::parse(&serde_json::to_string(&retained).unwrap()).unwrap();
+        let before = serde_json::to_vec(&retained.rows).unwrap();
         assert!(!migrate_document(&mut retained).unwrap());
-        assert_eq!(retained, before);
-        assert!(migrate_document(&mut serde_json::json!({"instances": []})).is_err());
+        assert_eq!(serde_json::to_vec(&retained.rows).unwrap(), before);
+        assert!(RawDocument::parse("{\"instances\": []}").is_err());
     }
 }

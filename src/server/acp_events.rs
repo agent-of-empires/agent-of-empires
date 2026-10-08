@@ -351,26 +351,31 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let file_watch = state.file_watch.clone();
             let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let storage = crate::session::Storage::open(&profile, file_watch)?;
-                storage.update_metadata(|all, _| {
-                    let Some(inst) = all
-                        .iter_mut()
-                        .find(|inst| inst.id == session_id && inst.is_structured())
-                    else {
-                        return Ok(None);
-                    };
-                    // Stamped before `apply_acp_session_change`, whose
-                    // same-id arm returns without touching the row: a first
-                    // `session/load` reattaching a legacy session must still
-                    // attest the route its launch observed.
-                    inst.attest_launch_default_store(observed.as_ref());
-                    apply_acp_session_change(inst, &session_id, change.as_ref());
-                    Ok(Some((
-                        inst.acp_session_id.clone(),
-                        inst.idle_dormant_since,
-                        inst.import_pending,
-                        inst.fork_pending.clone(),
-                    )))
-                })
+                storage.update_metadata(
+                    crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                        &session_id,
+                    )),
+                    |all, _| {
+                        let Some(inst) = all
+                            .iter_mut()
+                            .find(|inst| inst.id == session_id && inst.is_structured())
+                        else {
+                            return Ok(None);
+                        };
+                        // Stamped before `apply_acp_session_change`, whose
+                        // same-id arm returns without touching the row: a first
+                        // `session/load` reattaching a legacy session must still
+                        // attest the route its launch observed.
+                        inst.attest_launch_default_store(observed.as_ref());
+                        apply_acp_session_change(inst, &session_id, change.as_ref());
+                        Ok(Some((
+                            inst.acp_session_id.clone(),
+                            inst.idle_dormant_since,
+                            inst.import_pending,
+                            inst.fork_pending.clone(),
+                        )))
+                    },
+                )
             })
             .await;
             match saved {
@@ -618,6 +623,7 @@ pub(super) async fn persist_and_mirror_unread(
         profile.clone(),
         "acp turn-end unread",
         file_watch,
+        crate::session::MetadataSelection::Session(id.to_owned().into()),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 inst.mark_unread();

@@ -990,7 +990,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let id = instance.id.clone();
         match instance.start_with_size(crate::terminal::get_size()) {
             Ok(()) => {
-                let landed = storage.update_metadata(|all_instances, _groups| {
+                let landed = storage.update_metadata(crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id)), |all_instances, _groups| {
                     if let Some(stored) = all_instances.iter_mut().find(|i| i.id == id) {
                         stored.merge_post_start(&instance);
                         Ok(true)
@@ -1031,12 +1031,15 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
             }
             Err(e) => {
-                if let Err(rollback_err) = storage.update_metadata(|all_instances, _groups| {
-                    if let Some(stored) = all_instances.iter_mut().find(|i| i.id == id) {
-                        stored.status = crate::session::Status::Error;
-                    }
-                    Ok(())
-                }) {
+                if let Err(rollback_err) = storage.update_metadata(
+                    crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id)),
+                    |all_instances, _groups| {
+                        if let Some(stored) = all_instances.iter_mut().find(|i| i.id == id) {
+                            stored.status = crate::session::Status::Error;
+                        }
+                        Ok(())
+                    },
+                ) {
                     tracing::error!(
                         target: "session.store",
                         "Failed to persist Status::Error rollback for {}: {}; row may show stale Starting status",

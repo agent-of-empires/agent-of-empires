@@ -350,13 +350,16 @@ fn session_meta_set(
         .storage()
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     let found = storage
-        .update_metadata(|instances, _groups| {
-            let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
-                return Ok(false);
-            };
-            set_in_slot(inst, &plugin_id, &key, value.clone());
-            Ok(true)
-        })
+        .update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&session_id)),
+            |instances, _groups| {
+                let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
+                    return Ok(false);
+                };
+                set_in_slot(inst, &plugin_id, &key, value.clone());
+                Ok(true)
+            },
+        )
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     if !found {
         return Err(DispatchError::invalid_params(format!(
@@ -383,23 +386,26 @@ fn session_meta_cas(
         .storage()
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     let outcome = storage
-        .update_metadata(|instances, _groups| {
-            let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
-                return Ok(None);
-            };
-            let current = inst
-                .plugin_meta
-                .get(&plugin_id)
-                .and_then(|slot| slot.get(&key))
-                .cloned()
-                .unwrap_or(Value::Null);
-            if current == expected {
-                set_in_slot(inst, &plugin_id, &key, value.clone());
-                Ok(Some((true, value.clone())))
-            } else {
-                Ok(Some((false, current)))
-            }
-        })
+        .update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&session_id)),
+            |instances, _groups| {
+                let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
+                    return Ok(None);
+                };
+                let current = inst
+                    .plugin_meta
+                    .get(&plugin_id)
+                    .and_then(|slot| slot.get(&key))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if current == expected {
+                    set_in_slot(inst, &plugin_id, &key, value.clone());
+                    Ok(Some((true, value.clone())))
+                } else {
+                    Ok(Some((false, current)))
+                }
+            },
+        )
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     let (swapped, current) = outcome
         .ok_or_else(|| DispatchError::invalid_params(format!("unknown session {session_id:?}")))?;

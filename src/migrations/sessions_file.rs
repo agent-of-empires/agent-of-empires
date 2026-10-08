@@ -32,23 +32,36 @@ pub(super) fn heal_rows(
     content: &str,
     mut heal: impl FnMut(&mut Map<String, Value>) -> bool,
 ) -> Result<usize> {
-    let mut document: Value = match serde_json::from_str(content) {
+    let mut document = match crate::session::raw_document::RawDocument::parse(content) {
         Ok(document) => document,
-        Err(e) => {
-            debug!("failed to parse {}: {e}, skipping", path.display());
+        Err(error) => {
+            debug!("failed to parse {}: {error}, skipping", path.display());
             return Ok(0);
         }
     };
-    let mut healed = 0usize;
-    for row in document.as_array_mut().into_iter().flatten() {
-        if let Some(row) = row.as_object_mut() {
-            if heal(row) {
+    let mut healed = 0;
+    for raw in &mut document.rows {
+        let Ok(Value::Object(mut fields)) = serde_json::from_str(raw.get()) else {
+            continue;
+        };
+        let before = Value::Object(fields.clone());
+        if !heal(&mut fields) {
+            continue;
+        }
+        match crate::session::raw_document::patch(raw, &before, &Value::Object(fields)) {
+            Ok(crate::session::raw_document::Emission::Changed(changed)) => {
+                *raw = changed;
                 healed += 1;
             }
+            Ok(crate::session::raw_document::Emission::Original(_)) => {}
+            Err(error) => debug!(
+                "ambiguous row in {}: {error}, retaining original",
+                path.display()
+            ),
         }
     }
     if healed > 0 {
-        crate::session::atomic_write(path, serde_json::to_string_pretty(&document)?.as_bytes())?;
+        crate::session::atomic_write(path, &serde_json::to_vec_pretty(&document.rows)?)?;
     }
     Ok(healed)
 }

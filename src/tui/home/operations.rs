@@ -675,23 +675,26 @@ impl HomeView {
         let id_owned = id.to_string();
         let new_tool = new_tool.to_string();
         let row_profile = profile.clone();
-        let observed = storage.update_metadata(|instances, _groups| {
-            let mut observed = Vec::new();
-            if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
-                observed = crate::session::conversation_carry::conversation_ids(disk);
-                // `source_profile` is `skip_serializing`, so a storage-loaded row
-                // resolves `agent_detect_as` against the default profile and would pin
-                // the wrong built-in; `detect_as` is not in `reconcile_from_disk`'s carry
-                // set, so the next launch reads that value. Restore it before the swap.
-                disk.source_profile = row_profile.clone();
-                if account_swap {
-                    disk.swap_account(&new_tool);
-                } else {
-                    disk.swap_tool(&new_tool);
+        let observed = storage.update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(id)),
+            |instances, _groups| {
+                let mut observed = Vec::new();
+                if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
+                    observed = crate::session::conversation_carry::conversation_ids(disk);
+                    // `source_profile` is `skip_serializing`, so a storage-loaded row
+                    // resolves `agent_detect_as` against the default profile and would pin
+                    // the wrong built-in; `detect_as` is not in `reconcile_from_disk`'s carry
+                    // set, so the next launch reads that value. Restore it before the swap.
+                    disk.source_profile = row_profile.clone();
+                    if account_swap {
+                        disk.swap_account(&new_tool);
+                    } else {
+                        disk.swap_tool(&new_tool);
+                    }
                 }
-            }
-            Ok(observed)
-        });
+                Ok(observed)
+            },
+        );
         match observed {
             Ok(ids) => ids,
             Err(e) => {
@@ -785,32 +788,36 @@ impl HomeView {
             .get(profile)
             .ok_or_else(|| anyhow::anyhow!("No storage registered for profile '{profile}'"))?;
         let restart_in_flight = &self.restart_in_flight;
-        let mut outcome = storage.update_metadata(|instances, groups| {
-            let mut has_creating = false;
-            let mut has_restarting = false;
-            for instance in instances.iter().filter(|instance| {
-                instance.group_path == group_path || instance.group_path.starts_with(&prefix)
-            }) {
-                has_creating |= instance.status == Status::Creating;
-                has_restarting |= restart_in_flight.contains_key(&instance.id);
-            }
-            if has_creating {
-                return Ok(PersistGroupDelete::Creating);
-            }
-            if has_restarting {
-                return Ok(PersistGroupDelete::Restarting);
-            }
-
-            let mut members = Vec::new();
-            for instance in instances.iter_mut() {
-                if instance.group_path == group_path || instance.group_path.starts_with(&prefix) {
-                    members.push(instance.clone());
-                    instance.group_path.clear();
+        let mut outcome = storage.update_metadata(
+            crate::session::MetadataSelection::Subtree(std::borrow::Cow::Borrowed(group_path)),
+            |instances, groups| {
+                let mut has_creating = false;
+                let mut has_restarting = false;
+                for instance in instances.iter().filter(|instance| {
+                    instance.group_path == group_path || instance.group_path.starts_with(&prefix)
+                }) {
+                    has_creating |= instance.status == Status::Creating;
+                    has_restarting |= restart_in_flight.contains_key(&instance.id);
                 }
-            }
-            groups.retain(|group| group.path != group_path && !group.path.starts_with(&prefix));
-            Ok(PersistGroupDelete::Ready(members))
-        })?;
+                if has_creating {
+                    return Ok(PersistGroupDelete::Creating);
+                }
+                if has_restarting {
+                    return Ok(PersistGroupDelete::Restarting);
+                }
+
+                let mut members = Vec::new();
+                for instance in instances.iter_mut() {
+                    if instance.group_path == group_path || instance.group_path.starts_with(&prefix)
+                    {
+                        members.push(instance.clone());
+                        instance.group_path.clear();
+                    }
+                }
+                groups.retain(|group| group.path != group_path && !group.path.starts_with(&prefix));
+                Ok(PersistGroupDelete::Ready(members))
+            },
+        )?;
         if let PersistGroupDelete::Ready(members) = &mut outcome {
             for instance in members {
                 instance.source_profile.clear();

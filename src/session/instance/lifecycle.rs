@@ -179,26 +179,31 @@ impl Instance {
         restart: bool,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let committed = storage.update_metadata(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
-            };
-            if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
-                return Ok(false);
-            }
-            stored.status = self.status;
-            stored.idle_entered_at = self.idle_entered_at;
-            stored.last_accessed_at = self.last_accessed_at;
-            stored.sandbox_info = self.sandbox_info.clone();
-            stored.capture_started_at = self.capture_started_at;
-            stored.active_execution = self.active_execution.clone();
-            if restart && stored.agent_session_id == self.agent_session_id {
-                stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
-            }
-            stored.first_launch_names_agent = false;
-            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
-            Ok(true)
-        })?;
+        let committed = storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    return Ok(false);
+                };
+                if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
+                    return Ok(false);
+                }
+                stored.status = self.status;
+                stored.idle_entered_at = self.idle_entered_at;
+                stored.last_accessed_at = self.last_accessed_at;
+                stored.sandbox_info = self.sandbox_info.clone();
+                stored.capture_started_at = self.capture_started_at;
+                stored.active_execution = self.active_execution.clone();
+                if restart && stored.agent_session_id == self.agent_session_id {
+                    stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
+                }
+                stored.first_launch_names_agent = false;
+                stored
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+                Ok(true)
+            },
+        )?;
         anyhow::ensure!(
             committed,
             "session {} disappeared or lost its lifecycle reservation before launch commit",
@@ -219,34 +224,42 @@ impl Instance {
         let now = Utc::now();
         let mut acquired = None;
         let mut receipt = None;
-        storage.update_metadata(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(());
-            };
-            let generation = stored
-                .try_acquire_lifecycle_reservation(operation, Self::LIFECYCLE_RESERVATION_TTL, now)
-                .map_err(|error| match error {
-                    LifecycleReservationError::Busy(holder) => {
-                        anyhow::anyhow!("session {} is {}", self.id, holder.busy_reason())
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    return Ok(());
+                };
+                let generation = stored
+                    .try_acquire_lifecycle_reservation(
+                        operation,
+                        Self::LIFECYCLE_RESERVATION_TTL,
+                        now,
+                    )
+                    .map_err(|error| match error {
+                        LifecycleReservationError::Busy(holder) => {
+                            anyhow::anyhow!("session {} is {}", self.id, holder.busy_reason())
+                        }
+                        LifecycleReservationError::GenerationOverflow => {
+                            anyhow::anyhow!("session {} lifecycle generation overflow", self.id)
+                        }
+                    })?;
+                if let Some(status) = status {
+                    stored.status = status;
+                    if status != Status::Idle {
+                        stored.idle_entered_at = None;
                     }
-                    LifecycleReservationError::GenerationOverflow => {
-                        anyhow::anyhow!("session {} lifecycle generation overflow", self.id)
-                    }
-                })?;
-            if let Some(status) = status {
-                stored.status = status;
-                if status != Status::Idle {
-                    stored.idle_entered_at = None;
                 }
-            }
-            if acknowledgement.is_some() {
-                let mut emitted = stored.clone();
-                emitted.storage_origin = Some(std::sync::Arc::new(storage.clone()));
-                receipt = Some(crate::session::LaunchOrigin::capture(&emitted)?);
-            }
-            acquired = Some((generation, stored.lifecycle_reservation.clone()));
-            Ok(())
-        })?;
+                if acknowledgement.is_some() {
+                    let mut emitted = stored.clone();
+                    emitted.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+                    receipt = Some(crate::session::LaunchOrigin::capture(&emitted)?);
+                }
+                acquired = Some((generation, stored.lifecycle_reservation.clone()));
+                Ok(())
+            },
+        )?;
         let Some((generation, reservation)) = acquired else {
             anyhow::bail!("session {} no longer exists", self.id);
         };
@@ -271,20 +284,24 @@ impl Instance {
         status: Status,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let committed = storage.update_metadata(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
-            };
-            if !stored.lifecycle_reservation_is_owned(operation, generation) {
-                return Ok(false);
-            }
-            stored.status = status;
-            if status != Status::Idle {
-                stored.idle_entered_at = None;
-            }
-            stored.release_lifecycle_reservation_if_owned(operation, generation);
-            Ok(true)
-        })?;
+        let committed = storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    return Ok(false);
+                };
+                if !stored.lifecycle_reservation_is_owned(operation, generation) {
+                    return Ok(false);
+                }
+                stored.status = status;
+                if status != Status::Idle {
+                    stored.idle_entered_at = None;
+                }
+                stored.release_lifecycle_reservation_if_owned(operation, generation);
+                Ok(true)
+            },
+        )?;
         anyhow::ensure!(
             committed,
             "session {} disappeared or lost its lifecycle reservation before commit",
@@ -304,12 +321,16 @@ impl Instance {
         operation: LifecycleOperation,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let released = storage.update_metadata(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
-            };
-            Ok(stored.release_lifecycle_reservation_if_owned(operation, generation))
-        })?;
+        let released = storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    return Ok(false);
+                };
+                Ok(stored.release_lifecycle_reservation_if_owned(operation, generation))
+            },
+        )?;
         anyhow::ensure!(
             released,
             "session {} disappeared or lost its lifecycle reservation before release",
@@ -390,12 +411,17 @@ impl Instance {
         operation: LifecycleOperation,
     ) -> Result<bool> {
         let generation = self.lifecycle_generation;
-        storage.update_metadata(|instances, _groups| {
-            Ok(instances
-                .iter()
-                .find(|instance| instance.id == self.id)
-                .is_some_and(|stored| stored.lifecycle_reservation_is_owned(operation, generation)))
-        })
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                Ok(instances
+                    .iter()
+                    .find(|instance| instance.id == self.id)
+                    .is_some_and(|stored| {
+                        stored.lifecycle_reservation_is_owned(operation, generation)
+                    }))
+            },
+        )
     }
 
     fn reservation_is_current(&self, storage: &crate::session::storage::Storage) -> Result<bool> {
