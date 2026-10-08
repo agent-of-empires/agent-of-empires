@@ -1406,10 +1406,13 @@ fn transcript_lines(
                 }
                 out.push(Line::default());
             }
+            // Empty until the summary arrives; the row only anchors its position.
             TranscriptRowKind::CompactionSummary => {
-                out.push(note_line(NoteKind::Info, "Compaction summary"));
-                out.extend(agent_message_lines(&row.text, theme));
-                out.push(Line::default());
+                if !row.text.is_empty() {
+                    out.push(note_line(NoteKind::Info, "Compaction summary"));
+                    out.extend(agent_message_lines(&row.text, theme));
+                    out.push(Line::default());
+                }
             }
             TranscriptRowKind::EmptyOutput
             | TranscriptRowKind::ContextReset
@@ -2335,8 +2338,13 @@ mod tests {
                 compaction_id: "c-1".into(),
                 text: "kept the codeword".into(),
             },
+            Event::ConversationCompactionSummary {
+                compaction_id: "c-2".into(),
+                text: String::new(),
+            },
         ]);
         let out = joined(&transcript_lines(&t, &Theme::default(), None));
+        assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
         for want in [
             "working on it",
             "› Proceed?: Yes",

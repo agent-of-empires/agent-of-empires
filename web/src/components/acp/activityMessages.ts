@@ -90,6 +90,8 @@ export function activityToThreadMessages(
     }
     // Rendered collapsed by `AssistantText`; summaries run to thousands of chars.
     if (row.kind === "compaction_summary") {
+      // Empty until the summary arrives; the row only anchors its position.
+      if (!row.text) continue;
       flushAssistant();
       messages.push({
         id: `assistant-${row.id}`,

@@ -77,8 +77,11 @@ describe("AssistantMessage compaction summary", () => {
         text: "Kept **PINEAPPLE-42**",
         at: "2026-10-06T00:00:00Z",
       },
+      // An empty row only anchors a summary that has not arrived yet.
+      { id: "compaction-summary-2", kind: "compaction_summary", text: "", at: "2026-10-06T00:00:00Z" },
     ];
     const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
+    expect(container.querySelectorAll("details")).toHaveLength(1);
     const details = container.querySelector("details");
     expect(details).not.toBeNull();
     expect(details!.open).toBe(false);

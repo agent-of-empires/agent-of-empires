@@ -318,17 +318,14 @@ impl TranscriptModel {
                 compaction_id,
                 text,
             } => {
+                // Kept even when empty (clients hide it), so a later summary
+                // lands beside its divider.
                 let id = format!("compaction-summary-{compaction_id}");
                 match self.rows.iter().position(|r| r.id == id) {
-                    Some(i) if text.is_empty() => {
-                        self.rows.remove(i);
-                        vec![TranscriptDelta::Remove(id)]
-                    }
                     Some(i) => {
                         self.rows[i].text = text.clone();
                         vec![patch(&self.rows[i])]
                     }
-                    None if text.is_empty() => Vec::new(),
                     None => vec![self.push(id, TranscriptRowKind::CompactionSummary, text.clone())],
                 }
             }
@@ -1280,29 +1277,36 @@ mod tests {
         assert_eq!(tool_of(&m, "start-dup").name, "Edit a.rs");
     }
 
-    /// ACP compaction updates are upserts by id: a later summary replaces the
-    /// row and an empty one clears it.
+    /// ACP compaction updates are upserts by id: a late, cleared or restored
+    /// summary stays beside its divider, past any later turn.
     #[test]
     fn compaction_summary_row_is_keyed_by_compaction() {
         let summary = |id: &str, text: &str| Event::ConversationCompactionSummary {
             compaction_id: id.into(),
             text: text.into(),
         };
-        let mut m = fold([summary("a", "old"), summary("b", "other")]);
-        let deltas = m.apply_event(3, &summary("a", "new"));
-        assert!(
-            matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, row }] if id == "compaction-summary-a" && row.text == "new")
-        );
+        let mut m = fold([
+            Event::ConversationCompacted,
+            summary("a", ""),
+            summary("b", "other"),
+            Event::AgentMessageChunk {
+                text: "later turn".into(),
+            },
+        ]);
+        let ids = |m: &TranscriptModel| -> Vec<String> {
+            m.rows().iter().map(|r| r.id.clone()).collect()
+        };
+        let layout = ids(&m);
+        for (seq, text) in [(5, "late"), (6, ""), (7, "restored")] {
+            let deltas = m.apply_event(seq, &summary("a", text));
+            assert!(
+                matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, row }] if id == "compaction-summary-a" && row.text == text),
+                "{text:?}"
+            );
+            assert_eq!(ids(&m), layout, "{text:?}");
+        }
+        assert_eq!(layout[1], "compaction-summary-a");
         assert_eq!(row(&m, "compaction-summary-b").text, "other");
-        let deltas = m.apply_event(4, &summary("a", ""));
-        assert!(
-            matches!(deltas.as_slice(), [TranscriptDelta::Remove(id)] if id == "compaction-summary-a")
-        );
-        assert!(
-            m.apply_event(5, &summary("a", "")).is_empty(),
-            "nothing left to clear"
-        );
-        assert_eq!(m.rows().len(), 1);
     }
 
     #[test]

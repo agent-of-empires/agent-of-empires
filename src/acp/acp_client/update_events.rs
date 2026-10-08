@@ -104,9 +104,8 @@ pub(super) enum CompactionFold {
 pub(super) struct CompactionTracker {
     active: Option<CompactionId>,
     chunks: String,
-    /// Recent finished ids, so a late patch for an earlier compaction is
-    /// still a patch. Bounded: ids are unique per session.
-    terminal: std::collections::VecDeque<CompactionId>,
+    /// Finished ids, so a late patch for an earlier compaction is still a patch.
+    terminal: std::collections::HashSet<CompactionId>,
 }
 
 impl CompactionTracker {
@@ -129,14 +128,10 @@ impl CompactionTracker {
                 CompactionFold::Pass
             }
             SessionUpdate::CompactionUpdate(u) => {
-                if self.terminal.contains(&u.compaction_id) {
+                if !self.terminal.insert(u.compaction_id.clone()) {
                     return compaction_summary_event(&u.compaction_id, &u.summary)
                         .map_or(CompactionFold::Skip, |e| CompactionFold::Patch(Box::new(e)));
                 }
-                if self.terminal.len() == 16 {
-                    self.terminal.pop_front();
-                }
-                self.terminal.push_back(u.compaction_id.clone());
                 let streamed = if self.active.as_ref() == Some(&u.compaction_id) {
                     self.active = None;
                     std::mem::take(&mut self.chunks)
@@ -574,13 +569,14 @@ pub(super) fn map_update_to_events(
         SessionUpdate::CompactionUpdate(update) => match update.status {
             CompactionStatus::InProgress => vec![Event::ConversationCompactionStarted],
             CompactionStatus::Completed => {
-                let mut events = vec![Event::ConversationCompacted];
-                events.extend(compaction_summary_event(
-                    &update.compaction_id,
-                    &update.summary,
-                ));
-                events.push(cleared_plan());
-                events
+                // Always sent, so the summary row anchors beside the divider
+                // even when its text arrives later.
+                let summary = compaction_summary_event(&update.compaction_id, &update.summary)
+                    .unwrap_or_else(|| Event::ConversationCompactionSummary {
+                        compaction_id: update.compaction_id.to_string(),
+                        text: String::new(),
+                    });
+                vec![Event::ConversationCompacted, summary, cleared_plan()]
             }
             CompactionStatus::Failed => vec![Event::SessionNotice {
                 severity: "error".to_string(),
@@ -790,25 +786,18 @@ mod tests {
                 started(
                     &[
                         &ok[..],
-                        &[
-                            "conversation_compaction_started",
-                            "conversation_compacted",
-                            "plan_updated",
-                        ],
+                        &["conversation_compaction_started"],
+                        &ok[..],
                         &["conversation_compaction_summary"],
                     ]
                     .concat(),
                 ),
-                vec!["a1", "a2"],
+                vec!["a1", "", "a2"],
             ),
             (
                 vec![start(), done(none()), done(summary("late"))],
-                started(&[
-                    "conversation_compacted",
-                    "plan_updated",
-                    "conversation_compaction_summary",
-                ]),
-                vec!["late"],
+                started(&[&ok[..], &["conversation_compaction_summary"]].concat()),
+                vec!["", "late"],
             ),
             (
                 vec![
@@ -829,11 +818,7 @@ mod tests {
                 started(&ok),
                 vec!["full"],
             ),
-            (
-                vec![start(), done(none())],
-                started(&["conversation_compacted", "plan_updated"]),
-                vec![],
-            ),
+            (vec![start(), done(none())], started(&ok), vec![""]),
             (
                 vec![start(), compaction_update("a", "cancelled", none())],
                 started(&[]),
@@ -877,6 +862,18 @@ mod tests {
         assert!(matches!(
             tracker.observe(&mut compaction_chunk("a", "late")),
             CompactionFold::Skip
+        ));
+        // Completed ids are never forgotten, however many follow.
+        for i in 0..32 {
+            tracker.observe(&mut compaction_update(
+                &format!("x{i}"),
+                "completed",
+                none(),
+            ));
+        }
+        assert!(matches!(
+            tracker.observe(&mut done(summary("late"))),
+            CompactionFold::Patch(_)
         ));
 
         let failed = compaction_update("a", "failed", serde_json::json!({"error": "aborted"}));
