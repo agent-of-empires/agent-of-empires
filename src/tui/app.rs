@@ -2151,7 +2151,7 @@ impl App {
             let outcome = http
                 .smart_rename(&session_id)
                 .await
-                .map_err(|e| format!("auto-name failed: {e}"));
+                .map_err(|e| smart_rename_failure(&e));
             let _ = tx.send(outcome);
         });
     }
@@ -3108,11 +3108,49 @@ pub enum Action {
     SmartRenameNow(String),
 }
 
+/// Leads with the API `message` so the agent's reason fits the one-row banner.
+fn smart_rename_failure(e: &crate::acp::client::HttpError) -> String {
+    let message = match e {
+        crate::acp::client::HttpError::Server { body, .. } => {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v["message"].as_str().map(str::to_owned))
+        }
+        _ => None,
+    };
+    format!(
+        "auto-name failed: {}",
+        message.unwrap_or_else(|| e.to_string())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::telemetry::SendOutcome;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn smart_rename_failure_leads_with_the_api_message() {
+        use crate::acp::client::HttpError;
+        use reqwest::StatusCode;
+        for (body, want) in [
+            (
+                r#"{"error":"smart_rename_failed","message":"`opencode` failed: token expired"}"#,
+                "auto-name failed: `opencode` failed: token expired",
+            ),
+            (
+                "upstream down",
+                "auto-name failed: daemon returned HTTP 502 Bad Gateway: upstream down",
+            ),
+        ] {
+            let e = HttpError::Server {
+                status: StatusCode::BAD_GATEWAY,
+                body: body.to_string(),
+            };
+            assert_eq!(smart_rename_failure(&e), want);
+        }
+    }
 
     /// Read a signal's disposition; `sigaction` sets while reading, so restore it.
     #[cfg(unix)]
