@@ -45,6 +45,7 @@ pub struct DeletionResult {
     pub teardown_started: bool,
     /// Latest durable row when the transaction deliberately kept it.
     pub retained_instance: Option<Instance>,
+    pub(crate) retained_origin: Option<std::sync::Arc<crate::session::LaunchOrigin>>,
 }
 
 impl DeletionResult {
@@ -62,7 +63,25 @@ impl DeletionResult {
             disposition,
             retained_instance,
             teardown_started: false,
+            retained_origin: None,
         }
+    }
+
+    pub(crate) fn retained_release_matches(&self, current: &Instance) -> bool {
+        let (Some(original), Some(retained)) = (&self.retained_origin, &self.retained_instance)
+        else {
+            return false;
+        };
+        current.same_storage_origin(retained)
+            && current.trashed_at == retained.trashed_at
+            && (current.lifecycle_generation == original.generation()
+                || current.lifecycle_generation == retained.lifecycle_generation)
+            && original
+                .validate_baseline_at(current, current.lifecycle_generation)
+                .is_ok()
+            && original
+                .validate_baseline_at(retained, retained.lifecycle_generation)
+                .is_ok()
     }
 }
 
@@ -284,14 +303,7 @@ impl PurgeTransaction {
         let Some(message) = self.ownership_error() else {
             return Ok(self);
         };
-        let id = self.request.session_id.clone();
-        let retained = self.release_reservation().ok().flatten();
-        Err(Box::new(DeletionResult::rejected(
-            id,
-            DeletionDisposition::Failed,
-            message,
-            retained,
-        )))
+        Err(Box::new(self.failed_after_release(message)))
     }
 
     fn ownership_error(&mut self) -> Option<String> {
@@ -376,6 +388,25 @@ impl PurgeTransaction {
         // row removal after another profile inventory has changed.
         self.ownership_verdict = None;
         Ok(())
+    }
+
+    fn failed_after_release(&mut self, message: impl Into<String>) -> DeletionResult {
+        let mut result = DeletionResult::rejected(
+            self.request.session_id.clone(),
+            DeletionDisposition::Failed,
+            message,
+            None,
+        );
+        self.acknowledge_retention(&mut result);
+        result
+    }
+
+    fn acknowledge_retention(&mut self, result: &mut DeletionResult) {
+        result.retained_instance = self.release_reservation().ok().flatten();
+        result.retained_origin = result
+            .retained_instance
+            .as_ref()
+            .map(|_| self.original.clone());
     }
 
     fn release_reservation(&mut self) -> Result<Option<Instance>> {
@@ -498,13 +529,7 @@ impl PurgeTransaction {
             )));
         }
         if let Some(message) = self.ownership_error() {
-            let retained = self.release_reservation().ok().flatten();
-            return Err(Box::new(DeletionResult::rejected(
-                self.request.session_id.clone(),
-                DeletionDisposition::Failed,
-                message,
-                retained,
-            )));
+            return Err(Box::new(self.failed_after_release(message)));
         }
         let id = self.request.session_id.clone();
         let generation = self.generation;
@@ -633,22 +658,16 @@ impl PurgeTransaction {
             return self.result_for_gate(gate, retained);
         }
         if let Some(message) = self.ownership_error() {
-            let retained = self.release_reservation().ok().flatten();
-            return DeletionResult::rejected(id, DeletionDisposition::Failed, message, retained);
+            return self.failed_after_release(message);
         }
         let mut result = perform_deletion_core(&self.request, true, true, teardown);
         if !result.success && !commit_on_teardown_failure {
-            result.retained_instance = self.release_reservation().ok().flatten();
+            self.acknowledge_retention(&mut result);
             result.disposition = DeletionDisposition::Failed;
             return result;
         }
         if let Err(error) = after_teardown(&self.request.instance) {
-            let mut failed = DeletionResult::rejected(
-                id,
-                DeletionDisposition::Failed,
-                error,
-                self.release_reservation().ok().flatten(),
-            );
+            let mut failed = self.failed_after_release(error);
             failed.teardown_started = result.teardown_started;
             failed.messages = result.messages;
             return failed;
@@ -818,17 +837,12 @@ async fn settle_runner_of_owned(
     match outcome {
         Ok(()) => Ok(released),
         Err(error) => {
-            let retained = released.release_reservation().ok().flatten();
+            let failed = released.failed_after_release(format!(
+                "The agent for this session is not proven dead, so nothing was removed: \
+                 {error}. Retry once it exits."
+            ));
             released.active = false;
-            Err(Box::new(DeletionResult::rejected(
-                released.request.session_id.clone(),
-                DeletionDisposition::Failed,
-                format!(
-                    "The agent for this session is not proven dead, so nothing was removed: \
-                     {error}. Retry once it exits."
-                ),
-                retained,
-            )))
+            Err(Box::new(failed))
         }
     }
 }
@@ -916,6 +930,7 @@ fn perform_deletion_sidecars(request: &DeletionRequest) -> DeletionResult {
         disposition: DeletionDisposition::Removed,
         teardown_started: true,
         retained_instance: None,
+        retained_origin: None,
     }
 }
 
@@ -1566,6 +1581,7 @@ fn perform_deletion_teardown_under_ownership_guard(
             )],
             disposition: DeletionDisposition::Failed,
             retained_instance: None,
+            retained_origin: None,
         };
     }
 
@@ -1625,6 +1641,7 @@ fn perform_deletion_teardown_under_ownership_guard(
         errors,
         disposition: DeletionDisposition::Failed,
         retained_instance: None,
+        retained_origin: None,
     }
 }
 
@@ -2966,6 +2983,37 @@ mod tests {
             let before = storage.load().unwrap().remove(0);
             let result = execute_drop(requested).await;
             assert_eq!(result.disposition, expected, "{profile}");
+            if change == 0 {
+                assert!(result.retained_release_matches(&before));
+                assert!(result.retained_release_matches(result.retained_instance.as_ref().unwrap()));
+                for field in ["dob", "plan", "trash", "generation", "profile"] {
+                    let mut replaced = before.clone();
+                    match field {
+                        "dob" => replaced.created_at += chrono::Duration::microseconds(1),
+                        "plan" => replaced.title.push_str(" changed"),
+                        "trash" => {
+                            replaced.trashed_at = replaced
+                                .trashed_at
+                                .map(|at| at + chrono::Duration::microseconds(1))
+                        }
+                        "generation" => {
+                            replaced.lifecycle_generation = result
+                                .retained_instance
+                                .as_ref()
+                                .unwrap()
+                                .lifecycle_generation
+                                + 1
+                        }
+                        "profile" => {
+                            replaced.storage_origin = Some(std::sync::Arc::new(
+                                Storage::new_unwatched("replacement-root").unwrap(),
+                            ))
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(!result.retained_release_matches(&replaced), "{field}");
+                }
+            }
             let retained = storage.load().unwrap().remove(0);
             assert_eq!(
                 (retained.id, retained.created_at),
@@ -3025,7 +3073,8 @@ mod tests {
         let transaction = reserve(
             profile,
             stored_instance(&storage, profile, "/tmp/test-project"),
-        );
+        )
+        .release_locks_for_teardown();
         storage
             .update(|instances, _groups| {
                 instances[0].lifecycle_generation += 1;

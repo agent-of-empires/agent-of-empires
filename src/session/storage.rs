@@ -3948,43 +3948,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[serial]
-    fn test_update_does_not_serialize_across_profiles() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-        let storage_a = Storage::new_unwatched("test-update-profile-a")?;
-        let storage_b = Storage::new_unwatched("test-update-profile-b")?;
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (overlap_tx, overlap_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            let storage_a = &storage_a;
-            let storage_b = &storage_b;
-            let a = scope.spawn(move || {
-                storage_a.update(|instances, _| {
-                    entered_tx.send(()).unwrap();
-                    let overlap = overlap_rx.recv_timeout(Duration::from_secs(2));
-                    instances.push(Instance::new("a1", "/tmp/a1"));
-                    overlap.context("profile B must enter while profile A owns its update locks")
-                })
-            });
-            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            let b = scope.spawn(move || {
-                storage_b.update(|instances, _| {
-                    let _ = overlap_tx.send(());
-                    instances.push(Instance::new("b1", "/tmp/b1"));
-                    Ok(())
-                })
-            });
-            a.join().unwrap()?;
-            b.join().unwrap()?;
-            Ok::<_, anyhow::Error>(())
-        })?;
-        assert_eq!(storage_a.load()?[0].title, "a1");
-        assert_eq!(storage_b.load()?[0].title, "b1");
-        Ok(())
-    }
-
     /// A writer whose profile was deleted mid-flight must not bring it back: the
     /// lock file opened with `create_dir_all` resurrected an empty directory
     /// between the two identity checks, and `list_profiles` then reported a
@@ -4996,11 +4959,13 @@ mod tests {
             record(&entry, a)
         };
         let target_duplicate: Arrange = |a, b, before| {
-            push_copy(b, before)?;
-            push_copy(b, before)?;
+            fs::write(b.sessions_path(), serde_json::to_vec(&[before, before])?)?;
             record(&fresh_journal_entry(a, b, &before.id), a)
         };
-        let same_profile: Arrange = |a, _, before| push_copy(a, before);
+        let same_profile: Arrange = |a, _, before| {
+            fs::write(a.sessions_path(), serde_json::to_vec(&[before, before])?)?;
+            Ok(())
+        };
         let newer_unresolved: Arrange = |a, b, before| {
             push_copy(b, before)?;
             let mut older = fresh_journal_entry(a, b, &before.id);

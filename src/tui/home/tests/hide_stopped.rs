@@ -675,6 +675,7 @@ fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         ("archive", |view, id| {
             view.select_session_by_id(id);
             view.toggle_archive_at_cursor().unwrap();
+            finish_runner_settlements(view);
             assert!(view.get_instance(id).unwrap().is_archived());
         }),
         ("trash", |view, id| {

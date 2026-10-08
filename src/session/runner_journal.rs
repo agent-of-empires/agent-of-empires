@@ -2999,16 +2999,18 @@ mod tests {
         );
         let workspace = super::super::acquire_session_workspace_claim_lock().unwrap();
         drop(last);
-        let mut closing = lifecycle.lock().unwrap();
-        assert!(!closing.is_owned(&row.id));
-        let pending = closing.close_admissions();
-        for kind in [ResumeKind::Spawn, ResumeKind::Attach] {
-            assert_eq!(
-                closing.admit("future-admission", kind),
-                Err(crate::acp::runner_lifecycle::AdmitError::ShuttingDown)
-            );
-        }
-        drop(closing);
+        let pending = {
+            let mut closing = lifecycle.lock().unwrap();
+            assert!(!closing.is_owned(&row.id));
+            let pending = closing.close_admissions();
+            for kind in [ResumeKind::Spawn, ResumeKind::Attach] {
+                assert_eq!(
+                    closing.admit("future-admission", kind),
+                    Err(crate::acp::runner_lifecycle::AdmitError::ShuttingDown)
+                );
+            }
+            pending
+        };
         let original = pending
             .into_iter()
             .next()

@@ -61,12 +61,25 @@ impl HomeView {
                         ));
                     }
                     DeletionDisposition::Failed => {
+                        if result.retained_instance.is_some()
+                            && !self
+                                .instances
+                                .get(&result.session_id)
+                                .is_some_and(|inst| result.retained_release_matches(inst))
+                        {
+                            return true;
+                        }
                         let error = if result.errors.is_empty() {
                             None
                         } else {
                             Some(result.errors.join("; "))
                         };
                         self.mutate_instance(&result.session_id, |inst| {
+                            if let Some(retained) = result.retained_instance {
+                                inst.lifecycle_generation = retained.lifecycle_generation;
+                                inst.lifecycle_reservation = retained.lifecycle_reservation;
+                                inst.runner_journal = retained.runner_journal;
+                            }
                             inst.status = Status::Error;
                             inst.last_error = error;
                         });
