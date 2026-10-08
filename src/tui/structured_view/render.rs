@@ -1928,6 +1928,7 @@ mod tests {
                 severity: "warning".into(),
                 title: "Model fallback".into(),
                 description: Some("Switched to Sonnet.".into()),
+                key: None,
             }]));
 
         // One strip row per undismissed notice, each with its own close target.

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
-use super::state::{DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock};
+use super::state::{notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock};
 use crate::daemon::PromptAttachmentRef;
 
 /// One renderable row of the transcript.
@@ -365,13 +365,18 @@ impl TranscriptModel {
                 severity,
                 title,
                 description,
+                key,
             } => {
                 self.turn_has_output = true;
-                vec![self.push(
-                    format!("notice-{seq}"),
-                    TranscriptRowKind::Advisory,
-                    session_notice_text(severity, title, description),
-                )]
+                let id = notice_id(key.as_deref(), seq);
+                let text = session_notice_text(severity, title, description);
+                match self.rows.iter().position(|r| r.id == id) {
+                    Some(i) => {
+                        self.rows[i].text = text;
+                        vec![patch(&self.rows[i])]
+                    }
+                    None => vec![self.push(id, TranscriptRowKind::Advisory, text)],
+                }
             }
             Event::RateLimitAutoResumed { resets_at, manual } => {
                 let how = if *manual { "resumed" } else { "auto-resumed" };
@@ -864,6 +869,7 @@ mod tests {
                     severity: "warning".into(),
                     title: "Model fallback".into(),
                     description: Some("Switched to Sonnet.".into()),
+                    key: None,
                 },
                 "notice-1",
                 TranscriptRowKind::Advisory,
@@ -874,6 +880,7 @@ mod tests {
                     severity: "info".into(),
                     title: "Task stopped by user".into(),
                     description: None,
+                    key: None,
                 },
                 "notice-1",
                 TranscriptRowKind::Advisory,
@@ -1310,6 +1317,27 @@ mod tests {
     }
 
     #[test]
+    fn keyed_session_notice_is_replaced_in_place() {
+        let failed = |reason: &str| Event::SessionNotice {
+            severity: "error".into(),
+            title: "Compaction failed".into(),
+            description: Some(reason.into()),
+            key: Some("compaction-a".into()),
+        };
+        let mut m = fold([
+            failed("aborted"),
+            Event::AgentMessageChunk {
+                text: "later turn".into(),
+            },
+        ]);
+        let deltas = m.apply_event(3, &failed("out of tokens"));
+        assert!(
+            matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, row }] if id == "notice-compaction-a" && row.text == "error: Compaction failed: out of tokens")
+        );
+        assert_eq!(m.rows()[0].id, "notice-compaction-a");
+    }
+
+    #[test]
     fn ask_user_question_cards_are_suppressed_in_either_order() {
         let mut m = fold([started(tool("tc-ask", "Asking"))]);
         let deltas = m.apply_event(2, &elicitation_requested("tc-ask"));
@@ -1432,6 +1460,7 @@ mod tests {
                     severity: "error".into(),
                     title: "Compaction failed".into(),
                     description: None,
+                    key: None,
                 }],
                 false,
             ),

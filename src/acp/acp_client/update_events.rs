@@ -88,6 +88,16 @@ fn compaction_summary_event(
     })
 }
 
+/// Keyed by compaction, so a later error for the same id replaces it.
+fn compaction_failed_notice(id: &CompactionId, error: Option<String>) -> Event {
+    Event::SessionNotice {
+        severity: "error".to_string(),
+        title: "Compaction failed".to_string(),
+        description: error,
+        key: Some(format!("compaction-{id}")),
+    }
+}
+
 pub(super) enum CompactionFold {
     Pass,
     /// A chunk outside the open compaction, or claude-agent-acp's status-only
@@ -137,7 +147,15 @@ impl CompactionTracker {
                 ) =>
             {
                 if !self.terminal.insert(u.compaction_id.clone()) {
-                    return compaction_summary_event(&u.compaction_id, &u.summary)
+                    let patch = if u.status == CompactionStatus::Failed && !u.error.is_undefined() {
+                        Some(compaction_failed_notice(
+                            &u.compaction_id,
+                            u.error.clone().take(),
+                        ))
+                    } else {
+                        compaction_summary_event(&u.compaction_id, &u.summary)
+                    };
+                    return patch
                         .map_or(CompactionFold::Skip, |e| CompactionFold::Patch(Box::new(e)));
                 }
                 let streamed = if self.active.as_ref() == Some(&u.compaction_id) {
@@ -572,6 +590,7 @@ pub(super) fn map_update_to_events(
                 severity: severity.to_string(),
                 title: notice.title,
                 description: notice.description,
+                key: None,
             }]
         }
         SessionUpdate::CompactionUpdate(update) => match update.status {
@@ -586,11 +605,10 @@ pub(super) fn map_update_to_events(
                     });
                 vec![Event::ConversationCompacted, summary, cleared_plan()]
             }
-            CompactionStatus::Failed => vec![Event::SessionNotice {
-                severity: "error".to_string(),
-                title: "Compaction failed".to_string(),
-                description: update.error.take(),
-            }],
+            CompactionStatus::Failed => vec![compaction_failed_notice(
+                &update.compaction_id,
+                update.error.take(),
+            )],
             // A cancel is reported by the turn's own terminal.
             _ => Vec::new(),
         },
@@ -895,12 +913,47 @@ mod tests {
             CompactionFold::Patch(_)
         ));
 
-        let failed = compaction_update("a", "failed", serde_json::json!({"error": "aborted"}));
-        assert!(matches!(
-            claude(failed).as_slice(),
-            [Event::SessionNotice { severity, title, description: Some(d) }]
-                if severity == "error" && title == "Compaction failed" && d == "aborted"
-        ));
+        // A later error for a failed compaction replaces its keyed notice.
+        let failed = |extra| compaction_update("a", "failed", extra);
+        let mut tracker = CompactionTracker::default();
+        let notices: Vec<(String, Option<String>, Option<String>)> = [
+            start(),
+            failed(serde_json::json!({"error": "aborted"})),
+            failed(none()),
+            failed(serde_json::json!({"error": "out of tokens"})),
+        ]
+        .into_iter()
+        .flat_map(|mut u| match tracker.observe(&mut u) {
+            CompactionFold::Pass => claude(u),
+            CompactionFold::Skip => Vec::new(),
+            CompactionFold::Patch(e) => vec![*e],
+        })
+        .filter_map(|e| match e {
+            Event::SessionNotice {
+                severity,
+                title,
+                description,
+                key,
+            } => Some((format!("{severity}: {title}"), description, key)),
+            _ => None,
+        })
+        .collect();
+        let key = Some("compaction-a".to_string());
+        assert_eq!(
+            notices,
+            [
+                (
+                    "error: Compaction failed".into(),
+                    Some("aborted".into()),
+                    key.clone()
+                ),
+                (
+                    "error: Compaction failed".into(),
+                    Some("out of tokens".into()),
+                    key
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1130,6 +1183,7 @@ mod tests {
                 severity,
                 title,
                 description,
+                ..
             }] = events.as_slice()
             else {
                 panic!("expected one SessionNotice, got {events:?}");
