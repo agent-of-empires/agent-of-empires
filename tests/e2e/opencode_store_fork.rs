@@ -32,7 +32,8 @@ srv.listen(16)
 while True:
     conn, _ = srv.accept()
     try:
-        request = conn.recv(65535)
+        with conn.makefile("rb") as reader:
+            request = reader.readline()
         if request.startswith(b'POST '):
             parent = request.split()[1].decode().split('/')[-2]
             if mode == 'parent':
