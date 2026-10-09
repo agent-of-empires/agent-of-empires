@@ -1179,6 +1179,47 @@ fn restart_selected_session_skips_when_already_in_flight() {
     );
 }
 
+#[test]
+#[serial]
+fn rejected_duplicate_delete_is_visible_before_the_other_ack_is_consumed() {
+    use crate::tui::dialogs::DeleteOptions;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    let storage = env.view.storages.get("test").unwrap().clone();
+    storage
+        .update_metadata(
+            crate::session::MetadataSelection::Session(id.as_str().into()),
+            |rows, _| {
+                rows.iter_mut().find(|row| row.id == id).unwrap().title =
+                    "Changed original goal".into();
+                Ok(())
+            },
+        )
+        .unwrap();
+    let durable = std::fs::read(storage.sessions_path()).unwrap();
+    env.view.delete_selected(&DeleteOptions::default()).unwrap();
+    env.view.delete_selected(&DeleteOptions::default()).unwrap();
+    assert_eq!(env.view.deletes_in_flight.len(), 2);
+    let other_request = *env.view.deletes_in_flight.keys().max().unwrap();
+    wait_for_native_fixture("first real deletion refusal", || {
+        env.view.apply_deletion_results().then_some(())
+    });
+    assert!(
+        env.view.info_dialog.is_some(),
+        "a real refusal must remain visible"
+    );
+    assert!(env.view.deletes_in_flight.contains_key(&other_request));
+    assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Deleting);
+    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), durable);
+    wait_for_native_fixture("second real deletion refusal", || {
+        env.view.apply_deletion_results();
+        env.view.deletes_in_flight.is_empty().then_some(())
+    });
+    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), durable);
+}
+
 /// Deleting a row whose restart cascade is still running would fire docker commands
 /// against the container the worker is creating, so the delete must be refused visibly.
 #[test]
