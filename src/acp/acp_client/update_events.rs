@@ -98,15 +98,14 @@ fn compaction_failed_notice(id: &CompactionId, error: Option<String>) -> Event {
     }
 }
 
-/// ACP ids are unique only per session, while an agent switch keeps the
-/// transcript; qualifying them keeps each session's rows and notices apart.
+/// Length-prefix the session so unrestricted ACP ids cannot share a transcript key.
 pub(super) fn qualify_compaction_id(session: &SessionId, update: &mut SessionUpdate) {
     let id = match update {
         SessionUpdate::CompactionUpdate(u) => &mut u.compaction_id,
         SessionUpdate::CompactionSummaryChunk(c) => &mut c.compaction_id,
         _ => return,
     };
-    *id = CompactionId::new(format!("{}/{}", session.0, id.0));
+    *id = CompactionId::new(format!("{}:{}{}", session.0.len(), session.0, id.0));
 }
 
 pub(super) enum CompactionFold {
@@ -972,81 +971,104 @@ mod tests {
     #[test]
     fn compaction_ids_are_scoped_to_their_session() {
         use crate::acp::transcript::TranscriptModel;
-        let summary = |text: &str| serde_json::json!({"summary": [{"type": "text", "text": text}]});
-        let error = |text: &str| serde_json::json!({"error": text});
-        let mut model = TranscriptModel::new();
-        let mut seq = 0;
-        let mut feed = |tracker: &mut CompactionTracker, session: &str, mut u: SessionUpdate| {
-            qualify_compaction_id(&SessionId::new(session), &mut u);
-            let events = match tracker.observe(&mut u) {
-                CompactionFold::Pass => claude(u),
-                CompactionFold::Skip => Vec::new(),
-                CompactionFold::Patch(e) => vec![*e],
+        for (sessions, ids, keys) in [
+            (
+                ["s1", "s2"],
+                ["a", "b", "a", "b"],
+                ["2:s1a", "2:s1b", "2:s2a", "2:s2b"],
+            ),
+            (
+                ["s/a", "s"],
+                ["b", "c", "a/b", "a/c"],
+                ["3:s/ab", "3:s/ac", "1:sa/b", "1:sa/c"],
+            ),
+        ] {
+            let summary =
+                |text: &str| serde_json::json!({"summary": [{"type": "text", "text": text}]});
+            let error = |text: &str| serde_json::json!({"error": text});
+            let mut model = TranscriptModel::new();
+            let mut seq = 0;
+            let mut feed =
+                |tracker: &mut CompactionTracker, session: &str, mut u: SessionUpdate| {
+                    qualify_compaction_id(&SessionId::new(session), &mut u);
+                    let events = match tracker.observe(&mut u) {
+                        CompactionFold::Pass => claude(u),
+                        CompactionFold::Skip => Vec::new(),
+                        CompactionFold::Patch(e) => vec![*e],
+                    };
+                    for event in events {
+                        seq += 1;
+                        model.apply_event(seq, &event);
+                    }
+                };
+            let (mut one, mut two) = (CompactionTracker::default(), CompactionTracker::default());
+            feed(
+                &mut one,
+                sessions[0],
+                compaction_update(ids[0], "completed", summary("first")),
+            );
+            feed(
+                &mut one,
+                sessions[0],
+                compaction_update(ids[1], "failed", error("e1")),
+            );
+            feed(
+                &mut two,
+                sessions[1],
+                compaction_update(ids[2], "completed", summary("second")),
+            );
+            feed(
+                &mut two,
+                sessions[1],
+                compaction_update(ids[3], "failed", error("e2")),
+            );
+            feed(
+                &mut two,
+                sessions[1],
+                compaction_update(ids[2], "completed", summary("patched")),
+            );
+            feed(
+                &mut two,
+                sessions[1],
+                compaction_update(ids[3], "failed", error("e3")),
+            );
+            let rows: Vec<(String, &str)> = model
+                .rows()
+                .iter()
+                .map(|r| (r.id.clone(), r.text.as_str()))
+                .filter(|(id, _)| !id.starts_with("compacted-"))
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    (format!("compaction-summary-{}", keys[0]), "first"),
+                    (
+                        format!("notice-compaction-{}", keys[1]),
+                        "error: Compaction failed: e1"
+                    ),
+                    (format!("compaction-summary-{}", keys[2]), "patched"),
+                    (
+                        format!("notice-compaction-{}", keys[3]),
+                        "error: Compaction failed: e3"
+                    ),
+                ]
+            );
+            let kinds: Vec<_> = model.rows().iter().map(|r| r.kind).collect();
+            use crate::acp::transcript::TranscriptRowKind::{
+                Advisory, Compacted, CompactionSummary,
             };
-            for event in events {
-                seq += 1;
-                model.apply_event(seq, &event);
-            }
-        };
-        let (mut one, mut two) = (CompactionTracker::default(), CompactionTracker::default());
-        feed(
-            &mut one,
-            "s1",
-            compaction_update("a", "completed", summary("first")),
-        );
-        feed(
-            &mut one,
-            "s1",
-            compaction_update("b", "failed", error("e1")),
-        );
-        feed(
-            &mut two,
-            "s2",
-            compaction_update("a", "completed", summary("second")),
-        );
-        feed(
-            &mut two,
-            "s2",
-            compaction_update("b", "failed", error("e2")),
-        );
-        feed(
-            &mut two,
-            "s2",
-            compaction_update("a", "completed", summary("patched")),
-        );
-        feed(
-            &mut two,
-            "s2",
-            compaction_update("b", "failed", error("e3")),
-        );
-        let rows: Vec<(&str, &str)> = model
-            .rows()
-            .iter()
-            .map(|r| (r.id.as_str(), r.text.as_str()))
-            .filter(|(id, _)| !id.starts_with("compacted-"))
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                ("compaction-summary-s1/a", "first"),
-                ("notice-compaction-s1/b", "error: Compaction failed: e1"),
-                ("compaction-summary-s2/a", "patched"),
-                ("notice-compaction-s2/b", "error: Compaction failed: e3"),
-            ]
-        );
-        let kinds: Vec<_> = model.rows().iter().map(|r| r.kind).collect();
-        use crate::acp::transcript::TranscriptRowKind::{Advisory, Compacted, CompactionSummary};
-        assert_eq!(
-            kinds,
-            [
-                Compacted,
-                CompactionSummary,
-                Advisory,
-                Compacted,
-                CompactionSummary,
-                Advisory
-            ]
-        );
+            assert_eq!(
+                kinds,
+                [
+                    Compacted,
+                    CompactionSummary,
+                    Advisory,
+                    Compacted,
+                    CompactionSummary,
+                    Advisory
+                ]
+            );
+        }
     }
 
     #[test]
