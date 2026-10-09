@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyAcpState } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
-import { ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
+import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
   flushAsync,
@@ -105,6 +105,63 @@ describe("reconnect (#1130)", () => {
     expect(result.current.retryCount).toBe(0);
   });
 
+  it("dials anyway when the replay fetch hangs", async () => {
+    calls = installAcpFakes((call) => (call.url.includes("/acp/replay") ? new Promise<Response>(() => {}) : undefined));
+    FakeWebSocket.closeFiresOnClose = true;
+    render("sess-hung-replay");
+    await flushAsync();
+    expect(sockets).toHaveLength(0);
+    await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("drops a replay response that lands after the dial timeout and a newer socket row", async () => {
+    const row = { id: "row-1", kind: "user_prompt", at: "t" };
+    const pending: Array<() => void> = [];
+    calls = installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      const rows = url.includes("view=rows") ? [{ ...row, text: "stale" }] : [];
+      return new Promise<Response>((resolve) => {
+        pending.push(() => resolve(json({ frames: [], rows, lost: false, highest_seq: 1, next_cursor: 1 })));
+      });
+    });
+    const { result } = render("sess-late-replay");
+    await flushAsync();
+    await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    sockets[0]!.open();
+    sockets[0]!.message({ kind: "transcript_delta", delta: { Append: { ...row, text: "fresh" } } });
+    expect(result.current.state.activity).toMatchObject([{ id: "row-1", text: "fresh" }]);
+
+    pending.forEach((release) => release());
+    await flushAsync();
+    expect(result.current.state.activity).toMatchObject([{ id: "row-1", text: "fresh" }]);
+  });
+
+  it("abandons a socket stuck connecting and backs off", async () => {
+    const { result } = render("sess-hung-connect");
+    await flushAsync();
+    await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
+    expect(sockets[0]!.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(result.current).toMatchObject({ reconnecting: true, retryCount: 1 });
+    await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    await flushAsync();
+    expect(sockets).toHaveLength(2);
+  });
+
+  it("does not show a stale retry count while redialing after resume", async () => {
+    const { result } = render("sess-resume");
+    await flushAsync();
+    sockets[0]!.drop();
+    expect(result.current.reconnecting).toBe(true);
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(result.current).toMatchObject({ reconnecting: false, retryCount: 0, status: "connecting" });
+  });
+
   it("dials without an elevation preflight", async () => {
     render("sess-no-preflight");
     await flushAsync();
@@ -135,10 +192,10 @@ describe("liveness watchdog (#2287)", () => {
     expect(sockets[0]!.readyState).toBe(FakeWebSocket.OPEN);
   });
 
-  it("never redials a socket that is not OPEN", async () => {
+  it("never redials a socket that is still connecting within the dial deadline", async () => {
     render("sess-connecting");
     await flushAsync();
-    await act(() => vi.advanceTimersByTimeAsync(ACP_WS_STALE_MS + 30000));
+    await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS - 1000));
     await flushAsync();
     expect(sockets).toHaveLength(1);
   });
