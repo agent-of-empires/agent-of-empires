@@ -4,7 +4,7 @@ Maintainer reference for how `agent-of-empires` ships: a weekly automated cadenc
 
 ## Weekly cadence
 
-At least one release per week. Every Wednesday at 03:23 UTC, `.github/workflows/open-release-pr.yml` opens a release-staging PR using the [automatic versioning policy](#versioning). Review it, adjust the bump if needed, and merge. Merging fires `tag-release-pr.yml`, which tags the merge commit, and the tag push triggers `release.yml`, which builds the platform binaries and publishes the GitHub release and the ClawHub artifact.
+At least one release per week. Every Wednesday at 03:23 UTC, `.github/workflows/open-release-pr.yml` opens a release-staging PR using the [automatic versioning policy](#versioning). Review it, adjust the bump if needed, and merge. Merging fires `tag-release-pr.yml`, which tags the merge commit, and the tag push triggers `release.yml`, which builds the platform binaries and publishes the GitHub release, the `aoe-server` container image, and the ClawHub artifact.
 
 You can trigger the staging PR by hand:
 
