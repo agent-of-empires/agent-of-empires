@@ -148,9 +148,14 @@ pub struct HomeView {
     pub(super) view_mode: ViewMode,
     /// Whether the terminal-view last-prompt footer (toggled with `Ctrl+L`) is on.
     pub(super) show_last_prompt: bool,
-    /// Throttled scrape of the selected terminal session's last sent prompt.
-    /// Module-private: only the `home` submodules touch it.
+    /// Latest last-prompt scrape adopted for rendering. Module-private: only the
+    /// `home` submodules touch it.
     last_prompt_cache: Option<last_prompt::LastPromptCache>,
+    /// Drop-box a background scrape thread writes into, keeping `capture-pane` off
+    /// the render/input path.
+    last_prompt_slot: last_prompt::LastPromptSlot,
+    /// Whether a background last-prompt scrape is currently running.
+    last_prompt_in_flight: bool,
     pub(super) sort_order: SortOrder,
     pub(super) group_by: GroupByMode,
     pub(super) row_tag_mode: crate::session::config::RowTagMode,

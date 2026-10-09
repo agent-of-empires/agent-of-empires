@@ -13,9 +13,19 @@
 //! last horizontal rule — is excluded, and an in-progress draft is never
 //! mistaken for a sent prompt.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::tmux::Session;
+
+/// Drop-box a background scrape writes its result into; the render thread adopts
+/// it on the next frame. Keeps `tmux capture-pane` off the render/input path.
+pub(super) type LastPromptSlot = Arc<Mutex<Option<LastPromptCache>>>;
+
+/// A fresh, empty slot for [`super::HomeView`] construction.
+pub(super) fn new_slot() -> LastPromptSlot {
+    Arc::new(Mutex::new(None))
+}
 
 /// Marker Claude Code renders before each submitted user prompt (and before the
 /// live input line, which is why the input box is excluded by rule).
@@ -111,44 +121,62 @@ fn is_horizontal_rule(line: &str) -> bool {
 }
 
 impl super::HomeView {
-    /// Refresh the throttled scrape of the selected terminal session's last
-    /// prompt. A no-op (and cache clear) unless the footer is toggled on and a
-    /// terminal session is selected; otherwise captures at most once per
-    /// [`REFRESH_INTERVAL`], and re-captures immediately on a session switch.
+    /// Keep the last-prompt cache fresh without ever blocking the render/input
+    /// thread: adopt any completed background scrape, then, when the cache for the
+    /// displayed pane is stale and no capture is running, dispatch one on a short
+    /// background thread. The result's timestamp is set on completion, so a slow
+    /// capture does not immediately read as stale and re-fire.
     pub(super) fn refresh_last_prompt(&mut self) {
         if !self.show_last_prompt {
             self.last_prompt_cache = None;
+            self.last_prompt_in_flight = false;
             return;
         }
-        // Scrape the pane actually shown in the preview (honouring the view mode,
+        // The pane actually shown in the preview (honouring the view mode,
         // live-send, and any rename), not a name rebuilt from the title.
-        let Some(tmux_name) = self.displayed_pane_tmux_name() else {
+        let Some(pane) = self.displayed_pane_tmux_name() else {
             self.last_prompt_cache = None;
             return;
         };
-        let now = Instant::now();
-        if matches!(&self.last_prompt_cache, Some(c) if c.is_fresh(&tmux_name, now)) {
-            return;
+        if let Some(done) = self
+            .last_prompt_slot
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        {
+            self.last_prompt_in_flight = false;
+            self.last_prompt_cache = Some(done);
         }
-        let text = scrape(&tmux_name);
-        self.last_prompt_cache = Some(LastPromptCache {
-            pane: tmux_name,
-            text,
-            at: now,
-        });
+        let fresh = matches!(&self.last_prompt_cache, Some(c) if c.is_fresh(&pane, Instant::now()));
+        if !fresh && !self.last_prompt_in_flight {
+            self.last_prompt_in_flight = true;
+            let slot = self.last_prompt_slot.clone();
+            std::thread::spawn(move || {
+                let text = scrape(&pane);
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(LastPromptCache {
+                        pane,
+                        text,
+                        at: Instant::now(),
+                    });
+                }
+            });
+        }
     }
 
-    /// The footer line to paint, or `None` when the footer is off or no session
-    /// is selected. When on but no prompt was scraped (a non-Claude pane, or the
-    /// last prompt scrolled past the capture window), a muted placeholder shows
-    /// so the toggle is always visibly acknowledged.
+    /// The footer line to paint, or `None` when the footer is off or no pane is
+    /// shown. The cache is only used when it matches the displayed pane, so a
+    /// pane switch shows the placeholder until its own scrape lands rather than a
+    /// stale neighbour's prompt.
     pub(super) fn last_prompt_footer_line(&self) -> Option<String> {
-        if !self.show_last_prompt || self.displayed_pane_tmux_name().is_none() {
+        if !self.show_last_prompt {
             return None;
         }
+        let pane = self.displayed_pane_tmux_name()?;
         let text = self
             .last_prompt_cache
             .as_ref()
+            .filter(|c| c.pane == pane)
             .and_then(|c| c.text.as_deref());
         Some(text.unwrap_or("(no recent prompt found)").to_string())
     }
