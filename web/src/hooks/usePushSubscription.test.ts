@@ -164,11 +164,7 @@ describe("usePushSubscription initial refresh", () => {
     ["granted with no subscription", noSubscription, { kind: "off" }],
     ["denied permission", () => setPermission("denied"), { kind: "denied" }],
     ["push disabled on the server", () => installFetch(DISABLED_BY_SERVER), { kind: "disabled-by-server" }],
-    [
-      "a failing status endpoint",
-      () => installFetch({ status: { ok: false, body: {} } }),
-      error("Could not fetch push status (500)"),
-    ],
+    ["a failing status endpoint", () => installFetch({ status: { ok: false, body: {} } }), { kind: "enabled" }],
     ["a rejected serviceWorker.ready", () => rejectServiceWorker("sw boom"), error("sw boom")],
     ["an insecure LAN origin", () => setInsecureHost("192.168.1.5"), unsupported("insecure-origin")],
     ["localhost over http", () => setInsecureHost("localhost"), { kind: "enabled" }],
@@ -190,6 +186,52 @@ describe("usePushSubscription initial refresh", () => {
   it("re-registers an existing subscription with the server on open (#3386)", async () => {
     await mountAndSettle();
     expect(called("/api/push/subscribe")).toBe(true);
+  });
+
+  it.each<[string, FetchOverrides]>([
+    ["a non-OK response", { status: { ok: false, body: {} } }],
+    ["a network error", { statusError: new Error("status unavailable") }],
+  ])("keeps the local enabled state after %s during refresh", async (_label, overrides) => {
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    const health = result.current.health;
+
+    installFetch(overrides);
+    await act_(result, "refresh");
+
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    expect(result.current.health).toBe(health);
+    expect(calls).toEqual(["/api/push/status?endpoint=https%3A%2F%2Fpush.example%2Fabc"]);
+  });
+
+  it("retains existing subscription intent when the initial status request fails", async () => {
+    installFetch({ statusError: new Error("status unavailable") });
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    expect(result.current.health).toBe("unknown");
+    expect(localStorage.getItem("aoe.push.wanted")).toBe("1");
+    expect(called("/api/push/subscribe")).toBe(false);
+
+    noSubscription();
+    installFetch(statusWith(serverSub({ registered: false, owned: false })));
+    await act_(result, "refresh");
+    expect(result.current.state).toEqual({ kind: "off" });
+    expect(result.current.health).toBe("revoked");
+    expect(called("/api/push/subscribe")).toBe(false);
+  });
+
+  it.each<[NotificationPermission, PushState]>([
+    ["granted", { kind: "off" }],
+    ["denied", { kind: "denied" }],
+  ])("retains %s permission without a subscription when status fails", async (permission, expected) => {
+    noSubscription();
+    setPermission(permission);
+    installFetch({ status: { ok: false, body: {} } });
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual(expected);
+    expect(result.current.health).toBe("unknown");
+    expect(localStorage.getItem("aoe.push.wanted")).toBeNull();
+    expect(calls).toEqual(["/api/push/status"]);
   });
 });
 
@@ -434,10 +476,11 @@ describe("usePushSubscription enable() with an existing subscription", () => {
     expect(registrationIndex).toBeGreaterThan(absenceCheckIndex);
   });
 
-  it("does not treat a forbidden removal as success while another owner has the endpoint", async () => {
+  it("renews after confirming a forbidden cleanup belongs to another owner", async () => {
     const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
     currentSub = existing;
-    subscribeImpl = vi.fn(async () => makeSubscription("https://push.example/replacement", keyBytes("ABC")));
+    subscribeImpl = vi.fn(async () => (currentSub = replacement));
     const expiredStatus = statusWith(
       serverSub({
         last_failure: "gone",
@@ -450,11 +493,14 @@ describe("usePushSubscription enable() with an existing subscription", () => {
       unsubscribeResponses: [403],
     });
     const { result } = await mountAndSettle();
+    calls.length = 0;
 
-    expect(await act_(result, "enable")).toEqual(error("Could not remove the expired notification subscription"));
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
     expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
-    expect(currentSub).toBeNull();
-    expect(subscribeImpl).not.toHaveBeenCalled();
+    expect(subscribeImpl).toHaveBeenCalledTimes(1);
+    expect(currentSub).toBe(replacement);
+    expect(calls.filter((url) => url.includes("/api/push/unsubscribe"))).toHaveLength(1);
+    expect(calls.at(-1)).toContain("/api/push/subscribe");
   });
 
   it("does not replace an endpoint when browser unsubscribe fails", async () => {
@@ -479,6 +525,33 @@ describe("usePushSubscription enable() with an existing subscription", () => {
       message: "Could not unsubscribe the expired notification subscription",
     });
     expect(subscribeImpl).not.toHaveBeenCalled();
+  });
+
+  it("replaces an endpoint when unsubscribe reports it was already inactive", async () => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
+    existing.unsubscribe.mockImplementation(async () => {
+      currentSub = null;
+      return false;
+    });
+    currentSub = existing;
+    subscribeImpl = vi.fn(async () => (currentSub = replacement));
+    installFetch(
+      statusWith(
+        serverSub({
+          registered: false,
+          owned: false,
+          last_failure: "gone",
+          last_failure_at: "2026-09-02T10:00:00Z",
+        }),
+      ),
+    );
+    const { result } = await mountAndSettle();
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(subscribeImpl).toHaveBeenCalledTimes(1);
+    expect(currentSub).toBe(replacement);
   });
 });
 
