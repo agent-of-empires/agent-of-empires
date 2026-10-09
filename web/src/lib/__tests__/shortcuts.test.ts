@@ -26,12 +26,6 @@ describe("SHORTCUTS registry", () => {
     expect(new Set(SHORTCUTS.map((s) => s.id)).size).toBe(SHORTCUTS.length);
     for (const s of SHORTCUTS) expect(SHORTCUTS_BY_ID[s.id]).toBe(s);
   });
-
-  it("SHORTCUTS_BY_ID resolves every entry", () => {
-    for (const s of SHORTCUTS) {
-      expect(SHORTCUTS_BY_ID[s.id]).toBe(s);
-    }
-  });
 });
 
 describe("label formatting (locked byte-for-byte against pre-refactor output)", () => {
