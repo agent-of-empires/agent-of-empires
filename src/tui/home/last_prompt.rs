@@ -127,9 +127,12 @@ impl super::HomeView {
     /// background thread. The result's timestamp is set on completion, so a slow
     /// capture does not immediately read as stale and re-fire.
     pub(super) fn refresh_last_prompt(&mut self) {
+        self.refresh_last_prompt_at(Instant::now());
+    }
+
+    pub(super) fn refresh_last_prompt_at(&mut self, now: Instant) {
         if !self.show_last_prompt {
             self.last_prompt_cache = None;
-            self.last_prompt_in_flight = false;
             return;
         }
         // The pane actually shown in the preview (honouring the view mode,
@@ -147,7 +150,7 @@ impl super::HomeView {
             self.last_prompt_in_flight = false;
             self.last_prompt_cache = Some(done);
         }
-        let fresh = matches!(&self.last_prompt_cache, Some(c) if c.is_fresh(&pane, Instant::now()));
+        let fresh = matches!(&self.last_prompt_cache, Some(c) if c.is_fresh(&pane, now));
         if !fresh && !self.last_prompt_in_flight {
             self.last_prompt_in_flight = true;
             let slot = self.last_prompt_slot.clone();

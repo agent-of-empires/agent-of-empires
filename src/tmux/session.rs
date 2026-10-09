@@ -856,9 +856,7 @@ impl Session {
     /// escapes (unlike `capture_pane`, which passes `-e`), so callers match on the
     /// text rather than on embedded SGR sequences. Used to scrape the pane.
     pub fn capture_plain(&self, lines: usize) -> Result<String> {
-        // Deadline-bounded: this is called on the render path, so a stalled tmux
-        // must time out rather than block input and redraws. Both the existence
-        // probe and the capture share one budget.
+        // The existence probe and capture share one deadline.
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         if !self.exists_with_deadline(&deadline) {
             return Ok(String::new());

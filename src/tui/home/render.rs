@@ -3625,9 +3625,7 @@ impl HomeView {
         );
     }
 
-    /// One-line footer echoing the last prompt the user sent to the terminal
-    /// session, so it stays visible after the agent's reply scrolls it off. A
-    /// multi-line prompt is flattened to one clipped line.
+    /// Show the first line of the last submitted prompt as a clipped footer.
     fn render_last_prompt_footer(&self, frame: &mut Frame, area: Rect, theme: &Theme, text: &str) {
         // `text` is the scrape's first prompt line, already whitespace-collapsed
         // and length-capped; the paragraph clips whatever still overruns the row.
