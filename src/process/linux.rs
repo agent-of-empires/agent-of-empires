@@ -500,9 +500,10 @@ impl CreateTraceDiagnostics {
         let socket = (nr == libc::SYS_socket).then(|| [args[0], args[1], args[2]]);
         let descriptor = create_descriptor_argument(nr).map(|index| args[index]);
         let request = (nr == libc::SYS_ioctl).then_some(args[1]);
+        let command = (nr == libc::SYS_fcntl).then_some(args[1]);
         let audit = action.entry();
         create_trace_diagnostic(format_args!(
-            "root={:?} actor={:?} actor_pid={} sequence={sequence} nr={nr} phase=held_entry external={} unproven={} decision={action:?} socket={socket:?} descriptor={descriptor:?} ioctl_request={request:?}",
+            "root={:?} actor={:?} actor_pid={} sequence={sequence} nr={nr} phase=held_entry external={} unproven={} decision={action:?} socket={socket:?} descriptor={descriptor:?} ioctl_request={request:?} fcntl_command={command:?}",
             self.root, actor.birth, actor.trace_pid, audit.external, audit.unproven,
         ));
         Some(sequence)
@@ -611,6 +612,9 @@ fn create_syscall_action(nr: i64, args: &[u64; 6], fd: CreateFdEvidence) -> Crea
             Action::External
         };
     }
+    if nr == libc::SYS_fcntl && [libc::F_GETFD as u64, libc::F_GETFL as u64].contains(&args[1]) {
+        return Action::Ordinary;
+    }
     if [
         libc::SYS_socketpair,
         libc::SYS_bind,
@@ -641,7 +645,7 @@ fn create_syscall_action(nr: i64, args: &[u64; 6], fd: CreateFdEvidence) -> Crea
         return Action::External;
     }
     if create_descriptor_argument(nr).is_some() {
-        // Ordinary write-family APIs and fcntl can act on a socket, too.
+        // Mutating descriptor operations can delegate through a socket.
         return match fd {
             CreateFdEvidence::UnixStream | CreateFdEvidence::OtherSocket => Action::External,
             CreateFdEvidence::Unknown => Action::Unproven,
@@ -1444,6 +1448,36 @@ full avg10=0.10 avg60=0.20 avg300=0.30 total=42
         }
         let args = |a, b, c| [a, b, c, 0, 0, 0];
         let cases = [
+            Case {
+                name: "socket descriptor flag query",
+                nr: libc::SYS_fcntl,
+                args: args(3, libc::F_GETFD as u64, 0),
+                fd: Fd::UnixStream,
+                exit: Some((libc::FD_CLOEXEC as i64, false)),
+                identity: true,
+                private: true,
+                retired: true,
+            },
+            Case {
+                name: "unknown descriptor status query",
+                nr: libc::SYS_fcntl,
+                args: args(3, libc::F_GETFL as u64, 0),
+                fd: Fd::Unknown,
+                exit: Some((-(libc::EBADF as i64), true)),
+                identity: true,
+                private: true,
+                retired: true,
+            },
+            Case {
+                name: "socket descriptor owner mutation remains protected",
+                nr: libc::SYS_fcntl,
+                args: args(3, libc::F_SETOWN as u64, 42),
+                fd: Fd::UnixStream,
+                exit: Some((0, false)),
+                identity: true,
+                private: true,
+                retired: false,
+            },
             Case {
                 name: "local UNIX allocation",
                 nr: libc::SYS_socket,

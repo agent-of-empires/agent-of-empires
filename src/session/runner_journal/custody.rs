@@ -259,6 +259,43 @@ impl<C: OriginalChild> OriginalLaunchCustody<C> {
         Ok(())
     }
 
+    pub(super) fn complete_installation(
+        &self,
+        acknowledgement: super::OriginalInstallationAck,
+    ) -> Result<()> {
+        self.admission
+            .acknowledge_installation(acknowledgement.clone())?;
+        let retirement = self
+            .admission
+            .preparation_retirement()
+            .context("installation lost its original preparation ACK channel")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match *retirement.borrow() {
+                Some(true) => break,
+                Some(false) => anyhow::bail!("original installation preparation remains protected"),
+                None => {}
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "original installation preparation ACK deadline expired"
+            );
+            std::thread::park_timeout(std::time::Duration::from_millis(25));
+        }
+        let job = {
+            let mut state = self.lock();
+            anyhow::ensure!(
+                Arc::ptr_eq(&state.original, acknowledgement.original())
+                    && state.channels_closed
+                    && state.fences.is_none(),
+                "installation preparation ACK belongs to another original custody"
+            );
+            state.job.take()
+        };
+        drop(job);
+        Ok(())
+    }
+
     pub(super) fn release_acknowledged(
         &self,
         ack: &super::OriginalNoTargetRemovalAck,

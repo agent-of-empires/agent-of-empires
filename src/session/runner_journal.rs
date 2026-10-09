@@ -420,11 +420,23 @@ struct RunnerPreparation {
     generation: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OriginalInstallationAck {
+    original: std::sync::Arc<LaunchOrigin>,
+}
+
+impl OriginalInstallationAck {
+    pub(crate) fn original(&self) -> &std::sync::Arc<LaunchOrigin> {
+        &self.original
+    }
+}
+
 #[derive(Debug)]
 enum PreparationAcknowledgement {
     Produced(std::sync::Arc<LaunchOrigin>),
     Stopped(std::sync::Arc<OwnedStop>),
     NoTarget(std::sync::Arc<OriginalNoTargetRemovalAck>),
+    Installed(OriginalInstallationAck),
 }
 
 #[derive(Debug)]
@@ -442,6 +454,12 @@ impl PreparationCustody {
         self._completion
             .send(PreparationAcknowledgement::Produced(origin))
             .map_err(|_| anyhow::anyhow!("owned preparation retirement lost its output receiver"))
+    }
+
+    pub(crate) fn installed(&self, acknowledgement: OriginalInstallationAck) -> Result<()> {
+        self._completion
+            .send(PreparationAcknowledgement::Installed(acknowledgement))
+            .map_err(|_| anyhow::anyhow!("original installation lost its preparation receiver"))
     }
 
     pub(crate) fn stopped(&self, stop: std::sync::Arc<OwnedStop>) -> Result<()> {
@@ -689,6 +707,7 @@ fn prepare_locked<'a>(
     let mut retirement_scope = prepared.clone();
     let mut retirement_stop = None;
     let mut no_target_acknowledgement = None;
+    let mut installation_acknowledgement = None;
     let nonce = *Uuid::new_v4().as_bytes();
     let (completion, finished) = std::sync::mpsc::channel();
     let (retired_tx, retired) = tokio::sync::watch::channel(None);
@@ -703,6 +722,10 @@ fn prepare_locked<'a>(
                     no_target_acknowledgement = Some(acknowledgement);
                     break;
                 }
+                PreparationAcknowledgement::Installed(acknowledgement) => {
+                    installation_acknowledgement = Some(acknowledgement);
+                    break;
+                }
             }
         }
         let result = (|| -> Result<()> {
@@ -710,14 +733,22 @@ fn prepare_locked<'a>(
             let _identity = super::acquire_session_identity_lock()?;
             original.verify_profile_identity()?;
             let _lifecycle = original.acquire_instance_lifecycle_lock(&session_id)?;
-            let acknowledgement = no_target_acknowledgement
-                .context("preparation completion lacks an original no-target producer ACK; retaining protection")?;
-            let acknowledgement = retirement_scope.with_acknowledged_no_target_retirement(acknowledgement)?;
-            retirement_scope = acknowledgement.derived().clone();
+            let installed = installation_acknowledgement.is_some();
+            if let Some(acknowledgement) = installation_acknowledgement {
+                anyhow::ensure!(std::sync::Arc::ptr_eq(&retirement_scope, acknowledgement.original()),
+                    "installation ACK replaced its original preparation output");
+            } else {
+                let acknowledgement = no_target_acknowledgement
+                    .context("preparation completion lacks an original no-target producer ACK; retaining protection")?;
+                let acknowledgement = retirement_scope.with_acknowledged_no_target_retirement(acknowledgement)?;
+                retirement_scope = acknowledgement.derived().clone();
+            }
             let validate = |row: &Instance| -> Result<()> {
                 if let Some(stop) = &retirement_stop {
-                    anyhow::ensure!(std::sync::Arc::ptr_eq(&stop.native_origin(), &retirement_scope),
-                        "preparation Stop has not consumed its original no-target ACK");
+                    if !installed {
+                        anyhow::ensure!(std::sync::Arc::ptr_eq(&stop.native_origin(), &retirement_scope),
+                            "preparation Stop has not consumed its original no-target ACK");
+                    }
                     stop.current_projection().validate_baseline_at(row, stop.generation())?;
                     stop.validate_acknowledged_native_history(row)?;
                     anyhow::ensure!(row.lifecycle_reservation_is_owned(stop.operation(), stop.generation()),
@@ -736,8 +767,10 @@ fn prepare_locked<'a>(
                 anyhow::ensure!(count == 1, "original preparation ACK has missing or duplicate tuples");
                 row.runner_journal.preparations.retain(|ticket|
                     ticket.nonce != nonce || ticket.boot != boot || ticket.generation != generation);
-                anyhow::ensure!(row.runner_journal.proves_runner_quiescent(),
-                    "preparation no-target ACK left another protected runner domain");
+                if !installed {
+                    anyhow::ensure!(row.runner_journal.proves_runner_quiescent(),
+                        "preparation no-target ACK left another protected runner domain");
+                }
                 Ok(())
             }).and_then(|_| sync_parent_directory(original.sessions_path()));
             if let Err(error) = removed {
@@ -761,8 +794,10 @@ fn prepare_locked<'a>(
             anyhow::ensure!(!row.runner_journal.preparations.iter().any(|ticket|
                 ticket.nonce == nonce && ticket.boot == boot && ticket.generation == generation),
                 "original preparation writer did not acknowledge exact tuple removal");
-            anyhow::ensure!(row.runner_journal.proves_runner_quiescent(),
-                "original preparation writer still retains protected runner authority");
+            if !installed {
+                anyhow::ensure!(row.runner_journal.proves_runner_quiescent(),
+                    "original preparation writer still retains protected runner authority");
+            }
             Ok(())
         })();
         let _ = retired_tx.send(Some(result.is_ok()));
@@ -2169,6 +2204,7 @@ impl ManagedLaunch {
         custody.lock().fences = Some([workspace_fence, identity_fence, lifecycle_fence]);
         let nonce = *self.nonce.as_bytes();
         let mut pid = None;
+        let mut installation = None;
         let published = (|| -> Result<()> {
             storage.update_under_workspace_claim_lock(|rows, _| {
                 let row = rows
@@ -2363,7 +2399,7 @@ impl ManagedLaunch {
                 Ok(())
             })?;
             sync_parent_directory(storage.sessions_path())?;
-            let committed = {
+            let acknowledgement = {
                 let mut state = custody.lock();
                 let channel = state
                     .channel
@@ -2371,6 +2407,7 @@ impl ManagedLaunch {
                     .context("original commit channel is absent")?;
                 bootstrap::commit_original(channel, &armed, identity)?
             };
+            let committed = acknowledgement.original().clone();
             admission.record_produced_origin(&armed, committed.clone(), Some(identity))?;
             {
                 let mut state = custody.lock();
@@ -2381,6 +2418,7 @@ impl ManagedLaunch {
                     .context("original natal watchdog is absent")?
                     .finish()?;
             }
+            installation = Some(acknowledgement);
             Ok(())
         })();
         if let Err(error) = published {
@@ -2443,6 +2481,8 @@ impl ManagedLaunch {
         }
         custody.close_parent_channels();
         drop(custody.lock().fences.take());
+        custody
+            .complete_installation(installation.context("original installation ACK is absent")?)?;
         Ok((custody, pid))
     }
 }

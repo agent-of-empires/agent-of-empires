@@ -633,6 +633,29 @@ impl ExecutionAdmission {
         issue()
     }
 
+    pub(crate) fn acknowledge_installation(
+        &self,
+        acknowledgement: crate::session::runner_journal::OriginalInstallationAck,
+    ) -> anyhow::Result<()> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            state
+                .prepared
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, acknowledgement.original())),
+            "installation ACK replaced its original prepared admission"
+        );
+        state
+            .preparation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("installation ACK lost its preparation custody"))?
+            .installed(acknowledgement)
+    }
+
     pub(crate) fn acknowledge_no_target_retirement(
         &self,
         acknowledgement: Arc<crate::session::runner_journal::OriginalNoTargetRemovalAck>,

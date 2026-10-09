@@ -1559,13 +1559,19 @@ mod tests {
         gate.open.notify_one();
         spawner.await.unwrap().expect("spawn");
 
-        let explicit = sup
+        let (explicit, admission) = sup
             .workers
             .lock()
             .await
             .get("s-prov")
             .map(|handle| match &handle.kind {
-                WorkerKind::Runner { spawn_config } => spawn_config.default_effort_explicit,
+                WorkerKind::Runner { spawn_config } => (
+                    spawn_config.default_effort_explicit,
+                    spawn_config
+                        .execution_admission
+                        .clone()
+                        .expect("original admission"),
+                ),
                 _ => panic!("runner handle expected"),
             })
             .expect("worker installed");
@@ -1573,9 +1579,29 @@ mod tests {
             !explicit,
             "a resolved default effort must not read as a session pin"
         );
-        sup.shutdown(crate::acp::supervisor::test_support::stop_receipt("s-prov"))
-            .await
-            .expect("fixture shutdown");
+        assert!(
+            admission.is_drained(),
+            "genuine installed preparation was not acknowledged"
+        );
+        assert!(!storage
+            .load()
+            .unwrap()
+            .remove(0)
+            .runner_journal
+            .proves_quiescent());
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sup.shutdown(crate::acp::supervisor::test_support::stop_receipt("s-prov")),
+        )
+        .await
+        .expect("Stop waited on a completed startup job");
+        assert!(matches!(stopped, Err(SupervisorError::TeardownPending(id)) if id == "s-prov"));
+        assert!(!storage
+            .load()
+            .unwrap()
+            .remove(0)
+            .runner_journal
+            .proves_quiescent());
     }
 
     /// #4116: the handshake holds no lifecycle lock, so an archive (which a TUI takes on its

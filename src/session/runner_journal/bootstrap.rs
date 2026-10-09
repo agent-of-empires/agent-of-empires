@@ -131,7 +131,7 @@ pub(super) fn commit_original(
     channel: &mut UnixStream,
     issued: &LaunchOrigin,
     identity: RunnerIdentity,
-) -> Result<Arc<LaunchOrigin>> {
+) -> Result<super::OriginalInstallationAck> {
     let commit = OriginalCommit::capture(issued, identity)?;
     write_frame(channel, &commit)?;
     let ack: InstallationAck = read_frame(channel)?;
@@ -149,7 +149,9 @@ pub(super) fn commit_original(
         published == ack.published,
         "installation ACK changed durable Published snapshot"
     );
-    issued.with_launch_snapshot(ack.published)
+    Ok(super::OriginalInstallationAck {
+        original: issued.with_launch_snapshot(ack.published)?,
+    })
 }
 
 /// Inherited channel custody, started before the runtime and passed unchanged to receive.
