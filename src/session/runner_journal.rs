@@ -576,6 +576,8 @@ fn prepare_locked<'a>(
 struct LaunchPlan {
     storage: std::sync::Arc<Storage>,
     execution: ExecutionPlan,
+    pre_trash_project_path: Option<String>,
+    scratch: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -690,6 +692,8 @@ impl LaunchOrigin {
         Ok(Self {
             plan: std::sync::Arc::new(LaunchPlan {
                 storage,
+                pre_trash_project_path: expected.pre_trash_project_path.clone(),
+                scratch: expected.scratch,
                 execution: ExecutionPlan {
                     session_id: expected.id.clone(),
                     created_at: expected.created_at,
@@ -761,6 +765,8 @@ impl LaunchOrigin {
             && a.title == b.title
             && a.archived == b.archived
             && a.trashed == b.trashed
+            && a.pre_trash_project_path == b.pre_trash_project_path
+            && a.scratch == b.scratch
             && a.project_path == b.project_path
             && a.worktree == b.worktree
             && workspace_matches
@@ -915,6 +921,8 @@ impl LaunchOrigin {
             && row.title == self.plan.title
             && row.is_archived() == self.plan.archived
             && row.is_trashed() == trashed
+            && row.pre_trash_project_path == self.plan.pre_trash_project_path
+            && row.scratch == self.plan.scratch
             && row.project_path == self.plan.project_path
             && row.worktree_info == self.plan.worktree
             && workspace_matches

@@ -2857,7 +2857,7 @@ async fn archive_metadata_ack_preserves_idle_and_rejects_replaced_cache() {
     let epoch = state
         .mutation_epoch
         .load(std::sync::atomic::Ordering::SeqCst);
-    super::lifecycle::publish_archive_update(
+    super::lifecycle::publish_operation_update(
         &state,
         &original,
         None,
@@ -2888,7 +2888,7 @@ async fn archive_metadata_ack_preserves_idle_and_rejects_replaced_cache() {
         }
         state.instances.write().await[0] = replacement.clone();
         let bytes = std::fs::read(storage.sessions_path()).unwrap();
-        assert!(super::lifecycle::publish_archive_update(
+        assert!(super::lifecycle::publish_operation_update(
             &state,
             &original,
             None,
@@ -2916,6 +2916,150 @@ async fn archive_metadata_ack_preserves_idle_and_rejects_replaced_cache() {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
         assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn lifecycle_claim_and_rollback_ack_preserve_cache_ownership() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    for (operation, rollback) in [
+        (LifecycleOperation::Trash, false),
+        (LifecycleOperation::Trash, true),
+        (LifecycleOperation::Restore, false),
+        (LifecycleOperation::Restore, true),
+    ] {
+        let mut row = Instance::new("cache-ack", "/metadata-only-original");
+        row.source_profile = "default".into();
+        if operation == LifecycleOperation::Restore {
+            row.trash();
+        }
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row]);
+        let storage = Storage::open_unwatched("default").unwrap();
+        let before = storage.load().unwrap().remove(0);
+        let original = crate::session::LaunchOrigin::capture_baseline(&before).unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![before.clone()]);
+        let claim = storage
+            .update_metadata(
+                crate::session::MetadataSelection::Session(before.id.as_str().into()),
+                |rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| original.matches_instance(row))
+                        .unwrap();
+                    row.try_acquire_lifecycle_reservation(
+                        operation,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap();
+                    if operation == LifecycleOperation::Trash {
+                        row.trash();
+                    }
+                    Ok(row.clone())
+                },
+            )
+            .unwrap();
+        let issued = crate::session::LaunchOrigin::capture_baseline(&claim).unwrap();
+        let generation = claim.lifecycle_generation;
+        let epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        super::lifecycle::publish_operation_update(
+            &state,
+            &original,
+            Some(&issued),
+            generation,
+            &issued,
+            claim.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let emitted = storage
+            .update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| issued.matches_instance(row))
+                    .unwrap();
+                if rollback {
+                    if operation == LifecycleOperation::Trash {
+                        row.untrash();
+                    }
+                } else {
+                    row.project_path = if operation == LifecycleOperation::Trash {
+                        "/metadata-only-held"
+                    } else {
+                        "/metadata-only-restored"
+                    }
+                    .into();
+                    if operation == LifecycleOperation::Restore {
+                        row.untrash();
+                    }
+                }
+                row.release_lifecycle_reservation_if_owned(operation, generation);
+                Ok(row.clone())
+            })
+            .unwrap();
+        let acknowledged = crate::session::LaunchOrigin::capture_baseline(&emitted).unwrap();
+        for changed in 0..3 {
+            let mut replacement = claim.clone();
+            match changed {
+                0 => replacement.created_at += chrono::Duration::seconds(1),
+                1 => replacement.scratch = !replacement.scratch,
+                _ => replacement.pre_trash_project_path = Some("/foreign-restore-target".into()),
+            }
+            state.instances.write().await[0] = replacement.clone();
+            assert!(super::lifecycle::publish_operation_update(
+                &state,
+                &original,
+                Some(&issued),
+                generation,
+                &acknowledged,
+                emitted.clone()
+            )
+            .await
+            .unwrap()
+            .is_none());
+            let cached = state.instances.read().await[0].clone();
+            assert_eq!(cached.created_at, replacement.created_at);
+            assert_eq!(cached.scratch, replacement.scratch);
+            assert_eq!(
+                cached.pre_trash_project_path,
+                replacement.pre_trash_project_path
+            );
+            assert_eq!(
+                state
+                    .mutation_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                epoch + 1
+            );
+        }
+        state.instances.write().await[0] = claim;
+        super::lifecycle::publish_operation_update(
+            &state,
+            &original,
+            Some(&issued),
+            generation,
+            &acknowledged,
+            emitted.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let cached = state.instances.read().await[0].clone();
+        assert_eq!(cached.created_at, before.created_at);
+        assert!(cached.same_storage_origin(&before));
+        assert_eq!(cached.lifecycle_generation, generation);
+        assert_eq!(cached.project_path, emitted.project_path);
+        assert_eq!(cached.is_trashed(), emitted.is_trashed());
+        assert!(cached.lifecycle_reservation.is_none());
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            epoch + 2
+        );
     }
 }
 

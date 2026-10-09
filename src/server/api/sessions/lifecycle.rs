@@ -220,7 +220,7 @@ pub async fn update_session_color(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-pub(super) async fn publish_archive_update(
+pub(super) async fn publish_operation_update(
     state: &Arc<AppState>,
     original: &crate::session::LaunchOrigin,
     issued: Option<&crate::session::LaunchOrigin>,
@@ -261,7 +261,7 @@ pub(super) async fn publish_archive_update(
         ))
     })
     .await
-    .map_err(|error| format!("Archive cache publication task failed: {error}"))
+    .map_err(|error| format!("Lifecycle cache publication task failed: {error}"))
 }
 
 pub async fn update_session_archive(
@@ -325,7 +325,7 @@ pub async fn update_session_archive(
             Err(_) => return persist_failed_response(),
         };
         let response =
-            match publish_archive_update(&state, &original, None, generation, &acknowledged, row)
+            match publish_operation_update(&state, &original, None, generation, &acknowledged, row)
                 .await
             {
                 Ok(Some(response)) => response,
@@ -404,7 +404,7 @@ pub async fn update_session_archive(
         }
         Err(_) => return persist_failed_response(),
     };
-    let response = match publish_archive_update(
+    let response = match publish_operation_update(
         &state,
         &original,
         Some(&issued),
@@ -445,40 +445,35 @@ pub async fn trash_session(
     };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-    let profile = {
+    let expected = {
         let instances = state.instances.read().await;
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return session_not_found();
         };
-        instance.source_profile.clone()
+        instance.clone()
     };
-    let recovery_profile = profile.clone();
-
-    let reserve_profile = profile.clone();
-    let reserve_id = id.clone();
-    let file_watch = state.file_watch.clone();
-    let (storage, generation, plan) = match tokio::task::spawn_blocking(
+    let reserve_state = Arc::clone(&state);
+    let (original, storage, generation, plan, native) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
+            let original = reserve_state.capture_operation_origin(&expected)?;
             let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
             let _identity_lock = crate::session::acquire_session_identity_lock()?;
-            let storage = Storage::open(&reserve_profile, file_watch)?;
-            let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
+            let storage = original.storage().reopen_preserving_watch()?;
+            let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(original.session_id())?;
             let snapshot = storage
                 .load_strict_for_worktree_ownership_locked()?
                 .into_iter()
-                .find(|row| row.id == reserve_id)
-                .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
+                .find(|row| original.matches_instance(row))
+                .ok_or_else(|| anyhow::anyhow!("trash original was replaced"))?;
             ensure_trash_paths_unclaimed(&storage, &snapshot)?;
             let (generation, plan) =
                 storage.update_under_workspace_claim_lock(|instances, _groups| {
                     let instance = instances
                         .iter_mut()
-                        .find(|row| row.id == reserve_id)
-                        .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
-                    anyhow::ensure!(
-                        worktree_transition_plan_unchanged(&snapshot, instance),
-                        "trash plan changed before reservation"
-                    );
+                        .find(|row| original.matches_instance(row))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("trash original changed before reservation")
+                        })?;
                     let generation = instance
                         .try_acquire_lifecycle_reservation(
                             LifecycleOperation::Trash,
@@ -489,7 +484,13 @@ pub async fn trash_session(
                     instance.trash();
                     Ok((generation, instance.clone()))
                 })?;
-            Ok((storage, generation, plan))
+            let native = crate::session::runner_journal::OwnedStop::from_claim(
+                &storage,
+                &plan,
+                LifecycleOperation::Trash,
+                generation,
+            )?;
+            Ok((original, storage, generation, plan, native))
         },
     )
     .await
@@ -506,26 +507,15 @@ pub async fn trash_session(
     };
 
     let was_structured_view = plan.is_structured();
+    let issued = native.current_projection();
+    match publish_operation_update(&state, &original, Some(&issued), generation, &issued, plan)
+        .await
     {
-        let mut instances = state.instances.write().await;
-        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        instance.trash();
-        instance.lifecycle_generation = generation;
+        Ok(Some(_)) => {}
+        Ok(None) => return crate::server::api::session_gone_after_persist(),
+        Err(_) => return persist_failed_response(),
     }
-
-    // Registry absence and daemon memory do not prove runner quiescence.
-    let native = match crate::session::runner_journal::OwnedStop::from_claim(
-        &storage,
-        &plan,
-        LifecycleOperation::Trash,
-        generation,
-    ) {
-        Ok(native) => native,
-        Err(error) => return api_error(StatusCode::CONFLICT, "lifecycle_busy", error.to_string()),
-    };
-    let relocation_allowed = match crate::session::runner_journal::settle(native).await {
+    let relocation_allowed = match crate::session::runner_journal::settle(native.clone()).await {
         Ok(()) => true,
         Err(error) => {
             tracing::warn!(target: "http.api.sessions", session = %id,
@@ -546,119 +536,124 @@ pub async fn trash_session(
             .into_iter()
             .find(|row| row.id == work_id)
             .ok_or_else(|| anyhow::anyhow!("session disappeared during trash"))?;
+        let issued = native.current_projection();
         anyhow::ensure!(
-            snapshot.is_trashed()
-                && snapshot.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
-                && worktree_transition_plan_unchanged(&plan, &snapshot),
-            "trash reservation or relocation plan was superseded",
+            issued.matches_instance(&snapshot)
+                && snapshot.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation),
+            "trash original reservation was superseded"
         );
-        // Scan all profile ownership before storage.update takes this profile's storage flock.
+        // Cross-profile inventory precedes the storage flock.
         if relocation_allowed {
             if let Err(error) = ensure_trash_paths_unclaimed(&storage, &snapshot) {
-                storage.update_under_workspace_claim_lock(|instances, _groups| {
-                    if let Some(stored) = instances.iter_mut().find(|row| row.id == work_id) {
-                        if stored
-                            .lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
-                        {
-                            stored.untrash();
-                            stored.release_lifecycle_reservation_if_owned(
-                                LifecycleOperation::Trash,
-                                generation,
-                            );
-                        }
-                    }
-                    Ok(())
+                let durable = storage.update_under_workspace_claim_lock(|instances, _groups| {
+                    let stored = instances
+                        .iter_mut()
+                        .find(|row| issued.matches_instance(row))
+                        .ok_or_else(|| anyhow::anyhow!("trash rollback original was replaced"))?;
+                    anyhow::ensure!(
+                        stored
+                            .lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation),
+                        "trash rollback claim was superseded"
+                    );
+                    stored.untrash();
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Trash,
+                        generation,
+                    );
+                    Ok(stored.clone())
                 })?;
-                return Err(error);
+                let acknowledged = crate::session::LaunchOrigin::capture_baseline(&durable)?;
+                return Ok((Err(error), durable, acknowledged));
             }
         }
-        let outcome = storage.update_under_workspace_claim_lock(|instances, _groups| {
-            let stored = instances
-                .iter()
-                .find(|row| row.id == work_id)
-                .ok_or_else(|| anyhow::anyhow!("session disappeared before trash relocation"))?;
-            anyhow::ensure!(
-                stored.is_trashed()
-                    && stored.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
-                    && worktree_transition_plan_unchanged(&snapshot, stored),
-                "trash reservation or relocation plan was superseded",
-            );
-            let outcome = if relocation_allowed && stored.runner_journal.proves_quiescent() {
-                let mut instance = stored.clone();
-                instance.source_profile = storage.profile().to_owned();
-                if kill_pane {
-                    if was_structured_view {
-                        instance.kill_ancillary_tmux_sessions_locked();
-                    } else {
-                        instance.kill_all_tmux_sessions_locked();
+        let (outcome, durable) =
+            storage.update_under_workspace_claim_lock(|instances, _groups| {
+                let stored = instances
+                    .iter()
+                    .find(|row| issued.matches_instance(row))
+                    .ok_or_else(|| anyhow::anyhow!("trash relocation original was replaced"))?;
+                anyhow::ensure!(
+                    stored.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation),
+                    "trash reservation was superseded",
+                );
+                let outcome = if relocation_allowed && stored.runner_journal.proves_quiescent() {
+                    let mut instance = stored.clone();
+                    instance.source_profile = storage.profile().to_owned();
+                    if kill_pane {
+                        if was_structured_view {
+                            instance.kill_ancillary_tmux_sessions_locked();
+                        } else {
+                            instance.kill_all_tmux_sessions_locked();
+                        }
                     }
-                }
-                let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
-                if matches!(
-                    outcome,
-                    crate::session::trash::RelocateOutcome::Relocated { .. }
-                ) {
-                    let relocation = crate::session::trash::TrashRelocation {
-                        new_project_path: instance.project_path.clone(),
-                        pre_trash_project_path: instance.pre_trash_project_path.clone(),
-                    };
-                    anyhow::ensure!(
-                        crate::session::claim::commit_trash_relocation(
-                            instances,
-                            &work_id,
-                            generation,
-                            &relocation,
-                        ) == crate::session::claim::RelocationCommit::Persisted,
-                        "trash relocation reservation was superseded",
-                    );
-                }
-                outcome
-            } else {
-                crate::session::trash::RelocateOutcome::Failed {
-                    reason: "durable runner history does not prove checkout quiescence".to_string(),
-                }
-            };
-            crate::session::claim::release_trash_reservation(instances, &work_id, generation);
-            Ok(outcome)
-        })?;
-        let durable = storage.load()?.into_iter().find(|row| row.id == work_id);
-        Ok((outcome, durable))
+                    let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+                    if matches!(
+                        outcome,
+                        crate::session::trash::RelocateOutcome::Relocated { .. }
+                    ) {
+                        let relocation = crate::session::trash::TrashRelocation {
+                            new_project_path: instance.project_path.clone(),
+                            pre_trash_project_path: instance.pre_trash_project_path.clone(),
+                        };
+                        anyhow::ensure!(
+                            crate::session::claim::commit_trash_relocation(
+                                instances,
+                                &work_id,
+                                generation,
+                                &relocation,
+                            ) == crate::session::claim::RelocationCommit::Persisted,
+                            "trash relocation reservation was superseded",
+                        );
+                    }
+                    outcome
+                } else {
+                    crate::session::trash::RelocateOutcome::Failed {
+                        reason: "durable runner history does not prove checkout quiescence"
+                            .to_string(),
+                    }
+                };
+                crate::session::claim::release_trash_reservation(instances, &work_id, generation);
+                let durable = instances
+                    .iter()
+                    .find(|row| row.id == work_id)
+                    .ok_or_else(|| anyhow::anyhow!("trash committed row disappeared"))?
+                    .clone();
+                Ok((outcome, durable))
+            })?;
+        let acknowledged = crate::session::LaunchOrigin::capture_baseline(&durable)?;
+        Ok((Ok(outcome), durable, acknowledged))
     })
     .await;
 
-    let (outcome, durable) = match transition {
+    let (outcome, durable, acknowledged) = match transition {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
-            let durable = tokio::task::spawn_blocking({
-                let profile = recovery_profile.clone();
-                let id = id.clone();
-                move || {
-                    Storage::open_unwatched(&profile)
-                        .ok()?
-                        .load()
-                        .ok()?
-                        .into_iter()
-                        .find(|instance| instance.id == id)
-                }
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(durable) = durable {
-                let mut instances = state.instances.write().await;
-                if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
-                    instance.trashed_at = durable.trashed_at;
-                    instance.project_path = durable.project_path;
-                    instance.pre_trash_project_path = durable.pre_trash_project_path;
-                    instance.lifecycle_generation = durable.lifecycle_generation;
-                    instance.lifecycle_reservation = durable.lifecycle_reservation;
-                }
-            }
             return persist_failed_response();
         }
         Err(error) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "trash transition join failed: {error}");
+            return persist_failed_response();
+        }
+    };
+    let response = match publish_operation_update(
+        &state,
+        &original,
+        Some(&issued),
+        generation,
+        &acknowledged,
+        durable,
+    )
+    .await
+    {
+        Ok(Some(response)) => response,
+        Ok(None) => return crate::server::api::session_gone_after_persist(),
+        Err(_) => return persist_failed_response(),
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash rolled back: {error}");
             return persist_failed_response();
         }
     };
@@ -670,21 +665,6 @@ pub async fn trash_session(
         );
     }
 
-    let Some(durable) = durable else {
-        return session_not_found();
-    };
-    let response = {
-        let mut instances = state.instances.write().await;
-        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        instance.trashed_at = durable.trashed_at;
-        instance.project_path = durable.project_path;
-        instance.pre_trash_project_path = durable.pre_trash_project_path;
-        instance.lifecycle_generation = durable.lifecycle_generation;
-        instance.lifecycle_reservation = durable.lifecycle_reservation;
-        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
-    };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -700,48 +680,53 @@ pub async fn restore_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-    let profile = {
+    let expected = {
         let instances = state.instances.read().await;
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return session_not_found();
         };
-        instance.source_profile.clone()
+        instance.clone()
     };
-
     enum RestoreTransitionError {
         NotFound,
         Busy(String),
         Worktree(String),
         Persist(String),
     }
-
-    let restore_profile = profile.clone();
-    let restore_id = id.clone();
-    let file_watch = state.file_watch.clone();
-    let restored: Result<Instance, RestoreTransitionError> = async {
-        let (storage, generation, plan) =
+    let reserve_state = Arc::clone(&state);
+    let restored: Result<SessionResponse, RestoreTransitionError> = async {
+        let (original, native, plan) =
             tokio::task::spawn_blocking(move || -> Result<_, RestoreTransitionError> {
-                let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()
+                let original = reserve_state
+                    .capture_operation_origin(&expected)
                     .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-                let _identity_lock = crate::session::acquire_session_identity_lock()
+                let _workspace = crate::session::acquire_session_workspace_claim_lock()
                     .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-                let storage = Storage::open(&restore_profile, file_watch)
+                let _identity = crate::session::acquire_session_identity_lock()
                     .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-                let _lifecycle_lock = storage
-                    .acquire_instance_lifecycle_lock(&restore_id)
+                let storage = original
+                    .storage()
+                    .reopen_preserving_watch()
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+                let _lifecycle = storage
+                    .acquire_instance_lifecycle_lock(original.session_id())
                     .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
                 let (decision, plan) = storage
-                    .update_under_workspace_claim_lock(|instances, _groups| {
+                    .update_under_workspace_claim_lock(|rows, _| {
+                        let row = rows
+                            .iter()
+                            .find(|row| original.matches_instance(row))
+                            .ok_or_else(|| anyhow::anyhow!("restore original was replaced"))?;
+                        let session_id = row.id.clone();
                         let decision = crate::session::claim::decide_restore_claim(
-                            instances,
-                            &restore_id,
+                            rows,
+                            &session_id,
                             chrono::Utc::now(),
                         )
                         .map_err(anyhow::Error::new)?;
-                        let plan = instances.iter().find(|row| row.id == restore_id).cloned();
+                        let plan = rows.iter().find(|row| row.id == session_id).cloned();
                         Ok((decision, plan))
                     })
                     .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
@@ -755,182 +740,176 @@ pub async fn restore_session(
                     }
                 };
                 let plan = plan.ok_or(RestoreTransitionError::NotFound)?;
-                Ok((storage, generation, plan))
+                let native = crate::session::runner_journal::OwnedStop::from_claim(
+                    &storage,
+                    &plan,
+                    LifecycleOperation::Restore,
+                    generation,
+                )
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+                Ok((original, native, plan))
             })
             .await
             .map_err(|error| RestoreTransitionError::Persist(error.to_string()))??;
+        let generation = native.generation();
+        let issued = native.current_projection();
         let needs_move = plan
             .pre_trash_project_path
             .as_ref()
             .is_some_and(|original| original != &plan.project_path);
+        publish_operation_update(&state, &original, Some(&issued), generation, &issued, plan)
+            .await
+            .map_err(RestoreTransitionError::Persist)?
+            .ok_or(RestoreTransitionError::NotFound)?;
         let settled = if needs_move {
-            let native = crate::session::runner_journal::OwnedStop::from_claim(
-                &storage,
-                &plan,
-                LifecycleOperation::Restore,
-                generation,
-            )
-            .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            crate::session::runner_journal::settle(native).await
+            crate::session::runner_journal::settle(native.clone()).await
         } else {
             Ok(())
         };
-        let work_id = id.clone();
-        tokio::task::spawn_blocking(move || -> Result<Instance, RestoreTransitionError> {
-            let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let _identity_lock = crate::session::acquire_session_identity_lock()
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let storage = storage
-                .reopen_preserving_watch()
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let _lifecycle_lock = storage
-                .acquire_instance_lifecycle_lock(&work_id)
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            if let Err(error) = settled {
-                release_restore_claim(&storage, &work_id, generation);
-                return Err(RestoreTransitionError::Worktree(format!(
-                    "runner shutdown is unproven: {error}"
-                )));
-            }
-            let snapshot = storage
-                .load_strict_for_worktree_ownership_locked()
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
-                .into_iter()
-                .find(|row| row.id == work_id)
-                .ok_or(RestoreTransitionError::NotFound)?;
-            if !snapshot.lifecycle_reservation_is_owned(LifecycleOperation::Restore, generation)
-                || !worktree_transition_plan_unchanged(&plan, &snapshot)
-            {
-                release_restore_claim(&storage, &work_id, generation);
-                return Err(RestoreTransitionError::Busy(
-                    crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
-                ));
-            }
-            // Read the cross-profile inventory outside storage.update to avoid recursive flock.
-            if needs_move {
-                let paths = vec![
-                    PathBuf::from(&snapshot.project_path),
-                    PathBuf::from(snapshot.pre_trash_project_path.as_ref().unwrap()),
-                ];
-                if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
-                    crate::session::deletion::SessionPathOwner {
-                        profile: storage.profile(),
-                        session_id: &work_id,
-                    },
-                    &paths,
-                ) {
-                    release_restore_claim(&storage, &work_id, generation);
-                    return Err(RestoreTransitionError::Worktree(format!(
-                        "worktree ownership could not be verified: {error}"
-                    )));
-                }
-            }
-            let result = storage.update_under_workspace_claim_lock(|instances, _groups| {
-                let Some(stored) = instances.iter_mut().find(|row| row.id == work_id) else {
-                    return Ok(Err(RestoreTransitionError::NotFound));
-                };
-                if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Restore, generation)
-                    || !worktree_transition_plan_unchanged(&snapshot, stored)
+        let (outcome, durable, acknowledged) =
+            tokio::task::spawn_blocking(move || -> Result<_, RestoreTransitionError> {
+                let _workspace = crate::session::acquire_session_workspace_claim_lock()
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+                let _identity = crate::session::acquire_session_identity_lock()
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+                let storage = native
+                    .storage()
+                    .reopen_preserving_watch()
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+                let _lifecycle = storage
+                    .acquire_instance_lifecycle_lock(native.session_id())
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+                let scope = native.current_projection();
+                let snapshot = storage
+                    .load_strict_for_worktree_ownership_locked()
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
+                    .into_iter()
+                    .find(|row| scope.matches_instance(row))
+                    .ok_or_else(|| {
+                        RestoreTransitionError::Busy(
+                            crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
+                        )
+                    })?;
+                if !snapshot.lifecycle_reservation_is_owned(LifecycleOperation::Restore, generation)
                 {
-                    stored.release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Restore,
-                        generation,
-                    );
-                    return Ok(Err(RestoreTransitionError::Busy(
+                    return Err(RestoreTransitionError::Busy(
                         crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
-                    )));
+                    ));
                 }
-                let mut instance = stored.clone();
-                instance.source_profile = storage.profile().to_owned();
-                if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                    crate::session::trash::restore_worktree_location(&mut instance)
-                {
-                    stored.release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Restore,
-                        generation,
-                    );
-                    return Ok(Err(RestoreTransitionError::Worktree(reason)));
+                let mut move_error = settled.err().map(|error| {
+                    RestoreTransitionError::Worktree(format!(
+                        "runner shutdown is unproven: {error}"
+                    ))
+                });
+                if move_error.is_none() && needs_move {
+                    let paths = [
+                        PathBuf::from(&snapshot.project_path),
+                        PathBuf::from(snapshot.pre_trash_project_path.as_ref().unwrap()),
+                    ];
+                    move_error = crate::session::deletion::ensure_unclaimed_paths(
+                        crate::session::deletion::SessionPathOwner {
+                            profile: storage.profile(),
+                            session_id: native.session_id(),
+                        },
+                        &paths,
+                    )
+                    .err()
+                    .map(|error| {
+                        RestoreTransitionError::Worktree(format!(
+                            "worktree ownership could not be verified: {error}"
+                        ))
+                    });
                 }
-                anyhow::ensure!(
-                    crate::session::claim::finalize_restore_commit(
-                        instances,
-                        &work_id,
-                        generation,
-                        &instance.project_path,
-                        &instance.pre_trash_project_path,
-                    ) == crate::session::claim::RestoreCommit::Committed,
-                    "restore reservation was superseded during worktree move",
-                );
-                Ok(Ok(instances
-                    .iter()
-                    .find(|row| row.id == work_id)
-                    .unwrap()
-                    .clone()))
-            });
-            if result.is_err() {
-                release_restore_claim(&storage, &work_id, generation);
-            }
-            result.map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
-        })
+                let (outcome, durable) = storage
+                    .update_under_workspace_claim_lock(|rows, _| {
+                        let stored = rows
+                            .iter_mut()
+                            .find(|row| scope.matches_instance(row))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("restore original was replaced before publication")
+                            })?;
+                        anyhow::ensure!(
+                            stored.lifecycle_reservation_is_owned(
+                                LifecycleOperation::Restore,
+                                generation
+                            ),
+                            "restore original claim was superseded"
+                        );
+                        let outcome = if let Some(error) = move_error {
+                            Err(error)
+                        } else {
+                            let mut instance = stored.clone();
+                            match crate::session::trash::restore_worktree_location(&mut instance) {
+                                crate::session::trash::RestoreOutcome::Failed { reason } => {
+                                    Err(RestoreTransitionError::Worktree(reason))
+                                }
+                                _ => {
+                                    anyhow::ensure!(
+                                        crate::session::claim::finalize_restore_commit(
+                                            rows,
+                                            scope.session_id(),
+                                            generation,
+                                            &instance.project_path,
+                                            &instance.pre_trash_project_path
+                                        ) == crate::session::claim::RestoreCommit::Committed,
+                                        "restore reservation was superseded during worktree move"
+                                    );
+                                    Ok(())
+                                }
+                            }
+                        };
+                        let stored = rows
+                            .iter_mut()
+                            .find(|row| row.id == scope.session_id())
+                            .ok_or_else(|| anyhow::anyhow!("restore emitted row disappeared"))?;
+                        if outcome.is_err() {
+                            stored.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Restore,
+                                generation,
+                            );
+                        }
+                        Ok((outcome, stored.clone()))
+                    })
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+                let acknowledged = crate::session::LaunchOrigin::capture_baseline(&durable)
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+                Ok((outcome, durable, acknowledged))
+            })
+            .await
+            .map_err(|error| RestoreTransitionError::Persist(error.to_string()))??;
+        let response = publish_operation_update(
+            &state,
+            &original,
+            Some(&issued),
+            generation,
+            &acknowledged,
+            durable,
+        )
         .await
-        .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
+        .map_err(RestoreTransitionError::Persist)?
+        .ok_or(RestoreTransitionError::NotFound)?;
+        outcome?;
+        Ok(response)
     }
     .await;
-
-    let restored = match restored {
-        Ok(instance) => instance,
-        Err(RestoreTransitionError::NotFound) => return session_not_found(),
-        Err(RestoreTransitionError::Busy(holder)) => {
-            return api_error(
-                StatusCode::CONFLICT,
-                "lifecycle_busy",
-                format!("Session is {holder}, so it was not restored"),
-            );
-        }
-        Err(RestoreTransitionError::Worktree(reason)) => {
-            return api_error(
-                StatusCode::CONFLICT,
-                "worktree_restore_failed",
-                format!("Could not restore the worktree: {reason}"),
-            );
-        }
+    match restored {
+        Ok(response) => (StatusCode::OK, Json(serde_json::json!(response))).into_response(),
+        Err(RestoreTransitionError::NotFound) => session_not_found(),
+        Err(RestoreTransitionError::Busy(holder)) => api_error(
+            StatusCode::CONFLICT,
+            "lifecycle_busy",
+            format!("Session is {holder}, so it was not restored"),
+        ),
+        Err(RestoreTransitionError::Worktree(reason)) => api_error(
+            StatusCode::CONFLICT,
+            "worktree_restore_failed",
+            format!("Could not restore the worktree: {reason}"),
+        ),
         Err(RestoreTransitionError::Persist(error)) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "restore transition failed: {error}");
-            return persist_failed_response();
+            persist_failed_response()
         }
-    };
-
-    let response = {
-        let mut instances = state.instances.write().await;
-        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        instance.project_path = restored.project_path;
-        instance.pre_trash_project_path = restored.pre_trash_project_path;
-        instance.lifecycle_generation = restored.lifecycle_generation;
-        instance.lifecycle_reservation = restored.lifecycle_reservation;
-        instance.untrash();
-        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
-    };
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
-}
-
-fn worktree_transition_plan_unchanged(snapshot: &Instance, durable: &Instance) -> bool {
-    snapshot.is_trashed() == durable.is_trashed()
-        && snapshot.project_path == durable.project_path
-        && snapshot.pre_trash_project_path == durable.pre_trash_project_path
-        && snapshot.worktree_info == durable.worktree_info
-        && snapshot.scratch == durable.scratch
-        && snapshot
-            .workspace_info
-            .as_ref()
-            .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
-            == durable
-                .workspace_info
-                .as_ref()
-                .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
-        && snapshot.is_sandboxed() == durable.is_sandboxed()
+    }
 }
 
 fn ensure_trash_paths_unclaimed(storage: &Storage, instance: &Instance) -> anyhow::Result<()> {
@@ -965,16 +944,6 @@ fn ensure_trash_paths_unclaimed(storage: &Storage, instance: &Instance) -> anyho
     .map_err(|error| {
         anyhow::anyhow!("trash skipped because worktree ownership is shared or unknown: {error}")
     })
-}
-
-// The caller holds workspace -> identity -> lifecycle locks.
-fn release_restore_claim(storage: &Storage, id: &str, generation: u64) {
-    let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|row| row.id == id) {
-            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
-        }
-        Ok(())
-    });
 }
 
 /// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" for a
@@ -1267,28 +1236,19 @@ pub async fn stop_session(
 
     // Publish the dormant ACK before shutting down the structured worker.
     let native_stop = if is_structured {
-        let original = match state.capture_operation_origin(&expected) {
-            Ok(original) => original,
-            Err(error) => {
-                return api_error(
-                    StatusCode::CONFLICT,
-                    "original_authority_changed",
-                    error.to_string(),
-                )
-            }
-        };
+        let reserve_state = Arc::clone(&state);
         let stop = match tokio::task::spawn_blocking(move || {
+            let original = reserve_state
+                .capture_operation_origin(&expected)
+                .map_err(|error| ("original_authority_changed", error))?;
             crate::session::runner_journal::reserve_stop_from_origin(original, false)
+                .map_err(|error| ("stop_not_authorized", error))
         })
         .await
         {
             Ok(Ok(stop)) => stop,
-            Ok(Err(error)) => {
-                return api_error(
-                    StatusCode::CONFLICT,
-                    "stop_not_authorized",
-                    error.to_string(),
-                )
+            Ok(Err((code, error))) => {
+                return api_error(StatusCode::CONFLICT, code, error.to_string())
             }
             Err(_) => return persist_failed_response(),
         };
@@ -1345,13 +1305,21 @@ pub async fn stop_session(
     };
 
     if is_structured {
-        // Structured view: shut down the worker so the reconciler does not race
-        // to respawn it. `shutdown` preserves the transcript.
         let stop = native_stop.expect("structured stop reserved its original scope");
         match state.acp_supervisor.shutdown(stop.clone()).await {
             Ok(()) => {
-                if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
-                    tracing::warn!(target: "http.api.sessions", %error, "original stop claim remains protected");
+                match tokio::task::spawn_blocking(move || {
+                    crate::session::runner_journal::release_owned_stop(&stop)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "http.api.sessions", %error, "original stop claim remains protected")
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "http.api.sessions", %error, "original stop release task failed")
+                    }
                 }
             }
             Err(e) => tracing::warn!(
@@ -1671,143 +1639,123 @@ pub async fn update_session_snooze(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (was_structured_view, profile, expected) = {
+    let (was_structured_view, expected) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return session_not_found();
         };
 
         let structured_view = inst.is_structured();
-        (structured_view, inst.source_profile.clone(), inst.clone())
+        (structured_view, inst.clone())
     };
 
     let minutes = body.minutes;
-    let native_stop = if was_structured_view && minutes.is_some() {
-        let original = match state.capture_operation_origin(&expected) {
-            Ok(original) => original,
-            Err(error) => {
-                return api_error(
-                    StatusCode::CONFLICT,
-                    "original_authority_changed",
-                    error.to_string(),
-                )
-            }
+    let reserve_state = Arc::clone(&state);
+    let reserved = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let original = if was_structured_view && minutes.is_some() {
+            reserve_state.capture_operation_origin(&expected)?
+        } else {
+            Arc::new(crate::session::LaunchOrigin::capture_baseline(&expected)?)
         };
-        match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
-            Ok(stop) => Some(stop),
-            Err(error) => {
-                return api_error(
-                    StatusCode::CONFLICT,
-                    "snooze_not_authorized",
-                    error.to_string(),
-                )
-            }
+        let stop = if was_structured_view && minutes.is_some() {
+            Some(crate::session::runner_journal::reserve_stop_from_origin(
+                original.clone(),
+                false,
+            )?)
+        } else {
+            None
+        };
+        Ok((original, stop))
+    })
+    .await;
+    let (original, native_stop) = match reserved {
+        Ok(Ok(reserved)) => reserved,
+        Ok(Err(error)) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "snooze_not_authorized",
+                error.to_string(),
+            )
         }
-    } else {
-        None
+        Err(_) => return persist_failed_response(),
     };
-
-    // Persist first; only mutate memory once disk is durable, and fire the
-    // structured teardown below only on a write that landed (#1589).
-    let persist_id = id.clone();
-    let saved = if let Some(owner) = native_stop.as_ref().cloned() {
-        tokio::task::spawn_blocking(move || {
+    let writer = original.clone();
+    let owner = native_stop.clone();
+    let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let durable = if let Some(owner) = owner.as_ref() {
             owner.update_projection(
                 |row| {
                     row.snooze(minutes.expect("snooze stop has a duration"));
-                    Ok(())
+                    Ok(row.clone())
                 },
                 Ok,
-            )
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result.map_err(|error| error.to_string()))
-    } else {
-        persist_session_update(
-            profile,
-            "snooze update",
-            state.file_watch.clone(),
-            crate::session::MetadataSelection::Session(id.clone().into()),
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+            )?
+        } else {
+            writer.storage().update_metadata(
+                crate::session::MetadataSelection::Session(writer.session_id().into()),
+                |rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| writer.matches_instance(row))
+                        .ok_or_else(|| anyhow::anyhow!("snooze original was replaced"))?;
                     match minutes {
-                        Some(m) => inst.snooze(m),
-                        None => inst.unsnooze(),
+                        Some(m) => row.snooze(m),
+                        None => row.unsnooze(),
                     }
-                }
-            },
-        )
-        .await
-        .map_err(|()| "snooze update did not commit".to_owned())
-    };
-    if saved.is_err() {
-        return persist_failed_response();
-    }
-
-    {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances
-            .iter_mut()
-            .find(|instance| match native_stop.as_ref() {
-                Some(stop) => {
-                    stop.original().matches_instance(instance)
-                        || stop.cancellation_origin().matches_instance(instance)
-                }
-                None => {
-                    instance.id == id
-                        && instance.same_storage_origin(&expected)
-                        && instance.created_at == expected.created_at
-                        && instance.lifecycle_generation == expected.lifecycle_generation
-                }
-            })
-        else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "snooze update: instance vanished after persist"
-            );
-            return crate::server::api::session_gone_after_persist();
+                    Ok(row.clone())
+                },
+            )?
         };
-        match minutes {
-            Some(m) => inst.snooze(m),
-            None => inst.unsnooze(),
+        let acknowledged = crate::session::LaunchOrigin::capture_baseline(&durable)?;
+        Ok((durable, acknowledged))
+    })
+    .await;
+    let (durable, acknowledged) = match saved {
+        Ok(Ok(saved)) => saved,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "snooze persistence failed: {error}");
+            return persist_failed_response();
         }
-        if let Some(stop) = native_stop.as_ref() {
-            inst.lifecycle_generation = stop.generation();
-        }
-    }
-
-    // Snoozing tears a structured worker down the way archive does: snooze is
-    // a temporary archive, and the worker is too heavy to keep idle while the
-    // row is sunk. The reconciler skips snoozed sessions and re-picks them on
-    // the first tick after expiry. `shutdown` preserves the transcript, so that
-    // respawn resumes the conversation (#1710).
-    if was_structured_view && minutes.is_some() {
-        let stop = native_stop.expect("structured snooze reserved its original stop");
+        Err(_) => return persist_failed_response(),
+    };
+    let issued = native_stop.as_ref().map(|owner| owner.current_projection());
+    let response = match publish_operation_update(
+        &state,
+        &original,
+        issued.as_deref(),
+        acknowledged.generation(),
+        &acknowledged,
+        durable,
+    )
+    .await
+    {
+        Ok(Some(response)) => response,
+        Ok(None) => return crate::server::api::session_gone_after_persist(),
+        Err(_) => return persist_failed_response(),
+    };
+    // A committed snooze skips reconciliation until expiry.
+    if let Some(stop) = native_stop {
         match state.acp_supervisor.shutdown(stop.clone()).await {
             Ok(()) => {
-                if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
-                    tracing::warn!(target: "http.api.sessions", %error, "original snooze claim remains protected");
+                match tokio::task::spawn_blocking(move || {
+                    crate::session::runner_journal::release_owned_stop(&stop)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "http.api.sessions", %error, "original snooze claim remains protected")
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "http.api.sessions", %error, "original snooze release task failed")
+                    }
                 }
             }
-            Err(e) => tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                "shutdown during snooze failed: {e}"
-            ),
+            Err(error) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, "shutdown during snooze failed: {error}")
+            }
         }
     }
-
-    let instances = state.instances.read().await;
-    let response = match instances.iter().find(|i| i.id == id) {
-        Some(inst) => {
-            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        }
-        None => {
-            return session_not_found();
-        }
-    };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 

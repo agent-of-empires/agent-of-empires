@@ -19,6 +19,8 @@ use uuid::Uuid;
 struct OriginalBootstrap<'a> {
     profile: &'a str,
     execution: &'a ExecutionPlan,
+    pre_trash_project_path: Option<&'a str>,
+    scratch: bool,
     births: &'a [NativeBirthKey],
     born: RunnerIdentity,
     creations: &'a [super::native_create::CreateExecution],
@@ -30,6 +32,9 @@ struct OriginalBootstrap<'a> {
 struct ReceivedBootstrap {
     profile: String,
     execution: ExecutionPlan,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pre_trash_project_path: Option<String>,
+    scratch: bool,
     births: Vec<NativeBirthKey>,
     born: RunnerIdentity,
     creations: Vec<super::native_create::CreateExecution>,
@@ -127,6 +132,8 @@ pub(super) fn publish_original(
         &OriginalBootstrap {
             profile: original.profile(),
             execution: &original.plan.execution,
+            pre_trash_project_path: original.plan.pre_trash_project_path.as_deref(),
+            scratch: original.plan.scratch,
             births: &original.births,
             born,
             creations: &original.creations,
@@ -228,6 +235,8 @@ impl LaunchBootstrap {
             plan: Arc::new(LaunchPlan {
                 storage: Arc::new(storage),
                 execution: received.execution,
+                pre_trash_project_path: received.pre_trash_project_path,
+                scratch: received.scratch,
             }),
             generation,
             births: received.births.into(),
