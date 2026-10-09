@@ -59,7 +59,7 @@ pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct FrozenEnvironment<T, E> {
-    pub(crate) command: T,
+    pub(crate) argv: Vec<String>,
     pub(crate) cwd: T,
     pub(crate) environment: Vec<(E, E)>,
 }
@@ -98,10 +98,16 @@ pub fn exec_frozen_environment() -> anyhow::Result<()> {
     >(file);
     platform::close_frozen_payload().context("closing frozen environment descriptor")?;
     let payload = payload.context("reading frozen environment descriptor")?;
+    let program = payload
+        .argv
+        .iter()
+        .find(|word| !word.contains('='))
+        .context("frozen launch program is missing")?;
+    anyhow::ensure!(!program.is_empty(), "frozen launch program is empty");
     let mut command = Command::new("/usr/bin/env");
     command
         .arg("--")
-        .args(shell_words::split(&payload.command)?)
+        .args(&payload.argv)
         .current_dir(payload.cwd)
         .env_clear();
     for (key, value) in payload.environment {

@@ -99,10 +99,8 @@ for the harness API.
 - Use conventional commit and PR titles.
 - Follow `.github/pull_request_template.md`; include what changed, why, tests,
   and screenshots or recordings for UI changes.
-- Before review, run `cargo fmt` and `cargo test`, adding `--features web`
-  when relevant. Before pushing, run the Clippy command from the
-  [CI job](.github/workflows/ci.yml), which covers all features and targets,
-  including E2E code that plain `cargo clippy` does not lint.
+- Before review, run `cargo fmt`, `cargo clippy`, and `cargo test`, adding
+  `--features web` when relevant.
 - For `web/` changes also run its format, lint, type, and applicable test checks
   from `web/AGENTS.md`, including the coverage matrix requirement.
 

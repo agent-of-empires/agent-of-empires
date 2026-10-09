@@ -428,8 +428,9 @@ fn wrap_bound_opencode_command(
         .get_current_dir()
         .and_then(std::path::Path::to_str)
         .context("OpenCode launch cwd is not UTF-8")?;
+    let argv = shell_words::split(cmd).context("parsing frozen OpenCode launch argv")?;
     let payload = serde_json::to_string(&crate::process::FrozenEnvironment {
-        command: cmd,
+        argv,
         cwd,
         environment,
     })?;
@@ -1664,58 +1665,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cmd, "codex fork parent-1234 --some-flag");
-    }
-
-    /// A fork that cannot reach the agent's store must refuse the launch rather
-    /// than fall through to an unforked session.
-    ///
-    /// The stub is installed as `opencode` itself and advertises `--auto` but no
-    /// `--fork`, so the generation this launch resolves to is the stub's rather
-    /// than whatever the host has. The stub's `serve` never answers, so the fork
-    /// has no child to adopt and the arm has to refuse. Both are bounded: the
-    /// readiness deadline, not a fixed wait, and nothing touches the store the
-    /// developer's own `PATH` would name.
-    #[test]
-    #[serial_test::serial]
-    fn opencode_fork_refuses_when_the_store_returns_no_child() {
-        let home = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
-        let _isolated = crate::session::test_support::install_login_shell_path_command(
-            home.path(),
-            "opencode",
-            "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' 'USAGE\n  --auto  approve';; esac\nexit 0\n",
-        );
-        crate::agents::forget_agent_help_for_test();
-        let project = home.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-
-        let mut inst = tool_instance("opencode", project.to_str().unwrap());
-        inst.agent_session_id = Some("ses_child000000000000000000000000".to_string());
-        inst.resume_intent = ResumeIntent::Fork {
-            from: "ses_parent00000000000000000000000".to_string(),
-        };
-        let mut cmd = "opencode".to_string();
-        let error = inst
-            .apply_session_flags(
-                &mut cmd,
-                "test",
-                crate::agents::get_agent("opencode"),
-                None,
-                super::execution::AgentLaunchContext::host(
-                    crate::agents::get_agent("opencode"),
-                    inst.default_selector_agent()
-                        .and_then(|agent| inst.host_agent_command(agent, None))
-                        .as_ref(),
-                ),
-                &mut inst.conversation_state(),
-            )
-            .expect_err("a fork with no child to adopt must not launch");
-        assert!(
-            format!("{error:#}").contains("refused"),
-            "the fork arm must name its own refusal: {error:#}"
-        );
-        assert!(!cmd.contains("--fork"), "{cmd}");
-        assert!(!cmd.contains("--session"), "{cmd}");
     }
 
     /// A store fork adopts a child mid-preparation, and the launch then

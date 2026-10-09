@@ -214,20 +214,16 @@ impl Instance {
             return SidPersistOutcome::Skip;
         };
         if !is_valid_session_id(&sid) {
-            tracing::warn!(target: "session.store",
-                "Refusing to persist invalid forked session ID {sid:?} for {}",
-                self.id
-            );
+            tracing::warn!(target: "session.store", instance = %self.id, sid = ?sid,
+                "refusing to persist an invalid forked session ID");
             return SidPersistOutcome::Skip;
         }
         let storage =
             match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
-                    tracing::warn!(target: "session.store",
-                        "Failed to create storage for the fork adoption of {}: {error}",
-                        self.id
-                    );
+                    tracing::warn!(target: "session.store", instance = %self.id, %error,
+                        "failed to create storage for fork adoption");
                     return SidPersistOutcome::Skip;
                 }
             };
@@ -257,10 +253,8 @@ impl Instance {
             }
             Ok(None) => SidPersistOutcome::Skip,
             Err(error) => {
-                tracing::warn!(target: "session.store",
-                    "Failed to persist the fork adoption of {}: {error}",
-                    self.id
-                );
+                tracing::warn!(target: "session.store", instance = %self.id, %error,
+                    "failed to persist fork adoption");
                 SidPersistOutcome::Skip
             }
         }

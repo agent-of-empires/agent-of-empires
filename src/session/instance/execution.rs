@@ -280,6 +280,7 @@ pub(super) struct NativeExecution {
     pub(super) resolved_target_session_id: Option<String>,
     pub(super) pi_pinnable: bool,
     pub(super) opencode_preassign: bool,
+    pub(super) opencode_schema: Option<OpenCodeSessionSchema>,
     /// A recorded store outranks the store a new session would use here, as
     /// `(launch, new_session, source)`. The launch reports it once.
     pub(super) store_override: Option<(PathBuf, PathBuf, &'static str)>,
@@ -304,6 +305,44 @@ impl NativeExecution {
             }
         }
         command
+    }
+
+    pub(super) fn validate_opencode_session_target(&self, sid: &str) -> Result<()> {
+        let schema = self
+            .opencode_schema
+            .context("OpenCode active schema was not prepared")?;
+        let database = self
+            .binding
+            .stores
+            .first()
+            .context("OpenCode store is missing")?;
+        let location = self.inputs.physical_location(database);
+        anyhow::ensure!(
+            location.filesystem == "host",
+            "OpenCode routing requires a local database projection"
+        );
+        let connection = rusqlite::Connection::open_with_flags(
+            location.path.canonicalize()?,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_millis(100))?;
+        let (workspace, directory) = opencode_session_row(&connection, sid, schema)?
+            .with_context(|| format!("OpenCode target {sid} is absent from this build's active session table in OPENCODE_DB"))?;
+        anyhow::ensure!(
+            !workspace,
+            "OpenCode target may forward to another workspace; managed resume and fork are refused"
+        );
+        anyhow::ensure!(
+            std::path::Path::new(&directory).is_absolute()
+                && self
+                    .inputs
+                    .canonical_path(std::path::Path::new(&directory))?
+                    == self.inputs.cwd,
+            "OpenCode target routes to a different working directory"
+        );
+        Ok(())
     }
 
     fn opencode_session_schema(&self) -> Result<OpenCodeSessionSchema> {
@@ -1292,7 +1331,7 @@ impl Instance {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OpenCodeSessionSchema {
+pub(super) enum OpenCodeSessionSchema {
     Session,
     SessionV2,
 }
@@ -2124,7 +2163,7 @@ impl Instance {
             && inputs.container.is_none()
             && config.session.opencode_preassign_session_id
             && direct_capture;
-        let execution = NativeExecution {
+        let mut execution = NativeExecution {
             agent,
             binding: ExecutionBinding {
                 agent: agent.name.into(),
@@ -2147,39 +2186,13 @@ impl Instance {
             resolved_target_session_id,
             pi_pinnable,
             opencode_preassign,
+            opencode_schema: None,
             store_override,
         };
         if agent.name == "opencode" {
             if let Some((sid, _, _)) = target {
-                let schema = execution.opencode_session_schema()?;
-                let database = execution
-                    .binding
-                    .stores
-                    .first()
-                    .context("OpenCode store is missing")?;
-                let location = execution.inputs.physical_location(database);
-                anyhow::ensure!(
-                    location.filesystem == "host",
-                    "OpenCode routing requires a local database projection"
-                );
-                let connection = rusqlite::Connection::open_with_flags(
-                    location.path.canonicalize()?,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-                )?;
-                connection.busy_timeout(std::time::Duration::from_millis(100))?;
-                let (workspace, directory) = opencode_session_row(&connection, sid, schema)?
-                    .with_context(|| format!("OpenCode target {sid} is absent from this build's active session table in OPENCODE_DB"))?;
-                anyhow::ensure!(!workspace, "OpenCode target may forward to another workspace; managed resume and fork are refused");
-                anyhow::ensure!(
-                    std::path::Path::new(&directory).is_absolute()
-                        && execution
-                            .inputs
-                            .canonical_path(std::path::Path::new(&directory))?
-                            == execution.inputs.cwd,
-                    "OpenCode target routes to a different working directory"
-                );
+                execution.opencode_schema = Some(execution.opencode_session_schema()?);
+                execution.validate_opencode_session_target(sid)?;
             }
         }
         Ok(execution)

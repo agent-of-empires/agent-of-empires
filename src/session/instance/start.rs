@@ -885,6 +885,7 @@ mod tests {
             resolved_target_session_id: None,
             pi_pinnable: false,
             opencode_preassign: false,
+            opencode_schema: None,
             store_override: None,
         };
 

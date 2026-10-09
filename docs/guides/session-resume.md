@@ -49,7 +49,14 @@ OpenCode legacy-generation builds approve permissions through `OPENCODE_PERMISSI
 
 Store-bound launches, managed resume/fork and successful preassignment restore the captured environment after login startup so the native store, generation and API-created ID agree. Configure credentials for these managed conversations in AoE's inherited environment or profile `environment` entries; login-only exports are not imported. `TERM`, `TMUX` and `TMUX_PANE` come from the new pane. If help cannot establish a generation, managed operations are refused and no approval mechanism is guessed. Legacy preassignment remains disabled; sandbox preparation probes inside the actual selected container, not on the host or from an image-tag assumption.
 
-Captured managed host environment values travel through a protected descriptor, not process arguments. The transport preserves non-UTF-8 keys and values, arbitrary environment names and multiline values without replacing the pane's standard input. Successful host generation answers are reprobed for each preparation. A failed help probe cools down only the identical program, working directory and complete environment for 30 seconds; a different context, including a new launch-source ID, probes immediately. After a failure, later probes of that executable use the longer retry timeout. On Linux, if a running AoE's executable was replaced in place, the managed launch resolves the installed replacement; that replacement must implement the same helper contract.
+Captured managed host environment values travel through a protected descriptor, not process arguments.
+The transport preserves non-UTF-8 keys and values, arbitrary environment names and multiline values without replacing the pane's standard input.
+The helper receives literal argv values, not a shell command string; a missing or empty program is refused before execution.
+Successful host generation answers are reprobed for each preparation.
+A failed help probe cools down only the identical program, working directory and complete environment for 30 seconds; a different context, including a new launch-source ID, probes immediately.
+After a failure, later probes of that executable use the longer retry timeout.
+On Linux, if a running AoE's executable was replaced in place, the managed launch resolves the installed replacement.
+AoE and its installed helper must implement the same payload contract; restart AoE if an upgrade changes that contract.
 
 Disabling `agent_status_hooks` removes status writers only; identity hooks declared for native resume stay installed.
 
@@ -114,7 +121,10 @@ A fork starts a new, independent session from an existing session's conversation
 
 The fork inherits the parent tool, group, working directory, and conversation binding. A qualified binding has already established the native agent and store through a qualified publication, import, or explicit recovery assertion. A raw or preallocated ID is insufficient; status detection and matching tool labels grant no authority. A raw ID that migration left unqualified is not a reason to refuse: a fork of it launches against the store current configuration resolves, under the same agent the parent row resolves to, because nothing recorded the store or the tool its parent used. A child asked for under another agent is refused before dispatch, whatever it is asked for by name. A conflicting native command or user-supplied resume/fork selector is refused before dispatch whatever the binding, and for a qualified binding so is a different tool, without clearing the pending fork. `--fork-from` cannot be combined with `--worktree` / `--new-branch` or `--sandbox` / `--sandbox-image`.
 
-The child gets its own AoE ID and native conversation. The parent row and transcript remain unchanged. Automatic recovery still depends on the agent's capture capability and supported execution context; dispatching a native fork adds no new child-ID discovery path.
+The child gets its own AoE ID and native conversation. The parent row and transcript remain unchanged.
+Current-generation OpenCode store forks validate the returned child in the prepared active store after the short-lived server is reaped, before adoption.
+A returned parent, missing child, or unsupported route preserves the pending fork.
+Automatic recovery still depends on the agent's capture capability and supported execution context; dispatching a native fork adds no new child-ID discovery path.
 
 Forking needs an agent that can branch a conversation: claude, codex, opencode, and pi in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
 

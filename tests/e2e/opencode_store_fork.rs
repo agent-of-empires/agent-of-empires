@@ -1,13 +1,4 @@
-//! A store fork of an OpenCode 2.x conversation happens before the pane exists.
-//!
-//! OpenCode 2.x rejects the root `--fork` flag AoE used to emit, so the fork is
-//! requested from the store over `POST /api/session/{id}/fork` against a
-//! short-lived `opencode serve`. Nothing below unit level exercises that
-//! composed path: the serve child is spawned by the AoE binary with its own
-//! environment and reaped once the fork returns, and the id it mints has to
-//! reach the launch command line.
-//!
-//! Isolated frontends check login parity and managed conversation snapshots.
+//! CLI coverage for store-backed OpenCode forks and managed host environments.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,33 +20,38 @@ fn child_body() -> String {
     format!(r#"{{"data":{{"id":"{CHILD_ID}"}}}}"#)
 }
 
-/// A loopback listener that answers every request and stays bound, which is what
-/// a real `opencode serve` does. Written to disk rather than inlined so no
-/// quoting has to survive the shell.
 fn server_program() -> String {
-    [
-        "import socket, sys",
-        "port = int(sys.argv[1])",
-        "body = sys.argv[2].encode()",
-        "srv = socket.socket()",
-        "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
-        "srv.bind((\"127.0.0.1\", port))",
-        "srv.listen(16)",
-        "sys.stderr.write('BOUND on %d\\n' % port); sys.stderr.flush()",
-        "response = (b\"HTTP/1.1 200 OK\\r\\n\"",
-        "            b\"Content-Type: application/json\\r\\n\"",
-        "            + (\"Content-Length: %d\\r\\n\\r\\n\" % len(body)).encode()",
-        "            + body + b\"\\r\\n\")",
-        "while True:",
-        "    conn, _ = srv.accept()",
-        "    try:",
-        "        conn.recv(65535)",
-        "        conn.sendall(response)",
-        "    finally:",
-        "        conn.close()",
-        "",
-    ]
-    .join("\n")
+    r#"import json, os, socket, sqlite3, sys
+port = int(sys.argv[1])
+body = json.loads(sys.argv[2])
+mode = os.environ.get('AOE_FORK_FIXTURE_ROW', 'persisted')
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', port))
+srv.listen(16)
+while True:
+    conn, _ = srv.accept()
+    try:
+        request = conn.recv(65535)
+        if request.startswith(b'POST '):
+            parent = request.split()[1].decode().split('/')[-2]
+            if mode == 'parent':
+                body['data']['id'] = parent
+            elif mode != 'missing':
+                with sqlite3.connect(os.environ['OPENCODE_DB']) as database:
+                    directory = database.execute('SELECT directory FROM session_v2 WHERE id=?', (parent,)).fetchone()[0]
+                    table = 'session' if mode == 'inactive' else 'session_v2'
+                    if mode == 'inactive':
+                        database.execute('CREATE TABLE session AS SELECT * FROM session_v2 WHERE 0')
+                    if mode == 'wrong-cwd': directory = os.path.dirname(directory)
+                    if mode == 'relative': directory = '.'
+                    workspace = 'remote' if mode == 'workspace' else None
+                    database.execute('INSERT INTO ' + table + ' (id,project_id,directory,workspace_id,slug,version) SELECT ?,project_id,?,?,slug,version FROM session_v2 WHERE id=?', (body['data']['id'], directory, workspace, parent))
+        encoded = json.dumps(body).encode()
+        conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n' + ('Content-Length: %d\r\n\r\n' % len(encoded)).encode() + encoded)
+    finally:
+        conn.close()
+"#.to_string()
 }
 
 /// The fake agent. `listener` is the path of the server program to run in the
@@ -181,9 +177,7 @@ impl Drop for StopSessionsOnDrop<'_> {
     }
 }
 
-/// OpenCode will not attest a store unless the database is pinned, so the test
-/// declares one and seeds the parent conversation in it. The fake agent never
-/// reads it; AoE resolves the routing against it.
+/// Pin the real SQLite store and seed only the parent. The server mints its child.
 fn seed_store(h: &TuiTestHarness) -> String {
     // AoE compares canonical paths and the harness project sits under a
     // temporary directory that may carry a symlink.
@@ -305,6 +299,94 @@ fn opencode_store_fork_opens_the_child_the_store_minted() {
                 .any(|store| store.as_str() == Some(database.as_str()))),
         "the fork lost its live database route: {child}"
     );
+}
+
+#[test]
+#[parallel]
+fn opencode_store_fork_rejects_an_unattested_child_without_adoption() {
+    require_tmux!();
+    require_python3!();
+    for (case, reason) in [
+        ("missing", "active session table"),
+        ("inactive", "active session table"),
+        ("wrong-cwd", "working directory"),
+        ("relative", "working directory"),
+        ("workspace", "workspace"),
+        ("parent", "instead of a child"),
+    ] {
+        let mut h = TuiTestHarness::new("opencode_fork_invalid_child");
+        let database = seed_store(&h);
+        h.set_env("OPENCODE_DB", &database);
+        h.set_env("AOE_FORK_FIXTURE_ROW", case);
+        let log = install_fake_opencode(&mut h, true);
+        h.run_cli_ok(&[
+            "add",
+            h.project_path().to_str().unwrap(),
+            "--cmd",
+            "opencode",
+            "-t",
+            PARENT,
+        ]);
+        h.run_cli_ok(&["session", "set-session-id", PARENT, PARENT_ID]);
+        h.run_cli_ok(&[
+            "add",
+            h.project_path().to_str().unwrap(),
+            "--cmd",
+            "opencode",
+            "-t",
+            CHILD,
+            "--fork-from",
+            PARENT,
+        ]);
+        let _cleanup = StopSessionsOnDrop { h: &h };
+        let before = h.read_sessions();
+        let start = h.run_cli(&["session", "start", CHILD]);
+        let stderr = String::from_utf8_lossy(&start.stderr);
+        assert!(!start.status.success(), "{case}: {stderr}");
+        assert!(stderr.contains(reason), "{case}: {stderr}");
+        let after = h.read_sessions();
+        for title in [PARENT, CHILD] {
+            let find = |rows: &serde_json::Value| {
+                rows.as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["title"] == title)
+                    .unwrap()
+                    .clone()
+            };
+            let old = find(&before);
+            let new = find(&after);
+            for key in [
+                "agent_session_id",
+                "agent_session_binding",
+                "resume_intent",
+                "resume_binding",
+            ] {
+                assert_eq!(old.get(key), new.get(key), "{case}: {title} changed {key}");
+            }
+            assert!(new.get("active_execution").is_none(), "{case}: {new}");
+        }
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(
+            calls.lines().any(|line| line.starts_with("serve ")),
+            "{case}: {calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .all(|line| line == "--help" || line == "--version" || line.starts_with("serve ")),
+            "{case}: a refused child reached the pane: {calls}"
+        );
+        assert!(
+            !h.tmux()
+                .arg("has-session")
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{case}: a refused child opened a pane"
+        );
+    }
 }
 
 /// With no store reachable the fork must be refused rather than started

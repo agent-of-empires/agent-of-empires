@@ -294,10 +294,7 @@ impl Instance {
         })
     }
 
-    /// Fork `parent_id` in the store this launch selects and adopt the child the
-    /// store minted, so the durable row carries a real conversation instead of
-    /// the id AoE pre-pinned. The server is reaped before this returns, which
-    /// keeps the pane from ever sharing the store with it.
+    /// Attest the store-minted child after the server is reaped, before adoption.
     pub(super) fn fork_session_in_store(
         &mut self,
         execution: Option<&super::execution::NativeExecution>,
@@ -308,32 +305,39 @@ impl Instance {
             self.opencode_store_fork_available(execution),
             "a fork through the agent's store needs a host launch of opencode itself"
         );
-        let agent = crate::agents::get_agent("opencode").expect("opencode is a builtin agent");
-        let command = self
-            .host_agent_command(agent, execution)
-            .context("the host OpenCode launch cannot be resolved")?;
+        let execution =
+            execution.context("OpenCode store fork requires a prepared native execution")?;
+        anyhow::ensure!(
+            execution.opencode_schema.is_some(),
+            "OpenCode store fork requires a prepared active schema"
+        );
+        let command = execution.host_command();
         let cwd = execution
-            .map_or(Some(self.project_path.as_str()), |execution| {
-                execution.inputs.cwd.to_str()
-            })
+            .inputs
+            .cwd
+            .to_str()
             .context("fork working directory is not UTF-8")?;
 
         let child = crate::session::capture::fork_opencode_session_id(cwd, command, parent_id)
             .context("the store returned no child for this fork")?;
-        // Observed provenance distinguishes a reusable child from its preallocated seed.
+        anyhow::ensure!(
+            child != parent_id,
+            "OpenCode fork returned its parent instead of a child"
+        );
+        execution
+            .validate_opencode_session_target(&child)
+            .context("the returned OpenCode fork child is not valid in the pinned store")?;
         self.set_agent_conversation(
             Some(child.clone()),
             Some(crate::session::ConversationBinding {
                 session_id: child.clone(),
-                execution: execution.map(|execution| execution.binding.clone()),
+                execution: Some(execution.binding.clone()),
                 provenance: crate::session::ConversationProvenance::Observed,
                 transcript_path: None,
             }),
             None,
         );
-        // Publish the child and resolve Fork without moving the in-memory target
-        // during validation. If this fails, finalize can retry the publication;
-        // a crash before that may leave the next launch forking the parent again.
+        // Keep Fork as the in-memory validation target until launch finalization.
         if let SidPersistOutcome::Skip =
             self.persist_fork_adoption(&self.effective_profile(), expected)
         {
@@ -378,7 +382,7 @@ impl Instance {
                     && execution.inputs.container.is_none()
                     && self.launch_invokes_resolved_agent_directly(execution.agent)
             }
-            None => !self.is_sandboxed() && self.opencode_launch_mirrorable_by_ambient_serve(),
+            None => false,
         }
     }
 
@@ -1586,35 +1590,6 @@ work-opencode = "opencode"
         assert_eq!(inst.stored_fork_child(), None);
     }
 
-    /// A store fork runs `opencode serve` against the launch's own database, so
-    /// a wrapper-mediated or sandboxed launch cannot reach it.
-    #[test]
-    #[serial_test::serial]
-    fn opencode_store_fork_needs_a_direct_host_launch() {
-        // The gate reads the profile and the app directory, so both are
-        // isolated: the runner's own configuration would decide the answer.
-        let home = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
-        let project = home.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let project = project.to_str().unwrap();
-
-        let mut inst = tool_instance("opencode", project);
-        assert!(inst.opencode_store_fork_available(None));
-        inst.command = "opencode-wrapper".to_string();
-        assert!(!inst.opencode_store_fork_available(None));
-
-        let mut sandboxed = tool_instance("opencode", project);
-        sandboxed.sandbox_info = Some(super::super::test_helpers::test_sandbox(
-            "fork-refusal",
-            None,
-        ));
-        assert!(!sandboxed.opencode_store_fork_available(None));
-
-        let other = tool_instance("claude", project);
-        assert!(!other.opencode_store_fork_available(None));
-    }
-
     /// A sandbox fork is refused independently of either installed generation.
     #[test]
     #[serial_test::serial]
@@ -1744,6 +1719,7 @@ work-opencode = "opencode"
             target_session_id: None,
             resolved_target_session_id: None,
             opencode_preassign: false,
+            opencode_schema: None,
             store_override: None,
         };
         assert!(
