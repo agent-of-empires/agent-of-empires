@@ -775,11 +775,14 @@ mod tests {
             .unwrap();
 
         let snapshot = temp.path().join("sessions-at-kill.json");
+        let ready = temp.path().join("trap-installed");
         let script = format!(
-            "trap 'find {root} -name sessions.json -exec cat {{}} + > {out}; exit 0' TERM HUP; \
-             while :; do sleep 0.05; done",
+            "trap 'find {root} -name sessions.json -exec cat {{}} + > {out}.tmp; \
+             mv {out}.tmp {out}; exit 0' TERM HUP; \
+             touch {ready}; while :; do sleep 0.05; done",
             root = temp.path().display(),
             out = snapshot.display(),
+            ready = ready.display(),
         );
         let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let _ = crate::tmux::tmux_command()
@@ -803,10 +806,22 @@ mod tests {
             .expect("tmux");
         assert!(created.status.success(), "the test needs a real pane");
         crate::tmux::refresh_session_cache();
+        let wait_for = |path: &std::path::Path, what: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait_for(&ready, "the pane to install its trap");
 
         inst.stop().expect("stop");
 
-        let at_kill = std::fs::read_to_string(&snapshot).expect("the pane saw its kill signal");
+        wait_for(&snapshot, "the pane to record its kill signal");
+        let at_kill = std::fs::read_to_string(&snapshot).unwrap();
         let rows: Vec<serde_json::Value> = serde_json::from_str(&at_kill).unwrap();
         let row = rows
             .iter()
