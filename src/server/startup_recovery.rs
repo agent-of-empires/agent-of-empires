@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use super::push::publish_status_change;
 use super::state::AppState;
 
 /// Startup auto-recovery for AI agent sessions whose tmux pane is missing after a daemon
@@ -124,6 +125,34 @@ pub(super) async fn daemon_startup_recovery_mark(
     Some((lock, candidates))
 }
 
+/// What a finished recovery worker hands back for the live row.
+enum RecoveryApplied {
+    /// The worker's row, whether its cascade succeeded or failed.
+    Updated(Box<crate::session::Instance>),
+    /// The worker panicked; the row is stamped `Error`.
+    Panicked(String),
+}
+
+/// Fold a finished recovery into the live row and publish the status move it made, so an online
+/// plugin hears of it.
+async fn apply_recovery_outcome(state: &AppState, id: &str, applied: RecoveryApplied) {
+    let mut instances = state.instances.write().await;
+    let Some(slot) = instances.iter_mut().find(|i| i.id == id) else {
+        return;
+    };
+    let old_status = slot.status;
+    match applied {
+        RecoveryApplied::Updated(updated) => *slot = *updated,
+        RecoveryApplied::Panicked(error) => {
+            slot.status = crate::session::Status::Error;
+            slot.last_error = Some(format!("recovery worker panicked: {error}"));
+            // Same stickiness arming as a failed cascade.
+            slot.last_error_check = Some(std::time::Instant::now());
+        }
+    }
+    publish_status_change(&state.status_tx, slot, old_status);
+}
+
 /// Phase B: drive the cascade workers for the pre-marked candidates.
 pub(super) async fn daemon_startup_recovery_cascade(
     state: Arc<AppState>,
@@ -242,11 +271,8 @@ pub(super) async fn daemon_startup_recovery_cascade(
                         ?outcome,
                         "recovery completed",
                     );
-                    let mut instances = inst_state.instances.write().await;
-                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-                        *slot = updated;
-                    }
-                    drop(instances);
+                    let applied = RecoveryApplied::Updated(Box::new(updated));
+                    apply_recovery_outcome(&inst_state, &id, applied).await;
                     // Release the suppression now that the cascade has succeeded and the
                     // pane is alive.
                     crate::session::recovery::drain_recovery_pending(
@@ -263,11 +289,8 @@ pub(super) async fn daemon_startup_recovery_cascade(
                         error = %e,
                         "recovery cascade failed",
                     );
-                    let mut instances = inst_state.instances.write().await;
-                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-                        *slot = updated;
-                    }
-                    drop(instances);
+                    let applied = RecoveryApplied::Updated(Box::new(updated));
+                    apply_recovery_outcome(&inst_state, &id, applied).await;
                     // Release the suppression so the next poll respects the Error state
                     // instead of forcing Status::Starting for the rest of the TTL window.
                     crate::session::recovery::drain_recovery_pending(
@@ -284,14 +307,12 @@ pub(super) async fn daemon_startup_recovery_cascade(
                         error = %join_err,
                         "recovery worker panicked",
                     );
-                    let mut instances = inst_state.instances.write().await;
-                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-                        slot.status = crate::session::Status::Error;
-                        slot.last_error = Some(format!("recovery worker panicked: {}", join_err));
-                        // Same stickiness arming as the cascade-Err arm above.
-                        slot.last_error_check = Some(std::time::Instant::now());
-                    }
-                    drop(instances);
+                    apply_recovery_outcome(
+                        &inst_state,
+                        &id,
+                        RecoveryApplied::Panicked(join_err.to_string()),
+                    )
+                    .await;
                     // Same suppression release as above.
                     crate::session::recovery::drain_recovery_pending(
                         &inst_state.recovery_pending,
@@ -320,6 +341,77 @@ pub(super) async fn daemon_startup_recovery_cascade(
 mod tests {
     use super::*;
     use crate::server::test_support;
+    use crate::session::Status;
+
+    fn recovering(status: Status) -> crate::session::Instance {
+        let mut inst = crate::session::Instance::new("recovering", "/tmp/aoe-recovery-publish");
+        inst.source_profile = "default".to_string();
+        inst.status = status;
+        inst
+    }
+
+    /// The recovery cascade writes the live row itself, so it must publish the status move: if a
+    /// poll tick reported Starting and recovery lands Error between ticks, the next tick snapshots
+    /// Error and an online plugin would never hear of it.
+    #[tokio::test]
+    async fn a_finished_recovery_publishes_the_status_move_it_makes() {
+        // (live status, status the worker returned, expected move)
+        let cases = [
+            (
+                Status::Starting,
+                Status::Error,
+                Some((Status::Starting, Status::Error)),
+            ),
+            (
+                Status::Running,
+                Status::Starting,
+                Some((Status::Running, Status::Starting)),
+            ),
+            (Status::Error, Status::Error, None),
+        ];
+        for (live, returned, want) in cases {
+            let inst = recovering(live);
+            let state = test_support::build_test_app_state(vec![inst.clone()]);
+            let mut rx = state.status_tx.subscribe();
+            let mut updated = inst.clone();
+            updated.status = returned;
+
+            let applied = RecoveryApplied::Updated(Box::new(updated));
+            apply_recovery_outcome(&state, &inst.id, applied).await;
+
+            let got = rx.try_recv().ok().map(|c| (c.old, c.new));
+            assert_eq!(got, want, "live={live:?} returned={returned:?}");
+            assert_eq!(state.instances.read().await[0].status, returned);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicked_recovery_publishes_the_error_it_stamps() {
+        let inst = recovering(Status::Starting);
+        let state = test_support::build_test_app_state(vec![inst.clone()]);
+        let mut rx = state.status_tx.subscribe();
+
+        apply_recovery_outcome(&state, &inst.id, RecoveryApplied::Panicked("boom".into())).await;
+
+        let change = rx.try_recv().expect("the Error stamp is published");
+        assert_eq!((change.old, change.new), (Status::Starting, Status::Error));
+        let row = state.instances.read().await[0].clone();
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("recovery worker panicked: boom")
+        );
+        assert!(row.last_error_check.is_some(), "the stickiness is armed");
+    }
+
+    #[tokio::test]
+    async fn a_recovery_for_a_vanished_row_publishes_nothing() {
+        let state = test_support::build_test_app_state(Vec::new());
+        let mut rx = state.status_tx.subscribe();
+
+        apply_recovery_outcome(&state, "gone", RecoveryApplied::Panicked("boom".into())).await;
+
+        assert!(rx.try_recv().is_err());
+    }
 
     /// #2994 wiring test for `daemon_startup_recovery_mark` (Phase A).
     #[tokio::test]

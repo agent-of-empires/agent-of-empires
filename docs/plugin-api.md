@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 13
+api_version = 14
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -48,7 +48,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 | Capability | Grants |
 |---|---|
 | `runtime.worker` | Running any plugin code at all (host RPCs the worker initiates). Any worker needs this. |
-| `session.read` | Reading the attached session. |
+| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` notifications (`api_version >= 14`). |
 | `session.write` | Mutating the attached session. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
@@ -223,6 +223,8 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 **Limits.** Per plugin: 20 creates per hour, 5 active plugin-created sessions, 120 turns per hour, reported as `rate_limited` or `concurrency_limited`. Disabling the plugin stops all of its automation.
 
 **Settings-change events.** After a settings write the host notifies the worker with `plugin.settings.changed` carrying `{ revision, changed_keys }`; the worker re-reads those values with `config.get`, whose response carries the current `revision`. Polling that method is the fallback for a worker that was down.
+
+**Session status events.** With `api_version >= 14` and the `session.read` capability, the host notifies the worker with `session.status.changed` on every status transition of a session in the host's profile (the same sessions `sessions.list` returns), for structured and terminal sessions alike. The params are `{ session_id, title, from, to, at }`: `from` and `to` use the same PascalCase spelling as `sessions.list` (`Running`, `Idle`, `Waiting`, `Stopped`, `Error`, and so on), and `at` is an RFC 3339 timestamp. The host sends the transitions it processes, so filter on `to` (for example `Idle` for "the agent stopped working"). Do not treat the notifications as a complete transition log: a status change made by another process, such as the CLI or TUI, is reported when the daemon next reloads it, changes within one poll tick can merge into one event, and delivery is best-effort as described below. It is a best-effort, fire-and-forget notification: do not reply, and an event is never replayed. It is lost if the worker was down when it fired, if the daemon's status stream lagged and skipped it, or if the worker had stopped reading stdin (at most 64 unread status events are queued per worker; later ones are dropped until it catches up). Resynchronize from `sessions.list` on startup and whenever you may have missed events, but it reads the stored sessions: the `status` of a structured (ACP) session moves on the live row without being persisted each time, so the listed value can be older than the live one. There is no live-status snapshot call yet.
 
 ## Plugin storage
 
