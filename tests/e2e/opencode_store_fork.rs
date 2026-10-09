@@ -19,6 +19,18 @@ const CHILD_ID: &str = "ses_22222222222222222222222222bbbb";
 fn child_body() -> String {
     format!(r#"{{"data":{{"id":"{CHILD_ID}"}}}}"#)
 }
+fn declare_host_environment(h: &TuiTestHarness, entries: &[String]) {
+    let path = crate::harness::app_dir_in(h.home_path()).join("config.toml");
+    let seeded = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "environment = {}\n{seeded}",
+            serde_json::to_string(entries).unwrap()
+        ),
+    )
+    .unwrap();
+}
 
 fn server_program() -> String {
     r#"import json, os, socket, sqlite3, sys
@@ -318,7 +330,7 @@ fn opencode_store_fork_rejects_an_unattested_child_without_adoption() {
         let mut h = TuiTestHarness::new("opencode_fork_invalid_child");
         let database = seed_store(&h);
         h.set_env("OPENCODE_DB", &database);
-        h.set_env("AOE_FORK_FIXTURE_ROW", case);
+        declare_host_environment(&h, &[format!("AOE_FORK_FIXTURE_ROW={case}")]);
         let log = install_fake_opencode(&mut h, true);
         h.run_cli_ok(&[
             "add",
@@ -444,13 +456,14 @@ fn opencode_host_launch_preserves_login_or_managed_environment() {
     require_tmux!();
     require_python3!();
     use std::os::unix::ffi::OsStrExt;
-    for (mode, managed) in [
-        ("current", false),
-        ("legacy", false),
-        ("external", false),
-        ("current", true),
-        ("legacy", true),
-        ("wrapper", true),
+    for (mode, managed, inherit) in [
+        ("current", false, false),
+        ("legacy", false, false),
+        ("external", false, false),
+        ("current", true, false),
+        ("current", true, true),
+        ("legacy", true, false),
+        ("wrapper", true, false),
     ] {
         let mut h = TuiTestHarness::new("opencode_host_environment");
         if managed {
@@ -461,9 +474,9 @@ fn opencode_host_launch_preserves_login_or_managed_environment() {
             h.set_env("OPENCODE_DB", "");
             h.set_env("OPENCODE_DISABLE_CHANNEL_DB", "0");
         }
-        h.append_config(
-            "[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false",
-        );
+        h.append_config(&format!(
+            "[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\ninherit_host_environment={inherit}",
+        ));
         let bin = h.install_path_command("opencode");
         let wrong = h.home_path().join("wrong");
         fs::create_dir(&wrong).unwrap();
@@ -477,16 +490,30 @@ fn opencode_host_launch_preserves_login_or_managed_environment() {
         h.set_env("SHELL", "/bin/bash");
         h.set_env("LOGIN_GENERATION", "captured");
         h.set_env("LOGIN_ENGINE", bin.join("engine").to_str().unwrap());
+        declare_host_environment(
+            &h,
+            &[
+                format!("LOGIN_ENGINE={}", bin.join("engine").display()),
+                "OPENCODE_PERMISSION=captured-user-policy".into(),
+                "REVIEW_DECLARED=explicit".into(),
+            ],
+        );
+        h.set_env("REVIEW_DECLARED", "ambient");
+        h.set_env("AOE_REVIEW_INTERNAL", "fixture");
+        h.set_env("OPENAI_API_KEY", "dummy-parent-key");
+        h.set_env("SSH_AUTH_SOCK", "/parent/agent.sock");
+        h.set_env("HTTPS_PROXY", "http://parent.invalid");
         h.set_env("PRIVATE_EXEC_TOKEN", "dummy-frozen-secret");
         h.set_env("AOE.test-key", "line1\nline2 '\"$");
         h.set_env("BASH_FUNC_aoe_probe%%", "() { :; }");
         h.set_env("TMUX_PANE", "%parent");
         h.set_env("OPENCODE_PERMISSION", "captured-user-policy");
-        h.set_env("AOE_RAW_VALUE", std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+        h.set_env("REVIEW_RAW_VALUE", std::ffi::OsStr::from_bytes(b"\xff\xfe"));
         h.set_env(
-            std::ffi::OsStr::from_bytes(b"AOE_RAW_\xff"),
+            std::ffi::OsStr::from_bytes(b"REVIEW_RAW_\xff"),
             std::ffi::OsStr::from_bytes(b"\xfe\xfd"),
         );
+        h.set_env(std::ffi::OsStr::from_bytes(b"AOE_REVIEW_\xff"), "fixture");
         for directory in [&bin, &wrong] {
             let legacy = (mode == "legacy") != (directory == &wrong);
             let help = if legacy { "--fork" } else { "--auto" };
@@ -498,7 +525,8 @@ if sys.argv[1:] == ['--help']:
 def opened(fd):
     try: os.fstat(fd); return True
     except OSError: return False
-record = dict(program=os.path.abspath(__file__), cwd=os.getcwd(), argv=sys.argv[1:], environment=dict((k,v) for k,v in os.environ.items() if not k.startswith('AOE_RAW')), raw=[os.environb.get(b'AOE_RAW_VALUE', b'').hex(), os.environb.get(b'AOE_RAW_\xff', b'').hex()], tty=os.isatty(0), descriptors=[opened(3), opened(4)])
+keys = ['LOGIN_GENERATION', 'PRIVATE_EXEC_TOKEN', 'AOE.test-key', 'BASH_FUNC_aoe_probe%%', 'OPENAI_API_KEY', 'SSH_AUTH_SOCK', 'HTTPS_PROXY', 'PATH', 'TMUX_PANE', 'OPENCODE_PERMISSION', 'REVIEW_DECLARED', 'AOE_REVIEW_INTERNAL', {added:?}]
+record = dict(program=os.path.abspath(__file__), cwd=os.getcwd(), argv=sys.argv[1:], environment={{k: os.environ[k] for k in keys if k in os.environ}}, raw=[os.environb.get(b'REVIEW_RAW_VALUE', b'').hex(), os.environb.get(b'REVIEW_RAW_\xff', b'').hex(), os.environb.get(b'AOE_REVIEW_\xff', b'').hex()], tty=os.isatty(0), descriptors=[opened(3), opened(4)])
 with open({output:?}, 'w') as f: json.dump(record, f)
 for line in sys.stdin: pass
 "#,
@@ -547,12 +575,25 @@ for line in sys.stdin: pass
         );
         let env = &record["environment"];
         if managed {
-            assert_eq!(env["LOGIN_GENERATION"], "captured");
-            assert_eq!(env["PRIVATE_EXEC_TOKEN"], "dummy-frozen-secret");
-            assert_eq!(env["AOE.test-key"], "line1\nline2 '\"$");
-            assert_eq!(env["BASH_FUNC_aoe_probe%%"], "() { :; }");
+            if inherit {
+                assert_eq!(env["LOGIN_GENERATION"], "captured");
+                assert_eq!(env["PRIVATE_EXEC_TOKEN"], "dummy-frozen-secret");
+                assert_eq!(env["AOE.test-key"], "line1\nline2 '\"$");
+                assert_eq!(env["BASH_FUNC_aoe_probe%%"], "() { :; }");
+                assert_eq!(record["raw"], serde_json::json!(["fffe", "fefd", ""]));
+            } else {
+                for key in [
+                    "LOGIN_GENERATION",
+                    "PRIVATE_EXEC_TOKEN",
+                    "AOE.test-key",
+                    "BASH_FUNC_aoe_probe%%",
+                ] {
+                    assert!(env.get(key).is_none(), "{mode}:{key}");
+                }
+                assert_eq!(record["raw"], serde_json::json!(["", "", ""]));
+            }
+            assert!(env.get("AOE_REVIEW_INTERNAL").is_none());
             assert!(env.get(&added).is_none());
-            assert_eq!(record["raw"], serde_json::json!(["fffe", "fefd"]));
         } else {
             assert_eq!(env["LOGIN_GENERATION"], "login");
             assert_eq!(env["PRIVATE_EXEC_TOKEN"], "login-secret");
@@ -566,6 +607,7 @@ for line in sys.stdin: pass
                 .starts_with(wrong.to_str().unwrap()));
             assert_eq!(record["raw"][0], "fffe");
         }
+        assert_eq!(env["REVIEW_DECLARED"], "explicit");
         assert_ne!(env["TMUX_PANE"], "%parent");
         assert!(env["TMUX_PANE"].as_str().unwrap().starts_with('%'));
         assert_eq!(record["tty"], true);

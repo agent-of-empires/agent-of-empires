@@ -868,6 +868,7 @@ mod tests {
             case_insensitive_routing: &[],
             omp: None,
             inputs: NativeLaunchInputs {
+                raw_environment: Vec::new(),
                 launch_id: "launch-attested-route".into(),
                 environment: Default::default(),
                 cwd: temp.path().to_path_buf(),

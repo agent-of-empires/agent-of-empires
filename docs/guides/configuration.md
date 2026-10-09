@@ -272,6 +272,8 @@ inherit_host_environment = true
 
 Every variable AoE holds then reaches host sessions, except `AOE_*` and `AGENT_OF_EMPIRES_*` (its own wiring) and `TERM` (owned by tmux). Off by default, since it widens what every agent can read, including tokens exported in your shell. In the terminal view the pairs ride `tmux new-session -e`, so a secret is briefly visible in `ps` while that command runs.
 
+Managed OpenCode selects this policy before probing or launching the native agent. It also retains process essentials and OpenCode database, configuration and workspace selector inputs for validation when wholesale inheritance is off. Unsupported selectors remain unsupported. Explicit profile `environment` entries and before-session overrides take precedence; login-only exports are not imported. See [managed OpenCode contexts](session-resume.md#supported-managed-contexts).
+
 ### When AoE has no environment to forward
 
 Forwarding is a passthrough, not a store: AoE can only hand a session what its own process holds. A daemon started by systemd, launchd, cron, or an SSH command inherits that launcher's environment, not your shell's.

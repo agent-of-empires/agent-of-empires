@@ -293,8 +293,10 @@ impl NativeExecution {
             .current_dir(&self.inputs.cwd)
             .env_clear()
             .envs(
-                std::env::vars_os()
-                    .filter(|(key, value)| key.to_str().is_none() || value.to_str().is_none()),
+                self.inputs
+                    .raw_environment
+                    .iter()
+                    .map(|(key, value)| (key, value)),
             )
             .envs(&self.inputs.environment);
         for (key, value) in &self.routing {
@@ -316,13 +318,12 @@ impl NativeExecution {
             .stores
             .first()
             .context("OpenCode store is missing")?;
-        let location = self.inputs.physical_location(database);
         anyhow::ensure!(
-            location.filesystem == "host",
+            self.binding.filesystem == "host",
             "OpenCode routing requires a local database projection"
         );
         let connection = rusqlite::Connection::open_with_flags(
-            location.path.canonicalize()?,
+            database.canonicalize()?,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -439,9 +440,63 @@ impl<'a> AgentLaunchContext<'a> {
     }
 }
 
+const OPENCODE_NATIVE_ENV_KEYS: &[&str] = &[
+    "OPENCODE_DB",
+    "OPENCODE_DISABLE_CHANNEL_DB",
+    "OPENCODE_CONFIG_DIR",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_CONTENT",
+    "OPENCODE_WORKSPACE_ID",
+];
+
+fn host_launch_environment_from(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    entries: &[String],
+    opencode_inheritance: Option<bool>,
+) -> (
+    std::collections::HashMap<String, String>,
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) {
+    use std::ffi::{OsStr, OsString};
+    let mut environment = std::collections::HashMap::new();
+    let mut raw_environment = Vec::new();
+    for (key, value) in vars {
+        if let Some(passthrough) = opencode_inheritance {
+            let live = crate::process::LIVE_PANE_ENV_KEYS
+                .iter()
+                .any(|live| key == OsStr::new(live));
+            let required = crate::session::environment::HOST_BASE_ENV_KEYS
+                .iter()
+                .chain(OPENCODE_NATIVE_ENV_KEYS)
+                .any(|required| key == OsStr::new(required));
+            if live
+                || !(required
+                    || crate::session::environment::host_env_key_inherited(&key, passthrough))
+            {
+                continue;
+            }
+        }
+        match (key.into_string(), value.into_string()) {
+            (Ok(key), Ok(value)) => {
+                environment.insert(key, value);
+            }
+            (key, value) => raw_environment.push((
+                key.map(OsString::from).unwrap_or_else(|key| key),
+                value.map(OsString::from).unwrap_or_else(|value| value),
+            )),
+        }
+    }
+    for (key, value) in crate::session::environment::resolve_host_environment_pairs(entries) {
+        raw_environment.retain(|(raw_key, _)| raw_key != OsStr::new(&key));
+        environment.insert(key, value);
+    }
+    (environment, raw_environment)
+}
+
 pub(super) struct NativeLaunchInputs {
     pub(super) launch_id: String,
     pub(super) environment: std::collections::HashMap<String, String>,
+    pub(super) raw_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     pub(super) cwd: PathBuf,
     pub(super) profile: String,
     pub(super) container: Option<crate::containers::ContainerExecutionSnapshot>,
@@ -1293,6 +1348,7 @@ impl Instance {
             Ok(NativeLaunchInputs {
                 launch_id,
                 environment,
+                raw_environment: Vec::new(),
                 cwd,
                 container: Some(container),
                 docker_env: Some(docker_env),
@@ -1302,7 +1358,11 @@ impl Instance {
             })
         } else {
             let entries = self.resolved_host_environment_from(config.environment.clone());
-            let mut environment = crate::session::capture::host_launcher_environment(&entries);
+            let (mut environment, raw_environment) = host_launch_environment_from(
+                std::env::vars_os(),
+                &entries,
+                (agent.name == "opencode").then_some(config.session.inherit_host_environment),
+            );
             environment.insert(crate::hooks::SESSION_SOURCE_ENV.into(), launch_id.clone());
             if let Some((_, values)) = &identity_extension {
                 for entry in shell_words::split(values)? {
@@ -1319,6 +1379,7 @@ impl Instance {
             Ok(NativeLaunchInputs {
                 launch_id,
                 environment,
+                raw_environment,
                 cwd: crate::session::capture::canonicalize_or_raw(&self.project_path),
                 container: None,
                 docker_env: None,
@@ -1420,23 +1481,31 @@ impl Instance {
                 }
                 let parsed = super::launch_command::parse_launch_command(command)?;
                 let program = parsed.words.first()?;
-                let environment = self.resolved_host_environment();
-                let path = crate::session::environment::resolve_host_environment_value(
-                    &environment,
-                    "PATH",
-                )
-                .map(std::ffi::OsString::from)
-                .or_else(|| std::env::var_os("PATH"));
-                match which::which_in(program, path.as_deref(), &self.project_path) {
+                let config = crate::session::config::profile_config::resolve_config_or_warn(
+                    &self.effective_profile(),
+                );
+                let entries = self.resolved_host_environment_from(config.environment);
+                let (environment, raw_environment) = host_launch_environment_from(
+                    std::env::vars_os(),
+                    &entries,
+                    (agent.name == "opencode").then_some(config.session.inherit_host_environment),
+                );
+                let path = environment
+                    .get("PATH")
+                    .map(std::ffi::OsStr::new)
+                    .or_else(|| {
+                        raw_environment.iter().find_map(|(key, value)| {
+                            (key == std::ffi::OsStr::new("PATH")).then_some(value.as_os_str())
+                        })
+                    });
+                match which::which_in(program, path, &self.project_path) {
                     Ok(program) => {
                         let mut command = std::process::Command::new(program);
                         command
                             .current_dir(&self.project_path)
                             .env_clear()
-                            .envs(std::env::vars_os());
-                        command.envs(crate::session::environment::resolve_host_environment_pairs(
-                            &environment,
-                        ));
+                            .envs(raw_environment)
+                            .envs(environment);
                         Some(command)
                     }
                     Err(error) => {
@@ -2771,6 +2840,252 @@ impl Instance {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn opencode_host_snapshot_enforces_selection_and_explicit_override_precedence() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStrExt;
+        let vars = [
+            ("HOME", "/review/home"),
+            ("PATH", "/review/bin"),
+            ("XDG_DATA_HOME", "/review/data"),
+            ("DISPLAY", ":17"),
+            ("OPENCODE_DB", "/review/store.db"),
+            ("OPENCODE_CONFIG_CONTENT", "{}"),
+            ("OPENCODE_WORKSPACE_ID", "unsupported-workspace"),
+            ("REVIEW_UNLISTED", "ambient"),
+            ("REVIEW_OVERRIDE", "ambient"),
+            ("AOE_REVIEW_INTERNAL", "fixture"),
+            ("AGENT_OF_EMPIRES_REVIEW_INTERNAL", "fixture"),
+            ("TERM", "parent-term"),
+            ("TMUX", "parent-tmux"),
+            ("TMUX_PANE", "%parent"),
+        ];
+        let entries = vec![
+            "REVIEW_OVERRIDE=explicit".into(),
+            "REVIEW_DECLARED=explicit".into(),
+            "REVIEW_RAW_OVERRIDE=explicit".into(),
+        ];
+        for inherit in [false, true] {
+            let mut captured = vars
+                .iter()
+                .map(|(key, value)| (OsString::from(*key), OsString::from(*value)))
+                .collect::<Vec<_>>();
+            captured.extend([
+                (
+                    OsString::from("REVIEW_RAW_VALUE"),
+                    OsStr::from_bytes(b"\xff").to_owned(),
+                ),
+                (
+                    OsStr::from_bytes(b"REVIEW.RAW_\xff").to_owned(),
+                    OsString::from("fixture"),
+                ),
+                (
+                    OsStr::from_bytes(b"AOE_REVIEW_\xff").to_owned(),
+                    OsString::from("fixture"),
+                ),
+                (
+                    OsString::from("REVIEW_RAW_OVERRIDE"),
+                    OsStr::from_bytes(b"\xfe").to_owned(),
+                ),
+            ]);
+            let (environment, raw) =
+                host_launch_environment_from(captured, &entries, Some(inherit));
+            for (key, value) in &vars[..7] {
+                assert_eq!(
+                    environment.get(*key).map(String::as_str),
+                    Some(*value),
+                    "{inherit}:{key}"
+                );
+            }
+            assert_eq!(
+                environment.get("REVIEW_UNLISTED").map(String::as_str),
+                inherit.then_some("ambient")
+            );
+            assert_eq!(
+                environment.get("REVIEW_OVERRIDE").map(String::as_str),
+                Some("explicit")
+            );
+            assert_eq!(
+                environment.get("REVIEW_DECLARED").map(String::as_str),
+                Some("explicit")
+            );
+            assert_eq!(
+                environment.get("REVIEW_RAW_OVERRIDE").map(String::as_str),
+                Some("explicit")
+            );
+            for key in [
+                "AOE_REVIEW_INTERNAL",
+                "AGENT_OF_EMPIRES_REVIEW_INTERNAL",
+                "TERM",
+                "TMUX",
+                "TMUX_PANE",
+            ] {
+                assert!(!environment.contains_key(key), "{inherit}:{key}");
+            }
+            assert_eq!(
+                raw.iter()
+                    .find(|(key, _)| key == "REVIEW_RAW_VALUE")
+                    .map(|(_, value)| value.as_bytes()),
+                inherit.then_some(b"\xff".as_slice())
+            );
+            assert_eq!(
+                raw.iter()
+                    .any(|(key, _)| key == OsStr::from_bytes(b"REVIEW.RAW_\xff")),
+                inherit
+            );
+            assert!(!raw
+                .iter()
+                .any(|(key, _)| key.as_bytes().starts_with(b"AOE_")));
+            assert!(!raw.iter().any(|(key, _)| key == "REVIEW_RAW_OVERRIDE"));
+        }
+        let (other_agent, _) = host_launch_environment_from(
+            vars.map(|(key, value)| (key.into(), value.into())),
+            &[],
+            None,
+        );
+        assert_eq!(
+            other_agent.get("REVIEW_UNLISTED").map(String::as_str),
+            Some("ambient")
+        );
+        assert_eq!(
+            other_agent.get("AOE_REVIEW_INTERNAL").map(String::as_str),
+            Some("fixture")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_routing_consumes_the_physical_store_and_compares_native_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let native = temp.path().join("native");
+        for directory in [&host, &native] {
+            std::fs::create_dir_all(directory.join("checkout")).unwrap();
+        }
+        let transport = temp.path().join("transport");
+        // Run the production path resolver; replace only the container transport.
+        std::fs::write(&transport, "#!/bin/sh\n[ \"$1\" = exec ] && [ \"$2\" = -w ] && [ \"$3\" = / ] && [ \"$4\" = fixture-id ] || exit 2\nshift 4\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = host.join("opencode.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL)").unwrap();
+        for (sid, workspace, directory) in [
+            (
+                "native",
+                None,
+                native.join("checkout").display().to_string(),
+            ),
+            (
+                "physical",
+                None,
+                host.join("checkout").display().to_string(),
+            ),
+            ("relative", None, ".".into()),
+            (
+                "workspace",
+                Some("remote"),
+                native.join("checkout").display().to_string(),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO session VALUES (?1, ?2, ?3)",
+                    rusqlite::params![sid, workspace, directory],
+                )
+                .unwrap();
+        }
+        let inputs = NativeLaunchInputs {
+            launch_id: "review".into(),
+            environment: std::collections::HashMap::new(),
+            raw_environment: Vec::new(),
+            cwd: native.join("checkout"),
+            profile: "default".into(),
+            container: Some(crate::containers::ContainerExecutionSnapshot {
+                runtime: crate::containers::RuntimeExecutionSnapshot {
+                    kind: crate::session::ContainerRuntimeName::Docker,
+                    program: transport,
+                    cwd: temp.path().into(),
+                    endpoint: String::new(),
+                    local_mounts: true,
+                    routing: Vec::new(),
+                    global_arguments: Vec::new(),
+                },
+                name: "fixture".into(),
+                id: "fixture-id".into(),
+                mounts: vec![crate::containers::VolumeMount {
+                    host_path: host.display().to_string(),
+                    container_path: native.display().to_string(),
+                    read_only: false,
+                }],
+                shadow_mounts: Vec::new(),
+            }),
+            docker_env: None,
+            pane_env: Vec::new(),
+            identity_extension: None,
+        };
+        let store = inputs.physical_location(&native.join("opencode.db"));
+        let cwd = inputs.physical_location(&inputs.cwd);
+        let mut execution = NativeExecution {
+            agent: crate::agents::get_agent("opencode").unwrap(),
+            binding: ExecutionBinding {
+                agent: "opencode".into(),
+                stores: vec![store.path],
+                filesystem: store.filesystem,
+                cwd: cwd.path,
+                cwd_filesystem: cwd.filesystem,
+                configuration: Vec::new(),
+                exported_default_store: None,
+            },
+            routing: Vec::new(),
+            case_insensitive_routing: &[],
+            omp: None,
+            inputs,
+            program: PathBuf::from("opencode"),
+            capture: None,
+            pi_transcript_path: None,
+            namespace_arguments: Vec::new(),
+            target_session_id: None,
+            resolved_target_session_id: None,
+            pi_pinnable: false,
+            opencode_preassign: false,
+            opencode_schema: Some(OpenCodeSessionSchema::Session),
+            store_override: None,
+        };
+        execution
+            .validate_opencode_session_target("native")
+            .unwrap();
+        for (sid, reason) in [
+            ("physical", "working directory"),
+            ("relative", "working directory"),
+            ("workspace", "workspace"),
+        ] {
+            let error = execution
+                .validate_opencode_session_target(sid)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{sid}: {error}");
+        }
+        execution
+            .inputs
+            .container
+            .as_mut()
+            .unwrap()
+            .runtime
+            .local_mounts = false;
+        let remote_store = execution
+            .inputs
+            .physical_location(&native.join("opencode.db"));
+        execution.binding.stores = vec![remote_store.path];
+        execution.binding.filesystem = remote_store.filesystem;
+        let error = execution
+            .validate_opencode_session_target("native")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("local database projection"), "{error}");
+    }
+
     #[test]
     fn opencode_build_identity_refuses_unattested_versions_and_aliases() {
         use OpenCodeSessionSchema::{Session, SessionV2};
@@ -3063,6 +3378,7 @@ mod tests {
                 "HOME".into(),
                 cwd.display().to_string(),
             )]),
+            raw_environment: Vec::new(),
             cwd,
             profile: "default".into(),
             container: None,
@@ -3200,6 +3516,7 @@ mod tests {
         let inputs = NativeLaunchInputs {
             launch_id: uuid::Uuid::new_v4().to_string(),
             environment: Default::default(),
+            raw_environment: Vec::new(),
             cwd: root.path().to_path_buf(),
             profile: "default".into(),
             container: None,

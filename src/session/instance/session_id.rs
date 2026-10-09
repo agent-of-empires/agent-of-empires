@@ -1682,6 +1682,7 @@ work-opencode = "opencode"
         let profile_bin = home.path().join("elsewhere");
         std::fs::create_dir_all(&profile_bin).unwrap();
         let agent = crate::session::instance::execution::NativeLaunchInputs {
+            raw_environment: Vec::new(),
             launch_id: "test".to_string(),
             environment: [(
                 "PATH".to_string(),
