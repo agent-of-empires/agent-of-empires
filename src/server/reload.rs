@@ -7,6 +7,7 @@ use crate::session::Status;
 use crate::session::Storage;
 use std::sync::Arc;
 
+use super::push::publish_status_change;
 use super::state::{AppState, StatusSource};
 use super::structured_repair::{
     persist_structured_row_repairs, repair_structured_rows_from_live_workers,
@@ -331,6 +332,16 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
+    // The one place a polled or reloaded status reaches the live rows, so it publishes the moves
+    // it makes, from the live status at this instant. A handler publishes its own move under the
+    // same lock, so whichever lands first leaves nothing for the other to repeat, and a snapshot
+    // rejected above publishes nothing.
+    for row in &merged {
+        if let Some(prior) = prior_by_id.get(&row.id) {
+            publish_status_change(&state.status_tx, row, prior.status);
+        }
+    }
+
     *current = merged;
     drop(current);
     drop(reload_guard);
@@ -358,6 +369,136 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    fn terminal_row(status: Status) -> Instance {
+        let mut row = Instance::new("reload-publish", "/tmp/aoe-reload-publish");
+        row.source_profile = "default".to_string();
+        row.tool = "claude".to_string();
+        row.status = status;
+        row
+    }
+
+    /// A reload that applies a different status than the live row holds is the one place that
+    /// moves it, so it publishes the move: from the live status at that instant, not from the
+    /// stale tick snapshot the caller diffed against.
+    #[tokio::test]
+    async fn a_reload_publishes_the_status_move_it_applies() {
+        // (live status, status in the snapshot, source, expected move)
+        let cases = [
+            (
+                Status::Running,
+                Status::Error,
+                StatusSource::TmuxApplied,
+                Some((Status::Running, Status::Error)),
+            ),
+            (
+                Status::Starting,
+                Status::Error,
+                StatusSource::TmuxApplied,
+                Some((Status::Starting, Status::Error)),
+            ),
+            (Status::Idle, Status::Idle, StatusSource::TmuxApplied, None),
+            // A disk-only reload never decides a status, so it moves nothing.
+            (
+                Status::Running,
+                Status::Stopped,
+                StatusSource::DiskOnly,
+                None,
+            ),
+        ];
+        for (live, snapshot, source, want) in cases {
+            let row = terminal_row(live);
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            let mut rx = state.status_tx.subscribe();
+            let mut fresh = row.clone();
+            fresh.status = snapshot;
+            let read_epoch = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            reload_state_instances_from_disk(&state, vec![fresh], Vec::new(), source, read_epoch)
+                .await;
+
+            let got = rx.try_recv().ok().map(|c| (c.old, c.new));
+            assert_eq!(got, want, "live={live:?} snapshot={snapshot:?} {source:?}");
+        }
+    }
+
+    /// A snapshot that predates a lifecycle mutation is dropped whole, so it publishes nothing.
+    #[tokio::test]
+    async fn a_rejected_snapshot_publishes_nothing() {
+        let row = terminal_row(Status::Running);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let mut rx = state.status_tx.subscribe();
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut fresh = row.clone();
+        fresh.status = Status::Error;
+
+        reload_state_instances_from_disk(
+            &state,
+            vec![fresh],
+            Vec::new(),
+            StatusSource::TmuxApplied,
+            read_epoch,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.instances.read().await[0].status, Status::Running);
+    }
+
+    /// The window the poll used to publish a second time: a reload holding a snapshot of the disk
+    /// as the handler left it is parked behind the reload gate while the real archive handler
+    /// moves the live row and publishes. Applying the snapshot afterwards must add nothing.
+    #[tokio::test]
+    async fn a_parked_reload_does_not_repeat_a_handlers_move() {
+        let row = terminal_row(Status::Running);
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let mut rx = state.status_tx.subscribe();
+        // What the poll read from disk once the archive had settled the row to Idle.
+        let mut fresh = row.clone();
+        fresh.status = Status::Idle;
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        let gate = state.session_service.disk_reload_guard().await;
+        let mut reload = Box::pin(reload_state_instances_from_disk(
+            &state,
+            vec![fresh],
+            Vec::new(),
+            StatusSource::TmuxApplied,
+            read_epoch,
+        ));
+        assert!(
+            futures_util::poll!(reload.as_mut()).is_pending(),
+            "the reload must be parked on the gate"
+        );
+
+        crate::server::api::sessions::update_session_archive(
+            axum::extract::State(Arc::clone(&state)),
+            axum::extract::Path(id),
+            Ok(axum::Json(
+                crate::server::api::sessions::UpdateArchiveBody {
+                    archived: true,
+                    kill_pane: false,
+                },
+            )),
+        )
+        .await;
+        drop(gate);
+        reload.await;
+
+        let first = rx.try_recv().expect("the handler published its move");
+        assert_eq!((first.old, first.new), (Status::Running, Status::Idle));
+        assert!(rx.try_recv().is_err(), "the reload must not repeat it");
+    }
 
     fn live_repair_fixture() -> (Arc<AppState>, Instance, LiveStructuredWorkerRecord, Storage) {
         let mut row = Instance::new("repair-transition", "/tmp/repo");

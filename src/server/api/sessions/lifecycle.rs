@@ -220,6 +220,40 @@ pub async fn update_session_color(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+pub(super) async fn publish_archive_update(
+    state: &AppState,
+    original: &crate::session::LaunchOrigin,
+    issued: Option<&crate::session::LaunchOrigin>,
+    generation: u64,
+    acknowledged: &crate::session::LaunchOrigin,
+    authoritative: Instance,
+) -> Option<SessionResponse> {
+    if !original.storage().same_origin_as(acknowledged.storage()) {
+        return None;
+    }
+    let mut instances = state.instances.write().await;
+    let row = instances.iter_mut().find(|row| {
+        original.matches_instance(row)
+            || issued.is_some_and(|scope| scope.matches_instance(row))
+            || acknowledged.matches_instance(row)
+            || (row
+                .storage_origin
+                .as_ref()
+                .is_some_and(|storage| original.storage().same_origin_as(storage))
+                && original.validate_baseline_at(row, generation).is_ok())
+    })?;
+    let old_status = row.status;
+    *row = crate::server::reload::merge_runtime_fields(row, authoritative);
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    publish_status_change(&state.status_tx, row, old_status);
+    Some(SessionResponse::from_instance(
+        row,
+        crate::claude_settings::read_tui_fullscreen(),
+    ))
+}
+
 pub async fn update_session_archive(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -253,39 +287,39 @@ pub async fn update_session_archive(
         };
         inst.clone()
     };
-    let profile = expected.source_profile.clone();
     if !body.archived {
-        let persist_id = id.clone();
-        if persist_session_update_locked(
-            profile,
-            "unarchive update",
-            state.file_watch.clone(),
-            id.clone(),
-            crate::session::MetadataSelection::Session(id.clone().into()),
-            move |instances| {
-                if let Some(row) = instances.iter_mut().find(|row| row.id == persist_id) {
+        let generation = expected.lifecycle_generation;
+        let published = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let original = Arc::new(crate::session::LaunchOrigin::capture_baseline(&expected)?);
+            let writer = original.clone();
+            let row = writer.storage().update_metadata(
+                crate::session::MetadataSelection::Session(writer.session_id().into()),
+                |rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| writer.matches_instance(row))
+                        .ok_or_else(|| anyhow::anyhow!("unarchive original was replaced"))?;
                     row.unarchive();
-                }
-            },
-        )
-        .await
-        .is_err()
-        {
-            return persist_failed_response();
-        }
-        let mut instances = state.instances.write().await;
-        let Some(row) = instances.iter_mut().find(|row| row.id == id) else {
+                    Ok(row.clone())
+                },
+            )?;
+            let acknowledged = crate::session::LaunchOrigin::capture_baseline(&row)?;
+            Ok((original, row, acknowledged))
+        })
+        .await;
+        let (original, row, acknowledged) = match published {
+            Ok(Ok(published)) => published,
+            Ok(Err(error)) => {
+                return api_error(StatusCode::CONFLICT, "unarchive_failed", error.to_string())
+            }
+            Err(_) => return persist_failed_response(),
+        };
+        let Some(response) =
+            publish_archive_update(&state, &original, None, generation, &acknowledged, row).await
+        else {
             return crate::server::api::session_gone_after_persist();
         };
-        row.unarchive();
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!(SessionResponse::from_instance(
-                row,
-                crate::claude_settings::read_tui_fullscreen()
-            ))),
-        )
-            .into_response();
+        return (StatusCode::OK, Json(response)).into_response();
     }
 
     let claimed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -306,9 +340,7 @@ pub async fn update_session_archive(
         }
         Err(_) => return persist_failed_response(),
     };
-    // A reversible archive cancels admissions and settles runners, but never
-    // sends session/delete or touches the transcript and checkout. No flock is
-    // retained across either asynchronous wait.
+    // Settle original runners without deleting transcripts or checkouts.
     let settled = state
         .acp_supervisor
         .shutdown_and_require_dead(generation.clone())
@@ -322,6 +354,9 @@ pub async fn update_session_archive(
     }
     let persist_id = id.clone();
     let kill_pane = body.kill_pane;
+    let original = generation.original_arc();
+    let issued = generation.current_projection();
+    let counter = generation.generation();
     let published = tokio::task::spawn_blocking(move || {
         crate::session::runner_journal::finish_owned_stop(&generation, |row| {
             if kill_pane {
@@ -330,7 +365,7 @@ pub async fn update_session_archive(
                 }
                 row.kill_ancillary_tmux_sessions_locked();
             }
-            storage.update_under_workspace_claim_lock(|rows, _| {
+            let archived = storage.update_under_workspace_claim_lock(|rows, _| {
                 let row = rows
                     .iter_mut()
                     .find(|row| row.id == persist_id)
@@ -343,31 +378,32 @@ pub async fn update_session_archive(
                 );
                 row.archive();
                 Ok(row.clone())
-            })
+            })?;
+            let acknowledged = crate::session::LaunchOrigin::capture_baseline(&archived)?;
+            Ok((archived, acknowledged))
         })
     })
     .await;
-    let mut authoritative = match published {
-        Ok(Ok(row)) => row,
+    let (authoritative, acknowledged) = match published {
+        Ok(Ok(published)) => published,
         Ok(Err(error)) => {
             return api_error(StatusCode::CONFLICT, "archive_failed", error.to_string())
         }
         Err(_) => return persist_failed_response(),
     };
-    let mut instances = state.instances.write().await;
-    let Some(row) = instances.iter_mut().find(|row| row.id == id) else {
+    let Some(response) = publish_archive_update(
+        &state,
+        &original,
+        Some(&issued),
+        counter,
+        &acknowledged,
+        authoritative,
+    )
+    .await
+    else {
         return crate::server::api::session_gone_after_persist();
     };
-    authoritative.merge_runtime_from_reload(row);
-    *row = authoritative;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!(SessionResponse::from_instance(
-            row,
-            crate::claude_settings::read_tui_fullscreen()
-        ))),
-    )
-        .into_response()
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 /// `POST /api/sessions/:id/trash`. Reserve durably before stopping without flocks,
@@ -1226,19 +1262,25 @@ pub async fn stop_session(
                 )
             }
         };
-        let stop = match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
-            Ok(stop) => stop,
-            Err(error) => {
+        let stop = match tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::reserve_stop_from_origin(original, false)
+        })
+        .await
+        {
+            Ok(Ok(stop)) => stop,
+            Ok(Err(error)) => {
                 return api_error(
                     StatusCode::CONFLICT,
                     "stop_not_authorized",
                     error.to_string(),
                 )
             }
+            Err(_) => return persist_failed_response(),
         };
         let owner = stop.clone();
         let instances = Arc::clone(&state.instances);
         let epoch = Arc::clone(&state.mutation_epoch);
+        let status_tx = state.status_tx.clone();
         let saved = tokio::task::spawn_blocking(move || {
             owner.update_projection(
                 |row| {
@@ -1257,9 +1299,11 @@ pub async fn stop_session(
                     }) else {
                         return Ok(false);
                     };
+                    let old_status = slot.status;
                     *slot = crate::server::reload::merge_runtime_fields(slot, emitted);
                     slot.plugin_revival_pending = false;
                     epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    publish_status_change(&status_tx, slot, old_status);
                     Ok(true)
                 },
             )
@@ -1330,7 +1374,9 @@ pub async fn stop_session(
                         let mut instances = state.instances.write().await;
                         if let Some(live) = instances.iter_mut().find(|instance| instance.id == id)
                         {
+                            let old_status = live.status;
                             live.merge_post_start(&stopped);
+                            publish_status_change(&state.status_tx, live, old_status);
                         }
                     }
                     Ok(None) => {}
@@ -1460,9 +1506,11 @@ pub async fn start_session(
         {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                let old_status = inst.status;
                 inst.idle_dormant_since = None;
                 inst.status = Status::Idle;
                 inst.last_error = None;
+                publish_status_change(&state.status_tx, inst, old_status);
             }
         }
         let instances = state.instances.read().await;
@@ -1483,8 +1531,10 @@ pub async fn start_session(
     {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            let old_status = inst.status;
             inst.status = Status::Starting;
             inst.last_error = None;
+            publish_status_change(&state.status_tx, inst, old_status);
         }
     }
 
@@ -1517,7 +1567,7 @@ pub async fn start_session(
             let mut instances = state.instances.write().await;
             let response = match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) => {
-                    apply_post_restart_sync(inst, &sync_base, &started);
+                    sync_live_after_restart(&state.status_tx, inst, &sync_base, &started);
                     SessionResponse::from_instance(
                         inst,
                         crate::claude_settings::read_tui_fullscreen(),
@@ -1547,9 +1597,13 @@ pub async fn start_session(
             tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                if apply_post_restart_sync(inst, &sync_base, &started) && blocked.is_none() {
+                if sync_live_after_restart(&state.status_tx, inst, &sync_base, &started)
+                    && blocked.is_none()
+                {
+                    let synced_status = inst.status;
                     inst.status = Status::Error;
                     inst.last_error = Some(msg.clone());
+                    publish_status_change(&state.status_tx, inst, synced_status);
                 }
             }
             if let Some(blocked) = blocked {

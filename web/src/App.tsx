@@ -1697,11 +1697,22 @@ function AppContent({
     if (next) handleSelectSession(next);
   }, [attentionJump, activeSessionId, handleSelectSession]);
 
+  const handleFocusSidebar = useCallback(() => {
+    setSidebarOpen(true);
+    requestAnimationFrame(() => {
+      const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+      const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
+      const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
+      target?.focus();
+    });
+  }, []);
+
   useKeyboardShortcuts(
     useCallback(
       () => ({
         onNew: handleNewSession,
         onJumpToAttention: handleJumpToAttention,
+        onFocusSidebar: handleFocusSidebar,
         onNewScratch: handleNewScratch,
         onDiff: () => toggleDiff(),
         // Escape closes local UI surfaces only (dialogs, palette,
@@ -1753,6 +1764,7 @@ function AppContent({
         handleNewSession,
         handleNewScratch,
         handleJumpToAttention,
+        handleFocusSidebar,
       ],
     ),
   );
@@ -2538,6 +2550,11 @@ function AppContent({
         <textarea
           ref={setKeyboardProxyRef}
           data-keyboard-proxy
+          data-session-input={
+            activeSession && !showSettings && (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
+              ? ""
+              : undefined
+          }
           aria-hidden="true"
           tabIndex={-1}
           // Keep the element in the visual viewport. Focusing a zero-size

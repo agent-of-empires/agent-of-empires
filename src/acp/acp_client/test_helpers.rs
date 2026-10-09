@@ -15,6 +15,28 @@ pub(super) fn text_chunk(text: &str, id: Option<&str>) -> SessionUpdate {
     SessionUpdate::AgentMessageChunk(chunk)
 }
 
+/// A `compaction_update` as claude-agent-acp sends it; `extra` adds fields.
+pub(super) fn compaction_update(id: &str, status: &str, extra: serde_json::Value) -> SessionUpdate {
+    let mut v = serde_json::json!({
+        "sessionUpdate": "compaction_update",
+        "compactionId": id,
+        "status": status,
+    });
+    v.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().cloned().unwrap_or_default());
+    serde_json::from_value(v).expect("compaction_update")
+}
+
+pub(super) fn compaction_chunk(id: &str, text: &str) -> SessionUpdate {
+    serde_json::from_value(serde_json::json!({
+        "sessionUpdate": "compaction_summary_chunk",
+        "compactionId": id,
+        "content": {"type": "text", "text": text},
+    }))
+    .expect("compaction_summary_chunk")
+}
+
 /// Build a minimal host (non-sandboxed) `SpawnConfig` for env tests.
 pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
     SpawnConfig {

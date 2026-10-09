@@ -2535,6 +2535,21 @@ impl HomeView {
             return None;
         }
 
+        // Ctrl+L toggles the last-prompt footer. Routed here, after the live-send
+        // relay and every dialog above, and gated on `!is_live_send_capturing()`
+        // with exact modifiers, so a configured `C-l` exit/leader still reaches
+        // the agent and a distinct Ctrl+Alt+L is not consumed.
+        if key.code == KeyCode::Char('l')
+            && key.modifiers == KeyModifiers::CONTROL
+            && !self.is_live_send_capturing()
+        {
+            self.show_last_prompt = !self.show_last_prompt;
+            if !self.show_last_prompt {
+                self.last_prompt_cache = None;
+            }
+            return None;
+        }
+
         // Drain a queued earned-tip pop now that the home view is idle: every
         // overlay-routing block above has returned. Skipped while searching so it can't
         // interrupt a query, and opening it consumes the keystroke. #2262

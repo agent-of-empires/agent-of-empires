@@ -70,6 +70,19 @@ impl<'a> RawObject<'a> {
         anyhow::ensure!(matches.next().is_none(), "duplicate canonical field {name}");
         Ok(value)
     }
+    pub(crate) fn sandbox_enabled(&self) -> Result<bool> {
+        let Some(sandbox) = self.unique("sandbox_info")? else {
+            return Ok(false);
+        };
+        let Some(sandbox) = serde_json::from_str::<Option<&RawValue>>(sandbox.get())? else {
+            return Ok(false);
+        };
+        let sandbox = Self::parse(sandbox)?;
+        match sandbox.unique("enabled")? {
+            Some(enabled) => Ok(serde_json::from_str(enabled.get())?),
+            None => Ok(false),
+        }
+    }
 
     pub(crate) fn values<'b>(&'b self, name: &'b str) -> impl Iterator<Item = &'a RawValue> + 'b {
         self.fields
@@ -334,6 +347,34 @@ impl RawDocument {
             serde_json::from_str(content).context("canonical document is not an array")?
         };
         Ok(Self { rows })
+    }
+    pub(crate) fn render_value_changes(
+        &self,
+        changes: &[(usize, &Value, Value)],
+    ) -> Result<Vec<u8>> {
+        let mut previous = None;
+        for (index, _, _) in changes {
+            anyhow::ensure!(
+                *index < self.rows.len(),
+                "changed raw row is outside document"
+            );
+            anyhow::ensure!(
+                previous.is_none_or(|prior| prior < *index),
+                "changed raw rows must be unique and ordered"
+            );
+            previous = Some(*index);
+        }
+        let mut changes = changes.iter().peekable();
+        let mut emitted = Vec::with_capacity(self.rows.len());
+        for (index, raw) in self.rows.iter().enumerate() {
+            if changes.peek().is_some_and(|change| change.0 == index) {
+                let (_, before, after) = changes.next().expect("peeked raw change");
+                emitted.push(patch(raw, before, after)?);
+            } else {
+                emitted.push(Emission::Original(raw));
+            }
+        }
+        Ok(serde_json::to_vec_pretty(&ArrayEmission(emitted))?)
     }
 
     pub(crate) fn owners(&self, field: &str) -> HashMap<String, OwnerSlot> {

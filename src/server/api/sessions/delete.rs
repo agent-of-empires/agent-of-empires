@@ -20,20 +20,29 @@ pub struct DeleteSessionBody {
     pub keep_scratch: bool,
 }
 
-/// Flip a session out of `Status::Deleting` into `Status::Error` so a
-/// bookkeeping failure after teardown does not strand it greyed-out and
-/// unclickable, the state this detached-task delete exists to prevent.
-async fn mark_delete_error(state: &AppState, id: &str, message: String) {
+/// Publish a failed purge without leaving its polling overlay active.
+pub(super) async fn mark_delete_error(
+    state: &AppState,
+    original: &crate::session::LaunchOrigin,
+    issued: Option<&crate::session::LaunchOrigin>,
+    message: String,
+) {
     let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+    if let Some(inst) = instances.iter_mut().find(|instance| {
+        original.matches_instance(instance)
+            || issued.is_some_and(|scope| scope.matches_instance(instance))
+    }) {
+        let old_status = inst.status;
         inst.status = Status::Error;
         inst.last_error = Some(message);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        publish_status_change(&state.status_tx, inst, old_status);
     }
 }
 
-/// Show a row as `Deleting` for polling clients, returning the status it had.
-/// The overlay is memory-only, so a caller that ends up deleting nothing has to
-/// put that status back rather than leave the row stuck greyed-out.
+/// Publish a temporary overlay owned by the admitted original.
 async fn mark_delete_in_progress(
     state: &AppState,
     original: &crate::session::LaunchOrigin,
@@ -42,7 +51,12 @@ async fn mark_delete_in_progress(
     let inst = instances
         .iter_mut()
         .find(|instance| original.matches_instance(instance))?;
-    Some(std::mem::replace(&mut inst.status, Status::Deleting))
+    let old_status = std::mem::replace(&mut inst.status, Status::Deleting);
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    publish_status_change(&state.status_tx, inst, old_status);
+    Some(old_status)
 }
 
 async fn restore_delete_status(
@@ -56,7 +70,11 @@ async fn restore_delete_status(
         original.matches_instance(instance)
             || issued.is_some_and(|scope| scope.matches_instance(instance))
     }) {
-        inst.status = status;
+        let old_status = std::mem::replace(&mut inst.status, status);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        publish_status_change(&state.status_tx, inst, old_status);
     }
 }
 
@@ -119,6 +137,17 @@ fn purge_session_artifacts(
         if !matches!(outcome, Ok((true, _))) {
             if let Some(status) = previous_status {
                 restore_delete_status(&state, &original, issued.as_deref(), status).await;
+            }
+        }
+        if let Err(refusal) = &outcome {
+            if !refusal.is_retryable() {
+                mark_delete_error(
+                    &state,
+                    &original,
+                    issued.as_deref(),
+                    refusal.message().to_owned(),
+                )
+                .await;
             }
         }
         outcome
@@ -736,9 +765,7 @@ pub async fn delete_session(
                 })),
             ),
             Err(refusal) if refusal.is_retryable() => {
-                // A runner that is still tearing down is a transient conflict,
-                // not a server error: nothing was removed and the overlay is
-                // already back, so the row is not marked failed either.
+                // A refused purge already restored its admitted overlay.
                 (
                     StatusCode::CONFLICT,
                     Json(serde_json::json!({
@@ -749,7 +776,7 @@ pub async fn delete_session(
             }
             Err(refusal) => {
                 let msg = refusal.message().to_string();
-                mark_delete_error(&state, &id, msg.clone()).await;
+
                 tracing::error!(target: "http.api.sessions", "delete failed: {msg}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -981,6 +1008,7 @@ pub(super) async fn purge_workspace_artifacts(
 
         // The overlay is owned by `purge_session_artifacts`; only a fatal
         // refusal has anything left to record on the row.
+
         let recent_entry = crate::session::recent_project_entry_for(&instance);
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
             Ok((removed, mut msgs)) => {
@@ -994,11 +1022,7 @@ pub(super) async fn purge_workspace_artifacts(
             }
             Err(refusal) => {
                 let msg = refusal.message().to_string();
-                // A retryable refusal removed nothing and already put the status
-                // back; marking it failed would be a lie the user has to undo.
-                if !refusal.is_retryable() {
-                    mark_delete_error(state, &id, msg.clone()).await;
-                }
+
                 failed.push(WorkspaceDeleteFailure {
                     id: id.clone(),
                     error: msg,
@@ -1151,6 +1175,73 @@ pub async fn delete_workspace(
 mod tests {
     use super::*;
     use crate::server::test_support::build_test_app_state;
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn purge_overlay_publishes_its_restoration_without_cleanup() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut row = Instance::new("overlay", "/original-metadata-only");
+        row.source_profile = "default".into();
+        row.status = Status::Waiting;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let row = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        let original = crate::session::LaunchOrigin::capture_baseline(&row).unwrap();
+        let state = build_test_app_state(vec![row.clone()]);
+        let mut updates = state.status_tx.subscribe();
+        let epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let previous = mark_delete_in_progress(&state, &original).await.unwrap();
+        assert_eq!(status_of(&state, &row.id).await, Some(Status::Deleting));
+        let applied = updates.try_recv().expect("admitted overlay was published");
+        assert_eq!(
+            (applied.instance_id.as_str(), applied.old, applied.new),
+            (row.id.as_str(), Status::Waiting, Status::Deleting)
+        );
+        restore_delete_status(&state, &original, None, previous).await;
+        assert_eq!(status_of(&state, &row.id).await, Some(Status::Waiting));
+        let restored = updates
+            .try_recv()
+            .expect("overlay restoration was published");
+        assert_eq!(
+            (restored.instance_id.as_str(), restored.old, restored.new),
+            (row.id.as_str(), Status::Deleting, Status::Waiting)
+        );
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            epoch + 2
+        );
+        mark_delete_error(&state, &original, None, "original failure".into()).await;
+        assert_eq!(status_of(&state, &row.id).await, Some(Status::Error));
+        let failed = updates.try_recv().unwrap();
+        assert_eq!((failed.old, failed.new), (Status::Waiting, Status::Error));
+        for changed in 0..3 {
+            let mut replacement = row.clone();
+            match changed {
+                0 => replacement.created_at += chrono::Duration::seconds(1),
+                1 => replacement.lifecycle_generation += 1,
+                _ => replacement.project_path = "/replacement".into(),
+            }
+            state.instances.write().await[0] = replacement;
+            mark_delete_error(&state, &original, None, "must not reach replacement".into()).await;
+            assert_eq!(status_of(&state, &row.id).await, Some(Status::Waiting));
+            assert!(matches!(
+                updates.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                state
+                    .mutation_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                epoch + 3
+            );
+        }
+    }
 
     async fn status_of(state: &AppState, id: &str) -> Option<Status> {
         state

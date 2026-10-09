@@ -900,24 +900,236 @@ fn retain_legacy_original_with(
     Ok(Retained::Original(destination))
 }
 
-fn read_registries(app: &Path) -> Result<Vec<(PathBuf, Value)>> {
-    let mut registries = Vec::new();
-    for path in layout::registry_paths(app)? {
-        match serde_json::from_slice(&fs::read(&path)?) {
-            Ok(value) => registries.push((path, value)),
-            // A registry AoE cannot parse is a pre-existing anomaly it cannot
-            // reason about; skipping it with a warning keeps one corrupt file
-            // from bricking every launch and migration, matching the reuse path
-            // that already tolerates a failed reload.
-            Err(error) => tracing::warn!(
-                target: "session.store",
-                registry = %path.display(),
-                error = %error,
-                "skipping unparseable session registry",
-            ),
+struct Registry {
+    raw: crate::session::raw_document::RawDocument,
+    value: Value,
+    owners: std::collections::HashMap<String, crate::session::raw_document::OwnerSlot>,
+    sandbox_rows: Vec<usize>,
+}
+
+impl Registry {
+    fn read(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)?;
+        let raw = crate::session::raw_document::RawDocument::parse(std::str::from_utf8(&bytes)?)?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        let rows = value
+            .as_array()
+            .context("session registry must be an array")?;
+        anyhow::ensure!(
+            rows.len() == raw.rows.len(),
+            "registry projection differs from raw rows"
+        );
+        let owners = raw.owners("id");
+        let mut sandbox_rows = Vec::new();
+        for (index, raw_row) in raw.rows.iter().enumerate() {
+            let object = crate::session::raw_document::RawObject::parse(raw_row)?;
+            if object.sandbox_enabled()? {
+                validate_content_row(&object, &rows[index])?;
+                let id = rows[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("sandbox owner has no id")?;
+                let slot = owners
+                    .get(id)
+                    .context("sandbox owner disappeared from raw inventory")?;
+                anyhow::ensure!(
+                    slot.count == 1 && !slot.ambiguous && slot.index == index,
+                    "ambiguous content owner {id}"
+                );
+                sandbox_rows.push(index);
+            }
+        }
+        Ok(Self {
+            raw,
+            value,
+            owners,
+            sandbox_rows,
+        })
+    }
+
+    fn rows(&self) -> &[Value] {
+        self.value.as_array().expect("validated registry array")
+    }
+
+    fn selected(&self, id: &str) -> Result<Option<usize>> {
+        let Some(slot) = self.owners.get(id) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            slot.count == 1 && !slot.ambiguous,
+            "ambiguous content owner {id}"
+        );
+        if self.sandbox_rows.binary_search(&slot.index).is_err() {
+            let object =
+                crate::session::raw_document::RawObject::parse(&self.raw.rows[slot.index])?;
+            validate_content_row(&object, &self.rows()[slot.index])?;
+        }
+        Ok(Some(slot.index))
+    }
+
+    fn reset(&mut self, index: usize, receipt: &Receipt) -> Result<Option<Vec<u8>>> {
+        let row = &mut self.value.as_array_mut().expect("validated registry array")[index];
+        let before = reset_metadata(row);
+        reset_row(row, receipt)?;
+        let after = reset_metadata(row);
+        if before == after {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.raw.render_value_changes(&[(index, &before, after)])?,
+        ))
+    }
+}
+
+fn reset_metadata(row: &Value) -> Value {
+    Value::Object(
+        [
+            "sandbox_content_policy",
+            "sandbox_content_resets",
+            "agent_session_id",
+            "agent_session_binding",
+            "pi_session_path",
+            "resume_binding",
+            "resume_intent",
+            "capture_started_at",
+            "prior_tool_session_ids",
+            "omp_capture_generation",
+        ]
+        .into_iter()
+        .filter_map(|field| {
+            row.get(field)
+                .map(|value| (field.to_owned(), value.clone()))
+        })
+        .collect(),
+    )
+}
+
+fn validate_content_row(
+    object: &crate::session::raw_document::RawObject<'_>,
+    value: &Value,
+) -> Result<()> {
+    for field in [
+        "id",
+        "tool",
+        "command",
+        "extra_args",
+        "detect_as",
+        "sandbox_info",
+        "sandbox_store_generation",
+        "project_path",
+        "workspace_info",
+        "prior_tool_session_ids",
+        "sandbox_content_resets",
+        "sandbox_content_policy",
+        "agent_session_id",
+        "agent_session_binding",
+        "resume_intent",
+        "resume_binding",
+        "pi_session_path",
+        "acp_session_id",
+        "fork_pending",
+        "import_pending",
+        "capture_started_at",
+        "omp_capture_generation",
+    ] {
+        object.unique(field)?;
+    }
+    let id: String = serde_json::from_str(
+        object
+            .unique("id")?
+            .context("content owner has no id")?
+            .get(),
+    )?;
+    crate::session::validate_instance_id(&id)?;
+    for field in [
+        "tool",
+        "command",
+        "agent_session_id",
+        "pi_session_path",
+        "acp_session_id",
+        "fork_pending",
+    ] {
+        if let Some(value) = object.unique(field)? {
+            let _: Option<String> = serde_json::from_str(value.get())?;
         }
     }
-    Ok(registries)
+    if let Some(sandbox) = object
+        .unique("sandbox_info")?
+        .filter(|value| value.get() != "null")
+    {
+        let sandbox = crate::session::raw_document::RawObject::parse(sandbox)?;
+        sandbox.unique("enabled")?;
+        if let Some(workdir) = sandbox.unique("container_workdir")? {
+            let _: Option<String> = serde_json::from_str(workdir.get())?;
+        }
+    }
+    for field in ["agent_session_binding", "resume_binding"] {
+        if let Some(binding) = object.unique(field)? {
+            let _: Option<crate::session::ConversationBinding> =
+                serde_json::from_str(binding.get())?;
+        }
+    }
+    if let Some(intent) = object
+        .unique("resume_intent")?
+        .filter(|value| value.get() != "null")
+    {
+        let intent_object = crate::session::raw_document::RawObject::parse(intent)?;
+        for field in ["kind", "value", "from"] {
+            intent_object.unique(field)?;
+        }
+        let _: crate::session::ResumeIntent = serde_json::from_str(intent.get())?;
+    }
+    if let Some(workspace) = object.unique("workspace_info")? {
+        let _: Option<crate::session::WorkspaceInfo> = serde_json::from_str(workspace.get())?;
+    }
+    if let Some(prior) = object
+        .unique("prior_tool_session_ids")?
+        .filter(|value| value.get() != "null")
+    {
+        let prior_object = crate::session::raw_document::RawObject::parse(prior)?;
+        let tools = value
+            .get("prior_tool_session_ids")
+            .and_then(Value::as_object)
+            .context("prior tool inventory must be an object")?;
+        for tool in tools.keys() {
+            let slot = crate::session::raw_document::RawObject::parse(
+                prior_object.unique(tool)?.context("missing prior tool")?,
+            )?;
+            for field in ["agent_session_id", "acp_session_id"] {
+                if let Some(value) = slot.unique(field)? {
+                    let _: Option<String> = serde_json::from_str(value.get())?;
+                }
+            }
+            if let Some(binding) = slot.unique("agent_session_binding")? {
+                let _: Option<crate::session::ConversationBinding> =
+                    serde_json::from_str(binding.get())?;
+            }
+        }
+    }
+    if let Some(resets) = object.unique("sandbox_content_resets")? {
+        let resets: Vec<&serde_json::value::RawValue> = serde_json::from_str(resets.get())?;
+        for reset in resets {
+            let reset = crate::session::raw_document::RawObject::parse(reset)?;
+            for field in ["slot", "transaction", "tool"] {
+                if let Some(value) = reset.unique(field)? {
+                    let _: Option<String> = serde_json::from_str(value.get())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_registries(app: &Path) -> Result<Vec<(PathBuf, Registry)>> {
+    layout::registry_paths(app)?
+        .into_iter()
+        .map(|path| {
+            let registry = Registry::read(&path).with_context(|| {
+                format!("cannot inventory content owners in {}", path.display())
+            })?;
+            Ok((path, registry))
+        })
+        .collect()
 }
 
 fn lock_registries(app: &Path) -> Result<Vec<crate::session::StorageFlock>> {
@@ -928,20 +1140,24 @@ fn lock_registries(app: &Path) -> Result<Vec<crate::session::StorageFlock>> {
     layout::lock_registry_dirs(&directories.into_iter().collect::<Vec<_>>())
 }
 
-fn write_registry(path: &Path, value: &Value) -> Result<()> {
-    crate::session::atomic_write(path, &serde_json::to_vec_pretty(value)?)?;
+fn write_registry(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::session::atomic_write(path, bytes)?;
     fs::File::open(path.parent().context("registry has no parent")?)?.sync_all()?;
     Ok(())
 }
 
 fn read_row(path: &Path, id: &str) -> Result<Option<Value>> {
-    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
-    Ok(value
-        .as_array()
-        .context("session registry must be an array")?
-        .iter()
-        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
-        .cloned())
+    let mut registry = Registry::read(path)?;
+    let Some(index) = registry.selected(id)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        registry
+            .value
+            .as_array_mut()
+            .expect("validated registry array")
+            .swap_remove(index),
+    ))
 }
 
 fn row_tools(row: &Value) -> BTreeSet<String> {
@@ -1234,17 +1450,8 @@ fn recovery_exposure(
     for (path, registry) in read_registries(app)? {
         let profile = layout::profile_for_registry(app, &path);
         let config = crate::session::config::profile_config::resolve_config(&profile)?;
-        for row in registry
-            .as_array()
-            .context("session registry must be an array")?
-        {
-            if row
-                .pointer("/sandbox_info/enabled")
-                .and_then(Value::as_bool)
-                != Some(true)
-            {
-                continue;
-            }
+        for &index in &registry.sandbox_rows {
+            let row = &registry.rows()[index];
             let id = row
                 .get("id")
                 .and_then(Value::as_str)
@@ -1929,15 +2136,11 @@ fn record_reset_in(
     config: &crate::session::Config,
     roots: &[ContentRoot],
 ) -> Result<()> {
-    let mut fresh: Value = serde_json::from_slice(&fs::read(registry)?)?;
-    let Some(current) = fresh
-        .as_array_mut()
-        .context("session registry must be an array")?
-        .iter_mut()
-        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
-    else {
+    let mut fresh = Registry::read(registry)?;
+    let Some(index) = fresh.selected(id)? else {
         return Ok(());
     };
+    let current = &fresh.rows()[index];
     let mut current_roots = row_roots(current, tool, home, config)?;
     container_config::expand_content_roles(&mut current_roots, home, &config.session)?;
     // The reset is per transaction, and `reset_row` already answers for this
@@ -1952,10 +2155,8 @@ fn record_reset_in(
     let Some(receipt) = retired_receipt(app, id, tool, current, &current_roots)? else {
         return Ok(());
     };
-    let before = current.clone();
-    reset_row(current, &receipt)?;
-    if *current != before {
-        write_registry(registry, &fresh)?;
+    if let Some(bytes) = fresh.reset(index, &receipt)? {
+        write_registry(registry, &bytes)?;
     }
     Ok(())
 }
@@ -2235,16 +2436,12 @@ fn migrate_target_with_workspace(
     transition = Some(crate::session::acquire_storage_flock(app, layout::LOCK)?);
     registries = Some(lock_registries(app)?);
     let fresh_config = crate::session::config::profile_config::resolve_config(&profile)?;
-    let mut fresh: Value = serde_json::from_slice(&fs::read(registry)?)?;
-    let Some(current) = fresh
-        .as_array_mut()
-        .context("session registry must be an array")?
-        .iter_mut()
-        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
-    else {
+    let mut fresh = Registry::read(registry)?;
+    let Some(index) = fresh.selected(id)? else {
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     };
+    let current = &fresh.rows()[index];
     let mut current_roots = row_roots(current, tool, home, &fresh_config)?;
     container_config::expand_content_roles(&mut current_roots, home, &fresh_config.session)?;
     if current_roots != roots
@@ -2272,6 +2469,10 @@ fn migrate_target_with_workspace(
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
+    if receipt.phase == Phase::Staged {
+        record_retirement(&mut receipt, current, home, &fresh_config)?;
+    }
+    let bytes = fresh.reset(index, &receipt)?;
     layout::refresh_liveness();
     if running(id)? || detached_writer_live(app, id)? || !reap(id)? {
         progress::notice(format!(
@@ -2287,13 +2488,14 @@ fn migrate_target_with_workspace(
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
+
     if receipt.phase == Phase::Staged {
-        record_retirement(&mut receipt, current, home, &fresh_config)?;
         write_receipt(&path, &receipt)?;
     }
     publish_receipt(&mut receipt, &path)?;
-    reset_row(current, &receipt)?;
-    write_registry(registry, &fresh)?;
+    if let Some(bytes) = bytes {
+        write_registry(registry, &bytes)?;
+    }
     receipt.phase = Phase::Committed;
     write_receipt(&path, &receipt)?;
     certify_receipt(app, &receipt)?;
@@ -2336,17 +2538,8 @@ fn reconcile_in_with_workspace(
 ) -> Result<()> {
     let mut targets = BTreeMap::new();
     for (path, registry) in read_registries(app)? {
-        for row in registry
-            .as_array()
-            .context("session registry must be an array")?
-        {
-            if row
-                .pointer("/sandbox_info/enabled")
-                .and_then(Value::as_bool)
-                != Some(true)
-            {
-                continue;
-            }
+        for &index in &registry.sandbox_rows {
+            let row = &registry.rows()[index];
             let id = row
                 .get("id")
                 .and_then(Value::as_str)
@@ -2668,6 +2861,81 @@ pub(crate) fn guard_preparation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn content_metadata_checkpoint_preserves_raw_owners() -> Result<()> {
+        use crate::session::raw_document::{RawDocument, RawObject};
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("sessions.json");
+        let journal = r#"{"coverage":"unknown","launches":[{"partial_native":{"same":1,"same":2,"number":1.2300e+02,"escaped":"\u0061"}}]}"#;
+        let owner = format!(
+            r#"{{"id":"e17a000000000041","tool":"gemini","sandbox_content_policy":0,"runner_journal":{journal},"extension":{{"x":1,"x":2,"number":1e400}}}}"#
+        );
+        let peer = format!(r#"{{"id":"e17a000000000042","runner_journal":{journal}}}"#);
+        let frozen = r#"{"id":"frozen-left","id":"frozen-right","sandbox_info":{"enabled":false},"opaque":{"x":1,"x":2,"number":-0}}"#;
+        fs::write(&path, format!("[{owner},{peer},{frozen}]"))?;
+        let receipt = Receipt {
+            policy: CONTENT_POLICY,
+            instance: "e17a000000000041".into(),
+            tool: "gemini".into(),
+            transaction: "metadata-only".into(),
+            roots: Vec::new(),
+            phase: Phase::Committed,
+            retired_identity: Value::Null,
+            retired_tools: BTreeMap::new(),
+        };
+        let mut fresh = Registry::read(&path)?;
+        let index = fresh.selected(&receipt.instance)?.unwrap();
+        let bytes = fresh.reset(index, &receipt)?.unwrap();
+        write_registry(&path, &bytes)?;
+        let mut unchanged = Registry::read(&path)?;
+        let index = unchanged.selected(&receipt.instance)?.unwrap();
+        assert!(unchanged.reset(index, &receipt)?.is_none());
+        assert_eq!(fs::read(&path)?, bytes);
+        let bytes = fs::read(&path)?;
+        let document = RawDocument::parse(std::str::from_utf8(&bytes)?)?;
+        let selected = RawObject::parse(&document.rows[0])?;
+        assert_eq!(selected.unique("runner_journal")?.unwrap().get(), journal);
+        assert_eq!(
+            selected.unique("extension")?.unwrap().get(),
+            r#"{"x":1,"x":2,"number":1e400}"#
+        );
+        assert_eq!(document.rows[1].get(), peer);
+        assert_eq!(document.rows[2].get(), frozen);
+        assert_eq!(
+            serde_json::from_str::<u8>(selected.unique("sandbox_content_policy")?.unwrap().get())?,
+            CONTENT_POLICY
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_content_claims_refuse_without_checkpoint() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("sessions.json");
+        let id = "e17a000000000061";
+        for rows in [
+            format!(r#"[{{"id":"{id}","id":"e17a000000000062"}}]"#),
+            format!(r#"[{{"id":"{id}"}},{{"id":"{id}"}}]"#),
+            format!(r#"[{{"id":"{id}","sandbox_info":{{"enabled":true,"enabled":false}}}}]"#),
+            format!(
+                r#"[{{"id":"{id}","prior_tool_session_ids":{{"gemini":{{}},"gemini":{{}}}}}}]"#
+            ),
+            format!(r#"[{{"id":"{id}","sandbox_content_resets":[{{"slot":"a","slot":"b"}}]}}]"#),
+            format!(
+                r#"[{{"id":"{id}","resume_intent":{{"kind":"Use","value":"left","value":"right"}}}}]"#
+            ),
+            format!(
+                r#"[{{"id":"{id}","resume_intent":{{"kind":"Cleared","from":"left","from":"right"}}}}]"#
+            ),
+        ] {
+            fs::write(&path, &rows)?;
+            let admitted = Registry::read(&path).and_then(|registry| registry.selected(id));
+            assert!(admitted.is_err());
+            assert_eq!(fs::read(&path)?, rows.as_bytes());
+        }
+        Ok(())
+    }
 
     fn prepare_context_in_store(
         storage: &crate::session::Storage,

@@ -693,6 +693,7 @@ async fn wait_until_left_starting_resolves_on_broadcast() {
         .send(crate::server::push::StatusChange {
             instance_id: "wait-resolves".to_string(),
             instance_title: "starting".to_string(),
+            effective_profile: "default".to_string(),
             old: Status::Starting,
             new: Status::Waiting,
             at: chrono::Utc::now(),
@@ -2023,6 +2024,31 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
 
 #[test]
 #[serial_test::serial]
+fn sync_live_after_restart_publishes_the_status_move_it_makes() {
+    // The tmux restart, ensure and send paths sync the live row through this wrapper, and
+    // none of them runs without tmux, so the wrapper carries the publish contract.
+    let mut live = make_test_instance();
+    live.status = Status::Stopped;
+    let before = live.clone();
+    let mut started = make_test_instance();
+    started.status = Status::Starting;
+    let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+
+    assert!(sync_live_after_restart(&tx, &mut live, &before, &started));
+
+    let change = rx.try_recv().expect("the status move is published");
+    assert_eq!(
+        (change.old, change.new),
+        (Status::Stopped, Status::Starting)
+    );
+    assert!(rx.try_recv().is_err(), "exactly one move");
+
+    // A sync that moves nothing publishes nothing.
+    assert!(sync_live_after_restart(&tx, &mut live, &before, &started));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn apply_post_restart_sync_propagates_agent_session_id() {
     // The rapid double-restart case: in-memory state is stale because the 2s
     // poller has not refreshed, while the just-finished restart produced a
@@ -2752,6 +2778,263 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
             .await
             .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
     }
+}
+
+/// What an opted-in plugin worker receives: the real forwarder runs over `status_tx`, so a test
+/// sees exactly what a plugin would, including transitions no producer published. Subscribe
+/// before calling the handler under test.
+struct PluginStatusFeed {
+    rx: tokio::sync::mpsc::Receiver<String>,
+    _host: std::sync::Arc<crate::plugin::host::PluginHost>,
+    _dir: tempfile::TempDir,
+}
+
+impl PluginStatusFeed {
+    async fn attach(state: &std::sync::Arc<crate::server::AppState>, profile: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let host = crate::plugin::host::PluginHost::new(dir.path(), profile, None).unwrap();
+        let rx = host.register_test_worker("acme.watcher", Some(16)).await;
+        tokio::spawn(crate::server::plugin_status::run_forwarder(
+            state.status_tx.subscribe(),
+            host.clone(),
+            state.shutdown.clone(),
+        ));
+        Self {
+            rx,
+            _host: host,
+            _dir: dir,
+        }
+    }
+
+    /// The next `(session, from, to)` the worker was notified of.
+    async fn next_of_session(&mut self) -> (String, String, String) {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), self.rx.recv())
+            .await
+            .expect("the plugin was never notified of the transition")
+            .expect("worker queue closed");
+        let msg: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        (
+            msg["params"]["session_id"].as_str().unwrap().to_string(),
+            msg["params"]["from"].as_str().unwrap().to_string(),
+            msg["params"]["to"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// The next `(from, to)` the worker was notified of.
+    async fn next(&mut self) -> (String, String) {
+        let (_, from, to) = self.next_of_session().await;
+        (from, to)
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn archive_metadata_ack_preserves_idle_and_rejects_replaced_cache() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("archive-metadata-only", "/original-metadata-only");
+    row.source_profile = "default".into();
+    row.status = Status::Running;
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row]);
+    let storage = crate::session::Storage::open_unwatched("default").unwrap();
+    let before = storage.load().unwrap().remove(0);
+    let original = crate::session::LaunchOrigin::capture_baseline(&before).unwrap();
+    let emitted = storage
+        .update_metadata(
+            crate::session::MetadataSelection::Session(before.id.as_str().into()),
+            |rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| original.matches_instance(row))
+                    .unwrap();
+                row.archive();
+                Ok(row.clone())
+            },
+        )
+        .unwrap();
+    let acknowledged = crate::session::LaunchOrigin::capture_baseline(&emitted).unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![before.clone()]);
+    let mut events = state.status_tx.subscribe();
+    let epoch = state
+        .mutation_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    super::lifecycle::publish_archive_update(
+        &state,
+        &original,
+        None,
+        before.lifecycle_generation,
+        &acknowledged,
+        emitted.clone(),
+    )
+    .await
+    .unwrap();
+    let cached = state.instances.read().await[0].clone();
+    assert_eq!(cached.status, Status::Idle);
+    assert!(cached.is_archived());
+    let event = events.try_recv().unwrap();
+    assert_eq!((event.old, event.new), (Status::Running, Status::Idle));
+    assert_eq!(
+        state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst),
+        epoch + 1
+    );
+    for changed in 0..3 {
+        let mut replacement = before.clone();
+        match changed {
+            0 => replacement.created_at += chrono::Duration::seconds(1),
+            1 => replacement.lifecycle_generation += 1,
+            _ => replacement.project_path = "/replacement".into(),
+        }
+        state.instances.write().await[0] = replacement.clone();
+        let bytes = std::fs::read(storage.sessions_path()).unwrap();
+        assert!(super::lifecycle::publish_archive_update(
+            &state,
+            &original,
+            None,
+            before.lifecycle_generation,
+            &acknowledged,
+            emitted.clone()
+        )
+        .await
+        .is_none());
+        let kept = state.instances.read().await[0].clone();
+        assert_eq!(kept.created_at, replacement.created_at);
+        assert_eq!(kept.lifecycle_generation, replacement.lifecycle_generation);
+        assert_eq!(kept.project_path, replacement.project_path);
+        assert_eq!(kept.status, Status::Running);
+        assert!(!kept.is_archived());
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            epoch + 1
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+    }
+}
+
+/// Archiving emits the durable Running-to-Idle transition, not an unchanged Idle status.
+#[tokio::test]
+async fn archive_session_notifies_plugins_of_the_idle_it_settles_to() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut running = make_test_instance();
+    running.source_profile = "default".to_string();
+    let mut idle = make_test_instance();
+    idle.source_profile = "default".to_string();
+    idle.status = Status::Idle;
+    let (running_id, idle_id) = (running.id.clone(), idle.id.clone());
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        "default",
+        vec![idle.clone(), running.clone()],
+    );
+    let state = crate::server::test_support::build_test_app_state(vec![idle, running]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+    let archive = |id: String| {
+        let state = std::sync::Arc::clone(&state);
+        async move {
+            update_session_archive(
+                State(state),
+                Path(id),
+                Ok(Json(UpdateArchiveBody {
+                    archived: true,
+                    kill_pane: false,
+                })),
+            )
+            .await
+            .into_response()
+            .status()
+        }
+    };
+
+    assert_eq!(archive(idle_id).await, StatusCode::OK);
+    assert_eq!(archive(running_id.clone()).await, StatusCode::OK);
+
+    assert_eq!(
+        feed.next_of_session().await,
+        (running_id, "Running".into(), "Idle".into())
+    );
+}
+
+/// A durable Stop publishes its transition before polling observes the new status.
+#[tokio::test]
+async fn stop_session_notifies_plugins() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = make_test_instance();
+    inst.view = crate::session::View::Structured;
+    inst.source_profile = "default".to_string();
+    let id = inst.id.clone();
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+
+    let response = stop_session(State(std::sync::Arc::clone(&state)), Path(id))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(feed.next().await, ("Running".into(), "Stopped".into()));
+}
+
+/// The same gap for the explicit structured start, which flips the live row to `Idle`.
+#[tokio::test]
+async fn start_session_notifies_plugins() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = Instance::new("start-notify", "/tmp/aoe-start-notify");
+    inst.view = crate::session::View::Structured;
+    inst.source_profile = "default".to_string();
+    inst.status = Status::Stopped;
+    let id = inst.id.clone();
+    Storage::new_unwatched("default")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+
+    start_session(State(std::sync::Arc::clone(&state)), Path(id)).await;
+
+    assert_eq!(feed.next().await, ("Stopped".into(), "Idle".into()));
+}
+
+/// Marking a session `Deleting` is a live-row write too.
+#[tokio::test]
+async fn delete_session_notifies_plugins_that_the_session_is_deleting() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = delete_race_state("sess-delete-notify");
+    let mut feed =
+        PluginStatusFeed::attach(&state, &crate::session::config::effective_profile("")).await;
+
+    delete_session(
+        State(std::sync::Arc::clone(&state)),
+        Path("sess-delete-notify".to_string()),
+        Some(Json(DeleteSessionBody::default())),
+    )
+    .await;
+
+    assert_eq!(feed.next().await, ("Idle".into(), "Deleting".into()));
+}
+
+/// A delete whose bookkeeping fails flips `Deleting` to `Error`; that move is published too.
+#[tokio::test]
+async fn failed_delete_notifies_plugins_of_the_error() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = delete_race_state("sess-delete-error");
+    state.instances.write().await[0].status = Status::Deleting;
+    let mut feed =
+        PluginStatusFeed::attach(&state, &crate::session::config::effective_profile("")).await;
+
+    let original =
+        crate::session::LaunchOrigin::capture_baseline(&state.instances.read().await[0]).unwrap();
+    super::delete::mark_delete_error(&state, &original, None, "boom".to_string()).await;
+
+    assert_eq!(feed.next().await, ("Deleting".into(), "Error".into()));
 }
 
 #[tokio::test]

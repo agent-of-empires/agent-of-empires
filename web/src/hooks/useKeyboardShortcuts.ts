@@ -7,11 +7,15 @@ export type { ShortcutActions };
 export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
+      const target = e.target instanceof Element ? e.target : null;
       const isInput =
-        !!target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+        target instanceof HTMLElement &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
 
-      const matched = matchShortcut(e, { mac: IS_MAC, isInput });
+      const isSessionInput = !!target?.closest(
+        '[data-term="agent"], [data-term="paired"], [data-session-composer], [data-keyboard-proxy][data-session-input]',
+      );
+      const matched = matchShortcut(e, { mac: IS_MAC, isInput, isSessionInput });
       if (!matched) return;
 
       if (matched.preventDefault) e.preventDefault();

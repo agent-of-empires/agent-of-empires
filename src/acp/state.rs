@@ -157,6 +157,14 @@ pub struct SessionNotice {
     pub description: Option<String>,
 }
 
+/// A keyed notice keeps one id across updates; others are minted from the seq.
+pub fn notice_id(key: Option<&str>, seq: u64) -> String {
+    match key {
+        Some(key) => format!("notice-{key}"),
+        None => format!("notice-{seq}"),
+    }
+}
+
 /// Snapshot of the most recent ACP agent handoff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSwitchInfo {
@@ -568,6 +576,9 @@ pub enum Event {
         title: String,
         #[serde(default)]
         description: Option<String>,
+        /// A later notice with the same key replaces this one in place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     /// Auto-resume breadcrumb; `manual` when the user pressed RESUME NOW.
     RateLimitAutoResumed {
@@ -740,6 +751,13 @@ pub enum Event {
     ConversationCompactionStarted,
     /// `/compact` replaced the model's context with a summary.
     ConversationCompacted,
+    /// The summary the agent retained when compacting, after its
+    /// `ConversationCompacted`. A later one for the same compaction replaces
+    /// it; empty `text` clears it.
+    ConversationCompactionSummary {
+        compaction_id: String,
+        text: String,
+    },
     AgentSwitched {
         from: String,
         to: String,
@@ -860,13 +878,18 @@ impl AcpState {
                 severity,
                 title,
                 description,
+                key,
             } => {
-                self.session_notices.push(SessionNotice {
-                    id: format!("notice-{seq}"),
+                let notice = SessionNotice {
+                    id: notice_id(key.as_deref(), seq),
                     severity,
                     title,
                     description,
-                });
+                };
+                match self.session_notices.iter_mut().find(|n| n.id == notice.id) {
+                    Some(existing) => *existing = notice,
+                    None => self.session_notices.push(notice),
+                }
                 let excess = self
                     .session_notices
                     .len()
@@ -1016,6 +1039,7 @@ impl AcpState {
             | Event::RawAgentUpdate { .. }
             | Event::AgentMessageChunk { .. }
             | Event::ConversationSummary { .. }
+            | Event::ConversationCompactionSummary { .. }
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. } => {}
         }
@@ -1185,7 +1209,31 @@ mod tests {
             severity: "warning".into(),
             title: title.into(),
             description: None,
+            key: None,
         }
+    }
+
+    #[test]
+    fn keyed_session_notice_replaces_in_place() {
+        let keyed = |description: &str| Event::SessionNotice {
+            severity: "error".into(),
+            title: "Compaction failed".into(),
+            description: Some(description.into()),
+            key: Some("compaction-a".into()),
+        };
+        let s = applied([keyed("aborted"), notice("other"), keyed("out of tokens")]);
+        let got: Vec<(&str, Option<&str>)> = s
+            .session_notices
+            .iter()
+            .map(|n| (n.id.as_str(), n.description.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("notice-compaction-a", Some("out of tokens")),
+                ("notice-2", None)
+            ]
+        );
     }
 
     /// #4242: notices are live advisories, so they are capped and retired on

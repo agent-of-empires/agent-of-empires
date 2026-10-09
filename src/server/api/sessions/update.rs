@@ -155,22 +155,6 @@ where
     persist_with(profile, label, file_watch, None, selection, mutate).await
 }
 
-/// [`persist_session_update`] holding session `id`'s lifecycle lock across the write, which
-/// `aoe send` also holds while it types into a live pane.
-pub(crate) async fn persist_session_update_locked<F>(
-    profile: String,
-    label: &'static str,
-    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
-    id: String,
-    selection: crate::session::MetadataSelection<'static>,
-    mutate: F,
-) -> Result<(), ()>
-where
-    F: FnOnce(&mut Vec<Instance>) + Send + 'static,
-{
-    persist_with(profile, label, file_watch, Some(id), selection, mutate).await
-}
-
 async fn persist_with<F>(
     profile: String,
     label: &'static str,

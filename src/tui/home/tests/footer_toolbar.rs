@@ -129,11 +129,10 @@ fn strict_mode_buttons_carry_shifted_chords() {
     );
 }
 
-/// The footer is replaced by the live-send banner, so it exposes no
-/// clickable buttons while live mode owns the status bar.
+/// Live mode replaces footer buttons with the configured chord hints.
 #[test]
 #[serial]
-fn no_buttons_during_live_send() {
+fn live_send_banner_names_space_chords_and_hides_buttons() {
     let mut env = create_test_env_with_sessions(3);
     render_at(&mut env, 120, 12);
     assert!(!env.view.footer_buttons.is_empty());
@@ -149,15 +148,19 @@ fn no_buttons_during_live_send() {
         title: "s".to_string(),
         tmux_name: "fake".to_string(),
         target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: crate::tui::home::live_send::parse_chord_list(
-            crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
-        ),
-        leader: None,
+        exit_chords: crate::tui::home::live_send::parse_chord_list("M-Space,C-q"),
+        leader: crate::tui::home::live_send::parse_chord("C-Space"),
     });
-    render_at(&mut env, 120, 12);
+    let screen = render_home_to_string(&mut env.view, 120, 12);
+    assert!(screen.contains("Alt+Space / Ctrl+Q to exit"), "{screen}");
+    assert!(screen.contains("Ctrl+Space menu"), "{screen}");
     assert!(
         env.view.footer_buttons.is_empty(),
         "live-send banner replaces the footer toolbar"
     );
     assert_eq!(env.view.footer_button_at(0, 11), None);
+
+    env.view.live_send_pending_leader = true;
+    let screen = render_home_to_string(&mut env.view, 120, 12);
+    assert!(screen.contains("Ctrl+Space:"), "{screen}");
 }

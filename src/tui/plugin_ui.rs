@@ -277,6 +277,15 @@ fn block_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>
             )],
             None => vec![],
         },
+        // The TUI cannot render rich markdown: show the source, markers kept.
+        Some("markdown") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_end()
+            .lines()
+            .map(|l| indented_line(indent, l.to_string(), tone_style(block_tone(block), theme)))
+            .collect(),
         Some("divider") => vec![indented_line(
             indent,
             "─".repeat(DIVIDER_WIDTH),
@@ -967,6 +976,14 @@ mod tests {
                     &divider,
                     "[action] Refresh",
                 ],
+            ),
+            (
+                "markdown keeps its source markers, one line per source line",
+                pane_entry(json!({"blocks": [
+                    {"kind": "markdown", "text": "# Title\n\n- [x] done\n- `code`\n\n", "tone": "info"},
+                    {"kind": "markdown"}
+                ]})),
+                vec!["p", "# Title", "", "- [x] done", "- `code`"],
             ),
             (
                 "nested section indents",

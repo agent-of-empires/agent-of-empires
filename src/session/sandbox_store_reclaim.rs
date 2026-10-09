@@ -35,7 +35,6 @@ use crate::migrations::v027_isolate_sandbox_stores as v027;
 use crate::migrations::v033_isolate_sandbox_content as content;
 use crate::session::anchored_fs::AnchoredDir;
 use anyhow::{bail, Context, Result};
-use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -281,14 +280,10 @@ fn guard(app_dir: &Path) -> Result<Vec<crate::session::StorageFlock>> {
 /// Serialises reclaim passes so two do not race to remove the same store.
 const RECLAIM_LOCK: &str = ".sandbox-reclaim.lock";
 
-/// The store ids every profile's registry claims.
-///
-/// Fails rather than answering short. A missing registry file is a profile
-/// with no sessions; a registry that exists but cannot be read, parsed, or
-/// understood is a profile whose sessions we cannot see, and treating its
-/// stores as unowned would delete them.
+/// Every ID occurrence claims its store, including ambiguous raw owners.
+/// An unreadable row refuses the inventory; it cannot authorize reclaim.
 fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
-    let mut paths = registry_paths(app_dir)?;
+    let mut paths = v027::registry_paths(app_dir)?;
     if paths.is_empty() {
         bail!(
             "no session registry under {}; refusing to treat every agent store as unowned",
@@ -296,7 +291,7 @@ fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
         );
     }
     for dir in also {
-        paths.extend(registry_paths(dir)?);
+        paths.extend(v027::registry_paths(dir)?);
     }
     let mut ids = BTreeSet::new();
     for namespace in std::iter::once(app_dir).chain(also.iter().map(PathBuf::as_path)) {
@@ -306,95 +301,23 @@ fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
     }
     for path in paths {
         let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let value: Value = serde_json::from_slice(&bytes)
+        let rows: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
-        let rows = value
-            .as_array()
-            .with_context(|| format!("{} is not a session array", path.display()))?;
         for row in rows {
-            let id = row
-                .get("id")
-                .and_then(Value::as_str)
-                .with_context(|| format!("session row without an id in {}", path.display()))?;
-            ids.insert(id.to_string());
+            let object = crate::session::raw_document::RawObject::parse(row)
+                .with_context(|| format!("reading session owner in {}", path.display()))?;
+            let mut found = false;
+            for raw_id in object.values("id") {
+                let id: String = serde_json::from_str(raw_id.get()).with_context(|| {
+                    format!("session row without a string id in {}", path.display())
+                })?;
+                ids.insert(id);
+                found = true;
+            }
+            anyhow::ensure!(found, "session row without an id in {}", path.display());
         }
     }
     Ok(ids)
-}
-
-/// Every profile's registry, plus the default one. A `sessions.json` that is
-/// present but not a regular file is a registry we cannot read, so it fails
-/// the pass rather than being skipped.
-fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut dirs = vec![app_dir.to_path_buf()];
-    let profiles = app_dir.join("profiles");
-    match fs::read_dir(&profiles) {
-        Ok(entries) => {
-            for entry in entries {
-                let path = entry?.path();
-                // Resolved, not `DirEntry::file_type`, which does not follow
-                // symlinks: a symlinked profile directory would otherwise be
-                // skipped and its sessions would read as unowned. An entry we
-                // cannot stat at all fails the pass rather than being skipped,
-                // for the same reason.
-                match fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_dir() => dirs.push(path),
-                    // A stray file under `profiles/` is not a profile.
-                    Ok(_) => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "{} cannot be inspected; refusing to reclaim stores \
-                                 without reading every profile",
-                                path.display()
-                            )
-                        })
-                    }
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("reading {}", profiles.display())),
-    }
-    let mut paths = Vec::new();
-    for dir in dirs {
-        let path = dir.join("sessions.json");
-        // Only a genuinely absent registry is a profile with no sessions.
-        // Every other failure means a registry we cannot read, and skipping it
-        // would drop its sessions from the ownership inventory and make its
-        // stores look like orphans. Presence is decided without following the
-        // link, resolution with it, so a dangling symlink fails here rather
-        // than reading as absent.
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "{} cannot be inspected; refusing to reclaim stores without reading it",
-                        path.display()
-                    )
-                })
-            }
-        }
-        match fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => paths.push(path),
-            Ok(_) => bail!(
-                "{} is not a regular file; refusing to reclaim stores without reading it",
-                path.display()
-            ),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "{} cannot be resolved; refusing to reclaim stores without reading it",
-                        path.display()
-                    )
-                })
-            }
-        }
-    }
-    paths.sort();
-    Ok(paths)
 }
 
 /// Every `sandbox-v2` root any profile can place a store under: the built-in
@@ -408,7 +331,7 @@ fn store_roots(app_dir: &Path, home: &Path) -> Result<Vec<PathBuf>> {
             crate::session::config::container_config::sandbox_store_roots(tool, home, None),
         );
     }
-    for path in registry_paths(app_dir)? {
+    for path in v027::registry_paths(app_dir)? {
         let profile = v027::profile_for_registry(app_dir, &path);
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         for tool in &tools {
@@ -799,6 +722,43 @@ mod tests {
             fs::read(store.join(".credentials.json")).unwrap(),
             vec![b'x'; 23]
         );
+    }
+
+    #[test]
+    fn ambiguous_and_opaque_owner_ids_remain_protected_in_reclaim_inventory() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let app = temporary.path().join("app");
+        fs::create_dir(&app)?;
+        crate::session::retained_intents::initialize_legacy_in(&app)?;
+        fs::write(app.join(".schema_version"), b"42")?;
+        let cases: &[(&str, Option<&[&str]>)] = &[
+            (
+                r#"[{"id":"1111111111111111","id":"2222222222222222","runner_journal":{"coverage":"complete","launches":[]}}]"#,
+                Some(&["1111111111111111", "2222222222222222"]),
+            ),
+            (
+                r#"[{"id":"1111111111111111","runner_journal":{"opaque":{"duplicate":1,"duplicate":2,"number":1e400}}}]"#,
+                Some(&["1111111111111111"]),
+            ),
+            (r#"[{"id":"1111111111111111","id":null}]"#, None),
+            (r#"[{"missing_identity":true}]"#, None),
+        ];
+        for (raw, expected) in cases {
+            let path = app.join("sessions.json");
+            fs::write(&path, raw)?;
+            let owned = owned_ids(&app, &[]);
+            match expected {
+                Some(expected) => {
+                    assert_eq!(owned?, expected.iter().map(|id| (*id).to_owned()).collect())
+                }
+                None => assert!(
+                    owned.is_err(),
+                    "an unreadable identity cannot authorize reclaim"
+                ),
+            }
+            assert_eq!(fs::read(&path)?, raw.as_bytes());
+        }
+        Ok(())
     }
 
     fn app_with_rows(app: &Path, rows: &[&str]) {
