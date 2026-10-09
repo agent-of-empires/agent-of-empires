@@ -125,7 +125,7 @@ Rebinding the record with `aoe session set-session-id --store` copies nothing, s
 
 ## Picking up an upgraded agent CLI
 
-Upgrading the agent binary from inside a session does not replace the process in the pane. Restart the session instead of creating a new one: press `e` (`E` with strict hotkeys) or `F5`, or run `aoe session restart <session>` (`--all` for every session in the profile). A restart runs only `on_launch`, whose failures are warnings, and resumes the conversation while `session.auto_resume_on_restart` is on (the default). A new session runs `on_create`, whose failure [aborts creation](repo-config.md#hooks).
+Upgrading the agent binary from inside a session does not replace the process in the pane. Restart the session instead of creating a new one: press `e` (`E` with strict hotkeys) or `F5`, or run `aoe session restart <session>` (`--all` to restart every eligible session in the profile; from an agent session, the caller is skipped so the command can finish). A restart runs only `on_launch`, whose failures are warnings, and resumes the conversation while `session.auto_resume_on_restart` is on (the default). A new session runs `on_create`, whose failure [aborts creation](repo-config.md#hooks).
 
 ## Importing an existing conversation
 

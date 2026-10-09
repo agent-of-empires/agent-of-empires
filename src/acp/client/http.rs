@@ -415,10 +415,17 @@ impl HttpClient {
             .await
     }
 
-    /// "Auto-name now": 2xx means started; the title arrives over the WS.
+    /// "Auto-name now": the daemon answers once the title one-shot finishes, with
+    /// its failure reason on error.
     pub async fn smart_rename(&self, session_id: &str) -> Result<(), HttpError> {
-        self.session_call(Method::POST, session_id, "/smart-rename", None)
-            .await
+        let path = format!("/api/sessions/{session_id}/smart-rename");
+        let timeout = crate::session::smart_rename::RENAME_DEADLINE + DEFAULT_TIMEOUT;
+        self.send(
+            || self.request(Method::POST, &path).timeout(timeout),
+            Scope::Session(session_id),
+        )
+        .await?;
+        Ok(())
     }
 
     /// The result echoes over the WS as `CurrentModeChanged` or

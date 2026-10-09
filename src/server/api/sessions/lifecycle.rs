@@ -928,8 +928,9 @@ fn release_restore_claim(storage: &Storage, id: &str, generation: u64) {
 
 /// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" for a
 /// structured session: clears the per-session attempted gate and regenerates the
-/// title from the first prompt, even over one already chosen. The rename runs
-/// detached and best-effort: a `202` means "re-run started", not "renamed".
+/// title from the first prompt, even over one already chosen. Waits for the
+/// rename: `200` once the title is saved, `409` when nothing could be applied,
+/// `502` with the agent's reason on failure, `504` past the rename deadline.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1045,7 +1046,8 @@ pub async fn force_smart_rename(
         attempted.remove(&id);
     }
 
-    tokio::spawn(crate::session::smart_rename::try_smart_rename(
+    use crate::session::smart_rename::SmartRenameError;
+    let Err(err) = crate::session::smart_rename::try_smart_rename(
         state.clone(),
         id.clone(),
         crate::session::smart_rename::SmartRenameInput {
@@ -1054,8 +1056,17 @@ pub async fn force_smart_rename(
         },
         // Manual action forces past the smart_rename-disabled gate (#3039).
         true,
-    ));
-    StatusCode::ACCEPTED.into_response()
+    )
+    .await
+    else {
+        return StatusCode::OK.into_response();
+    };
+    let (status, code) = match err {
+        SmartRenameError::Skipped(_) => (StatusCode::CONFLICT, "smart_rename_skipped"),
+        SmartRenameError::Failed(_) => (StatusCode::BAD_GATEWAY, "smart_rename_failed"),
+        SmartRenameError::TimedOut => (StatusCode::GATEWAY_TIMEOUT, "smart_rename_timeout"),
+    };
+    api_error(status, code, err.to_string())
 }
 
 /// On-demand "summarize the conversation so far" for a structured-view session.

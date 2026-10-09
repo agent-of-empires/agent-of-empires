@@ -223,7 +223,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     &agent_prose,
                 );
                 tokio::spawn(async move {
-                    crate::session::smart_rename::try_smart_rename(
+                    // Failures are logged in run_oneshot and retried on a later turn.
+                    let _ = crate::session::smart_rename::try_smart_rename(
                         state_for_rename,
                         session_id,
                         crate::session::smart_rename::SmartRenameInput {

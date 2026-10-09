@@ -352,7 +352,7 @@ mod serve {
             )
             .await
         };
-        let Some(raw) = raw else {
+        let Ok(raw) = raw else {
             return;
         };
         let Some(text) = sanitize_summary(&raw) else {
