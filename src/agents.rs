@@ -1093,49 +1093,24 @@ fn with_agent_help<R>(
             })
         }
     };
-    if cache_success {
-        if let Some(answer) = cache.answers.iter().find(|cached| {
-            cached.program == command.get_program()
-                && cached.launch_cwd.as_path() == launch_cwd.as_ref()
-                && cached.probe_cwd == probe_cwd
-                && cached
-                    .environment
-                    .iter()
-                    .map(|(key, value)| (key.as_os_str(), value.as_os_str()))
-                    .eq(help_environment(command))
-        }) {
-            return inspect(&answer.help);
-        }
-    }
-    cache.probe.help(std::time::Instant::now, |timeout| {
-        run_agent_help(
+    cache.with_help(
+        HelpContext {
             command,
-            &launch_cwd,
-            probe_cwd.as_deref().unwrap_or(&launch_cwd),
-            timeout,
-        )
-    });
-    let Some(help) = cache
-        .probe
-        .help
-        .take()
-        .filter(|help| !help.trim().is_empty())
-    else {
-        return inspect("");
-    };
-    if !cache_success {
-        return inspect(&help);
-    }
-    cache.answers.push(CachedHelp {
-        program: command.get_program().to_owned(),
-        launch_cwd: launch_cwd.into_owned(),
-        probe_cwd,
-        environment: help_environment(command)
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
-            .collect(),
-        help,
-    });
-    inspect(&cache.answers.last().expect("the answer was inserted").help)
+            launch_cwd: &launch_cwd,
+            probe_cwd: probe_cwd.as_deref(),
+        },
+        cache_success,
+        std::time::Instant::now,
+        |timeout| {
+            run_agent_help(
+                command,
+                &launch_cwd,
+                probe_cwd.as_deref().unwrap_or(&launch_cwd),
+                timeout,
+            )
+        },
+        inspect,
+    )
 }
 
 /// A flag the older generation's help lists and the current one's does not.
@@ -1159,49 +1134,6 @@ fn help_advertises_flag(help: &str, flag: &str) -> bool {
             .next()
             .is_none_or(|next| next.is_whitespace() || next == '=' || next == ',')
     })
-}
-
-/// An agent's `--help`, cached once it succeeds. A timeout or failure reports no flags for now
-/// and is retried after a cooldown with a longer deadline, since a cold start with many
-/// extensions can outlast the first one.
-#[derive(Default)]
-struct HelpProbe {
-    help: Option<String>,
-    retry_at: Option<std::time::Instant>,
-}
-
-impl HelpProbe {
-    fn help(
-        &mut self,
-        clock: impl Fn() -> std::time::Instant,
-        probe: impl FnOnce(std::time::Duration) -> Option<String>,
-    ) -> &str {
-        // Empty or whitespace-only help is inconclusive, not a confirmed absence of flags.
-        if self
-            .help
-            .as_deref()
-            .is_none_or(|help| help.trim().is_empty())
-            && self.retry_at.is_none_or(|at| clock() >= at)
-        {
-            let timeout = if self.retry_at.is_some() {
-                HELP_RETRY_TIMEOUT
-            } else {
-                HELP_PROBE_TIMEOUT
-            };
-            self.help = probe(timeout);
-            if self
-                .help
-                .as_deref()
-                .is_none_or(|help| help.trim().is_empty())
-            {
-                tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
-                    "agent --help did not answer; launching without the flags it gates until a retry succeeds");
-                // Timed from the answer, so a probe that ran to its deadline still cools down.
-                self.retry_at = Some(clock() + HELP_RETRY_COOLDOWN);
-            }
-        }
-        self.help.as_deref().unwrap_or_default()
-    }
 }
 
 fn ambient_help_command(program: &std::path::Path) -> std::process::Command {
@@ -1265,19 +1197,110 @@ fn run_agent_help(
         })
 }
 
+#[derive(Clone, Copy)]
+struct HelpContext<'a> {
+    command: &'a std::process::Command,
+    launch_cwd: &'a std::path::Path,
+    probe_cwd: Option<&'a std::path::Path>,
+}
+
 struct CachedHelp {
     program: std::ffi::OsString,
     launch_cwd: std::path::PathBuf,
     // Unbound probes relocate to temp; explicit probes use launch_cwd.
     probe_cwd: Option<std::path::PathBuf>,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    help: String,
+    answer: HelpAnswer,
+}
+
+enum HelpAnswer {
+    Available(String),
+    RetryAt(std::time::Instant),
 }
 
 #[derive(Default)]
 struct ProgramHelpCache {
-    probe: HelpProbe,
-    answers: Vec<CachedHelp>,
+    retry_timeout_escalated: bool,
+    contexts: Vec<CachedHelp>,
+}
+
+impl ProgramHelpCache {
+    fn with_help<R>(
+        &mut self,
+        context: HelpContext<'_>,
+        cache_success: bool,
+        clock: impl Fn() -> std::time::Instant,
+        probe: impl FnOnce(std::time::Duration) -> Option<String>,
+        inspect: impl FnOnce(&str) -> R,
+    ) -> R {
+        let HelpContext {
+            command,
+            launch_cwd,
+            probe_cwd,
+        } = context;
+        let now = clock();
+        self.contexts
+            .retain(|cached| !matches!(cached.answer, HelpAnswer::RetryAt(at) if now >= at));
+        let index = self.contexts.iter().position(|cached| {
+            cached.program == command.get_program()
+                && cached.launch_cwd == launch_cwd
+                && cached.probe_cwd.as_deref() == probe_cwd
+                && cached
+                    .environment
+                    .iter()
+                    .map(|(key, value)| (key.as_os_str(), value.as_os_str()))
+                    .eq(help_environment(command))
+        });
+        if let Some(index) = index {
+            match &self.contexts[index].answer {
+                HelpAnswer::Available(help) if cache_success => return inspect(help),
+                HelpAnswer::RetryAt(_) => return inspect(""),
+                HelpAnswer::Available(_) => {}
+            }
+        }
+        let timeout = if self.retry_timeout_escalated {
+            HELP_RETRY_TIMEOUT
+        } else {
+            HELP_PROBE_TIMEOUT
+        };
+        let help = probe(timeout).filter(|help| !help.trim().is_empty());
+        if !cache_success {
+            if let Some(help) = &help {
+                if let Some(index) = index {
+                    self.contexts.swap_remove(index);
+                }
+                return inspect(help);
+            }
+        }
+        let answer = match help {
+            Some(help) => HelpAnswer::Available(help),
+            None => {
+                self.retry_timeout_escalated = true;
+                tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
+                    "agent --help did not answer; this launch context cools down before retrying");
+                HelpAnswer::RetryAt(clock() + HELP_RETRY_COOLDOWN)
+            }
+        };
+        let index = if let Some(index) = index {
+            self.contexts[index].answer = answer;
+            index
+        } else {
+            self.contexts.push(CachedHelp {
+                program: command.get_program().to_owned(),
+                launch_cwd: launch_cwd.to_owned(),
+                probe_cwd: probe_cwd.map(std::path::Path::to_owned),
+                environment: help_environment(command)
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    .collect(),
+                answer,
+            });
+            self.contexts.len() - 1
+        };
+        match &self.contexts[index].answer {
+            HelpAnswer::Available(help) => inspect(help),
+            HelpAnswer::RetryAt(_) => inspect(""),
+        }
+    }
 }
 
 type SharedHelpProbe = std::sync::Arc<std::sync::Mutex<ProgramHelpCache>>;
@@ -1879,34 +1902,47 @@ if [ -f .use-legacy ]; then printf '%s\n' '  --fork branch'; else printf '%s\n' 
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn failed_help_cools_down_across_launch_sources() {
+    fn failed_help_cools_down_only_the_exact_launch_context() {
         use std::os::unix::fs::PermissionsExt as _;
         let temp = tempfile::tempdir().unwrap();
         let program = temp.path().join("opencode");
         let log = temp.path().join("probes");
         std::fs::write(
             &program,
-            "#!/bin/sh\nprintf '%s\n' \"$AOE_SESSION_SOURCE\" >> \"$PROBE_LOG\"\nexit 1\n",
+            r#"#!/bin/sh
+printf '%s:%s\n' "$AOE_SESSION_SOURCE" "$PROBE_MODE" >> "$PROBE_LOG"
+if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; else exit 1; fi
+"#,
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let agent = get_agent("opencode").unwrap();
         forget_agent_help_for_test();
-        for source in ["first", "second"] {
+        for (source, mode, expected) in [
+            ("first", "fail", AgentGeneration::Unknown),
+            ("first", "fail", AgentGeneration::Unknown),
+            ("second", "legacy", AgentGeneration::Legacy),
+            ("first", "fail", AgentGeneration::Unknown),
+            ("first", "legacy", AgentGeneration::Legacy),
+            ("third", "fail", AgentGeneration::Unknown),
+            ("third", "fail", AgentGeneration::Unknown),
+        ] {
             let mut command = std::process::Command::new(&program);
             command
                 .env_clear()
                 .env("AOE_SESSION_SOURCE", source)
-                .env("PROBE_LOG", &log);
+                .env("PROBE_MODE", mode)
+                .env("PROBE_LOG", &log)
+                .current_dir(temp.path());
             assert_eq!(
                 agent_generation_for(agent, &command),
-                AgentGeneration::Unknown
+                expected,
+                "{source}:{mode}"
             );
         }
         assert_eq!(
             std::fs::read_to_string(log).unwrap(),
-            "first
-"
+            "first:fail\nsecond:legacy\nfirst:legacy\nthird:fail\n"
         );
         forget_agent_help_for_test();
     }
@@ -1970,43 +2006,78 @@ if [ -f .use-legacy ]; then printf '%s\n' '  --fork branch'; else printf '%s\n' 
     }
 
     #[test]
-    fn help_probe_retries_an_inconclusive_answer_and_keeps_a_confirmed_one() {
-        let help = "  --session-id <id>\n  --extension, -e <path>\n";
-        let start = std::time::Instant::now();
-        let now = std::cell::Cell::new(start);
-        let mut probe = HelpProbe::default();
+    fn help_cooldown_starts_after_the_answer_and_retries_with_the_longer_timeout() {
+        let help = "--fork fork session";
+        let now = std::cell::Cell::new(std::time::Instant::now());
+        let mut cache = ProgramHelpCache::default();
         let mut timeouts = Vec::new();
-
-        // The first probe runs to its deadline before failing.
-        let first = probe.help(
-            || now.get(),
-            |timeout| {
+        let cwd = std::env::temp_dir();
+        let mut failed = std::process::Command::new("opencode");
+        failed.env_clear().env("MODE", "failed").current_dir(&cwd);
+        let mut healthy = std::process::Command::new("opencode");
+        healthy.env_clear().env("MODE", "healthy").current_dir(&cwd);
+        macro_rules! answer {
+            ($command:expr, $cached:expr, $probe:expr) => {
+                cache.with_help(
+                    HelpContext {
+                        command: $command,
+                        launch_cwd: &cwd,
+                        probe_cwd: None,
+                    },
+                    $cached,
+                    || now.get(),
+                    $probe,
+                    str::to_owned,
+                )
+            };
+        }
+        assert_eq!(
+            answer!(&failed, true, |timeout| {
                 timeouts.push(timeout);
                 now.set(now.get() + timeout);
                 None
-            },
+            }),
+            ""
         );
-        assert_eq!(first, "", "a timed-out probe advertises nothing");
         let failed_at = now.get();
         now.set(failed_at + HELP_RETRY_COOLDOWN - std::time::Duration::from_millis(1));
         assert_eq!(
-            probe.help(|| now.get(), |_| unreachable!("cooling down")),
-            "",
-            "the cooldown runs from the failed answer, not from when the probe began"
-        );
-
-        now.set(failed_at + HELP_RETRY_COOLDOWN);
-        let retried = probe.help(
-            || now.get(),
-            |timeout| {
+            answer!(&healthy, false, |timeout| {
                 timeouts.push(timeout);
-                Some(help.to_string())
-            },
+                Some(help.into())
+            }),
+            help
         );
-        assert_eq!(retried, help, "the process is not stuck on the failure");
+        assert_eq!(
+            answer!(&failed, true, |_| unreachable!("same-context cooldown")),
+            ""
+        );
+        now.set(failed_at + HELP_RETRY_COOLDOWN);
+        assert_eq!(
+            answer!(&failed, true, |timeout| {
+                timeouts.push(timeout);
+                Some(help.into())
+            }),
+            help
+        );
+        assert_eq!(
+            answer!(&failed, true, |_| unreachable!("positive flag cache")),
+            help
+        );
+        assert_eq!(answer!(&failed, false, |_| None), "");
+        assert_eq!(
+            answer!(&failed, true, |_| unreachable!("stale positive help")),
+            ""
+        );
         now.set(now.get() + HELP_RETRY_COOLDOWN);
-        assert_eq!(probe.help(|| now.get(), |_| unreachable!("cached")), help);
-        assert_eq!(timeouts, [HELP_PROBE_TIMEOUT, HELP_RETRY_TIMEOUT]);
+        assert_eq!(
+            answer!(&failed, false, |_| Some("--auto approvals".into())),
+            "--auto approvals"
+        );
+        assert_eq!(
+            timeouts,
+            [HELP_PROBE_TIMEOUT, HELP_RETRY_TIMEOUT, HELP_RETRY_TIMEOUT]
+        );
     }
 
     #[test]

@@ -3578,10 +3578,35 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// The worker never steals the size-owner lock back after entry: an external steal
-    /// flips its sticky `lock_lost` flag, the thief keeps the lock, and a queued resize is
-    /// dropped instead of stomping the new owner's grid. Fixes the tug-of-war where a
-    /// background TUI's next keystroke reverted a phone takeover.
+    fn start_ready_input_pane(name: &str) {
+        let mut args = [
+            "new-session", "-d", "-s", name, "-x", "80", "-y", "24",
+            r#"/bin/sh -c 'stty -echo; printf "INPUT-READY\n"; IFS= read -r line; printf "INPUT-ACK:%s\n" "$line"; exec sleep 30'"#,
+        ].map(str::to_owned).to_vec();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, name);
+        let output = crate::tmux::tmux_command()
+            .args(args)
+            .output()
+            .expect("start input pane");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        wait_until(
+            "input consumer ready",
+            std::time::Duration::from_secs(5),
+            || {
+                let output = crate::tmux::tmux_command()
+                    .args(["capture-pane", "-p", "-t", name])
+                    .output()
+                    .expect("capture consumer readiness");
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("INPUT-READY")
+            },
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn worker_flags_lock_loss_and_drops_resize_after_external_steal() {
@@ -3590,21 +3615,7 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_steal");
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
+        start_ready_input_pane(guard.name());
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
@@ -3630,9 +3641,8 @@ mod tests {
             Some("live-test-thief".to_string()),
             "worker must not steal the lock back"
         );
-        // Keys queued after the resize are dispatched after its batch, even
-        // when ownership filtering removes the resize itself.
         worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
+        worker.send(TmuxKey::Named("Enter".into()));
         wait_until(
             "post-resize input reached the pane",
             std::time::Duration::from_secs(5),
@@ -3642,7 +3652,8 @@ mod tests {
                     .output()
                     .expect("capture ordered input");
                 output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("INPUT-ACK:RESIZE-BATCH-COMPLETE")
             },
         );
         assert_eq!(
@@ -3716,21 +3727,7 @@ mod tests {
             || worker.take_resize_failed(),
         );
 
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
+        start_ready_input_pane(guard.name());
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
@@ -3749,9 +3746,8 @@ mod tests {
             Some("live-test-thief".to_string()),
             "unowned retry must not steal from a live owner"
         );
-        // Keys queued after the resize are dispatched after its batch, even
-        // when ownership filtering removes the resize itself.
         worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
+        worker.send(TmuxKey::Named("Enter".into()));
         wait_until(
             "post-resize input reached the pane",
             std::time::Duration::from_secs(5),
@@ -3761,7 +3757,8 @@ mod tests {
                     .output()
                     .expect("capture ordered input");
                 output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("INPUT-ACK:RESIZE-BATCH-COMPLETE")
             },
         );
         assert_eq!(

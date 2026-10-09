@@ -423,7 +423,11 @@ impl ContainerExecutionSnapshot {
                 "container",
                 "inspect",
                 "--format",
-                "{\"id\":{{json .Id}},\"mounts\":{{json .Mounts}}}",
+                if runtime.kind == Name::Podman {
+                    "{\"id\":{{json .ID}},\"mounts\":{{json .Mounts}}}"
+                } else {
+                    "{\"id\":{{json .Id}},\"mounts\":{{json .Mounts}}}"
+                },
                 name,
             ])?,
             Name::AppleContainer => runtime.probe_json(&["inspect", name])?,

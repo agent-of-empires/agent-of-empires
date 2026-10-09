@@ -305,6 +305,73 @@ impl NativeExecution {
         }
         command
     }
+
+    fn opencode_session_schema(&self) -> Result<OpenCodeSessionSchema> {
+        let probe = || -> Result<OpenCodeSessionSchema> {
+            let env_file;
+            let mut command = if let Some(container) = &self.inputs.container {
+                let environment = self
+                    .inputs
+                    .docker_env
+                    .as_ref()
+                    .context("OpenCode container environment is unavailable")?;
+                env_file = crate::session::environment::container_env_file(
+                    environment
+                        .env
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str()))
+                        .chain(self.routing.iter().filter_map(|(key, value)| {
+                            value.as_deref().map(|value| (key.as_str(), value))
+                        })),
+                )?;
+                let mut script = String::new();
+                for (key, value) in &self.routing {
+                    if value.is_none() {
+                        script.push_str(&format!(
+                            "unset {}; ",
+                            crate::session::environment::shell_escape_script_word(key)
+                        ));
+                    }
+                }
+                script.push_str(&format!(
+                    "exec {} --version",
+                    crate::session::environment::shell_escape_script_word(
+                        self.program
+                            .to_str()
+                            .context("OpenCode program is not UTF-8")?
+                    )
+                ));
+                container.runtime.exec_with_env_file(
+                    &container.id,
+                    self.inputs
+                        .cwd
+                        .to_str()
+                        .context("OpenCode cwd is not UTF-8")?,
+                    &["/bin/sh".into(), "-c".into(), script],
+                    env_file.path(),
+                )
+            } else {
+                let mut command = self.host_command();
+                command.arg("--version");
+                command
+            };
+            command.stdin(std::process::Stdio::null());
+            let output = crate::session::capture::run_with_timeout_limit(
+                command,
+                std::time::Duration::from_secs(5),
+                "OpenCode version probe",
+                4096,
+            )?;
+            let output = std::str::from_utf8(&output).context("OpenCode version is not UTF-8")?;
+            OpenCodeSessionSchema::from_version_output(output).with_context(|| {
+                format!(
+                    "OpenCode version/build is not source-attested: {:?}",
+                    output.trim()
+                )
+            })
+        };
+        probe().map_err(|error| error.context(UnattestedOpenCodeSchema))
+    }
 }
 #[derive(Clone, Copy)]
 pub(super) struct AgentLaunchContext<'a> {
@@ -1224,42 +1291,61 @@ impl Instance {
     }
 }
 
-/// The routing row for `sid`: whether its session is bound to a workspace, and
-/// the working directory its store recorded. `None` when no session table this
-/// build understands holds the id.
-///
-/// OpenCode 2.x renamed the table to `session_v2`, and the rename tracks the
-/// build channel rather than the semantic version: a store on the stable
-/// channel carries both names while the other keeps `session` alone. Probing
-/// in that order resolves both layouts, where naming either one refuses every
-/// store the other owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenCodeSessionSchema {
+    Session,
+    SessionV2,
+}
+
+impl OpenCodeSessionSchema {
+    // Only source-verified releases/builds qualify; CLI generation is not a schema discriminator.
+    fn from_version_output(output: &str) -> Option<Self> {
+        let version = output.trim();
+        let version = version.strip_prefix("opencode v").unwrap_or(version);
+        if version == "2.0.24+31bdd8e" {
+            return Some(Self::SessionV2);
+        }
+        let mut parts = version.split('.');
+        let mut number = || {
+            let part = parts.next()?;
+            if part.is_empty()
+                || (part.len() > 1 && part.starts_with('0'))
+                || !part.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            part.parse::<u16>().ok()
+        };
+        let version = (number()?, number()?, number()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        match version {
+            (1, 16, 0 | 2) | (1, 17, 0..=20) | (1, 18, 0..=35) => Some(Self::Session),
+            (2, 0, 0..=26) => Some(Self::SessionV2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("OpenCode native session schema cannot be attested; managed resume and fork are refused")]
+pub(super) struct UnattestedOpenCodeSchema;
+
 fn opencode_session_row(
     connection: &rusqlite::Connection,
     sid: &str,
+    schema: OpenCodeSessionSchema,
 ) -> Result<Option<(bool, String)>> {
-    for sql in [
-        "SELECT workspace_id IS NOT NULL, directory FROM session_v2 WHERE id = ?1 AND length(CAST(directory AS BLOB)) <= 65536",
-        "SELECT workspace_id IS NOT NULL, directory FROM session WHERE id = ?1 AND length(CAST(directory AS BLOB)) <= 65536",
-    ] {
-        let mut statement = match connection.prepare(sql) {
-            Ok(statement) => statement,
-            // The store predates the table, so the next candidate decides.
-            Err(rusqlite::Error::SqliteFailure(_, Some(reason)))
-                if reason.contains("no such table") =>
-            {
-                continue
-            }
-            Err(error) => {
-                return Err(error).context("OpenCode store rejected its own session schema")
-            }
-        };
-        match statement.query_row([sid], |row| Ok((row.get(0)?, row.get(1)?))) {
-            Ok(row) => return Ok(Some(row)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
-            Err(error) => return Err(error).context("OpenCode store rejected its own session row"),
-        }
-    }
-    Ok(None)
+    use rusqlite::OptionalExtension as _;
+    let sql = match schema {
+        OpenCodeSessionSchema::Session => "SELECT workspace_id IS NOT NULL, directory FROM session WHERE id = ?1 AND length(CAST(directory AS BLOB)) <= 65536",
+        OpenCodeSessionSchema::SessionV2 => "SELECT workspace_id IS NOT NULL, directory FROM session_v2 WHERE id = ?1 AND length(CAST(directory AS BLOB)) <= 65536",
+    };
+    connection
+        .query_row(sql, [sid], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .context("OpenCode store rejected its active session schema or routing row")
 }
 
 impl Instance {
@@ -1653,19 +1739,6 @@ impl Instance {
                 };
                 let database = inputs.canonical_path(&database)?;
                 anyhow::ensure!(value("OPENCODE_WORKSPACE_ID").is_none_or(|value| value.is_empty()), "managed OpenCode does not support workspace routing");
-                if let Some((sid, _, _)) = target {
-                    let location = inputs.physical_location(&database);
-                    anyhow::ensure!(location.filesystem == "host", "OpenCode routing requires a local database projection");
-                    let connection = rusqlite::Connection::open_with_flags(location.path.canonicalize()?,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
-                    connection.busy_timeout(std::time::Duration::from_millis(100))?;
-                    let (workspace, directory) = opencode_session_row(&connection, sid)
-                        .context("OpenCode target or its native routing schema is unavailable")?
-                        .with_context(|| format!("OpenCode target {sid} is absent from the store OPENCODE_DB pins; opencode debug paths reports the database this build writes"))?;
-                    anyhow::ensure!(!workspace, "OpenCode target may forward to another workspace; managed resume and fork are refused");
-                    anyhow::ensure!(std::path::Path::new(&directory).is_absolute()
-                        && inputs.canonical_path(std::path::Path::new(&directory))? == inputs.cwd, "OpenCode target routes to a different working directory");
-                }
                 routing.push(("OPENCODE_DB".into(), Some(database.to_str().context("OpenCode database path is not UTF-8")?.into())));
                 if let Some(path) = value("OPENCODE_CONFIG").filter(|value| !value.is_empty()).map(PathBuf::from).map(absolute) {
                     routing.push(("OPENCODE_CONFIG".into(), Some(path.to_str().context("OpenCode config path is not UTF-8")?.into())));
@@ -2051,7 +2124,7 @@ impl Instance {
             && inputs.container.is_none()
             && config.session.opencode_preassign_session_id
             && direct_capture;
-        Ok(NativeExecution {
+        let execution = NativeExecution {
             agent,
             binding: ExecutionBinding {
                 agent: agent.name.into(),
@@ -2075,7 +2148,41 @@ impl Instance {
             pi_pinnable,
             opencode_preassign,
             store_override,
-        })
+        };
+        if agent.name == "opencode" {
+            if let Some((sid, _, _)) = target {
+                let schema = execution.opencode_session_schema()?;
+                let database = execution
+                    .binding
+                    .stores
+                    .first()
+                    .context("OpenCode store is missing")?;
+                let location = execution.inputs.physical_location(database);
+                anyhow::ensure!(
+                    location.filesystem == "host",
+                    "OpenCode routing requires a local database projection"
+                );
+                let connection = rusqlite::Connection::open_with_flags(
+                    location.path.canonicalize()?,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )?;
+                connection.busy_timeout(std::time::Duration::from_millis(100))?;
+                let (workspace, directory) = opencode_session_row(&connection, sid, schema)?
+                    .with_context(|| format!("OpenCode target {sid} is absent from this build's active session table in OPENCODE_DB"))?;
+                anyhow::ensure!(!workspace, "OpenCode target may forward to another workspace; managed resume and fork are refused");
+                anyhow::ensure!(
+                    std::path::Path::new(&directory).is_absolute()
+                        && execution
+                            .inputs
+                            .canonical_path(std::path::Path::new(&directory))?
+                            == execution.inputs.cwd,
+                    "OpenCode target routes to a different working directory"
+                );
+            }
+        }
+        Ok(execution)
     }
 
     pub(crate) fn conversation_target(&self) -> Option<(&str, Option<&ConversationBinding>, bool)> {
@@ -2651,84 +2758,69 @@ impl Instance {
 mod tests {
     use super::*;
 
-    /// A store resolves whichever session table its own build wrote, an id no
-    /// table holds is refused, and a directory is compared verbatim.
     #[test]
-    fn opencode_routing_resolves_the_session_table_its_store_wrote() {
-        const V2: &str = "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL)";
-        const V1: &str = "CREATE TABLE session (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL)";
-        let target = "ses_0000000000000000000000000000abcd";
-        let legacy = "ses_0000000000000000000000000000beef";
+    fn opencode_build_identity_refuses_unattested_versions_and_aliases() {
+        use OpenCodeSessionSchema::{Session, SessionV2};
+        for (version, expected) in [
+            ("1.16.0\n", Some(Session)),
+            ("1.16.2", Some(Session)),
+            ("1.17.20", Some(Session)),
+            ("1.18.35", Some(Session)),
+            ("opencode v2.0.0\n", Some(SessionV2)),
+            ("opencode v2.0.26", Some(SessionV2)),
+            ("opencode v2.0.24+31bdd8e", Some(SessionV2)),
+            ("1.16.1", None),
+            ("1.17.21", None),
+            ("1.18.36", None),
+            ("2.0.27", None),
+            ("2.1.0", None),
+            ("2.0.24+unknown", None),
+            ("2.0.24-preview", None),
+            ("0.0.0-v2-20261008", None),
+            ("local", None),
+            ("02.0.24", None),
+            ("2.00.24", None),
+            ("2.0.024", None),
+            ("2.0.24 extra", None),
+            ("2.0.24\n2.0.24", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                OpenCodeSessionSchema::from_version_output(version),
+                expected,
+                "{version:?}"
+            );
+        }
+    }
 
-        let fresh = rusqlite::Connection::open_in_memory().unwrap();
-        fresh.execute_batch(V2).unwrap();
-        fresh
-            .execute("INSERT INTO session_v2 VALUES (?1, NULL, '/v2')", [target])
-            .unwrap();
-        assert_eq!(
-            opencode_session_row(&fresh, target).unwrap(),
-            Some((false, "/v2".to_string()))
-        );
-
-        // The non-stable channel keeps `session` alone.
-        let legacy_only = rusqlite::Connection::open_in_memory().unwrap();
-        legacy_only.execute_batch(V1).unwrap();
-        legacy_only
-            .execute("INSERT INTO session VALUES (?1, NULL, '/v1')", [legacy])
-            .unwrap();
-        assert_eq!(
-            opencode_session_row(&legacy_only, legacy).unwrap(),
-            Some((false, "/v1".to_string()))
-        );
-
-        // A migrated store carries both names and each id lives in one of them.
-        let migrated = rusqlite::Connection::open_in_memory().unwrap();
-        migrated.execute_batch(&format!("{V2}; {V1}")).unwrap();
-        migrated
-            .execute("INSERT INTO session_v2 VALUES (?1, NULL, '/v2')", [target])
-            .unwrap();
-        migrated
-            .execute("INSERT INTO session VALUES (?1, NULL, '/v1')", [legacy])
-            .unwrap();
-        assert_eq!(
-            opencode_session_row(&migrated, target).unwrap(),
-            Some((false, "/v2".to_string()))
-        );
-        assert_eq!(
-            opencode_session_row(&migrated, legacy).unwrap(),
-            Some((false, "/v1".to_string()))
-        );
-
-        // A workspace-bound session is reported so the caller can refuse it.
-        migrated
-            .execute(
-                "UPDATE session_v2 SET workspace_id = 'w1' WHERE id = ?1",
-                [target],
-            )
-            .unwrap();
-        assert_eq!(
-            opencode_session_row(&migrated, target)
-                .unwrap()
-                .map(|row| row.0),
-            Some(true)
-        );
-
-        // An id no table holds resolves to nothing rather than to a neighbour.
-        assert_eq!(opencode_session_row(&migrated, "ses_absent").unwrap(), None);
-
-        // A working directory carrying a `%` compares verbatim instead of being
-        // refused as a broken URI escape.
-        let percent = rusqlite::Connection::open_in_memory().unwrap();
-        percent.execute_batch(V2).unwrap();
-        percent
-            .execute(
-                "INSERT INTO session_v2 VALUES (?1, NULL, '/work/100%')",
-                [target],
-            )
-            .unwrap();
-        assert_eq!(
-            opencode_session_row(&percent, target).unwrap(),
-            Some((false, "/work/100%".to_string()))
+    #[test]
+    fn opencode_routing_reads_only_the_attested_active_schema() {
+        use OpenCodeSessionSchema::{Session, SessionV2};
+        let store = rusqlite::Connection::open_in_memory().unwrap();
+        store.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL);
+            CREATE TABLE session_v2 (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL);
+            INSERT INTO session VALUES ('shared', NULL, '/legacy/100%');
+            INSERT INTO session_v2 VALUES ('shared', 'remote', '/current');
+            INSERT INTO session VALUES ('legacy-only', NULL, '/legacy');
+            INSERT INTO session_v2 VALUES ('current-only', NULL, '/current');").unwrap();
+        for (schema, sid, expected) in [
+            (Session, "shared", Some((false, "/legacy/100%".into()))),
+            (SessionV2, "shared", Some((true, "/current".into()))),
+            (Session, "current-only", None),
+            (SessionV2, "legacy-only", None),
+            (Session, "absent", None),
+            (SessionV2, "absent", None),
+        ] {
+            assert_eq!(
+                opencode_session_row(&store, sid, schema).unwrap(),
+                expected,
+                "{schema:?}:{sid}"
+            );
+        }
+        store.execute_batch("DROP TABLE session_v2").unwrap();
+        assert!(
+            opencode_session_row(&store, "legacy-only", SessionV2).is_err(),
+            "a missing active table must not select the surviving inactive one"
         );
     }
 

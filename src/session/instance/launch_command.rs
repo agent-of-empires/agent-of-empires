@@ -728,6 +728,9 @@ impl Instance {
                     }
                     Some(execution)
                 }
+                Err(error) if error.is::<super::execution::UnattestedOpenCodeSchema>() => {
+                    return Err(error);
+                }
                 Err(error) if managed && !matches!(self.resume_intent, ResumeIntent::Default) => {
                     return Err(error);
                 }
@@ -2040,10 +2043,17 @@ mod tests {
     fn unknown_opencode_routes_refuse_preparation_and_preserve_the_conversation() {
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let version_file = home.path().join("native-version");
+        let help_file = home.path().join("native-help");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in --version) /bin/cat '{}';; --help) /bin/cat '{}';; esac\n",
+            version_file.display(),
+            help_file.display()
+        );
         let _opencode = crate::session::test_support::install_login_shell_path_command(
             home.path(),
             "opencode",
-            "#!/bin/sh\nexit 0\n",
+            &script,
         );
         let project = home.path().join("project");
         std::fs::create_dir(&project).unwrap();
@@ -2059,34 +2069,58 @@ mod tests {
         .unwrap();
         let profile = "unknown-opencode-route";
         write_profile_environment(profile, &format!("OPENCODE_DB={}", database.display()));
-        for mode in ["fresh", "use", "default", "fallback"] {
-            let mut inst = tool_instance("opencode", project.to_str().unwrap());
-            inst.source_profile = profile.into();
-            let binding = inst.asserted_resume_binding(sid, None).unwrap();
-            if mode == "use" {
-                inst.resume_intent = ResumeIntent::Use(sid.into());
-                inst.resume_binding = Some(binding);
-            } else if mode != "fresh" {
-                inst.set_agent_conversation(Some(sid.into()), Some(binding), None);
+        for (version, expected_error, modes) in [
+            (
+                "2.0.24",
+                "generation",
+                &["fresh", "use", "default", "fallback"][..],
+            ),
+            ("local", "schema", &["use", "default"][..]),
+        ] {
+            std::fs::write(
+                &help_file,
+                if version == "local" {
+                    "--auto approvals"
+                } else {
+                    ""
+                },
+            )
+            .unwrap();
+            for mode in modes {
+                std::fs::write(&version_file, "2.0.24").unwrap();
+                let mut inst = tool_instance("opencode", project.to_str().unwrap());
+                inst.source_profile = profile.into();
+                let binding = inst.asserted_resume_binding(sid, None).unwrap();
+                if *mode == "use" {
+                    inst.resume_intent = ResumeIntent::Use(sid.into());
+                    inst.resume_binding = Some(binding);
+                } else if *mode != "fresh" {
+                    inst.set_agent_conversation(Some(sid.into()), Some(binding), None);
+                }
+                std::fs::write(&version_file, version).unwrap();
+                assert!(
+                    inst.resolve_native_execution(None).is_ok(),
+                    "{version}:{mode}"
+                );
+                let expected = inst.conversation_state();
+                if *mode == "fallback" {
+                    super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION
+                        .with(|fail| fail.set(true));
+                }
+                let error = inst
+                    .prepare_launch_command(expected.clone())
+                    .err()
+                    .expect("unknown routing must refuse");
+                assert!(
+                    format!("{error:#}").contains(expected_error),
+                    "{version}:{mode}: {error:#}"
+                );
+                assert_eq!(
+                    inst.conversation_state(),
+                    expected,
+                    "{version}:{mode}: refused launch changed its target"
+                );
             }
-            assert!(inst.resolve_native_execution(None).is_ok(), "{mode}");
-            let expected = inst.conversation_state();
-            if mode == "fallback" {
-                super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.set(true));
-            }
-            let error = inst
-                .prepare_launch_command(expected.clone())
-                .err()
-                .expect("unknown routing must refuse");
-            assert!(
-                format!("{error:#}").contains("generation"),
-                "{mode}: {error:#}"
-            );
-            assert_eq!(
-                inst.conversation_state(),
-                expected,
-                "{mode}: refused launch changed its target"
-            );
         }
     }
 

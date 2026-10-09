@@ -1,14 +1,4 @@
-//! Regression test for issue #1962: inside a git worktree the build script
-//! must watch the *real* per-worktree `HEAD`, not the literal `.git/HEAD`
-//! (which does not exist there). A missing `rerun-if-changed` input makes
-//! cargo treat the build script as perpetually stale, recompiling the lib +
-//! binary on every build.
-//!
-//! The test drives the actual watch-path logic used by `build.rs`
-//! (`build_git_watch.rs`, shared via `include!`) against a temporary git
-//! worktree and asserts every watched path exists on disk. It also pins the
-//! two halves of the trigger contract: a revision change must disturb a
-//! watched file, and a plain `git status` (which rewrites `index`) must not.
+//! Build-version watches must resolve worktree HEAD and ignore index churn.
 
 #[path = "../../build_git_watch.rs"]
 mod build_git_watch;
@@ -17,12 +7,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
+    let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env("GIT_TEMPLATE_DIR", "")
         .output()
-        .expect("failed to run git")
+        .expect("failed to run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 fn git_available() -> bool {

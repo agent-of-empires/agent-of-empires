@@ -75,9 +75,10 @@ fn fake_script(
         launch_log.display()
     ));
     s.push_str("printf '%s\\n' \"$*\" >> \"$log\"\n");
-    // The pane runs through the harness env-file wrapper, so the launch line is
-    // recorded here rather than inferred from the argv log above. Overwritten
-    // each call, so the last line is the launch that survived.
+    // The last non-probe invocation records the pane's actual launch.
+    s.push_str(
+        "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'opencode v2.0.24'; exit 0; fi\n",
+    );
     s.push_str("printf '%s ' \"$0\" \"$@\" > \"$launch\"\n");
     s.push_str("if [ \"$1\" = \"--help\" ]; then\n");
     s.push_str("  printf 'FLAGS\\n  --auto  approve\\n  --session, -s string  Session ID\\n'\n  exit 0\nfi\n");
@@ -527,6 +528,8 @@ fn opencode_legacy_fork_adoption_uses_the_prepared_strategy() {
 import json, pathlib, sys, time
 first = pathlib.Path({first:?})
 launched = pathlib.Path({launched:?})
+if sys.argv[1:] == ['--version']:
+    print('1.18.29'); sys.exit(0)
 if sys.argv[1:] == ['--help']:
     if not first.exists():
         first.touch(); print('--fork'); sys.exit(0)
