@@ -954,6 +954,8 @@ mod tests {
         inst.source_profile = "prime-resident-root-refresh".into();
         inst.sandbox_info = Some(test_sandbox("prime-resident", Some("/workspace/project")));
         admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config().unwrap();
+        let _transport = install_container_transport(tmp.path(), "prime-resident", &config.volumes);
         let plan = inst
             .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
             .unwrap();

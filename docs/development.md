@@ -22,6 +22,8 @@ Git fixtures must ignore inherited global/system configuration and config-inject
 
 An isolated tmux socket still loads user tmux configuration. Raw fixtures addressing `^.0` must reuse managed pane-index setup. Input-delivery assertions need a ready consumer and its acknowledgment, not terminal echo.
 
+Sandbox unit tests that prepare launch commands must install the shared isolated container transport fixture rather than depend on an installed host runtime.
+
 ## Running and logs
 
 ```sh
