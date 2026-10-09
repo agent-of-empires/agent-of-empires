@@ -178,21 +178,22 @@ pub fn restart_marker_path(session_id: &str) -> Result<PathBuf> {
 }
 
 pub fn mark_restart_pending(session_id: &str, generation: u64) {
-    let Ok(path) = restart_marker_path(session_id) else {
-        return;
-    };
-    // Published by rename so a claim can never see a half-written marker.
-    let staged = path.with_extension(format!("restart.tmp-{}", std::process::id()));
-    if std::fs::write(&staged, generation.to_string()).is_err() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600));
-    }
-    if std::fs::rename(&staged, &path).is_err() {
-        let _ = std::fs::remove_file(&staged);
+    if let Err(error) = with_registry_lock(session_id, || {
+        let path = restart_marker_path(session_id)?;
+        let staged = path.with_extension(format!("restart.tmp-{}", std::process::id()));
+        std::fs::write(&staged, generation.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+        }
+        if let Err(error) = std::fs::rename(&staged, &path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        Ok(())
+    }) {
+        warn!(target: "acp.registry", session = %session_id, %error, "restart marker publication refused");
     }
 }
 
@@ -204,12 +205,21 @@ pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
 /// Renamed aside before reading, so a marker for a newer runner written in between survives.
 /// `None` when absent; `Some(None)` when it names no generation.
 pub fn claim_restart_marker(session_id: &str) -> Option<Option<u64>> {
-    let path = restart_marker_path(session_id).ok()?;
-    let claim = path.with_extension(format!("restart.claim-{}", std::process::id()));
-    std::fs::rename(&path, &claim).ok()?;
-    let generation = crate::process::worker::read_restart_marker(&claim);
-    let _ = std::fs::remove_file(&claim);
-    Some(generation)
+    with_registry_lock(session_id, || {
+        let path = restart_marker_path(session_id)?;
+        let claim = path.with_extension(format!("restart.claim-{}", std::process::id()));
+        match std::fs::rename(&path, &claim) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let generation = crate::process::worker::read_restart_marker(&claim);
+        std::fs::remove_file(&claim)?;
+        Ok(Some(generation))
+    }).unwrap_or_else(|error| {
+        warn!(target: "acp.registry", session = %session_id, %error, "restart marker claim refused");
+        None
+    })
 }
 
 /// A zero marker matches only a zero identity. The file is removed either way.
@@ -218,8 +228,14 @@ pub fn take_restart_marker(session_id: &str, generation: u64) -> bool {
 }
 
 pub fn clear_restart_marker(session_id: &str) {
-    if let Ok(path) = restart_marker_path(session_id) {
-        let _ = std::fs::remove_file(&path);
+    if let Err(error) = with_registry_lock(session_id, || {
+        match std::fs::remove_file(restart_marker_path(session_id)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }) {
+        warn!(target: "acp.registry", session = %session_id, %error, "restart marker cleanup refused");
     }
 }
 
@@ -319,6 +335,7 @@ pub(crate) fn publish_control_listener(
     let lock = acquire_registry_lock(&record.session_id)?;
     let mut endpoint = None;
     let publish = (|| {
+        crate::session::retained_intents::ensure_id_available(&record.session_id)?;
         use std::os::unix::fs::PermissionsExt;
         anyhow::ensure!(
             record.launch_nonce.is_some()
@@ -417,10 +434,20 @@ fn finish_registry_operation<T>(
     }
 }
 
-fn with_registry_lock<T>(session_id: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(crate) fn with_registry_fence<T>(
+    session_id: &str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let lock = acquire_registry_lock(session_id)?;
     let result = operation();
     finish_registry_operation(lock, session_id, result)
+}
+
+fn with_registry_lock<T>(session_id: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_registry_fence(session_id, || {
+        crate::session::retained_intents::ensure_id_available(session_id)?;
+        operation()
+    })
 }
 
 pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
@@ -603,6 +630,7 @@ fn update_if_owned<T>(
     );
     let lock = acquire_registry_lock(&expected.session_id)?;
     let result = (|| {
+        crate::session::retained_intents::ensure_id_available(&expected.session_id)?;
         let Some(current) = load_strict_unlocked(&expected.session_id)? else {
             return Ok(false);
         };

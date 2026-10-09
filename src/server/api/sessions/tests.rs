@@ -4231,14 +4231,30 @@ fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
     let registration = registry.register("key");
     let mut instance = Instance::new("hooked", project.path().to_str().unwrap());
 
+    let storage = crate::session::Storage::new_unwatched("default").unwrap();
+    let intent =
+        crate::session::builder::CreationIntent::reserve_metadata(&storage, &mut instance).unwrap();
+    let generation = instance.lifecycle_generation;
     run_create_hooks(
         &mut instance,
+        &intent,
         &plan,
         project.path(),
         Some(&registration.progress),
     )
     .unwrap();
 
+    assert_eq!(instance.lifecycle_generation, generation);
+    assert_eq!(
+        storage
+            .load()
+            .unwrap()
+            .iter()
+            .find(|row| row.id == instance.id)
+            .unwrap()
+            .lifecycle_generation,
+        generation
+    );
     let snapshot = registry.snapshot("key").unwrap();
     assert_eq!(snapshot.hook.as_deref(), Some("echo from-the-hook"));
     assert!(

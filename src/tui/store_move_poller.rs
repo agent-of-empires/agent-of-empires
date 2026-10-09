@@ -65,8 +65,11 @@ impl StoreMovePoller {
         }
     }
 
-    pub fn request_move(&self, request: StoreMoveRequest) {
-        self.worker.request(request);
+    pub fn request_move(
+        &self,
+        request: StoreMoveRequest,
+    ) -> Result<(), Box<std::sync::mpsc::SendError<StoreMoveRequest>>> {
+        self.worker.try_request(request).map_err(Box::new)
     }
 
     /// The next progress event of the move in flight, if any.
@@ -157,10 +160,12 @@ mod tests {
             )
             .map(|()| true)
         }));
-        poller.request_move(StoreMoveRequest {
-            instance,
-            resume: Some(Action::Quit),
-        });
+        poller
+            .request_move(StoreMoveRequest {
+                instance,
+                resume: Some(Action::Quit),
+            })
+            .unwrap();
         paused_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("the copy started");

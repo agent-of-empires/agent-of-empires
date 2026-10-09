@@ -194,6 +194,20 @@ impl DockerContainer {
         result
     }
 
+    pub(crate) fn create_owned(
+        &self,
+        config: &ContainerConfig,
+        intent: &crate::session::builder::CreationIntent,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<String> {
+        if self.runtime.does_container_exist(&self.name)? {
+            return Err(error::DockerError::ContainerAlreadyExists(self.name.clone()).into());
+        }
+        self.runtime
+            .base
+            .run_owned_create(&self.name, &self.image, config, intent, cancel)
+    }
+
     #[tracing::instrument(target = "containers.runtime", skip_all, fields(name = %self.name))]
     pub fn start(&self) -> Result<()> {
         tracing::info!(target: "containers.runtime", "starting container");

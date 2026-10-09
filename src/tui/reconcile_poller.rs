@@ -77,7 +77,16 @@ fn sweep(profiles: &[String]) -> bool {
             }
         }
     }
-    let mut changed = match crate::session::trash::reconcile_trashed_profiles(&storages) {
+    let mut changed = false;
+    for storage in &storages {
+        match storage.reconcile_filesystem_claims() {
+            Ok(reconciled) => changed |= reconciled,
+            Err(error) => {
+                tracing::warn!(target: "tui.home", profile = storage.profile(), %error, "filesystem claims retained after uncertain reconciliation")
+            }
+        }
+    }
+    changed |= match crate::session::trash::reconcile_trashed_profiles(&storages) {
         Ok(healed) => !healed.is_empty(),
         Err(error) => {
             tracing::warn!(target: "tui.home", "trash reconciliation skipped: {error}");

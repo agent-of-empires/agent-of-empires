@@ -16,7 +16,9 @@ use super::storage::{same_filesystem_identity, sync_parent_directory};
 use super::{Instance, LifecycleOperation, Storage};
 
 mod bootstrap;
+pub(crate) mod native_create;
 pub(crate) use bootstrap::LaunchBootstrap;
+pub use native_create::OwnedCreateCommand;
 
 pub(crate) type BootToken = [u8; 16];
 
@@ -182,14 +184,53 @@ impl PreparationCustody {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum CreationCoverage {
+    #[default]
+    Unknown,
+    Owned,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunnerExecutionJournal {
     #[serde(flatten)]
     coverage: Coverage,
     launches: Vec<RunnerLaunch>,
     preparations: Vec<RunnerPreparation>,
+    creations: Vec<native_create::CreateExecution>,
+    create_coverage: CreationCoverage,
 }
 
+impl<'de> Deserialize<'de> for RunnerExecutionJournal {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Document {
+            #[serde(flatten)]
+            coverage: Coverage,
+            launches: Vec<RunnerLaunch>,
+            preparations: Vec<RunnerPreparation>,
+            creations: Option<Vec<native_create::CreateExecution>>,
+            #[serde(default)]
+            create_coverage: CreationCoverage,
+        }
+        let document = Document::deserialize(deserializer)?;
+        if document.create_coverage == CreationCoverage::Owned && document.creations.is_none() {
+            return Err(serde::de::Error::custom(
+                "owned Create coverage has no explicit producer ledger",
+            ));
+        }
+        Ok(Self {
+            coverage: document.coverage,
+            launches: document.launches,
+            preparations: document.preparations,
+            creations: document.creations.unwrap_or_default(),
+            create_coverage: document.create_coverage,
+        })
+    }
+}
 impl Default for RunnerExecutionJournal {
     fn default() -> Self {
         Self {
@@ -198,6 +239,8 @@ impl Default for RunnerExecutionJournal {
             },
             launches: Vec::new(),
             preparations: Vec::new(),
+            creations: Vec::new(),
+            create_coverage: CreationCoverage::Unknown,
         }
     }
 }
@@ -208,6 +251,8 @@ impl RunnerExecutionJournal {
             coverage: Coverage::Complete,
             launches: Vec::new(),
             preparations: Vec::new(),
+            creations: Vec::new(),
+            create_coverage: CreationCoverage::Owned,
         }
     }
 
@@ -279,6 +324,13 @@ impl RunnerExecutionJournal {
     }
 
     pub(crate) fn proves_quiescent(&self) -> bool {
+        self.create_coverage == CreationCoverage::Owned
+            && self.creations.iter().all(|record| record.proves_retired())
+            && self.proves_runner_quiescent()
+    }
+
+    /// Runner admission/stop is not destructive Create/container retirement.
+    pub(crate) fn proves_runner_quiescent(&self) -> bool {
         self.proves_for(None)
     }
     pub(crate) fn owns_record(
@@ -346,6 +398,7 @@ pub(crate) fn with_current_execution_row<T>(
 }
 
 fn ensure_unique_owner(storage: &Storage, id: &str) -> Result<()> {
+    super::retained_intents::ensure_id_available(id)?;
     let directory = storage
         .sessions_path()
         .parent()
@@ -435,6 +488,8 @@ fn prepare_locked<'a>(
         plan: origin.plan.clone(),
         generation,
         births: origin.births.clone(),
+        creations: origin.creations.clone(),
+        create_coverage: origin.create_coverage,
     });
     let mut retirement_scope = prepared.clone();
     let mut retirement_stop = None;
@@ -509,7 +564,7 @@ fn prepare_locked<'a>(
             "session already has unfinished launch preparation");
         match operation {
             crate::acp::runner_lifecycle::NativeResume::Spawn => {
-                anyhow::ensure!(row.runner_journal.proves_quiescent(),
+                anyhow::ensure!(row.runner_journal.proves_runner_quiescent(),
                     "runner history does not prove quiescence before launch preparation");
                 if let Some(record) = crate::process::worker_registry::load_strict(id)? {
                     retire_quiescent_record_locked(storage, &record, &row.runner_journal, None)?;
@@ -550,7 +605,7 @@ struct LaunchPlan {
     execution: ExecutionPlan,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ExecutionPlan {
     session_id: String,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -584,6 +639,8 @@ pub struct LaunchOrigin {
     plan: std::sync::Arc<LaunchPlan>,
     generation: u64,
     births: std::sync::Arc<[NativeBirthKey]>,
+    creations: std::sync::Arc<[native_create::CreateExecution]>,
+    create_coverage: CreationCoverage,
 }
 
 impl std::fmt::Debug for LaunchOrigin {
@@ -648,6 +705,7 @@ impl LaunchOrigin {
     }
 
     fn capture_baseline_at(expected: &Instance, storage: std::sync::Arc<Storage>) -> Result<Self> {
+        super::retained_intents::ensure_id_available(&expected.id)?;
         anyhow::ensure!(
             expected
                 .storage_origin
@@ -679,6 +737,8 @@ impl LaunchOrigin {
                 },
             }),
             generation: expected.lifecycle_generation,
+            creations: expected.runner_journal.creations.clone().into(),
+            create_coverage: expected.runner_journal.create_coverage,
             births: expected
                 .runner_journal
                 .launches()
@@ -766,6 +826,16 @@ impl LaunchOrigin {
     }
 
     fn same_birth_scope(&self, other: &Self) -> bool {
+        if self.create_coverage != other.create_coverage
+            || self.creations.len() != other.creations.len()
+            || !self
+                .creations
+                .iter()
+                .zip(other.creations.iter())
+                .all(|(a, b)| a.same_record(b))
+        {
+            return false;
+        }
         if self.births == other.births {
             return true;
         }
@@ -875,6 +945,7 @@ impl LaunchOrigin {
     }
 
     fn validate_plan_at(&self, row: &Instance, generation: u64, trashed: bool) -> Result<()> {
+        super::retained_intents::ensure_id_available(&self.plan.session_id)?;
         anyhow::ensure!(
             self.plan_matches_at(row, generation, trashed),
             "original lifecycle or execution plan was superseded"
@@ -883,6 +954,16 @@ impl LaunchOrigin {
     }
 
     pub(super) fn validate_native_history(&self, row: &Instance) -> Result<()> {
+        anyhow::ensure!(
+            self.create_coverage == row.runner_journal.create_coverage
+                && self.creations.len() == row.runner_journal.creations.len()
+                && self
+                    .creations
+                    .iter()
+                    .zip(row.runner_journal.creations.iter())
+                    .all(|(a, b)| a.same_record(b)),
+            "original Create native scope changed without its producer ACK"
+        );
         anyhow::ensure!(
             row.runner_journal
                 .launches()
@@ -935,6 +1016,8 @@ impl LaunchOrigin {
             plan: self.plan.clone(),
             generation: self.generation,
             births: births.into(),
+            creations: self.creations.clone(),
+            create_coverage: self.create_coverage,
         }))
     }
 
@@ -956,6 +1039,8 @@ impl LaunchOrigin {
             plan: self.plan.clone(),
             generation: self.generation,
             births: births.into(),
+            creations: self.creations.clone(),
+            create_coverage: self.create_coverage,
         }))
     }
 
@@ -1055,6 +1140,7 @@ pub(crate) struct OwnedStop {
     operation: LifecycleOperation,
     finished: std::sync::atomic::AtomicBool,
     acknowledged: std::sync::Mutex<Option<std::sync::Arc<LaunchOrigin>>>,
+    native_create: native_create::CreateNativeCustody,
 }
 
 impl OwnedStop {
@@ -1115,6 +1201,7 @@ impl OwnedStop {
             generation,
             operation,
             acknowledged: std::sync::Mutex::new(None),
+            native_create: Default::default(),
             finished: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -1143,6 +1230,7 @@ impl OwnedStop {
                 row.lifecycle_reservation_is_owned(self.operation, self.generation),
                 "projection writer lost its original claim"
             );
+            let reservation = row.lifecycle_reservation.clone();
             let births: Vec<_> = row
                 .runner_journal
                 .launches()
@@ -1154,6 +1242,7 @@ impl OwnedStop {
                 row.id == self.session_id()
                     && row.created_at == self.original.plan.created_at
                     && row.lifecycle_generation == self.generation
+                    && row.lifecycle_reservation.as_ref() == reservation.as_ref()
                     && row.lifecycle_reservation_is_owned(self.operation, self.generation)
                     && births.iter().copied().eq(row
                         .runner_journal
@@ -1215,6 +1304,8 @@ impl OwnedStop {
         }
         std::sync::Arc::new(LaunchOrigin {
             plan: projection.plan.clone(),
+            creations: projection.creations.clone(),
+            create_coverage: self.original.create_coverage,
             generation: self.generation,
             births: self.original.births.clone(),
         })
@@ -1234,7 +1325,9 @@ impl OwnedStop {
             .context("original session disappeared during stop")?;
         self.current_projection()
             .validate_baseline_at(&row, self.generation)?;
-        self.original.validate_native_history(&row)?;
+        if self.operation != LifecycleOperation::Create {
+            self.original.validate_native_history(&row)?;
+        }
         anyhow::ensure!(
             row.lifecycle_reservation_is_owned(self.operation, self.generation),
             "original stop claim was superseded"
@@ -1677,6 +1770,7 @@ fn record_stop_endpoint_under_original_fences(
 ) -> Result<()> {
     let storage = original.storage();
     storage.verify_profile_identity()?;
+    ensure_unique_owner(storage, original.session_id())?;
     anyhow::ensure!(
         born.birth_is_complete()
             && born.pid == std::process::id()
@@ -2021,6 +2115,7 @@ pub(crate) fn capture_unique_origin(id: &str) -> Result<std::sync::Arc<LaunchOri
     LaunchOrigin::capture(&row)
 }
 fn find_stored_owner_locked(id: &str) -> Result<Option<Storage>> {
+    super::retained_intents::ensure_id_available(id)?;
     let mut found: Option<(Storage, std::fs::Metadata)> = None;
     for profile in super::list_profiles_for_worktree_inventory()? {
         let storage = Storage::open_unwatched(&profile)?;
@@ -2220,8 +2315,17 @@ pub(crate) enum JournalScope {
     Stop(std::sync::Arc<OwnedStop>),
     Launch(std::sync::Arc<LaunchOrigin>),
 }
-
 impl JournalScope {
+    fn proves_settled(&self, journal: &RunnerExecutionJournal, nonce: Option<[u8; 16]>) -> bool {
+        let destructive =
+            matches!(self, Self::Stop(stop) if stop.operation == LifecycleOperation::Purge);
+        if destructive {
+            journal.proves_quiescent() && journal.proves_for(nonce)
+        } else {
+            journal.proves_for(nonce)
+        }
+    }
+
     fn storage(&self) -> &Storage {
         match self {
             Self::Stop(stop) => stop.storage(),
@@ -2304,9 +2408,12 @@ pub(crate) async fn require_quiescent(scope: JournalScope) -> Result<()> {
     Ok(())
 }
 
-fn for_each_stored_session(mut visit: impl FnMut(Instance)) -> Result<()> {
+fn for_each_stored_session(
+    mut visit: impl FnMut(Instance),
+) -> Result<std::collections::HashSet<String>> {
     let _workspace = super::acquire_session_workspace_claim_lock()?;
     let _identity = super::acquire_session_identity_lock()?;
+    let retained = super::retained_intents::retained_ids_in(&super::get_app_dir()?)?;
     let mut directories = Vec::new();
     for profile in super::list_profiles_for_worktree_inventory()? {
         let storage = Storage::open_unwatched(&profile)?;
@@ -2324,17 +2431,22 @@ fn for_each_stored_session(mut visit: impl FnMut(Instance)) -> Result<()> {
         }
         directories.push(metadata);
         for row in storage.load_strict_for_worktree_ownership_locked()? {
-            visit(row);
+            // Retained owners are exclusions only, including an interrupted abort
+            // whose original profile row has not yet been removed.
+            if !retained.contains(&row.id) {
+                visit(row);
+            }
         }
     }
-    Ok(())
+    Ok(retained)
 }
 
 pub(crate) fn stored_session_ids() -> Result<Vec<String>> {
     let mut ids = std::collections::HashSet::new();
-    for_each_stored_session(|row| {
+    let retained = for_each_stored_session(|row| {
         ids.insert(row.id);
     })?;
+    ids.extend(retained);
     let mut ids: Vec<_> = ids.into_iter().collect();
     ids.sort_unstable();
     Ok(ids)
@@ -2343,7 +2455,7 @@ pub(crate) fn stored_session_ids() -> Result<Vec<String>> {
 pub(crate) fn retained_runner_session_ids() -> Result<std::collections::HashSet<String>> {
     let boot = current_boot().context("verified boot identity is unavailable")?;
     let mut ids = std::collections::HashSet::new();
-    for_each_stored_session(|row| {
+    let retained = for_each_stored_session(|row| {
         if row
             .runner_journal
             .launches()
@@ -2353,6 +2465,7 @@ pub(crate) fn retained_runner_session_ids() -> Result<std::collections::HashSet<
             ids.insert(row.id);
         }
     })?;
+    ids.extend(retained);
     Ok(ids)
 }
 
@@ -2509,7 +2622,7 @@ async fn settle_selected_owned(
     let scope_read = scope.clone();
     let (live, quiescent) = tokio::task::spawn_blocking(move || {
         let mut journal = snapshot(&scope_read, nonce)?;
-        let quiescent = journal.proves_for(nonce);
+        let quiescent = scope_read.proves_settled(&journal, nonce);
         let boot = current_boot().context("verified boot identity is unavailable")?;
         journal.launches.retain(|launch| {
             nonce.is_none_or(|nonce| nonce == launch.nonce) && !launch.is_quiescent(boot)
@@ -2660,7 +2773,7 @@ async fn settle_selected_owned(
             } else {
                 proof.await??
             };
-            let current = journal.proves_for(nonce);
+            let current = scope.proves_settled(&journal, nonce);
             if !current
                 && !upgraded
                 && control
@@ -2741,7 +2854,7 @@ async fn settle_selected_owned(
     }
     let quiescent = tokio::task::spawn_blocking(move || {
         let journal = snapshot(&scope, nonce)?;
-        anyhow::ensure!(journal.proves_for(nonce), "runner execution is not proven quiescent; retain the session and checkout. Legacy unknown history requires a verified boot change");
+        anyhow::ensure!(scope.proves_settled(&journal, nonce), "original native execution remains unproven; retain the session and checkout. A host boot change does not retire unknown Create/container authority");
         for (path, identity, _connection, _, _, _) in authenticated_endpoints {
             crate::process::worker_registry::retire_endpoint(scope.session_id(), &path, &identity)?;
         }
@@ -2755,6 +2868,60 @@ async fn settle_selected_owned(
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    #[serial_test::serial]
+    fn retained_intent_refuses_original_scope_even_with_its_source_row() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = super::super::test_support::isolate_app_dir_at(temporary.path());
+        super::super::retained_intents::initialize_legacy_in(&super::super::get_app_dir().unwrap())
+            .unwrap();
+        let storage = Storage::new_unwatched("default").unwrap();
+        let mut row = Instance::new("retained", temporary.path().to_str().unwrap());
+        row.runner_journal = RunnerExecutionJournal::default();
+        row.status = super::super::Status::Creating;
+        row.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Create,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        row.lifecycle_reservation.as_mut().unwrap().path_claims =
+            super::super::WorktreePathClaims::Unknown(None);
+        let source = serde_json::to_vec(&vec![&row]).unwrap();
+        std::fs::write(storage.sessions_path(), &source).unwrap();
+        row.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+        let original = LaunchOrigin::capture(&row).unwrap();
+        original
+            .validate_baseline_at(&row, row.lifecycle_generation)
+            .unwrap();
+        let selection = super::super::retained_intents::capture(&storage, &row.id).unwrap();
+        super::super::retained_intents::abort(&selection).unwrap();
+        // Recreate precisely the interrupted append-before-removal state.
+        std::fs::write(storage.sessions_path(), &source).unwrap();
+        assert!(LaunchOrigin::capture(&row).is_err());
+        assert!(original
+            .validate_baseline_at(&row, row.lifecycle_generation)
+            .is_err());
+        assert!(capture_unique_origin(&row.id).is_err());
+        assert!(original
+            .with_storage::<()>(|_, _| panic!("retained original ran an effect"))
+            .is_err());
+        assert!(admit_runner_prompt::<()>(
+            &storage,
+            &row.id,
+            std::process::id(),
+            row.lifecycle_generation,
+            Uuid::nil(),
+            || panic!("retained prompt ran an effect"),
+        )
+        .is_err());
+        let exclusions = for_each_stored_session(|_| panic!("retained row was visited")).unwrap();
+        assert!(exclusions.contains(&row.id));
+        assert_eq!(stored_session_ids().unwrap(), vec![row.id]);
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), source);
+    }
+
     #[test]
     #[serial_test::serial]
     fn merge_launch_plan_rejects_changed_naming_and_provider() {
@@ -3029,6 +3196,8 @@ mod tests {
                     )
                     .unwrap();
                 row.runner_journal = RunnerExecutionJournal {
+                    creations: Vec::new(),
+                    create_coverage: CreationCoverage::Owned,
                     coverage: Coverage::Complete,
                     preparations: Vec::new(),
                     launches: vec![RunnerLaunch {

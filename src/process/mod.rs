@@ -28,6 +28,50 @@ use linux as platform;
 use macos as platform;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
+    pub(super) struct OwnedCreateRoot;
+    impl OwnedCreateRoot {
+        pub(super) fn prepare(_: super::ProcessIncarnation) -> anyhow::Result<Self> {
+            anyhow::bail!("owned native Create is unsupported on this OS")
+        }
+        pub(super) fn release(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("owned native Create is unsupported on this OS")
+        }
+        pub(super) fn retire(
+            &mut self,
+            _: &mut std::process::Child,
+            _: &tokio_util::sync::CancellationToken,
+            _: impl FnMut(super::CreateObservation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<super::CreateRetirement> {
+            anyhow::bail!("owned native Create is unsupported on this OS")
+        }
+    }
+    pub(super) fn hold_owned_create_bootstrap() -> anyhow::Result<()> {
+        anyhow::bail!("owned native Create is unsupported on this OS")
+    }
+    pub(super) fn exec_owned_create(
+        _: &std::ffi::CString,
+        _: &std::fs::File,
+        _: &std::fs::File,
+        _: &[std::ffi::CString],
+        _: &[std::ffi::CString],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("owned native Create is unsupported on this OS")
+    }
+    pub(super) fn owned_create_descendant_traceable() -> bool {
+        false
+    }
+    pub(super) fn owned_create_anchor_path(
+        _: &std::fs::File,
+        _: u32,
+    ) -> anyhow::Result<(std::ffi::OsString, bool)> {
+        anyhow::bail!("owned native Create is unsupported on this OS")
+    }
+    pub(super) fn install_owned_create_anchors(
+        _: &[std::fs::File],
+        _: &[u32],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("owned native Create is unsupported on this OS")
+    }
     pub(super) fn configure_process_group(_: &mut std::process::Command) {}
 
     pub(super) fn kill_process_group(_: &std::process::Child) {}
@@ -45,6 +89,64 @@ mod platform {
     pub(super) fn process_group_has_live_members(_pgrp: u32) -> std::io::Result<bool> {
         Ok(false)
     }
+}
+
+pub(crate) enum CreateObservation {
+    Birth(ProcessIncarnation),
+    ExternalDomain,
+    ScopeUnproven,
+}
+pub(crate) struct CreateRetirement {
+    pub(crate) status: ExitStatus,
+    pub(crate) raw_status: i32,
+    pub(crate) descendants_retired: bool,
+    pub(crate) group_retired: bool,
+    pub(crate) external_domain: bool,
+}
+pub(crate) struct OwnedCreateRoot(platform::OwnedCreateRoot);
+impl OwnedCreateRoot {
+    pub(crate) fn prepare(birth: ProcessIncarnation) -> anyhow::Result<Self> {
+        platform::OwnedCreateRoot::prepare(birth).map(Self)
+    }
+    pub(crate) fn release(&mut self) -> anyhow::Result<()> {
+        self.0.release()
+    }
+    pub(crate) fn retire(
+        &mut self,
+        child: &mut Child,
+        cancel: &CancellationToken,
+        admit: impl FnMut(CreateObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<CreateRetirement> {
+        self.0.retire(child, cancel, admit)
+    }
+}
+pub(crate) fn hold_owned_create_bootstrap() -> anyhow::Result<()> {
+    platform::hold_owned_create_bootstrap()
+}
+pub(crate) fn exec_owned_create(
+    program: &std::ffi::CString,
+    executable: &std::fs::File,
+    directory: &std::fs::File,
+    argv: &[std::ffi::CString],
+    env: &[std::ffi::CString],
+) -> anyhow::Result<()> {
+    platform::exec_owned_create(program, executable, directory, argv, env)
+}
+
+pub(crate) fn owned_create_descendant_traceable() -> bool {
+    platform::owned_create_descendant_traceable()
+}
+pub(crate) fn owned_create_anchor_path(
+    file: &std::fs::File,
+    slot: u32,
+) -> anyhow::Result<(std::ffi::OsString, bool)> {
+    platform::owned_create_anchor_path(file, slot)
+}
+pub(crate) fn install_owned_create_anchors(
+    files: &[std::fs::File],
+    slots: &[u32],
+) -> anyhow::Result<()> {
+    platform::install_owned_create_anchors(files, slots)
 }
 
 /// Lower the child's scheduling and I/O priority where the OS supports it.
@@ -332,6 +434,112 @@ pub struct ProcessIncarnation {
     pub(crate) group: u32,
     pub(crate) start: [u64; 2],
     pub(crate) namespace: [u64; 2],
+}
+
+/// Durable liveness metadata, never an execution or cleanup capability.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OriginalCustodianBirth {
+    pub(crate) boot: String,
+    pub(crate) process: ProcessIncarnation,
+    pub(crate) profile: crate::session::DirectoryIdentity,
+    pub(crate) session_id: String,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustodianLiveness {
+    Live,
+    Lost,
+    Uncertain,
+}
+
+impl OriginalCustodianBirth {
+    pub(crate) fn capture(
+        storage: &crate::session::Storage,
+        row: &crate::session::Instance,
+    ) -> anyhow::Result<Self> {
+        storage.verify_profile_identity()?;
+        let profile = storage.original_profile_identity()?;
+        anyhow::ensure!(
+            profile.is_durable(),
+            "custodian profile has no durable birth"
+        );
+        let boot = boot_id().ok_or_else(|| anyhow::anyhow!("custodian boot is unavailable"))?;
+        let process = process_incarnation(std::process::id())?
+            .ok_or_else(|| anyhow::anyhow!("original custodian process is unavailable"))?;
+        anyhow::ensure!(
+            process.start[0] != 0 && boot_id().as_deref() == Some(boot.as_str()),
+            "custodian process birth cannot be verified"
+        );
+        Ok(Self {
+            boot,
+            process,
+            profile,
+            session_id: row.id.clone(),
+            created_at: row.created_at,
+            generation: row.lifecycle_generation,
+        })
+    }
+
+    pub(crate) fn observe(&self) -> CustodianLiveness {
+        let boot = boot_id();
+        let namespace = process_namespace();
+        if self.boot.is_empty()
+            || self.process.start[0] == 0
+            || !(2..=i32::MAX as u32).contains(&self.process.pid)
+            || boot.as_deref() != Some(self.boot.as_str())
+            || namespace.as_ref().ok() != Some(&self.process.namespace)
+        {
+            return CustodianLiveness::Uncertain;
+        }
+        let observed = process_incarnation(self.process.pid);
+        let absent = if matches!(&observed, Ok(None)) {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                platform::custodian_process_absent(self.process.pid)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                false
+            }
+        } else {
+            false
+        };
+        self.classify(boot.as_deref(), namespace, observed, absent)
+    }
+
+    fn classify(
+        &self,
+        boot: Option<&str>,
+        namespace: std::io::Result<[u64; 2]>,
+        observed: std::io::Result<Option<ProcessIncarnation>>,
+        absent: bool,
+    ) -> CustodianLiveness {
+        if self.boot.is_empty()
+            || self.process.start[0] == 0
+            || !(2..=i32::MAX as u32).contains(&self.process.pid)
+            || boot != Some(self.boot.as_str())
+            || namespace.as_ref().ok() != Some(&self.process.namespace)
+        {
+            return CustodianLiveness::Uncertain;
+        }
+        match observed {
+            Ok(Some(process))
+                if process.pid == self.process.pid
+                    && process.start[0] != 0
+                    && process.namespace == self.process.namespace =>
+            {
+                if process.start == self.process.start {
+                    CustodianLiveness::Live
+                } else {
+                    CustodianLiveness::Lost
+                }
+            }
+            Ok(None) if absent => CustodianLiveness::Lost,
+            _ => CustodianLiveness::Uncertain,
+        }
+    }
 }
 
 pub(crate) fn process_namespace() -> std::io::Result<[u64; 2]> {
@@ -640,6 +848,114 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custodian_liveness_requires_same_boot_namespace_and_exact_birth() {
+        let birth = OriginalCustodianBirth {
+            boot: "boot".into(),
+            process: ProcessIncarnation {
+                pid: 4312,
+                group: 4312,
+                start: [123, 456],
+                namespace: [7, 8],
+            },
+            profile: crate::session::DirectoryIdentity {
+                device: 1,
+                inode: 2,
+                birth_time: Some(std::time::UNIX_EPOCH),
+            },
+            session_id: "owner".into(),
+            created_at: chrono::Utc::now(),
+            generation: 4,
+        };
+        let mut changed_group = birth.process;
+        changed_group.group += 1;
+        let mut recycled = birth.process;
+        recycled.start[0] += 1;
+        let mut foreign = birth.process;
+        foreign.namespace[1] += 1;
+        for (boot, namespace, observed, absent, expected) in [
+            (
+                Some("boot"),
+                Ok([7, 8]),
+                Ok(Some(birth.process)),
+                false,
+                CustodianLiveness::Live,
+            ),
+            (
+                Some("boot"),
+                Ok([7, 8]),
+                Ok(Some(changed_group)),
+                false,
+                CustodianLiveness::Live,
+            ),
+            (
+                Some("boot"),
+                Ok([7, 8]),
+                Ok(Some(recycled)),
+                false,
+                CustodianLiveness::Lost,
+            ),
+            (
+                Some("boot"),
+                Ok([7, 8]),
+                Ok(Some(foreign)),
+                false,
+                CustodianLiveness::Uncertain,
+            ),
+            (
+                Some("boot"),
+                Ok([7, 8]),
+                Ok(None),
+                false,
+                CustodianLiveness::Uncertain,
+            ),
+            (
+                Some("boot"),
+                Ok([7, 8]),
+                Ok(None),
+                true,
+                CustodianLiveness::Lost,
+            ),
+            (
+                Some("boot"),
+                Ok([7, 9]),
+                Ok(None),
+                true,
+                CustodianLiveness::Uncertain,
+            ),
+            (
+                Some("next-boot"),
+                Ok([7, 8]),
+                Ok(None),
+                true,
+                CustodianLiveness::Uncertain,
+            ),
+            (
+                None,
+                Ok([7, 8]),
+                Ok(None),
+                true,
+                CustodianLiveness::Uncertain,
+            ),
+            (
+                Some("boot"),
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                Ok(None),
+                true,
+                CustodianLiveness::Uncertain,
+            ),
+            (
+                Some("boot"),
+                Ok([7, 8]),
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                false,
+                CustodianLiveness::Uncertain,
+            ),
+        ] {
+            assert_eq!(birth.classify(boot, namespace, observed, absent), expected);
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

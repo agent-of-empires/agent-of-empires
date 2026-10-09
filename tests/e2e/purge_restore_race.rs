@@ -32,6 +32,7 @@ fn inject_reservation(h: &TuiTestHarness, title: &str, operation: &str) {
         "generation": generation,
         "at": chrono::Utc::now().to_rfc3339(),
         "path_claims": { "state": "none" },
+        "custodian": null,
     });
     write_sessions(h, &value);
 }

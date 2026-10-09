@@ -91,7 +91,11 @@ fn enter_and_tab_route_by_default_attach_mode() {
             );
         }
         env.view.view_mode = view_mode.clone();
-        let action = env.view.handle_key(key(code), None);
+        let action = {
+            let result = env.view.handle_key(key(code), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         let ok = match expect {
             Expect::Attach => action == Some(Action::AttachSession(id.clone())),
             Expect::Live => action == Some(Action::EnterLiveSend(id.clone())),
@@ -121,7 +125,11 @@ fn tab_in_terminal_view_swaps_to_attach_terminal_when_default_is_live_send() {
     env.view.cursor = 0;
     env.view.update_selected();
     env.view.view_mode = crate::tui::home::ViewMode::Terminal;
-    let action = env.view.handle_key(key(KeyCode::Tab), None);
+    let action = {
+        let result = env.view.handle_key(key(KeyCode::Tab), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         matches!(&action, Some(Action::AttachTerminal(returned_id, _)) if returned_id == &id),
         "Tab in Terminal view with LiveSend default must AttachTerminal, got {:?}",
@@ -141,7 +149,11 @@ fn m_in_terminal_view_targets_terminal_pane() {
     env.view.cursor = 0;
     env.view.update_selected();
     env.view.view_mode = crate::tui::home::ViewMode::Terminal;
-    let _ = env.view.handle_key(key(KeyCode::Char('m')), None);
+    let _ = {
+        let result = env.view.handle_key(key(KeyCode::Char('m')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.send_message_dialog.is_some(),
         "Terminal view 'm' must open the compose dialog even when \
@@ -272,7 +284,11 @@ fn view_switch_auto_starts_live_send_only_when_enabled() {
         env.view.update_selected();
         env.view.tool_hotkey_cache =
             vec![("lazygit".to_string(), KeyCode::Char('g'), KeyModifiers::ALT)];
-        let action = env.view.handle_key(key_event, None);
+        let action = {
+            let result = env.view.handle_key(key_event, None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(env.view.view_mode, expected_view, "{mode:?} {on_switch}");
         if live {
             assert_eq!(
@@ -502,7 +518,11 @@ fn footer_hides_tab_hint_for_structured_sessions() {
 #[serial]
 fn send_message_opens_structured_view() {
     let (mut env, id) = structured_session_env();
-    let action = env.view.handle_key(key(KeyCode::Char('m')), None);
+    let action = {
+        let result = env.view.handle_key(key(KeyCode::Char('m')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         matches!(&action, Some(Action::OpenStructuredView(returned_id)) if returned_id == &id),
         "m must open the structured composer for the selected session, got {action:?}"
@@ -517,7 +537,11 @@ fn send_message_opens_structured_view() {
 fn send_message_drains_pending_paste_for_structured_view() {
     let (mut env, id) = structured_session_env();
     env.view.pending_paste = Some("cached text".to_string());
-    env.view.handle_key(key(KeyCode::Char('m')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('m')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(
         env.view.pending_paste, None,
         "pending_paste must be drained when routing to structured view"
@@ -536,9 +560,17 @@ fn send_message_drains_pending_paste_for_structured_view() {
 fn send_message_merges_buffered_paste_for_same_session() {
     let (mut env, id) = structured_session_env();
     env.view.pending_paste = Some("first ".to_string());
-    env.view.handle_key(key(KeyCode::Char('m')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('m')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     env.view.pending_paste = Some("second".to_string());
-    env.view.handle_key(key(KeyCode::Char('m')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('m')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(
         env.view.pending_paste_for_structured_view.get(&id),
         Some(&"first second".to_string()),
@@ -553,7 +585,11 @@ fn send_message_merges_buffered_paste_for_same_session() {
 fn send_message_keeps_buffered_paste_per_session() {
     let (mut env, id_a) = structured_session_env();
     env.view.pending_paste = Some("session a draft".to_string());
-    env.view.handle_key(key(KeyCode::Char('m')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('m')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     let other = add_session(&mut env.view, "acp-two");
     env.view.mutate_instance(&other, |inst| {
         inst.view = crate::session::View::Structured;
@@ -562,7 +598,11 @@ fn send_message_keeps_buffered_paste_per_session() {
     env.view.pending_paste = Some("session b draft".to_string());
     // Select the other structured session and press 'm' again.
     env.view.select_session_by_id(&other);
-    env.view.handle_key(key(KeyCode::Char('m')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('m')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(
         env.view.pending_paste_for_structured_view.get(&other),
         Some(&"session b draft".to_string()),

@@ -279,9 +279,24 @@ fn test_session_context_menu_snooze_toggle() {
         .clone()
         .expect("a session should be selected");
 
-    env.view.snooze_session_for(&id, 60).unwrap();
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    (|| -> anyhow::Result<Option<String>> {
+        let _disposition = env.view.snooze_session_for(&id, 60)?;
+        drain_persistence(&mut env.view)?;
+        match env
+            .view
+            .take_persistence_action()
+            .map(super::super::PersistenceAction::into_action)
+        {
+            Some(Action::SetTransientStatus(message)) => Ok(Some(message)),
+            _ => Ok(None),
+        }
+    })()
+    .unwrap();
+    {
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(
         env.view.snooze_duration_dialog.is_none(),
         "waking a snoozed session must not open the duration picker"
@@ -294,8 +309,11 @@ fn test_session_context_menu_snooze_toggle() {
     env.view.sort_order = SortOrder::Attention;
     env.view.flat_items = env.view.build_flat_items();
     env.view.select_session_by_id(&id);
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    {
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(
         env.view.snooze_duration_dialog.is_some(),
         "context-menu Snooze on an active session must open the duration picker"
@@ -332,7 +350,11 @@ fn test_shift_n_prefills_from_selected_session() {
         env.view.update_selected();
         env.view.new_dialog = None;
 
-        env.view.handle_key(key(KeyCode::Char('N')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('N')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
         assert_eq!(dialog.path_value(), path, "{title}");
         assert_eq!(dialog.group_value(), "", "{title}");
@@ -379,7 +401,14 @@ fn test_rename_selected_group_with_children() {
             old_path: old.to_string(),
             old_profile: "test".to_string(),
         });
-        view.rename_selected_group(Some(new), None).unwrap();
+        {
+            let submitted = view.rename_selected_group(Some(new), None);
+            await_transaction_result(
+                &mut view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         let tree = view.group_trees.get("test").unwrap();
         assert!(
             !tree.group_exists(old),
@@ -443,7 +472,14 @@ fn test_rename_group_noop_and_duplicate() {
     };
 
     env.view.group_rename_context = Some(context());
-    env.view.rename_selected_group(Some("work"), None).unwrap();
+    {
+        let submitted = env.view.rename_selected_group(Some("work"), None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     let work_session = env
         .view
         .instances()
@@ -453,15 +489,27 @@ fn test_rename_group_noop_and_duplicate() {
 
     env.view.group_rename_context = Some(context());
     assert!(
-        env.view
-            .rename_selected_group(Some("personal"), None)
-            .is_err(),
+        {
+            let submitted = env.view.rename_selected_group(Some("personal"), None);
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .is_err(),
         "renaming to an existing group should fail"
     );
 
     env.view.sort_order = crate::session::config::SortOrder::AZ;
     env.view.group_rename_context = Some(context());
-    env.view.rename_selected_group(Some("aaa"), None).unwrap();
+    {
+        let submitted = env.view.rename_selected_group(Some("aaa"), None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     let group_items: Vec<&str> = env
         .view
         .flat_items
@@ -502,8 +550,14 @@ fn test_move_explicit_empty_group_between_profiles() {
         old_profile: "alpha".to_string(),
     });
 
-    view.rename_selected_group(Some("moved-empty"), Some("beta"))
-        .unwrap();
+    {
+        let submitted = view.rename_selected_group(Some("moved-empty"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
 
     assert!(Storage::new_unwatched("alpha")
         .unwrap()
@@ -556,9 +610,14 @@ fn test_group_profile_move_rejects_concurrent_fresh_member_without_metadata_spli
             Ok(())
         })
         .unwrap();
-    let error = view
-        .rename_selected_group(Some("moved-team"), Some("beta"))
-        .expect_err("a concurrent group member must abort the move");
+    let error = {
+        let submitted = view.rename_selected_group(Some("moved-team"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("a concurrent group member must abort the move");
     let message = format!("{error:#}");
     assert!(
         message.contains("group membership changed while the cross-profile move was pending"),
@@ -618,7 +677,14 @@ fn test_group_profile_move_is_all_or_nothing() {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    assert!(view.rename_selected_group(None, Some("beta")).is_err());
+    assert!({
+        let submitted = view.rename_selected_group(None, Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .is_err());
     assert_eq!(source.load().unwrap().len(), 2);
     assert_eq!(target.load().unwrap().len(), 1);
     let (_, source_groups) = source.load_with_groups().unwrap();
@@ -639,7 +705,14 @@ fn test_group_profile_move_is_all_or_nothing() {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    view.rename_selected_group(None, Some("beta")).unwrap();
+    {
+        let submitted = view.rename_selected_group(None, Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(source.load().unwrap().is_empty());
     assert_eq!(target.load().unwrap().len(), 2);
     let published: Vec<_> = view
@@ -700,9 +773,14 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         old_profile: "alpha".to_string(),
     });
 
-    let error = view
-        .rename_selected_group(Some("moved"), Some("beta"))
-        .expect_err("a creating member must reject the complete group move");
+    let error = {
+        let submitted = view.rename_selected_group(Some("moved"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("a creating member must reject the complete group move");
 
     assert!(error.to_string().contains("being created"));
     assert!(view
@@ -723,9 +801,14 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    let error = view
-        .rename_selected_group(Some("moved"), Some("beta"))
-        .expect_err("a deleting member must reject the complete group move");
+    let error = {
+        let submitted = view.rename_selected_group(Some("moved"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("a deleting member must reject the complete group move");
     assert!(error.to_string().contains("being deleted"));
     assert_eq!(source.load().unwrap().len(), 2);
     assert!(target.load().unwrap().is_empty());
@@ -735,6 +818,7 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         generation: 1,
         at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
         path_claims: crate::session::WorktreePathClaims::None,
+        custodian: None,
     };
     view.mutate_instance(&second.id, |instance| {
         instance.status = Status::Idle;
@@ -757,8 +841,14 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         old_profile: "alpha".to_string(),
     });
 
-    view.rename_selected_group(Some("moved"), Some("beta"))
-        .expect("expired reservation must not block the group move");
+    {
+        let submitted = view.rename_selected_group(Some("moved"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect("expired reservation must not block the group move");
     assert!(source.load().unwrap().is_empty());
     assert_eq!(target.load().unwrap().len(), 2);
 }
@@ -770,11 +860,19 @@ fn test_q_in_search_mode_types_q_not_quit() {
     let mut view = env.view;
 
     assert!(!view.has_dialog());
-    view.handle_key(key(KeyCode::Char('/')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(view.search_active);
     assert!(view.has_dialog(), "active search counts as a dialog");
 
-    let action = view.handle_key(key(KeyCode::Char('q')), None);
+    let action = {
+        let result = view.handle_key(key(KeyCode::Char('q')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert_eq!(action, None);
     assert!(view.search_active);
     assert_eq!(view.search_query.value(), "q");
@@ -842,6 +940,7 @@ fn apply_creation_results_finalizes_persisted_stub() {
         creation_data(&project_dir, "Async Test", "async-success"),
         gate.hooks(),
     );
+    drain_persistence(&mut view).unwrap();
     assert!(view.is_creation_pending());
     let stub_id = view
         .creating_stub_id
@@ -849,7 +948,11 @@ fn apply_creation_results_finalizes_persisted_stub() {
         .expect("request should install a Creating stub");
     let original_dob = view.get_instance(&stub_id).unwrap().created_at;
     gate.wait();
-    view.save().unwrap();
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
     let (persisted_while_creating, groups_while_creating) = storage.load_with_groups().unwrap();
     assert_eq!(persisted_while_creating.len(), 1);
     assert_eq!(persisted_while_creating[0].id, stub_id);
@@ -874,13 +977,6 @@ fn apply_creation_results_finalizes_persisted_stub() {
     assert!(
         view.get_instance(&session_id).is_some(),
         "created session should be findable after apply_creation_results"
-    );
-    assert!(
-        !view
-            .pending_added
-            .get("default")
-            .is_some_and(|pending| pending.contains(&session_id)),
-        "a row committed by finalization is not a provisional pending add"
     );
     let (persisted_after_finalization, groups_after_finalization) =
         storage.load_with_groups().unwrap();
@@ -920,7 +1016,11 @@ fn apply_creation_results_finalizes_persisted_stub() {
             Ok(())
         })
         .unwrap();
-    view.save().unwrap();
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
     assert!(
         view.get_instance(&session_id).is_none(),
         "save must evict the peer-deleted finalized row from memory"
@@ -955,6 +1055,7 @@ fn cancelled_creation_is_not_revived_by_a_later_request() {
     view.request_creation(cancelled, None);
     view.cancel_creation();
     view.request_creation(creation_data(&project_dir, "Kept", ""), None);
+    drain_persistence(&mut view).unwrap();
 
     let session_id = drain_creation_result(&mut view).expect("the later request should finish");
     assert_eq!(view.get_instance(&session_id).unwrap().title, "Kept");
@@ -1001,6 +1102,7 @@ fn cancel_during_on_create_skips_on_launch() {
         },
     );
     view.request_creation(creation_data(&project_dir, "Hooked", ""), hooks);
+    drain_persistence(&mut view).unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !project_dir.join("create-started").exists() {
@@ -1051,7 +1153,11 @@ fn pending_creation_claim_rejects_peer_collision() {
         .get_mut("default")
         .unwrap()
         .create_group(parent_group);
-    view.save().unwrap();
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
     let gate = CreationHookGate::new(&project_dir);
     let branch = "raced-worktree";
     let mut data = creation_data(&project_dir, "Raced title", group);
@@ -1059,6 +1165,7 @@ fn pending_creation_claim_rejects_peer_collision() {
     data.worktree_branch = Some(branch.to_string());
     data.create_new_branch = true;
     view.request_creation(data, gate.hooks());
+    drain_persistence(&mut view).unwrap();
     let id = view.creating_stub_id.clone().unwrap();
     let original_dob = view.get_instance(&id).unwrap().created_at;
     gate.wait();
@@ -1081,7 +1188,11 @@ fn pending_creation_claim_rejects_peer_collision() {
             Ok(())
         })
         .is_err());
-    view.save().unwrap();
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
     let still_claimed = storage
         .load()
         .unwrap()
@@ -1150,6 +1261,7 @@ fn creation_result_does_not_carry_the_ownership_flocks() {
         creation_data(&project_dir, "Lock Test", "async-locks"),
         None,
     );
+    drain_persistence(&mut view).unwrap();
     let start = std::time::Instant::now();
     let result = loop {
         if let Some(result) = view.creation_poller.try_recv_result() {
@@ -1227,8 +1339,15 @@ fn test_cursor_follows_session_after_deletion() {
     };
     super::remove_test_instance(&mut env.view, &victim_id);
     env.view.rebuild_group_trees();
-    let _ = env.view.save();
-    env.view.reload().unwrap();
+    let _ = {
+        env.view.request_save();
+        drain_persistence(&mut env.view)
+    };
+    {
+        env.view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
 
     // Cursor should have followed the tracked session to its new position
     assert_eq!(
@@ -1259,6 +1378,7 @@ fn creation_delayed_in_native_hook_cannot_adopt_recreated_profile() {
         creation_data(&project_dir, "Retired", "old-provisional-group"),
         hooks,
     );
+    drain_persistence(&mut view).unwrap();
     wait_for_native_fixture("old profile creation entering on_create", || {
         project_dir.join("create-started").exists().then_some(())
     });
@@ -1291,9 +1411,18 @@ fn creation_delayed_in_native_hook_cannot_adopt_recreated_profile() {
         rows_before
     );
     assert_eq!(std::fs::read(&groups_path).unwrap(), groups_before);
-    assert!(view.save().is_err());
-    view.reload().unwrap();
+    assert!({
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .is_err());
+    {
+        view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut view)
+    }
+    .unwrap();
     view.request_creation(creation_data(&project_dir, "Fresh", ""), None);
+    drain_persistence(&mut view).unwrap();
     let id = drain_creation_result(&mut view).expect("an explicit reload admits a fresh creation");
     assert_eq!(view.get_instance(&id).unwrap().title, "Fresh");
     let (rows, groups) = replacement.load_with_groups().unwrap();
@@ -1305,4 +1434,76 @@ fn creation_delayed_in_native_hook_cannot_adopt_recreated_profile() {
     assert!(!groups
         .iter()
         .any(|group| group.path == "old-provisional-group"));
+}
+
+#[test]
+#[serial]
+fn retained_creation_confirmation_does_not_retarget_after_selection_changes() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    view.request_creation(creation_data(&project_dir, "Retained original", ""), None);
+    let original_id = view.creating_stub_id.clone().unwrap();
+    drain_persistence(&mut view).unwrap();
+    view.storages
+        .get_mut("default")
+        .unwrap()
+        .set_fail_writes_for_test(true);
+    assert_eq!(drain_creation_result(&mut view), None);
+    assert!(
+        drain_persistence(&mut view).is_err(),
+        "publication fence must report its actual failed ACK"
+    );
+    assert_eq!(
+        view.get_instance(&original_id).unwrap().status,
+        Status::Creating
+    );
+    view.storages
+        .get_mut("default")
+        .unwrap()
+        .set_fail_writes_for_test(false);
+    let other = Instance::new("Other", project_dir.to_str().unwrap());
+    let other_id = other.id.clone();
+    storage
+        .update(|rows, _| {
+            rows.push(other);
+            Ok(())
+        })
+        .unwrap();
+    view.request_reload(super::super::ReloadKind::Full);
+    drain_persistence(&mut view).unwrap();
+    view.selected_session = Some(original_id.clone());
+    view.prompt_creation_recovery(
+        super::super::persistence_transactions::CreationRecoveryAction::RetryPublication,
+    );
+    drain_persistence(&mut view).unwrap();
+    assert_eq!(
+        view.pending_creation_confirmation
+            .as_ref()
+            .unwrap()
+            .capture
+            .id,
+        original_id
+    );
+    view.selected_session = Some(other_id.clone());
+    view.submit_creation_confirmation();
+    drain_persistence(&mut view).unwrap();
+    assert_eq!(
+        view.persistence
+            .created
+            .pop_front()
+            .map(|ack| ack.session_id().to_owned()),
+        Some(original_id.clone())
+    );
+    let rows = storage.load().unwrap();
+    assert!(rows
+        .iter()
+        .any(|row| row.id == original_id && row.status != Status::Creating));
+    assert!(rows
+        .iter()
+        .any(|row| row.id == other_id && row.title == "Other"));
 }

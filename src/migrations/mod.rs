@@ -45,6 +45,9 @@ mod v035_custom_sort_order;
 mod v036_runner_execution_journal;
 mod v037_runner_preparation_custody;
 mod v038_worktree_path_claims;
+mod v039_owned_create_native_custody;
+mod v040_filesystem_claim_custodian;
+pub(crate) mod v041_retained_intents;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -90,7 +93,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 38;
+const CURRENT_VERSION: u32 = 41;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -231,6 +234,17 @@ const MIGRATIONS: &[Migration] = &[
         v037_runner_preparation_custody::run,
     ),
     (38, "worktree_path_claims", v038_worktree_path_claims::run),
+    (
+        39,
+        "owned_create_native_custody",
+        v039_owned_create_native_custody::run,
+    ),
+    (
+        40,
+        "filesystem_claim_custodian",
+        v040_filesystem_claim_custodian::run,
+    ),
+    (41, "retained_intents", v041_retained_intents::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -267,6 +281,18 @@ pub fn migrate_sandbox_store_for_with(
     let _installed = progress::install(reporter);
     v027_isolate_sandbox_stores::migrate_instance(id)?;
     v033_isolate_sandbox_content::migrate_instance(id)
+}
+
+pub(crate) fn migrate_sandbox_store_under_workspace_locks(
+    id: &str,
+    reporter: Option<progress::Reporter>,
+) -> Result<()> {
+    if get_current_version() < 27 {
+        return Ok(());
+    }
+    let _installed = progress::install(reporter);
+    v027_isolate_sandbox_stores::migrate_instance_under_workspace_locks(id)?;
+    v033_isolate_sandbox_content::migrate_instance_under_workspace_locks(id)
 }
 
 /// [`migrate_sandbox_store_for_with`] with the container probes injected, for
@@ -315,6 +341,7 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
         );
     }
     if current == CURRENT_VERSION {
+        crate::session::retained_intents::validate_current_app()?;
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         return v033_isolate_sandbox_content::reconcile_pending(announce);
     }

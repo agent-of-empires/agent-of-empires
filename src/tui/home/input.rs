@@ -7,14 +7,14 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{
-    live_send, DragKind, HomeView, PermissionResponseTarget, PreviewSelection, TerminalMode,
-    ViewMode,
+    live_send, persistence_transactions, DragKind, HomeView, PermissionResponseTarget,
+    PreviewSelection, TerminalMode, ViewMode,
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
 };
-use crate::session::{list_profiles_for_display, Item, Status};
+use crate::session::{list_profiles_for_display, Item, Status, Storage};
 use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
@@ -1005,7 +1005,15 @@ impl HomeView {
     /// actions run inline and return `None`. Shared by the keyboard Enter path and the
     /// mouse-click path so both produce the same end state.
     pub(super) fn dispatch_confirm_submit(&mut self, action: &str) -> Option<Action> {
+        if action != "creation_recovery" {
+            self.pending_creation_confirmation = None;
+            self.pending_claim_abort_confirmation = None;
+        }
         match action {
+            "creation_recovery" => {
+                self.submit_creation_confirmation();
+                None
+            }
             "delete_group" => {
                 if let Err(e) = self.delete_selected_group() {
                     tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
@@ -1375,6 +1383,8 @@ impl HomeView {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
+                        self.pending_creation_confirmation = None;
+                        self.pending_claim_abort_confirmation = None;
                         self.pending_stop_session = None;
                         self.pending_stop_terminal = None;
                         self.pending_stop_tool = None;
@@ -2166,6 +2176,8 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
+                    self.pending_creation_confirmation = None;
+                    self.pending_claim_abort_confirmation = None;
                     self.pending_stop_session = None;
                     self.pending_stop_terminal = None;
                     self.pending_stop_tool = None;
@@ -2423,33 +2435,35 @@ impl HomeView {
                     }
                     ProfilePickerAction::Created(name) => {
                         self.profile_picker_dialog = None;
-                        match crate::session::create_profile(&name) {
-                            Ok(()) => {
-                                if let Err(e) = self.switch_profile(Some(name)) {
-                                    tracing::error!(target: "tui.input", "Failed to switch to new profile: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Error",
-                                    &format!("Failed to create profile: {}", e),
-                                ));
-                            }
+                        if let Err(error) = self.request_transaction(
+                            persistence_transactions::TransactionRequest::CreateProfile(name),
+                        ) {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Profile creation failed",
+                                &format!("{error:#}"),
+                            ));
                         }
                     }
                     ProfilePickerAction::Deleted(name) => {
-                        match crate::session::delete_profile(&name) {
-                            Ok(()) => {
-                                self.rewire_after_profile_delete(&name);
-                                self.show_profile_picker();
-                            }
-                            Err(e) => {
-                                self.profile_picker_dialog = None;
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Error",
-                                    &format!("Failed to delete profile: {}", e),
-                                ));
-                            }
+                        let result = self
+                            .storages
+                            .get(&name)
+                            .cloned()
+                            .map(Ok)
+                            .unwrap_or_else(|| Storage::open(&name, self.file_watch.clone()))
+                            .and_then(|storage| {
+                                self.request_transaction(
+                                    persistence_transactions::TransactionRequest::DeleteProfile(
+                                        storage,
+                                    ),
+                                )
+                            });
+                        self.profile_picker_dialog = None;
+                        if let Err(error) = result {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Profile deletion failed",
+                                &format!("{error:#}"),
+                            ));
                         }
                     }
                 },
@@ -3431,7 +3445,7 @@ impl HomeView {
             }
         }
         crate::tmux::refresh_session_cache();
-        self.reload()?;
+        self.request_reload(super::ReloadKind::Full);
         Ok(())
     }
 
@@ -3473,7 +3487,7 @@ impl HomeView {
             }
         }
         crate::tmux::refresh_session_cache();
-        self.reload()?;
+        self.request_reload(super::ReloadKind::Full);
         Ok(())
     }
 
@@ -4240,6 +4254,17 @@ impl HomeView {
     }
 
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
+        if self
+            .enqueue_transaction(
+                persistence_transactions::TransactionRequest::SetSortOrder(new_order),
+                super::persistence_worker::SaveSnapshot {
+                    profiles: Vec::new(),
+                },
+            )
+            .is_err()
+        {
+            return;
+        }
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
             self.refresh_flat_items();
@@ -4248,24 +4273,25 @@ impl HomeView {
             self.rebuild_flat_items();
             self.reseat_cursor_after_rebuild();
         }
-        let sort_order = self.sort_order;
-        if let Err(e) = update_app_state(|state| {
-            state.sort_order = Some(sort_order);
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
-        }
+        // Keep the desired presentation on ACK failure; the lane displays the
+        // unsaved-preference error without rolling back newer input.
     }
 
     pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
+        if self
+            .enqueue_transaction(
+                persistence_transactions::TransactionRequest::SetGroupBy(new_mode),
+                super::persistence_worker::SaveSnapshot {
+                    profiles: Vec::new(),
+                },
+            )
+            .is_err()
+        {
+            return;
+        }
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
-        let group_by = self.group_by;
-        if let Err(e) = update_app_state(|state| {
-            state.group_by = Some(group_by);
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to save group_by mode: {}", e);
-        }
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header derived automatically
@@ -4323,11 +4349,10 @@ impl HomeView {
             if let Some(tree) = self.group_trees.get_mut(&profile) {
                 tree.toggle_collapsed(path);
             }
+            self.record_group_edit(&profile);
         }
         self.rebuild_flat_items();
-        if let Err(e) = self.save() {
-            tracing::error!(target: "tui.input", "Failed to save group state: {}", e);
-        }
+        self.request_save();
     }
 
     /// Forward one wheel notch to the previewed full-screen pane so it scrolls its own
@@ -4730,6 +4755,13 @@ impl HomeView {
                 }
             }
             if let super::Item::Session { id, .. } = &self.flat_items[idx] {
+                if self
+                    .get_instance(id)
+                    .is_some_and(|inst| inst.status == Status::Creating)
+                {
+                    self.context_menu = Some(ContextMenuDialog::for_creating_session(anchor));
+                    return true;
+                }
                 if self.get_instance(id).is_some_and(|inst| inst.is_trashed()) {
                     self.context_menu = Some(ContextMenuDialog::for_trashed_session(anchor));
                     return true;
@@ -4776,14 +4808,28 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
                 };
-                ContextMenuDialog::for_session(
+                let mut menu = ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
-                )
+                );
+                if let super::Item::Session { id, .. } = &self.flat_items[idx] {
+                    if self.get_instance(id).is_some_and(|row| {
+                        row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+                            matches!(
+                                lease.op,
+                                crate::session::LifecycleOperation::Create
+                                    | crate::session::LifecycleOperation::Attach
+                            ) && lease.path_claims.is_pending()
+                        })
+                    }) {
+                        menu = menu.with_abort_intent();
+                    }
+                }
+                menu
             });
             return true;
         }
@@ -4843,6 +4889,12 @@ impl HomeView {
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
         match action {
+            ContextMenuAction::RetryCreationPublication => self.prompt_creation_recovery(
+                persistence_transactions::CreationRecoveryAction::RetryPublication,
+            ),
+            ContextMenuAction::UndoCreation => self
+                .prompt_creation_recovery(persistence_transactions::CreationRecoveryAction::Undo),
+            ContextMenuAction::AbortIntent => self.prompt_claim_abort(),
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
             ContextMenuAction::ToggleArchive => {
@@ -5261,6 +5313,9 @@ impl HomeView {
         if let Some(session_id) = &self.selected_session {
             if let Some(inst) = self.get_instance(session_id) {
                 if inst.status == Status::Creating {
+                    self.prompt_creation_recovery(
+                        persistence_transactions::CreationRecoveryAction::Undo,
+                    );
                     return;
                 }
                 if inst.status == Status::Deleting {
@@ -6756,37 +6811,14 @@ impl HomeView {
         None
     }
 
-    /// Create a session with optional hooks, delegating to the background
-    /// `CreationPoller` when hooks are present, the session is sandboxed, or a worktree
-    /// branch is requested, so a slow `post-checkout` can't freeze the TUI.
+    /// Every creation uses the native builder worker and the durable publication lane.
     pub(super) fn create_session_with_hooks(
         &mut self,
         data: NewSessionData,
         hooks: Option<repo_config::ResolvedHooks>,
     ) -> Option<Action> {
-        let has_hooks = hooks
-            .as_ref()
-            .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());
-        let has_worktree = data.worktree_enabled;
-
-        if data.sandbox || has_hooks || has_worktree {
-            self.request_creation(data, hooks);
-            return None;
-        }
-
-        match self.create_session(data) {
-            Ok(session_id) => {
-                self.new_dialog = None;
-                Some(Action::AttachAfterCreate(session_id))
-            }
-            Err(e) => {
-                tracing::error!(target: "tui.input", "Failed to create session: {}", e);
-                if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_error(e.to_string());
-                }
-                None
-            }
-        }
+        self.request_creation(data, hooks);
+        None
     }
 }
 

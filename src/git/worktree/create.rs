@@ -43,17 +43,92 @@ enum FetchOutcome {
     TimedOut,
 }
 
+/// Execution mode is chosen by the caller before any Git mutation.
+#[derive(Clone, Copy)]
+enum CreateExecutor<'a> {
+    Unmanaged,
+    Owned(&'a crate::session::builder::CreationIntent),
+}
+
+impl CreateExecutor<'_> {
+    fn run<I, S>(&self, cwd: &Path, args: I) -> Result<std::process::Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        match self {
+            Self::Unmanaged => Ok(crate::git::command::run_git(cwd, args)?),
+            Self::Owned(intent) => {
+                let mut command = intent
+                    .owned_git_command(cwd)
+                    .map_err(|e| GitError::WorktreeCommandFailed(format!("{e:#}")))?;
+                command.args(args).env("LC_ALL", "C");
+                intent
+                    .run_owned_output(&mut command, None)
+                    .map_err(|e| GitError::WorktreeCommandFailed(format!("{e:#}")))
+            }
+        }
+    }
+}
+
 impl GitWorktree {
+    fn fetch_owned(
+        &self,
+        intent: &crate::session::builder::CreationIntent,
+        remote: &str,
+        branch: &str,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<Option<std::process::Output>> {
+        let mut command = intent
+            .owned_git_command(&self.repo_path)
+            .map_err(std::io::Error::other)?;
+        command.args(["fetch", remote, branch]).env("LC_ALL", "C");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let deadline = cancel.clone();
+        let (complete, finished) = std::sync::mpsc::channel::<()>();
+        let timer = std::thread::Builder::new()
+            .name("aoe-owned-fetch-deadline".into())
+            .spawn(move || {
+                if matches!(
+                    finished.recv_timeout(timeout),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    deadline.cancel();
+                }
+            })?;
+        let output = intent.run_owned_output(&mut command, Some(&cancel));
+        drop(complete);
+        timer
+            .join()
+            .map_err(|_| std::io::Error::other("owned fetch deadline worker panicked"))?;
+        if cancel.is_cancelled() {
+            Ok(None)
+        } else {
+            output.map(Some).map_err(std::io::Error::other)
+        }
+    }
+
     /// `git fetch <remote> <branch>` with stdin nulled (no passphrase prompts)
     /// and a 10 second bound.
-    fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(["fetch", remote, branch])
-            .current_dir(&self.repo_path)
-            .stdin(std::process::Stdio::null());
+    fn fetch_branch(
+        &self,
+        remote: &str,
+        branch: &str,
+        executor: CreateExecutor<'_>,
+    ) -> FetchOutcome {
         let timeout = std::time::Duration::from_secs(10);
         let start = Instant::now();
-        match crate::process::run_with_timeout(&mut cmd, timeout) {
+        let result = match executor {
+            CreateExecutor::Unmanaged => {
+                let mut cmd = std::process::Command::new("git");
+                cmd.args(["fetch", remote, branch])
+                    .current_dir(&self.repo_path)
+                    .stdin(std::process::Stdio::null());
+                crate::process::run_with_timeout(&mut cmd, timeout)
+            }
+            CreateExecutor::Owned(intent) => self.fetch_owned(intent, remote, branch, timeout),
+        };
+        match result {
             Ok(Some(output)) if output.status.success() => {
                 tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", start.elapsed());
                 FetchOutcome::Ok
@@ -89,8 +164,14 @@ impl GitWorktree {
     }
 
     /// Fetches `branch` and records a non-`Ok` outcome as a warning.
-    fn fetch_with_warning(&self, warnings: &mut Vec<String>, remote: &str, branch: &str) {
-        let detail = match self.fetch_branch(remote, branch) {
+    fn fetch_with_warning(
+        &self,
+        warnings: &mut Vec<String>,
+        remote: &str,
+        branch: &str,
+        executor: CreateExecutor<'_>,
+    ) {
+        let detail = match self.fetch_branch(remote, branch, executor) {
             FetchOutcome::Ok => return,
             FetchOutcome::Failed(msg) | FetchOutcome::Skipped(msg) => msg,
             FetchOutcome::TimedOut => "timed out after 10s".to_string(),
@@ -114,6 +195,43 @@ impl GitWorktree {
         create_branch: bool,
         base_branch: Option<&str>,
     ) -> Result<Vec<String>> {
+        self.create_worktree_with(
+            branch,
+            path,
+            create_branch,
+            base_branch,
+            CreateExecutor::Unmanaged,
+        )
+    }
+
+    pub(crate) fn create_worktree_owned(
+        &self,
+        branch: &str,
+        path: &Path,
+        create_branch: bool,
+        base_branch: Option<&str>,
+        intent: &crate::session::builder::CreationIntent,
+    ) -> Result<Vec<String>> {
+        intent
+            .require_worktree_plan(&self.repo_path, branch, path)
+            .map_err(|e| GitError::WorktreeCommandFailed(format!("{e:#}")))?;
+        self.create_worktree_with(
+            branch,
+            path,
+            create_branch,
+            base_branch,
+            CreateExecutor::Owned(intent),
+        )
+    }
+
+    fn create_worktree_with(
+        &self,
+        branch: &str,
+        path: &Path,
+        create_branch: bool,
+        base_branch: Option<&str>,
+        executor: CreateExecutor<'_>,
+    ) -> Result<Vec<String>> {
         let total_start = Instant::now();
         let mut warnings: Vec<String> = Vec::new();
         tracing::info!(target: "git.worktree",
@@ -123,46 +241,96 @@ impl GitWorktree {
             return Err(GitError::WorktreeAlreadyExists(path.to_path_buf()));
         }
 
+        if let CreateExecutor::Owned(intent) = executor {
+            intent
+                .allocate_worktree_bootstrap(
+                    &self.repo_path,
+                    branch,
+                    path,
+                    super::WORKTREE_LOCK_REASON,
+                )
+                .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        }
+
         // A stale entry at exactly this path may be one aoe locked, and prune
         // skips locked entries; siblings keep their locks.
-        self.unlock_worktree(path);
         let t = Instant::now();
-        self.prune_worktrees()?;
+        // Creating never prunes unrelated stale entries: those are not in its Undo plan.
+        if matches!(executor, CreateExecutor::Unmanaged) {
+            self.unlock_worktree(path);
+            self.prune_worktrees()?;
+        }
         tracing::info!(target: "git.worktree", "worktree create: prune done in {:?}", t.elapsed());
 
         let t = Instant::now();
         if create_branch {
-            let base = self.fetch_base(&mut warnings, base_branch);
+            let base = self.fetch_base(&mut warnings, base_branch, executor);
             tracing::info!(target: "git.worktree", "worktree create: fetch step done in {:?}", t.elapsed());
             let t = Instant::now();
-            self.create_branch_from_base(branch, base)?;
+            if let CreateExecutor::Owned(intent) = executor {
+                intent
+                    .require_worktree_plan(&self.repo_path, branch, path)
+                    .map_err(|e| GitError::WorktreeCommandFailed(format!("{e:#}")))?;
+            }
+            let produced = self.create_branch_from_base(branch, base, executor)?;
+            if let CreateExecutor::Owned(intent) = executor {
+                intent
+                    .acknowledge_created_branch(&self.repo_path, branch, produced)
+                    .map_err(|e| GitError::WorktreeCommandFailed(format!("{e:#}")))?;
+            }
             tracing::info!(target: "git.worktree", "worktree create: branch resolve done in {:?}", t.elapsed());
         } else {
-            self.fetch_with_warning(&mut warnings, FETCH_REMOTE, branch);
+            self.fetch_with_warning(&mut warnings, FETCH_REMOTE, branch, executor);
             tracing::info!(target: "git.worktree", "worktree create: fetch step done in {:?}", t.elapsed());
             let t = Instant::now();
-            self.ensure_branch_exists(branch)?;
+            match executor {
+                CreateExecutor::Unmanaged => self.ensure_branch_exists(branch)?,
+                CreateExecutor::Owned(intent) => {
+                    self.ensure_owned_local_branch(branch, path, intent)?
+                }
+            }
             tracing::info!(target: "git.worktree", "worktree create: branch resolve done in {:?}", t.elapsed());
         }
 
-        self.add_worktree(branch, path, &mut warnings)?;
+        if let CreateExecutor::Owned(intent) = executor {
+            intent
+                .require_worktree_plan(&self.repo_path, branch, path)
+                .map_err(|e| GitError::WorktreeCommandFailed(format!("{e:#}")))?;
+        }
+        match executor {
+            CreateExecutor::Unmanaged => {
+                self.add_worktree(branch, path, &mut warnings, executor)?;
+            }
+            CreateExecutor::Owned(intent) => {
+                self.add_owned_worktree(branch, path, &mut warnings, intent)?;
+            }
+        }
 
         // Relative, so the checkout resolves when mounted elsewhere.
         let t = Instant::now();
-        Self::convert_git_file_to_relative(path)?;
+        if matches!(executor, CreateExecutor::Unmanaged) {
+            Self::convert_git_file_to_relative(path)?;
+        }
+        // The original issuer already wrote the relative .git link exclusively.
         tracing::info!(target: "git.worktree",
             "worktree create: convert .git file done in {:?}", t.elapsed());
 
         let t = Instant::now();
         let submodule_status = if self.init_submodules {
-            self.initialize_submodules(path)?
+            self.initialize_submodules(path, executor)?
         } else {
             "disabled-by-config".to_string()
         };
         tracing::info!(target: "git.worktree",
             "worktree create: submodules ({}) done in {:?}", submodule_status, t.elapsed());
 
-        if let Err(e) = self.lock_worktree(path) {
+        let lock_result = match executor {
+            CreateExecutor::Unmanaged => self.lock_worktree(path),
+            CreateExecutor::Owned(intent) => intent
+                .original_worktree_lock(path)
+                .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}"))),
+        };
+        if let Err(e) = lock_result {
             let warning = format!(
                 "could not lock worktree {} (cross-boundary prune protection unavailable): {}",
                 path.display(),
@@ -179,6 +347,11 @@ impl GitWorktree {
             path.display(),
             warnings.len()
         );
+        if let CreateExecutor::Owned(intent) = executor {
+            intent
+                .acknowledge_worktree(&self.repo_path, branch, path, true)
+                .map_err(|e| GitError::WorktreeCommandFailed(format!("{e:#}")))?;
+        }
         Ok(warnings)
     }
 
@@ -189,6 +362,7 @@ impl GitWorktree {
         &self,
         warnings: &mut Vec<String>,
         base_branch: Option<&str>,
+        executor: CreateExecutor<'_>,
     ) -> (String, Option<String>, bool) {
         let (base, remote, explicit) = match base_branch.map(str::trim) {
             Some(base) if !base.is_empty() => {
@@ -204,7 +378,12 @@ impl GitWorktree {
                 (info.name, info.remote, false)
             }
         };
-        self.fetch_with_warning(warnings, remote.as_deref().unwrap_or(FETCH_REMOTE), &base);
+        self.fetch_with_warning(
+            warnings,
+            remote.as_deref().unwrap_or(FETCH_REMOTE),
+            &base,
+            executor,
+        );
         (base, remote, explicit)
     }
 
@@ -216,7 +395,8 @@ impl GitWorktree {
         &self,
         branch: &str,
         (base, base_remote, explicit): (String, Option<String>, bool),
-    ) -> Result<()> {
+        executor: CreateExecutor<'_>,
+    ) -> Result<git2::Oid> {
         let repo = open_repo_at(&self.repo_path)?;
         let branch_tip = |name: &str, kind| {
             repo.find_branch(name, kind)
@@ -252,7 +432,118 @@ impl GitWorktree {
                     GitError::WorktreeCommandFailed("No commits found to branch from".to_string())
                 })?,
         };
-        repo.branch(branch, &repo.find_commit(commit_oid)?, false)?;
+        if let CreateExecutor::Owned(_) = executor {
+            let reference = format!("refs/heads/{branch}");
+            let output = executor.run(
+                &self.repo_path,
+                [
+                    "update-ref",
+                    &reference,
+                    &commit_oid.to_string(),
+                    &git2::Oid::ZERO_SHA1.to_string(),
+                ],
+            )?;
+            if !output.status.success() {
+                return Err(GitError::WorktreeCommandFailed(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
+            }
+            return Ok(commit_oid);
+        }
+        let produced = repo.branch(branch, &repo.find_commit(commit_oid)?, false)?;
+        produced.get().target().ok_or_else(|| {
+            GitError::WorktreeCommandFailed(
+                "Git branch producer did not return its actual tip".to_owned(),
+            )
+        })
+    }
+
+    fn ensure_owned_local_branch(
+        &self,
+        branch: &str,
+        path: &Path,
+        intent: &crate::session::builder::CreationIntent,
+    ) -> Result<()> {
+        let repo = open_repo_at(&self.repo_path)?;
+        if repo.find_branch(branch, git2::BranchType::Local).is_ok() {
+            return Ok(());
+        }
+        let suffix = format!("/{branch}");
+        let mut candidates = Vec::new();
+        for entry in repo.branches(Some(git2::BranchType::Remote))? {
+            let (remote, _) = entry?;
+            let name = remote.name()?.ok_or_else(|| {
+                GitError::WorktreeCommandFailed("non-UTF8 remote branch remains protected".into())
+            })?;
+            if name.ends_with(&suffix) {
+                let oid = remote.get().target().ok_or_else(|| {
+                    GitError::WorktreeCommandFailed("remote branch has no commit OID".into())
+                })?;
+                candidates.push((name.to_owned(), oid));
+            }
+        }
+        let preferred = repo.config()?.get_string("checkout.defaultRemote").ok();
+        let selected = match candidates.as_slice() {
+            [one] => one,
+            _ => candidates
+                .iter()
+                .find(|(name, _)| {
+                    preferred
+                        .as_ref()
+                        .is_some_and(|remote| name == &format!("{remote}/{branch}"))
+                })
+                .ok_or_else(|| GitError::BranchNotFound(branch.to_owned()))?,
+        };
+        intent
+            .require_worktree_plan(&self.repo_path, branch, path)
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        let reference = format!("refs/heads/{branch}");
+        let oid = selected.1;
+        let output = CreateExecutor::Owned(intent).run(
+            &self.repo_path,
+            [
+                "update-ref",
+                &reference,
+                &oid.to_string(),
+                &git2::Oid::ZERO_SHA1.to_string(),
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(GitError::WorktreeCommandFailed(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        intent
+            .acknowledge_created_branch(&self.repo_path, branch, oid)
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        intent
+            .prepare_tracking(&self.repo_path, branch)
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        let remote = selected
+            .0
+            .strip_suffix(&suffix)
+            .ok_or_else(|| GitError::BranchNotFound(branch.into()))?;
+        let merge = format!("refs/heads/{branch}");
+        for (suffix, value) in [("remote", remote), ("merge", merge.as_str())] {
+            let key = format!("branch.{branch}.{suffix}");
+            let output = CreateExecutor::Owned(intent).run(
+                &self.repo_path,
+                ["config", "--local", "--replace-all", &key, value],
+            )?;
+            if !output.status.success() {
+                return Err(GitError::WorktreeCommandFailed(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
+            }
+        }
+        intent
+            .acknowledge_tracking(
+                &self.repo_path,
+                branch,
+                remote,
+                &format!("refs/heads/{branch}"),
+            )
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
         Ok(())
     }
 
@@ -281,11 +572,181 @@ impl GitWorktree {
         }
     }
 
+    fn original_common_hook_path(repository: &git2::Repository) -> std::path::PathBuf {
+        // The issuer's linked layout has a literal ../.. commondir. Nonlinked
+        // sources already expose their original common Git directory path.
+        if repository.is_worktree() {
+            repository
+                .path()
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| repository.path().to_path_buf())
+                .join("hooks")
+        } else {
+            repository.path().join("hooks")
+        }
+    }
+
+    fn run_owned_post_checkout(
+        &self,
+        intent: &crate::session::builder::CreationIntent,
+        path: &Path,
+        oid: git2::Oid,
+        common: &crate::session::builder::AnchoredDir,
+    ) -> Result<Option<std::process::Output>> {
+        let executor = CreateExecutor::Owned(intent);
+        let version = executor.run(path, ["--version"])?;
+        if !version.status.success() {
+            return Err(super::command_failed(&version));
+        }
+        let text = String::from_utf8_lossy(&version.stdout);
+        let mut parts = text.split_whitespace().nth(2).unwrap_or("").split('.');
+        let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+        let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+        let modern = match (major, minor) {
+            (Some(major), Some(minor)) => major > 2 || (major == 2 && minor >= 36),
+            _ => {
+                return Err(GitError::WorktreeCommandFailed(
+                    "Git did not acknowledge an identifiable hook interface version".into(),
+                ))
+            }
+        };
+        let mut command = if modern {
+            let mut command = intent
+                .owned_git_command(path)
+                .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+            command.args(["hook", "run", "--ignore-missing", "post-checkout", "--"]);
+            command
+        } else {
+            let repository = open_repo_at(path)?;
+            let configured = match repository.config()?.get_path("core.hooksPath") {
+                Ok(path) => Some(path),
+                Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            let hooks = configured
+                .map(|hooks| {
+                    if hooks.is_absolute() {
+                        hooks
+                    } else {
+                        path.join(hooks)
+                    }
+                })
+                .unwrap_or_else(|| Self::original_common_hook_path(&repository));
+            let hook = hooks.join("post-checkout");
+            match nix::unistd::access(&hook, nix::unistd::AccessFlags::X_OK) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::ENOENT | nix::errno::Errno::EACCES) => return Ok(None),
+                Err(error) => {
+                    return Err(GitError::WorktreeCommandFailed(format!(
+                        "checking actual post-checkout executable: {error}"
+                    )))
+                }
+            }
+            intent
+                .owned_hook_command(&hook, path)
+                .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?
+        };
+        command
+            .anchored_env_path("GIT_COMMON_DIR", common)
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        command
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env("LC_ALL", "C")
+            .args([
+                "0000000000000000000000000000000000000000",
+                &oid.to_string(),
+                "1",
+            ]);
+        intent
+            .run_owned_output(&mut command, None)
+            .map(Some)
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))
+    }
+
+    fn add_owned_worktree(
+        &self,
+        branch: &str,
+        path: &Path,
+        warnings: &mut Vec<String>,
+        intent: &crate::session::builder::CreationIntent,
+    ) -> Result<()> {
+        let layout = intent
+            .begin_worktree_effect(&self.repo_path, branch, path)
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        let mut checkout = intent
+            .owned_command("git")
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        checkout
+            .anchored_current_dir(&layout.root)
+            .and_then(|command| command.anchored_env_path("GIT_DIR", &layout.admin))
+            .and_then(|command| command.anchored_env_path("GIT_COMMON_DIR", &layout.common))
+            .and_then(|command| command.anchored_env_path("GIT_WORK_TREE", &layout.root))
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        // read-tree is worktree-local plumbing: it does not move an existing
+        // branch or create a second opaque admin allocator. The native checkout
+        // uses the frozen OID and respects sparse/config/filter semantics.
+        checkout
+            .args(["read-tree", "--reset", "-u", &layout.oid.to_string()])
+            .env("LC_ALL", "C");
+        intent
+            .begin_checkout_command(&self.repo_path, branch, path)
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        let output = intent.run_owned_output(&mut checkout, None);
+        intent
+            .acknowledge_worktree(
+                &self.repo_path,
+                branch,
+                path,
+                output.as_ref().is_ok_and(|output| output.status.success()),
+            )
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        let output =
+            output.map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        if !output.status.success() {
+            return Err(super::command_failed(&output));
+        }
+
+        // The real Git hook dispatcher preserves executable/core.hooksPath
+        // lookup and subprocess semantics. Upstream worktree.c removes these
+        // two variables before post-checkout and passes zero, new OID, flag 1.
+        if let Some(output) =
+            self.run_owned_post_checkout(intent, path, layout.oid, &layout.common)?
+        {
+            if !output.status.success() {
+                let detail = sanitize_remote_credentials(&format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+                warnings.push(format!(
+                    "post-checkout hook failed for {} (worktree created, hook output below):\n{}",
+                    path.display(),
+                    detail.trim()
+                ));
+            }
+        }
+        // Hook failure is a distinct actual effect outcome; it cannot erase
+        // successful index/layout ACK, nor certify later dirty body changes.
+        intent
+            .acknowledge_worktree(&self.repo_path, branch, path, true)
+            .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        Ok(())
+    }
+
     /// `git worktree add`. A post-checkout hook can fail after the checkout
     /// exists; that worktree is usable, so the failure becomes a warning.
-    fn add_worktree(&self, branch: &str, path: &Path, warnings: &mut Vec<String>) -> Result<()> {
+    fn add_worktree(
+        &self,
+        branch: &str,
+        path: &Path,
+        warnings: &mut Vec<String>,
+        executor: CreateExecutor<'_>,
+    ) -> Result<bool> {
         let t = Instant::now();
-        let output = crate::git::command::run_git(
+        let output = executor.run(
             &self.repo_path,
             ["worktree", "add", path_str(path)?, branch],
         )?;
@@ -309,10 +770,18 @@ impl GitWorktree {
                 );
                 tracing::warn!(target: "git.worktree", "worktree create: {}", warning);
                 warnings.push(warning);
-            } else if self.worktree_path_for_branch(branch)?.is_some() {
-                // Porcelain rather than git's localized diagnostic.
-                return Err(GitError::BranchAlreadyCheckedOut(branch.to_string()));
             } else {
+                let output =
+                    executor.run(&self.repo_path, ["worktree", "list", "--porcelain", "-z"])?;
+                let branch_field = format!("branch refs/heads/{branch}");
+                if output.status.success()
+                    && output
+                        .stdout
+                        .split(|b| *b == 0)
+                        .any(|field| field == branch_field.as_bytes())
+                {
+                    return Err(GitError::BranchAlreadyCheckedOut(branch.to_string()));
+                }
                 return Err(classify_worktree_add_failure(&combined, branch));
             }
         }
@@ -328,10 +797,14 @@ impl GitWorktree {
                 if stats.capped { ", walk capped" } else { "" }
             );
         }
-        Ok(())
+        Ok(output.status.success())
     }
 
-    fn initialize_submodules(&self, worktree_path: &Path) -> Result<String> {
+    fn initialize_submodules(
+        &self,
+        worktree_path: &Path,
+        executor: CreateExecutor<'_>,
+    ) -> Result<String> {
         let gitmodules_path = worktree_path.join(".gitmodules");
         if !gitmodules_path.is_file() {
             return Ok("none".to_string());
@@ -353,7 +826,12 @@ impl GitWorktree {
         }
         args.extend(["submodule", "update", "--init", "--recursive"].map(String::from));
 
-        let output = crate::git::command::run_git(worktree_path, &args)?;
+        if let CreateExecutor::Owned(intent) = executor {
+            intent
+                .retain_submodule_domain(worktree_path)
+                .map_err(|error| GitError::WorktreeCommandFailed(format!("{error:#}")))?;
+        }
+        let output = executor.run(worktree_path, &args)?;
         if output.status.success() {
             return Ok(format!("initialized count={}", submodule_count));
         }
@@ -550,15 +1028,18 @@ pub(super) mod tests {
         let (no_remote, _repo) = init_repo();
         let git_wt = GitWorktree::new(no_remote.path().to_path_buf()).unwrap();
         assert!(matches!(
-            git_wt.fetch_branch("origin", "main"),
+            git_wt.fetch_branch("origin", "main", CreateExecutor::Unmanaged),
             FetchOutcome::Failed(_)
         ));
 
         let (_dirs, local, _, _) = fork_upstream_layout("main");
         let git_wt = GitWorktree::new(local).unwrap();
-        assert_eq!(git_wt.fetch_branch("origin", "main"), FetchOutcome::Ok);
+        assert_eq!(
+            git_wt.fetch_branch("origin", "main", CreateExecutor::Unmanaged),
+            FetchOutcome::Ok
+        );
         assert!(matches!(
-            git_wt.fetch_branch("origin", "nonexistent-branch"),
+            git_wt.fetch_branch("origin", "nonexistent-branch", CreateExecutor::Unmanaged),
             FetchOutcome::Failed(_)
         ));
     }

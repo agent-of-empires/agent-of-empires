@@ -599,10 +599,13 @@ pub(crate) fn reserve_attach(
                 super::Instance::LIFECYCLE_RESERVATION_TTL,
                 chrono::Utc::now(),
             )?;
-            row.lifecycle_reservation
+            let custodian = crate::process::OriginalCustodianBirth::capture(storage, row)?;
+            let reservation = row
+                .lifecycle_reservation
                 .as_mut()
-                .context("attach did not acquire its lease")?
-                .path_claims = super::WorktreePathClaims::Pending(plan.path_claims.clone());
+                .context("attach did not acquire its lease")?;
+            reservation.path_claims = super::WorktreePathClaims::Pending(plan.path_claims.clone());
+            reservation.custodian = Some(custodian);
             super::LaunchOrigin::capture(row)
         })?;
     plan.reservation_generation = Some(acknowledged.generation());
@@ -866,10 +869,6 @@ impl Undo {
                 ]))
             })?;
             self.run_filtered(&claimed)?;
-            anyhow::ensure!(
-                !self.uncertain,
-                "failed Git effect has no complete rollback proof"
-            );
             scope.with_scope(|_| {
                 scope.storage().complete_path_claims_under_workspace_lock(
                     &scope.current_projection(),
@@ -893,6 +892,10 @@ impl Undo {
     }
 
     fn run_filtered(&self, claimed: &crate::session::deletion::PathsInUse) -> Result<()> {
+        anyhow::ensure!(
+            !self.uncertain,
+            "failed Git effect has no complete rollback proof"
+        );
         let mut failure = None;
         for (main_repo, worktree, branch) in [self.added.as_ref(), self.created_primary.as_ref()]
             .into_iter()
@@ -1069,8 +1072,10 @@ pub fn attach_planned(
                         super::Instance::LIFECYCLE_RESERVATION_TTL,
                         chrono::Utc::now(),
                     )?;
-                    row.lifecycle_reservation.as_mut().context("attach did not acquire its lease")?
-                        .path_claims = super::WorktreePathClaims::Pending(plan.path_claims.clone());
+                    let custodian = crate::process::OriginalCustodianBirth::capture(storage, row)?;
+                    let reservation = row.lifecycle_reservation.as_mut().context("attach did not acquire its lease")?;
+                    reservation.path_claims = super::WorktreePathClaims::Pending(plan.path_claims.clone());
+                    reservation.custodian = Some(custodian);
                 }
                 if plan.moves_session {
                     anyhow::ensure!(
@@ -1542,6 +1547,23 @@ fn reset_sandbox_container(scope: &super::runner_journal::OwnedStop) -> Result<(
 mod tests {
     use super::*;
     use crate::session::{Instance, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+
+    #[test]
+    fn uncertain_attach_undo_keeps_the_original_workspace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let undo = Undo {
+            workspace_dir: Some(workspace.clone()),
+            uncertain: true,
+            ..Undo::default()
+        };
+        let claimed = crate::session::deletion::PathsInUse::Known(
+            crate::session::deletion::WorktreePathInventory::default(),
+        );
+        assert!(undo.run_filtered(&claimed).is_err());
+        assert!(workspace.is_dir());
+    }
 
     #[test]
     #[serial_test::serial]

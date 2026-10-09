@@ -448,6 +448,7 @@ pub(crate) fn resolve_create_hook_plan(
 /// prompt suppression) still applies.
 pub(crate) fn run_create_hooks(
     instance: &mut Instance,
+    intent: &crate::session::builder::CreationIntent,
     plan: &CreateHookPlan,
     project_path: &std::path::Path,
     progress: Option<&crate::server::create_progress::CreateProgress>,
@@ -485,22 +486,24 @@ pub(crate) fn run_create_hooks(
                 progress.set_stage(CreateStage::StartingContainer);
             }
             instance.get_container_for_instance()?;
-            let workdir = instance.container_workdir();
-            if let Some(sandbox) = instance.sandbox_info.as_ref() {
-                repo_config::execute_hooks_in_container_streamed(
+            if instance.sandbox_info.is_some() {
+                repo_config::execute_creating_hooks_in_container(
+                    intent,
+                    instance,
                     plan.on_create(),
-                    &sandbox.container_name,
-                    &workdir,
-                    &progress_tx,
+                    Some(&progress_tx),
                     &hook_env,
+                    None,
                 )?;
             }
         } else {
-            repo_config::execute_hooks_streamed(
+            repo_config::execute_creating_hooks(
+                intent,
                 plan.on_create(),
                 std::path::Path::new(&instance.project_path),
-                &progress_tx,
+                Some(&progress_tx),
                 &hook_env,
+                None,
             )?;
         }
         Ok(())

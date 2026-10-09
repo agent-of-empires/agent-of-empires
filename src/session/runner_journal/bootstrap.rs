@@ -20,6 +20,8 @@ struct OriginalBootstrap<'a> {
     execution: &'a ExecutionPlan,
     births: &'a [NativeBirthKey],
     born: RunnerIdentity,
+    creations: &'a [super::native_create::CreateExecution],
+    create_coverage: super::CreationCoverage,
     fences: [DirectoryIdentity; 3],
 }
 
@@ -29,6 +31,8 @@ struct ReceivedBootstrap {
     execution: ExecutionPlan,
     births: Vec<NativeBirthKey>,
     born: RunnerIdentity,
+    creations: Vec<super::native_create::CreateExecution>,
+    create_coverage: super::CreationCoverage,
     fences: [DirectoryIdentity; 3],
 }
 
@@ -70,6 +74,8 @@ pub(super) fn publish_original(
             execution: &original.plan.execution,
             births: &original.births,
             born,
+            creations: &original.creations,
+            create_coverage: original.create_coverage,
             fences: [
                 fences[0].file_identity()?,
                 fences[1].file_identity()?,
@@ -157,6 +163,8 @@ impl LaunchBootstrap {
             }),
             generation,
             births: received.births.into(),
+            creations: received.creations.into(),
+            create_coverage: received.create_coverage,
         });
         let row = origin
             .storage()
@@ -246,7 +254,7 @@ impl LaunchBootstrap {
     }
 }
 
-fn write_frame<T: Serialize>(channel: &mut UnixStream, value: &T) -> Result<()> {
+pub(super) fn write_frame<T: Serialize>(channel: &mut UnixStream, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     let length = u32::try_from(bytes.len()).context("native bootstrap exceeds wire length")?;
     channel.write_all(&length.to_le_bytes())?;
@@ -254,7 +262,7 @@ fn write_frame<T: Serialize>(channel: &mut UnixStream, value: &T) -> Result<()> 
     Ok(())
 }
 
-fn read_frame<T: DeserializeOwned>(channel: &mut UnixStream) -> Result<T> {
+pub(super) fn read_frame<T: DeserializeOwned>(channel: &mut UnixStream) -> Result<T> {
     let mut length = [0; 4];
     channel.read_exact(&mut length)?;
     let mut bytes = vec![0; u32::from_le_bytes(length) as usize];
@@ -262,7 +270,10 @@ fn read_frame<T: DeserializeOwned>(channel: &mut UnixStream) -> Result<T> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn send_descriptors(channel: &UnixStream, descriptors: [BorrowedFd<'_>; 4]) -> Result<()> {
+pub(super) fn send_descriptors<const N: usize>(
+    channel: &UnixStream,
+    descriptors: [BorrowedFd<'_>; N],
+) -> Result<()> {
     let descriptors = descriptors.map(|fd| fd.as_raw_fd());
     let marker = [IoSlice::new(&[1])];
     let rights = [ControlMessage::ScmRights(&descriptors)];
@@ -277,13 +288,13 @@ fn send_descriptors(channel: &UnixStream, descriptors: [BorrowedFd<'_>; 4]) -> R
     Ok(())
 }
 
-fn receive_descriptors(channel: &UnixStream) -> Result<[OwnedFd; 4]> {
+pub(super) fn receive_descriptors<const N: usize>(channel: &UnixStream) -> Result<[OwnedFd; N]> {
     #[repr(C)]
-    struct Ancillary {
+    struct Ancillary<const N: usize> {
         header: libc::cmsghdr,
-        descriptors: [RawFd; 4],
+        descriptors: [RawFd; N],
     }
-    let mut ancillary = std::mem::MaybeUninit::<Ancillary>::zeroed();
+    let mut ancillary = std::mem::MaybeUninit::<Ancillary<N>>::zeroed();
     let mut marker = [0u8];
     let mut payload = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
@@ -293,7 +304,7 @@ fn receive_descriptors(channel: &UnixStream) -> Result<[OwnedFd; 4]> {
     message.msg_iov = &mut payload;
     message.msg_iovlen = 1;
     message.msg_control = ancillary.as_mut_ptr().cast();
-    message.msg_controllen = std::mem::size_of::<Ancillary>() as _;
+    message.msg_controllen = std::mem::size_of::<Ancillary<N>>() as _;
     #[cfg(target_os = "macos")]
     // SAFETY: marker, payload and ancillary buffers remain live for this call.
     unsafe {
@@ -315,12 +326,12 @@ fn receive_descriptors(channel: &UnixStream) -> Result<[OwnedFd; 4]> {
             return Err(error.into());
         }
     };
-    let mut descriptors: [Option<OwnedFd>; 4] = [None, None, None, None];
+    let mut descriptors: [Option<OwnedFd>; N] = std::array::from_fn(|_| None);
     let mut count = 0;
     let mut unexpected = false;
     // Darwin may retain the sender's cmsg_len after truncating delivered rights.
     let base = message.msg_control as usize;
-    let delivered = (message.msg_controllen as usize).min(std::mem::size_of::<Ancillary>());
+    let delivered = (message.msg_controllen as usize).min(std::mem::size_of::<Ancillary<N>>());
     let end = base + delivered;
     let mut control = unsafe { libc::CMSG_FIRSTHDR(&message) };
     while !control.is_null() {
@@ -364,11 +375,11 @@ fn receive_descriptors(channel: &UnixStream) -> Result<[OwnedFd; 4]> {
         }
     }
     anyhow::ensure!(
-        received == 1 && message.msg_flags & libc::MSG_CTRUNC == 0 && count == 4 && !unexpected,
+        received == 1 && message.msg_flags & libc::MSG_CTRUNC == 0 && count == N && !unexpected,
         "original descriptor transfer was truncated or malformed"
     );
     anyhow::ensure!(marker == [1], "original descriptor transfer marker differs");
-    let descriptors = descriptors.map(|fd| fd.expect("four received descriptors"));
+    let descriptors = descriptors.map(|fd| fd.expect("validated original descriptor count"));
     for fd in &descriptors {
         nix::fcntl::fcntl(
             fd,
@@ -446,7 +457,7 @@ mod tests {
         )
         .context("sending oversized descriptor transfer")?;
         drop(transferred);
-        assert!(receive_descriptors(&receiver).is_err());
+        assert!(receive_descriptors::<4>(&receiver).is_err());
         assert_eq!(
             peer.read(&mut [0])
                 .context("reading rejected-transfer close witness")?,

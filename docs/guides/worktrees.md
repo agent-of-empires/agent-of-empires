@@ -82,6 +82,14 @@ Checkout ownership uses the required identity, path and lifecycle-claim fields, 
 
 Creation and attach reserve the complete future path set durably before Git, workspace, or scratch effects. Ordinary path writers and profile deletion or rename cannot retire these claims. Completion through the original physical storage and unchanged plan retires them only after a successful write. A cancelled, failed, or interrupted operation retains its claim and resources when original ownership or native quiescence cannot be proved. Claims do not expire with a timeout; restarting aoe does not reclaim them. Legacy unfinished operations with an unknown path set fail closed until their original ownership can be established. Lifecycle leases require an explicit path-claim state after migration; do not keep an older writer running against the upgraded store.
 
+### Abandoning unresolved intent metadata
+
+When original creation or attach custody is lost, `aoe -p PROFILE session abort-intent FULL_ID` removes only that exact intent row. In the TUI, right-click the unfinished session and choose **Abort metadata; retain resources**, then confirm. Cancelling the confirmation leaves the row unchanged.
+
+This does not stop a process, run destroy hooks, undo creation or purge anything. Before removing the row, aoe durably retains its exact owner, native history and path inventory in `retained-intents.json` outside the profiles. Its ID remains reserved; cleanup continues to exclude its resources in both build namespaces even when no live row owns them. A failed source write keeps both copies until retry.
+
+The original physical profile remains protected from deletion or rename. An unknown resource scope remains fail-closed, and native store preparation or migration still refuses domains it cannot prove disjoint. A missing or unreadable required retention ledger refuses admission and cleanup; deleting it is not a recovery procedure.
+
 **The default branch's checkout is never removed.** In a bare-repo layout the default branch lives in a linked worktree other tooling expects to stay put, so aoe refuses to remove that checkout or delete its branch, reports the refusal, and deletes the session anyway. Force does not bypass this, including trash auto-purge and `aoe session empty-trash`, and `aoe worktree cleanup` lists such a checkout as skipped. Detection uses what git states: the bare repo's own `HEAD` plus every remote's `refs/remotes/<remote>/HEAD`, falling back to `main` and `master` by convention when neither exists. To remove one anyway, do it with git and then delete the session.
 
 An externally placed `git worktree lock` is not a deletion guard: aoe locks every worktree it creates and unlocks before each intentional remove or move, so it unlocks yours too.

@@ -212,12 +212,22 @@ impl HomeView {
                         rename_branch,
                     ),
                     SettlementAction::Archive { reveal } => {
-                        let outcome = self.toggle_archive_by_id(&request.session_id);
-                        if outcome.is_ok() && reveal {
-                            self.reveal_archived_section();
-                            self.rebuild_flat_items();
+                        let row = self.capture_transaction_row(&request.session_id);
+                        match row {
+                            Ok(row) => {
+                                let settled = self.settled_edit.take();
+                                let successor = self.archive_successor_session(&request.session_id);
+                                self.request_transaction(
+                                    persistence_transactions::TransactionRequest::Archive {
+                                        row,
+                                        settled,
+                                        reveal,
+                                        successor,
+                                    },
+                                )
+                            }
+                            Err(error) => Err(error),
                         }
-                        outcome
                     }
                 };
                 self.settled_edit = None;
@@ -252,17 +262,15 @@ impl HomeView {
 
         match self.stop_poller.try_recv_result() {
             Ok(result) => {
-                if let Some(committed) = self.load_durable_instance(&result.session_id) {
-                    self.mutate_instance(&result.session_id, |instance| {
-                        instance.merge_post_start(&committed);
-                    });
-                }
+                self.request_reload(super::ReloadKind::Full);
                 if !result.success {
-                    self.set_instance_error(&result.session_id, result.error);
-                    self.set_instance_status(&result.session_id, Status::Error);
-                    if let Err(e) = self.save() {
-                        tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
-                    }
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Stop Failed",
+                        result
+                            .error
+                            .as_deref()
+                            .unwrap_or("The original stop was not acknowledged"),
+                    ));
                 }
                 true
             }
@@ -284,19 +292,10 @@ impl HomeView {
                     );
                     self.set_instance_status(id, Status::Error);
                 }
-                if let Err(e) = self.save() {
-                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
-                }
+                self.request_save();
                 true
             }
         }
-    }
-
-    /// The row as last committed to its profile's storage.
-    fn load_durable_instance(&self, id: &str) -> Option<Instance> {
-        let profile = &self.instances.get(id)?.source_profile;
-        let instances = self.storages.get(profile)?.load().ok()?;
-        instances.into_iter().find(|instance| instance.id == id)
     }
 
     pub fn apply_trash_results(&mut self) -> bool {
@@ -304,58 +303,11 @@ impl HomeView {
 
         match self.trash_poller.try_recv_result() {
             Ok(result) => {
-                let mut changed = false;
-                let mut applied_authoritative = false;
-                // A restore of a newer generation can land while this result sits in
-                // the channel. The durable row is the authority: comparing against
-                // the local generation would not see it, because a restore does not
-                // mirror the durable generation back. The value applied is that
-                // durable row, never the result, which is what the generation
-                // comparison is there to reject.
-                if let Some(durable) =
-                    self.load_durable_instance(&result.session_id)
-                        .filter(|durable| {
-                            result.authoritative.as_ref().is_some_and(|authoritative| {
-                                durable.lifecycle_generation >= authoritative.lifecycle_generation
-                            })
-                        })
-                {
-                    if let Some(instance) = self.instances.get_mut(&result.session_id) {
-                        instance.trashed_at = durable.trashed_at;
-                        instance.project_path = durable.project_path;
-                        instance.pre_trash_project_path = durable.pre_trash_project_path;
-                        instance.lifecycle_generation = durable.lifecycle_generation;
-                        instance.lifecycle_reservation = durable.lifecycle_reservation;
-                        changed = true;
-                    }
-                    applied_authoritative = true;
-                }
-                if let Some(relocation) = result.relocation {
-                    let durable = self.load_durable_instance(&result.session_id);
-                    if let Some(durable) = durable.filter(|instance| {
-                        instance.is_trashed()
-                            && instance.project_path == relocation.new_project_path
-                    }) {
-                        if let Some(instance) = self.instances.get_mut(&result.session_id) {
-                            instance.project_path = durable.project_path;
-                            instance.pre_trash_project_path = durable.pre_trash_project_path;
-                            instance.lifecycle_generation = durable.lifecycle_generation;
-                            instance.lifecycle_reservation = durable.lifecycle_reservation;
-                            changed = true;
-                        }
-                    }
-                }
-                if !applied_authoritative && self.reload().is_ok() {
-                    changed = true;
-                }
+                self.request_reload(super::ReloadKind::Full);
                 if let Some(reason) = result.relocate_warning {
-                    tracing::warn!(
-                        target: "tui.session",
-                        session = %result.session_id,
-                        "trash transition incomplete: {reason}",
-                    );
+                    tracing::warn!(target: "tui.session", session = %result.session_id, "trash transition incomplete: {reason}");
                 }
-                changed
+                true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
@@ -426,7 +378,6 @@ impl HomeView {
             return false;
         }
 
-        let mut reloaded = false;
         if self.pending_reconcile_reload {
             if self
                 .reconcile_reload_retry_at
@@ -434,25 +385,13 @@ impl HomeView {
             {
                 return false;
             }
-            match self.reload_storage_only() {
-                Ok(()) => {
-                    self.pending_reconcile_reload = false;
-                    self.reconcile_reload_retry_at = None;
-                    reloaded = true;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "tui.home",
-                        "reload after load-time reconciliation failed: {error}",
-                    );
-                    self.reconcile_reload_retry_at =
-                        Some(std::time::Instant::now() + Self::RECONCILE_RELOAD_RETRY_INTERVAL);
-                    return false;
-                }
+            if !self.reconcile_reload_is_pending() {
+                self.request_reload(super::ReloadKind::Reconciled);
             }
+            return false;
         }
         self.release_startup_recovery_gate(sweep_landed);
-        reloaded
+        false
     }
 
     pub fn apply_session_id_updates(&mut self) -> bool {
@@ -496,76 +435,27 @@ impl HomeView {
     }
 
     pub fn apply_recovery_updates(&mut self) -> bool {
-        let Some(rx) = self.recovery_rx.as_ref() else {
+        if self.recovery_rx.is_none() {
             return false;
-        };
+        }
         let mut touched = false;
         let mut disconnected = false;
         loop {
-            match rx.try_recv() {
+            match self
+                .recovery_rx
+                .as_ref()
+                .expect("recovery receiver retained during drain")
+                .try_recv()
+            {
                 Ok(update) => {
-                    let RecoveryUpdate {
-                        instance_id,
-                        title,
-                        before,
-                        instance,
-                        result,
-                    } = update;
-                    if !super::RequestOrigin::retire(&mut self.recovery_in_flight, &before) {
+                    if !super::RequestOrigin::retire(&mut self.recovery_in_flight, &update.before) {
                         continue;
                     }
                     touched = true;
-                    let _authority = match self.completed_launch_authority(&before, &instance) {
-                        Ok(authority) => authority,
-                        Err(error) => {
-                            tracing::warn!(target: "session.startup_recovery", id = %instance_id, %error, "recovery result authority rejected");
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Recovery result rejected",
-                                &format!("{title}: {error}. The current session was not changed."),
-                            ));
-                            continue;
-                        }
-                    };
-                    match result {
-                        Ok(crate::session::StartOutcome::Resumed) => {
-                            tracing::info!(target: "session.startup_recovery", id = %instance_id, %title, "resumed");
-                        }
-                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
-                            tracing::warn!(
-                                target: "session.startup_recovery",
-                                id = %instance_id,
-                                %title,
-                                %sid,
-                                "resume failed; sid preserved for explicit retry",
-                            );
-                        }
-                        Ok(crate::session::StartOutcome::Fresh) => {}
-                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
-                            tracing::info!(
-                                target: "session.startup_recovery",
-                                id = %instance_id,
-                                %title,
-                                %sid,
-                                "started fresh; sid previously failed a resume probe",
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "session.startup_recovery",
-                                id = %instance_id,
-                                %title,
-                                error = %e,
-                                "recovery cascade failed",
-                            );
-                        }
-                    }
-                    if let Some(slot) = self.instances.get_mut(&instance_id) {
-                        slot.merge_post_restart_with_baseline(&before, &instance);
-                        slot.last_error = instance.last_error.clone();
-                        slot.last_error_check = instance.last_error_check;
-                        slot.last_start_time = instance.last_start_time;
-                        touched = true;
-                    }
+                    self.request_reload_after(
+                        super::ReloadKind::Full,
+                        persistence_lane::ReloadContinuation::Recovery(update),
+                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -598,18 +488,16 @@ impl HomeView {
     }
 
     pub fn apply_restart_results(&mut self) -> bool {
-        use crate::session::Status;
         use std::sync::mpsc::TryRecvError;
 
         let mut touched = false;
-        let mut changed = false;
         loop {
             match self.restart_poller.try_recv_result() {
                 Ok(result) => {
                     let crate::session::restart::RestartResult {
                         session_id,
                         before,
-                        mut instance,
+                        instance,
                         outcome,
                     } = result;
 
@@ -618,86 +506,18 @@ impl HomeView {
                     }
                     let attach_after = self.attach_after_restart.remove(&session_id);
                     touched = true;
-                    let _authority = match self.completed_launch_authority(&before, &instance) {
-                        Ok(authority) => authority,
-                        Err(error) => {
-                            tracing::warn!(target: "session.restart", id = %session_id, %error, "restart result authority rejected");
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Restart result rejected",
-                                &format!(
-                                    "{}: {error}. The current session was not changed.",
-                                    before.title
-                                ),
-                            ));
-                            continue;
-                        }
-                    };
-
-                    if attach_after && crate::session::restart::launched_agent(&outcome) {
-                        self.restarted_attaches.push(session_id.clone());
-                    }
-
-                    match outcome {
-                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
-                            tracing::warn!(
-                                target: "session.restart",
-                                id = %session_id,
-                                %sid,
-                                "resume failed; sid preserved for explicit retry",
-                            );
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Restart Failed",
-                                &format!(
-                                    "Resume failed for sid {sid}; preserved for explicit retry"
-                                ),
-                            ));
-                        }
-                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
-                            tracing::info!(
-                                target: "session.restart",
-                                id = %session_id,
-                                %sid,
-                                "started fresh; sid previously failed a resume probe",
-                            );
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Restarted",
-                                &format!(
-                                    "Started fresh; a prior resume attempt failed for sid {sid}. \
-                                     The old conversation is still reachable via the agent's \
-                                     own resume/history picker."
-                                ),
-                            ));
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "session.restart",
-                                id = %session_id,
-                                error = %e,
-                                "restart cascade failed",
-                            );
-                            instance.status = Status::Error;
-                            instance.last_error = Some(e.clone());
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Restart Failed",
-                                &format!("Could not restart session: {e}"),
-                            ));
-                        }
-                    }
-
-                    if let Some(slot) = self.instances.get_mut(&session_id) {
-                        slot.merge_post_restart_with_baseline(&before, &instance);
-                        slot.last_error = if instance.status == Status::Error {
-                            instance.last_error.clone()
-                        } else {
-                            None
-                        };
-                        slot.last_error_check = instance.last_error_check;
-                        slot.last_start_time = instance.last_start_time;
-                        slot.retroactive_capture_excludes =
-                            instance.retroactive_capture_excludes.clone();
-                        changed = true;
-                    }
+                    self.request_reload_after(
+                        super::ReloadKind::Full,
+                        persistence_lane::ReloadContinuation::Restart {
+                            result: crate::session::restart::RestartResult {
+                                session_id,
+                                before,
+                                instance,
+                                outcome,
+                            },
+                            attach_after,
+                        },
+                    );
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -717,11 +537,6 @@ impl HomeView {
 
         if touched {
             self.refresh_rows_preserving_selection();
-        }
-        if changed {
-            if let Err(e) = self.save() {
-                tracing::error!(target: "tui.home", "Failed to save after restart: {}", e);
-            }
         }
         touched
     }
@@ -890,47 +705,150 @@ impl HomeView {
         self.recovery_rx = Some(rx);
         self.recovery_lock = Some(lock);
     }
-    fn completed_launch_authority(
-        &self,
-        before: &Instance,
-        after: &Instance,
-    ) -> anyhow::Result<(
-        crate::session::StorageFlock,
-        crate::session::StorageFlock,
-        crate::session::StorageFlock,
-    )> {
-        let workspace = crate::session::acquire_session_workspace_claim_lock()?;
-        let identity = crate::session::acquire_session_identity_lock()?;
-        let storage = before.original_storage()?;
-        storage.verify_profile_identity()?;
-        anyhow::ensure!(
-            before.same_storage_origin(after),
-            "worker storage authority changed"
-        );
-        let lifecycle = storage.acquire_instance_lifecycle_lock(&before.id)?;
-        let current = self
-            .instances
-            .get(&before.id)
-            .ok_or_else(|| anyhow::anyhow!("worker row was removed"))?;
-        anyhow::ensure!(
-            current.same_storage_origin(before)
-                && ((current.lifecycle_generation == before.lifecycle_generation
-                    && current.active_execution == before.active_execution)
-                    || (current.lifecycle_generation == after.lifecycle_generation
-                        && current.active_execution == after.active_execution))
-                && current.tool == before.tool,
-            "worker baseline was superseded"
-        );
-        let rows = storage.load()?;
-        let disk = rows
-            .iter()
-            .find(|row| row.id == before.id)
-            .ok_or_else(|| anyhow::anyhow!("worker row disappeared"))?;
-        anyhow::ensure!(
-            disk.lifecycle_generation == after.lifecycle_generation
-                && disk.active_execution == after.active_execution,
-            "worker execution was superseded"
-        );
-        Ok((workspace, identity, lifecycle))
+    pub(super) fn apply_completed_recovery(&mut self, update: RecoveryUpdate) {
+        let RecoveryUpdate {
+            instance_id,
+            title,
+            before,
+            instance,
+            result,
+        } = update;
+        if !self.completed_launch_projection_matches(&before, &instance) {
+            self.info_dialog = Some(InfoDialog::new("Recovery result rejected", "The original producer result no longer matches the acknowledged row. No replacement was changed."));
+            return;
+        }
+        match result {
+            Ok(crate::session::StartOutcome::Resumed) => {
+                tracing::info!(target: "session.startup_recovery", id = %instance_id, %title, "resumed");
+            }
+            Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
+                tracing::warn!(
+                    target: "session.startup_recovery",
+                    id = %instance_id,
+                    %title,
+                    %sid,
+                    "resume failed; sid preserved for explicit retry",
+                );
+            }
+            Ok(crate::session::StartOutcome::Fresh) => {}
+            Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                tracing::info!(
+                    target: "session.startup_recovery",
+                    id = %instance_id,
+                    %title,
+                    %sid,
+                    "started fresh; sid previously failed a resume probe",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "session.startup_recovery",
+                    id = %instance_id,
+                    %title,
+                    error = %e,
+                    "recovery cascade failed",
+                );
+            }
+        }
+        if let Some(slot) = self.instances.get_mut(&instance_id) {
+            slot.merge_post_restart_with_baseline(&before, &instance);
+            slot.last_error = instance.last_error.clone();
+            slot.last_error_check = instance.last_error_check;
+            slot.last_start_time = instance.last_start_time;
+        }
+        self.refresh_rows_preserving_selection();
+    }
+
+    pub(super) fn apply_completed_restart(
+        &mut self,
+        result: crate::session::restart::RestartResult,
+        attach_after: bool,
+    ) {
+        use crate::session::Status;
+        let crate::session::restart::RestartResult {
+            session_id,
+            before,
+            mut instance,
+            outcome,
+        } = result;
+        if !self.completed_launch_projection_matches(&before, &instance) {
+            self.info_dialog = Some(InfoDialog::new("Restart result rejected", "The original producer result no longer matches the acknowledged row. No replacement was changed or attached."));
+            return;
+        }
+        if attach_after && crate::session::restart::launched_agent(&outcome) {
+            self.restarted_attaches.push(session_id.clone());
+        }
+
+        match outcome {
+            Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
+                tracing::warn!(
+                    target: "session.restart",
+                    id = %session_id,
+                    %sid,
+                    "resume failed; sid preserved for explicit retry",
+                );
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restart Failed",
+                    &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                ));
+            }
+            Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                tracing::info!(
+                    target: "session.restart",
+                    id = %session_id,
+                    %sid,
+                    "started fresh; sid previously failed a resume probe",
+                );
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restarted",
+                    &format!(
+                        "Started fresh; a prior resume attempt failed for sid {sid}. \
+                     The old conversation is still reachable via the agent's \
+                     own resume/history picker."
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "session.restart",
+                    id = %session_id,
+                    error = %e,
+                    "restart cascade failed",
+                );
+                instance.status = Status::Error;
+                instance.last_error = Some(e.clone());
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restart Failed",
+                    &format!("Could not restart session: {e}"),
+                ));
+            }
+        }
+
+        if let Some(slot) = self.instances.get_mut(&session_id) {
+            slot.merge_post_restart_with_baseline(&before, &instance);
+            slot.last_error = if instance.status == Status::Error {
+                instance.last_error.clone()
+            } else {
+                None
+            };
+            slot.last_error_check = instance.last_error_check;
+            slot.last_start_time = instance.last_start_time;
+            slot.retroactive_capture_excludes = instance.retroactive_capture_excludes.clone();
+        }
+        self.refresh_rows_preserving_selection();
+        self.request_save();
+    }
+
+    fn completed_launch_projection_matches(&self, before: &Instance, after: &Instance) -> bool {
+        before.created_at == after.created_at
+            && before.same_storage_origin(after)
+            && self.instances.get(&before.id).is_some_and(|current| {
+                current.created_at == before.created_at
+                    && current.same_storage_origin(before)
+                    && current.lifecycle_generation == after.lifecycle_generation
+                    && current.active_execution == after.active_execution
+                    && current.tool == before.tool
+            })
     }
 }

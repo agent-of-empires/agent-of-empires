@@ -7,6 +7,356 @@ use std::fs;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+// Owned Create uses a genuinely held bootstrap and follows all native descendants.
+pub(super) struct OwnedCreateRoot {
+    pid: u32,
+    handles: std::collections::BTreeMap<u32, Option<std::os::fd::OwnedFd>>,
+}
+impl OwnedCreateRoot {
+    pub(super) fn prepare(birth: super::ProcessIncarnation) -> anyhow::Result<Self> {
+        let pid = birth.pid;
+        anyhow::ensure!(
+            super::process_incarnation(pid)? == Some(birth) && birth.group == pid,
+            "original held Linux bootstrap birth changed"
+        );
+        create_trace_begin(pid)?;
+        anyhow::ensure!(
+            super::process_incarnation(pid)? == Some(birth),
+            "original held Linux bootstrap changed during trace admission"
+        );
+        Ok(Self {
+            pid,
+            handles: std::collections::BTreeMap::from([(pid, create_pidfd(pid)?)]),
+        })
+    }
+    pub(super) fn release(&mut self) -> anyhow::Result<()> {
+        create_trace_resume(self.pid, 0)
+    }
+    pub(super) fn retire(
+        &mut self,
+        child: &mut std::process::Child,
+        cancel: &tokio_util::sync::CancellationToken,
+        mut admit: impl FnMut(super::CreateObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<super::CreateRetirement> {
+        use anyhow::Context;
+        use std::collections::BTreeSet;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::ExitStatusExt;
+        anyhow::ensure!(child.id() == self.pid, "original Create root was replaced");
+        let mut live = BTreeSet::from([self.pid]);
+        let handles = &mut self.handles;
+        let mut observed = Vec::new();
+        let mut root_status = None;
+        let mut external = false;
+        let mut scope_unproven = false;
+        while !live.is_empty() {
+            if cancel.is_cancelled() {
+                for fd in handles.values().flatten() {
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            fd.as_raw_fd(),
+                            libc::SIGKILL,
+                            0,
+                            0,
+                        )
+                    };
+                    if result == -1
+                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                    {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                }
+            }
+            observed.clear();
+            observed.extend(live.iter().copied());
+            let mut made_progress = false;
+            for &pid in &observed {
+                let mut status = 0;
+                let waited =
+                    unsafe { libc::waitpid(pid as i32, &mut status, libc::__WALL | libc::WNOHANG) };
+                if waited == 0 {
+                    continue;
+                }
+                if waited == -1 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                made_progress = true;
+                if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                    live.remove(&pid);
+                    if pid != self.pid {
+                        handles.remove(&pid);
+                    }
+                    if pid == self.pid {
+                        root_status = Some(status);
+                    }
+                    continue;
+                }
+                anyhow::ensure!(libc::WIFSTOPPED(status), "unrecognized native trace status");
+                let event = status >> 16;
+                let signal = libc::WSTOPSIG(status);
+                if event == libc::PTRACE_EVENT_FORK
+                    || event == libc::PTRACE_EVENT_VFORK
+                    || event == libc::PTRACE_EVENT_CLONE
+                {
+                    let mut born: libc::c_ulong = 0;
+                    create_ptrace(
+                        libc::PTRACE_GETEVENTMSG,
+                        pid,
+                        0,
+                        (&mut born as *mut libc::c_ulong) as usize,
+                    )?;
+                    let born = u32::try_from(born)?;
+                    let birth = super::process_incarnation(born)?
+                        .context("held descendant lacks actual kernel birth")?;
+                    live.insert(born);
+                    handles.insert(born, create_pidfd(born)?);
+                    admit(super::CreateObservation::Birth(birth))?;
+                } else if event == libc::PTRACE_EVENT_EXEC {
+                    let mut former: libc::c_ulong = 0;
+                    create_ptrace(
+                        libc::PTRACE_GETEVENTMSG,
+                        pid,
+                        0,
+                        (&mut former as *mut libc::c_ulong) as usize,
+                    )?;
+                    if former != 0 && former != pid as libc::c_ulong {
+                        // Thread-group exec changes PID projection; never promote a fresh alias.
+                        live.remove(&(former as u32));
+                        handles.remove(&(former as u32));
+                        if !scope_unproven {
+                            admit(super::CreateObservation::ScopeUnproven)?;
+                            scope_unproven = true;
+                        }
+                    }
+                } else if signal == (libc::SIGTRAP | 0x80) {
+                    let audit = create_audit_syscall(pid)?;
+                    if audit.external && !external {
+                        admit(super::CreateObservation::ExternalDomain)?;
+                        external = true;
+                    }
+                    if audit.unproven && !scope_unproven {
+                        admit(super::CreateObservation::ScopeUnproven)?;
+                        scope_unproven = true;
+                    }
+                }
+                if cancel.is_cancelled() {
+                    create_ptrace(libc::PTRACE_KILL, pid, 0, 0)?;
+                } else {
+                    let delivery = if event != 0
+                        || signal == (libc::SIGTRAP | 0x80)
+                        || signal == libc::SIGSTOP
+                    {
+                        0
+                    } else {
+                        signal
+                    };
+                    create_trace_resume(pid, delivery)?;
+                }
+            }
+            if !made_progress {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        // Keep this original producer until every original group member is gone.
+        // Uncovered/foreign members are never signalled; observation failure is not absence.
+        while process_group_has_live_members(self.pid)? {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let raw_status =
+            root_status.context("original native root never returned its actual exit status")?;
+        Ok(super::CreateRetirement {
+            status: std::process::ExitStatus::from_raw(raw_status),
+            raw_status,
+            descendants_retired: !scope_unproven,
+            group_retired: true,
+            external_domain: external,
+        })
+    }
+}
+pub(super) fn hold_owned_create_bootstrap() -> anyhow::Result<()> {
+    unsafe {
+        if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == -1 || libc::raise(libc::SIGSTOP) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+fn create_ptrace(
+    request: libc::c_uint,
+    pid: u32,
+    address: usize,
+    data: usize,
+) -> anyhow::Result<libc::c_long> {
+    let value = unsafe {
+        libc::ptrace(
+            request,
+            pid as libc::pid_t,
+            address as *mut libc::c_void,
+            data as *mut libc::c_void,
+        )
+    };
+    if value == -1 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(value)
+    }
+}
+fn create_trace_begin(pid: u32) -> anyhow::Result<()> {
+    let mut status = 0;
+    anyhow::ensure!(
+        unsafe { libc::waitpid(pid as i32, &mut status, libc::__WALL) } == pid as i32
+            && libc::WIFSTOPPED(status),
+        "original native bootstrap was not held"
+    );
+    create_ptrace(
+        libc::PTRACE_SETOPTIONS,
+        pid,
+        0,
+        (libc::PTRACE_O_TRACEFORK
+            | libc::PTRACE_O_TRACEVFORK
+            | libc::PTRACE_O_TRACECLONE
+            | libc::PTRACE_O_TRACEEXEC
+            | libc::PTRACE_O_EXITKILL
+            | libc::PTRACE_O_TRACESYSGOOD) as usize,
+    )?;
+    Ok(())
+}
+fn create_trace_resume(pid: u32, signal: i32) -> anyhow::Result<()> {
+    create_ptrace(libc::PTRACE_SYSCALL, pid, 0, signal as usize).map(|_| ())
+}
+fn create_pidfd(pid: u32) -> anyhow::Result<Option<std::os::fd::OwnedFd>> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd >= 0 {
+        return Ok(Some(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(fd as i32)
+        }));
+    }
+    let error = std::io::Error::last_os_error();
+    // Kernels without separate thread pidfds still retain real kernel ptrace ownership.
+    if error.raw_os_error() == Some(libc::EINVAL) || error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(None);
+    }
+    Err(error.into())
+}
+struct CreateSyscallAudit {
+    external: bool,
+    unproven: bool,
+}
+#[cfg(target_arch = "x86_64")]
+fn create_audit_syscall(pid: u32) -> anyhow::Result<CreateSyscallAudit> {
+    let mut info = [0u8; 128];
+    let length = create_ptrace(0x420e, pid, info.len(), info.as_mut_ptr() as usize)? as usize;
+    anyhow::ensure!(length >= 8, "native syscall ABI observation was incomplete");
+    if info[0] != 1 {
+        return Ok(CreateSyscallAudit {
+            external: false,
+            unproven: false,
+        });
+    }
+    let arch = u32::from_ne_bytes(info[4..8].try_into().unwrap());
+    if arch != 0xc000003e || length < 80 {
+        return Ok(CreateSyscallAudit {
+            external: false,
+            unproven: true,
+        });
+    }
+    let nr = u64::from_ne_bytes(info[24..32].try_into().unwrap());
+    let argument =
+        |index: usize| u64::from_ne_bytes(info[32 + index * 8..40 + index * 8].try_into().unwrap());
+    if nr & 0x40000000 != 0 {
+        return Ok(CreateSyscallAudit {
+            external: false,
+            unproven: true,
+        });
+    }
+    let nr = nr as i64;
+    let external = [
+        libc::SYS_socket,
+        libc::SYS_connect,
+        libc::SYS_sendmsg,
+        libc::SYS_sendto,
+        libc::SYS_bpf,
+        libc::SYS_io_uring_setup,
+        libc::SYS_ptrace,
+        libc::SYS_shmget,
+        libc::SYS_shmat,
+        libc::SYS_semop,
+        libc::SYS_msgsnd,
+        libc::SYS_mq_open,
+        libc::SYS_mq_timedsend,
+        libc::SYS_pidfd_getfd,
+        libc::SYS_process_vm_writev,
+    ]
+    .contains(&nr)
+        || ((nr == libc::SYS_kill || nr == libc::SYS_tkill) && argument(1) != 0)
+        || (nr == libc::SYS_tgkill && argument(2) != 0)
+        || (nr == libc::SYS_ioctl
+            && ![libc::TCGETS, libc::TIOCGWINSZ, libc::FIONREAD].contains(&argument(1)));
+    // clone3's shared userspace arguments can change after a peek; no fake complete coverage.
+    Ok(CreateSyscallAudit {
+        external,
+        unproven: nr == libc::SYS_clone3
+            || (nr == libc::SYS_clone && argument(0) & libc::CLONE_UNTRACED as u64 != 0),
+    })
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn create_audit_syscall(_: u32) -> anyhow::Result<CreateSyscallAudit> {
+    Ok(CreateSyscallAudit {
+        external: false,
+        unproven: true,
+    })
+}
+pub(super) fn exec_owned_create(
+    _program: &std::ffi::CString,
+    executable: &std::fs::File,
+    directory: &std::fs::File,
+    argv: &[std::ffi::CString],
+    env: &[std::ffi::CString],
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut argvp: Vec<_> = argv.iter().map(|v| v.as_ptr()).collect();
+    argvp.push(std::ptr::null());
+    let mut envp: Vec<_> = env.iter().map(|v| v.as_ptr()).collect();
+    envp.push(std::ptr::null());
+    let input = std::fs::File::open("/dev/null")?;
+    unsafe {
+        if libc::fchdir(directory.as_raw_fd()) != 0
+            || libc::dup2(input.as_raw_fd(), libc::STDIN_FILENO) == -1
+            || libc::fcntl(executable.as_raw_fd(), libc::F_SETFD, 0) == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        libc::fexecve(executable.as_raw_fd(), argvp.as_ptr(), envp.as_ptr());
+    }
+    Err(std::io::Error::last_os_error().into())
+}
+
+pub(super) fn owned_create_descendant_traceable() -> bool {
+    cfg!(target_arch = "x86_64")
+}
+pub(super) fn owned_create_anchor_path(
+    _: &std::fs::File,
+    slot: u32,
+) -> anyhow::Result<(std::ffi::OsString, bool)> {
+    Ok((format!("/proc/self/fd/{slot}").into(), false))
+}
+pub(super) fn install_owned_create_anchors(
+    files: &[std::fs::File],
+    slots: &[u32],
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    for (file, &slot) in files.iter().zip(slots) {
+        if unsafe { libc::dup2(file.as_raw_fd(), slot as i32) } == -1
+            || unsafe { libc::fcntl(slot as i32, libc::F_SETFD, 0) } == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn is_process_group_alive(pgid: u32) -> bool {
     if pgid == 0 {
         return false;
@@ -300,6 +650,12 @@ pub(super) fn process_namespace() -> std::io::Result<[u64; 2]> {
     }
     let namespace = fs::metadata("/proc/self/ns/pid")?;
     Ok([namespace.dev(), namespace.ino()])
+}
+
+// A hidden or unreadable process is not absent. Signal zero has no process effect.
+pub(super) fn custodian_process_absent(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 pub(super) fn process_incarnation(pid: u32) -> std::io::Result<Option<super::ProcessIncarnation>> {

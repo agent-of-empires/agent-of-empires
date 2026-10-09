@@ -13,6 +13,33 @@ use super::structured_repair::{
     LiveStructuredWorkerRecord,
 };
 
+/// Metadata healing runs before reload snapshots, never while holding the cache lock.
+pub(super) async fn reconcile_filesystem_claims(state: &Arc<AppState>) {
+    if state.read_only {
+        return;
+    }
+    let file_watch = state.file_watch.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        for profile in crate::session::list_profiles_for_worktree_inventory()? {
+            let result = Storage::open(&profile, file_watch.clone())
+                .and_then(|storage| storage.reconcile_filesystem_claims());
+            if let Err(error) = result {
+                tracing::warn!(target: "server.file_watch", %profile, %error, "filesystem claims retained after uncertain reconciliation");
+            }
+        }
+        Ok(())
+    }).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target: "server.file_watch", %error, "filesystem claim inventory unavailable")
+        }
+        Err(error) => {
+            tracing::warn!(target: "server.file_watch", %error, "filesystem claim worker failed")
+        }
+    }
+}
+
 /// Load sessions from all profiles, matching the TUI's "all profiles" view.
 pub(super) fn load_all_instances(
     file_watch: &Arc<FileWatchService>,

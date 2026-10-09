@@ -402,22 +402,27 @@ fn workspace_ordering_lock() -> &'static Mutex<()> {
 
 /// RAII guard for a held cross-process `flock`.
 pub(crate) struct StorageFlock {
+    own: HeldFlock,
+    sibling: Option<HeldFlock>,
+}
+
+struct HeldFlock {
     file: fs::File,
 }
 
 impl StorageFlock {
     pub(crate) fn file_identity(&self) -> Result<DirectoryIdentity> {
-        Ok(DirectoryIdentity::from_metadata(&self.file.metadata()?))
+        Ok(DirectoryIdentity::from_metadata(&self.own.file.metadata()?))
     }
 }
 
 impl std::os::fd::AsFd for StorageFlock {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.file.as_fd()
+        self.own.file.as_fd()
     }
 }
 
-impl Drop for StorageFlock {
+impl Drop for HeldFlock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
@@ -657,7 +662,10 @@ fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFloc
             }
         }
     }
-    Ok(StorageFlock { file })
+    Ok(StorageFlock {
+        own: HeldFlock { file },
+        sibling: None,
+    })
 }
 fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
     if let Err(e) = FileExt::try_lock_shared(&file) {
@@ -686,7 +694,10 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
             }
         }
     }
-    Ok(StorageFlock { file })
+    Ok(StorageFlock {
+        own: HeldFlock { file },
+        sibling: None,
+    })
 }
 
 /// Acquire the app-wide session identity-mutation lock.
@@ -696,7 +707,35 @@ pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
 
 /// Serialize path ownership claims without holding the global identity lock over Git work.
 pub(crate) fn acquire_session_workspace_claim_lock() -> Result<StorageFlock> {
-    acquire_storage_flock(&get_app_dir()?, SESSION_WORKSPACE_CLAIM_LOCK_FILENAME)
+    let current = get_app_dir()?;
+    let Some(sibling) = super::sibling_namespace_app_dir() else {
+        return acquire_session_workspace_claim_lock_in(&current);
+    };
+    fs::create_dir_all(&current)?;
+    fs::create_dir_all(&sibling)?;
+    let current = current.canonicalize()?;
+    let sibling = sibling.canonicalize()?;
+    if paths_share_filesystem_identity(&current, &sibling)? {
+        return acquire_session_workspace_claim_lock_in(&current);
+    }
+    let (first, second) = if current < sibling {
+        (&current, &sibling)
+    } else {
+        (&sibling, &current)
+    };
+    let first_lock = acquire_session_workspace_claim_lock_in(first)?;
+    let second_lock = acquire_session_workspace_claim_lock_in(second)?;
+    let (mut own, other) = if first == &current {
+        (first_lock, second_lock)
+    } else {
+        (second_lock, first_lock)
+    };
+    own.sibling = Some(other.own);
+    Ok(own)
+}
+
+pub(crate) fn acquire_session_workspace_claim_lock_in(app_dir: &Path) -> Result<StorageFlock> {
+    acquire_storage_flock(app_dir, SESSION_WORKSPACE_CLAIM_LOCK_FILENAME)
 }
 
 /// Serialize one session's title commit and post-commit tmux rekey across profiles and
@@ -830,7 +869,10 @@ pub(crate) fn acquire_storage_shared_flock(dir: &Path, name: &str) -> Result<Sto
 pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option<StorageFlock>> {
     let (file, _path) = open_storage_lock_file(dir, name)?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(StorageFlock { file })),
+        Ok(()) => Ok(Some(StorageFlock {
+            own: HeldFlock { file },
+            sibling: None,
+        })),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -1226,6 +1268,43 @@ impl Storage {
             .context("original profile inode pin is unavailable")
     }
 
+    pub(crate) fn load_claim_abort_document_locked(
+        &self,
+    ) -> Result<super::raw_document::RawDocument> {
+        self.verify_profile_identity()?;
+        let anchor = super::AnchoredDir::duplicate_original(
+            self.sessions_path
+                .parent()
+                .context("sessions path has no parent")?,
+            self.original_profile_fd()?,
+        )?;
+        let bytes = anchor
+            .read_regular(Path::new("sessions.json"), usize::MAX)?
+            .unwrap_or_default();
+        super::raw_document::RawDocument::parse(std::str::from_utf8(&bytes)?)
+    }
+
+    pub(crate) fn publish_claim_abort_document_locked(&self, mut bytes: &[u8]) -> Result<()> {
+        self.verify_profile_identity()?;
+        #[cfg(test)]
+        anyhow::ensure!(!self.fail_writes_for_test, "injected storage write failure");
+        let anchor = super::AnchoredDir::duplicate_original(
+            self.sessions_path
+                .parent()
+                .context("sessions path has no parent")?,
+            self.original_profile_fd()?,
+        )?;
+        anchor.publish_file(
+            Path::new("sessions.json"),
+            &mut bytes,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            true,
+            None,
+        )?;
+        self.file_watch.notify_local_change(&self.sessions_path);
+        Ok(())
+    }
+
     pub(crate) fn same_origin_as(&self, other: &Self) -> bool {
         self.profile_identity.is_some() && self.profile_identity == other.profile_identity
     }
@@ -1485,6 +1564,71 @@ impl Storage {
         self.verify_profile_identity()?;
         super::raw_document::RawDocument::parse(&content)
             .with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Loss changes only the claim state; original authority is never reconstructed.
+    pub(crate) fn reconcile_filesystem_claims(&self) -> Result<bool> {
+        self.reconcile_filesystem_claims_with(crate::process::OriginalCustodianBirth::observe)
+    }
+
+    fn reconcile_filesystem_claims_with(
+        &self,
+        observe: impl Fn(&crate::process::OriginalCustodianBirth) -> crate::process::CustodianLiveness,
+    ) -> Result<bool> {
+        let _workspace = acquire_session_workspace_claim_lock()?;
+        let _identity = acquire_session_identity_lock()?;
+        self.verify_profile_identity()?;
+        let profile = self.original_profile_identity()?;
+        if !profile.is_durable() {
+            return Ok(false);
+        }
+        let mut ids = with_storages_locked(std::slice::from_ref(self), || {
+            self.load_raw_document_locked(&self.sessions_path)
+                .map(|document| {
+                    document
+                        .owners("id")
+                        .into_iter()
+                        .filter_map(|(id, owner)| {
+                            (owner.count == 1
+                                && !owner.ambiguous
+                                && super::claim_reconcile::pending_custodian(
+                                    &document.rows[owner.index],
+                                    profile,
+                                )
+                                .ok()
+                                .flatten()
+                                .is_some())
+                            .then_some(id)
+                        })
+                        .collect::<Vec<_>>()
+                })
+        })??;
+        ids.sort();
+        let mut changed = false;
+        for id in ids {
+            if super::validate_instance_id(&id).is_err() {
+                continue;
+            }
+            let _lifecycle = self.acquire_instance_lifecycle_lock(&id)?;
+            changed |= with_storages_locked(std::slice::from_ref(self), || -> Result<bool> {
+                self.verify_profile_identity()?;
+                let mut document = self.load_raw_document_locked(&self.sessions_path)?;
+                if !super::claim_reconcile::mark_lost(&mut document, &id, profile, &observe)? {
+                    return Ok(false);
+                }
+                #[cfg(test)]
+                anyhow::ensure!(!self.fail_writes_for_test, "injected storage write failure");
+                self.verify_profile_identity()?;
+                atomic_write(
+                    &self.sessions_path,
+                    &serde_json::to_vec_pretty(&document.rows)?,
+                )?;
+                sync_parent_directory(&self.sessions_path)?;
+                self.file_watch.notify_local_change(&self.sessions_path);
+                Ok(true)
+            })??;
+        }
+        Ok(changed)
     }
 
     pub(crate) fn load_path_owners_locked(&self) -> Result<super::deletion::WorktreeOwnerDocument> {
@@ -1857,6 +2001,9 @@ impl Storage {
                 .as_ref()
                 .filter(|lease| lease.path_claims.is_pending());
             let changed_pending = pending != prior.and_then(|prior| prior.pending.as_ref());
+            if prior.is_none() || changed_geometry || changed_pending {
+                super::retained_intents::ensure_id_available(&row.id)?;
+            }
             if metadata_only {
                 anyhow::ensure!(
                     !changed_geometry && !changed_pending,
@@ -1873,7 +2020,7 @@ impl Storage {
                     Some(super::WorktreePathClaims::Pending(pending)) => {
                         paths.extend(pending.iter().cloned())
                     }
-                    Some(super::WorktreePathClaims::Unknown) => {
+                    Some(super::WorktreePathClaims::Unknown(_)) => {
                         anyhow::bail!("cannot publish an unknown filesystem intent")
                     }
                     _ => {}
@@ -3555,6 +3702,94 @@ fn reconcile_groups_after_repair(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn crash_claim_reconciliation_is_durable_and_never_expires_or_erases_paths() -> Result<()> {
+        use crate::process::{CustodianLiveness, OriginalCustodianBirth, ProcessIncarnation};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("crash-claims")?;
+        let root = tempfile::tempdir()?;
+        let paths = vec![
+            root.path().join("future"),
+            root.path().join("second"),
+            root.path().join("future"),
+        ];
+        let mut row = Instance::new("original", root.path().join("current").to_str().unwrap());
+        row.try_acquire_lifecycle_reservation(
+            super::super::LifecycleOperation::Create,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )?;
+        let birth = OriginalCustodianBirth {
+            boot: "fixture-boot".into(),
+            process: ProcessIncarnation {
+                pid: 4312,
+                group: 4312,
+                start: [123, 0],
+                namespace: [7, 8],
+            },
+            profile: storage.original_profile_identity()?,
+            session_id: row.id.clone(),
+            created_at: row.created_at,
+            generation: row.lifecycle_generation,
+        };
+        let lease = row.lifecycle_reservation.as_mut().unwrap();
+        lease.path_claims = super::super::WorktreePathClaims::Pending(paths.clone());
+        lease.custodian = Some(birth.clone());
+        let raw = serde_json::to_string(&row)?;
+        let opaque =
+            r#"{"id":"opaque","project_path":false,"literal":{"same":1,"same":2,"number":1e400}}"#;
+        let duplicated = r#"{"id":"duplicate","id":"duplicate","project_path":"/tmp/keep"}"#;
+        let bytes = format!("[{raw},{opaque},{duplicated}]");
+        fs::write(storage.sessions_path(), &bytes)?;
+        for observation in [CustodianLiveness::Live, CustodianLiveness::Uncertain] {
+            assert!(!storage.reconcile_filesystem_claims_with(|_| observation)?);
+            assert_eq!(fs::read_to_string(storage.sessions_path())?, bytes);
+        }
+        let mut failed = storage.clone();
+        failed.fail_writes_for_test = true;
+        assert!(failed
+            .reconcile_filesystem_claims_with(|_| CustodianLiveness::Lost)
+            .is_err());
+        assert_eq!(fs::read_to_string(storage.sessions_path())?, bytes);
+        assert!(storage.reconcile_filesystem_claims_with(|_| CustodianLiveness::Lost)?);
+        let persisted = fs::read(storage.sessions_path())?;
+        let document =
+            super::super::raw_document::RawDocument::parse(std::str::from_utf8(&persisted)?)?;
+        let mut retained: Instance = serde_json::from_str(document.rows[0].get())?;
+        assert_eq!(retained.id, row.id);
+        assert_eq!(retained.created_at, row.created_at);
+        assert_eq!(retained.lifecycle_generation, row.lifecycle_generation);
+        let lease = retained.lifecycle_reservation.as_ref().unwrap();
+        assert_eq!(lease.op, row.lifecycle_reservation.as_ref().unwrap().op);
+        assert_eq!(lease.at, row.lifecycle_reservation.as_ref().unwrap().at);
+        assert_eq!(lease.custodian.as_ref(), Some(&birth));
+        assert_eq!(
+            lease.path_claims,
+            super::super::WorktreePathClaims::Unknown(Some(paths))
+        );
+        assert_eq!(document.rows[1].get(), opaque);
+        assert_eq!(document.rows[2].get(), duplicated);
+        let reopened = Storage::open_unwatched("crash-claims")?;
+        assert!(!reopened
+            .reconcile_filesystem_claims_with(|_| panic!("Unknown never becomes new authority"))?);
+        assert_eq!(fs::read(reopened.sessions_path())?, persisted);
+        let operation = row.lifecycle_reservation.as_ref().unwrap().op;
+        assert!(
+            !retained.release_lifecycle_reservation_if_owned(operation, row.lifecycle_generation)
+        );
+        assert!(retained
+            .has_active_lifecycle_reservation(chrono::Utc::now() + chrono::Duration::days(90)));
+        assert!(retained
+            .try_acquire_lifecycle_reservation(
+                super::super::LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now() + chrono::Duration::days(90)
+            )
+            .is_err());
+        Ok(())
+    }
+
     use super::super::move_journal;
     use super::*;
     use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};

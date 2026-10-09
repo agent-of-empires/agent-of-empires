@@ -4,110 +4,6 @@
 use super::*;
 
 impl HomeView {
-    pub fn save(&mut self) -> anyhow::Result<()> {
-        let _workspace_lock = crate::session::acquire_session_workspace_claim_lock()?;
-        let _identity_lock = crate::session::acquire_session_identity_lock()?;
-        self.save_with_storage()
-    }
-
-    /// The caller owns workspace, then identity.
-    pub(super) fn save_with_storage(&mut self) -> anyhow::Result<()> {
-        let mut all_peer_deleted: Vec<String> = Vec::new();
-        let profile_names: Vec<String> = self.storages.keys().cloned().collect();
-
-        for profile_name in profile_names {
-            if !crate::session::get_profile_dir_path(&profile_name).is_ok_and(|path| path.exists())
-            {
-                self.storages.remove(&profile_name);
-                self.pending_deletions.remove(&profile_name);
-                self.pending_group_deletions.remove(&profile_name);
-                self.pending_added.remove(&profile_name);
-                continue;
-            }
-            let storage = self
-                .storages
-                .get(&profile_name)
-                .ok_or_else(|| anyhow::anyhow!("Profile storage no longer exists"))?;
-            let tui_rows: Vec<Instance> = self
-                .cloned_instances_for_profile(&profile_name)
-                .into_iter()
-                .filter(|row| self.creating_stub_id.as_deref() != Some(&row.id))
-                .collect();
-            let dels: HashSet<String> = self
-                .pending_deletions
-                .get(&profile_name)
-                .cloned()
-                .unwrap_or_default();
-            let added: HashSet<String> = self
-                .pending_added
-                .get(&profile_name)
-                .cloned()
-                .unwrap_or_default();
-            let group_dels: HashSet<String> = self
-                .pending_group_deletions
-                .get(&profile_name)
-                .cloned()
-                .unwrap_or_default();
-            let groups_target = self
-                .group_trees
-                .get(&profile_name)
-                .map(|t| t.get_all_groups())
-                .unwrap_or_default();
-
-            let peer_deleted: Vec<String> =
-                storage.update_under_workspace_claim_lock(|disk_instances, disk_groups| {
-                    disk_instances.retain(|d| !dels.contains(&d.id));
-                    let mut peer_deleted: Vec<String> = Vec::new();
-                    for tui_inst in &tui_rows {
-                        if let Some(disk_inst) =
-                            disk_instances.iter_mut().find(|d| d.id == tui_inst.id)
-                        {
-                            let durable_status = disk_inst.status;
-                            disk_inst.merge_from_tui(tui_inst);
-                            if tui_inst.status == crate::session::Status::Deleting {
-                                disk_inst.status = durable_status;
-                            }
-                        } else if added.contains(&tui_inst.id) {
-                            if tui_inst.status != crate::session::Status::Deleting {
-                                disk_instances.push(tui_inst.clone());
-                            }
-                        } else {
-                            // Disk had no row with this id and we did not add it
-                            // this session: a peer (CLI / aoe serve) removed it.
-                            peer_deleted.push(tui_inst.id.clone());
-                        }
-                    }
-                    disk_groups.retain(|g| !group_dels.contains(&g.path));
-                    for tui_g in &groups_target {
-                        if let Some(disk_g) = disk_groups.iter_mut().find(|g| g.path == tui_g.path)
-                        {
-                            disk_g.name = tui_g.name.clone();
-                            disk_g.collapsed = tui_g.collapsed;
-                            disk_g.archived_at = tui_g.archived_at;
-                        } else {
-                            disk_groups.push(tui_g.clone());
-                        }
-                    }
-                    Ok(peer_deleted)
-                })?;
-
-            self.pending_deletions.remove(&profile_name);
-            self.pending_group_deletions.remove(&profile_name);
-            self.pending_added.remove(&profile_name);
-            all_peer_deleted.extend(peer_deleted);
-        }
-
-        if !all_peer_deleted.is_empty() {
-            self.drop_peer_deleted_rows(&all_peer_deleted);
-            tracing::info!(
-                target: "tui.home",
-                count = all_peer_deleted.len(),
-                "Dropped peer-deleted rows from in-memory mirror"
-            );
-        }
-        Ok(())
-    }
-
     /// Drop in-memory mirror rows that no longer exist on disk (peer-deleted via the CLI or
     /// aoe serve), rebuilding derived UI state so callers don't target removed rows.
     pub(super) fn drop_peer_deleted_rows(&mut self, ids: &[String]) {
@@ -201,16 +97,17 @@ impl HomeView {
         if instance.status != crate::session::Status::Creating {
             crate::tui::app::record_session_create();
         }
+        let token = self.record_row_edit(&instance.source_profile, &instance.id);
         self.pending_added
             .entry(instance.source_profile.clone())
             .or_default()
-            .insert(instance.id.clone());
+            .insert(instance.id.clone(), token);
         self.instances.insert(instance.id.clone(), instance);
     }
 
     /// Publish a row this process already committed through `Storage::update`. Unlike a
     /// provisional TUI add, a later missing disk row is a peer deletion and must not be
-    /// recreated by `save()`.
+    /// recreated by `request_save` acknowledgement.
     pub(super) fn publish_persisted_instance(&mut self, instance: Instance) {
         let profile = instance.source_profile.clone();
         let id = instance.id.clone();
@@ -224,258 +121,37 @@ impl HomeView {
         }
     }
 
-    /// Tombstones `path` and every descendant from the per-profile tree so
-    /// `save()` drops them under the flock instead of wholesale-replacing.
-    pub(in crate::tui) fn delete_group_in_profile(&mut self, profile: &str, path: &str) {
-        let prefix = format!("{}/", path);
-        let descendants: Vec<String> = self
-            .group_trees
-            .get(profile)
-            .map(|tree| {
-                tree.get_all_groups()
-                    .into_iter()
-                    .filter(|g| g.path == path || g.path.starts_with(&prefix))
-                    .map(|g| g.path)
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![path.to_string()]);
-        if let Some(tree) = self.group_trees.get_mut(profile) {
-            tree.delete_group(path);
-        }
-        self.pending_group_deletions
-            .entry(profile.to_string())
-            .or_default()
-            .extend(descendants);
-    }
-
     /// Centralized instance mutation: applies `f` in place, a no-op on unknown ids so
     /// callers can be idempotent (matching `remove_instance`).
     pub(in crate::tui) fn mutate_instance(&mut self, id: &str, f: impl FnOnce(&mut Instance)) {
         if let Some(inst) = self.instances.get_mut(id) {
             f(inst);
+            let profile = inst.source_profile.clone();
+            self.record_row_edit(&profile, id);
         }
     }
 
-    /// Acquire the per-session title flock and then the source profile's per-instance
-    /// lifecycle flock, and replace the TUI snapshot with the authoritative source row.
-    /// Only TUI-owned launch configuration is merged from the snapshot; lifecycle and
-    /// runtime fields stay as reloaded under the lifecycle lock.
-    pub(in crate::tui) fn lock_session_mutation_and_reload(
+    /// Queue a passive observation on its original row; the daemon owns structured status.
+    pub(in crate::tui) fn persist_passive_status_transition(
         &mut self,
         id: &str,
-    ) -> anyhow::Result<SessionMutationGuards> {
-        let snapshot = self
-            .instances
-            .get(id)
+        mark_unread: bool,
+    ) {
+        let Some(row) = self
+            .get_instance(id)
+            .filter(|r| !r.is_structured())
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
-        let source_profile = snapshot.source_profile.clone();
-        let session_title = crate::session::acquire_session_title_lock(id)
-            .map_err(|error| anyhow::anyhow!("failed to acquire session title lock: {error}"))?;
-        let storage = self
-            .storages
-            .get(&source_profile)
-            .ok_or_else(|| anyhow::anyhow!("original session storage is no longer registered"))?;
-        storage.verify_profile_identity()?;
-        let lifecycle = storage
-            .acquire_instance_lifecycle_lock(id)
-            .map_err(|error| {
-                anyhow::anyhow!("failed to acquire session lifecycle lock: {error}")
-            })?;
-        // Read-only: both flocks are already held, so a plain `load()` gives the
-        // authoritative row without `update()`, which would rewrite sessions.json and fire
-        // `notify_local_change` even when nothing changed. `move_group_to_profile` acquires
-        // these guards per member in a loop, so an update-per-read would be N rewrites.
-        let mut authoritative = storage
-            .load()?
-            .into_iter()
-            .find(|instance| instance.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))?;
-        let authoritative_generation = authoritative.lifecycle_generation;
-        let authoritative_status = authoritative.status;
-        let authoritative_idle_entered_at = authoritative.idle_entered_at;
-        let authoritative_last_accessed_at = authoritative.last_accessed_at;
-        authoritative.merge_runtime_from_reload(&snapshot);
-        authoritative.merge_from_tui(&snapshot);
-        authoritative.source_profile.clone_from(&source_profile);
-        authoritative.lifecycle_generation = authoritative_generation;
-        authoritative.status = authoritative_status;
-        authoritative.idle_entered_at = authoritative_idle_entered_at;
-        authoritative.last_accessed_at =
-            authoritative_last_accessed_at.max(snapshot.last_accessed_at);
-        self.instances.insert(id.to_string(), authoritative);
-        Ok(SessionMutationGuards {
-            _session_title: session_title,
-            _lifecycle: lifecycle,
-        })
-    }
-
-    /// Move a row between profiles as one dual-locked storage transaction,
-    /// then publish the committed row in memory.
-    pub(in crate::tui) fn move_to_profile(
-        &mut self,
-        id: &str,
-        target: &str,
-        requested: Instance,
-        baseline: Option<&Instance>,
-        account_swap: bool,
-    ) -> anyhow::Result<()> {
-        self.move_to_profile_with_effect(id, target, requested, baseline, account_swap, |_| Ok(()))
-    }
-
-    /// Cross-profile move: structurally distinct from `mutate_instance` because the source
-    /// row and group metadata must be removed in the same transaction that durably
-    /// publishes the target row and metadata.
-    ///
-    /// `before_commit` runs after authoritative target validation while both profile
-    /// storage locks are held; it may perform only bounded worktree/container effects and
-    /// must not re-enter storage or rekey tmux. Callers retain [`SessionMutationGuards`]
-    /// around the transaction and any post-persist rekey.
-    pub(in crate::tui) fn move_to_profile_with_effect<B>(
-        &mut self,
-        id: &str,
-        target: &str,
-        mut requested: Instance,
-        baseline: Option<&Instance>,
-        account_swap: bool,
-        before_commit: B,
-    ) -> anyhow::Result<()>
-    where
-        B: FnOnce(&Instance) -> anyhow::Result<()>,
-    {
-        let Some(current) = self.instances.get(id).cloned() else {
-            return Ok(());
+        else {
+            return;
         };
-        let lifecycle_reserved = current.has_active_lifecycle_reservation(chrono::Utc::now());
-        let before = baseline.cloned().unwrap_or_else(|| current.clone());
-        let old_profile = before.source_profile.clone();
-        requested.source_profile = old_profile.clone();
-        if old_profile == target {
-            requested.source_profile = target.to_string();
-            self.instances.insert(id.to_string(), requested);
-            return Ok(());
-        }
-        anyhow::ensure!(
-            current.status != crate::session::Status::Creating,
-            "Cannot move session {id} between profiles while it is being created"
-        );
-        anyhow::ensure!(
-            !lifecycle_reserved,
-            "Cannot move session {id} between profiles while a lifecycle operation is in progress"
-        );
-
-        if !self.storages.contains_key(target) {
-            self.storages.insert(
-                target.to_string(),
-                Storage::open(target, self.file_watch.clone())?,
-            );
-        }
-        let source = self
-            .storages
-            .get(&old_profile)
-            .ok_or_else(|| anyhow::anyhow!("Source profile storage is not loaded"))?;
-        let target_storage = self
-            .storages
-            .get(target)
-            .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
-        let mut moved = source.move_instance_to_with_effect(
-            target_storage,
-            &before,
-            &requested,
-            account_swap,
-            |instances, candidate| {
-                if crate::session::is_duplicate_session(
-                    instances.iter(),
-                    &candidate.title,
-                    &candidate.project_path,
-                    None,
-                ) {
-                    return Err(crate::session::duplicate_session_error(&candidate.title));
-                }
-                Ok(())
-            },
-            before_commit,
-        )?;
-        moved.merge_runtime_for_profile_move(&current);
-        moved.source_profile = target.to_string();
-        self.instances.insert(id.to_string(), moved);
-        Ok(())
-    }
-
-    /// Reload storage after a profile move without dropping runtime-only state
-    /// from the rows the transaction just published.
-    pub(in crate::tui) fn reload_preserving_profile_move_runtime(
-        &mut self,
-        ids: &[String],
-    ) -> anyhow::Result<()> {
-        let previous: Vec<(String, Instance)> = ids
-            .iter()
-            .filter_map(|id| {
-                self.instances
-                    .get(id)
-                    .cloned()
-                    .map(|instance| (id.clone(), instance))
+        let result = persistence_transactions::RowCapture::capture(row).and_then(|row| {
+            self.request_transaction(persistence_transactions::TransactionRequest::Passive {
+                row,
+                mark_unread,
             })
-            .collect();
-        self.reload()?;
-        for (id, prior) in previous {
-            if let Some(reloaded) = self.instances.get_mut(&id) {
-                reloaded.merge_runtime_for_profile_move(&prior);
-            }
-        }
-        Ok(())
-    }
-
-    /// Persist a passively-detected status transition so the next disk reload (a relaunch,
-    /// or a peer like `aoe serve`) finds disk caught up instead of misreading a stale
-    /// snapshot as a fresh transition (#2690). Best effort: unlike `apply_user_action`, a
-    /// write failure does not roll back the in-memory update, since the poller is the sole
-    /// authority on live status.
-    ///
-    /// `mark_unread` folds the Running -> Idle unread mark into the same `Storage::update`
-    /// instead of a second flock round-trip on the same row in the same tick, matching the
-    /// daemon's per-tick batching. Terminal rows only; see the `is_structured()` return.
-    pub(in crate::tui) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
-        let Some(inst) = self.instances.get(id) else {
-            return;
-        };
-        let Some(storage) = self.storages.get(&inst.source_profile) else {
-            return;
-        };
-        // A structured row has nothing for the TUI to persist, so bail before taking the
-        // flock.
-        //
-        // Its status is a daemon-side overlay rebuilt from live worker state and re-derived
-        // at daemon boot by `seed_acp_statuses`, and the daemon's own passive writer gates
-        // its patch on exactly this predicate. Persisting it here would strand a row at
-        // `Running` or `Error` with no producer left to heal it once the daemon is gone,
-        // since the tmux poller bails on structured rows: the #3201 regression from #3170.
-        //
-        // Its unread mark is the daemon's too (#3181), written from the live ACP turn-end
-        // event, and the caller's predicate is gated on `!structured` to match, so
-        // `mark_unread` is only ever `false` here and this return is total.
-        if inst.is_structured() {
-            return;
-        }
-        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
-        if let Err(e) = storage.update_metadata(
-            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(id)),
-            |insts, _groups| {
-                if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                    disk.merge_passive_status_patch(id, &patch);
-                    if mark_unread {
-                        disk.mark_unread();
-                    }
-                }
-                Ok(())
-            },
-        ) {
-            // Passive persistence failure keeps the in-memory observation.
-            tracing::warn!(
-                target: "session.store",
-                session_id = %id,
-                "persist_passive_status_transition failed: {e}"
-            );
+        });
+        if let Err(error) = result {
+            tracing::warn!(target:"session.store",session_id=%id,"Passive observation was not queued: {error:#}");
         }
     }
 }

@@ -8,8 +8,10 @@ pub(crate) mod capture;
 pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
+mod creation_undo;
 // Discovery of on-disk Claude Code sessions. Lives here rather than under
 // `acp` because terminal/tmux import via the CLI does not involve ACP.
+pub(crate) mod claim_reconcile;
 pub mod claude_import;
 pub mod config;
 pub mod conversation_carry;
@@ -28,6 +30,7 @@ pub mod projects;
 pub(crate) mod raw_document;
 pub(crate) mod recovery;
 pub mod restart;
+pub(crate) mod retained_intents;
 pub(crate) mod runner_journal;
 pub mod sandbox_store_reclaim;
 pub mod scope;
@@ -77,9 +80,8 @@ pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{
-    duplicate_session_error, find_duplicate_session, is_duplicate_session,
-    persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
-    NEWER_GENERATION_BUSY_REASON,
+    duplicate_session_error, is_duplicate_session, persist_session_to_storage, PassiveStatusPatch,
+    ResumeIntent, SidWrite, NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
@@ -98,7 +100,7 @@ pub use instance::{
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
-pub use runner_journal::LaunchOrigin;
+pub use runner_journal::{LaunchOrigin, OwnedCreateCommand};
 pub use storage::DirectoryIdentity;
 pub(crate) use storage::{
     acquire_profile_namespace_lock, acquire_session_identity_lock, sync_parent_directory,
@@ -190,17 +192,18 @@ pub use scope::SessionScope;
 #[cfg(test)]
 pub(crate) use storage::migration_backups;
 pub(crate) use storage::{
-    acquire_session_title_lock, acquire_session_workspace_claim_lock, acquire_storage_flock,
-    acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
-    replace_file_no_follow, resolve_symlink_chain, same_filesystem_identity,
-    try_acquire_storage_flock, GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
+    acquire_session_title_lock, acquire_session_workspace_claim_lock,
+    acquire_session_workspace_claim_lock_in, acquire_storage_flock, acquire_storage_shared_flock,
+    atomic_write, backup_before_migration, read_file_no_follow, replace_file_no_follow,
+    resolve_symlink_chain, same_filesystem_identity, try_acquire_storage_flock, GroupMovePlan,
+    StorageFlock, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
     update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -757,7 +760,21 @@ pub fn delete_profile(name: &str) -> Result<()> {
     let _workspace_lock = acquire_session_workspace_claim_lock()?;
     let _identity_lock = acquire_session_identity_lock()?;
     let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
+    delete_profile_locked(name)
+}
 
+/// Delete only the profile directory captured by the caller before enqueueing.
+pub(crate) fn delete_original_profile(storage: &Storage) -> Result<()> {
+    let name = storage.profile();
+    validate_profile_name(name)?;
+    let _workspace_lock = acquire_session_workspace_claim_lock()?;
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
+    storage.verify_profile_identity()?;
+    delete_profile_locked(name)
+}
+
+fn delete_profile_locked(name: &str) -> Result<()> {
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
 
@@ -818,6 +835,7 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
 
 fn ensure_profile_has_no_pending_paths(name: &str) -> Result<()> {
     let storage = Storage::open_unwatched(name)?;
+    retained_intents::ensure_profile_unretained(&storage)?;
     let document = storage.load_path_owners_locked()?;
     anyhow::ensure!(
         document
@@ -826,6 +844,25 @@ fn ensure_profile_has_no_pending_paths(name: &str) -> Result<()> {
             .all(|row| matches!(row.pending, WorktreePathClaims::None)),
         "profile has unfinished or unknown filesystem intent"
     );
+    let sessions = storage.sessions_path();
+    let directory = sessions.parent().context("profile has no directory")?;
+    for owner in retained_intents::load_owners()?.rows {
+        let pending = match &owner.pending {
+            WorktreePathClaims::Pending(paths) | WorktreePathClaims::Unknown(Some(paths)) => {
+                paths.as_slice()
+            }
+            WorktreePathClaims::Unknown(None) => anyhow::bail!(
+                "retained intent has unknown resource scope; physical profile mutation is unsafe"
+            ),
+            WorktreePathClaims::None => &[],
+        };
+        for path in owner.paths.iter().chain(pending) {
+            anyhow::ensure!(
+                !deletion::paths_overlap_destructive(directory, path),
+                "profile contains resources protected by a retained intent"
+            );
+        }
+    }
     Ok(())
 }
 

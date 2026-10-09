@@ -51,39 +51,6 @@ fn add_instance_counts_only_finalized_creates() {
     );
 }
 
-#[test]
-#[serial]
-fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    let current = vec!["test".to_string()];
-
-    assert!(
-        view.disk_watch.handles.is_empty(),
-        "construction outside a tokio runtime must not prewire subscriptions"
-    );
-    view.rewire_disk_subscriptions(&current);
-    assert!(
-        view.disk_watch.handles.is_empty(),
-        "rewire outside a tokio runtime must stay a no-op for lib tests"
-    );
-    assert!(
-        !view
-            .disk_watch
-            .dirty
-            .load(std::sync::atomic::Ordering::Acquire),
-        "the noop branch must leave disk_dirty clear outside a runtime"
-    );
-}
-
 /// Watcher refreshes stash the latest theme for the tick loop and never reopen the hotkey
 /// warning; interactive refreshes do the reverse.
 #[test]
@@ -314,7 +281,11 @@ fn ctrl_c_in_live_mode_forwards_to_agent_and_flashes() {
     assert!(!env.view.live_send_ctrl_c_flash_active());
 
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-    let action = env.view.handle_key(ctrl_c, None);
+    let action = {
+        let result = env.view.handle_key(ctrl_c, None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         action.is_none(),
@@ -675,7 +646,11 @@ fn second_stop_key_press_confirms_the_stop() {
         env.view.view_mode = ViewMode::Structured;
 
         assert_eq!(
-            env.view.handle_key(key(KeyCode::Char(stop_key)), None),
+            {
+                let result = env.view.handle_key(key(KeyCode::Char(stop_key)), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            },
             None
         );
         assert_eq!(
@@ -689,11 +664,22 @@ fn second_stop_key_press_confirms_the_stop() {
             "strict={strict}\n{screen}"
         );
 
-        assert_eq!(env.view.handle_key(key(KeyCode::Char('j')), None), None);
+        assert_eq!(
+            {
+                let result = env.view.handle_key(key(KeyCode::Char('j')), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            },
+            None
+        );
         assert!(env.view.confirm_dialog.is_some(), "strict={strict}");
 
         assert_eq!(
-            env.view.handle_key(key(KeyCode::Char(stop_key)), None),
+            {
+                let result = env.view.handle_key(key(KeyCode::Char(stop_key)), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            },
             Some(Action::StopSession(id)),
             "strict={strict}"
         );
@@ -784,7 +770,14 @@ fn manual_unread_hold_lasts_one_visit() {
 
     // Same visit: the hold keeps the hand-set mark through a full dwell.
     env.view.select_session_by_id(&a);
-    env.view.toggle_unread_at_cursor().expect("manual mark A");
+    {
+        let submitted = env.view.toggle_unread_at_cursor();
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect("manual mark A");
     let t0 = Instant::now();
     assert!(!env.view.tick_unread_dwell(t0));
     assert!(!env.view.tick_unread_dwell(t0 + past_dwell));
@@ -814,10 +807,18 @@ fn manual_unread_hold_lasts_one_visit() {
 
     // Engaging clears the mark and ends the hold without leaving the row, so a later auto
     // mark on the still-selected row clears on the next tick of the parked dwell clock.
-    env.view
-        .toggle_unread_at_cursor()
-        .expect("manual mark A again");
-    env.view.clear_unread_on_view(&a);
+    {
+        let submitted = env.view.toggle_unread_at_cursor();
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect("manual mark A again");
+    {
+        env.view.clear_unread_on_view(&a);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(
         env.view.manual_unread_hold.is_none(),
         "engaging with the row must release the manual hold"
@@ -835,7 +836,11 @@ fn manual_unread_hold_lasts_one_visit() {
 #[serial]
 fn test_q_returns_quit_action() {
     let mut env = create_test_env_empty();
-    let action = env.view.handle_key(key(KeyCode::Char('q')), None);
+    let action = {
+        let result = env.view.handle_key(key(KeyCode::Char('q')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(action, Some(Action::Quit));
 }
 
@@ -845,10 +850,14 @@ fn test_ctrl_q_does_not_quit_home() {
     // #1569: Ctrl+Q is a live-mode-exit habit and must not quit aoe on the home view. The
     // app-level handler swallows it, and the home view must not treat it as a quit either.
     let mut env = create_test_env_empty();
-    let action = env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-        None,
-    );
+    let action = {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(action, None);
 }
 
@@ -862,9 +871,21 @@ fn test_quit_confirm_dont_ask_again_persists_opt_out() {
     assert!(env.view.confirm_dialog.is_some());
 
     // Focus and tick "don't warn me again", then confirm.
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Char(' ')), None);
-    let action = env.view.handle_key(key(KeyCode::Char('y')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char(' ')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    let action = {
+        let result = env.view.handle_key(key(KeyCode::Char('y')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert_eq!(action, Some(Action::Quit));
     assert!(!env.view.confirm_before_quit);
@@ -883,7 +904,11 @@ fn test_quit_confirm_without_opt_out_keeps_flag() {
 
     env.view.show_quit_confirm();
     // Confirm without ticking the checkbox.
-    let action = env.view.handle_key(key(KeyCode::Char('y')), None);
+    let action = {
+        let result = env.view.handle_key(key(KeyCode::Char('y')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert_eq!(action, Some(Action::Quit));
     assert!(env.view.confirm_before_quit);
@@ -902,10 +927,18 @@ fn help_overlay_opens_on_question_mark_and_closes_on_each_dismiss_key() {
         KeyCode::Char('Q'),
     ] {
         assert!(!env.view.has_dialog());
-        env.view.handle_key(key(KeyCode::Char('?')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('?')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert!(env.view.show_help);
         assert!(env.view.has_dialog());
-        env.view.handle_key(key(close), None);
+        {
+            let result = env.view.handle_key(key(close), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert!(!env.view.show_help, "{close:?} must close help");
     }
 }
@@ -915,7 +948,11 @@ fn help_overlay_opens_on_question_mark_and_closes_on_each_dismiss_key() {
 fn test_n_opens_new_dialog() {
     let mut env = create_test_env_empty();
     assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('n')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('n')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.new_dialog.is_some());
     assert!(env.view.has_dialog());
 }
@@ -928,15 +965,27 @@ fn test_b_opens_project_add_flow_when_no_projects() {
     std::fs::create_dir_all(&project_dir).unwrap();
     let profile = env.view.config_profile();
 
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('b')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.project_session_picker_dialog.is_none());
     assert!(env.view.info_dialog.is_none());
     assert!(env.view.projects_dialog.is_some());
 
     for ch in project_dir.to_string_lossy().chars() {
-        env.view.handle_key(key(KeyCode::Char(ch)), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char(ch)), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
     }
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let canonical = project_dir
         .canonicalize()
@@ -955,10 +1004,18 @@ fn test_b_opens_project_add_flow_when_no_projects() {
 fn test_b_empty_project_add_flow_escape_closes_dialog() {
     let mut env = create_test_env_empty();
 
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('b')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.projects_dialog.is_some());
 
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.projects_dialog.is_none());
     assert!(env.view.info_dialog.is_none());
 }
@@ -979,14 +1036,22 @@ fn test_b_submit_opens_new_dialog_with_prefilled_path() {
     .unwrap();
     let expected = projects::load_merged("test").unwrap()[0].path.clone();
 
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('b')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.project_session_picker_dialog.is_some());
     assert!(env.view.info_dialog.is_none());
     // The picker captures filter chars, so it must register as a modal: unregistered, the
     // global `q` shortcut quits the app and the paste-burst detector fires mid-filter.
     assert!(env.view.has_dialog());
     assert!(!env.view.wants_paste_burst());
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.project_session_picker_dialog.is_none());
     let dialog = env
         .view
@@ -1017,13 +1082,21 @@ fn cursor_navigation_keys_move_and_clamp() {
         (3, KeyCode::Char('G'), 19),
     ] {
         env.view.cursor = start;
-        env.view.handle_key(key(code), None);
+        {
+            let result = env.view.handle_key(key(code), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(env.view.cursor, expected, "{code:?} from {start}");
     }
 
     let mut empty = create_test_env_empty();
     for code in [KeyCode::Down, KeyCode::Up] {
-        empty.view.handle_key(key(code), None);
+        {
+            let result = empty.view.handle_key(key(code), None);
+            drain_persistence(&mut empty.view).unwrap();
+            result
+        };
         assert_eq!(empty.view.cursor, 0);
     }
 }
@@ -1037,27 +1110,59 @@ fn test_g_key_opens_group_picker() {
     env.view.group_by = GroupByMode::Manual;
 
     // 'g' opens the picker without changing the current mode.
-    env.view.handle_key(key(KeyCode::Char('g')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('g')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.group_picker_dialog.is_some());
     assert_eq!(env.view.group_by, GroupByMode::Manual);
 
     // Down + Enter selects the next option (Project).
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
 
     // 'g' again, Esc cancels without changing mode.
-    env.view.handle_key(key(KeyCode::Char('g')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('g')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.group_picker_dialog.is_some());
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
 
     // 'g' again, Down + Enter advances Project -> Org.
-    env.view.handle_key(key(KeyCode::Char('g')), None);
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('g')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Org);
 }

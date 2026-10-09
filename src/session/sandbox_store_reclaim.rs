@@ -242,32 +242,41 @@ fn also_owned(app_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Serialise reclaim passes against each other, and hold v027's transition
-/// lock for the duration.
-///
-/// The transition lock is taken *shared*. Exclusive would also block
-/// `Storage::update`, which is what publishes the session row for a store
-/// being created: holding it exclusively turns the creation race below into a
-/// guaranteed loss by preventing the very insert that would mark the store
-/// owned. Shared still excludes v027's own planning and publishing, which take
-/// it exclusively, and v027's copy phase holds no transition lock at all, so
-/// exclusivity buys nothing there either.
-///
-/// A row that is merely still on the shared store does not block the pass: it
-/// owns no private store to reclaim yet, and the one it will own carries its
-/// id, which this pass reads as claimed. Blocking on that instead would refuse
-/// forever on any machine holding an archived or trashed pre-transition
-/// session, since those keep their shared store until they are started again.
-fn guard(app_dir: &Path) -> Result<(crate::session::StorageFlock, crate::session::StorageFlock)> {
+/// Serialize reclaim passes, then fence both build namespaces' ownership
+/// inventories before taking their shared store-transition locks. Abort appends
+/// retained ownership and removes its source row under the workspace fence;
+/// reclaim must never observe the gap or invert transition -> workspace.
+fn guard(app_dir: &Path) -> Result<Vec<crate::session::StorageFlock>> {
     fs::create_dir_all(app_dir)?;
-    let pass = crate::session::acquire_storage_flock(app_dir, RECLAIM_LOCK)?;
-    let transition = crate::session::acquire_storage_shared_flock(app_dir, v027::LOCK)?;
-    if v027::transition_in_flight(app_dir)? {
-        bail!(
-            "the sandbox store migration is still moving stores; run `aoe migrate` and try again"
-        );
+    let mut locks = vec![crate::session::acquire_storage_flock(
+        app_dir,
+        RECLAIM_LOCK,
+    )?];
+    let mut namespaces = also_owned(app_dir);
+    namespaces.push(app_dir.to_path_buf());
+    for namespace in &mut namespaces {
+        fs::create_dir_all(&*namespace)?;
+        *namespace = fs::canonicalize(&*namespace)?;
     }
-    Ok((pass, transition))
+    namespaces.sort();
+    namespaces.dedup();
+    for namespace in &namespaces {
+        locks.push(crate::session::acquire_session_workspace_claim_lock_in(
+            namespace,
+        )?);
+    }
+    for namespace in &namespaces {
+        locks.push(crate::session::acquire_storage_shared_flock(
+            namespace,
+            v027::LOCK,
+        )?);
+        if v027::transition_in_flight(namespace)? {
+            bail!(
+                "the sandbox store migration is still moving stores; run `aoe migrate` and try again"
+            );
+        }
+    }
+    Ok(locks)
 }
 
 /// Serialises reclaim passes so two do not race to remove the same store.
@@ -291,6 +300,11 @@ fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
         paths.extend(registry_paths(dir)?);
     }
     let mut ids = BTreeSet::new();
+    for namespace in std::iter::once(app_dir).chain(also.iter().map(PathBuf::as_path)) {
+        ids.extend(crate::session::retained_intents::retained_ids_in(
+            namespace,
+        )?);
+    }
     for path in paths {
         let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let value: Value = serde_json::from_slice(&bytes)
@@ -506,6 +520,12 @@ fn content_transition_pending(app: &Path, also_owned: &[PathBuf], id: &str) -> R
 }
 
 fn remove_owned_store(app: &Path, also_owned: &[PathBuf], id: &str, path: &Path) -> Result<()> {
+    for namespace in std::iter::once(app).chain(also_owned.iter().map(PathBuf::as_path)) {
+        anyhow::ensure!(
+            !crate::session::retained_intents::retained_ids_in(namespace)?.contains(id),
+            "sandbox {id} has retained ownership; its agent store cannot be removed"
+        );
+    }
     if content_transition_pending(app, also_owned, id)? {
         bail!("native content transition is pending");
     }
@@ -550,9 +570,9 @@ fn reclaim_in(
         plan,
         ..Outcome::default()
     };
-    // Ownership is re-read: the pass holds the transition lock shared, so a
-    // session created during it can publish its row, and a store that was
-    // unclaimed at planning time may be claimed by the time we reach it.
+    // The public pass retains both namespaces' workspace fences through this
+    // re-read and every deletion. The re-read also protects direct metadata/FS
+    // callers from a claim published by their planning callback.
     let owned = owned_ids(app_dir, also_owned)?;
     for orphan in &outcome.plan.orphans {
         // Per candidate, not once for the loop. v027's probe caches its
@@ -639,6 +659,8 @@ fn directory_bytes(root: &Path) -> u64 {
 /// shared legacy store owns no per-instance directory to remove, and v027 may
 /// be publishing the private one it will own, so it is left to the reclaim
 /// pass.
+/// Caller retains the workspace fences for both build namespaces. Do not
+/// reacquire them here: deletion already owns its original physical fences.
 pub(crate) fn remove_stores_for(
     instance: &crate::session::Instance,
 ) -> Result<(Vec<PathBuf>, u64)> {
@@ -697,6 +719,87 @@ pub(crate) fn remove_stores_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retain_unknown_intent() -> String {
+        crate::session::retained_intents::initialize_legacy_in(
+            &crate::session::get_app_dir().unwrap(),
+        )
+        .unwrap();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut row = crate::session::Instance::new("retained", "/retained-original");
+        row.runner_journal = Default::default();
+        row.status = crate::session::Status::Creating;
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Create,
+            crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        row.lifecycle_reservation.as_mut().unwrap().path_claims =
+            crate::session::WorktreePathClaims::Unknown(None);
+        fs::write(
+            storage.sessions_path(),
+            serde_json::to_vec(&vec![&row]).unwrap(),
+        )
+        .unwrap();
+        let selected = crate::session::retained_intents::capture(&storage, &row.id).unwrap();
+        crate::session::retained_intents::abort(&selected).unwrap();
+        row.id
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retained_ids_from_both_namespaces_keep_stores_without_native_probes() {
+        let first = tempfile::tempdir().unwrap();
+        let _first_environment = crate::session::test_support::isolate_app_dir_at(first.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let main_id = retain_unknown_intent();
+        let second = tempfile::tempdir().unwrap();
+        let _second_environment = crate::session::test_support::isolate_app_dir_at(second.path());
+        let sibling = crate::session::get_app_dir().unwrap();
+        let sibling_id = retain_unknown_intent();
+        let home = dirs::home_dir().unwrap();
+        let main_store = unproven_store(&home, &main_id, 17);
+        let sibling_store = unproven_store(&home, &sibling_id, 19);
+        let also = vec![sibling];
+        let inventory = owned_ids(&app, &also).unwrap();
+        assert!(inventory.contains(&main_id));
+        assert!(inventory.contains(&sibling_id));
+        let outcome = reclaim_in(&app, &also, &home, NO_GRACE, &|_| {
+            panic!("retained IDs reached a native existence probe")
+        })
+        .unwrap();
+        assert!(outcome.removed.is_empty());
+        assert_eq!(
+            fs::read(main_store.join(".credentials.json")).unwrap(),
+            vec![b'x'; 17]
+        );
+        assert_eq!(
+            fs::read(sibling_store.join(".credentials.json")).unwrap(),
+            vec![b'x'; 19]
+        );
+        assert!(remove_owned_store(&app, &also, &main_id, &main_store).is_err());
+        assert!(remove_owned_store(&app, &also, &sibling_id, &sibling_store).is_err());
+    }
+
+    #[test]
+    fn unreadable_retained_inventory_refuses_before_store_removal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let app = temporary.path().join("app");
+        let home = temporary.path().join("home");
+        fs::create_dir_all(&app).unwrap();
+        app_with_rows(&app, &[]);
+        fs::write(app.join("retained-intents.json"), b"not json").unwrap();
+        let store = unproven_store(&home, "1111111111111111", 23);
+        assert!(reclaim_in(&app, &[], &home, NO_GRACE, &|_| {
+            panic!("unreadable ledger reached a native existence probe")
+        })
+        .is_err());
+        assert_eq!(
+            fs::read(store.join(".credentials.json")).unwrap(),
+            vec![b'x'; 23]
+        );
+    }
 
     fn app_with_rows(app: &Path, rows: &[&str]) {
         let ids: Vec<String> = rows

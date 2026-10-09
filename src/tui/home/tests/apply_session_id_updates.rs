@@ -391,7 +391,11 @@ fn settings_mouse_discard_reverts_theme_preview() {
     assert!(yes.width > 0, "render should populate the [Yes] hit-rect");
 
     // Click the center of [Yes] to discard.
-    view.handle_dialog_click(yes.x + yes.width / 2, yes.y + yes.height / 2);
+    {
+        let result = view.handle_dialog_click(yes.x + yes.width / 2, yes.y + yes.height / 2);
+        drain_persistence(view).unwrap();
+        result
+    };
 
     // The click path must queue the same theme revert the keyboard path
     // returns. Before the fix this was `None` and the previewed theme stuck.

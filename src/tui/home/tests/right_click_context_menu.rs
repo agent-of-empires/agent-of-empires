@@ -100,9 +100,17 @@ fn session_menu_entries_route_like_their_keys() {
             "{label}"
         );
         for _ in 0..downs {
-            env.view.handle_key(key(KeyCode::Down), None);
+            {
+                let result = env.view.handle_key(key(KeyCode::Down), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
         }
-        env.view.handle_key(key(submit), None);
+        {
+            let result = env.view.handle_key(key(submit), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         finish_runner_settlements(&mut env.view);
         assert!(env.view.context_menu.is_none(), "{label}: menu closes");
         assert!(check(&env.view, &id), "{label}");
@@ -122,7 +130,14 @@ fn right_click_unarchive_action_restores_session() {
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
     {
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            let submitted = env.view.toggle_archive_at_cursor();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         finish_runner_settlements(&mut env.view);
     };
     assert!(env.view.get_instance(&id).unwrap().is_archived());
@@ -140,9 +155,21 @@ fn right_click_unarchive_action_restores_session() {
     let row = shelf_row_for_idx(&env.view, idx);
     assert!(env.view.handle_right_click(5, row));
 
-    env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
-    env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    }; // New Session -> Rename
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    }; // Rename -> Unarchive
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
         "context-menu Unarchive must unarchive the session"
@@ -157,7 +184,10 @@ fn right_click_trashed_row_offers_restore() {
     setup_inner(&mut env);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(env.view.get_instance(&id).unwrap().is_trashed());
 
     let idx = env
@@ -178,7 +208,11 @@ fn right_click_trashed_row_offers_restore() {
         ]
     );
 
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.context_menu.is_none());
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
@@ -194,6 +228,10 @@ fn right_click_fork_requires_provenance_not_a_tool_label() {
     let id = parent.id.clone();
     let binding = parent.agent_session_binding.take();
     env.view.add_instance(parent);
+    env.view.request_save();
+    drain_persistence(&mut env.view).unwrap();
+    env.view.request_reload(super::super::ReloadKind::Full);
+    drain_persistence(&mut env.view).unwrap();
     env.view.flat_items = env.view.build_flat_items();
     setup_inner(&mut env);
     assert!(env.view.handle_right_click(5, 1));
@@ -206,12 +244,17 @@ fn right_click_fork_requires_provenance_not_a_tool_label() {
         .iter()
         .any(|(action, _)| *action == ContextMenuAction::Fork));
     env.view.context_menu = None;
-    env.view
-        .apply_user_action(&id, |instance| {
+    {
+        let submitted = env.view.apply_user_action(&id, |instance| {
             instance.agent_session_binding = binding;
             instance.tool = "status-alias".into();
-        })
-        .unwrap();
+        });
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
         .view
@@ -240,9 +283,16 @@ fn right_click_session_menu_hides_fork_for_unforkable_agent() {
         Item::Session { id, .. } => id.clone(),
         _ => panic!("expected a session row"),
     };
-    env.view
-        .apply_user_action(&id, |inst| inst.tool = "gemini".to_string())
-        .unwrap();
+    {
+        let submitted = env
+            .view
+            .apply_user_action(&id, |inst| inst.tool = "gemini".to_string());
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     env.view.flat_items = env.view.build_flat_items();
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
@@ -409,10 +459,14 @@ fn right_click_on_empty_sidebar_opens_empty_menu() {
 /// real input does. Click and keyboard both funnel through `dispatch_context_menu_action`,
 /// so this covers the dispatcher without mocking the menu's `last_area`.
 fn send_key(env: &mut crate::tui::home::tests::TestEnv, code: crossterm::event::KeyCode) {
-    env.view.handle_key(
-        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 }
 
 /// Each empty-sidebar entry submits through the shared dispatcher and opens its dialog.

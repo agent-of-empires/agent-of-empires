@@ -24,8 +24,11 @@ impl RestartPoller {
         }
     }
 
-    pub fn request_restart(&self, request: RestartRequest) {
-        self.worker.request(request);
+    pub fn request_restart(
+        &self,
+        request: RestartRequest,
+    ) -> Result<(), Box<std::sync::mpsc::SendError<RestartRequest>>> {
+        self.worker.try_request(request).map_err(Box::new)
     }
 
     /// Non-blocking poll for a completed restart. Surfaces `Disconnected`
@@ -84,16 +87,18 @@ mod tests {
         instance.command = "true".to_string();
         let session_id = instance.id.clone();
 
-        poller.request_restart(RestartRequest {
-            session_id: session_id.clone(),
-            instance,
-            size: None,
-            wake_message: String::new(),
-            skip_on_launch: false,
-            bound_hooks: true,
-            discard_sandbox_container: false,
-            conversation_carry: None,
-        });
+        poller
+            .request_restart(RestartRequest {
+                session_id: session_id.clone(),
+                instance,
+                size: None,
+                wake_message: String::new(),
+                skip_on_launch: false,
+                bound_hooks: true,
+                discard_sandbox_container: false,
+                conversation_carry: None,
+            })
+            .unwrap();
 
         let result = loop {
             match poller.try_recv_result() {

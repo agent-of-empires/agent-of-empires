@@ -8,15 +8,27 @@ use super::*;
 #[serial]
 fn test_search_mode_esc_exits_and_clears() {
     let mut env = create_test_env_with_sessions(3);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.search_active);
     assert!(env.view.search_query.value().is_empty());
     for code in [KeyCode::Char('s'), KeyCode::Char('x'), KeyCode::Backspace] {
-        env.view.handle_key(key(code), None);
+        {
+            let result = env.view.handle_key(key(code), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
     }
     assert_eq!(env.view.search_query.value(), "s");
     assert!(!env.view.search_matches.is_empty());
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(!env.view.search_active);
     assert!(env.view.search_query.value().is_empty());
     assert!(env.view.search_matches.is_empty());
@@ -27,11 +39,31 @@ fn test_search_mode_esc_exits_and_clears() {
 #[serial]
 fn test_search_mode_enter_commits_without_clearing_matches() {
     let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Char('e')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('e')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.search_active);
     let matches_before = env.view.search_matches.len();
     assert!(
@@ -39,7 +71,11 @@ fn test_search_mode_enter_commits_without_clearing_matches() {
         "test needs multiple matches to be meaningful"
     );
 
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(!env.view.search_active);
     assert_eq!(
@@ -62,19 +98,47 @@ fn test_reload_after_enter_preserves_search_state() {
     // Enter cleared search_query the next reload would destroy the matches Enter promised to
     // keep and silently break `n` cycling.
     let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Char('e')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('e')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     let matches_before = env.view.search_matches.len();
     assert!(
         matches_before >= 3,
         "test needs matches for meaningful assertions"
     );
 
-    env.view.reload().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
 
     assert_eq!(
         env.view.search_matches.len(),
@@ -82,7 +146,11 @@ fn test_reload_after_enter_preserves_search_state() {
         "reload after Enter must not wipe search_matches"
     );
 
-    env.view.handle_key(key(KeyCode::Char('n')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('n')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(
         env.view.search_match_index, 1,
         "n still cycles after a reload lands between Enter and the first press"
@@ -97,11 +165,23 @@ fn test_sort_order_change_after_enter_rescores_search_matches() {
     // Newest and 0 under Oldest, so the stale index would land on session4.
     use crate::session::config::SortOrder;
     let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     for c in "session0".chars() {
-        env.view.handle_key(key(KeyCode::Char(c)), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char(c)), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
     }
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert_eq!(env.view.search_matches.len(), 1);
     let matched_id_before = match &env.view.flat_items[env.view.search_matches[0]] {
@@ -135,12 +215,36 @@ fn test_sort_order_change_after_enter_rescores_search_matches() {
 #[serial]
 fn test_search_mode_enter_keeps_matches_for_cycling() {
     let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Char('e')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('e')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let n_matches = env.view.search_matches.len();
     assert!(
@@ -150,18 +254,30 @@ fn test_search_mode_enter_keeps_matches_for_cycling() {
     assert_eq!(env.view.search_match_index, 0);
 
     for expected in 1..n_matches {
-        env.view.handle_key(key(KeyCode::Char('n')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('n')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(env.view.search_match_index, expected);
         assert_eq!(env.view.cursor, env.view.search_matches[expected]);
     }
 
-    env.view.handle_key(key(KeyCode::Char('n')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('n')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(env.view.search_match_index, 0, "n wraps to first");
 
     // #3038: Shift+N never cycles. Even with a committed search live, it opens
     // the new-from-selection dialog and leaves the match index untouched.
     assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('N')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('N')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.new_dialog.is_some(),
         "Shift+N opens new-from-selection even during a committed search"
@@ -181,7 +297,11 @@ fn test_d_opens_delete_dialog_for_session_and_group() {
     disable_delete_to_trash();
     env.view.update_selected();
     assert!(env.view.unified_delete_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.unified_delete_dialog.is_some());
 
     let mut env = create_test_env_with_groups();
@@ -189,7 +309,11 @@ fn test_d_opens_delete_dialog_for_session_and_group() {
     env.view.update_selected();
     assert!(env.view.selected_group.is_some());
     assert!(env.view.group_delete_options_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.group_delete_options_dialog.is_some());
 }
 
@@ -202,7 +326,11 @@ fn test_selection_tracks_cursor_across_sessions_and_groups() {
     let first_id = env.view.selected_session.clone();
     let first = env.view.selected_session_title().map(str::to_string);
     assert!(first.is_some());
-    env.view.handle_key(key(KeyCode::Down), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_ne!(env.view.selected_session, first_id);
     assert_ne!(env.view.selected_session_title().map(str::to_string), first);
 
@@ -322,15 +450,27 @@ fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
 fn committed_search_keeps_bar_visible_until_esc() {
     for (query, matches) in [("sess", true), ("zqxwv", false)] {
         let mut env = create_test_env_with_sessions(5);
-        env.view.handle_key(key(KeyCode::Char('/')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         for ch in query.chars() {
-            env.view.handle_key(key(KeyCode::Char(ch)), None);
+            {
+                let result = env.view.handle_key(key(KeyCode::Char(ch)), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
         }
         assert!(env.view.search_active);
         assert!(env.view.search_bar_visible());
         assert_eq!(!env.view.search_matches.is_empty(), matches, "{query}");
 
-        env.view.handle_key(key(KeyCode::Enter), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Enter), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert!(!env.view.search_active, "Enter commits the search");
         assert_eq!(!env.view.search_matches.is_empty(), matches, "{query}");
         assert!(env.view.search_bar_visible(), "{query}");
@@ -342,7 +482,11 @@ fn committed_search_keeps_bar_visible_until_esc() {
             "committed search bar must still render the query after Enter\n{screen}"
         );
 
-        env.view.handle_key(key(KeyCode::Esc), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Esc), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert!(!env.view.search_bar_visible(), "Esc clears the search");
     }
 }
@@ -351,14 +495,30 @@ fn committed_search_keeps_bar_visible_until_esc() {
 #[serial]
 fn test_esc_clears_matches_so_n_opens_new_dialog() {
     let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(!env.view.search_active);
     assert!(env.view.search_matches.is_empty());
 
     assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('n')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('n')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.new_dialog.is_some());
 }
 
@@ -467,12 +627,20 @@ fn earned_new_from_selection_tip_pops_after_repeated_n_with_selection() {
 
     // Open + cancel `n` with a selection enough times to earn the tip.
     for _ in 0..crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD {
-        env.view.handle_key(key(KeyCode::Char('n')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('n')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert!(
             env.view.new_dialog.is_some(),
             "n opens the new-session dialog"
         );
-        env.view.handle_key(key(KeyCode::Esc), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Esc), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
     }
 
     // The earned tip is now in the badge and queued to pop.
@@ -488,7 +656,11 @@ fn earned_new_from_selection_tip_pops_after_repeated_n_with_selection() {
 
     // The next idle keystroke drains the queue into the tips overlay.
     assert!(env.view.tips_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('j')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('j')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.tips_dialog.is_some(),
         "queued earned tip should pop on the next keystroke"
@@ -510,8 +682,16 @@ fn earned_tip_does_not_pop_when_tips_disabled() {
     });
 
     for _ in 0..crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD {
-        env.view.handle_key(key(KeyCode::Char('n')), None);
-        env.view.handle_key(key(KeyCode::Esc), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('n')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
+        {
+            let result = env.view.handle_key(key(KeyCode::Esc), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
     }
 
     assert!(
@@ -533,7 +713,11 @@ fn using_n_suppresses_the_earned_tip() {
     assert!(earned > 0, "tip is earned and badged");
 
     // The user discovers N for themselves: open new-from-selection.
-    env.view.handle_key(key(KeyCode::Char('N')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('N')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.new_dialog.is_some(),
         "N opens the new-from-selection dialog"
@@ -560,9 +744,21 @@ fn test_reload_does_not_snap_cursor_after_enter() {
     let mut env = create_test_env_with_sessions(5);
     // Search and commit with Enter: matches stay non-empty so
     // `refresh_search_matches` fires on reload; the cursor must not snap.
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(!env.view.search_active);
 
     // Navigate away from the search result
@@ -570,7 +766,11 @@ fn test_reload_does_not_snap_cursor_after_enter() {
     env.view.update_selected();
 
     // Simulate periodic reload
-    env.view.reload().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
 
     // Cursor should stay where the user put it, not snap back to best match
     assert_eq!(env.view.cursor, 4);
@@ -584,7 +784,11 @@ fn test_r_opens_rename_dialog_for_session_and_group() {
     let mut env = create_test_env_with_sessions(3);
     env.view.update_selected();
     assert!(!env.view.has_dialog());
-    env.view.handle_key(key(KeyCode::Char('r')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('r')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.rename_dialog.is_some());
     assert!(env.view.has_dialog());
 
@@ -592,7 +796,11 @@ fn test_r_opens_rename_dialog_for_session_and_group() {
     env.view.cursor = 1;
     env.view.update_selected();
     assert!(env.view.selected_group.is_some());
-    env.view.handle_key(key(KeyCode::Char('r')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('r')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.rename_dialog.is_some());
     assert!(env.view.group_rename_context.is_some());
 }
@@ -649,13 +857,29 @@ fn test_select_top_attention() {
 #[serial]
 fn test_uppercase_p_opens_profile_picker_outside_search() {
     let mut env = create_test_env_empty();
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('P')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('P')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.profile_picker_dialog.is_none());
     assert_eq!(env.view.search_query.value(), "P");
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
-    let action = env.view.handle_key(key(KeyCode::Char('P')), None);
+    let action = {
+        let result = env.view.handle_key(key(KeyCode::Char('P')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(action, None);
     assert!(env.view.profile_picker_dialog.is_some());
 }

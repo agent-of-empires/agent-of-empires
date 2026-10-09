@@ -134,8 +134,25 @@ jobs:
         # Echo the guarded temp root so an unset override is visible.
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/aoe-full-suite-home"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          mkdir -p "$XDG_CONFIG_HOME"
           cargo build --bin aoe
           cargo nextest run --no-fail-fast
+      - name: Hosted Creating/Undo (Linux tracked execution and same-g withdrawal)
+        if: ${{ !cancelled() && matrix.leg == 'core-rest' }}
+        shell: bash
+        run: bash scripts/run-hosted-creating-proofs.sh
+      - name: Upload hosted Creating proof outcomes (Linux)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() && matrix.leg == 'core-rest' }}
+        with:
+          name: hosted-creating-Linux
+          path: ${{ runner.temp }}/hosted-creating-Linux.log
+          if-no-files-found: error
+          retention-days: 14
       # bare-core: the three no-default-features feature corners. `web` is not
       # a default feature, so these runs are also the dashboard-off compile
       # gate that keeps the `cfg(feature = "web")` sites from rotting.
@@ -277,8 +294,25 @@ jobs:
         env:
           AOE_CI_ORIGINAL_PURGE_FORCE: "1"
         run: |
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/aoe-full-suite-home"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          mkdir -p "$XDG_CONFIG_HOME"
           cargo build --features e2e-tests --bin aoe
           cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
+      - name: Hosted Creating/Undo (Darwin real launch and uncertain-scope refusal)
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')) }}
+        shell: bash
+        run: bash scripts/run-hosted-creating-proofs.sh --features e2e-tests
+      - name: Upload hosted Creating proof outcomes (Darwin)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')) }}
+        with:
+          name: hosted-creating-macOS
+          path: ${{ runner.temp }}/hosted-creating-macOS.log
+          if-no-files-found: error
+          retention-days: 14
       - name: Cargo test (macOS, acp live-daemon e2e)
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: cargo test --features e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture

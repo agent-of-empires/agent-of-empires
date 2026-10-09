@@ -621,7 +621,7 @@ impl App {
         self.emit_telemetry_snapshot();
         let mut last_telemetry_snapshot = std::time::Instant::now();
 
-        loop {
+        'event_loop: loop {
             if self.needs_redraw {
                 crate::tui::clear_terminal(terminal)?;
                 self.needs_redraw = false;
@@ -637,12 +637,12 @@ impl App {
             let embedded_mounted = self.home.structured_preview.is_some();
 
             tokio::select! {
-                event = self.event_stream.as_mut().expect("event_stream missing").next() => {
+                event = async { self.event_stream.as_mut().expect("event_stream missing").next().await }, if self.event_stream.is_some() && !self.should_quit => { 'input: {
                     match event {
                         Some(Ok(Event::Key(key))) => {
                             // Terminals reporting releases would double-fire every handler.
                             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                                continue;
+                                continue 'event_loop;
                             }
                             crate::session::write_tui_activity();
                             // Mosh strips bracketed-paste markers, so pasted text
@@ -771,9 +771,9 @@ impl App {
                                     self.draw(terminal)?;
                                 }
                                 if self.should_quit {
-                                    break;
+                                    break 'input;
                                 }
-                                continue;
+                                continue 'event_loop;
                             }
 
                             self.handle_key(key, terminal).await?;
@@ -790,9 +790,9 @@ impl App {
                             }
 
                             if self.should_quit {
-                                break;
+                                break 'input;
                             }
-                            continue;
+                            continue 'event_loop;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
                             if !matches!(mouse.kind, MouseEventKind::Moved) {
@@ -820,7 +820,7 @@ impl App {
                                     if !self.needs_redraw {
                                         self.draw(terminal)?;
                                     }
-                                    continue;
+                                    continue 'event_loop;
                                 }
                                 let active = self
                                     .home
@@ -853,7 +853,7 @@ impl App {
                                     if !self.needs_redraw {
                                         self.draw(terminal)?;
                                     }
-                                    continue;
+                                    continue 'event_loop;
                                 }
                             // Footer buttons replay their shortcut. Returns None
                             // while an overlay is open.
@@ -867,9 +867,9 @@ impl App {
                                         self.draw(terminal)?;
                                     }
                                     if self.should_quit {
-                                        break;
+                                        break 'input;
                                     }
-                                    continue;
+                                    continue 'event_loop;
                                 }
                             }
                             // Checked before forwarding so the agent doesn't swallow the second press.
@@ -887,12 +887,12 @@ impl App {
                                     self.open_structured_view(&session_id).await?;
                                 }
                                 if self.should_quit {
-                                    break;
+                                    break 'input;
                                 }
                                 if !self.needs_redraw {
                                     self.draw(terminal)?;
                                 }
-                                continue;
+                                continue 'event_loop;
                             }
                             // aoe captures the mouse, so the host terminal can't
                             // open links. Shift keeps aoe out of the way.
@@ -907,7 +907,7 @@ impl App {
                                     // Otherwise clicking the link again counts as a double-click.
                                     self.home.forget_preview_click();
                                     self.draw(terminal)?;
-                                    continue;
+                                    continue 'event_loop;
                                 }
                             }
                             // Mouse-tracking agents get presses and drags as if
@@ -921,7 +921,7 @@ impl App {
                                 if !self.needs_redraw {
                                     self.draw(terminal)?;
                                 }
-                                continue;
+                                continue 'event_loop;
                             }
                             let hit_list = self.home.hit_list(mouse.column, mouse.row);
                             let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
@@ -1061,7 +1061,7 @@ impl App {
                                     self.perform_smart_rename(&session_id).await;
                                 }
                             }
-                            continue;
+                            continue 'event_loop;
                         }
                         Some(Ok(Event::Paste(text))) => {
                             crate::session::write_tui_activity();
@@ -1079,30 +1079,31 @@ impl App {
                                     )));
                                 }
                                 self.draw(terminal)?;
-                                continue;
+                                continue 'event_loop;
                             }
                             self.home.handle_paste(&text);
                             self.draw(terminal)?;
-                            continue;
+                            continue 'event_loop;
                         }
                         Some(Ok(Event::Resize(_, _))) => {
                             // Redraw so viewport-driven layout re-evaluates.
                             self.draw(terminal)?;
-                            continue;
+                            continue 'event_loop;
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
                             // The tty is gone.
                             tracing::info!(target: "tui.input", "Terminal event stream error, exiting: {}", e);
                             self.should_quit = true;
-                            break;
+                            self.event_stream = None;
                         }
                         None => {
                             tracing::info!(target: "tui.input", "Terminal event stream ended (EOF), exiting");
                             self.should_quit = true;
-                            break;
+                            self.event_stream = None;
                         }
                     }
+                }
                 }
                 // `next_event` is cancel-safe; the apply runs in the arm body.
                 ev = async {
@@ -1141,7 +1142,6 @@ impl App {
                 } => {
                     tracing::info!(target: "tui.input", "Received SIGHUP, exiting");
                     self.should_quit = true;
-                    break;
                 }
                 _ = async {
                     #[cfg(unix)]
@@ -1154,7 +1154,6 @@ impl App {
                 } => {
                     tracing::info!(target: "tui.input", "Received SIGTERM, exiting");
                     self.should_quit = true;
-                    break;
                 }
                 _ = async {
                     #[cfg(unix)]
@@ -1167,7 +1166,6 @@ impl App {
                 } => {
                     tracing::info!(target: "tui.input", "Received SIGINT, exiting");
                     self.should_quit = true;
-                    break;
                 }
             }
 
@@ -1221,6 +1219,33 @@ impl App {
             }
 
             full |= self.home.apply_session_id_updates();
+            full |= self.home.apply_persistence_results();
+            while let Some(ack) = self.home.take_persistence_action() {
+                match ack {
+                    crate::tui::home::PersistenceAction::Status(message) => {
+                        self.execute_action(Action::SetTransientStatus(message), terminal)?
+                    }
+                    crate::tui::home::PersistenceAction::Resume { id, origin, action } => {
+                        if self
+                            .home
+                            .get_instance(&id)
+                            .is_some_and(|row| origin.matches(row))
+                        {
+                            self.execute_action(action, terminal)?;
+                        } else {
+                            self.home.info_dialog=Some(crate::tui::dialogs::InfoDialog::new("Original continuation changed","The original physical profile, session DOB or generation changed; its dependent action was not retargeted."));
+                        }
+                        drop(origin);
+                    }
+                }
+                full = true;
+            }
+            if let Some(mouse_capture) = self.home.take_persisted_mouse_capture() {
+                if mouse_capture != self.mouse_capture_allowed {
+                    self.mouse_capture_allowed = mouse_capture;
+                    self.sync_mouse_capture(terminal)?;
+                }
+            }
             full |= self.home.apply_recovery_updates();
             full |= self.home.apply_restart_results();
             for session_id in self.home.take_restarted_attaches() {
@@ -1231,13 +1256,13 @@ impl App {
 
             let store_move = self.home.poll_store_move();
             full |= store_move.changed;
-            if let Some(action) = store_move.resume {
-                self.execute_action(action, terminal)?;
-                full = true;
-            }
 
-            if let Some(session_id) = self.home.apply_creation_results() {
-                self.dispatch_new_session_attach(&session_id, terminal)?;
+            if let Some(ack) = self.home.apply_creation_results() {
+                if ack.matches(&self.home) {
+                    self.dispatch_new_session_attach(ack.session_id(), terminal)?;
+                } else {
+                    self.home.info_dialog=Some(crate::tui::dialogs::InfoDialog::new("Original creation changed","The acknowledged creation no longer matches this view; a replacement row was not attached."));
+                }
                 if let Some(sid) = self.pending_structured_view_open.take() {
                     self.open_structured_view(&sid).await?;
                 }
@@ -1249,7 +1274,7 @@ impl App {
 
             // Full/config reloads stay deferred during live-send to preserve input
             // policy and mouse-capture state.
-            let live_idle = self.home.live_send.is_none();
+            let live_idle = self.home.live_send.is_none() && !self.should_quit;
             if take_config_refresh_kick(live_idle, &self.home.config_watch.dirty) {
                 let result = self.home.try_refresh_from_config_watcher();
                 handle_tick_reload_config(result, &mut self.home.reload_failure_state);
@@ -1269,33 +1294,23 @@ impl App {
                 plan_disk_refresh(live_idle, heartbeat_due, dirty, full_heartbeat_deferred);
             full_heartbeat_deferred = refresh_plan.full_heartbeat_deferred;
 
-            match refresh_plan.decision {
-                DiskRefreshDecision::FullHeartbeat => {
-                    let reload_result = self.home.reload();
-                    let reload_ok = reload_result.is_ok();
-                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
-                    if reload_ok {
-                        let profile = self.home.active_profile.as_deref().unwrap_or("default");
-                        let mouse_capture_allowed = crate::session::resolve_config(profile)
-                            .map(|c| crate::tui::mouse_capture_requested(&c.session))
-                            .unwrap_or(self.mouse_capture_allowed);
-                        if mouse_capture_allowed != self.mouse_capture_allowed {
-                            self.mouse_capture_allowed = mouse_capture_allowed;
-                            self.sync_mouse_capture(terminal)?;
-                        }
-                    }
-                    last_disk_refresh = std::time::Instant::now();
-                    full = true;
-                }
-                DiskRefreshDecision::StorageOnly => {
-                    let reload_result = self.home.reload_storage_only();
-                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
-                    if heartbeat_due {
+            if !self.should_quit {
+                match refresh_plan.decision {
+                    DiskRefreshDecision::FullHeartbeat => {
+                        self.home.request_reload(crate::tui::home::ReloadKind::Full);
                         last_disk_refresh = std::time::Instant::now();
+                        full = true;
                     }
-                    full = true;
+                    DiskRefreshDecision::StorageOnly => {
+                        self.home
+                            .request_reload(crate::tui::home::ReloadKind::Storage);
+                        if heartbeat_due {
+                            last_disk_refresh = std::time::Instant::now();
+                        }
+                        full = true;
+                    }
+                    DiskRefreshDecision::None => {}
                 }
-                DiskRefreshDecision::None => {}
             }
 
             full |= self.home.try_present_reload_failure_dialog();
@@ -1365,23 +1380,39 @@ impl App {
                 refresh_needed = false;
             }
 
-            if refresh_needed {
+            if refresh_needed && self.event_stream.is_some() {
                 self.draw(terminal)?;
                 last_refresh_at = Some(std::time::Instant::now());
             }
 
-            if self.should_quit {
+            if let Some(error) = self.home.take_cancelled_persistence_quit_error() {
+                if self.event_stream.is_none() {
+                    anyhow::bail!(error);
+                }
+                self.should_quit = false;
+                self.needs_redraw = true;
+                self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Quit cancelled",
+                    &error,
+                ));
+            }
+            if self.should_quit && !self.home.persistence_is_closing() {
+                self.home.apply_session_id_updates();
+                self.home.apply_restart_results();
+                self.home.cleanup_pending_creation();
+                self.home.request_persistence_close();
+            }
+            if self.should_quit && self.home.persistence_has_failed() {
+                anyhow::bail!(self.home.take_persistence_quit_error().unwrap_or_else(|| {
+                    "Persistence worker stopped without acknowledging pending edits".to_owned()
+                }));
+            }
+            if self.should_quit && self.home.persistence_is_closed() {
                 break;
             }
         }
-
-        self.home.apply_session_id_updates();
-        // Persist the final restart snapshot instead of a stale `Starting` row.
-        self.home.apply_restart_results();
-        self.home.cleanup_pending_creation();
-
-        if let Err(e) = self.home.save() {
-            tracing::error!(target: "tui.input", "Failed to save on quit: {}", e);
+        if let Some(error) = self.home.take_persistence_quit_error() {
+            anyhow::bail!(error);
         }
 
         // Bounded and deduped so a dead endpoint or an unchanged launch-then-quit costs nothing.
@@ -1893,26 +1924,6 @@ fn plan_disk_refresh(
     DiskRefreshPlan {
         decision,
         full_heartbeat_deferred,
-    }
-}
-
-/// Log and record reload errors; the loop keeps the previous in-memory state.
-fn handle_tick_reload_storage(
-    result: anyhow::Result<()>,
-    state: &mut crate::tui::home::ReloadFailureState,
-) {
-    if let Err(ref e) = result {
-        tracing::warn!(
-            target: "tui.file_watch",
-            error = %e,
-            "tick storage reload failed; preserving in-memory state, will retry on next tick"
-        );
-    }
-    if state.record_storage(&result) {
-        tracing::info!(
-            target: "tui.file_watch",
-            "storage reload recovered"
-        );
     }
 }
 
@@ -2443,9 +2454,7 @@ impl App {
             }
         }
         if reaped {
-            if let Err(e) = self.home.save() {
-                tracing::error!(target: "tui.idle_reap", "failed to save after idle reap: {e}");
-            }
+            self.home.request_save();
         }
         reaped
     }
@@ -2479,8 +2488,7 @@ impl App {
                     };
                     self.home
                         .set_instance_status(&id, crate::session::Status::Stopped);
-                    self.home.save()?;
-                    self.home.stop_poller.request_stop(request);
+                    self.home.request_saved_stop(request);
                 }
             }
             Action::SetTheme(name) => {
@@ -2696,18 +2704,15 @@ impl App {
         // terminal, and re-assert preview geometry afterwards.
         tmux_session.reset_size_to_latest_client();
         self.home.clear_preview_pane_sync(session_id);
+        let origin = crate::tui::home::RequestOrigin::capture(
+            self.home
+                .get_instance(session_id)
+                .ok_or_else(|| anyhow::anyhow!("Original attach row disappeared"))?,
+        )?;
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
 
-        self.settle_after_attach(attached_status_updates)?;
-        // Turns that finished during the attach were applied without the
-        // live-send exemption; the user just viewed them.
-        self.home.clear_unread_on_view(session_id);
-        self.home.stamp_last_accessed(session_id);
-        if let Err(e) = self.home.save() {
-            tracing::error!("Failed to save after attach-return: {}", e);
-        }
-        self.select_after_attach(session_id);
+        self.settle_after_attach(session_id, origin, attached_status_updates, true);
 
         if let Err(e) = attach_result {
             tracing::warn!(target: "tui.input", "tmux attach returned error: {}", e);
@@ -2716,22 +2721,17 @@ impl App {
         Ok(())
     }
 
-    fn settle_after_attach(&mut self, updates: Vec<StatusUpdate>) -> Result<()> {
+    fn settle_after_attach(
+        &mut self,
+        session_id: &str,
+        origin: crate::tui::home::RequestOrigin,
+        updates: Vec<StatusUpdate>,
+        agent: bool,
+    ) {
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
-        self.home.reload()?;
-        self.home.apply_status_updates_without_hooks(updates);
-        Ok(())
-    }
-
-    /// In Attention sort, jump to the top-attention row: the session we left
-    /// usually dropped a tier.
-    fn select_after_attach(&mut self, session_id: &str) {
-        if self.home.sort_order() == crate::session::config::SortOrder::Attention {
-            self.home.select_top_attention(Some(session_id));
-        } else {
-            self.home.select_session_by_id(session_id);
-        }
+        self.home
+            .request_attach_return_reload(session_id.to_owned(), origin, updates, agent);
     }
 
     /// Start a pending sandbox store copy and resume `resume` afterwards,
@@ -2802,11 +2802,15 @@ impl App {
             }
         };
 
+        let origin = crate::tui::home::RequestOrigin::capture(
+            self.home
+                .get_instance(session_id)
+                .ok_or_else(|| anyhow::anyhow!("Original attach row disappeared"))?,
+        )?;
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, attach_fn)?;
 
-        self.settle_after_attach(attached_status_updates)?;
-        self.select_after_attach(session_id);
+        self.settle_after_attach(session_id, origin, attached_status_updates, false);
 
         if let Err(e) = attach_result {
             tracing::warn!(target: "tui.input", "tmux terminal attach returned error: {}", e);
@@ -2883,11 +2887,15 @@ impl App {
         );
 
         let attach_fn: Box<dyn FnOnce() -> Result<()>> = Box::new(move || tool_session.attach());
+        let origin = crate::tui::home::RequestOrigin::capture(
+            self.home
+                .get_instance(session_id)
+                .ok_or_else(|| anyhow::anyhow!("Original attach row disappeared"))?,
+        )?;
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, attach_fn)?;
 
-        self.settle_after_attach(attached_status_updates)?;
-        self.home.select_session_by_id(session_id);
+        self.settle_after_attach(session_id, origin, attached_status_updates, false);
 
         if let Err(e) = attach_result {
             tracing::warn!(

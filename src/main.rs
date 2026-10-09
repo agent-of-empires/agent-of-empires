@@ -41,8 +41,16 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
     })
 }
 
+fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__owned-create-native"))
+    {
+        return agent_of_empires::session::builder::run_owned_create_bootstrap();
+    }
+    application_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn application_main() -> Result<()> {
     // Hidden helper for the VT live preview, handled before clap so it stays off the CLI surface.
     {
         let mut a = std::env::args();

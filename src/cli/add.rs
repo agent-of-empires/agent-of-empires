@@ -461,14 +461,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 instance.project_path = worktree_path.to_string_lossy().into_owned();
                 instance.worktree_info.clone_from(&worktree_info_opt);
                 creation_intent = Some(builder::CreationIntent::reserve(&storage, &mut instance)?);
-                let warnings = git_wt.create_worktree(
-                    branch,
-                    &worktree_path,
-                    args.create_branch,
-                    worktree_info_opt
-                        .as_ref()
-                        .and_then(|info| info.base_branch.as_deref()),
-                )?;
+                let warnings = git_wt
+                    .create_worktree_owned(
+                        branch,
+                        &worktree_path,
+                        args.create_branch,
+                        worktree_info_opt
+                            .as_ref()
+                            .and_then(|info| info.base_branch.as_deref()),
+                        creation_intent.as_ref().unwrap(),
+                    )
+                    .map_err(|error| {
+                        builder::finish_failed_creation(&storage, &instance, error.into())
+                    })?;
                 path = worktree_path;
 
                 for w in &warnings {
@@ -504,7 +509,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.project_path = path.to_string_lossy().into_owned();
         instance.scratch = true;
         creation_intent = Some(builder::CreationIntent::reserve(&storage, &mut instance)?);
-        crate::session::scratch::provision_scratch_dir(&instance.id)?;
+        creation_intent
+            .as_ref()
+            .unwrap()
+            .provision_directory(std::path::Path::new(&instance.project_path))
+            .map_err(|error| builder::finish_failed_creation(&storage, &instance, error))?;
     }
 
     if let Some(group) = &group_path {
@@ -854,13 +863,22 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     instance.get_container_for_instance()?;
                 }
                 let ran = match instance.sandbox_info {
-                    Some(ref sandbox) => repo_config::execute_hooks_in_container(
+                    Some(_) => repo_config::execute_creating_hooks_in_container(
+                        &creation_intent,
+                        &instance,
                         commands,
-                        &sandbox.container_name,
-                        &instance.container_workdir(),
+                        None,
                         &hook_env,
+                        None,
                     ),
-                    None => repo_config::execute_hooks(commands, &path, &hook_env),
+                    None => repo_config::execute_creating_hooks(
+                        &creation_intent,
+                        commands,
+                        &path,
+                        None,
+                        &hook_env,
+                        None,
+                    ),
                 };
                 if let Err(e) = ran {
                     let hint = resolved
@@ -875,9 +893,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         Ok(())
     })();
 
-    if let Err(e) = hook_result {
-        tracing::warn!(target: "cli.add", "Creation ownership and resources retained: original native quiescence is unproven");
-        return Err(e);
+    if let Err(error) = hook_result {
+        return Err(builder::finish_failed_creation(&storage, &instance, error));
     }
 
     let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {

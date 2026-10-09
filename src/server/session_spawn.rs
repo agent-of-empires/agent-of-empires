@@ -340,6 +340,7 @@ pub(crate) async fn spawn_structured_session(
         // Run creation hooks after the complete plan is durable.
         if let Err(e) = crate::server::api::sessions::run_create_hooks(
             &mut instance,
+            &creation_intent,
             &hook_plan,
             std::path::Path::new(&original_path),
             progress.as_deref(),
@@ -351,7 +352,7 @@ pub(crate) async fn spawn_structured_session(
                 .and_then(|h| h.origin_hint("on_create"))
                 .map(|hint| format!("\n{hint}"))
                 .unwrap_or_default();
-            return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
+            return Err(builder::finish_failed_creation(&storage, &instance, anyhow::anyhow!("on_create hook failed: {e:#}{hint}")));
         }
 
         if let Some(progress) = &progress {

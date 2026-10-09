@@ -380,7 +380,11 @@ fn daemon_status_does_not_persist_a_structured_row_to_disk() {
     let id = structured_row(&mut env, Status::Idle);
     // `add_instance` only stages the row; flush it to disk as Idle so the
     // passive writer has a durable row to (not) touch.
-    env.view.save().expect("seed the structured row on disk");
+    {
+        env.view.request_save();
+        drain_persistence(&mut env.view)
+    }
+    .expect("seed the structured row on disk");
 
     env.view
         .apply_daemon_status_update(update(&id, Status::Running));
@@ -412,9 +416,11 @@ fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Running);
-    env.view
-        .save()
-        .expect("seed the structured row on disk as read/Running");
+    {
+        env.view.request_save();
+        drain_persistence(&mut env.view)
+    }
+    .expect("seed the structured row on disk as read/Running");
 
     // A finished turn (Running -> Idle).
     env.view

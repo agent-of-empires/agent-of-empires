@@ -34,6 +34,8 @@ Invariants worth knowing before touching this code:
 
 TUI restart and recovery callbacks retire only their original physical request. Rejected authority produces a visible error without merging stale worker fields, persisting them or attaching to a replacement row. A newer request keeps its own in-flight marker.
 
+TUI mutations use one ordered persistence lane. Row requests capture their original storage and visible lifecycle before enqueueing; the worker acquires flocks and returns durable ACKs before native or UI continuations. Sort/group preferences and quit confirmation use that lane too. Quit closes only after its accepted saves settle; a failed save cancels closing and preserves input admission.
+
 ## Session deletion
 
 `session/delete` fires only on permanent removal (a purge, or disabling the structured view, which discards the conversation). Reversible teardown (`aoe acp stop`, snooze, archive, trash, idle auto-stop) deliberately does not fire it, so the transcript stays on disk and the next respawn resumes through `session/load`.
@@ -50,6 +52,10 @@ One daemon trash-reconciliation invocation builds one path-claim index from each
 Successful lifecycle replies replace the client row with the complete authoritative session snapshot, including status, pin and snooze changes. Bulk operations apply successful rows while preserving each refused original and its guidance, without waiting for a list poll.
 
 Filesystem reservations cover the full future workspace and repository path set before effects. Creation publication carries the original opaque `CreationIntent` and the actual canonical write acknowledgement; neither is native execution authority. A replacement profile, changed plan, unreadable peer inventory, or unproven cancellation retains the reservation. See [worktree cleanup](../../guides/worktrees.md#cleanup) for the retention contract.
+
+A reservation records its original custodian's process birth, boot and PID namespace plus the physical profile's device, inode and native birth time before any effect. This metadata can prove loss, never grant execution or Undo authority. A live writer in another process, a failed observation, a different namespace or missing birth evidence retains Pending. Startup and reload workers may change only Pending to scoped Unknown after proven original loss, under workspace, identity, original lifecycle and storage fences. Every candidate path, row ID/DOB/counter and custodian birth remains unchanged. Historical Unknown without an inventory stays globally fail-closed; scoped Unknown excludes its complete path set. Neither TTL, restart nor reboot clears filesystem claims. Original registry custody survives observer cancellation and channel loss; while it survives, explicit publication retry or original-custody withdrawal remains available. Migration v040 backs up the old document and marks historical claims lacking birth evidence unknown without completing them.
+
+Metadata-only intent retirement appends the exact raw owner to the required retention ledger and syncs it before removing the original source row. Retry acknowledges only that same physical source and raw owner; interrupted publication retains both copies. The ledger grants no execution, Stop or Undo authority. Workspace admission fences both build namespaces in canonical order, and permanent exclusions cannot be excluded as a live row’s own claims. See [abandoning unresolved intent metadata](../../guides/worktrees.md#abandoning-unresolved-intent-metadata).
 
 Live teardown retains HOME after a refused original Stop and attaches the canonical stored session rows and available daemon/runner logs to the failed Playwright result. These snapshots diagnose the refusal; they cannot replace original physical custody, publication acknowledgements or native-group quiescence.
 

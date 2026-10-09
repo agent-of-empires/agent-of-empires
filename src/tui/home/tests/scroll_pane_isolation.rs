@@ -524,7 +524,11 @@ fn live_leader_b_toggles_sidebar() {
     let mut env = live_env_with_leader();
     assert!(!env.view.sidebar_collapsed);
 
-    env.view.handle_key(ctrl('b'), None);
+    {
+        let result = env.view.handle_key(ctrl('b'), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.live_send_pending_leader,
         "leader press should arm the menu"
@@ -534,13 +538,25 @@ fn live_leader_b_toggles_sidebar() {
         "leader alone must not toggle anything yet"
     );
 
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('b')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(!env.view.live_send_pending_leader, "menu should disarm");
     assert!(env.view.sidebar_collapsed, "leader+b hides the sidebar");
 
     // And again to reveal it.
-    env.view.handle_key(ctrl('b'), None);
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    {
+        let result = env.view.handle_key(ctrl('b'), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('b')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(!env.view.sidebar_collapsed, "leader+b again shows it");
     env.assert_native_input(b"");
 }
@@ -588,7 +604,11 @@ fn live_leader_follow_up_keys() {
         let mut env = live_env_with_leader();
         env.view.sidebar_collapsed = collapsed;
         for k in keys {
-            env.view.handle_key(k, None);
+            {
+                let result = env.view.handle_key(k, None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
         }
         assert!(!env.view.live_send_pending_leader, "{label}: menu disarms");
         assert_eq!(env.view.live_send.is_some(), live, "{label}");
@@ -607,16 +627,32 @@ fn palette_command_while_live_exits_live() {
     crate::tmux::test_helpers::require_tmux!();
     let mut env = live_env_with_leader();
     // Open the palette from within live mode via the leader.
-    env.view.handle_key(ctrl('b'), None);
-    env.view.handle_key(key(KeyCode::Char('k')), None);
+    {
+        let result = env.view.handle_key(ctrl('b'), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('k')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.command_palette.is_some());
     assert!(env.view.live_send.is_some(), "palette opens over live mode");
 
     // Filter to a jump entry and commit it.
     for ch in "jump".chars() {
-        env.view.handle_key(key(KeyCode::Char(ch)), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char(ch)), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
     }
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.live_send.is_none(),
@@ -770,7 +806,11 @@ fn diff_modal_owns_clicks_and_wheel() {
     assert!(!env.view.handle_scroll_down(5, 5));
     assert_eq!(env.view.diff_view.as_ref().unwrap().scroll_offset, 0);
     assert!(
-        env.view.handle_dialog_click(5, 5),
+        {
+            let result = env.view.handle_dialog_click(5, 5);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        },
         "the modal consumes the click"
     );
 
@@ -781,7 +821,11 @@ fn diff_modal_owns_clicks_and_wheel() {
         "without a modal only the diff pane hits"
     );
     assert!(
-        env.view.handle_dialog_click(5, 5),
+        {
+            let result = env.view.handle_dialog_click(5, 5);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        },
         "the full-screen diff still owns clicks over the stale list rect"
     );
     assert!(

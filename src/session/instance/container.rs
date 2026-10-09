@@ -126,6 +126,24 @@ impl Instance {
         &mut self,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<containers::DockerContainer> {
+        let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+        self.get_container_under_workspace_locks(cancel)
+    }
+
+    pub(crate) fn get_container_for_instance_under_workspace_locks(
+        &mut self,
+    ) -> Result<containers::DockerContainer> {
+        self.get_container_under_workspace_locks(&tokio_util::sync::CancellationToken::new())
+    }
+
+    fn get_container_under_workspace_locks(
+        &mut self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<containers::DockerContainer> {
+        crate::session::retained_intents::ensure_id_available(&self.id)?;
+        if let Some(intent) = crate::session::builder::CreationIntent::original_for(self)? {
+            intent.retain_container_domain(self)?;
+        }
         let checkpoint = || {
             if cancel.is_cancelled() {
                 anyhow::bail!("sandbox start cancelled");
@@ -139,19 +157,17 @@ impl Instance {
             .image
             .clone();
         let container = DockerContainer::new(&self.id, &image);
-        // Charge the sandbox store move to the session that needs it, at the
-        // one chokepoint every entry point shares: tmux launches, ACP
-        // structured sessions and a bare container terminal all arrive here.
-        // The TUI runs it ahead of time on a worker so this is a no-op there;
-        // see `tui::store_move_poller`. It must stay above the shared flock
-        // below. Failure is not permission to launch on unproven native state.
         if self.sandbox_store_move_pending() {
-            if !self.move_sandbox_store(Some(crate::migrations::progress::tracing_reporter()))? {
+            if container.is_running()? {
                 anyhow::bail!(
                     "sandbox {} must be stopped before native history can be isolated",
                     self.id
                 );
             }
+            crate::migrations::migrate_sandbox_store_under_workspace_locks(
+                &self.id,
+                Some(crate::migrations::progress::tracing_reporter()),
+            )?;
             self.reconcile_from_disk();
         }
         self.warn_legacy_agent_config_mounts();
@@ -292,7 +308,10 @@ impl Instance {
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         container_config::place_shadowed_credential_mountpoints(&config);
         checkpoint()?;
-        let container_id = container.create(&config)?;
+        let container_id = match crate::session::builder::CreationIntent::original_for(self)? {
+            None => container.create(&config)?,
+            Some(intent) => container.create_owned(&config, &intent, cancel)?,
+        };
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)
             && self.hook_session_publisher_allowed_by_argv();
@@ -551,12 +570,21 @@ impl Instance {
                 )
             })
             .unwrap_or_default();
-        let minted = crate::session::config::repo_config::run_before_start_hooks(
-            &commands,
-            &project_path,
-            &hook_env,
-            &session_env,
-        )?;
+        let minted = match crate::session::builder::CreationIntent::original_for(self)? {
+            Some(intent) => crate::session::config::repo_config::run_creating_before_start_hooks(
+                &intent,
+                &commands,
+                &project_path,
+                &hook_env,
+                &session_env,
+            )?,
+            None => crate::session::config::repo_config::run_before_start_hooks(
+                &commands,
+                &project_path,
+                &hook_env,
+                &session_env,
+            )?,
+        };
         if let Some(sb) = self.sandbox_info.as_mut() {
             sb.before_start_env = minted;
         }

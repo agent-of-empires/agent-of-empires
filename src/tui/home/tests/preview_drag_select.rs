@@ -261,7 +261,11 @@ fn finalized_selection_survives_scroll_but_not_a_live_keypress() {
     assert!(env.view.preview_selection.is_some());
     // Any keystroke clears it so it doesn't follow agent output as the live pane refreshes.
     // The session doesn't exist in tmux, but dismissal happens before the translate step.
-    env.view.handle_key(key(KeyCode::Char('x')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('x')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.preview_selection.is_none());
 }
 

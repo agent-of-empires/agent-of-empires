@@ -4,6 +4,14 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **session:** Produce Creating checkout/Git-admin roots and public layout before native effects, bind Git and local hooks to their original physical resources and same Create, and withdraw only after actual native retirement plus exact resource Undo. Preserve original body proofs, unrelated Git configuration, and preexisting/dirty/replaced/unacknowledged resources; unresolved module/container and pathname-only domains stay protected.
+- **tui:** Keep lifecycle and metadata persistence off the input thread, order presentation preferences behind durable saves, and cancel quit on failed persistence.
+- **session:** Add explicit metadata-only abort for unresolved Create/Attach intents, retaining exact owners, native history, IDs, physical profiles and resource exclusions durably across build namespaces.
+
 ## [1.18.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.18.0) - 2026-09-30
 
 

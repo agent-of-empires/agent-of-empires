@@ -51,7 +51,11 @@ fn settings_takeover_owns_wheel_and_scrollbar_drag() {
     let (col, row) = scrollbar_hit(&env).expect("fields must overflow so a scrollbar renders");
 
     assert!(
-        env.view.handle_dialog_click(col, row),
+        {
+            let result = env.view.handle_dialog_click(col, row);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        },
         "a scrollbar press is consumed by the settings takeover"
     );
     assert!(
@@ -72,7 +76,11 @@ fn settings_takeover_owns_wheel_and_scrollbar_drag() {
     );
 
     // Column 2 is deep in the categories panel, nowhere near the bar.
-    assert!(env.view.handle_dialog_click(2, 6));
+    assert!({
+        let result = env.view.handle_dialog_click(2, 6);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    });
     assert!(
         env.view.drag_state.is_none(),
         "a click off the bar must not begin a scrollbar drag"
@@ -89,7 +97,11 @@ fn settings_help_overlay_takes_the_click_over_the_scrollbar() {
     let (col, row) = scrollbar_hit(&env).expect("fields must overflow so a scrollbar renders");
     env.view.settings_view.as_mut().unwrap().show_help = true;
 
-    assert!(env.view.handle_dialog_click(col, row));
+    assert!({
+        let result = env.view.handle_dialog_click(col, row);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    });
     assert!(env.view.drag_state.is_none(), "no drag starts under help");
     assert!(
         !env.view.settings_view.as_ref().unwrap().show_help,

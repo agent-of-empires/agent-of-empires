@@ -790,10 +790,14 @@ fn wants_paste_burst_only_for_paste_aware_dialogs() {
 
     // Command palette: captures keys, no handle_paste. Burst would
     // strand input in pending_paste — must be disabled.
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.command_palette.is_some(),
         "Ctrl+K must open the command palette"
@@ -802,7 +806,11 @@ fn wants_paste_burst_only_for_paste_aware_dialogs() {
         !env.view.wants_paste_burst(),
         "burst must be disabled when command palette is open"
     );
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.command_palette.is_none());
     assert!(
         env.view.wants_paste_burst(),
@@ -979,10 +987,24 @@ fn toggle_favorite_at_cursor_round_trip() {
     // Initial state: not favorited.
     assert!(!env.view.instance_at(0).is_favorited());
 
-    env.view.toggle_favorite_at_cursor().unwrap();
+    {
+        let submitted = env.view.toggle_favorite_at_cursor();
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(env.view.instance_at(0).is_favorited());
 
-    env.view.toggle_favorite_at_cursor().unwrap();
+    {
+        let submitted = env.view.toggle_favorite_at_cursor();
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(!env.view.instance_at(0).is_favorited());
 }
 
@@ -998,7 +1020,10 @@ fn trash_then_restore_round_trip() {
     env.view.selected_session = Some(id.clone());
     assert!(!env.view.instance_at(0).is_trashed());
 
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
         "session must be trashed"
@@ -1018,7 +1043,14 @@ fn trash_then_restore_round_trip() {
     // Restore via the shelve/unshelve key.
     env.view.select_session_by_id(&id);
     {
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            let submitted = env.view.toggle_archive_at_cursor();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         finish_runner_settlements(&mut env.view);
     };
     assert!(
@@ -1040,7 +1072,10 @@ fn trashing_leaves_collapsed_trash_section_collapsed() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
 
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
@@ -1062,7 +1097,10 @@ fn trash_offloads_blocking_teardown_to_poller() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
 
     // Inline: the row is durably trashed the instant the key is handled.
     assert!(
@@ -1089,7 +1127,10 @@ fn trash_reserves_durable_lifecycle_generation() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
 
     let rows = env.view.storages.get("test").unwrap().load().unwrap();
     let row = rows.iter().find(|instance| instance.id == id).unwrap();
@@ -1106,7 +1147,10 @@ fn trash_teardown_release_clears_durable_claim() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     let row = |view: &HomeView| {
         view.storages
             .get("test")
@@ -1158,7 +1202,10 @@ fn restore_does_not_steal_peer_trash_reservation() {
         .unwrap();
     env.view.instances.insert(id.clone(), peer.clone());
     env.view.selected_session = Some(id.clone());
-    env.view.restore_selected_from_trash();
+    {
+        env.view.restore_selected_from_trash();
+        drain_persistence(&mut env.view).unwrap();
+    };
     let retained = env
         .view
         .storages
@@ -1207,7 +1254,10 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     };
 
     env.view.selected_session = Some(id.clone());
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     entered_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("teardown entered");
@@ -1219,7 +1269,10 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     ));
 
     env.view.selected_session = Some(id.clone());
-    env.view.restore_selected_from_trash();
+    {
+        env.view.restore_selected_from_trash();
+        drain_persistence(&mut env.view).unwrap();
+    };
     let restored = row(&env.view);
     assert!(
         !restored.is_trashed(),
@@ -1282,10 +1335,16 @@ fn a_delayed_authoritative_trash_result_applies_the_durable_restore() {
                 authoritative: Some(authoritative),
             }
         });
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     let published = published_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     env.view.selected_session = Some(id.clone());
-    env.view.restore_selected_from_trash();
+    {
+        env.view.restore_selected_from_trash();
+        drain_persistence(&mut env.view).unwrap();
+    };
     let durable = env
         .view
         .storages
@@ -1326,7 +1385,10 @@ fn right_click_trash_header_shows_bulk_menu() {
         let mut env = create_test_env_with_sessions(2);
         env.view.trashed_section_collapsed = false;
         let id = env.view.instance_at(0).id.clone();
-        env.view.trash_session_by_id(&id);
+        {
+            env.view.trash_session_by_id(&id);
+            drain_persistence(&mut env.view).unwrap();
+        };
 
         let header_idx = env
             .view
@@ -1359,7 +1421,14 @@ fn right_click_trash_header_shows_bulk_menu() {
         env.view.cursor = 0;
         env.view.update_selected();
         {
-            env.view.toggle_archive_at_cursor().unwrap();
+            {
+                let submitted = env.view.toggle_archive_at_cursor();
+                await_transaction_result(
+                    &mut env.view,
+                    submitted.map(|_| super::super::TransactionDisposition::Queued),
+                )
+            }
+            .unwrap();
             finish_runner_settlements(&mut env.view);
         };
 
@@ -1396,7 +1465,10 @@ fn right_click_trash_header_shows_bulk_menu() {
         let mut env = create_test_env_with_sessions(2);
         env.view.trashed_section_collapsed = false;
         let id = env.view.instance_at(0).id.clone();
-        env.view.trash_session_by_id(&id);
+        {
+            env.view.trash_session_by_id(&id);
+            drain_persistence(&mut env.view).unwrap();
+        };
 
         let theme = load_theme("empire");
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -1444,17 +1516,32 @@ fn trash_header_d_and_palette_open_empty_trash_confirm() {
         disable_confirm_delete();
         env.view.trashed_section_collapsed = false;
         let id = env.view.instance_at(0).id.clone();
-        env.view.trash_session_by_id(&id);
+        {
+            env.view.trash_session_by_id(&id);
+            drain_persistence(&mut env.view).unwrap();
+        };
 
         if via_palette {
-            env.view.handle_key(
-                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-                None,
-            );
+            {
+                let result = env.view.handle_key(
+                    KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                    None,
+                );
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
             for ch in "empty trash".chars() {
-                env.view.handle_key(key(KeyCode::Char(ch)), None);
+                {
+                    let result = env.view.handle_key(key(KeyCode::Char(ch)), None);
+                    drain_persistence(&mut env.view).unwrap();
+                    result
+                };
             }
-            env.view.handle_key(key(KeyCode::Enter), None);
+            {
+                let result = env.view.handle_key(key(KeyCode::Enter), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
         } else {
             env.view.cursor = env
                 .view
@@ -1466,7 +1553,11 @@ fn trash_header_d_and_palette_open_empty_trash_confirm() {
                 })
                 .expect("Trash header must render");
             env.view.update_selected();
-            env.view.handle_key(key(KeyCode::Char('d')), None);
+            {
+                let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
         }
 
         assert_eq!(
@@ -1514,8 +1605,15 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
                 Ok(())
             })
             .unwrap();
-        env.view.reload().unwrap();
-        env.view.trash_session_by_id(&id);
+        {
+            env.view.request_reload(super::super::ReloadKind::Full);
+            drain_persistence(&mut env.view)
+        }
+        .unwrap();
+        {
+            env.view.trash_session_by_id(&id);
+            drain_persistence(&mut env.view).unwrap();
+        };
         // A held Trash reservation would turn the first purge into Busy, not Failed.
         let deadline = Instant::now() + Duration::from_secs(10);
         while env.view.trash_poller.is_pending(&id) {
@@ -1556,7 +1654,11 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
                     })
                     .unwrap();
             }
-            env.view.handle_key(key(KeyCode::Char('y')), None);
+            {
+                let result = env.view.handle_key(key(KeyCode::Char('y')), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
 
             if round == 2 {
                 // The submit returned with the lock still held; the row leaves only when
@@ -1582,7 +1684,11 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
                 .unwrap()
                 .checkbox_labels_for_test()
                 .is_empty());
-            env.view.handle_key(key(KeyCode::Char('y')), None);
+            {
+                let result = env.view.handle_key(key(KeyCode::Char('y')), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
             let deadline = Instant::now() + Duration::from_secs(10);
             while !env.view.apply_deletion_results() {
                 assert!(Instant::now() < deadline, "round {round}: no result");
@@ -1604,8 +1710,14 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         let mut env = create_test_env_with_sessions(3);
         let a = env.view.instance_at(0).id.clone();
         let b = env.view.instance_at(1).id.clone();
-        env.view.trash_session_by_id(&a);
-        env.view.trash_session_by_id(&b);
+        {
+            env.view.trash_session_by_id(&a);
+            drain_persistence(&mut env.view).unwrap();
+        };
+        {
+            env.view.trash_session_by_id(&b);
+            drain_persistence(&mut env.view).unwrap();
+        };
 
         env.view.prompt_empty_trash();
         let dialog = env
@@ -1643,8 +1755,14 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         let mut env = create_test_env_with_sessions(3);
         let a = env.view.instance_at(0).id.clone();
         let b = env.view.instance_at(1).id.clone();
-        env.view.trash_session_by_id(&a);
-        env.view.trash_session_by_id(&b);
+        {
+            env.view.trash_session_by_id(&a);
+            drain_persistence(&mut env.view).unwrap();
+        };
+        {
+            env.view.trash_session_by_id(&b);
+            drain_persistence(&mut env.view).unwrap();
+        };
         assert_eq!(
             env.view
                 .instances
@@ -1654,7 +1772,10 @@ fn empty_trash_confirm_purges_every_trashed_row() {
             2
         );
 
-        env.view.restore_all_from_trash();
+        {
+            env.view.restore_all_from_trash();
+            drain_persistence(&mut env.view).unwrap();
+        };
         assert_eq!(
             env.view
                 .instances
@@ -1672,7 +1793,14 @@ fn empty_trash_confirm_purges_every_trashed_row() {
             env.view.cursor = i;
             env.view.update_selected();
             {
-                env.view.toggle_archive_at_cursor().unwrap();
+                {
+                    let submitted = env.view.toggle_archive_at_cursor();
+                    await_transaction_result(
+                        &mut env.view,
+                        submitted.map(|_| super::super::TransactionDisposition::Queued),
+                    )
+                }
+                .unwrap();
                 finish_runner_settlements(&mut env.view);
             };
         }
@@ -1685,7 +1813,10 @@ fn empty_trash_confirm_purges_every_trashed_row() {
             2
         );
 
-        env.view.unarchive_all();
+        {
+            env.view.unarchive_all();
+            drain_persistence(&mut env.view).unwrap();
+        };
         assert_eq!(
             env.view
                 .instances
@@ -1708,7 +1839,10 @@ fn trashed_preview_surfaces_delete_failure() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     env.view.select_session_by_id(&id);
 
     env.view.mutate_instance(&id, |inst| {
@@ -1736,7 +1870,10 @@ fn trashed_preview_shows_deleting_status() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     env.view.select_session_by_id(&id);
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Deleting;
@@ -1760,7 +1897,14 @@ fn archived_preview_surfaces_delete_failure() {
     let id = env.view.instance_at(0).id.clone();
     env.view.select_session_by_id(&id);
     {
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            let submitted = env.view.toggle_archive_at_cursor();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         finish_runner_settlements(&mut env.view);
     };
     env.view.select_session_by_id(&id);
@@ -1784,12 +1928,20 @@ fn restart_on_trashed_row_surfaces_refusal() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     env.view.select_session_by_id(&id);
 
-    env.view
-        .restart_selected_session(None, None, None, None)
-        .unwrap();
+    {
+        let submitted = env.view.restart_selected_session(None, None, None, None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(
         env.view.info_dialog.is_some(),
         "restarting a trashed row must explain why nothing happened"
@@ -1805,15 +1957,23 @@ fn restart_on_deleting_trashed_row_stays_silent() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     env.view.select_session_by_id(&id);
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Deleting;
     });
 
-    env.view
-        .restart_selected_session(None, None, None, None)
-        .unwrap();
+    {
+        let submitted = env.view.restart_selected_session(None, None, None, None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(
         env.view.info_dialog.is_none(),
         "a mid-purge row must not get a restore hint that races the delete"
@@ -1830,7 +1990,10 @@ fn compact_title_masks_stale_spinner_on_trashed_row() {
     let mut env = create_test_env_with_sessions(2);
     env.view.trashed_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
-    env.view.trash_session_by_id(&id);
+    {
+        env.view.trash_session_by_id(&id);
+        drain_persistence(&mut env.view).unwrap();
+    };
     env.view.select_session_by_id(&id);
     // Stale persisted live status; the pane was killed on trash.
     env.view.mutate_instance(&id, |inst| {
@@ -1875,7 +2038,10 @@ fn w_skips_unread_trashed_session() {
         .mutate_instance(&active, |inst| inst.status = Status::Idle);
     env.view
         .mutate_instance(&trashed, |inst| inst.mark_unread());
-    env.view.trash_session_by_id(&trashed);
+    {
+        env.view.trash_session_by_id(&trashed);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(env.view.get_instance(&trashed).unwrap().is_trashed());
     assert!(
         env.view.get_instance(&trashed).unwrap().is_unread(),
@@ -1883,7 +2049,11 @@ fn w_skips_unread_trashed_session() {
     );
 
     env.view.select_session_by_id(&active);
-    env.view.handle_key(key(KeyCode::Char('w')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('w')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let landed = match env.view.flat_items.get(env.view.cursor) {
         Some(Item::Session { id, .. }) => Some(id.clone()),
@@ -1904,12 +2074,20 @@ fn d_then_d_confirms_the_trash_and_persists_the_marker() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "the first d must only open the dialog"
     );
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.confirm_dialog.is_none(),
@@ -1945,7 +2123,11 @@ fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
     disable_confirm_delete();
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.confirm_dialog.is_none(),
@@ -1995,7 +2177,11 @@ fn w_skips_sunk_waiting_session() {
         });
 
         env.view.select_session_by_id(&active);
-        env.view.handle_key(key(KeyCode::Char('w')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('w')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
 
         let landed = cursor_session_id(&env.view);
         assert_ne!(
@@ -2032,7 +2218,11 @@ fn w_skips_sunk_idle_session_in_fallback() {
 
         env.view.cursor = running;
         env.view.update_selected();
-        env.view.handle_key(key(KeyCode::Char('w')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('w')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
 
         let landed = cursor_session_id(&env.view);
         assert_ne!(
@@ -2056,11 +2246,27 @@ fn confirm_delete_dont_ask_again_persists_the_opt_out() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     // Down focuses the checkbox, Space ticks it, the second `d` accepts.
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Char(' ')), None);
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char(' ')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
@@ -2083,7 +2289,11 @@ fn d_with_confirm_delete_prompts_before_trashing() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
@@ -2105,7 +2315,11 @@ fn d_with_confirm_delete_prompts_before_trashing() {
     assert!(screen.contains("Press d again to confirm"), "{screen}");
 
     // A second `d` accepts, trashing via the same trash_session_by_id path.
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
         "accepting the confirm dialog must trash the session"
@@ -2124,10 +2338,18 @@ fn confirm_delete_dialog_cancel_leaves_session() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.confirm_dialog.is_some());
 
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.confirm_dialog.is_none(),
         "Esc must dismiss the confirm dialog"

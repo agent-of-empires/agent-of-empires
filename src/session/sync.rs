@@ -1251,6 +1251,7 @@ mod tests {
             generation: 1,
             at: chrono::Utc::now(),
             path_claims: crate::session::WorktreePathClaims::None,
+            custodian: None,
         });
         seed_instance_on_disk(profile, &mut instance);
         attach_poller_with_update(&mut instance, sid);

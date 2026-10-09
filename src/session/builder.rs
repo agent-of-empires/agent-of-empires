@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, path::PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use crate::containers;
@@ -104,12 +104,310 @@ pub struct WorkspaceResult {
     pub(crate) creation_intent: std::sync::Arc<CreationIntent>,
 }
 
-/// Filesystem-only custody issued by a successful canonical write, never native authority.
+/// Live originals are retained independently of channels and UI lifetimes.
+#[derive(Debug)]
+pub struct CreationCustody {
+    storage: std::sync::Arc<super::Storage>,
+    admitted: Instance,
+    state: std::sync::Mutex<CreationCustodyState>,
+}
+
+#[derive(Debug, Default)]
+struct CreationCustodyState {
+    intent: Option<std::sync::Arc<CreationIntent>>,
+    ready: Option<CreationReady>,
+    published: Option<Instance>,
+    withdrawn: Option<CreationWithdrawalAck>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreationReady {
+    pub instance: Instance,
+    pub warnings: Vec<String>,
+    pub on_launch_hooks_ran: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationUndoVerdict {
+    NotReserved,
+    RequiresOriginalProofCheck,
+    Withdrawn,
+    AlreadyPublished,
+}
+
+fn creation_originals() -> &'static std::sync::Mutex<Vec<std::sync::Arc<CreationCustody>>> {
+    static ORIGINALS: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Arc<CreationCustody>>>> =
+        std::sync::OnceLock::new();
+    ORIGINALS.get_or_init(Default::default)
+}
+
+impl CreationCustody {
+    pub fn register(
+        storage: std::sync::Arc<super::Storage>,
+        admitted: &Instance,
+    ) -> Result<std::sync::Arc<Self>> {
+        if let Some(origin) = &admitted.storage_origin {
+            anyhow::ensure!(
+                storage.same_origin_as(origin),
+                "creation admission changed its original profile"
+            );
+        }
+        let mut originals = creation_originals()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(original) = originals.iter().find(|entry| {
+            entry.admitted.id == admitted.id
+                && entry.admitted.created_at == admitted.created_at
+                && entry.storage.same_origin_as(&storage)
+        }) {
+            return Ok(original.clone());
+        }
+        storage.verify_profile_identity()?;
+        let original = std::sync::Arc::new(Self {
+            storage,
+            admitted: admitted.clone(),
+            state: Default::default(),
+        });
+        originals.push(original.clone());
+        Ok(original)
+    }
+
+    /// Routing only: returned entries already own their original capabilities.
+    pub fn retained() -> Vec<std::sync::Arc<Self>> {
+        creation_originals()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.admitted.id
+    }
+    pub fn storage(&self) -> &std::sync::Arc<super::Storage> {
+        &self.storage
+    }
+    pub fn created_at(&self) -> chrono::DateTime<Utc> {
+        self.admitted.created_at
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .intent
+            .as_ref()
+            .map(|intent| intent.acknowledged.lifecycle_generation)
+    }
+
+    pub fn ready(&self) -> Option<CreationReady> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ready
+            .clone()
+    }
+
+    pub fn retain_ready(&self, mut ready: CreationReady) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let intent = state
+            .intent
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("creation has no original reserve acknowledgement"))?;
+        anyhow::ensure!(
+            ready.instance.id == self.admitted.id
+                && ready.instance.created_at == self.admitted.created_at,
+            "ready result changed its admitted identity"
+        );
+        intent.refresh_prepared(&ready.instance)?;
+        ready.warnings.extend(intent.native_warnings()?);
+        anyhow::ensure!(state.published.is_none(), "creation is already published");
+        state.ready = Some(ready);
+        Ok(())
+    }
+
+    /// Explicit publication only; never launches Git, hooks, containers or attach.
+    pub fn retry_publication(&self) -> Result<Instance> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(published) = &state.published {
+            return Ok(published.clone());
+        }
+        let ready = state.ready.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("creation has no complete prepared result; effects must not be rerun")
+        })?;
+        let intent = state
+            .intent
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("original creation custody is unavailable"))?;
+        let published = intent.publish(&ready.instance)?;
+        state.published = Some(published.clone());
+        Ok(published)
+    }
+
+    /// No deletion authority is inferred from absent runner journals or CLI exit.
+    pub fn undo_verdict(&self) -> CreationUndoVerdict {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.withdrawn.is_some() {
+            CreationUndoVerdict::Withdrawn
+        } else if state.published.is_some() {
+            CreationUndoVerdict::AlreadyPublished
+        } else if state.intent.is_none() {
+            CreationUndoVerdict::NotReserved
+        } else {
+            CreationUndoVerdict::RequiresOriginalProofCheck
+        }
+    }
+}
+
+/// Opaque producer acknowledgement, created only after physical Undo and same-Create withdrawal.
+#[derive(Clone, Debug)]
+pub struct CreationWithdrawalAck {
+    storage: std::sync::Arc<super::Storage>,
+    id: String,
+    created_at: chrono::DateTime<Utc>,
+    generation: u64,
+}
+impl CreationWithdrawalAck {
+    pub fn session_id(&self) -> &str {
+        &self.id
+    }
+    pub fn created_at(&self) -> chrono::DateTime<Utc> {
+        self.created_at
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn matches_original(
+        &self,
+        storage: &super::Storage,
+        id: &str,
+        created_at: chrono::DateTime<Utc>,
+        generation: u64,
+    ) -> Result<bool> {
+        self.storage.verify_profile_identity()?;
+        storage.verify_profile_identity()?;
+        Ok(self.storage.same_origin_as(storage)
+            && self.id == id
+            && self.created_at == created_at
+            && self.generation == generation)
+    }
+}
+
+impl CreationCustody {
+    pub fn matches_original(
+        &self,
+        storage: &super::Storage,
+        id: &str,
+        created_at: chrono::DateTime<Utc>,
+        generation: u64,
+    ) -> Result<bool> {
+        self.storage.verify_profile_identity()?;
+        storage.verify_profile_identity()?;
+        if !self.storage.same_origin_as(storage)
+            || self.admitted.id != id
+            || self.admitted.created_at != created_at
+        {
+            return Ok(false);
+        }
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ack) = &state.withdrawn {
+            return ack.matches_original(storage, id, created_at, generation);
+        }
+        let Some(intent) = &state.intent else {
+            return Ok(false);
+        };
+        if intent.acknowledged.lifecycle_generation != generation {
+            return Ok(false);
+        }
+        let Some(row) = self.storage.load()?.into_iter().find(|row| row.id == id) else {
+            return Ok(false);
+        };
+        if state.published.is_none() {
+            intent.validate_row(&row)?;
+        }
+        Ok(row.created_at == created_at && row.lifecycle_generation == generation)
+    }
+
+    pub fn withdraw(&self) -> Result<CreationWithdrawalAck> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ack) = &state.withdrawn {
+            self.storage.verify_profile_identity()?;
+            return Ok(ack.clone());
+        }
+        anyhow::ensure!(
+            state.published.is_none(),
+            "published creation cannot be withdrawn"
+        );
+        let intent = state
+            .intent
+            .as_ref()
+            .context("original Creating reservation is unavailable")?;
+        intent.undo_original()?;
+        let ack = CreationWithdrawalAck {
+            storage: self.storage.clone(),
+            id: self.admitted.id.clone(),
+            created_at: self.admitted.created_at,
+            generation: intent.acknowledged.lifecycle_generation,
+        };
+        state.ready = None;
+        state.intent = None;
+        state.withdrawn = Some(ack.clone());
+        Ok(ack)
+    }
+}
+
+/// Borrowed physical namespace of this same original Create. The constructor
+/// accepts only its producer-held PFD; no pathname can manufacture this token.
+pub(crate) struct AnchoredDir {
+    owner: std::sync::Arc<super::runner_journal::OwnedStop>,
+    file: std::fs::File,
+    path: PathBuf,
+    identity: super::DirectoryIdentity,
+}
+impl AnchoredDir {
+    pub(super) fn from_original(
+        intent: &CreationIntent,
+        directory: &super::AnchoredDir,
+        identity: super::DirectoryIdentity,
+    ) -> Result<Self> {
+        let file = directory.duplicate_native_file()?;
+        anyhow::ensure!(
+            super::DirectoryIdentity::from_metadata(&file.metadata()?) == identity
+                && identity.is_durable(),
+            "original native filesystem PFD changed"
+        );
+        Ok(Self {
+            owner: intent
+                .owned_create
+                .get()
+                .context("original Create native custody is unavailable")?
+                .clone(),
+            file,
+            path: directory.path().to_path_buf(),
+            identity,
+        })
+    }
+    pub(crate) fn native_owner(&self) -> &std::sync::Arc<super::runner_journal::OwnedStop> {
+        &self.owner
+    }
+    pub(crate) fn native_file(&self) -> &std::fs::File {
+        &self.file
+    }
+    pub(crate) fn native_path(&self) -> &std::path::Path {
+        &self.path
+    }
+    pub(crate) fn native_identity(&self) -> super::DirectoryIdentity {
+        self.identity
+    }
+}
+
+/// The canonical original Create and its pre-effect resource custody.
 pub struct CreationIntent {
     storage: std::sync::Arc<super::Storage>,
     acknowledged: Instance,
     ready_status: super::Status,
     paths: Vec<PathBuf>,
+    owned_create: std::sync::OnceLock<std::sync::Arc<super::runner_journal::OwnedStop>>,
+    undo: std::sync::Mutex<super::creation_undo::CreationUndo>,
 }
 
 impl std::fmt::Debug for CreationIntent {
@@ -121,11 +419,49 @@ impl std::fmt::Debug for CreationIntent {
     }
 }
 
+pub fn run_owned_create_bootstrap() -> Result<()> {
+    super::runner_journal::native_create::bootstrap_child()
+}
+
 impl CreationIntent {
+    pub(crate) fn borrow_owned_create(
+        &self,
+    ) -> Result<std::sync::Arc<super::runner_journal::OwnedStop>> {
+        self.owned_create
+            .get()
+            .cloned()
+            .context("original Create producer acknowledgement is unavailable")
+    }
+
     /// Publish the prepared build through its original physical profile.
     pub fn publish(&self, prepared: &Instance) -> Result<Instance> {
+        self.ensure_native_commands_observed()?;
         let _workspace = super::acquire_session_workspace_claim_lock()?;
         let _identity = super::acquire_session_identity_lock()?;
+        self.storage.verify_profile_identity()?;
+        super::validate_managed_workspace(prepared).map_err(anyhow::Error::msg)?;
+        let manages_worktree = prepared
+            .worktree_info
+            .as_ref()
+            .is_some_and(|info| info.managed_by_aoe)
+            || prepared.workspace_info.is_some();
+        if manages_worktree {
+            let mut paths = vec![PathBuf::from(&prepared.project_path)];
+            paths.extend(
+                prepared
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
+            );
+            super::deletion::ensure_unclaimed_paths(
+                super::deletion::SessionPathOwner {
+                    profile: self.storage.profile(),
+                    session_id: &prepared.id,
+                },
+                &paths,
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
         publish_prepared_creation_under_workspace_claim_lock(
             self.storage(),
             prepared,
@@ -163,6 +499,12 @@ impl CreationIntent {
         prepared: &mut Instance,
         paths: Vec<PathBuf>,
     ) -> Result<std::sync::Arc<Self>> {
+        let custody = CreationCustody::register(std::sync::Arc::new(storage.clone()), prepared)?;
+        let mut custody_state = custody.state.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            custody_state.intent.is_none(),
+            "original creation already reserved; retry publication instead"
+        );
         if let Some(origin) = &prepared.storage_origin {
             anyhow::ensure!(
                 storage.same_origin_as(origin),
@@ -180,8 +522,12 @@ impl CreationIntent {
             Instance::LIFECYCLE_RESERVATION_TTL,
             Utc::now(),
         )?;
-        reserved.lifecycle_reservation.as_mut().unwrap().path_claims =
-            super::WorktreePathClaims::Pending(paths.clone());
+        let custodian = crate::process::OriginalCustodianBirth::capture(storage, &reserved)?;
+        let reservation = reserved.lifecycle_reservation.as_mut().unwrap();
+        reservation.path_claims = super::WorktreePathClaims::Pending(paths.clone());
+        reservation.custodian = Some(custodian);
+        // Pure snapshot, before canonical reserve and before any native or FS effect.
+        let undo = super::creation_undo::CreationUndo::freeze(&reserved, &paths)?;
         let acknowledged = storage.update(|rows, _groups| {
             if super::is_duplicate_session(
                 rows.iter(),
@@ -207,12 +553,255 @@ impl CreationIntent {
         })?;
         prepared.lifecycle_generation = acknowledged.lifecycle_generation;
         prepared.lifecycle_reservation = acknowledged.lifecycle_reservation.clone();
-        Ok(std::sync::Arc::new(Self {
-            storage: std::sync::Arc::new(storage.clone()),
+        let intent = std::sync::Arc::new(Self {
+            storage: std::sync::Arc::clone(&custody.storage),
             acknowledged,
             ready_status,
             paths,
-        }))
+            undo: std::sync::Mutex::new(undo),
+            owned_create: Default::default(),
+        });
+        custody_state.intent = Some(intent.clone());
+        let owned_create = super::runner_journal::OwnedStop::from_claim(
+            &custody.storage,
+            &intent.acknowledged,
+            super::LifecycleOperation::Create,
+            intent.acknowledged.lifecycle_generation,
+        )?;
+        intent
+            .owned_create
+            .set(owned_create)
+            .map_err(|_| anyhow::anyhow!("creation native original was already installed"))?;
+        Ok(intent)
+    }
+
+    /// Routing only; a DTO cannot reconstruct missing historical originals.
+    pub(crate) fn original_for(instance: &Instance) -> Result<Option<std::sync::Arc<Self>>> {
+        if !instance
+            .lifecycle_reservation
+            .as_ref()
+            .is_some_and(|lease| lease.op == super::LifecycleOperation::Create)
+        {
+            return Ok(None);
+        }
+        let storage = instance.original_storage()?;
+        let original = CreationCustody::retained()
+            .into_iter()
+            .find(|entry| {
+                entry.admitted.id == instance.id
+                    && entry.admitted.created_at == instance.created_at
+                    && entry.storage.same_origin_as(&storage)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "original Creating custodian is unavailable; native commands remain protected"
+                )
+            })?;
+        let intent = original
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .intent
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("original Creating reservation is unavailable"))?;
+        anyhow::ensure!(
+            intent.acknowledged.lifecycle_generation == instance.lifecycle_generation,
+            "original Creating counter changed"
+        );
+        intent.storage.verify_profile_identity()?;
+        Ok(Some(intent))
+    }
+
+    pub(crate) fn require_worktree_plan(
+        &self,
+        repo: &std::path::Path,
+        branch: &str,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .require_worktree(repo, branch, path)
+    }
+    pub(crate) fn acknowledge_created_branch(
+        &self,
+        repo: &std::path::Path,
+        branch: &str,
+        produced: git2::Oid,
+    ) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acknowledge_created_branch(repo, branch, produced)
+    }
+    pub(crate) fn owned_git_command(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Result<super::runner_journal::OwnedCreateCommand> {
+        let mut command = self.owned_command("git")?;
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bind_command_directory(self, &mut command, cwd, true)?;
+        Ok(command)
+    }
+    pub(crate) fn owned_hook_command(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        cwd: &std::path::Path,
+    ) -> Result<super::runner_journal::OwnedCreateCommand> {
+        let mut command = self.owned_command(program)?;
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bind_command_directory(self, &mut command, cwd, false)?;
+        Ok(command)
+    }
+    pub(crate) fn allocate_worktree_bootstrap(
+        &self,
+        repo: &std::path::Path,
+        branch: &str,
+        path: &std::path::Path,
+        reason: &str,
+    ) -> Result<()> {
+        let _fences = self.original_undo_fences()?;
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .allocate_worktree_bootstrap(repo, branch, path, reason)
+    }
+    pub(crate) fn begin_worktree_effect(
+        &self,
+        repo: &std::path::Path,
+        branch: &str,
+        path: &std::path::Path,
+    ) -> Result<super::creation_undo::OwnedWorktreeLayout> {
+        let _fences = self.original_undo_fences()?;
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .begin_worktree_effect(self, repo, branch, path)
+    }
+    pub(crate) fn begin_checkout_command(
+        &self,
+        repo: &std::path::Path,
+        branch: &str,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .begin_checkout_command(repo, branch, path)
+    }
+    pub(crate) fn original_worktree_lock(&self, path: &std::path::Path) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .original_worktree_lock(path)
+    }
+    pub(crate) fn retain_submodule_domain(&self, path: &std::path::Path) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain_submodule_domain(path)
+    }
+    pub(crate) fn prepare_tracking(&self, repo: &std::path::Path, branch: &str) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .prepare_tracking(repo, branch)
+    }
+    pub(crate) fn acknowledge_tracking(
+        &self,
+        repo: &std::path::Path,
+        branch: &str,
+        remote: &str,
+        merge: &str,
+    ) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .acknowledge_tracking(repo, branch, remote, merge)
+    }
+    pub(crate) fn acknowledge_worktree(
+        &self,
+        repo: &std::path::Path,
+        branch: &str,
+        path: &std::path::Path,
+        complete: bool,
+    ) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acknowledge_worktree(repo, branch, path, complete)
+    }
+    pub(crate) fn provision_directory(&self, path: &std::path::Path) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provision(path)
+    }
+    pub(crate) fn retain_container_domain(&self, instance: &Instance) -> Result<()> {
+        self.undo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain_container(instance)
+    }
+    pub(crate) fn retain_container_goal(&self, argv: &[String]) {
+        self.undo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain_container_goal(argv);
+    }
+    pub(crate) fn acknowledge_container_result(&self, id: &str) {
+        self.undo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acknowledge_container_result(id);
+    }
+    pub(crate) fn original_undo_fences(&self) -> Result<CleanupOwnershipLocks> {
+        let fences = CleanupOwnershipLocks::acquire()?;
+        self.storage.verify_profile_identity()?;
+        let canonical = self
+            .storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == self.session_id())
+            .ok_or_else(|| anyhow::anyhow!("original Creating row is unavailable"))?;
+        self.validate_row(&canonical)?;
+        if !self.paths.is_empty() {
+            super::deletion::ensure_unclaimed_paths(
+                super::deletion::SessionPathOwner {
+                    profile: self.storage.profile(),
+                    session_id: self.session_id(),
+                },
+                &self.paths,
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        Ok(fences)
+    }
+
+    pub(crate) fn undo_original(&self) -> Result<()> {
+        // Native settlement must precede acquiring the filesystem Undo fences.
+        self.begin_owned_withdrawal()?;
+        self.retire_owned_commands()?;
+        self.undo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .undo(self)?;
+        self.retire_owned_commands()?;
+        let _fences = self.original_undo_fences()?;
+        self.storage
+            .complete_creation_under_workspace_claim_lock(self, |rows, _| {
+                let row = rows
+                    .iter()
+                    .find(|row| row.id == self.session_id())
+                    .ok_or_else(|| anyhow::anyhow!("original Creating row disappeared"))?;
+                self.validate_row(row)?;
+                rows.retain(|row| row.id != self.session_id());
+                Ok(())
+            })
     }
 
     pub(crate) fn storage(&self) -> &super::Storage {
@@ -319,20 +908,17 @@ impl CreationIntent {
     }
 
     pub(crate) fn refresh_prepared(&self, prepared: &Instance) -> Result<()> {
-        self.storage.update_metadata(
-            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
-                self.session_id(),
-            )),
-            |rows, _groups| {
-                let row = rows
-                    .iter_mut()
-                    .find(|row| row.id == self.session_id())
-                    .ok_or_else(|| anyhow::anyhow!("creation filesystem owner disappeared"))?;
+        // The true producer retains the actual metadata CAS ACK as its current
+        // projection. Later Git/hooks freeze this effective goal without
+        // recapturing a DTO, renewing Create, or discarding prior native births.
+        self.borrow_owned_create()?.update_projection(
+            |row| {
                 let mut refreshed = self.prepared_row(row, prepared)?;
                 refreshed.status = super::Status::Creating;
                 *row = refreshed;
                 Ok(())
             },
+            |_| Ok(()),
         )
     }
 
@@ -482,194 +1068,200 @@ pub(crate) fn create_workspace(
     init_submodules: bool,
     prepared: &mut Instance,
 ) -> Result<WorkspaceResult> {
-    let storage = prepared.original_storage()?;
-    let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
-    let primary_git_wt = GitWorktree::new(primary_main_repo)?;
+    let original_storage = prepared.original_storage()?;
+    let result = (|| -> Result<WorkspaceResult> {
+        let storage = prepared.original_storage()?;
+        let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
+        let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
-    let session_id_short = &prepared.id[..8];
+        let session_id_short = &prepared.id[..8];
 
-    let workspace_path =
-        primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
-    anyhow::ensure!(
-        !workspace_path.try_exists()?,
-        "workspace destination already exists"
-    );
-    let workspace_dir = workspace_path.to_string_lossy().to_string();
+        let workspace_path =
+            primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
+        anyhow::ensure!(
+            !workspace_path.try_exists()?,
+            "workspace destination already exists"
+        );
+        let workspace_dir = workspace_path.to_string_lossy().to_string();
 
-    // (canonicalized path, resolved base branch) for the primary repo followed by every extra repo.
-    let all_repos: Vec<(PathBuf, Option<String>)> =
-        std::iter::once((primary.path.clone(), primary.base_branch.clone()))
-            .chain(extra_repos.iter().map(|r| {
-                (
-                    r.path.canonicalize().unwrap_or_else(|_| r.path.clone()),
-                    r.base_branch.clone(),
-                )
-            }))
-            .collect();
-
-    // Check for duplicate repo directory names
-    let mut seen_names = std::collections::HashSet::new();
-    for (repo_path, _) in &all_repos {
-        let name = repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "repo".to_string());
-        if !seen_names.insert(name.clone()) {
-            bail!(
-                "Duplicate repository name '{}' in workspace\n\
-                 Tip: Rename one of the directories to avoid the collision",
-                name
-            );
-        }
-    }
-
-    // Resolve every repository before reserving or mutating a path.
-    struct RepoPlan {
-        repo_path: PathBuf,
-        repo_name: String,
-        main_repo_path: PathBuf,
-        worktree_subdir: PathBuf,
-        base_branch: Option<String>,
-    }
-    let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
-    for (repo_path, base_branch) in &all_repos {
-        if !GitWorktree::is_git_repo(repo_path) {
-            bail!(
-                "Path is not in a git repository: {}\n\
-                 Tip: All --repo paths must be git repositories",
-                repo_path.display()
-            );
-        }
-
-        let main_repo_path_raw = GitWorktree::find_main_repo(repo_path)?;
-        let main_repo_path = main_repo_path_raw
-            .canonicalize()
-            .unwrap_or(main_repo_path_raw);
-
-        let repo_name = repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "repo".to_string());
-
-        let worktree_subdir = workspace_path.join(&repo_name);
-
-        plans.push(RepoPlan {
-            repo_path: repo_path.clone(),
-            repo_name,
-            main_repo_path,
-            worktree_subdir,
-            base_branch: base_branch.clone(),
-        });
-    }
-    let workspace_info = WorkspaceInfo {
-        branch: branch.to_string(),
-        workspace_dir,
-        created_at: Utc::now(),
-        cleanup_on_delete: true,
-        repos: plans
-            .iter()
-            .map(|plan| WorkspaceRepo {
-                name: plan.repo_name.clone(),
-                source_path: plan.repo_path.to_string_lossy().into_owned(),
-                branch: branch.to_string(),
-                worktree_path: plan.worktree_subdir.to_string_lossy().into_owned(),
-                main_repo_path: plan.main_repo_path.to_string_lossy().into_owned(),
-                managed_by_aoe: true,
-                branch_preexisting: false,
-                base_branch: create_new_branch
-                    .then(|| plan.base_branch.clone())
-                    .flatten(),
-                base_branch_override: None,
-            })
-            .collect(),
-    };
-    prepared.project_path = workspace_path.to_string_lossy().into_owned();
-    prepared.workspace_info = Some(workspace_info.clone());
-    let creation_intent = CreationIntent::reserve(&storage, prepared)?;
-    std::fs::create_dir_all(&workspace_path)?;
-
-    // Run create_worktree for every repo concurrently.
-    let create_start = std::time::Instant::now();
-    let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = plans
-                .iter()
-                .map(|plan| {
-                    let branch = branch.to_string();
-                    let base = plan.base_branch.clone();
-                    let main_repo_path = plan.main_repo_path.clone();
-                    let worktree_subdir = plan.worktree_subdir.clone();
-                    let repo_name = plan.repo_name.clone();
-                    scope.spawn(move || -> std::result::Result<Vec<String>, String> {
-                        let repo_start = std::time::Instant::now();
-                        let result = (|| -> std::result::Result<Vec<String>, String> {
-                            let git_wt = GitWorktree::new(main_repo_path)
-                                .map_err(|e| format!("{}: {}", repo_name, e))?
-                                .with_init_submodules(init_submodules);
-                            git_wt
-                                .create_worktree(
-                                    &branch,
-                                    &worktree_subdir,
-                                    create_new_branch,
-                                    base.as_deref(),
-                                )
-                                .map_err(|e| format!("{}: {}", repo_name, e))
-                        })();
-                        tracing::info!(target: "session.create",
-                            "workspace create: repo={} elapsed={:?} ok={}",
-                            repo_name,
-                            repo_start.elapsed(),
-                            result.is_ok()
-                        );
-                        result
-                    })
-                })
+        // (canonicalized path, resolved base branch) for the primary repo followed by every extra repo.
+        let all_repos: Vec<(PathBuf, Option<String>)> =
+            std::iter::once((primary.path.clone(), primary.base_branch.clone()))
+                .chain(extra_repos.iter().map(|r| {
+                    (
+                        r.path.canonicalize().unwrap_or_else(|_| r.path.clone()),
+                        r.base_branch.clone(),
+                    )
+                }))
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| match h.join() {
-                    Ok(r) => r,
-                    Err(_) => Err("worktree thread panicked".to_string()),
-                })
-                .collect()
-        });
-    tracing::info!(target: "session.create",
-        "workspace create: {} repos completed in {:?}",
-        plans.len(),
-        create_start.elapsed()
-    );
 
-    let mut warnings: Vec<String> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    for result in parallel_results {
-        match result {
-            Ok(w) => {
-                warnings.extend(w);
+        // Check for duplicate repo directory names
+        let mut seen_names = std::collections::HashSet::new();
+        for (repo_path, _) in &all_repos {
+            let name = repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "repo".to_string());
+            if !seen_names.insert(name.clone()) {
+                bail!(
+                    "Duplicate repository name '{}' in workspace\n\
+                 Tip: Rename one of the directories to avoid the collision",
+                    name
+                );
             }
-            Err(msg) => errors.push(msg),
         }
-    }
 
-    if !errors.is_empty() {
-        tracing::warn!(target: "session.create", session = %prepared.id, "Retaining durable creation intent after an uncertain Git outcome");
-        if errors.len() == 1 {
-            bail!("Failed to create worktree for {}", errors.remove(0));
-        } else {
-            bail!(
-                "Failed to create worktrees ({} repos):\n  - {}",
-                errors.len(),
-                errors.join("\n  - ")
-            );
+        // Resolve every repository before reserving or mutating a path.
+        struct RepoPlan {
+            repo_path: PathBuf,
+            repo_name: String,
+            main_repo_path: PathBuf,
+            worktree_subdir: PathBuf,
+            base_branch: Option<String>,
         }
-    }
+        let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
+        for (repo_path, base_branch) in &all_repos {
+            if !GitWorktree::is_git_repo(repo_path) {
+                bail!(
+                    "Path is not in a git repository: {}\n\
+                 Tip: All --repo paths must be git repositories",
+                    repo_path.display()
+                );
+            }
 
-    Ok(WorkspaceResult {
-        workspace_info,
-        workspace_path,
-        warnings,
-        creation_intent,
-    })
+            let main_repo_path_raw = GitWorktree::find_main_repo(repo_path)?;
+            let main_repo_path = main_repo_path_raw
+                .canonicalize()
+                .unwrap_or(main_repo_path_raw);
+
+            let repo_name = repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "repo".to_string());
+
+            let worktree_subdir = workspace_path.join(&repo_name);
+
+            plans.push(RepoPlan {
+                repo_path: repo_path.clone(),
+                repo_name,
+                main_repo_path,
+                worktree_subdir,
+                base_branch: base_branch.clone(),
+            });
+        }
+        let workspace_info = WorkspaceInfo {
+            branch: branch.to_string(),
+            workspace_dir,
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+            repos: plans
+                .iter()
+                .map(|plan| WorkspaceRepo {
+                    name: plan.repo_name.clone(),
+                    source_path: plan.repo_path.to_string_lossy().into_owned(),
+                    branch: branch.to_string(),
+                    worktree_path: plan.worktree_subdir.to_string_lossy().into_owned(),
+                    main_repo_path: plan.main_repo_path.to_string_lossy().into_owned(),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: create_new_branch
+                        .then(|| plan.base_branch.clone())
+                        .flatten(),
+                    base_branch_override: None,
+                })
+                .collect(),
+        };
+        prepared.project_path = workspace_path.to_string_lossy().into_owned();
+        prepared.workspace_info = Some(workspace_info.clone());
+        let creation_intent = CreationIntent::reserve(&storage, prepared)?;
+        creation_intent.provision_directory(&workspace_path)?;
+
+        // Run create_worktree for every repo concurrently.
+        let create_start = std::time::Instant::now();
+        let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = plans
+                    .iter()
+                    .map(|plan| {
+                        let branch = branch.to_string();
+                        let base = plan.base_branch.clone();
+                        let main_repo_path = plan.main_repo_path.clone();
+                        let worktree_subdir = plan.worktree_subdir.clone();
+                        let repo_name = plan.repo_name.clone();
+                        let creation_intent = creation_intent.clone();
+                        scope.spawn(move || -> std::result::Result<Vec<String>, String> {
+                            let repo_start = std::time::Instant::now();
+                            let result = (|| -> std::result::Result<Vec<String>, String> {
+                                let git_wt = GitWorktree::new(main_repo_path)
+                                    .map_err(|e| format!("{}: {}", repo_name, e))?
+                                    .with_init_submodules(init_submodules);
+                                git_wt
+                                    .create_worktree_owned(
+                                        &branch,
+                                        &worktree_subdir,
+                                        create_new_branch,
+                                        base.as_deref(),
+                                        &creation_intent,
+                                    )
+                                    .map_err(|e| format!("{}: {}", repo_name, e))
+                            })();
+                            tracing::info!(target: "session.create",
+                                "workspace create: repo={} elapsed={:?} ok={}",
+                                repo_name,
+                                repo_start.elapsed(),
+                                result.is_ok()
+                            );
+                            result
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| match h.join() {
+                        Ok(r) => r,
+                        Err(_) => Err("worktree thread panicked".to_string()),
+                    })
+                    .collect()
+            });
+        tracing::info!(target: "session.create",
+            "workspace create: {} repos completed in {:?}",
+            plans.len(),
+            create_start.elapsed()
+        );
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for result in parallel_results {
+            match result {
+                Ok(w) => {
+                    warnings.extend(w);
+                }
+                Err(msg) => errors.push(msg),
+            }
+        }
+
+        if !errors.is_empty() {
+            tracing::warn!(target: "session.create", session = %prepared.id, "Retaining durable creation intent after an uncertain Git outcome");
+            if errors.len() == 1 {
+                bail!("Failed to create worktree for {}", errors.remove(0));
+            } else {
+                bail!(
+                    "Failed to create worktrees ({} repos):\n  - {}",
+                    errors.len(),
+                    errors.join("\n  - ")
+                );
+            }
+        }
+
+        Ok(WorkspaceResult {
+            workspace_info,
+            workspace_path,
+            warnings,
+            creation_intent,
+        })
+    })();
+    result.map_err(|error| finish_failed_creation(&original_storage, prepared, error))
 }
 
 /// Build an instance with all setup (worktree resolution, sandbox config).
@@ -692,9 +1284,63 @@ pub(crate) fn build_instance_from_admitted(
     params: InstanceParams,
     existing_titles: &[&str],
     existing_branches: &[&str],
+    instance: Instance,
+    storage: &super::Storage,
+) -> Result<BuildResult> {
+    let admitted = instance.clone();
+    prepare_admitted_instance(
+        params,
+        existing_titles,
+        existing_branches,
+        instance,
+        storage,
+    )
+    .map_err(|error| finish_failed_creation(storage, &admitted, error))
+}
+
+/// Error cleanup only routes to a surviving original; it cannot mint one from a row.
+pub(crate) fn finish_failed_creation(
+    storage: &super::Storage,
+    admitted: &Instance,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let Some(original) = CreationCustody::retained().into_iter().find(|entry| {
+        entry.admitted.id == admitted.id
+            && entry.admitted.created_at == admitted.created_at
+            && entry.storage.same_origin_as(storage)
+    }) else {
+        return error;
+    };
+    if original
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .intent
+        .is_none()
+    {
+        return error;
+    }
+    match original.withdraw() {
+        Ok(ack) => error.context(format!(
+            "Original Create {} at counter {} was retired and withdrawn",
+            ack.session_id(),
+            ack.generation()
+        )),
+        Err(proof) => error.context(format!(
+            "Original Create {} and its resources remain retained: {proof:#}",
+            admitted.id
+        )),
+    }
+}
+
+fn prepare_admitted_instance(
+    params: InstanceParams,
+    existing_titles: &[&str],
+    existing_branches: &[&str],
     mut instance: Instance,
     storage: &super::Storage,
 ) -> Result<BuildResult> {
+    let _custody = CreationCustody::register(std::sync::Arc::new(storage.clone()), &instance)?;
     storage.verify_profile_identity()?;
     let profile = storage.profile();
     instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
@@ -1001,7 +1647,13 @@ pub(crate) fn build_instance_from_admitted(
                     instance.project_path.clone_from(&final_path);
                     instance.worktree_info.clone_from(&worktree_info);
                     creation_intent = Some(CreationIntent::reserve(storage, &mut instance)?);
-                    let w = git_wt.create_worktree(branch, &worktree_path, false, None)?;
+                    let w = git_wt.create_worktree_owned(
+                        branch,
+                        &worktree_path,
+                        false,
+                        None,
+                        creation_intent.as_ref().unwrap(),
+                    )?;
                     warnings.extend(w);
                 }
             } else {
@@ -1039,13 +1691,14 @@ pub(crate) fn build_instance_from_admitted(
                 instance.project_path.clone_from(&final_path);
                 instance.worktree_info.clone_from(&worktree_info);
                 creation_intent = Some(CreationIntent::reserve(storage, &mut instance)?);
-                let w = git_wt.create_worktree(
+                let w = git_wt.create_worktree_owned(
                     branch,
                     &worktree_path,
                     true,
                     worktree_info
                         .as_ref()
                         .and_then(|info| info.base_branch.as_deref()),
+                    creation_intent.as_ref().unwrap(),
                 )?;
                 warnings.extend(w);
             }
@@ -1071,7 +1724,10 @@ pub(crate) fn build_instance_from_admitted(
             .into_owned();
         instance.scratch = true;
         creation_intent = Some(CreationIntent::reserve(storage, &mut instance)?);
-        super::scratch::provision_scratch_dir(&instance.id)?;
+        creation_intent
+            .as_ref()
+            .unwrap()
+            .provision_directory(std::path::Path::new(&instance.project_path))?;
     }
     instance.worktree_info = worktree_info;
     instance.workspace_info = workspace_info;
@@ -1708,6 +2364,733 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
         parent
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn hosted_git_creation(
+        storage: &super::super::Storage,
+        post_checkout: Option<&str>,
+    ) -> (tempfile::TempDir, BuildResult) {
+        let parent = init_repo_with_commit("hosted-repo");
+        let repo = parent.path().join("hosted-repo").canonicalize().unwrap();
+        if let Some(script) = post_checkout {
+            use std::os::unix::fs::PermissionsExt;
+            let hook = repo.join(".git/hooks/post-checkout");
+            std::fs::write(&hook, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut params = custom_agent_params(&repo, "claude");
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("hosted-native".into());
+        params.create_new_branch = true;
+        let build = build_instance(params, &[], &[], storage).unwrap();
+        (parent, build)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[ignore = "real native Creating proof, hosted Linux/macOS only"]
+    #[serial_test::serial]
+    fn hosted_creating_remote_branch_tracking_and_original_withdrawal() {
+        crate::session::test_support::require_hosted_creating_native();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let parent = init_repo_with_commit("hosted-repo");
+        let source = parent.path().join("hosted-repo").canonicalize().unwrap();
+        let repository = git2::Repository::open(&source).unwrap();
+        let oid = repository.head().unwrap().target().unwrap();
+        let remote_path = parent.path().join("remote.git");
+        let remote = git2::build::RepoBuilder::new()
+            .bare(true)
+            .clone(source.to_str().unwrap(), &remote_path)
+            .unwrap();
+        remote
+            .branch("hosted-existing", &remote.find_commit(oid).unwrap(), false)
+            .unwrap();
+        repository
+            .remote("origin", remote_path.to_str().unwrap())
+            .unwrap();
+        repository
+            .config()
+            .unwrap()
+            .set_str("user.fixture", "keep")
+            .unwrap();
+        assert!(repository
+            .find_branch("hosted-existing", git2::BranchType::Local)
+            .is_err());
+        let mut params = custom_agent_params(&source, "claude");
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("hosted-existing".into());
+        params.create_new_branch = false;
+        let build = build_instance(params, &[], &[], &storage).unwrap();
+        let prepared = build.instance;
+        let checkout = PathBuf::from(&prepared.project_path);
+        assert_eq!(
+            git2::Repository::open(&checkout)
+                .unwrap()
+                .head()
+                .unwrap()
+                .target(),
+            Some(oid)
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("README.md")).unwrap(),
+            b"hosted-repo
+"
+        );
+        let config = repository.config().unwrap();
+        assert_eq!(
+            config.get_string("branch.hosted-existing.remote").unwrap(),
+            "origin"
+        );
+        assert_eq!(
+            config.get_string("branch.hosted-existing.merge").unwrap(),
+            "refs/heads/hosted-existing"
+        );
+        let canonical = storage.load().unwrap().pop().unwrap();
+        hosted_creation_receipts(&canonical);
+        let custody = CreationCustody::retained()
+            .into_iter()
+            .find(|original| original.session_id() == prepared.id)
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let ack = custody.withdraw().unwrap();
+            assert!(ack
+                .matches_original(
+                    &storage,
+                    &prepared.id,
+                    prepared.created_at,
+                    prepared.lifecycle_generation
+                )
+                .unwrap());
+            assert!(!checkout.exists());
+            assert!(repository
+                .find_branch("hosted-existing", git2::BranchType::Local)
+                .is_err());
+            let config = repository.config().unwrap();
+            assert!(config.get_string("branch.hosted-existing.remote").is_err());
+            assert!(config.get_string("branch.hosted-existing.merge").is_err());
+            assert_eq!(config.get_string("user.fixture").unwrap(), "keep");
+            assert_eq!(
+                repository
+                    .find_reference("refs/remotes/origin/hosted-existing")
+                    .unwrap()
+                    .target(),
+                Some(oid)
+            );
+            assert!(storage.load().unwrap().is_empty());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(custody.withdraw().is_err());
+            let retained = storage.load().unwrap().pop().unwrap();
+            assert_eq!(
+                retained.lifecycle_reservation,
+                canonical.lifecycle_reservation
+            );
+            assert_eq!(
+                retained.lifecycle_generation,
+                canonical.lifecycle_generation
+            );
+            assert!(checkout.is_dir());
+        }
+        assert_eq!(repository.head().unwrap().target(), Some(oid));
+        println!("hosted remote Creating: actual fetch, original branch/config issuances, checkout and truthful original withdrawal outcome");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn hosted_creation_receipts(row: &Instance) -> serde_json::Value {
+        let journal = serde_json::to_value(&row.runner_journal).unwrap();
+        let records = journal["creations"]
+            .as_array()
+            .expect("native creation journal");
+        assert!(
+            !records.is_empty(),
+            "a real native effect must publish receipts"
+        );
+        for record in records {
+            assert_eq!(record["session_id"], row.id);
+            assert_eq!(record["generation"], row.lifecycle_generation);
+            assert!(record["births"]
+                .as_array()
+                .is_some_and(|births| !births.is_empty()));
+            assert!(
+                record["root_status"].is_number(),
+                "actual producer must acknowledge exit"
+            );
+            assert_eq!(
+                record["effect_acknowledged"], true,
+                "publication needs the actual producer CAS ACK"
+            );
+            assert_eq!(record["scope_unproven"], cfg!(target_os = "macos"));
+        }
+        serde_json::json!({"create_coverage": journal["create_coverage"], "creations": records})
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "real native Creating proof, hosted Linux/macOS only"]
+    #[serial_test::serial]
+    async fn hosted_creating_checkout_publication_and_managed_launch_preserve_receipts() {
+        crate::session::test_support::require_hosted_creating_native();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let (_parent, build) = hosted_git_creation(&storage, None);
+        let mut prepared = build.instance;
+        prepared.view = crate::session::View::Structured;
+        build.creation_intent.refresh_prepared(&prepared).unwrap();
+        let checkout = PathBuf::from(&prepared.project_path);
+        assert_eq!(
+            std::fs::read(checkout.join("README.md")).unwrap(),
+            b"hosted-repo\n"
+        );
+        assert_eq!(
+            git2::Repository::open(&checkout)
+                .unwrap()
+                .head()
+                .unwrap()
+                .shorthand()
+                .unwrap(),
+            "hosted-native"
+        );
+        let canonical = storage.load().unwrap().pop().unwrap();
+        let generation = canonical.lifecycle_generation;
+        let receipts = hosted_creation_receipts(&canonical);
+        assert!(canonical.has_pending_worktree_path_claims());
+        let custody = CreationCustody::retained()
+            .into_iter()
+            .find(|original| original.session_id() == prepared.id)
+            .unwrap();
+        custody
+            .retain_ready(CreationReady {
+                instance: prepared,
+                warnings: build.warnings,
+                on_launch_hooks_ran: false,
+            })
+            .unwrap();
+        let published = custody.retry_publication().unwrap();
+        assert_eq!(published.lifecycle_generation, generation);
+        assert!(published.lifecycle_reservation.is_none());
+        assert_eq!(hosted_creation_receipts(&published), receipts);
+        assert!(custody
+            .matches_original(&storage, &published.id, published.created_at, generation)
+            .unwrap());
+        let execution = crate::acp::supervisor::test_support::published_execution(
+            &published.id,
+            "default",
+            None,
+            false,
+        );
+        assert!(execution.identity.birth_is_complete());
+        assert_eq!(execution.identity.generation, generation + 1);
+        let launched = storage.load().unwrap().pop().unwrap();
+        let journal = serde_json::to_value(&launched.runner_journal).unwrap();
+        assert_eq!(journal["creations"], receipts["creations"]);
+        assert_eq!(journal["create_coverage"], receipts["create_coverage"]);
+        assert_eq!(launched.lifecycle_generation, generation + 1);
+        assert!(!launched.runner_journal.proves_quiescent());
+        assert!(custody
+            .matches_original(&storage, &published.id, published.created_at, generation)
+            .unwrap());
+        assert_eq!(
+            std::fs::read(checkout.join("README.md")).unwrap(),
+            b"hosted-repo\n"
+        );
+        println!("hosted Creating: genuine checkout, same-g publication, actual ManagedLaunch g+1; original receipts unchanged");
+        drop(execution);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[ignore = "real native Creating proof, hosted Linux/macOS only"]
+    #[serial_test::serial]
+    fn hosted_creating_hook_exit23_retains_error_and_original_withdrawal_outcome() {
+        crate::session::test_support::require_hosted_creating_native();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let (parent, build) = hosted_git_creation(&storage, Some("exit 23"));
+        assert!(
+            build.warnings.iter().any(|warning| warning.contains("23")),
+            "post-checkout exit23 must remain visible"
+        );
+        let prepared = build.instance;
+        let future = PathBuf::from(&prepared.project_path);
+        let custody = CreationCustody::retained()
+            .into_iter()
+            .find(|original| original.session_id() == prepared.id)
+            .unwrap();
+        let intent = build.creation_intent;
+        let generation = prepared.lifecycle_generation;
+        let claim = prepared.lifecycle_reservation.clone();
+        let peer = parent.path().join("preexisting-peer");
+        std::fs::create_dir(&peer).unwrap();
+        std::fs::write(peer.join("user-data"), b"keep").unwrap();
+        let checkout = git2::Repository::open(&future).unwrap();
+        let admin = checkout.path().canonicalize().unwrap();
+        let common = parent
+            .path()
+            .join("hosted-repo/.git")
+            .canonicalize()
+            .unwrap();
+        for path in [&future, &admin, &common] {
+            assert!(super::super::AnchoredDir::open(path)
+                .unwrap()
+                .birth_identity()
+                .unwrap()
+                .is_durable());
+        }
+        drop(checkout);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        drop(output_rx);
+        let error = crate::session::config::repo_config::execute_creating_hooks(
+            &intent,
+            &["printf 'hook-visible-output\\n'; exit 23".into()],
+            &future,
+            Some(&output_tx),
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("23"),
+            "original exit23 must not become success"
+        );
+        let original = storage.load().unwrap().pop().unwrap();
+        let receipts = hosted_creation_receipts(&original);
+        assert_eq!(
+            receipts["creations"].as_array().unwrap().last().unwrap()["root_status"],
+            23 << 8
+        );
+        let error = finish_failed_creation(&storage, &prepared, error);
+        assert!(format!("{error:#}").contains("23"));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(custody.undo_verdict(), CreationUndoVerdict::Withdrawn);
+            assert!(!future.exists());
+            assert!(!admin.exists());
+            assert!(common.is_dir());
+            assert!(storage.load().unwrap().is_empty());
+            let ack = custody.withdraw().unwrap();
+            assert_eq!(ack.generation(), generation);
+            assert!(ack
+                .matches_original(&storage, &prepared.id, prepared.created_at, generation)
+                .unwrap());
+            println!("hosted Linux Creating: exit23 preserved, actual tracked retirement and original same-g withdrawal");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                custody.withdraw().is_err(),
+                "uncertain Darwin scope cannot prove strong withdrawal"
+            );
+            let retained = storage.load().unwrap().pop().unwrap();
+            assert_eq!(retained.lifecycle_generation, generation);
+            assert_eq!(retained.lifecycle_reservation, claim);
+            assert!(retained.has_pending_worktree_path_claims());
+            assert!(future.is_dir());
+            println!("hosted Darwin Creating: exit23 preserved; uncertain descendant scope retains original claim and resource");
+        }
+        assert_eq!(std::fs::read(peer.join("user-data")).unwrap(), b"keep");
+        #[cfg(target_os = "linux")]
+        let _ = claim;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "real native Creating proof, hosted Linux only"]
+    #[serial_test::serial]
+    fn hosted_creating_branch_unlink_ack_survives_late_retirement_failure() {
+        crate::session::test_support::require_hosted_creating_native();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let (parent, build) = hosted_git_creation(&storage, None);
+        let prepared = build.instance;
+        let source = git2::Repository::open(parent.path().join("hosted-repo")).unwrap();
+        let original_head = source.head().unwrap().target();
+        let custody = CreationCustody::retained()
+            .into_iter()
+            .find(|original| original.session_id() == prepared.id)
+            .unwrap();
+        struct ResetBranchFailure;
+        impl Drop for ResetBranchFailure {
+            fn drop(&mut self) {
+                super::super::creation_undo::FAIL_BRANCH_RETIRE_ONCE.set(false);
+            }
+        }
+        let _reset = ResetBranchFailure;
+        super::super::creation_undo::FAIL_BRANCH_RETIRE_ONCE.set(true);
+        let first = match custody.withdraw() {
+            Err(error) => error,
+            Ok(_) => panic!("expected late retirement failure"),
+        };
+        assert!(format!("{first:#}").contains("injected original branch retirement failure"));
+        assert!(source
+            .find_branch("hosted-native", git2::BranchType::Local)
+            .is_err());
+        assert!(!std::path::Path::new(&prepared.project_path).exists());
+        let retained = storage.load().unwrap().pop().unwrap();
+        assert_eq!(retained.lifecycle_generation, prepared.lifecycle_generation);
+        assert_eq!(
+            retained.lifecycle_reservation,
+            prepared.lifecycle_reservation
+        );
+        hosted_creation_receipts(&retained);
+        let ack = custody.withdraw().unwrap();
+        assert!(ack
+            .matches_original(
+                &storage,
+                &prepared.id,
+                prepared.created_at,
+                prepared.lifecycle_generation
+            )
+            .unwrap());
+        assert!(storage.load().unwrap().is_empty());
+        assert_eq!(source.head().unwrap().target(), original_head);
+        assert!(source
+            .find_branch("hosted-native", git2::BranchType::Local)
+            .is_err());
+        println!("hosted original branch Undo: real CAS delete ACK survived later failure; same-g retry completed without replaying deletion");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[ignore = "real native Creating proof, hosted Linux/macOS only"]
+    #[serial_test::serial]
+    fn hosted_creating_changed_resources_refuse_deletion_and_keep_claims() {
+        crate::session::test_support::require_hosted_creating_native();
+        for change in ["dirty", "rewritten-file", "root", "admin", "common"] {
+            let home = tempfile::tempdir().unwrap();
+            let _home_guard = crate::session::test_support::isolate_home(home.path());
+            let storage =
+                std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+            let (parent, build) = hosted_git_creation(&storage, None);
+            let prepared = build.instance;
+            let root = PathBuf::from(&prepared.project_path);
+            let admin = git2::Repository::open(&root)
+                .unwrap()
+                .path()
+                .canonicalize()
+                .unwrap();
+            let common = parent
+                .path()
+                .join("hosted-repo/.git")
+                .canonicalize()
+                .unwrap();
+            let original_row = storage.load().unwrap().pop().unwrap();
+            let receipts = hosted_creation_receipts(&original_row);
+            let preserved = match change {
+                "dirty" => {
+                    std::fs::write(root.join("user-data"), b"keep").unwrap();
+                    root.join("user-data")
+                }
+                "rewritten-file" => {
+                    let file = root.join("README.md");
+                    let bytes = std::fs::read(&file).unwrap();
+                    std::fs::rename(&file, root.join("original-readme")).unwrap();
+                    std::fs::write(&file, bytes).unwrap();
+                    file
+                }
+                _ => {
+                    let changed = match change {
+                        "root" => &root,
+                        "admin" => &admin,
+                        "common" => &common,
+                        _ => unreachable!(),
+                    };
+                    std::fs::rename(
+                        changed,
+                        changed.with_file_name(format!("retained-{change}")),
+                    )
+                    .unwrap();
+                    std::fs::create_dir(changed).unwrap();
+                    std::fs::write(changed.join("user-data"), b"keep").unwrap();
+                    changed.join("user-data")
+                }
+            };
+            let bytes = std::fs::read(&preserved).unwrap();
+            let custody = CreationCustody::retained()
+                .into_iter()
+                .find(|original| original.session_id() == prepared.id)
+                .unwrap();
+            assert!(
+                custody.withdraw().is_err(),
+                "{change}: changed original must refuse deletion"
+            );
+            assert_eq!(
+                std::fs::read(&preserved).unwrap(),
+                bytes,
+                "{change}: user bytes changed"
+            );
+            let retained = storage.load().unwrap().pop().unwrap();
+            assert_eq!(
+                retained.lifecycle_generation,
+                original_row.lifecycle_generation
+            );
+            assert_eq!(
+                retained.lifecycle_reservation,
+                original_row.lifecycle_reservation
+            );
+            assert_eq!(retained.created_at, original_row.created_at);
+            assert!(retained.has_pending_worktree_path_claims());
+            let journal = serde_json::to_value(&retained.runner_journal).unwrap();
+            assert_eq!(journal["creations"], receipts["creations"]);
+            assert_eq!(journal["create_coverage"], receipts["create_coverage"]);
+            assert!(root.is_dir());
+            println!("hosted Creating: {change} preserved; original same-g claim retained");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[ignore = "real native Creating proof, hosted Linux/macOS only"]
+    #[serial_test::serial]
+    fn hosted_creating_preexisting_checkout_is_never_undone() {
+        crate::session::test_support::require_hosted_creating_native();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let (parent, build) = hosted_git_creation(&storage, None);
+        let owner = build.creation_intent.publish(&build.instance).unwrap();
+        let root = PathBuf::from(&owner.project_path);
+        std::fs::write(root.join("user-data"), b"keep").unwrap();
+        let repo = parent.path().join("hosted-repo").canonicalize().unwrap();
+        let mut params = custom_agent_params(&repo, "claude");
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("hosted-native".into());
+        let second = build_instance(params, &[], &[], &storage).unwrap();
+        assert!(
+            !second
+                .instance
+                .worktree_info
+                .as_ref()
+                .unwrap()
+                .managed_by_aoe
+        );
+        let generation = second.instance.lifecycle_generation;
+        let custody = CreationCustody::retained()
+            .into_iter()
+            .find(|original| original.session_id() == second.instance.id)
+            .unwrap();
+        let error = crate::session::config::repo_config::execute_creating_hooks(
+            &second.creation_intent,
+            &["exit 23".into()],
+            &root,
+            None,
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("23"));
+        #[cfg(target_os = "linux")]
+        assert_eq!(custody.withdraw().unwrap().generation(), generation);
+        #[cfg(target_os = "macos")]
+        {
+            assert!(custody.withdraw().is_err());
+            let rows = storage.load().unwrap();
+            let retained = rows
+                .iter()
+                .find(|row| row.id == second.instance.id)
+                .unwrap();
+            assert_eq!(retained.lifecycle_generation, generation);
+            assert_eq!(
+                retained.lifecycle_reservation,
+                second.instance.lifecycle_reservation
+            );
+        }
+        assert_eq!(std::fs::read(root.join("user-data")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read(root.join("README.md")).unwrap(),
+            b"hosted-repo\n"
+        );
+        assert!(git2::Repository::open(&root).unwrap().path().is_dir());
+        assert!(storage.load().unwrap().iter().any(|row| row.id == owner.id));
+        println!("hosted Creating: dirty preexisting checkout and canonical owner preserved");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn original_creation_custody_survives_dropped_handles_and_retries_publication() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let mut prepared = Instance::new("retained original", home.path().to_str().unwrap());
+        let custody = CreationCustody::register(storage.clone(), &prepared).unwrap();
+        let weak = std::sync::Arc::downgrade(&custody);
+        let intent = CreationIntent::reserve_metadata(&storage, &mut prepared).unwrap();
+        let generation = prepared.lifecycle_generation;
+        drop(intent);
+        drop(custody);
+        let custody = weak
+            .upgrade()
+            .expect("process owner retains the actual original");
+        assert!(custody
+            .matches_original(&storage, &prepared.id, prepared.created_at, generation)
+            .unwrap());
+        assert!(!custody
+            .matches_original(&storage, &prepared.id, prepared.created_at, generation + 1)
+            .unwrap());
+        assert!(custody.retry_publication().is_err());
+        assert!(CreationIntent::reserve_metadata(&storage, &mut prepared).is_err());
+        custody
+            .retain_ready(CreationReady {
+                instance: prepared,
+                warnings: vec!["original warning".into()],
+                on_launch_hooks_ran: false,
+            })
+            .unwrap();
+        let published = custody.retry_publication().unwrap();
+        assert_eq!(published.lifecycle_generation, generation);
+        assert!(published.lifecycle_reservation.is_none());
+        assert_eq!(custody.retry_publication().unwrap().id, published.id);
+        assert_eq!(custody.ready().unwrap().warnings, vec!["original warning"]);
+        assert_eq!(
+            custody.undo_verdict(),
+            CreationUndoVerdict::AlreadyPublished
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn original_scratch_withdrawal_returns_producer_ack_without_renewing_create() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let future = home.path().join("owned-scratch");
+        let mut prepared = Instance::new("owned scratch", future.to_str().unwrap());
+        prepared.scratch = true;
+        let custody = CreationCustody::register(storage.clone(), &prepared).unwrap();
+        let intent = CreationIntent::reserve(&storage, &mut prepared).unwrap();
+        let generation = prepared.lifecycle_generation;
+        intent.provision_directory(&future).unwrap();
+        let ack = custody.withdraw().unwrap();
+        assert!(ack
+            .matches_original(&storage, &prepared.id, prepared.created_at, generation)
+            .unwrap());
+        assert!(!future.exists());
+        assert!(!storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == prepared.id));
+        assert_eq!(custody.withdraw().unwrap().generation(), generation);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn original_checkout_undo_retries_after_git_unlink_sync_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let source = home.path().join("source");
+        let repository = git2::Repository::init(&source).unwrap();
+        let tree_oid = repository.index().unwrap().write_tree().unwrap();
+        let tree = repository.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        let oid = repository
+            .commit(Some("HEAD"), &signature, &signature, "original", &tree, &[])
+            .unwrap();
+        let commit = repository.find_commit(oid).unwrap();
+        repository.branch("retained", &commit, false).unwrap();
+        let storage = super::super::Storage::new_unwatched("default").unwrap();
+        let checkout = home.path().join("owned-checkout");
+        let mut prepared = Instance::new("owned checkout", checkout.to_str().unwrap());
+        prepared.worktree_info = Some(super::super::WorktreeInfo {
+            branch: "retained".into(),
+            main_repo_path: source.to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        let intent = CreationIntent::reserve(&storage, &mut prepared).unwrap();
+        let reservation = prepared.lifecycle_reservation.clone();
+        intent
+            .allocate_worktree_bootstrap(&source, "retained", &checkout, "fixture")
+            .unwrap();
+        struct ResetSyncFailure;
+        impl Drop for ResetSyncFailure {
+            fn drop(&mut self) {
+                super::super::anchored_fs::FAIL_SYNC_IDENTITY_ONCE.set(None);
+            }
+        }
+        let _reset = ResetSyncFailure;
+        let identity = super::super::AnchoredDir::open(&checkout)
+            .unwrap()
+            .identity()
+            .unwrap();
+        let admin = std::fs::read_dir(repository.path().join("worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        super::super::anchored_fs::FAIL_SYNC_IDENTITY_ONCE.set(Some(identity));
+        let first = intent.undo_original().unwrap_err();
+        assert!(format!("{first:#}").contains("injected anchored directory sync failure"));
+        let staged = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                super::super::AnchoredDir::open(path)
+                    .is_ok_and(|directory| directory.identity().is_ok_and(|seen| seen == identity))
+            })
+            .unwrap();
+        assert!(staged.is_dir());
+        assert!(!staged.join(".git").exists());
+        assert_eq!(
+            storage.load().unwrap()[0].lifecycle_reservation,
+            reservation
+        );
+        intent.undo_original().unwrap();
+        assert!(!staged.exists());
+        assert!(!checkout.exists());
+        assert!(!admin.exists());
+        assert_eq!(
+            repository
+                .find_branch("retained", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .target(),
+            Some(oid)
+        );
+        assert_eq!(repository.head().unwrap().target(), Some(oid));
+        assert!(storage
+            .load()
+            .unwrap()
+            .iter()
+            .all(|row| row.id != prepared.id));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dirty_original_scratch_retains_both_data_and_same_create_claim() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let future = home.path().join("dirty-scratch");
+        let mut prepared = Instance::new("dirty scratch", future.to_str().unwrap());
+        prepared.scratch = true;
+        let custody = CreationCustody::register(storage.clone(), &prepared).unwrap();
+        let intent = CreationIntent::reserve(&storage, &mut prepared).unwrap();
+        let generation = prepared.lifecycle_generation;
+        intent.provision_directory(&future).unwrap();
+        std::fs::write(future.join("user-data"), b"keep").unwrap();
+        assert!(custody.withdraw().is_err());
+        assert_eq!(std::fs::read(future.join("user-data")).unwrap(), b"keep");
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == prepared.id)
+            .unwrap();
+        assert_eq!(stored.lifecycle_generation, generation);
+        assert_eq!(stored.lifecycle_reservation, prepared.lifecycle_reservation);
+        assert!(custody
+            .matches_original(&storage, &prepared.id, prepared.created_at, generation)
+            .unwrap());
     }
 
     #[test]

@@ -50,7 +50,7 @@ impl std::error::Error for LifecycleReservationError {}
 pub enum WorktreePathClaims {
     None,
     Pending(Vec<std::path::PathBuf>),
-    Unknown,
+    Unknown(Option<Vec<std::path::PathBuf>>),
 }
 
 impl WorktreePathClaims {
@@ -65,6 +65,7 @@ pub struct LifecycleReservation {
     pub generation: u64,
     pub at: DateTime<Utc>,
     pub path_claims: WorktreePathClaims,
+    pub custodian: Option<crate::process::OriginalCustodianBirth>,
 }
 
 impl Instance {
@@ -96,6 +97,7 @@ impl Instance {
             generation,
             at: now,
             path_claims: WorktreePathClaims::None,
+            custodian: None,
         });
         Ok(generation)
     }
@@ -478,6 +480,7 @@ mod tests {
             generation: 1,
             at,
             path_claims: crate::session::WorktreePathClaims::None,
+            custodian: None,
         })
     }
 

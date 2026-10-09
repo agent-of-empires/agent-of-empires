@@ -183,9 +183,12 @@ fn create_session_publishes_before_reloading_with_the_ownership_flocks_released(
         data.profile = "alpha".to_string();
 
         let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
-        let created = view
-            .create_session(data)
-            .expect("create_session must publish the new row");
+        let created = {
+            view.request_creation(data, None);
+            drain_creation_result(&mut view)
+                .ok_or_else(|| anyhow::anyhow!("Original creation did not publish"))
+        }
+        .expect("create_session must publish the new row");
         assert!(
             view.get_instance(&created).is_some(),
             "the new row must be published"

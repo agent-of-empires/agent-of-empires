@@ -159,19 +159,12 @@ impl HomeView {
         id: &str,
         project: &crate::session::Project,
     ) {
-        self.info_dialog = Some(
-            match self.add_project_to_session(id, std::path::Path::new(&project.path)) {
-                Ok(()) => InfoDialog::new(
-                    "Attaching Project",
-                    &format!(
-                        "Attaching '{}'. Creating the worktree can take a moment; this dialog \
-                         updates when it finishes.",
-                        project.name
-                    ),
-                ),
-                Err(e) => InfoDialog::new("Could Not Attach Project", &format!("{e:#}")),
-            },
-        );
+        if let Err(error) = self.add_project_to_session(id, std::path::Path::new(&project.path)) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Could Not Attach Project",
+                &format!("{error:#}"),
+            ));
+        }
     }
 
     /// Drain finished attaches, reload from disk and report each outcome in
@@ -183,22 +176,30 @@ impl HomeView {
         loop {
             match self.attach_project_poller.try_recv_result() {
                 Ok(result) => {
-                    self.attach_project_in_flight.remove(&result.session_id);
                     touched = true;
-                    self.info_dialog = Some(match result.outcome {
+                    match result.outcome {
                         Ok(message) => {
-                            // Reload now so the new repo is on the row when the dialog is read.
-                            if let Err(e) = self.reload() {
-                                tracing::warn!(
-                                    target: "session.attach",
-                                    id = %result.session_id,
-                                    "attach landed but the reload failed: {e:#}"
+                            if let Some(origin) = self
+                                .attach_project_in_flight
+                                .get(&result.session_id)
+                                .cloned()
+                            {
+                                self.request_reload_after(
+                                    ReloadKind::Full,
+                                    persistence_lane::ReloadContinuation::AttachProject {
+                                        id: result.session_id,
+                                        message,
+                                        origin,
+                                    },
                                 );
                             }
-                            InfoDialog::new("Project Attached", &message)
                         }
-                        Err(message) => InfoDialog::new("Could Not Attach Project", &message),
-                    });
+                        Err(message) => {
+                            self.attach_project_in_flight.remove(&result.session_id);
+                            self.info_dialog =
+                                Some(InfoDialog::new("Could Not Attach Project", &message));
+                        }
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {

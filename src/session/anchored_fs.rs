@@ -26,9 +26,19 @@ pub(crate) struct FilePublication<'a> {
 #[cfg(test)]
 thread_local! {
     pub(crate) static FAIL_SYNC_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static FAIL_SYNC_IDENTITY_ONCE: std::cell::Cell<Option<(libc::dev_t, libc::ino_t)>> = const { std::cell::Cell::new(None) };
 }
 
 impl AnchoredDir {
+    pub(crate) fn duplicate_original(
+        root: &Path,
+        original: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<Self> {
+        Ok(Self {
+            root: root.to_path_buf(),
+            fd: original.try_clone_to_owned()?,
+        })
+    }
     /// Anchor at `path`, whose ancestors are resolved the way any other caller resolves them and
     /// whose own leaf may not be a symlink.
     pub(crate) fn open(path: &Path) -> Result<Self> {
@@ -102,12 +112,92 @@ impl AnchoredDir {
         })
     }
 
+    pub(crate) fn entry_identity(
+        &self,
+        relative: &Path,
+    ) -> Result<Option<(libc::dev_t, libc::ino_t)>> {
+        let (parent, leaf) = match self.open_parent(relative) {
+            Ok(parent) => parent,
+            Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::ENOENT) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some((stat.st_dev, stat.st_ino))),
+            Err(Errno::ENOENT) => Ok(None),
+            Err(error) => Err(error).context("inspecting original anchored path"),
+        }
+    }
+
+    pub(crate) fn permissions_mode(&self) -> Result<u32> {
+        let mode = fstat(&self.fd)?.st_mode;
+        #[cfg(target_os = "macos")]
+        let mode = u32::from(mode);
+        Ok(mode)
+    }
+
+    pub(crate) fn relocated(&self, root: PathBuf) -> Result<Self> {
+        Ok(Self {
+            root,
+            fd: self.fd.try_clone()?,
+        })
+    }
+    pub(crate) fn move_original_entry(&self, from: &Path, to: &Path) -> Result<bool> {
+        let (source, source_leaf) = self.open_parent(from)?;
+        let (target, target_leaf) = self.open_parent(to)?;
+        match crate::process::rename_exclusive(
+            &source,
+            source_leaf.as_os_str(),
+            &target,
+            target_leaf.as_os_str(),
+        ) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error).context("moving original Undo resource"),
+        }
+    }
+    pub(crate) fn remove_empty_child(&self, relative: &Path) -> Result<()> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::RemoveDir)
+            .context("consuming original empty directory")
+    }
+    pub(crate) fn remove_original_file(&self, relative: &Path) -> Result<()> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::NoRemoveDir)
+            .context("consuming original regular file")
+    }
+
+    pub(crate) fn duplicate_native_file(&self) -> Result<File> {
+        Ok(File::from(self.fd.try_clone()?))
+    }
+
+    pub(crate) fn birth_identity(&self) -> Result<super::DirectoryIdentity> {
+        let file = File::from(self.fd.try_clone()?);
+        Ok(super::DirectoryIdentity::from_metadata(&file.metadata()?))
+    }
+
+    /// Producer-only mkdir: unlike ensure_dir, an existing entry is not acknowledged.
+    pub(crate) fn create_fresh_child(&self, leaf: &Path) -> Result<Self> {
+        let components = normal_components(leaf)?;
+        anyhow::ensure!(components.len() == 1, "fresh directory needs one component");
+        mkdirat(&self.fd, leaf, Mode::S_IRWXU)?;
+        let child = self.child(leaf)?;
+        self.sync()?;
+        Ok(child)
+    }
+
     pub(crate) fn identity(&self) -> Result<(libc::dev_t, libc::ino_t)> {
         let stat = fstat(&self.fd)?;
         Ok((stat.st_dev, stat.st_ino))
     }
 
     pub(crate) fn sync(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(identity) = FAIL_SYNC_IDENTITY_ONCE.get() {
+            if self.identity()? == identity {
+                FAIL_SYNC_IDENTITY_ONCE.set(None);
+                bail!("injected anchored directory sync failure");
+            }
+        }
         #[cfg(test)]
         if FAIL_SYNC_ONCE.with(|path| {
             let mut path = path.borrow_mut();
@@ -215,9 +305,7 @@ impl AnchoredDir {
         let mut dir = Dir::from_fd(fd)?;
         let mut names = Vec::with_capacity(max_entries.min(64));
         for entry in dir.iter() {
-            let Ok(entry) = entry else {
-                continue;
-            };
+            let entry = entry.context("reading complete anchored directory inventory")?;
             let name = entry.file_name().to_bytes();
             if name == b"." || name == b".." {
                 continue;

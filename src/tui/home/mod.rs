@@ -16,6 +16,9 @@ mod operations;
 mod overlays;
 mod panes;
 mod persistence;
+mod persistence_lane;
+mod persistence_transactions;
+mod persistence_worker;
 mod pollers;
 mod preview;
 mod profiles;
@@ -45,7 +48,7 @@ use crate::session::{
 };
 use crate::tmux::AvailableTools;
 
-use super::creation_poller::{CreationPoller, CreationRequest};
+use super::creation_poller::CreationPoller;
 use super::deletion_poller::DeletionPoller;
 use super::dialogs::ServeView;
 use super::dialogs::{
@@ -62,19 +65,19 @@ use super::settings::SettingsView;
 use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
 
-use self::creation::SessionMutationGuards;
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
     ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN,
     ICON_UNREAD, UNREAD_DWELL,
 };
+pub(super) use self::persistence_worker::ReloadKind;
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
+use self::watchers::RELOAD_FAILED_TITLE;
 pub(super) use self::watchers::{
     log_legacy_duplicates_once, tips_unseen_count, ConfigRefreshOrigin, ConfigWatchState,
     DiskWatchState, ReloadFailureState,
 };
-use self::watchers::{RELOAD_FAILED_TITLE, WATCHER_WARNING_TITLE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DragKind {
@@ -122,12 +125,13 @@ impl PendingDeletion {
             origin: RequestOrigin {
                 storage: instance.original_storage()?,
                 generation: instance.lifecycle_generation,
+                created_at: instance.created_at,
             },
             created_at: instance.created_at,
         })
     }
 
-    fn matches(&self, instance: &Instance) -> bool {
+    pub(in crate::tui) fn matches(&self, instance: &Instance) -> bool {
         self.session_id == instance.id
             && self.created_at == instance.created_at
             && self.control.matches(instance)
@@ -192,23 +196,27 @@ struct RecoveryUpdate {
     result: Result<crate::session::StartOutcome, String>,
 }
 
-pub(super) struct RequestOrigin {
+#[derive(Clone)]
+pub(in crate::tui) struct RequestOrigin {
     storage: std::sync::Arc<Storage>,
     generation: u64,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl RequestOrigin {
-    fn capture(instance: &Instance) -> anyhow::Result<Self> {
+    pub(in crate::tui) fn capture(instance: &Instance) -> anyhow::Result<Self> {
         let storage = instance.original_storage()?;
         storage.verify_profile_identity()?;
         Ok(Self {
             storage,
             generation: instance.lifecycle_generation,
+            created_at: instance.created_at,
         })
     }
 
-    fn matches(&self, instance: &Instance) -> bool {
-        self.generation == instance.lifecycle_generation
+    pub(in crate::tui) fn matches(&self, instance: &Instance) -> bool {
+        self.created_at == instance.created_at
+            && self.generation == instance.lifecycle_generation
             && instance
                 .storage_origin
                 .as_ref()
@@ -227,14 +235,45 @@ impl RequestOrigin {
     }
 }
 
+pub(in crate::tui) enum PersistenceAction {
+    Status(String),
+    Resume {
+        id: String,
+        origin: RequestOrigin,
+        action: crate::tui::app::Action,
+    },
+}
+#[cfg(test)]
+impl PersistenceAction {
+    pub(super) fn into_action(self) -> crate::tui::app::Action {
+        match self {
+            Self::Status(message) => crate::tui::app::Action::SetTransientStatus(message),
+            Self::Resume { action, .. } => action,
+        }
+    }
+}
+pub(in crate::tui) struct CreatedContinuation {
+    id: String,
+    origin: RequestOrigin,
+}
+impl CreatedContinuation {
+    pub(in crate::tui) fn session_id(&self) -> &str {
+        &self.id
+    }
+    pub(in crate::tui) fn matches(&self, view: &HomeView) -> bool {
+        view.get_instance(&self.id)
+            .is_some_and(|row| self.origin.matches(row))
+    }
+}
+
 pub struct HomeView {
     pub(super) storages: HashMap<String, Storage>,
     pub(super) active_profile: Option<String>,
     instances: indexmap::IndexMap<String, Instance>,
-    pending_deletions: HashMap<String, HashSet<String>>,
-    pending_group_deletions: HashMap<String, HashSet<String>>,
-    /// Ids added since the last save; TUI rows missing from both disk and this set are peer-deleted.
-    pending_added: HashMap<String, HashSet<String>>,
+    pending_deletions: HashMap<String, persistence_worker::RowDeletions>,
+    pending_group_deletions: HashMap<String, persistence_worker::EditTokens>,
+    pending_added: HashMap<String, persistence_worker::EditTokens>,
+    persistence: persistence_lane::PersistenceLane,
     pub(super) group_trees: HashMap<String, GroupTree>,
     pub(super) legacy_duplicate_reports: Vec<crate::session::DuplicateIdReport>,
     pub(super) flat_items: Vec<Item>,
@@ -261,6 +300,8 @@ pub struct HomeView {
     pub(super) help_scroll: u16,
     pub(super) new_dialog: Option<NewSessionDialog>,
     pub(super) confirm_dialog: Option<ConfirmDialog>,
+    pending_creation_confirmation: Option<persistence_transactions::CreationConfirmation>,
+    pending_claim_abort_confirmation: Option<crate::session::retained_intents::ClaimAbort>,
     pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
@@ -402,16 +443,17 @@ pub struct HomeView {
     store_move_bypass: Option<String>,
 
     pub(super) attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller,
-    pub(super) attach_project_in_flight: std::collections::HashSet<String>,
+    pub(super) attach_project_in_flight: HashMap<String, RequestOrigin>,
 
     pub(super) creation_poller: CreationPoller,
     /// Cancels the request behind `creating_stub_id`.
     pub(super) creation_cancel: Option<tokio_util::sync::CancellationToken>,
-    pub(super) on_launch_hooks_ran: HashSet<String>,
+    pub(super) on_launch_hooks_ran: HashMap<String, RequestOrigin>,
 
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
     pub(super) creating_stub_id: Option<String>,
     creating_provisional_group_paths: HashSet<String>,
+    creating_provisional_profile: Option<String>,
 
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,
@@ -515,9 +557,57 @@ pub struct HomeView {
     pub(super) tool_picker_dialog: Option<super::dialogs::ToolPickerDialog>,
 
     pub(super) file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
-    pub(super) disk_watch: DiskWatchState,
-    pub(super) config_watch: ConfigWatchState,
+    pub(super) disk_watch: persistence_worker::WatchView<String>,
+    pub(super) config_watch: persistence_worker::WatchView<watchers::ConfigWatchKey>,
     pub(super) watcher_config_refresh_count: std::sync::atomic::AtomicU64,
     pub(super) reload_failure_state: ReloadFailureState,
     pub(super) pending_watcher_theme: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) enum TransactionDisposition {
+    Queued,
+    Ignored,
+}
+
+impl HomeView {
+    fn capture_transaction_row(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<persistence_transactions::RowCapture> {
+        persistence_transactions::RowCapture::capture(
+            self.get_instance(id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?,
+        )
+    }
+    fn capture_transaction_target(
+        &self,
+        profile: Option<&str>,
+        source: &str,
+    ) -> anyhow::Result<Option<Storage>> {
+        profile
+            .filter(|p| *p != source)
+            .map(|p| match self.storages.get(p) {
+                Some(s) => Ok(s.clone()),
+                None => Storage::open(p, self.file_watch.clone()),
+            })
+            .transpose()
+    }
+    fn project_transaction_rows(&mut self, rows: Vec<Instance>) {
+        for mut row in rows {
+            if let Some(current) = self.instances.get_mut(&row.id).filter(|current| {
+                current.created_at == row.created_at && current.same_storage_origin(&row)
+            }) {
+                if current.lifecycle_generation >= row.lifecycle_generation {
+                    current.merge_runtime_for_profile_move(&row);
+                    continue;
+                }
+                row.merge_runtime_for_profile_move(current);
+            }
+            self.instances.insert(row.id.clone(), row);
+        }
+        self.rebuild_group_trees();
+        self.rebuild_flat_items_keeping_cursor();
+    }
 }

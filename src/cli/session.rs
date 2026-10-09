@@ -12,6 +12,9 @@ use crate::session::{
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
+    /// Remove an unresolved create/attach intent's metadata; retain resources and exclusions
+    AbortIntent(AbortIntentArgs),
+
     /// Start a session's tmux process
     Start(SessionIdArgs),
 
@@ -164,6 +167,13 @@ pub struct ArchiveArgs {
     /// Skip tmux teardown on archive.
     #[arg(long = "no-kill")]
     pub no_kill: bool,
+}
+
+#[derive(Args)]
+pub struct AbortIntentArgs {
+    /// Exact full session ID of a pending or unknown create/attach intent
+    #[arg(value_name = "ID")]
+    id: String,
 }
 
 #[derive(Args)]
@@ -385,6 +395,7 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     match command {
+        SessionCommands::AbortIntent(args) => abort_intent(profile, args).await,
         SessionCommands::Start(args) => start_session(profile, args).await,
         SessionCommands::Stop(args) => stop_session(profile, args).await,
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
@@ -418,6 +429,21 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::ListTrash => list_trash(profile).await,
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
+}
+
+async fn abort_intent(profile: &str, args: AbortIntentArgs) -> Result<()> {
+    let profile = profile.to_owned();
+    let ack = tokio::task::spawn_blocking(move || {
+        let storage = Storage::open_unwatched(&profile)?;
+        let selection = crate::session::retained_intents::capture(&storage, &args.id)?;
+        crate::session::retained_intents::abort(&selection)
+    })
+    .await??;
+    println!(
+        "Aborted intent {}: session metadata removed; resources and exclusions retained. No resource cleanup performed.",
+        ack.id()
+    );
+    Ok(())
 }
 
 /// Flips one boolean marker on a session and reports it with `verb`.

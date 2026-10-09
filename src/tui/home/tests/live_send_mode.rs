@@ -107,7 +107,11 @@ fn live_mode_keys_exit_on_chord_or_drift() {
             install_native_live_for_first_session(&mut env);
             env
         };
-        let action = env.view.handle_key(key_event, None);
+        let action = {
+            let result = env.view.handle_key(key_event, None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         let case = format!("orphan={orphan} key={key_event:?}");
         if stays_live {
             assert!(action.is_none(), "{case}");
@@ -135,7 +139,11 @@ fn page_keys_in_live_mode() {
         (KeyCode::PageUp, KeyModifiers::NONE, 25, Ordering::Equal),
     ] {
         env.view.preview_scroll_offset = start;
-        env.view.handle_key(KeyEvent::new(code, mods), None);
+        {
+            let result = env.view.handle_key(KeyEvent::new(code, mods), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(
             env.view.preview_scroll_offset.cmp(&start),
             moves,
@@ -180,8 +188,13 @@ fn drift_check_auto_exits_when_session_renamed() {
         crate::tmux::test_helpers::TmuxTestSession::from_name(renamed);
     crate::tmux::refresh_session_cache();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.live_send.is_none());
     assert!(env.view.info_dialog.is_some());
 }
@@ -200,8 +213,13 @@ fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
     });
     crate::tmux::refresh_session_cache();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.live_send.is_some(),
         "a retitle that never reached tmux must not read as drift"
@@ -227,8 +245,13 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
         true,
     );
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.live_send.is_some(),
@@ -258,9 +281,13 @@ fn live_mode_counts_as_dialog_and_wants_paste_burst() {
 #[serial]
 fn tab_enters_live_send_only_for_a_selected_session() {
     let mut empty = create_test_env_empty();
-    let action = empty
-        .view
-        .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+    let action = {
+        let result = empty
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        drain_persistence(&mut empty.view).unwrap();
+        result
+    };
     assert!(action.is_none());
     assert!(empty.view.live_send.is_none());
     drop(empty);
@@ -272,9 +299,13 @@ fn tab_enters_live_send_only_for_a_selected_session() {
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Stopped;
     });
-    let action = env
-        .view
-        .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+    let action = {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         matches!(action, Some(Action::EnterLiveSend(_))),
         "Tab on a stopped session should emit Action::EnterLiveSend, got {:?}",
@@ -304,9 +335,13 @@ fn tab_does_not_start_live_send_for_acp_session() {
         inst.status = crate::session::Status::Stopped;
         inst.view = crate::session::View::Structured;
     });
-    let action = env
-        .view
-        .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+    let action = {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         matches!(
             &action,

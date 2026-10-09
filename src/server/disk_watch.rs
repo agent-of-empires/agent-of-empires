@@ -229,6 +229,7 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             _ = state.disk_changed.notified() => {}
         }
         let started = std::time::Instant::now();
+        super::reload::reconcile_filesystem_claims(&state).await;
         let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch

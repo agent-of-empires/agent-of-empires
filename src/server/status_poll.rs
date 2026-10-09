@@ -199,6 +199,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
         // fall back to comparing against its own possibly-stale disk-loaded `status`.
         let prev_for_poll = prev.clone();
         let snapshot_guard = state.session_service.disk_reload_guard().await;
+        super::reload::reconcile_filesystem_claims(&state).await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);

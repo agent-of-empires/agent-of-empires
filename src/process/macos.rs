@@ -4,6 +4,155 @@ pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 pub(super) const BOOTSTRAP_RECV_FLAGS: i32 = 0;
 use std::collections::HashMap;
 use std::process::Command;
+// Darwin retains the real original Child/group, but does not claim exhaustive
+// descendant containment from a host CLI's exit or from a process-table guess.
+pub(super) struct OwnedCreateRoot {
+    birth: super::ProcessIncarnation,
+}
+impl OwnedCreateRoot {
+    pub(super) fn prepare(birth: super::ProcessIncarnation) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            super::process_incarnation(birth.pid)? == Some(birth),
+            "original held Darwin bootstrap birth changed"
+        );
+        anyhow::ensure!(
+            birth.pid == birth.group,
+            "original Darwin bootstrap is not its new group root"
+        );
+        Ok(Self { birth })
+    }
+    pub(super) fn release(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            super::process_incarnation(self.birth.pid)? == Some(self.birth),
+            "held Darwin original changed before its private gate release"
+        );
+        Ok(())
+    }
+    pub(super) fn retire(
+        &mut self,
+        child: &mut std::process::Child,
+        cancel: &tokio_util::sync::CancellationToken,
+        _admit: impl FnMut(super::CreateObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<super::CreateRetirement> {
+        use std::os::unix::process::ExitStatusExt;
+        anyhow::ensure!(
+            child.id() == self.birth.pid,
+            "Darwin original Child was replaced"
+        );
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if cancel.is_cancelled() {
+                anyhow::ensure!(
+                    super::process_incarnation(child.id())? == Some(self.birth),
+                    "Darwin cancellation lost its original kernel birth"
+                );
+                child.kill()?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        while process_group_has_live_members(self.birth.group)? {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(super::CreateRetirement {
+            raw_status: status.clone().into_raw(),
+            status,
+            descendants_retired: false,
+            group_retired: true,
+            external_domain: false,
+        })
+    }
+}
+pub(super) fn hold_owned_create_bootstrap() -> anyhow::Result<()> {
+    // The real private-channel read in the producer bootstrap is Darwin's gate.
+    // Confirm the actual root/group before entering that held state.
+    use anyhow::Context;
+    let birth = super::process_incarnation(std::process::id())?
+        .context("original Darwin bootstrap birth unavailable")?;
+    anyhow::ensure!(
+        birth.pid == birth.group,
+        "Darwin native bootstrap changed its original group"
+    );
+    Ok(())
+}
+pub(super) fn exec_owned_create(
+    program: &std::ffi::CString,
+    executable: &std::fs::File,
+    directory: &std::fs::File,
+    argv: &[std::ffi::CString],
+    env: &[std::ffi::CString],
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    // XNU has no fexecve. Retain and validate the real executable pin, execute
+    // the sealed resolved pathname, and never turn this into containment proof.
+    let metadata = std::fs::metadata(std::path::Path::new(std::ffi::OsStr::from_bytes(
+        program.as_bytes(),
+    )))?;
+    anyhow::ensure!(
+        crate::session::DirectoryIdentity::from_metadata(&metadata)
+            == crate::session::DirectoryIdentity::from_metadata(&executable.metadata()?),
+        "Darwin resolved executable changed before native exec"
+    );
+    let mut argvp: Vec<_> = argv.iter().map(|v| v.as_ptr()).collect();
+    argvp.push(std::ptr::null());
+    let mut envp: Vec<_> = env.iter().map(|v| v.as_ptr()).collect();
+    envp.push(std::ptr::null());
+    let input = std::fs::File::open("/dev/null")?;
+    unsafe {
+        if libc::fchdir(directory.as_raw_fd()) != 0
+            || libc::dup2(input.as_raw_fd(), libc::STDIN_FILENO) == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        libc::execve(program.as_ptr(), argvp.as_ptr(), envp.as_ptr());
+    }
+    Err(std::io::Error::last_os_error().into())
+}
+
+pub(super) fn owned_create_descendant_traceable() -> bool {
+    false
+}
+pub(super) fn owned_create_anchor_path(
+    file: &std::fs::File,
+    _: u32,
+) -> anyhow::Result<(std::ffi::OsString, bool)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    let mut path = [0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let length = path
+        .iter()
+        .position(|&v| v == 0)
+        .ok_or_else(|| anyhow::anyhow!("original Darwin FD path was not terminated"))?;
+    let path = std::ffi::OsString::from_vec(path[..length].to_vec());
+    anyhow::ensure!(
+        crate::session::DirectoryIdentity::from_metadata(&std::fs::metadata(
+            std::path::Path::new(&path)
+        )?) == crate::session::DirectoryIdentity::from_metadata(&file.metadata()?),
+        "Darwin F_GETPATH replaced its original role birth"
+    );
+    // XNU /dev/fd is dupfdopen, not a traversable directory capability; /.vol
+    // also rebuilds a pathname. This is explicitly PathOnly, NEVER strong effect proof.
+    Ok((path, true))
+}
+pub(super) fn install_owned_create_anchors(
+    files: &[std::fs::File],
+    slots: &[u32],
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    for (file, &slot) in files.iter().zip(slots) {
+        if unsafe { libc::dup2(file.as_raw_fd(), slot as i32) } == -1
+            || unsafe { libc::fcntl(slot as i32, libc::F_SETFD, 0) } == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn is_process_group_alive(pgid: u32) -> bool {
     if pgid == 0 {
@@ -402,6 +551,12 @@ Pages wired down:                        300000.
             parse_process_record(line).unwrap().start_id
         );
     }
+}
+
+// A hidden or unreadable process is not absent. Signal zero has no process effect.
+pub(super) fn custodian_process_absent(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 pub(super) fn process_incarnation(pid: u32) -> std::io::Result<Option<super::ProcessIncarnation>> {

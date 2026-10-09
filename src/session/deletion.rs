@@ -1254,7 +1254,7 @@ pub(crate) fn resolve_claim_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
+pub(crate) fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
@@ -1369,10 +1369,11 @@ fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> P
                     }
                     paths.established.extend(row.paths);
                     match row.pending {
-                        super::WorktreePathClaims::Pending(pending) => {
+                        super::WorktreePathClaims::Pending(pending)
+                        | super::WorktreePathClaims::Unknown(Some(pending)) => {
                             paths.pending.extend(pending)
                         }
-                        super::WorktreePathClaims::Unknown => {
+                        super::WorktreePathClaims::Unknown(None) => {
                             return PathsInUse::Unknown(format!(
                                 "profile '{}' has unknown filesystem intent",
                                 storage.profile()
@@ -1388,6 +1389,25 @@ fn scan_paths_in_use(storages: &[Storage], except: &[SessionPathOwner<'_>]) -> P
                     storage.profile()
                 ))
             }
+        }
+    }
+    let retained = match super::retained_intents::load_owners() {
+        Ok(retained) => retained,
+        Err(error) => {
+            return PathsInUse::Unknown(format!("reading permanent retained owners: {error}"))
+        }
+    };
+    for row in retained.rows {
+        paths.established.extend(row.paths);
+        match row.pending {
+            super::WorktreePathClaims::Pending(pending)
+            | super::WorktreePathClaims::Unknown(Some(pending)) => paths.pending.extend(pending),
+            super::WorktreePathClaims::Unknown(None) => {
+                return PathsInUse::Unknown(
+                    "permanent retained owner has unknown filesystem intent".into(),
+                )
+            }
+            super::WorktreePathClaims::None => {}
         }
     }
     if owners.iter().any(|(_, _, seen, _)| !seen) {
@@ -1406,7 +1426,7 @@ pub(crate) fn paths_in_use_except(except: &[SessionPathOwner<'_>]) -> PathsInUse
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ClaimOwner {
-    profile: usize,
+    profile: Option<usize>,
     id: std::sync::Arc<str>,
     exclusive: bool,
 }
@@ -1568,8 +1588,9 @@ impl PathClaimIndex {
                 );
                 for row in &document.rows {
                     let pending = match &row.pending {
-                        super::WorktreePathClaims::Pending(paths) => paths.as_slice(),
-                        super::WorktreePathClaims::Unknown => {
+                        super::WorktreePathClaims::Pending(paths)
+                        | super::WorktreePathClaims::Unknown(Some(paths)) => paths.as_slice(),
+                        super::WorktreePathClaims::Unknown(None) => {
                             result.valid = false;
                             &[]
                         }
@@ -1598,6 +1619,37 @@ impl PathClaimIndex {
                     }
                 }
                 profiles.push(identity);
+            }
+            let retained = super::retained_intents::load_owners()?;
+            for row in retained.rows {
+                let pending = match &row.pending {
+                    super::WorktreePathClaims::Pending(paths)
+                    | super::WorktreePathClaims::Unknown(Some(paths)) => paths.as_slice(),
+                    super::WorktreePathClaims::Unknown(None) => {
+                        result.valid = false;
+                        &[]
+                    }
+                    super::WorktreePathClaims::None => &[],
+                };
+                for id in &row.ids {
+                    let id: std::sync::Arc<str> = std::sync::Arc::from(id.as_str());
+                    for (path, exclusive) in row
+                        .paths
+                        .iter()
+                        .map(|path| (path, false))
+                        .chain(pending.iter().map(|path| (path, true)))
+                    {
+                        let Some(path) = resolve_claim_path(path) else {
+                            result.valid = false;
+                            continue;
+                        };
+                        result.claims.entry(path).or_default().push(ClaimOwner {
+                            profile: None,
+                            id: std::sync::Arc::clone(&id),
+                            exclusive,
+                        });
+                    }
+                }
             }
             for (target, identity) in targets.iter().zip(&target_identities) {
                 anyhow::ensure!(
@@ -1664,7 +1716,7 @@ impl PathClaimIndex {
                 .entry(path.clone())
                 .or_default()
                 .push(ClaimOwner {
-                    profile,
+                    profile: Some(profile),
                     id: std::sync::Arc::clone(&id),
                     exclusive,
                 });
@@ -1682,7 +1734,7 @@ impl PathClaimIndex {
             .map(|(id, _)| std::sync::Arc::clone(id))
             .unwrap_or_else(|| std::sync::Arc::from(row.id.as_str()));
         let owner = ClaimOwner {
-            profile,
+            profile: Some(profile),
             id: std::sync::Arc::clone(&id),
             exclusive: false,
         };
@@ -1693,8 +1745,9 @@ impl PathClaimIndex {
             .as_ref()
             .map(|lease| &lease.path_claims)
         {
-            Some(crate::session::WorktreePathClaims::Pending(paths)) => paths.as_slice(),
-            Some(crate::session::WorktreePathClaims::Unknown) => {
+            Some(crate::session::WorktreePathClaims::Pending(paths))
+            | Some(crate::session::WorktreePathClaims::Unknown(Some(paths))) => paths.as_slice(),
+            Some(crate::session::WorktreePathClaims::Unknown(None)) => {
                 self.valid = false;
                 return;
             }
@@ -1799,7 +1852,7 @@ impl PathClaimIndex {
             owners.iter().any(|owner| {
                 (!pending_only || owner.exclusive)
                     && excluded_owner.is_none_or(|(profile, id)| {
-                        owner.profile != profile || owner.id.as_ref() != id
+                        owner.profile != Some(profile) || owner.id.as_ref() != id
                     })
             })
         };
@@ -2648,6 +2701,53 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn scoped_unknown_preserves_every_path_without_blocking_unrelated_paths() -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = tempfile::tempdir()?;
+        let peer = Storage::new_unwatched("uncertain-peer")?;
+        let target = Storage::new_unwatched("target")?;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let unrelated = root.path().join("unrelated");
+        let mut row = Instance::new("peer", root.path().join("current").to_str().unwrap());
+        row.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Create,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )?;
+        row.lifecycle_reservation.as_mut().unwrap().path_claims =
+            crate::session::WorktreePathClaims::Unknown(Some(vec![first.clone(), second.clone()]));
+        std::fs::write(
+            peer.sessions_path(),
+            serde_json::to_vec(&vec![row.clone()])?,
+        )?;
+        let claims = PathClaimIndex::load_for_writer(std::slice::from_ref(&target))?;
+        let profile = claims.writer_profile(&target)?;
+        claims.ensure_unclaimed(profile, "new-owner", std::slice::from_ref(&unrelated))?;
+        for blocked in [first, second, root.path().to_path_buf()] {
+            assert!(claims
+                .ensure_unclaimed(profile, "new-owner", std::slice::from_ref(&blocked))
+                .is_err());
+        }
+        let PathsInUse::Known(inventory) = paths_in_use_except(&[]) else {
+            panic!("complete scoped Unknown has a usable exclusion inventory")
+        };
+        assert_eq!(inventory.pending.len(), 2);
+        row.lifecycle_reservation.as_mut().unwrap().path_claims =
+            crate::session::WorktreePathClaims::Unknown(None);
+        std::fs::write(peer.sessions_path(), serde_json::to_vec(&vec![row])?)?;
+        let claims = PathClaimIndex::load_for_writer(std::slice::from_ref(&target))?;
+        let profile = claims.writer_profile(&target)?;
+        assert!(claims
+            .ensure_unclaimed(profile, "new-owner", &[unrelated])
+            .is_err());
+        assert!(matches!(paths_in_use_except(&[]), PathsInUse::Unknown(_)));
+        Ok(())
+    }
+
     use crate::containers::error::DockerError;
     use crate::containers::Teardown;
     use crate::session::test_support::{isolate_app_dir, isolate_app_dir_at};
@@ -2772,8 +2872,8 @@ mod tests {
         let second = temp.path().join("second");
         let future = temp.path().join("future");
         let peer_document = serde_json::json!([
-            {"id":"duplicate", "title":17,"project_path":first,"lifecycle_reservation":{"op":"launch","generation":"broken","at":false,"path_claims":{"state":"none"}}},
-            {"id":"duplicate", "project_path":second,"lifecycle_reservation":{"op":"attach","path_claims":{"state":"pending","paths":[future]}}}
+            {"id":"duplicate", "title":17,"project_path":first,"lifecycle_reservation":{"op":"launch","generation":"broken","at":false,"path_claims":{"state":"none"},"custodian":null}},
+            {"id":"duplicate", "project_path":second,"lifecycle_reservation":{"op":"attach","path_claims":{"state":"pending","paths":[future]},"custodian":null}}
         ]);
         std::fs::write(peer.sessions_path(), serde_json::to_vec(&peer_document)?)?;
         let index = PathClaimIndex::load_for_writer(std::slice::from_ref(&target))?;

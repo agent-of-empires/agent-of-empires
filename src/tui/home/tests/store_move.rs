@@ -5,6 +5,13 @@ use crate::tui::store_move_poller::{StoreMovePoller, StoreMoveResult};
 fn in_flight(view: &mut HomeView, title: &str) {
     view.store_move_in_flight = Some(super::super::store_move::StoreMoveInFlight {
         title: title.to_string(),
+        origin: super::super::RequestOrigin::capture(
+            view.instances
+                .values()
+                .next()
+                .expect("canonical fixture row"),
+        )
+        .unwrap(),
         console: Default::default(),
         last_line: None,
     });
@@ -31,7 +38,20 @@ fn a_finished_move_resumes_or_explains() {
     seed_result(&mut env.view, &id, Ok(true));
     let poll = env.view.poll_store_move();
     assert!(poll.changed);
-    assert_eq!(poll.resume, Some(Action::AttachSession(id.clone())));
+    assert!(
+        env.view
+            .take_persistence_action()
+            .map(super::super::PersistenceAction::into_action)
+            .is_none(),
+        "result is not a reload ACK"
+    );
+    drain_persistence(&mut env.view).unwrap();
+    assert_eq!(
+        env.view
+            .take_persistence_action()
+            .map(super::super::PersistenceAction::into_action),
+        Some(Action::AttachSession(id.clone()))
+    );
     assert!(env.view.store_move_in_flight.is_none());
     assert!(env.view.info_dialog.is_none());
     assert!(!env.view.poll_store_move().changed, "nothing in flight");
@@ -39,7 +59,18 @@ fn a_finished_move_resumes_or_explains() {
     in_flight(&mut env.view, "session0");
     seed_result(&mut env.view, &id, Ok(false));
     assert_eq!(
-        env.view.poll_store_move().resume,
+        {
+            env.view.poll_store_move();
+            assert!(env
+                .view
+                .take_persistence_action()
+                .map(super::super::PersistenceAction::into_action)
+                .is_none());
+            drain_persistence(&mut env.view).unwrap();
+            env.view
+                .take_persistence_action()
+                .map(super::super::PersistenceAction::into_action)
+        },
         Some(Action::AttachSession(id.clone()))
     );
 
@@ -47,7 +78,17 @@ fn a_finished_move_resumes_or_explains() {
     seed_result(&mut env.view, &id, Err("disk full".to_string()));
     let poll = env.view.poll_store_move();
     assert!(poll.changed);
-    assert_eq!(poll.resume, None);
+    assert!(env
+        .view
+        .take_persistence_action()
+        .map(super::super::PersistenceAction::into_action)
+        .is_none());
+    drain_persistence(&mut env.view).unwrap();
+    assert!(env
+        .view
+        .take_persistence_action()
+        .map(super::super::PersistenceAction::into_action)
+        .is_none());
     let dialog = env.view.info_dialog.take().expect("failure dialog");
     assert_eq!(dialog.title(), "Agent Store Move Failed");
     assert!(dialog.message().contains("disk full"));
@@ -69,12 +110,26 @@ fn a_finished_move_resumes_or_explains() {
             Ok(())
         })
         .unwrap();
-    env.view.reload().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
     assert!(env.view.sandbox_store_move_pending(&id));
     in_flight(&mut env.view, "session0");
     seed_result(&mut env.view, &id, Ok(true));
-    let poll = env.view.poll_store_move();
-    assert_eq!(poll.resume, None);
+    env.view.poll_store_move();
+    assert!(env
+        .view
+        .take_persistence_action()
+        .map(super::super::PersistenceAction::into_action)
+        .is_none());
+    drain_persistence(&mut env.view).unwrap();
+    assert!(env
+        .view
+        .take_persistence_action()
+        .map(super::super::PersistenceAction::into_action)
+        .is_none());
     let dialog = env.view.info_dialog.take().expect("still-shared dialog");
     assert_eq!(dialog.title(), "Agent Store Still Shared");
     // A container that was already up hands the attach back and lets it
@@ -84,7 +139,18 @@ fn a_finished_move_resumes_or_explains() {
     in_flight(&mut env.view, "session0");
     seed_result(&mut env.view, &id, Ok(false));
     assert_eq!(
-        env.view.poll_store_move().resume,
+        {
+            env.view.poll_store_move();
+            assert!(env
+                .view
+                .take_persistence_action()
+                .map(super::super::PersistenceAction::into_action)
+                .is_none());
+            drain_persistence(&mut env.view).unwrap();
+            env.view
+                .take_persistence_action()
+                .map(super::super::PersistenceAction::into_action)
+        },
         Some(Action::AttachSession(id.clone()))
     );
     assert!(env.view.sandbox_store_move_pending(&id));
@@ -97,7 +163,13 @@ fn a_finished_move_resumes_or_explains() {
         outcome: Ok(false),
         resume: None,
     });
-    assert_eq!(env.view.poll_store_move().resume, None);
+    env.view.poll_store_move();
+    drain_persistence(&mut env.view).unwrap();
+    assert!(env
+        .view
+        .take_persistence_action()
+        .map(super::super::PersistenceAction::into_action)
+        .is_none());
     assert!(env.view.needs_store_move_before_launch(&id));
     // A second move is refused while one is in flight.
     assert!(env.view.begin_store_move(&id, None));
@@ -109,7 +181,7 @@ fn a_finished_move_resumes_or_explains() {
 #[test]
 #[serial]
 fn status_line_follows_the_moves_progress() {
-    let mut env = create_test_env_empty();
+    let mut env = create_test_env_with_sessions(1);
     assert_eq!(env.view.store_move_status_line(), None);
     in_flight(&mut env.view, "big session");
     assert_eq!(

@@ -96,7 +96,7 @@ pub fn ensure_container_for_session_locked(
                         false
                     };
                     instance
-                        .get_container_for_instance()
+                        .get_container_for_instance_under_workspace_locks()
                         .context("ensuring sandbox container")?;
                     let workdir = instance.container_workdir();
                     let hooks = if run_on_launch_hooks {

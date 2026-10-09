@@ -330,6 +330,47 @@ fn install_env_vars(path: PathBuf, temp: Option<TempDir>) -> AppDirGuard {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn require_hosted_creating_native() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert_eq!(
+        std::env::var("GITHUB_ACTIONS").as_deref(),
+        Ok("true"),
+        "native Creating proofs require GitHub Actions"
+    );
+    assert_eq!(
+        std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+        Ok("github-hosted"),
+        "native Creating proofs require a disposable hosted runner"
+    );
+    let expected_os = if cfg!(target_os = "linux") {
+        "Linux"
+    } else {
+        "macOS"
+    };
+    assert_eq!(std::env::var("RUNNER_OS").as_deref(), Ok(expected_os));
+    let executable = PathBuf::from(
+        std::env::var_os("AOE_NATIVE_CREATE_EXECUTABLE")
+            .expect("AOE_NATIVE_CREATE_EXECUTABLE must name the newly built aoe"),
+    );
+    assert!(
+        executable.is_absolute(),
+        "bootstrap executable must be absolute"
+    );
+    let metadata = std::fs::metadata(&executable).expect("built aoe executable is missing");
+    assert!(
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        "bootstrap must be an executable regular file"
+    );
+    let canonical = executable.canonicalize().expect("cannot resolve built aoe");
+    assert_eq!(
+        canonical, executable,
+        "bootstrap must name the physical built aoe"
+    );
+    canonical
+}
+
 pub(crate) type HomeGuard = EnvGuard;
 
 pub(crate) fn isolate_home(temp: &Path) -> HomeGuard {

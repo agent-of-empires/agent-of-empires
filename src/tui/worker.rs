@@ -75,10 +75,14 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         }
     }
 
+    pub(crate) fn try_request(&self, req: Req) -> Result<(), mpsc::SendError<Req>> {
+        self.request_tx.send(req)
+    }
+
     /// Enqueue a request. A send failure means the worker thread is gone, so
     /// log it rather than dropping silently.
     pub fn request(&self, req: Req) {
-        if let Err(e) = self.request_tx.send(req) {
+        if let Err(e) = self.try_request(req) {
             tracing::warn!(
                 target: "tui.worker",
                 worker = %self.name,

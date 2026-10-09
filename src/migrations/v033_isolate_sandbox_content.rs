@@ -871,6 +871,8 @@ fn retain_legacy_original_with(
         return Ok(Retained::Absent);
     };
     let app = crate::session::get_app_dir()?;
+    // v027's caller retains the resource workspace fences.
+    layout::ensure_no_retained_owners(&app)?;
     let recovery = recovery_root(host)?;
     if let Some(message) =
         recovery_exposure(&app, &[canonical_expected_path(&recovery)?], exposure)?.refusal(None)
@@ -1225,6 +1227,9 @@ fn recovery_exposure(
     targets: &[PathBuf],
     exposure: &ExposureProbe<'_>,
 ) -> Result<Exposure> {
+    // Retained IDs cannot be probed as reconstructed native authorities, nor
+    // treated as absent owners of custom roots or recovery-namespace mounts.
+    layout::ensure_no_retained_owners(app)?;
     let mut found = Exposure::default();
     for (path, registry) in read_registries(app)? {
         let profile = layout::profile_for_registry(app, &path);
@@ -2104,6 +2109,7 @@ fn migration_targets(app: &Path, roots: &[ContentRoot]) -> Result<Vec<PathBuf>> 
     Ok(targets)
 }
 
+#[cfg(test)]
 fn migrate_target(
     app: &Path,
     home: &Path,
@@ -2112,7 +2118,25 @@ fn migrate_target(
     reap: &dyn Fn(&str) -> Result<bool>,
     exposure: &ExposureProbe<'_>,
 ) -> Result<bool> {
+    migrate_target_with_workspace(app, home, target, running, reap, exposure, false)
+}
+
+fn migrate_target_with_workspace(
+    app: &Path,
+    home: &Path,
+    target: (&Path, &str, &str),
+    running: &dyn Fn(&str) -> Result<bool>,
+    reap: &dyn Fn(&str) -> Result<bool>,
+    exposure: &ExposureProbe<'_>,
+    workspace_held: bool,
+) -> Result<bool> {
     let (registry, id, tool) = target;
+    let mut workspace_locks = if workspace_held {
+        None
+    } else {
+        Some(layout::lock_workspace_namespaces(app)?)
+    };
+    layout::ensure_no_retained_owners(app)?;
     let profile = layout::profile_for_registry(app, registry);
     let config = crate::session::config::profile_config::resolve_config(&profile)?;
     let Some(snapshot) = read_row(registry, id)? else {
@@ -2128,10 +2152,21 @@ fn migrate_target(
         return Ok(true);
     }
     container_config::expand_content_roles(&mut roots, home, &config.session)?;
+    drop(workspace_locks.take());
     let mut cohorts = Vec::with_capacity(roots.len());
     for root in &roots {
-        cohorts.push(layout::acquire_cohort_lock(app, &root.path)?);
+        let lock = if workspace_held {
+            layout::try_lock_cohort_under_workspace(app, &root.path)?
+                .context("sandbox content is moving; release original admission and retry")?
+        } else {
+            layout::acquire_cohort_lock(app, &root.path)?
+        };
+        cohorts.push(lock);
     }
+    if !workspace_held {
+        workspace_locks = Some(layout::lock_workspace_namespaces(app)?);
+    }
+    layout::ensure_no_retained_owners(app)?;
     let mut transition = Some(crate::session::acquire_storage_flock(app, layout::LOCK)?);
     let mut registries = Some(lock_registries(app)?);
     let Some(row) = read_row(registry, id)? else {
@@ -2180,11 +2215,16 @@ fn migrate_target(
     }
     drop(registries.take());
     drop(transition.take());
+    drop(workspace_locks.take());
     let workspace = Path::new(
         row.get("project_path")
             .and_then(Value::as_str)
             .context("sandbox row has no project path")?,
     );
+    if !workspace_held {
+        workspace_locks = Some(layout::lock_workspace_namespaces(app)?);
+    }
+    layout::ensure_no_retained_owners(app)?;
     stage_receipt(app, &mut receipt, &path, home, &config, workspace)?;
     #[cfg(test)]
     AFTER_STAGE_HOOK.with(|hook| {
@@ -2261,6 +2301,7 @@ fn migrate_target(
     drop(registries);
     drop(transition);
     drop(cohorts);
+    drop(workspace_locks);
     Ok(true)
 }
 
@@ -2268,6 +2309,26 @@ fn reconcile_in(
     app: &Path,
     home: &Path,
     only: Option<&str>,
+    move_stores: bool,
+    running: &dyn Fn(&str) -> Result<bool>,
+    reap: &dyn Fn(&str) -> Result<bool>,
+    exposure: &ExposureProbe<'_>,
+) -> Result<()> {
+    reconcile_in_with_workspace(
+        app,
+        home,
+        (only, false),
+        move_stores,
+        running,
+        reap,
+        exposure,
+    )
+}
+
+fn reconcile_in_with_workspace(
+    app: &Path,
+    home: &Path,
+    (only, workspace_held): (Option<&str>, bool),
     move_stores: bool,
     running: &dyn Fn(&str) -> Result<bool>,
     reap: &dyn Fn(&str) -> Result<bool>,
@@ -2301,9 +2362,15 @@ fn reconcile_in(
     }
     for ((path, id, tool), ()) in targets {
         if move_stores || only.is_some() {
-            if let Err(error) =
-                migrate_target(app, home, (&path, &id, &tool), running, reap, exposure)
-            {
+            if let Err(error) = migrate_target_with_workspace(
+                app,
+                home,
+                (&path, &id, &tool),
+                running,
+                reap,
+                exposure,
+                workspace_held,
+            ) {
                 if !container_config::source_changed(&error) {
                     return Err(error);
                 }
@@ -2414,6 +2481,20 @@ pub(crate) fn migrate_instance(id: &str) -> Result<()> {
     )
 }
 
+/// Caller retains both namespaces' actual workspace fences; never reacquire them.
+pub(crate) fn migrate_instance_under_workspace_locks(id: &str) -> Result<()> {
+    let app = crate::session::get_app_dir()?;
+    let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
+    reconcile_in_with_workspace(
+        &app,
+        &home,
+        (Some(id), true),
+        true,
+        &layout::batched_running_probe(false),
+        &layout::reap_migrated_container,
+        &live_bind_sources,
+    )
+}
 /// Fresh builders may certify only absent roots or already certified roots.
 /// Existing unproven data requires the stopped, registry-backed migration.
 pub(crate) fn ensure_fresh_content(
@@ -2446,6 +2527,9 @@ fn ensure_fresh_content_with(
     exposure: &ExposureProbe<'_>,
 ) -> Result<crate::session::StorageFlock> {
     crate::session::validate_instance_id(instance)?;
+    // The caller owns workspace admission. This may run under a shared
+    // transition fence; do not reacquire workspace in this helper.
+    layout::ensure_no_retained_owners(app)?;
     if !roots_ready(app, instance, tool, roots)? {
         // Never wait for a cohort held by a migrator while already holding the
         // transition lock. Callers initialize fresh stores before launch admission.
@@ -2566,6 +2650,9 @@ pub(crate) fn guard_preparation(
         .context("sandbox path has no instance id")?;
     crate::session::validate_instance_id(instance)?;
     let app = crate::session::get_app_dir()?;
+    // Nested fresh-store preparation already holds transition and its original
+    // workspace admission. Read only; transition -> workspace would invert.
+    layout::ensure_no_retained_owners(&app)?;
     let transition = crate::session::acquire_storage_shared_flock(&app, layout::LOCK)?;
     let root = ContentRoot {
         path: canonical_expected_path(sandbox)?,

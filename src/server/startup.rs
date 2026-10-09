@@ -764,6 +764,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             "server.trash_retention_sweep",
             crate::task_util::PanicPolicy::Log,
             async move {
+                super::reload::reconcile_filesystem_claims(&sweep_state).await;
                 // One-shot startup backfill.
                 crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
                 // Same one-shot startup slot.

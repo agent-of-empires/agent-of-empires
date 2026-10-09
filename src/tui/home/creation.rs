@@ -1,16 +1,7 @@
 //! Session creation, canonical publication, and retained cancellation ownership.
 
 use super::*;
-use std::path::PathBuf;
-
-/// Cross-process guards for a single-session title mutation or profile move. The source
-/// profile's lifecycle flock nests inside the per-session title flock; callers retain this
-/// through durable persistence and any tmux rekey, so a terminal launch cannot observe the
-/// transition halfway through.
-pub(in crate::tui) struct SessionMutationGuards {
-    pub(super) _session_title: crate::session::StorageFlock,
-    pub(super) _lifecycle: crate::session::StorageFlock,
-}
+use crate::session::Status;
 
 impl HomeView {
     /// Request background session creation, used for sandbox sessions so the UI does not
@@ -21,24 +12,29 @@ impl HomeView {
         mut data: NewSessionData,
         hooks: Option<crate::session::config::repo_config::ResolvedHooks>,
     ) {
-        let storage = (|| -> anyhow::Result<Storage> {
-            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
-            let _identity = crate::session::acquire_session_identity_lock()?;
-            match self.storages.get(&data.profile) {
-                Some(original) => original.reopen_preserving_watch(),
-                None => Storage::open_or_create(&data.profile, self.file_watch.clone()),
-            }
-        })();
-        let storage = match storage {
-            Ok(storage) => std::sync::Arc::new(storage),
-            Err(error) => {
-                self.info_dialog = Some(InfoDialog::sized_to_fit(
-                    "Creation Failed",
-                    &format!("{error:#}"),
-                ));
-                return;
+        if data.profile.is_empty() {
+            data.profile = crate::session::config::resolve_default_profile();
+        }
+        let storage = if let Some(original) = self.storages.get(&data.profile) {
+            Some(original.clone())
+        } else {
+            let captured = (|| {
+                let path = crate::session::get_profile_dir_path(&data.profile)?;
+                if path.try_exists()? {
+                    Storage::open(&data.profile, self.file_watch.clone()).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })();
+            match captured {
+                Ok(storage) => storage,
+                Err(error) => {
+                    self.info_dialog=Some(InfoDialog::new("Creation Failed",&format!("Original creation profile could not be captured before admission: {error:#}")));
+                    return;
+                }
             }
         };
+        self.creating_provisional_profile = Some(data.profile.clone());
         // Pre-resolve the title with the logic the builder will run, so the stub, the
         // background creation and the final instance agree; otherwise an empty title shows
         // as the path basename in the stub and a civilization name in the instance.
@@ -72,7 +68,8 @@ impl HomeView {
             }
         }
         let stub_title = data.title.clone();
-        let admitted_instance = Instance::new(&stub_title, &data.path);
+        let mut admitted_instance = Instance::new(&stub_title, &data.path);
+        admitted_instance.source_profile = data.profile.clone();
         let mut stub = admitted_instance.clone();
         stub.tool = if data.tool.is_empty() {
             "claude".to_string()
@@ -172,18 +169,31 @@ impl HomeView {
             .filter(|i| i.id != stub_id)
             .cloned()
             .collect();
-        let request = CreationRequest {
-            storage,
+        let request = persistence_transactions::CreationAdmission {
             admitted_instance,
             data,
             existing_instances,
             hooks,
             cancel,
         };
-        self.creation_poller.request_creation(request);
+        if let Err(error) = self.request_transaction(
+            persistence_transactions::TransactionRequest::AdmitCreation {
+                storage,
+                request: Box::new(request),
+            },
+        ) {
+            self.info_dialog = Some(InfoDialog::new("Creation Failed", &format!("{error:#}")));
+        }
     }
 
-    fn remove_creation_stub(&mut self, id: &str) {
+    pub(super) fn remove_creation_stub(&mut self, id: &str) {
+        if self
+            .instances
+            .get(id)
+            .is_some_and(|row| row.status == Status::Creating && row.lifecycle_generation > 0)
+        {
+            return;
+        }
         if let Some(instance) = self.instances.shift_remove(id) {
             if let Some(pending) = self.pending_added.get_mut(&instance.source_profile) {
                 pending.remove(id);
@@ -198,6 +208,7 @@ impl HomeView {
         // Remove the stub instance
         if let Some(stub_id) = self.creating_stub_id.take() {
             self.creating_provisional_group_paths.clear();
+            self.creating_provisional_profile = None;
             self.remove_creation_stub(&stub_id);
             self.creating_hook_progress.remove(&stub_id);
             self.rebuild_group_trees();
@@ -209,10 +220,14 @@ impl HomeView {
 
     /// Apply any pending creation results from the background poller.
     /// Returns Some(session_id) if creation succeeded and we should attach.
-    pub fn apply_creation_results(&mut self) -> Option<String> {
+    pub(in crate::tui) fn apply_creation_results(&mut self) -> Option<CreatedContinuation> {
         use crate::tui::creation_poller::CreationResult;
 
+        if let Some(id) = self.persistence.created.pop_front() {
+            return Some(id);
+        }
         let outcome = self.creation_poller.try_recv_result()?;
+        let original_id = outcome.session_id;
         let result = outcome.result;
 
         // A cancelled request's stub is already gone; the fields below may belong to a
@@ -229,12 +244,13 @@ impl HomeView {
             return None;
         }
 
-        self.creation_cancel = None;
-        let stub_id = self.creating_stub_id.take();
-        // Taken, not borrowed, so every early return leaves the field empty: the
-        // provisional group paths belong to this stub alone and must not carry into the
-        // next creation.
-        self.creating_provisional_group_paths.clear();
+        let stub_id = self
+            .creating_stub_id
+            .as_ref()
+            .filter(|id| **id == original_id)
+            .cloned();
+        // Keep this original ID and provisional metadata until publication ACK;
+        // native preparation is not durable publication. A later request owns its own marker.
         if let Some(ref id) = stub_id {
             self.creating_hook_progress.remove(id);
         }
@@ -247,193 +263,48 @@ impl HomeView {
                 on_launch_hooks_ran,
                 warnings,
             } => {
-                let mut instance = *instance;
-                // Taken here rather than carried over the channel from the
-                // builder thread: the UI thread must be able to take these
-                // flocks itself (save, reload and the publish path all need
-                // them), so a guard owned by the worker would self-deadlock.
-                // Workspace claim before identity, the single order every other
-                // owner uses.
-                let ownership_locks = match crate::session::builder::CleanupOwnershipLocks::acquire(
-                ) {
-                    Ok(locks) => locks,
-                    Err(error) => {
-                        tracing::warn!(target: "tui.create", "Creation ownership and resources retained: original native quiescence is unproven");
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Creation Failed",
-                            &format!("Could not lock the session inventory to publish: {error}"),
-                        ));
-                        self.new_dialog = None;
-                        self.rebuild_group_trees();
-                        self.rebuild_flat_items();
-                        self.update_selected();
-                        return None;
-                    }
+                let Some(custody) = crate::session::builder::CreationCustody::retained()
+                    .into_iter()
+                    .find(|custody| {
+                        custody.session_id() == session_id
+                            && custody.created_at() == instance.created_at
+                            && custody.storage().same_origin_as(&outcome.storage)
+                    })
+                else {
+                    self.info_dialog=Some(InfoDialog::new("Original creation custody unavailable","The actual original custodian and native receipts are missing. A result DTO cannot reconstruct them; publication was not attempted."));
+                    return None;
                 };
-
-                // Remove the stub instance
-                if let Some(id) = &stub_id {
+                // The native worker retained the complete prepared result before send/cancel.
+                // Only the retained original may publish; a DTO or a profile-name reopen is not authority.
+                let _ = creation_intent;
+                let _ = (on_launch_hooks_ran, warnings);
+                if let Some(ref id) = stub_id {
                     self.remove_creation_stub(id);
                 }
-
-                let storage = &*outcome.storage;
-                if let Err(error) = storage.verify_profile_identity() {
-                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                if stub_id.is_some() || self.creating_stub_id.is_none() {
+                    self.creating_stub_id = Some(session_id);
+                }
+                if let Err(error) = self.request_transaction(
+                    persistence_transactions::TransactionRequest::PublishCreation {
+                        custody,
+                        cancel: outcome.cancel,
+                    },
+                ) {
+                    self.info_dialog = Some(InfoDialog::new(
                         "Creation Failed",
-                        &format!(
-                            "Original profile was replaced; retaining created resources: {error:#}"
-                        ),
+                        &format!("Original creation retained: {error:#}"),
                     ));
-                    self.new_dialog = None;
-                    self.rebuild_group_trees();
-                    self.rebuild_flat_items();
-                    self.update_selected();
-                    return None;
                 }
-                let manages_worktree = instance
-                    .worktree_info
-                    .as_ref()
-                    .is_some_and(|worktree| worktree.managed_by_aoe)
-                    || instance.workspace_info.is_some();
-                let authoritative = match storage.load() {
-                    Ok(authoritative) => authoritative,
-                    Err(error) => {
-                        tracing::warn!(target: "tui.create", "Creation ownership and resources retained: original native quiescence is unproven");
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Creation Failed",
-                            &format!("Failed to read profile storage: {error}"),
-                        ));
-                        self.new_dialog = None;
-                        // `reload()` re-takes the identity lock for duplicate
-                        // reconciliation, so the ownership flocks go first.
-                        drop(ownership_locks);
-                        let _ = self.reload();
-                        return None;
-                    }
-                };
-                if let Err(error) = crate::session::validate_managed_workspace(&instance) {
-                    tracing::warn!(target: "tui.create", "Creation ownership and resources retained: original native quiescence is unproven");
-                    self.info_dialog = Some(InfoDialog::sized_to_fit(
-                        "Creation Failed",
-                        &format!("Managed workspace validation failed: {error}"),
-                    ));
-                    self.new_dialog = None;
-                    drop(ownership_locks);
-                    let _ = self.reload();
-                    return None;
-                }
-                if manages_worktree
-                    && crate::session::find_duplicate_session(
-                        authoritative.iter(),
-                        &instance.title,
-                        &instance.project_path,
-                        None,
-                    )
-                    .is_none()
-                {
-                    let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
-                    candidate_paths.extend(
-                        instance
-                            .all_repos()
-                            .iter()
-                            .map(|repo| PathBuf::from(&repo.worktree_path)),
-                    );
-                    if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
-                        crate::session::deletion::SessionPathOwner {
-                            profile: storage.profile(),
-                            session_id: &instance.id,
-                        },
-                        &candidate_paths,
-                    ) {
-                        tracing::warn!(target: "tui.create", "Creation ownership and resources retained: original native quiescence is unproven");
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Creation Failed",
-                            &format!("Session path is already claimed: {error}"),
-                        ));
-                        self.new_dialog = None;
-                        drop(ownership_locks);
-                        let _ = self.reload();
-                        return None;
-                    }
-                }
-                let persist_result =
-                    crate::session::builder::publish_prepared_creation_under_workspace_claim_lock(
-                        storage,
-                        &instance,
-                        &creation_intent,
-                        |instances, groups| {
-                            if !instance.group_path.is_empty() {
-                                let mut tree = GroupTree::new_with_groups(instances, groups);
-                                tree.create_group(&instance.group_path);
-                                *groups = tree.get_all_groups();
-                            }
-                            Ok(())
-                        },
-                    );
-                match persist_result {
-                    Ok(committed) => instance = committed,
-                    Err(error) => {
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Creation Failed",
-                            &format!(
-                                "Creation publication failed; resources were retained: {error}"
-                            ),
-                        ));
-                        self.new_dialog = None;
-                        drop(ownership_locks);
-                        if let Err(reload_error) = self.reload() {
-                            tracing::warn!(target: "tui.home", "Could not reload failed creation: {reload_error}");
-                        }
-                        return None;
-                    }
-                }
-
-                // Publish locally only after the actual canonical acknowledgement.
-                self.publish_persisted_instance(instance.clone());
-                self.rebuild_group_trees();
-
-                if on_launch_hooks_ran {
-                    self.on_launch_hooks_ran.insert(session_id.clone());
-                }
-                drop(ownership_locks);
-
-                if let Err(e) = self.reload() {
-                    tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
-                }
-                // The creation poller may have minted `before_start_env` while bringing the
-                // container up. It is `#[serde(skip)]`, so the reload dropped it; carry it
-                // back onto the live instance (as the CLI's `merge_post_start` does) so the
-                // agent launch reuses it instead of re-minting.
-                let minted = instance
-                    .sandbox_info
-                    .as_mut()
-                    .map(|sb| std::mem::take(&mut sb.before_start_env))
-                    .unwrap_or_default();
-                if !minted.is_empty() {
-                    self.mutate_instance(&session_id, |inst| {
-                        if let Some(sb) = inst.sandbox_info.as_mut() {
-                            sb.before_start_env = minted.clone();
-                        }
-                    });
-                }
-                // reload()'s restore-previous-selection fallback lands the cursor on
-                // whichever index is closest to the removed stub, often the new session's
-                // group folder, so pin the selection onto the new session directly.
-                self.select_and_reveal_session(&session_id);
-                self.new_dialog = None;
-
-                if !warnings.is_empty() {
-                    let body = warnings.join("\n\n");
-                    let message = format!(
-                        "Session was created, but the following warnings were emitted during setup:\n\n{}",
-                        body
-                    );
-                    self.info_dialog = Some(InfoDialog::sized_to_fit("Session warnings", &message));
-                }
-
-                Some(session_id)
+                None
             }
             CreationResult::Error(error) => {
+                if stub_id.is_some() {
+                    self.creation_cancel = None;
+                    self.creating_stub_id = None;
+                    self.creating_provisional_group_paths.clear();
+                    self.creating_provisional_profile = None;
+                }
+                self.request_reload(ReloadKind::Full);
                 // Remove the stub and show the error in an info dialog
                 if let Some(id) = &stub_id {
                     self.remove_creation_stub(id);
@@ -443,9 +314,11 @@ impl HomeView {
                     // Hook failures carry multi-line output; size to fit so
                     // the actual error isn't clipped at the default 50x9.
                     self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
-                } else if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_loading(false);
-                    dialog.set_error(error);
+                } else {
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Original creation failed",
+                        &format!("{original_id}: {error}"),
+                    ));
                 }
                 None
             }
@@ -456,12 +329,17 @@ impl HomeView {
 
     /// Check if on_launch hooks already ran for this session (and consume the flag).
     pub fn take_on_launch_hooks_ran(&mut self, session_id: &str) -> bool {
-        self.on_launch_hooks_ran.remove(session_id)
+        self.on_launch_hooks_ran
+            .remove(session_id)
+            .is_some_and(|origin| {
+                self.get_instance(session_id)
+                    .is_some_and(|row| origin.matches(row))
+            })
     }
 
     /// Check if there's a pending creation operation
     pub fn is_creation_pending(&self) -> bool {
-        self.creation_poller.is_pending()
+        self.creation_poller.is_pending() || self.creating_stub_id.is_some()
     }
 
     /// Check if the currently selected session is the in-flight creating stub
@@ -500,14 +378,15 @@ impl HomeView {
         );
     }
 
-    /// Persist `confirm_before_quit = false` and update the cached flag, when the user
-    /// ticks "don't warn me again" in the quit dialog.
+    /// Queue the quit opt-out; the cached flag changes only after its durable ACK.
     pub(in crate::tui) fn disable_confirm_before_quit(&mut self) {
-        self.confirm_before_quit = false;
-        if let Err(e) = update_config(|config| {
-            config.session.confirm_before_quit = false;
-        }) {
-            tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+        if let Err(error) = self.enqueue_transaction(
+            persistence_transactions::TransactionRequest::DisableQuitConfirmation,
+            super::persistence_worker::SaveSnapshot {
+                profiles: Vec::new(),
+            },
+        ) {
+            self.cancel_persistence_quit(format!("Quit preference was not admitted: {error:#}"));
         }
     }
 
@@ -531,12 +410,9 @@ impl HomeView {
         }
     }
 
-    /// Clean up a pending creation on shutdown, waiting briefly for the background thread
-    /// so worktrees and instances can be cleaned up. If it does not finish in time the hook
-    /// subprocess completes on its own and orphaned Creating stubs are cleaned up on the
-    /// next launch.
+    /// Cancel publication without discarding original creation ownership.
     pub fn cleanup_pending_creation(&mut self) {
-        if !self.creation_poller.is_pending() {
+        if !self.is_creation_pending() {
             return;
         }
         if let Some(cancel) = self.creation_cancel.take() {
@@ -561,6 +437,80 @@ impl HomeView {
             {
                 tracing::warn!(target: "tui.home", session_id = %instance.id, "Cancelled creation ownership remains retained on exit");
             }
+        }
+    }
+}
+
+impl HomeView {
+    pub(super) fn prompt_creation_recovery(
+        &mut self,
+        action: persistence_transactions::CreationRecoveryAction,
+    ) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let result = (|| {
+            let row = self.capture_transaction_row(&id)?;
+            anyhow::ensure!(
+                row.before.status == Status::Creating,
+                "Only a Creating row can resolve its retained original creation"
+            );
+            let cancel = (self.creating_stub_id.as_deref() == Some(id.as_str()))
+                .then(|| self.creation_cancel.clone())
+                .flatten();
+            self.request_transaction(
+                persistence_transactions::TransactionRequest::ResolveCreation {
+                    row,
+                    action,
+                    cancel,
+                },
+            )
+        })();
+        if let Err(error) = result {
+            self.info_dialog = Some(InfoDialog::new(
+                "Creation recovery unavailable",
+                &format!("{error:#}"),
+            ));
+        }
+    }
+    pub(super) fn prompt_claim_abort(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let result = self.capture_transaction_row(&id).and_then(|row| {
+            self.request_transaction(
+                persistence_transactions::TransactionRequest::PrepareClaimAbort(row),
+            )
+        });
+        if let Err(error) = result {
+            self.info_dialog = Some(InfoDialog::new(
+                "Intent metadata abort unavailable",
+                &format!("{error:#}"),
+            ));
+        }
+    }
+    pub(super) fn submit_creation_confirmation(&mut self) {
+        if let Some(selection) = self.pending_claim_abort_confirmation.take() {
+            if let Err(error) = self.request_transaction(
+                persistence_transactions::TransactionRequest::AbortClaim(selection),
+            ) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Intent metadata abort failed",
+                    &format!("{error:#}"),
+                ));
+            }
+            return;
+        }
+        let Some(confirmation) = self.pending_creation_confirmation.take() else {
+            return;
+        };
+        if let Err(error) = self.request_transaction(
+            persistence_transactions::TransactionRequest::RecoverCreation(confirmation),
+        ) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Creation recovery failed",
+                &format!("{error:#}"),
+            ));
         }
     }
 }

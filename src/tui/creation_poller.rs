@@ -40,10 +40,14 @@ pub enum CreationResult {
 }
 
 pub struct CreationOutcome {
+    /// Routing identity captured from the admitted request, including errors.
+    pub session_id: String,
     pub storage: std::sync::Arc<crate::session::Storage>,
     pub result: CreationResult,
     /// Cancellation raced the worker result; unpublished ownership remains retained.
     pub cancelled: bool,
+    /// The admitted request's original token, including late cancellation races.
+    pub cancel: CancellationToken,
 }
 
 pub struct CreationPoller {
@@ -52,6 +56,7 @@ pub struct CreationPoller {
         CreationResult,
         CancellationToken,
         std::sync::Arc<crate::session::Storage>,
+        String,
     )>,
     progress_rx: mpsc::Receiver<HookProgress>,
     progress_tx: mpsc::Sender<HookProgress>,
@@ -77,6 +82,7 @@ impl CreationPoller {
             CreationResult,
             CancellationToken,
             std::sync::Arc<crate::session::Storage>,
+            String,
         )>();
         let (progress_tx, progress_rx) = mpsc::channel::<HookProgress>();
 
@@ -84,8 +90,9 @@ impl CreationPoller {
             while let Ok((request, prog_tx)) = request_rx.recv() {
                 let cancel = request.cancel.clone();
                 let storage = std::sync::Arc::clone(&request.storage);
+                let session_id = request.admitted_instance.id.clone();
                 let result = Self::create_instance(request, &prog_tx);
-                if let Err(undelivered) = result_tx.send((result, cancel, storage)) {
+                if let Err(undelivered) = result_tx.send((result, cancel, storage, session_id)) {
                     if let CreationResult::Success { instance, .. } = &undelivered.0 .0 {
                         tracing::warn!(target: "tui.create", session_id = %instance.id, "Creation receiver closed; durable ownership and resources remain retained");
                     }
@@ -108,6 +115,15 @@ impl CreationPoller {
         request: CreationRequest,
         progress_tx: &mpsc::Sender<HookProgress>,
     ) -> CreationResult {
+        let custody = match builder::CreationCustody::register(
+            request.storage.clone(),
+            &request.admitted_instance,
+        ) {
+            Ok(custody) => custody,
+            Err(error) => {
+                return CreationResult::Error(format!("Creation admission failed: {error:#}"))
+            }
+        };
         if let Err(error) = request.storage.verify_profile_identity() {
             return CreationResult::Error(format!("Creation profile was replaced: {error:#}"));
         }
@@ -161,13 +177,23 @@ impl CreationPoller {
             ));
         }
         let cancelled = |instance: &Instance| {
-            CreationResult::Error(format!("Creation cancelled; session {} and its resources at {} are retained because original owner quiescence is unproven.", instance.id, instance.project_path))
+            let error = builder::finish_failed_creation(
+                &request.storage,
+                instance,
+                anyhow::anyhow!("Creation cancelled"),
+            );
+            CreationResult::Error(format!("{error:#}"))
         };
         let failed = |instance: &Instance, message: String| {
             if cancel.is_cancelled() {
                 return cancelled(instance);
             }
-            CreationResult::Error(format!("{message}\nSession {} and its resources at {} are retained because original owner quiescence is unproven.", instance.id, instance.project_path))
+            let error = builder::finish_failed_creation(
+                &request.storage,
+                instance,
+                anyhow::anyhow!(message),
+            );
+            CreationResult::Error(format!("{error:#}"))
         };
         if cancel.is_cancelled() {
             return cancelled(&instance);
@@ -196,24 +222,26 @@ impl CreationPoller {
                 if cancel.is_cancelled() {
                     return cancelled(&instance);
                 }
-                if let Some(ref sandbox) = instance.sandbox_info {
-                    let workdir = instance.container_workdir();
-                    if let Err(e) = repo_config::execute_hooks_in_container_streamed(
+                if instance.sandbox_info.is_some() {
+                    if let Err(e) = repo_config::execute_creating_hooks_in_container(
+                        &creation_intent,
+                        &instance,
                         &hooks.hooks().on_create,
-                        &sandbox.container_name,
-                        &workdir,
-                        progress_tx,
+                        Some(progress_tx),
                         &hook_env,
+                        Some(&cancel),
                     ) {
                         tracing::warn!(target: "session.create", "on_create hook failed in container: {:#}", e);
                         return failed(&instance, on_create_error(&e, hooks));
                     }
                 }
-            } else if let Err(e) = repo_config::execute_hooks_streamed(
+            } else if let Err(e) = repo_config::execute_creating_hooks(
+                &creation_intent,
                 &hooks.hooks().on_create,
                 std::path::Path::new(&instance.project_path),
-                progress_tx,
+                Some(progress_tx),
                 &hook_env,
+                Some(&cancel),
             ) {
                 return failed(&instance, on_create_error(&e, hooks));
             }
@@ -249,25 +277,25 @@ impl CreationPoller {
                         }
                     }
                 }
-                if container_started {
-                    if let Some(ref sandbox) = instance.sandbox_info {
-                        let workdir = instance.container_workdir();
-                        if let Err(e) = repo_config::execute_hooks_in_container_streamed(
-                            &hooks.hooks().on_launch,
-                            &sandbox.container_name,
-                            &workdir,
-                            progress_tx,
-                            &hook_env,
-                        ) {
-                            tracing::warn!(target: "session.create", "on_launch hook failed in container: {}", e);
-                        }
+                if container_started && instance.sandbox_info.is_some() {
+                    if let Err(e) = repo_config::execute_creating_hooks_in_container(
+                        &creation_intent,
+                        &instance,
+                        &hooks.hooks().on_launch,
+                        Some(progress_tx),
+                        &hook_env,
+                        Some(&cancel),
+                    ) {
+                        tracing::warn!(target: "session.create", "on_launch hook failed in container: {}", e);
                     }
                 }
-            } else if let Err(e) = repo_config::execute_hooks_streamed(
+            } else if let Err(e) = repo_config::execute_creating_hooks(
+                &creation_intent,
                 &hooks.hooks().on_launch,
                 std::path::Path::new(&instance.project_path),
-                progress_tx,
+                Some(progress_tx),
                 &hook_env,
+                Some(&cancel),
             ) {
                 tracing::warn!(target: "session.create", "on_launch hook failed: {}", e);
             }
@@ -280,6 +308,16 @@ impl CreationPoller {
             if let Err(e) = instance.get_container_until_cancelled(&cancel) {
                 return failed(&instance, format!("{:#}", e));
             }
+        }
+        if let Err(error) = custody.retain_ready(builder::CreationReady {
+            instance: instance.clone(),
+            warnings: warnings.clone(),
+            on_launch_hooks_ran: has_on_launch,
+        }) {
+            return failed(
+                &instance,
+                format!("Retaining prepared creation failed: {error:#}"),
+            );
         }
         if cancel.is_cancelled() {
             return cancelled(&instance);
@@ -329,16 +367,17 @@ impl CreationPoller {
         }
     }
 
-    pub fn request_creation(&mut self, request: CreationRequest) {
-        if self
-            .request_tx
+    pub fn request_creation(&mut self, request: CreationRequest) -> anyhow::Result<()> {
+        builder::CreationCustody::register(request.storage.clone(), &request.admitted_instance)?;
+        self.request_tx
             .send((request, self.progress_tx.clone()))
-            .is_err()
-        {
-            tracing::error!(target: "session.create", "Failed to send creation request: receiver thread died");
-        } else {
-            self.in_flight += 1;
-        }
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Creation worker receiver closed; original admission remains retained"
+                )
+            })?;
+        self.in_flight += 1;
+        Ok(())
     }
 
     pub fn try_recv_result(&mut self) -> Option<CreationOutcome> {
@@ -356,14 +395,17 @@ impl CreationPoller {
             CreationResult,
             CancellationToken,
             std::sync::Arc<crate::session::Storage>,
+            String,
         )>,
     ) -> Option<CreationOutcome> {
-        let (result, cancel, storage) = received?;
+        let (result, cancel, storage, session_id) = received?;
         self.in_flight = self.in_flight.saturating_sub(1);
         Some(CreationOutcome {
+            session_id,
             storage,
             result,
             cancelled: cancel.is_cancelled(),
+            cancel,
         })
     }
 
@@ -379,5 +421,181 @@ impl CreationPoller {
 impl Default for CreationPoller {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod hosted_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn finish_driver(handle: std::thread::JoinHandle<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("creation driver did not retire by the completion deadline")
+            .expect("creation driver panicked");
+    }
+
+    fn scratch_request(
+        storage: std::sync::Arc<crate::session::Storage>,
+        cancel: CancellationToken,
+    ) -> CreationRequest {
+        CreationRequest {
+            storage,
+            admitted_instance: Instance::new("hosted retained", ""),
+            data: NewSessionData {
+                profile: "default".into(),
+                title: "hosted retained".into(),
+                title_typed: true,
+                path: String::new(),
+                group: String::new(),
+                tool: "claude".into(),
+                worktree_enabled: false,
+                worktree_branch: None,
+                create_new_branch: false,
+                base_branch: None,
+                extra_repo_paths: Vec::new(),
+                sandbox: false,
+                sandbox_image: "ubuntu:latest".into(),
+                yolo_mode: false,
+                extra_env: Vec::new(),
+                extra_args: String::new(),
+                command_override: String::new(),
+                scratch: true,
+                fork_seed: None,
+                structured: false,
+            },
+            existing_instances: Vec::new(),
+            hooks: ResolvedHooks::global("default"),
+            cancel,
+        }
+    }
+
+    #[test]
+    #[ignore = "real native Creating proof, hosted Linux/macOS only"]
+    #[serial_test::serial]
+    fn hosted_creating_lost_receiver_and_late_cancel_retry_without_effects() {
+        crate::session::test_support::require_hosted_creating_native();
+        for drop_receiver in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let _home_guard = crate::session::test_support::isolate_home(home.path());
+            let count = home.path().join("effects-count");
+            let _count_env =
+                crate::session::test_support::EnvGuard::set(&[("AOE_HOSTED_COUNT", &count)]);
+            let app = crate::session::get_app_dir().unwrap();
+            std::fs::create_dir_all(&app).unwrap();
+            let hooks = crate::session::config::repo_config::HooksConfig {
+                on_create: vec!["printf 'once\\n' >> \"$AOE_HOSTED_COUNT\"".into()],
+                ..Default::default()
+            };
+            std::fs::write(
+                app.join("config.toml"),
+                format!("[hooks]\n{}", toml::to_string(&hooks).unwrap()),
+            )
+            .unwrap();
+            let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+            let storage =
+                std::sync::Arc::new(crate::session::Storage::new_unwatched("default").unwrap());
+            let cancel = CancellationToken::new();
+            let request = scratch_request(storage.clone(), cancel.clone());
+            assert!(
+                request.hooks.is_some(),
+                "the real global hook must be resolved"
+            );
+            let id = request.admitted_instance.id.clone();
+            let dob = request.admitted_instance.created_at;
+            let mut poller = CreationPoller::new();
+            poller.request_creation(request).unwrap();
+            if drop_receiver {
+                let CreationPoller {
+                    request_tx,
+                    result_rx,
+                    progress_rx,
+                    progress_tx,
+                    _handle,
+                    ..
+                } = poller;
+                drop(result_rx);
+                drop(progress_rx);
+                drop(progress_tx);
+                drop(request_tx);
+                finish_driver(_handle);
+            } else {
+                let outcome = poller
+                    .recv_result_timeout(std::time::Duration::from_secs(30))
+                    .expect("actual native worker did not produce a causal completion");
+                assert!(
+                    matches!(outcome.result, CreationResult::Success { .. }),
+                    "actual creation failed: {:?}",
+                    outcome.result
+                );
+                assert!(!outcome.cancelled);
+                cancel.cancel();
+                assert!(outcome.cancel.is_cancelled());
+                let CreationPoller {
+                    request_tx,
+                    result_rx,
+                    progress_rx,
+                    progress_tx,
+                    _handle,
+                    ..
+                } = poller;
+                drop(result_rx);
+                drop(progress_rx);
+                drop(progress_tx);
+                drop(request_tx);
+                finish_driver(_handle);
+            }
+            let custody = builder::CreationCustody::retained()
+                .into_iter()
+                .find(|original| original.session_id() == id)
+                .unwrap();
+            let ready = custody
+                .ready()
+                .expect("driver retains actual completed result independently of observer");
+            let row = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            let generation = row.lifecycle_generation;
+            let journal = serde_json::to_value(&row.runner_journal).unwrap();
+            assert!(!journal["creations"].as_array().unwrap().is_empty());
+            assert!(
+                journal["creations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|record| record["effect_acknowledged"] == true),
+                "observer loss must retain actual producer acknowledgements"
+            );
+            assert!(row.lifecycle_reservation.is_some());
+            assert!(PathBuf::from(&ready.instance.project_path).is_dir());
+            assert_eq!(std::fs::read(&count).unwrap(), b"once\n");
+            assert!(custody
+                .matches_original(&storage, &id, dob, generation)
+                .unwrap());
+            let committed = custody.retry_publication().unwrap();
+            assert_eq!(committed.lifecycle_generation, generation);
+            assert!(committed.lifecycle_reservation.is_none());
+            let published_journal = serde_json::to_value(&committed.runner_journal).unwrap();
+            assert_eq!(published_journal["creations"], journal["creations"]);
+            assert_eq!(
+                published_journal["create_coverage"],
+                journal["create_coverage"]
+            );
+            assert_eq!(custody.retry_publication().unwrap().id, id);
+            assert_eq!(
+                std::fs::read(&count).unwrap(),
+                b"once\n",
+                "publication retry reran native effects"
+            );
+            assert!(PathBuf::from(&committed.project_path).is_dir());
+            println!("hosted Creating: dropped receiver={drop_receiver}, late-cancel={}, same-g retry, exactly one original hook effect", cancel.is_cancelled());
+        }
     }
 }

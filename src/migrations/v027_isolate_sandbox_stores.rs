@@ -314,6 +314,16 @@ pub(crate) fn migrate_instance(id: &str) -> Result<()> {
     )
 }
 
+/// Caller retains both namespaces' actual workspace fences; never reacquire them.
+pub(crate) fn migrate_instance_under_workspace_locks(id: &str) -> Result<()> {
+    reconcile_scoped_with_workspace(
+        false,
+        Some(id),
+        &batched_running_probe(false),
+        &reap_migrated_container,
+        true,
+    )
+}
 /// [`migrate_instance`] with the container probes injected, so a test can
 /// drive the launch-time move end to end with no container runtime.
 #[cfg(test)]
@@ -334,6 +344,16 @@ fn reconcile_scoped(
     is_running: &RunningProbe<'_>,
     reap: &ReapProbe<'_>,
 ) -> Result<()> {
+    reconcile_scoped_with_workspace(announce, only, is_running, reap, false)
+}
+
+fn reconcile_scoped_with_workspace(
+    announce: bool,
+    only: Option<&str>,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+    workspace_held: bool,
+) -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     if !transition_may_be_pending(&app_dir, !announce && only.is_none())? {
         return Ok(());
@@ -346,14 +366,14 @@ fn reconcile_scoped(
         position: 1,
         total: 1,
     });
-    run_in(
+    run_in_with_workspace(
         &app_dir,
         &home,
         is_running,
         reap,
         defer_requested() || (!announce && only.is_none()),
         announce,
-        only,
+        (only, workspace_held),
     )?;
     progress::report(progress::Event::Finished {
         version: 27,
@@ -469,22 +489,47 @@ fn run_in(
     announce: bool,
     only: Option<&str>,
 ) -> Result<()> {
+    run_in_with_workspace(
+        app_dir,
+        home,
+        is_running,
+        reap,
+        defer_stores,
+        announce,
+        (only, false),
+    )
+}
+
+fn run_in_with_workspace(
+    app_dir: &Path,
+    home: &Path,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+    defer_stores: bool,
+    announce: bool,
+    (only, workspace_held): (Option<&str>, bool),
+) -> Result<()> {
     progress::step("reading session registries");
     fs::create_dir_all(app_dir)?;
     // A scoped pass that finds its cohort mid-transition in another process
     // waits for that pass and looks again; the row is then usually current.
     for _ in 0..SCOPED_RETRIES {
-        match run_pass(
+        match run_pass_with_workspace(
             app_dir,
             home,
             is_running,
             reap,
             defer_stores,
             announce,
-            only,
+            (only, workspace_held),
         )? {
             PassOutcome::Done => return Ok(()),
             PassOutcome::WaitFor(root) => {
+                anyhow::ensure!(
+                    !workspace_held,
+                    "sandbox store {} is moving; release original admission and retry",
+                    root.display()
+                );
                 progress::step(format!(
                     "waiting for another process to finish moving {}",
                     root.display()
@@ -513,14 +558,13 @@ enum PassOutcome {
     WaitFor(PathBuf),
 }
 
-/// The lock a pass holds on one legacy root while it copies and publishes the
-/// stores under it. Per root rather than global, so a copy that takes minutes
-/// blocks neither registry writes nor moves under other roots; the transition
-/// lock covers only planning and publishing.
+/// The lock a pass holds on one legacy root while it copies and publishes its
+/// stores. Planning and publication retain workspace before transition and
+/// registry fences. Copying releases transition/registry; its physical mutation
+/// retains workspace so a metadata abort cannot revoke the source owner midway.
 ///
-/// Lock order is cohort, then transition, then registry. A holder of the
-/// transition lock therefore never waits for a cohort lock: `run_pass` only
-/// tries it, and leaves a busy root pending.
+/// Blocking cohort acquisition precedes workspace. A workspace/transition holder
+/// only tries cohorts; borrowed native admission never waits on a held cohort.
 fn cohort_lock_name(root: &Path) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
@@ -567,10 +611,11 @@ fn copy_gate(root: &Path) {
     #[cfg(not(test))]
     let _ = root;
 }
-
-/// One pass over the registries: plan under the transition and registry
-/// locks, copy under the cohort locks alone, then reacquire the former,
-/// revalidate the plan against the registries as they are now, and publish.
+/// One pass over the registries: plan under workspace, transition and registry
+/// fences, then release transition/registry for the copy. Each physical store
+/// mutation holds workspace after the copy seam, and publication reacquires
+/// workspace before transition to revalidate the combined ownership inventory.
+#[cfg(test)]
 fn run_pass(
     app_dir: &Path,
     home: &Path,
@@ -580,6 +625,32 @@ fn run_pass(
     announce: bool,
     only: Option<&str>,
 ) -> Result<PassOutcome> {
+    run_pass_with_workspace(
+        app_dir,
+        home,
+        is_running,
+        reap,
+        defer_stores,
+        announce,
+        (only, false),
+    )
+}
+
+fn run_pass_with_workspace(
+    app_dir: &Path,
+    home: &Path,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+    defer_stores: bool,
+    announce: bool,
+    (only, workspace_held): (Option<&str>, bool),
+) -> Result<PassOutcome> {
+    let mut workspace_locks = if workspace_held {
+        None
+    } else {
+        Some(lock_workspace_namespaces(app_dir)?)
+    };
+    ensure_no_retained_owners(app_dir)?;
     let mut transition_lock = Some(crate::session::acquire_storage_flock(app_dir, LOCK)?);
     let planned_paths = registry_paths(app_dir)?;
     let registry_dirs = registry_dirs_of(&planned_paths);
@@ -966,11 +1037,12 @@ fn run_pass(
                 }
             }
         }
-        // Copies must not hold the transition lock: `Storage::update` takes
-        // it shared in every profile, so a copy under it stalls unrelated
-        // session and group writes for its whole duration.
+        // Copies do not retain transition/registry fences. Their individual
+        // physical mutations retain workspace, so metadata abort cannot append
+        // an exclusion in the middle of changing that owner's store.
         registry_locks = None;
         transition_lock = None;
+        workspace_locks = None;
     }
     let wait_for = only.and_then(|wanted| {
         cohorts
@@ -1007,6 +1079,12 @@ fn run_pass(
             if gated_roots.insert(root.clone()) {
                 copy_gate(root);
             }
+            let _workspace = if workspace_held {
+                None
+            } else {
+                Some(lock_workspace_namespaces(app_dir)?)
+            };
+            ensure_no_retained_owners(app_dir)?;
             // Reaped before the move: a rename leaves no source for a
             // container that came up since the probe, and nothing can put one
             // back. Removing without force fails on a live container.
@@ -1106,6 +1184,12 @@ fn run_pass(
             if gated_roots.insert(target.cleanup_root.clone()) {
                 copy_gate(&target.cleanup_root);
             }
+            let _workspace = if workspace_held {
+                None
+            } else {
+                Some(lock_workspace_namespaces(app_dir)?)
+            };
+            ensure_no_retained_owners(app_dir)?;
             if !publish_store(
                 shared,
                 &target.private,
@@ -1136,6 +1220,10 @@ fn run_pass(
     // registries and a fresh liveness answer: rows may have changed and a
     // container may have come up during the copy.
     if transition_lock.is_none() {
+        if !workspace_held {
+            workspace_locks = Some(lock_workspace_namespaces(app_dir)?);
+        }
+        ensure_no_retained_owners(app_dir)?;
         transition_lock = Some(crate::session::acquire_storage_flock(app_dir, LOCK)?);
         // A profile created during the copy is locked too, since every
         // registry read below is written back.
@@ -1146,7 +1234,12 @@ fn run_pass(
         dirs.dedup();
         registry_locks = Some(lock_registry_dirs(&dirs)?);
     }
-    let _held = (transition_lock, registry_locks, cohort_locks);
+    let _held = (
+        workspace_locks,
+        transition_lock,
+        registry_locks,
+        cohort_locks,
+    );
     refresh_liveness();
     let mut fresh = load_registries(app_dir)?;
     let fresh_ids_by_root = collect_row_ids_by_root(&fresh, app_dir, home)?;
@@ -1358,6 +1451,50 @@ fn run_pass(
         Some(root) => PassOutcome::WaitFor(root),
         None => PassOutcome::Done,
     })
+}
+
+/// Retained ownership and live profile rows share the actual workspace fences.
+/// Acquire both build namespaces in stable order, always before transition locks.
+pub(super) fn lock_workspace_namespaces(
+    app_dir: &Path,
+) -> Result<Vec<crate::session::StorageFlock>> {
+    let mut namespaces = vec![app_dir.to_path_buf()];
+    if let Some(sibling) = crate::session::sibling_namespace_app_dir() {
+        namespaces.push(sibling);
+    }
+    for namespace in &mut namespaces {
+        fs::create_dir_all(&*namespace)?;
+        *namespace = fs::canonicalize(&*namespace)?;
+    }
+    namespaces.sort();
+    namespaces.dedup();
+    namespaces
+        .iter()
+        .map(|namespace| crate::session::acquire_session_workspace_claim_lock_in(namespace))
+        .collect()
+}
+
+/// A caller borrowing workspace must never wait for a cohort held by a mover
+/// that needs that workspace to publish.
+pub(super) fn try_lock_cohort_under_workspace(
+    app_dir: &Path,
+    root: &Path,
+) -> Result<Option<crate::session::StorageFlock>> {
+    try_acquire_cohort_lock(app_dir, root)
+}
+
+/// IDs are immutable exclusions, not rows from which native authority may be built.
+/// With only an ID inventory the removed owner's custom/shared roots are unknown;
+/// no physical migration may prove those roots unclaimed by ignoring that owner.
+pub(super) fn ensure_no_retained_owners(app_dir: &Path) -> Result<()> {
+    let sibling = crate::session::sibling_namespace_app_dir();
+    for namespace in std::iter::once(app_dir).chain(sibling.as_deref()) {
+        anyhow::ensure!(
+            crate::session::retained_intents::retained_ids_in(namespace)?.is_empty(),
+            "retained intent resources and exclusions remain protected; sandbox stores cannot be migrated"
+        );
+    }
+    Ok(())
 }
 
 fn registry_dirs_of(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -2295,6 +2432,72 @@ fn sync_parent(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    #[serial_test::serial]
+    fn retained_owner_refuses_layout_and_content_migration_before_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::retained_intents::initialize_legacy_in(&app).unwrap();
+        let home = dirs::home_dir().unwrap();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut owner = crate::session::Instance::new("retained", "/original");
+        owner.runner_journal = Default::default();
+        owner.status = crate::session::Status::Creating;
+        owner
+            .try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Create,
+                crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        owner.lifecycle_reservation.as_mut().unwrap().path_claims =
+            crate::session::WorktreePathClaims::Unknown(None);
+        fs::write(
+            storage.sessions_path(),
+            serde_json::to_vec(&vec![&owner]).unwrap(),
+        )
+        .unwrap();
+        let selected = crate::session::retained_intents::capture(&storage, &owner.id).unwrap();
+        crate::session::retained_intents::abort(&selected).unwrap();
+        let source = home.join(".gemini/sandbox");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("original"), b"ORIGINAL").unwrap();
+        let before = fs::read(storage.sessions_path()).unwrap();
+        assert!(run_pass(
+            &app,
+            &home,
+            &|_| panic!("retained owner reached a native liveness probe"),
+            &|_| panic!("retained owner reached container retirement"),
+            false,
+            false,
+            None,
+        )
+        .is_err());
+        assert!(
+            super::super::v033_isolate_sandbox_content::ensure_fresh_content(
+                &app,
+                &home,
+                &owner.id,
+                "gemini",
+                &[],
+                &crate::session::Config::default(),
+                Path::new("/original"),
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::v033_isolate_sandbox_content::retain_legacy_original(
+                &source,
+                source.parent().unwrap(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(source.join("original")).unwrap(), b"ORIGINAL");
+        assert_eq!(fs::read(storage.sessions_path()).unwrap(), before);
+        assert!(!app.join(JOURNAL).exists());
+    }
 
     /// [`super::run_in`] with every container reported reaped, which is what
     /// each case below assumes unless it drives the probe itself. Shadowing

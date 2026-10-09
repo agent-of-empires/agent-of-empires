@@ -88,10 +88,11 @@ impl Owned {
                 .as_ref()
                 .map(|lease| &lease.path_claims)
             {
-                Some(crate::session::WorktreePathClaims::Pending(paths)) => {
+                Some(crate::session::WorktreePathClaims::Pending(paths))
+                | Some(crate::session::WorktreePathClaims::Unknown(Some(paths))) => {
                     dirs.extend(paths.iter().cloned())
                 }
-                Some(crate::session::WorktreePathClaims::Unknown) => {
+                Some(crate::session::WorktreePathClaims::Unknown(None)) => {
                     anyhow::bail!("filesystem intent is unknown for session {}", instance.id)
                 }
                 _ => {}
@@ -264,7 +265,7 @@ mod tests {
             .lifecycle_reservation
             .as_mut()
             .unwrap()
-            .path_claims = crate::session::WorktreePathClaims::Unknown;
+            .path_claims = crate::session::WorktreePathClaims::Unknown(None);
         assert!(Owned::new(&unknown, Vec::new()).is_err());
         let plain = Instance::new("external", home.path().to_str().unwrap());
         let owned = Owned::new(&[plain], Vec::new()).unwrap();

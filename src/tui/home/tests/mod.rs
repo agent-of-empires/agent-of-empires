@@ -1,6 +1,5 @@
 //! Tests for HomeView
 
-use super::watchers::ConfigWatchKey;
 use super::{ConfigRefreshOrigin, HomeView, PreviewSelection, ViewMode};
 use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
 use crate::session::{
@@ -14,15 +13,56 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
+/// Observe actual worker ACKs, including failure, rather than treating enqueue as persistence.
+pub(super) fn drain_persistence(view: &mut HomeView) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !view.persistence_is_idle() {
+        view.apply_persistence_results();
+        anyhow::ensure!(
+            !view.persistence_has_failed(),
+            "Persistence worker failed before acknowledgement"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Persistence acknowledgement timed out"
+        );
+        std::thread::yield_now();
+    }
+    let mut failure = None;
+    while let Some(result) = view.persistence.acknowledgements.pop_front() {
+        if let Err(error) = result {
+            failure = Some(error);
+        }
+    }
+    match failure {
+        Some(error) => Err(anyhow::anyhow!(error)),
+        None => Ok(()),
+    }
+}
+fn await_transaction_result(
+    view: &mut HomeView,
+    submitted: anyhow::Result<super::TransactionDisposition>,
+) -> anyhow::Result<()> {
+    submitted?;
+    drain_persistence(view)
+}
+
 fn remove_test_instance(view: &mut HomeView, id: &str) {
     if let Some(instance) = view.instances.shift_remove(id) {
         if let Some(pending) = view.pending_added.get_mut(&instance.source_profile) {
             pending.remove(id);
         }
+        let token = view.record_row_edit(&instance.source_profile, id);
         view.pending_deletions
             .entry(instance.source_profile)
             .or_default()
-            .insert(id.to_owned());
+            .insert(
+                id.to_string(),
+                super::persistence_worker::RowDeletion {
+                    revision: token,
+                    created_at: instance.created_at,
+                },
+            );
     }
 }
 
@@ -122,8 +162,9 @@ fn wait_for_native_fixture<T>(what: &str, mut probe: impl FnMut() -> Option<T>) 
 
 fn finish_runner_settlements(view: &mut HomeView) {
     wait_for_native_fixture("runner settlement callbacks", || {
+        view.apply_persistence_results();
         view.apply_settlement_results();
-        view.settlement_in_flight.is_empty().then_some(())
+        (view.settlement_in_flight.is_empty() && view.persistence_is_idle()).then_some(())
     });
 }
 /// State-only fixtures use this without claiming a prepared input transport.
@@ -313,12 +354,14 @@ fn test_home() -> (TempDir, AppDirGuard) {
 }
 
 fn test_view(profile: Option<&str>) -> HomeView {
-    HomeView::new_for_test(
+    let mut view = HomeView::new_for_test(
         profile.map(str::to_string),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
     )
-    .unwrap()
+    .unwrap();
+    drain_persistence(&mut view).unwrap();
+    view
 }
 
 /// Persist `instances` (with derived groups) to `profile`.
@@ -410,34 +453,16 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
     seeded_env(test_home(), &instances, true)
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[serial]
-async fn config_watch_keys_distinguish_global_from_profile_named_global() {
-    let (_temp, _guard) = test_home();
-    let profile_name = "<global>";
-    // Outside the create grammar, so lay the legacy directory down directly.
-    let profile_dir = crate::session::get_app_dir()
-        .unwrap()
-        .join("profiles")
-        .join(profile_name);
-    std::fs::create_dir_all(&profile_dir).unwrap();
-    let _storage = Storage::open_unwatched(profile_name).unwrap();
-    let view = HomeView::new_for_test(
-        Some(profile_name.to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::new().unwrap(),
-    )
-    .unwrap();
-
-    assert_eq!(view.config_watch.handles.len(), 2);
-    assert!(view
-        .config_watch
-        .handles
-        .contains_key(&ConfigWatchKey::Global));
-    assert!(view
-        .config_watch
-        .handles
-        .contains_key(&ConfigWatchKey::profile(profile_name)));
+pub(super) async fn wait_persistence(view: &mut HomeView) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !view.persistence_is_idle() {
+        view.apply_persistence_results();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "persistence did not acknowledge its work"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Render once off-screen so geometry fields (`list_inner_area`, `shelf_inner_area`) are real.
@@ -659,8 +684,13 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
 fn drain_creation_result(view: &mut HomeView) -> Option<String> {
     let start = std::time::Instant::now();
     loop {
-        if let Some(id) = view.apply_creation_results() {
-            return Some(id);
+        view.apply_persistence_results();
+        if let Some(ack) = view.apply_creation_results() {
+            assert!(
+                ack.matches(view),
+                "creation publication ACK must match its actual original row"
+            );
+            return Some(ack.session_id().to_owned());
         }
         if !view.is_creation_pending() {
             return None;

@@ -83,9 +83,7 @@ pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
 #[cfg(test)]
 pub(crate) use test_helpers::install_aliases;
-pub(crate) use tmux_session::{
-    duplicate_session_error, find_duplicate_session, is_duplicate_session, AgentSeed,
-};
+pub(crate) use tmux_session::{duplicate_session_error, is_duplicate_session, AgentSeed};
 
 /// Why a session can never resume, decided from the registry before any runtime probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
