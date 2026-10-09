@@ -33,20 +33,14 @@ pub(super) fn is_transcript_event(event: &Event) -> bool {
             // create a running record with nothing to ever complete it.
             | Event::BackgroundAgentLaunched { .. }
             | Event::PromptRuntimeError { .. }
-            // Both halves of a `/compact` cycle are synthesized from
-            // `AgentMessageChunk` text, which is itself dropped here, so
-            // they must drop with their source chunk. Letting the
-            // completion through (the pre-#3219 behavior) re-ran its
-            // side effects on every reattach: a duplicate "conversation
-            // compacted" divider, and on the web a re-based
-            // `usageBaseline` plus a nulled usage snapshot. Its sibling
-            // `PlanUpdated` was already suppressed, so the pair was
-            // internally inconsistent too. A replayed start is worse
-            // still: the reloaded adapter cannot resume that historical
-            // summarization, so the flag would latch with nothing left
-            // to clear it before the turn's own `Stopped`.
+            // A replayed completion would re-run its side effects on every
+            // reattach (a duplicate divider and summary, a re-based web
+            // `usageBaseline`), and a replayed start would latch
+            // `compacting` for a summarization the reloaded adapter cannot
+            // resume (#3219).
             | Event::ConversationCompactionStarted
             | Event::ConversationCompacted
+            | Event::ConversationCompactionSummary { .. }
     )
 }
 
@@ -73,6 +67,7 @@ pub(super) fn transcript_event_kind(event: &Event) -> &'static str {
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         Event::ConversationCompactionStarted => "conversation_compaction_started",
         Event::ConversationCompacted => "conversation_compacted",
+        Event::ConversationCompactionSummary { .. } => "conversation_compaction_summary",
         _ => "other",
     }
 }

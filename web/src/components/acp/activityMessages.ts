@@ -88,6 +88,20 @@ export function activityToThreadMessages(
       });
       continue;
     }
+    // Rendered collapsed by `AssistantText`; summaries run to thousands of chars.
+    if (row.kind === "compaction_summary") {
+      // Empty until the summary arrives; the row only anchors its position.
+      if (!row.text) continue;
+      flushAssistant();
+      messages.push({
+        id: `assistant-${row.id}`,
+        role: "assistant",
+        content: [{ type: "text", text: row.text }],
+        createdAt: parseDate(row.at),
+        ...withCustom("compactionSummary", true),
+      });
+      continue;
+    }
     if (row.kind === "user_prompt") {
       // Images become image parts; other attachments show as a labelled line.
       const parts = [

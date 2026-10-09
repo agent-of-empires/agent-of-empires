@@ -263,6 +263,16 @@ describe("applyEvent control state", () => {
 
     expect(fold(emptyAcpState(), notice("stale"), prompt("next")).sessionNotices).toEqual([]);
 
+    // A keyed notice (a compaction's failure) is replaced in place by a later error.
+    const failed = (description: string): AcpEvent => ({
+      SessionNotice: { severity: "error", title: "Compaction failed", description, key: "compaction-a" },
+    });
+    const keyed = fold(emptyAcpState(), failed("aborted"), notice("b"), failed("out of tokens"));
+    expect(keyed.sessionNotices.map((n) => [n.id, n.description])).toEqual([
+      ["notice-compaction-a", "out of tokens"],
+      ["notice-2", null],
+    ]);
+
     const dismissed = acpHookReducer(fold(emptyAcpState(), notice("a"), notice("b")), {
       kind: "dismiss_session_notice",
       id: "notice-1",
