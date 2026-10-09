@@ -1072,3 +1072,168 @@ fn test_g_key_opens_group_picker() {
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Org);
 }
+
+/// TODO panel (#4325): Ctrl+Y opens it, `a` + text + Enter adds, space toggles,
+/// `d` deletes and clamps the selection onto the remaining item.
+#[test]
+#[serial]
+fn todo_panel_add_toggle_delete_round_trip() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(env.view.todo_panel.is_some(), "Ctrl+Y opens the panel");
+
+    let mut add = |view: &mut HomeView, text: &str| {
+        view.handle_key(key(KeyCode::Char('a')), None);
+        for ch in text.chars() {
+            view.handle_key(key(KeyCode::Char(ch)), None);
+        }
+        view.handle_key(key(KeyCode::Enter), None);
+    };
+    add(&mut env.view, "first");
+    add(&mut env.view, "second");
+    assert_eq!(
+        env.view.todo_items_for_test(&id),
+        vec![("first".to_string(), false), ("second".to_string(), false)]
+    );
+    assert_eq!(env.view.todo_selected_for_test(), Some(1));
+
+    env.view.handle_key(key(KeyCode::Char(' ')), None);
+    assert_eq!(
+        env.view.todo_items_for_test(&id)[1],
+        ("second".to_string(), true)
+    );
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+    assert_eq!(
+        env.view.todo_items_for_test(&id),
+        vec![("first".to_string(), false)]
+    );
+    assert_eq!(env.view.todo_selected_for_test(), Some(0));
+}
+
+/// Ctrl+Y is not stolen from the agent in live mode: with live-send capturing it
+/// passes through and the panel stays closed.
+#[test]
+#[serial]
+fn todo_ctrl_y_passes_through_in_live_send() {
+    use crate::tui::home::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let inst = env.view.instance_at(0).clone();
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    env.view.select_session_by_id(&inst.id);
+    env.view.live_send = Some(LiveSendState {
+        session_id: inst.id.clone(),
+        title: inst.title.clone(),
+        tmux_name,
+        target: LiveSendTarget::Agent,
+        exit_chords: parse_chord_list("C-q"),
+        leader: None,
+    });
+
+    let action = env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(action.is_none());
+    assert!(
+        env.view.todo_panel.is_none(),
+        "Ctrl+Y reaches the agent, not the panel, while live mode captures"
+    );
+    assert!(env.view.live_send.is_some());
+}
+
+/// Open, the panel is a modal overlay: it registers in `has_non_live_send_overlay`
+/// and consumes `q` instead of letting it quit.
+#[test]
+#[serial]
+fn todo_panel_owns_keys_as_overlay() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        None,
+    );
+
+    assert!(
+        env.view.has_non_live_send_overlay(),
+        "an open panel counts as an overlay"
+    );
+    let action = env.view.handle_key(key(KeyCode::Char('q')), None);
+    assert!(action.is_none(), "q is consumed by the panel, not a quit");
+    assert!(env.view.todo_panel.is_some());
+}
+
+/// A bracketed paste while adding goes into the add field, not the pane behind.
+#[test]
+#[serial]
+fn todo_panel_paste_routes_into_add_field() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        None,
+    );
+    env.view.handle_key(key(KeyCode::Char('a')), None);
+    env.view.handle_paste("pasted todo");
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert_eq!(
+        env.view.todo_items_for_test(&id),
+        vec![("pasted todo".to_string(), false)]
+    );
+}
+
+/// With more items than fit, the panel scrolls so the selection stays visible.
+#[test]
+#[serial]
+fn todo_panel_scrolls_to_keep_selection_visible() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        None,
+    );
+
+    let labels: Vec<String> = (0..30).map(|i| format!("todo-{i:02}")).collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    env.view.seed_todos_for_test(&id, &refs);
+    env.view.set_todo_selected_for_test(29);
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    assert!(
+        out.contains("todo-29"),
+        "selected item must be visible\n{out}"
+    );
+    assert!(
+        !out.contains("todo-00"),
+        "the top item must have scrolled off\n{out}"
+    );
+}

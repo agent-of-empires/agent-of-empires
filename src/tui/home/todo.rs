@@ -1,15 +1,20 @@
 //! Per-session manual TODO list, shown as a panel over the preview and toggled
 //! with `Ctrl+Y` from the terminal view (`Ctrl+T` is the strict-mode
-//! quick-attach, so the panel takes the next free chord).
+//! quick-attach, so the panel takes the next free chord). The chord is listed in
+//! the help overlay and in `docs/guides/live-mode.md`.
 //!
 //! The list is the user's own checklist for a session ("what's left / what's
 //! done"), independent of anything the agent tracks. It is keyed by session id
 //! and persisted to `<app_dir>/session-todos.json`, so it survives restarts and
-//! is shared by every aoe build pointed at the same config dir.
+//! is shared by every build pointed at the same config dir. Each edit is a
+//! read-modify-write against that file, so two TUIs on one config dir do not
+//! clobber each other's lists.
 //!
 //! Panel keys: `↑`/`↓` (or `j`/`k`) move, `space`/`Enter` toggle done, `a` adds
 //! an item (type, `Enter` to confirm / `Esc` to cancel), `d` deletes, and `Esc`
-//! or `Ctrl+Y` closes.
+//! or `Ctrl+Y` closes. The panel registers as an overlay (see
+//! `has_non_live_send_overlay` / `has_dialog`), so it owns `q`, paste and the
+//! live-send relay while it is open.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,11 +36,23 @@ pub(super) struct TodoItem {
     pub(super) done: bool,
 }
 
-/// Open-panel state: the highlighted row, and the text field while adding.
+/// Open-panel state.
 pub(super) struct TodoPanel {
+    /// Session this panel edits, captured at open so a mouse click that moves
+    /// `selected_session` underneath never redirects edits to another list.
+    session: String,
     selected: usize,
+    /// First item row shown, followed so the selection stays on screen.
+    scroll: usize,
     /// `Some` while typing a new item; `None` in navigation mode.
     adding: Option<Input>,
+}
+
+impl TodoPanel {
+    /// Whether the panel is in add-an-item (text entry) mode.
+    pub(super) fn is_adding(&self) -> bool {
+        self.adding.is_some()
+    }
 }
 
 fn store_path() -> Option<PathBuf> {
@@ -44,24 +61,58 @@ fn store_path() -> Option<PathBuf> {
         .map(|dir| dir.join("session-todos.json"))
 }
 
-/// Load the whole session→items map from disk, or an empty map on any error
-/// (missing file, bad JSON): the TODO list is best-effort, never fatal.
+/// Load the whole session→items map from disk. A missing file is an empty map;
+/// an unreadable one is set aside as `*.corrupt` and reported, rather than
+/// silently treated as empty and then overwritten.
 pub(super) fn load_store() -> HashMap<String, Vec<TodoItem>> {
     let Some(path) = store_path() else {
         return HashMap::new();
     };
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => {
+            tracing::warn!(target: "tui.home", "could not read {}: {err}", path.display());
+            return HashMap::new();
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(map) => map,
+        Err(err) => {
+            let aside = path.with_extension("corrupt");
+            tracing::warn!(
+                target: "tui.home",
+                "session-todos.json is unreadable ({err}); moving it to {}",
+                aside.display()
+            );
+            let _ = std::fs::rename(&path, &aside);
+            HashMap::new()
+        }
+    }
 }
 
+/// Persist the map by writing a temp file and renaming it over the target, so a
+/// crash mid-write cannot truncate the existing list. Failures are logged, never
+/// panicked.
 fn save_store(store: &HashMap<String, Vec<TodoItem>>) {
     let Some(path) = store_path() else {
         return;
     };
-    if let Ok(json) = serde_json::to_string_pretty(store) {
-        let _ = std::fs::write(path, json);
+    let json = match serde_json::to_string_pretty(store) {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::warn!(target: "tui.home", "could not serialize TODO store: {err}");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(err) = std::fs::write(&tmp, &json) {
+        tracing::warn!(target: "tui.home", "could not write {}: {err}", tmp.display());
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp, &path) {
+        tracing::warn!(target: "tui.home", "could not replace {}: {err}", path.display());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -79,33 +130,66 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 impl super::HomeView {
     /// Toggle the TODO panel for the selected session. Opening needs a selected
-    /// session; otherwise it is a no-op.
+    /// session and refreshes the on-disk store so the newest items show.
     pub(super) fn toggle_todo_panel(&mut self) {
         if self.todo_panel.is_some() {
             self.todo_panel = None;
             return;
         }
-        if self.selected_session.is_none() {
+        let Some(session) = self.selected_session.clone() else {
             return;
-        }
+        };
+        self.session_todos = load_store();
         self.todo_panel = Some(TodoPanel {
+            session,
             selected: 0,
+            scroll: 0,
             adding: None,
         });
     }
 
-    /// Handle a key while the panel is open. Returns `true` when the panel
-    /// consumed the key (always, while open), so the caller stops routing it.
-    pub(super) fn handle_todo_key(&mut self, key: KeyEvent) -> bool {
-        if self.todo_panel.is_none() {
-            return false;
-        }
-        let Some(session_id) = self.selected_session.clone() else {
-            self.todo_panel = None;
-            return true;
-        };
+    /// Number of items in the open panel's session.
+    fn todo_len(&self) -> usize {
+        self.todo_panel
+            .as_ref()
+            .and_then(|p| self.session_todos.get(&p.session))
+            .map_or(0, Vec::len)
+    }
 
-        // Adding mode owns the keyboard: typing goes to the text field.
+    /// Read-modify-write one edit against the on-disk store, then refresh the
+    /// in-memory cache, so a concurrent TUI's edits are merged rather than lost.
+    fn edit_todos(&mut self, edit: impl FnOnce(&mut Vec<TodoItem>)) {
+        let Some(session) = self.todo_panel.as_ref().map(|p| p.session.clone()) else {
+            return;
+        };
+        let mut map = load_store();
+        edit(map.entry(session).or_default());
+        save_store(&map);
+        self.session_todos = map;
+    }
+
+    /// Route a bracketed paste into the add field when the panel is adding.
+    /// Returns `true` when consumed.
+    pub(super) fn todo_panel_handle_paste(&mut self, text: &str) -> bool {
+        if let Some(input) = self.todo_panel.as_mut().and_then(|p| p.adding.as_mut()) {
+            let merged = format!("{}{text}", input.value());
+            *input = Input::new(merged);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Handle a key while the panel is open. The panel owns the keyboard, so
+    /// everything is consumed here.
+    pub(super) fn handle_todo_key(&mut self, key: KeyEvent) {
+        if self.todo_panel.is_none() {
+            return;
+        }
+        let ctrl_y = key.code == KeyCode::Char('y') && key.modifiers == KeyModifiers::CONTROL;
+
+        // Adding mode owns the keyboard: typing goes to the text field, Enter
+        // commits, Esc / Ctrl+Y close.
         if self.todo_panel.as_ref().is_some_and(|p| p.adding.is_some()) {
             match key.code {
                 KeyCode::Enter => {
@@ -116,13 +200,11 @@ impl super::HomeView {
                         .map(|input| input.value().trim().to_string())
                         .unwrap_or_default();
                     if !text.is_empty() {
-                        let items = self.session_todos.entry(session_id).or_default();
-                        items.push(TodoItem { text, done: false });
-                        let last = items.len() - 1;
+                        self.edit_todos(|items| items.push(TodoItem { text, done: false }));
+                        let last = self.todo_len().saturating_sub(1);
                         if let Some(panel) = self.todo_panel.as_mut() {
                             panel.selected = last;
                         }
-                        self.save_todos();
                     }
                 }
                 KeyCode::Esc => {
@@ -130,84 +212,76 @@ impl super::HomeView {
                         panel.adding = None;
                     }
                 }
+                _ if ctrl_y => self.todo_panel = None,
                 _ => {
                     if let Some(input) = self.todo_panel.as_mut().and_then(|p| p.adding.as_mut()) {
                         input.handle_event(&Event::Key(key));
                     }
                 }
             }
-            return true;
+            return;
         }
 
-        let len = self.session_todos.get(&session_id).map_or(0, Vec::len);
+        let len = self.todo_len();
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.todo_panel = None,
-            (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => self.todo_panel = None,
-            (KeyCode::Char('a'), _) => {
+            _ if ctrl_y => self.todo_panel = None,
+            (KeyCode::Char('a'), m) if m.is_empty() => {
                 if let Some(panel) = self.todo_panel.as_mut() {
                     panel.adding = Some(Input::default());
                 }
             }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), _) if len > 0 => {
+            (KeyCode::Down, m) | (KeyCode::Char('j'), m) if m.is_empty() && len > 0 => {
                 if let Some(panel) = self.todo_panel.as_mut() {
                     panel.selected = (panel.selected + 1).min(len - 1);
                 }
             }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+            (KeyCode::Up, m) | (KeyCode::Char('k'), m) if m.is_empty() => {
                 if let Some(panel) = self.todo_panel.as_mut() {
                     panel.selected = panel.selected.saturating_sub(1);
                 }
             }
-            (KeyCode::Char(' '), _) | (KeyCode::Enter, _) => {
+            (KeyCode::Char(' '), m) | (KeyCode::Enter, m) if m.is_empty() => {
                 let sel = self.todo_panel.as_ref().map_or(0, |p| p.selected);
-                if let Some(item) = self
-                    .session_todos
-                    .get_mut(&session_id)
-                    .and_then(|items| items.get_mut(sel))
-                {
-                    item.done = !item.done;
-                    self.save_todos();
-                }
+                self.edit_todos(|items| {
+                    if let Some(item) = items.get_mut(sel) {
+                        item.done = !item.done;
+                    }
+                });
             }
-            (KeyCode::Char('d'), _) => {
+            (KeyCode::Char('d'), m) if m.is_empty() => {
                 let sel = self.todo_panel.as_ref().map_or(0, |p| p.selected);
-                if let Some(items) = self.session_todos.get_mut(&session_id) {
+                self.edit_todos(|items| {
                     if sel < items.len() {
                         items.remove(sel);
                     }
-                    let new_len = items.len();
-                    if let Some(panel) = self.todo_panel.as_mut() {
-                        panel.selected = panel.selected.min(new_len.saturating_sub(1));
-                    }
-                    self.save_todos();
+                });
+                let new_len = self.todo_len();
+                if let Some(panel) = self.todo_panel.as_mut() {
+                    panel.selected = panel.selected.min(new_len.saturating_sub(1));
                 }
             }
             _ => {}
         }
-        true
     }
 
-    fn save_todos(&self) {
-        save_store(&self.session_todos);
-    }
-
-    /// Render the TODO panel centered over `area` (the preview region).
-    pub(super) fn render_todo_panel(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let Some(panel) = self.todo_panel.as_ref() else {
+    /// Render the TODO panel centered over `area` (the preview region), scrolling
+    /// so the selection and the add field stay on screen.
+    pub(super) fn render_todo_panel(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let Some(session) = self.todo_panel.as_ref().map(|p| p.session.clone()) else {
             return;
         };
-        let items = self
-            .selected_session
-            .as_ref()
-            .and_then(|id| self.session_todos.get(id))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        let len = self.session_todos.get(&session).map_or(0, Vec::len);
+        let adding = self.todo_panel.as_ref().is_some_and(|p| p.adding.is_some());
 
-        let adding = panel.adding.is_some();
-        // borders (2) + help row + optional input row, plus one row per item (at
-        // least one so an empty list still shows a hint line).
-        let body_rows = items.len().max(1) as u16 + u16::from(adding);
-        let height = body_rows.saturating_add(4);
+        // Rows below the list: a blank spacer, the help line, and the add field
+        // when active. The panel is capped to the area and scrolls inside.
+        let footer_rows = 2 + u16::from(adding);
+        let max_h = area.height.max(1);
+        let desired = (len.min(u16::MAX as usize) as u16)
+            .saturating_add(footer_rows)
+            .saturating_add(2); // borders
+        let height = desired.min(max_h).max(footer_rows + 2);
         let rect = centered(area, 60, height);
 
         let block = Block::default()
@@ -223,14 +297,36 @@ impl super::HomeView {
             return;
         }
 
+        let item_rows = inner.height.saturating_sub(footer_rows) as usize;
+
+        // Follow the selection: keep it within [scroll, scroll + item_rows).
+        if let Some(panel) = self.todo_panel.as_mut() {
+            if panel.selected < panel.scroll {
+                panel.scroll = panel.selected;
+            } else if item_rows > 0 && panel.selected >= panel.scroll + item_rows {
+                panel.scroll = panel.selected + 1 - item_rows;
+            }
+            if panel.scroll > len.saturating_sub(item_rows.max(1)) {
+                panel.scroll = len.saturating_sub(item_rows.max(1));
+            }
+        }
+
+        let panel = self.todo_panel.as_ref().expect("checked above");
+        let items = self
+            .session_todos
+            .get(&session)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
         let mut lines: Vec<Line> = Vec::new();
         if items.is_empty() {
             lines.push(Line::from(Span::styled(
-                "no items yet — press a to add",
+                "no items yet, press a to add",
                 Style::default().fg(theme.dimmed),
             )));
         } else {
-            for (i, item) in items.iter().enumerate() {
+            let end = (panel.scroll + item_rows).min(items.len());
+            for (i, item) in items.iter().enumerate().take(end).skip(panel.scroll) {
                 let box_ = if item.done { "[x] " } else { "[ ] " };
                 let mut style = if item.done {
                     Style::default()
@@ -266,6 +362,37 @@ impl super::HomeView {
         )));
 
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+#[cfg(test)]
+impl super::HomeView {
+    pub(crate) fn todo_selected_for_test(&self) -> Option<usize> {
+        self.todo_panel.as_ref().map(|p| p.selected)
+    }
+
+    pub(crate) fn set_todo_selected_for_test(&mut self, index: usize) {
+        if let Some(panel) = self.todo_panel.as_mut() {
+            panel.selected = index;
+        }
+    }
+
+    pub(crate) fn seed_todos_for_test(&mut self, session: &str, texts: &[&str]) {
+        let items = texts
+            .iter()
+            .map(|t| TodoItem {
+                text: (*t).to_string(),
+                done: false,
+            })
+            .collect();
+        self.session_todos.insert(session.to_string(), items);
+    }
+
+    pub(crate) fn todo_items_for_test(&self, session: &str) -> Vec<(String, bool)> {
+        self.session_todos
+            .get(session)
+            .map(|items| items.iter().map(|i| (i.text.clone(), i.done)).collect())
+            .unwrap_or_default()
     }
 }
 
