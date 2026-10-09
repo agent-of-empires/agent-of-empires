@@ -44,6 +44,7 @@ pub(crate) mod v033_isolate_sandbox_content;
 mod v034_trash_retention_minutes;
 mod v035_custom_sort_order;
 mod v042_canonical_execution_journal;
+mod v043_protect_natal_launches;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -90,7 +91,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 42;
+const CURRENT_VERSION: u32 = 43;
 const VERSION_FILE: &str = ".schema_version";
 
 enum MigrationAction {
@@ -276,6 +277,11 @@ const MIGRATIONS: &[Migration] = &[
         42,
         "canonical_execution_journal",
         MigrationAction::Anchored(v042_canonical_execution_journal::run),
+    ),
+    (
+        43,
+        "protect_natal_launches",
+        MigrationAction::Anchored(v043_protect_natal_launches::run),
     ),
 ];
 

@@ -116,6 +116,8 @@ struct AdmissionState {
     prepared: Option<Arc<crate::session::runner_journal::LaunchOrigin>>,
     retirement: Option<AdmissionRetirement>,
     preparation: Option<crate::session::runner_journal::PreparationCustody>,
+    no_target_acknowledgement:
+        Option<Arc<crate::session::runner_journal::OriginalNoTargetRemovalAck>>,
     preparation_retirement: Option<tokio::sync::watch::Receiver<Option<bool>>>,
 }
 
@@ -173,6 +175,12 @@ impl AdmissionRetirement {
 }
 
 pub(crate) struct ExecutionJob(ExecutionAdmission);
+
+impl ExecutionJob {
+    pub(crate) fn belongs_to(&self, admission: &ExecutionAdmission) -> bool {
+        Arc::ptr_eq(&self.0.inner, &admission.inner)
+    }
+}
 
 impl Drop for ExecutionJob {
     fn drop(&mut self) {
@@ -247,7 +255,7 @@ impl ExecutionAdmission {
         }
     }
 
-    fn is_drained(&self) -> bool {
+    pub(crate) fn is_drained(&self) -> bool {
         let state = self
             .inner
             .state
@@ -623,6 +631,43 @@ impl ExecutionAdmission {
             return Err(std::io::Error::other("runner admission was cancelled"));
         }
         issue()
+    }
+
+    pub(crate) fn acknowledge_no_target_retirement(
+        &self,
+        acknowledgement: Arc<crate::session::runner_journal::OriginalNoTargetRemovalAck>,
+    ) -> anyhow::Result<Arc<crate::session::runner_journal::OriginalNoTargetRemovalAck>> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            state.no_target_acknowledgement.is_none(),
+            "admission already consumed its original no-target retirement ACK"
+        );
+        let current = state
+            .prepared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no-target ACK lost its original prepared admission"))?;
+        let acknowledgement = current.with_acknowledged_no_target_retirement(acknowledgement)?;
+        let identity = acknowledgement.identity();
+        anyhow::ensure!(
+            state.identity.is_none() || state.identity == identity,
+            "no-target ACK replaced admission's original root birth"
+        );
+        if let Some(stop) = &state.cancelled_stop {
+            stop.acknowledge_no_target_retirement(acknowledgement.clone())?;
+        }
+        state
+            .preparation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no-target ACK lost its exact preparation custody"))?
+            .acknowledged_no_target(acknowledgement.clone())?;
+        state.identity = None;
+        state.prepared = Some(acknowledgement.derived().clone());
+        state.no_target_acknowledgement = Some(acknowledgement.clone());
+        Ok(acknowledgement)
     }
 }
 

@@ -285,6 +285,31 @@ fn backup(document: &Document<'_>, validate: &dyn Fn() -> Result<()>) -> Result<
 }
 
 pub(super) fn run(app: &AnchoredDir, version: u32) -> Result<()> {
+    let after = serde_json::json!({"runner_journal":
+        crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown()});
+    let absent = serde_json::json!({});
+    let null = serde_json::json!({"runner_journal": null});
+    rewrite_profiles(app, version, |raw| {
+        let fields = RawObject::parse(raw)?;
+        let before = match fields.unique("runner_journal") {
+            Ok(None) => &absent,
+            Ok(Some(value)) if value.get() == "null" => &null,
+            _ => return Ok(None),
+        };
+        match patch(raw, before, &after)? {
+            Emission::Original(_) => Ok(None),
+            Emission::Changed(updated) => Ok(Some(updated)),
+        }
+    })
+}
+
+pub(super) fn rewrite_profiles(
+    app: &AnchoredDir,
+    version: u32,
+    mut rewrite: impl FnMut(
+        &serde_json::value::RawValue,
+    ) -> Result<Option<Box<serde_json::value::RawValue>>>,
+) -> Result<()> {
     crate::session::retained_intents::validate_at(app)?;
     let original_version = super::schema::read_at(app)?;
     let inventory = Inventory::capture(app)?;
@@ -309,10 +334,7 @@ pub(super) fn run(app: &AnchoredDir, version: u32) -> Result<()> {
             total.1 |= owner.ambiguous;
         }
     }
-    let after = serde_json::json!({"runner_journal":
-        crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown()});
-    let absent = serde_json::json!({});
-    let null = serde_json::json!({"runner_journal": null});
+
     let mut changed = 0;
     for document in &mut documents {
         let mut modified = false;
@@ -333,12 +355,7 @@ pub(super) fn run(app: &AnchoredDir, version: u32) -> Result<()> {
             if owners.get(&id) != Some(&(1, false)) {
                 continue;
             }
-            let before = match fields.unique("runner_journal") {
-                Ok(None) => &absent,
-                Ok(Some(value)) if value.get() == "null" => &null,
-                _ => continue,
-            };
-            if let Emission::Changed(updated) = patch(raw, before, &after)? {
+            if let Some(updated) = rewrite(raw)? {
                 *raw = updated;
                 modified = true;
                 changed += 1;
@@ -370,7 +387,7 @@ pub(super) fn run(app: &AnchoredDir, version: u32) -> Result<()> {
         directory.sync()?;
     }
     super::set_version_at(app, version, Some(&validate))?;
-    tracing::info!(target: "migrations", changed, "published canonical execution journals without native authority reconstruction");
+    tracing::info!(target: "migrations", version, changed, "published canonical raw session migration without native authority reconstruction");
     Ok(())
 }
 

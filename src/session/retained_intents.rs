@@ -106,6 +106,7 @@ fn owner_id(raw: &RawValue) -> Result<String> {
 
 pub(crate) fn can_abort_metadata(row: &super::Instance) -> bool {
     row.runner_journal.has_unknown_runner_coverage()
+        || row.runner_journal.has_unresolved_native_launches()
         || row.lifecycle_reservation.as_ref().is_some_and(|lease| {
             matches!(
                 lease.op,
@@ -117,6 +118,11 @@ pub(crate) fn can_abort_metadata(row: &super::Instance) -> bool {
 fn eligible(raw: &RawValue) -> Result<()> {
     let object = RawObject::parse(raw)?;
     if let Some(journal) = object.unique("runner_journal")? {
+        if serde_json::from_str::<super::runner_journal::RunnerExecutionJournal>(journal.get())
+            .is_ok_and(|journal| journal.has_unresolved_native_launches())
+        {
+            return Ok(());
+        }
         if let Ok(journal) = RawObject::parse(journal) {
             if journal.unique("coverage")?.is_some_and(|coverage| {
                 serde_json::from_str::<String>(coverage.get())

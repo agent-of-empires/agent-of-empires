@@ -414,6 +414,13 @@ impl StorageFlock {
     pub(crate) fn file_identity(&self) -> Result<DirectoryIdentity> {
         Ok(DirectoryIdentity::from_metadata(&self.own.file.metadata()?))
     }
+    pub(crate) fn unlock_held(&self) -> Result<()> {
+        FileExt::unlock(&self.own.file)?;
+        if let Some(sibling) = &self.sibling {
+            FileExt::unlock(&sibling.file)?;
+        }
+        Ok(())
+    }
 }
 
 /// A held file supplies an immutable flock rank, not native execution authority.
@@ -1259,6 +1266,7 @@ enum StorageWriteScope<'a> {
     Geometry,
     GeometryOwner(&'a str),
     FencedGeometry(&'a super::deletion::PathClaimIndex),
+    NativeNoTarget(&'a super::runner_journal::OriginalNoTargetReceipt),
     CompletePaths {
         original: &'a super::LaunchOrigin,
         paths: &'a [PathBuf],
@@ -1890,6 +1898,22 @@ impl Storage {
         self.update_under_storage_locks(f, StorageWriteScope::Geometry)
     }
 
+    pub(crate) fn update_no_target_under_workspace_claim_lock<F, R>(
+        &self,
+        receipt: &super::runner_journal::OriginalNoTargetReceipt,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        anyhow::ensure!(
+            self.same_origin_as(receipt.original().storage()),
+            "no-target writer changed its physical original"
+        );
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f, StorageWriteScope::NativeNoTarget(receipt))
+    }
+
     /// Admit the selected raw owner before invoking a geometry mutation.
     pub(crate) fn update_owner_under_workspace_claim_lock<F, R>(&self, id: &str, f: F) -> Result<R>
     where
@@ -2111,11 +2135,15 @@ impl Storage {
         }
 
         // Compose both documents before the first write, retaining opaque rows.
-        let instances_buf = session_document.render(
+        let instances_buf = session_document.render_with_no_target_retirement(
             &instances,
             |row| row.id.as_str(),
             selected.as_ref().map(|selected| &selected.sessions),
             HashMap::new(),
+            match &scope {
+                StorageWriteScope::NativeNoTarget(receipt) => Some(*receipt),
+                _ => None,
+            },
         )?;
         groups.retain(|group| {
             !group_document.owners.contains_key(&group.path)

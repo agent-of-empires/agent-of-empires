@@ -13,8 +13,9 @@
 //! spawned in its own process group, with its real birth durably published
 //! before authorization, just like the managed production runner.
 
+use crate::session::runner_journal::ManagedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// App data dir for the debug binary under this test's env. The runner sees
@@ -55,7 +56,11 @@ impl Drop for Scratch {
 
 /// Spawn a runner with `cat` as the fake agent and wait until it has
 /// written its registry record. Returns the child and the record path.
-fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -> (Child, PathBuf) {
+fn spawn_runner_and_wait_for_record(
+    home: &Path,
+    xdg: &Path,
+    session_id: &str,
+) -> (ManagedChild, PathBuf) {
     let workers = app_dir(home, xdg).join("acp-workers");
     let socket = workers.join(format!("{session_id}.sock"));
     let record = workers.join(format!("{session_id}.json"));
@@ -103,7 +108,7 @@ fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -
 }
 
 /// Wait for `child` to exit within `secs`, killing + panicking otherwise.
-fn assert_exits_within(child: &mut Child, secs: u64, what: &str) {
+fn assert_exits_within(child: &mut ManagedChild, secs: u64, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         if child.try_wait().unwrap().is_some() {

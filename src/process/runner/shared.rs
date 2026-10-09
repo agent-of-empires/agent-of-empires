@@ -56,7 +56,8 @@ impl RegistryOwner {
             let mut record = owner
                 .record
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
             anyhow::ensure!(
                 !owner.retiring.load(Ordering::Acquire),
                 "original native registry is retiring"
@@ -66,7 +67,12 @@ impl RegistryOwner {
                 &mut record,
                 effect,
             )
-            .with_context(|| format!("updating owned native record {}", record.session_id))
+            .with_context(|| format!("updating owned native record {}", record.session_id))?;
+            *owner
+                .record
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = record;
+            Ok(())
         })
         .await
         .context("owned native metadata job")?
@@ -75,11 +81,12 @@ impl RegistryOwner {
     pub(super) async fn retire(self: &Arc<Self>) -> anyhow::Result<bool> {
         let owner = self.clone();
         tokio::task::spawn_blocking(move || {
+            owner.retiring.store(true, Ordering::Release);
             let record = owner
                 .record
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            owner.retiring.store(true, Ordering::Release);
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
             owner.original.validate_record_birth(&record)?;
             owner.original.with_storage(|_, row| {
                 anyhow::ensure!(
@@ -94,7 +101,7 @@ impl RegistryOwner {
     }
 }
 
-pub(super) struct RunnerShared {
+pub(crate) struct RunnerShared {
     pub(super) prompt_admission: Arc<std::sync::Mutex<PromptAdmission>>,
     pub(super) control: Mutex<ControlChannel>,
     pub(super) control_wake: tokio::sync::Notify,
@@ -272,6 +279,39 @@ pub(super) async fn write_control_frame(
 pub(super) const MAX_OUTSTANDING_REQUESTS: usize = 1024;
 
 impl RunnerShared {
+    pub(crate) fn with_registry_owner(
+        original: Arc<crate::session::runner_journal::LaunchOrigin>,
+        record: worker_registry::WorkerRecord,
+    ) -> Self {
+        Self::new(Some(Arc::new(RegistryOwner {
+            original,
+            record: std::sync::Mutex::new(record),
+            retiring: AtomicBool::new(false),
+        })))
+    }
+
+    pub(crate) fn installation_snapshot(
+        &self,
+    ) -> anyhow::Result<(
+        &Arc<crate::session::runner_journal::LaunchOrigin>,
+        worker_registry::WorkerRecord,
+    )> {
+        let owner = self
+            .registry_owner
+            .as_ref()
+            .context("shared native registry owner is absent")?;
+        anyhow::ensure!(
+            !owner.retiring.load(Ordering::Acquire),
+            "native registry owner is retiring"
+        );
+        let record = owner
+            .record
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        Ok((&owner.original, record))
+    }
+
     pub(super) fn new(registry_owner: Option<Arc<RegistryOwner>>) -> Self {
         Self {
             prompt_admission: Arc::new(std::sync::Mutex::new(PromptAdmission::default())),
@@ -936,7 +976,8 @@ impl RunnerShared {
                 let record = owner
                     .record
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
                 anyhow::ensure!(
                     !owner.retiring.load(Ordering::Acquire),
                     "original native registry is retiring"

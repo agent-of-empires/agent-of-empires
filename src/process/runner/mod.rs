@@ -2,7 +2,7 @@
 
 mod connection;
 mod jsonrpc;
-mod shared;
+pub(crate) mod shared;
 
 use self::connection::{fanout_agent_stdout, handle_control_connection};
 use self::shared::RunnerShared;
@@ -185,19 +185,22 @@ pub async fn run(args: AcpRunnerArgs, natal: RunnerNatalGuard) -> Result<()> {
     record.profile_identity = born_identity.profile_identity;
     let _control_endpoint = bootstrap.publish(&stop_endpoint, &mut record, &control_socket)?;
     let control_listener = _control_endpoint.listener();
-    let owner = Arc::new(shared::RegistryOwner {
-        original: bootstrap.origin(),
-        record: std::sync::Mutex::new(record),
-        retiring: std::sync::atomic::AtomicBool::new(false),
-    });
-    let shared = Arc::new(RunnerShared::new(Some(owner.clone())));
+    let shared = Arc::new(RunnerShared::with_registry_owner(
+        bootstrap.origin(),
+        record,
+    ));
+    let owner = shared
+        .registry_owner
+        .as_ref()
+        .context("native registry owner installation failed")?
+        .clone();
     let stop_request =
         crate::session::runner_journal::wait_for_stop(stop_listener, args.launch_nonce, |idle| {
             shared.admit_stop(idle)
         });
     tokio::pin!(stop_request);
     let startup = {
-        let authorization = bootstrap.await_authorization();
+        let authorization = bootstrap.await_authorization(&shared);
         tokio::pin!(authorization);
         tokio::select! {
             requested = &mut stop_request => requested.map(Some),

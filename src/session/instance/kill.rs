@@ -317,44 +317,64 @@ impl Instance {
 
     /// Stop the session and its sandbox container under the same lifecycle
     /// lock used by launch/restart.
-    pub fn stop(&self) -> Result<()> {
-        let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
+    pub(crate) fn stop<T>(
+        &self,
+        original: &std::sync::Arc<crate::session::LaunchOrigin>,
+        mut publish: impl FnMut(Instance) -> Result<T>,
+    ) -> Result<T> {
+        let storage = self.original_storage()?;
+        anyhow::ensure!(
+            storage.same_origin_as(original.storage()) && original.matches_instance(self),
+            "terminal Stop replaced its original authority"
+        );
+        storage.verify_profile_identity()?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance stop lock")?;
-        let mut lifecycle = storage
-            .load()?
-            .into_iter()
-            .find(|row| row.id == self.id)
-            .context("session disappeared before stop")?;
-        lifecycle.source_profile = profile.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None, None)?;
+        let lifecycle = storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |rows, _| {
+                let stored = rows
+                    .iter_mut()
+                    .find(|row| row.id == self.id && row.created_at == self.created_at)
+                    .context("session disappeared before terminal Stop claim")?;
+                original.validate_baseline_at(stored, original.generation())?;
+                stored
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Stop,
+                        Self::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("session {}: {error}", self.id))?;
+                Ok(stored.clone())
+            },
+        )?;
+        crate::session::storage::sync_parent_directory(storage.sessions_path())?;
+        storage.verify_profile_identity()?;
+        let lease = lifecycle.lifecycle_reservation.clone();
+        let generation = lifecycle.lifecycle_generation;
         self.stop_poller();
         let teardown = lifecycle.kill_locked().and_then(|()| {
-            let mut current = storage
+            let current = storage
                 .load()?
                 .into_iter()
-                .find(|row| row.id == self.id)
+                .find(|row| row.id == self.id && row.created_at == self.created_at)
                 .context("session disappeared during stop")?;
-            current.source_profile = profile.clone();
+            original.validate_baseline_at(&current, generation)?;
+            anyhow::ensure!(
+                current.lifecycle_reservation == lease
+                    && current.lifecycle_reservation_is_owned(LifecycleOperation::Stop, generation),
+                "terminal Stop lost its original lease"
+            );
             let flushed = current.flush_published_conversation(&storage);
-            // A pinned-foreign sid and a sid another row durably owns are both
-            // deliberate refusals rather than doubtful writes, so the teardown
-            // keeps no evidence to preserve. A real failure still keeps it, and
-            // the sandbox container always stops: the store is a host bind, not
-            // container state.
             let container_result = crate::session::worktree_edit::stop_sandbox_container(
                 &current.id,
                 current.is_sandboxed(),
             );
             match flushed {
-                Some(SidWrite::PinnedForeign) | Some(SidWrite::OwnershipConflict) => {
-                    container_result
-                }
-                Some(SidWrite::Applied) | None => container_result,
-                Some(SidWrite::Failed) | Some(SidWrite::Skipped) => {
+                Some(SidWrite::PinnedForeign | SidWrite::OwnershipConflict | SidWrite::Applied)
+                | None => container_result,
+                Some(SidWrite::Failed | SidWrite::Skipped) => {
                     container_result?;
                     anyhow::bail!(
                         "could not persist final conversation publication; hook evidence retained"
@@ -362,22 +382,43 @@ impl Instance {
                 }
             }
         });
+        let final_commit = |status: Status| -> Result<Instance> {
+            let emitted = storage.update_metadata(
+                crate::session::MetadataSelection::Session(self.id.as_str().into()),
+                |rows, _| {
+                    let stored = rows
+                        .iter_mut()
+                        .find(|row| row.id == self.id && row.created_at == self.created_at)
+                        .context("session disappeared before terminal Stop commit")?;
+                    original.validate_baseline_at(stored, generation)?;
+                    anyhow::ensure!(
+                        stored.lifecycle_reservation == lease
+                            && stored.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Stop,
+                                generation
+                            ),
+                        "terminal Stop lost its original lease before source commit"
+                    );
+                    stored.status = status;
+                    stored.idle_entered_at = None;
+                    Ok(stored.clone())
+                },
+            )?;
+            storage.verify_profile_identity()?;
+            crate::session::storage::sync_parent_directory(storage.sessions_path())?;
+            storage.verify_profile_identity()?;
+            Ok(emitted)
+        };
         match teardown {
             Ok(()) => {
-                lifecycle.commit_lifecycle_status(
-                    &storage,
-                    LifecycleOperation::Stop,
-                    Status::Stopped,
-                )?;
+                let result = publish(final_commit(Status::Stopped)?)?;
                 crate::hooks::cleanup_hook_status_dir(&self.id);
-                Ok(())
+                Ok(result)
             }
             Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
-                    &storage,
-                    LifecycleOperation::Stop,
-                    Status::Error,
-                );
+                if let Ok(emitted) = final_commit(Status::Error) {
+                    publish(emitted)?;
+                }
                 Err(error)
             }
         }
@@ -514,8 +555,17 @@ mod tests {
                 Some(published),
                 "{tool}"
             );
-            inst.stop()
-                .unwrap_or_else(|error| panic!("{tool}: {error}"));
+            {
+                let selected = storage
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.id == inst.id && row.created_at == inst.created_at)
+                    .unwrap();
+                let original = crate::session::LaunchOrigin::capture(&selected).unwrap();
+                selected.stop(&original, |_| Ok(()))
+            }
+            .unwrap_or_else(|error| panic!("{tool}: {error}"));
             let disk = storage.load().unwrap();
             assert_eq!(
                 disk.iter()
@@ -603,7 +653,14 @@ mod tests {
             .unwrap();
         crate::hooks::write_session_id_via_guard(&inst.id, sid, Some(&launch)).unwrap();
         assert!(sidecar.exists());
-        assert!(inst.stop().is_err());
+        let selected = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == inst.id && row.created_at == inst.created_at)
+            .unwrap();
+        let original = crate::session::LaunchOrigin::capture(&selected).unwrap();
+        assert!(selected.stop(&original, |_| Ok(())).is_err());
         assert!(sidecar.exists(), "stop must retain recovery evidence");
         assert_eq!(
             storage.load().unwrap()[0].resume_intent,
@@ -641,7 +698,17 @@ mod tests {
             .join("session_id");
         assert!(sidecar.exists());
         assert_eq!(inst.final_publication_observation().unwrap().sid, published);
-        inst.stop().unwrap();
+        {
+            let selected = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == inst.id && row.created_at == inst.created_at)
+                .unwrap();
+            let original = crate::session::LaunchOrigin::capture(&selected).unwrap();
+            selected.stop(&original, |_| Ok(()))
+        }
+        .unwrap();
         let row = storage
             .load()
             .unwrap()

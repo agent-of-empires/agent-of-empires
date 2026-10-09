@@ -4,10 +4,10 @@
 //! stand-in agents and exercise framed handshake, forward-lane, reverse-lane,
 //! reconnect, cache, and cancellation behavior over `<id>.control.sock`.
 
+use crate::session::runner_journal::ManagedChild;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::time::{Duration, Instant};
 
 use crate::acp::acp_client::AcpClient;
@@ -49,7 +49,7 @@ impl Drop for Scratch {
 /// Kill+reap the spawned runner on drop so an assertion failure mid-test
 /// doesn't leave a runner (and its agent tree) behind. Pairs with
 /// `Scratch`, which removes the scratch dir on drop.
-struct KillOnDrop(Child);
+struct KillOnDrop(ManagedChild);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -83,7 +83,7 @@ fn wait_for_u32(path: &Path, what: &str) -> u32 {
     }
 }
 
-fn wait_for_runner_exit(child: &mut Child) {
+fn wait_for_runner_exit(child: &mut ManagedChild) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if child.try_wait().expect("inspect runner").is_some() {

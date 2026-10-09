@@ -14,8 +14,8 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::unistd::Pid;
 
-/// Test-only original-root death observation; never group retirement authority.
-#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+/// Original-root kernel observation, never full-domain retirement authority.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) struct OriginalRootDeathObservation(platform::OriginalRootDeathObservation);
 
 #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
@@ -23,7 +23,7 @@ pub(crate) fn ignore_child_reaping_for_hosted_probe() -> std::io::Result<()> {
     platform::ignore_child_reaping_for_hosted_probe()
 }
 
-#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl OriginalRootDeathObservation {
     pub(crate) fn bind(birth: ProcessIncarnation) -> anyhow::Result<Self> {
         anyhow::ensure!(

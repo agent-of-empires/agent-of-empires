@@ -1,4 +1,4 @@
-use super::{ExecutionPlan, LaunchOrigin, LaunchPlan, NativeBirthKey, RegistryWitness};
+use super::{ExecutionPlan, LaunchOrigin, LaunchPlan, RegistryWitness, RunnerLaunch};
 use crate::acp::runner_lifecycle::{ExecutionAdmission as RunnerAdmission, RunnerIdentity};
 use crate::process::worker_registry::{self, BoundEndpoint, WorkerRecord};
 use crate::session::storage::{DirectoryIdentity, StorageFlock};
@@ -21,7 +21,7 @@ struct OriginalBootstrap<'a> {
     execution: &'a ExecutionPlan,
     pre_trash_project_path: Option<&'a str>,
     scratch: bool,
-    births: &'a [NativeBirthKey],
+    births: &'a [RunnerLaunch],
     born: RunnerIdentity,
     creations: &'a [super::native_create::CreateExecution],
     create_coverage: super::CreationCoverage,
@@ -35,7 +35,7 @@ struct ReceivedBootstrap {
     #[serde(deserialize_with = "Option::deserialize")]
     pre_trash_project_path: Option<String>,
     scratch: bool,
-    births: Vec<NativeBirthKey>,
+    births: Vec<RunnerLaunch>,
     born: RunnerIdentity,
     creations: Vec<super::native_create::CreateExecution>,
     create_coverage: super::CreationCoverage,
@@ -47,6 +47,102 @@ pub(super) struct NatalPublication {
     born: RunnerIdentity,
     endpoint: worker_registry::SocketEndpointIdentity,
     registry: RegistryWitness,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct OriginalCommit {
+    profile: String,
+    born: RunnerIdentity,
+    original: serde_json::Value,
+}
+
+impl OriginalCommit {
+    fn capture(original: &LaunchOrigin, born: RunnerIdentity) -> Result<Self> {
+        anyhow::ensure!(
+            born.birth_is_complete(),
+            "installation commit lacks complete native birth"
+        );
+        Ok(Self {
+            profile: original.profile().to_owned(),
+            born,
+            original: serde_json::to_value((
+                &original.plan.execution,
+                &original.plan.pre_trash_project_path,
+                original.plan.scratch,
+                original.generation,
+                original.births.as_ref(),
+                original.creations.as_ref(),
+                original.create_coverage,
+            ))?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct InstallationAck {
+    original: OriginalCommit,
+    publication: NatalPublication,
+    published: super::RunnerLaunch,
+}
+
+fn canonical_published(
+    original: &LaunchOrigin,
+    born: RunnerIdentity,
+    publication: &NatalPublication,
+) -> Result<super::RunnerLaunch> {
+    anyhow::ensure!(
+        publication.born == born,
+        "installation publication changed native birth"
+    );
+    original.storage().verify_profile_identity()?;
+    let row = original
+        .storage()
+        .load_strict_for_worktree_ownership_locked()?
+        .into_iter()
+        .find(|row| row.id == original.session_id())
+        .context("installation original session disappeared")?;
+    original.validate_row(&row)?;
+    let mut matches = row.runner_journal.launches().iter().filter(|launch| {
+        Some(Uuid::from_bytes(launch.nonce)) == born.launch_nonce
+            && Some(launch.boot) == born.boot
+            && launch.generation == born.generation
+            && launch.incarnation == born.incarnation
+            && launch.profile_identity == born.profile_identity
+    });
+    let launch = matches
+        .next()
+        .context("installation original birth disappeared")?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "installation original birth is duplicated"
+    );
+    anyhow::ensure!(
+        launch.phase == super::NativeLaunchPhase::Published
+            && launch.stop_endpoint == Some(publication.endpoint)
+            && launch.registry.as_ref() == Some(&publication.registry),
+        "installation differs from canonical Published original"
+    );
+    Ok(launch.clone())
+}
+
+pub(super) fn commit_original(
+    channel: &mut UnixStream,
+    issued: &LaunchOrigin,
+    identity: RunnerIdentity,
+) -> Result<Arc<LaunchOrigin>> {
+    let commit = OriginalCommit::capture(issued, identity)?;
+    write_frame(channel, &commit)?;
+    let ack: InstallationAck = read_frame(channel)?;
+    anyhow::ensure!(
+        ack.original == commit,
+        "installation ACK changed complete original"
+    );
+    let published = canonical_published(issued, identity, &ack.publication)?;
+    anyhow::ensure!(
+        published == ack.published,
+        "installation ACK changed durable Published snapshot"
+    );
+    issued.with_launch_snapshot(ack.published)
 }
 
 /// Inherited channel custody, started before the runtime and passed unchanged to receive.
@@ -192,7 +288,7 @@ impl LaunchBootstrap {
         let RunnerNatalGuard { mut channel, guard } = natal;
         let [directory, workspace, identity, lifecycle] =
             crate::process::receive_bootstrap_descriptors(&channel)?;
-        let received: ReceivedBootstrap = read_frame(&mut channel)?;
+        let received: ReceivedBootstrap = read_frame_until(&mut channel, guard.deadline)?;
         guard.frame_consumed();
         anyhow::ensure!(
             received.profile == profile
@@ -312,25 +408,61 @@ impl LaunchBootstrap {
         })();
         if let Err(error) = &result {
             let refusal: std::result::Result<NatalPublication, String> = Err(format!("{error:#}"));
-            let _ = write_frame(&mut self.channel, &refusal);
+            let _ = write_frame_until(&mut self.channel, &refusal, self.guard.deadline);
         }
         result
     }
 
-    pub(crate) async fn await_authorization(mut self) -> Result<()> {
+    pub(crate) async fn await_authorization(
+        &mut self,
+        installed: &crate::process::runner::shared::RunnerShared,
+    ) -> Result<()> {
+        let (installed_origin, installed_record) = installed.installation_snapshot()?;
+        let deadline = self.guard.deadline;
         let publication = self
             .publication
             .as_ref()
             .context("native resources were not published")?;
-        write_frame(&mut self.channel, &Ok::<_, String>(publication))?;
-        self.guard
+        write_frame_until(&mut self.channel, &Ok::<_, String>(publication), deadline)?;
+        let commit = self
+            .guard
             .authorization
             .take()
             .context("authorization reader is absent")?
             .await
             .context("authorization guard closed")??;
-        drop(self.fences.take());
+        remaining(deadline)?;
+        let expected = OriginalCommit::capture(&self.origin, self.born)?;
+        anyhow::ensure!(
+            commit == expected,
+            "Published commit changed complete original"
+        );
+        anyhow::ensure!(
+            Arc::ptr_eq(installed_origin, &self.origin),
+            "installation substituted original owner"
+        );
+        self.origin.validate_record_birth(&installed_record)?;
+        anyhow::ensure!(
+            publication.registry.matches_record(&installed_record),
+            "installation substituted registry owner"
+        );
+        let published = canonical_published(&self.origin, self.born, publication)?;
+        write_frame_until(
+            &mut self.channel,
+            &InstallationAck {
+                original: expected,
+                publication: NatalPublication {
+                    born: publication.born,
+                    endpoint: publication.endpoint,
+                    registry: publication.registry.clone(),
+                },
+                published,
+            },
+            deadline,
+        )?;
+        remaining(deadline)?;
         self.guard.disarm();
+        drop(self.fences.take());
         Ok(())
     }
 }
@@ -343,6 +475,75 @@ impl Drop for LaunchBootstrap {
         drop(self.fences.take());
         self.guard.disarm();
     }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    anyhow::ensure!(!remaining.is_zero(), "natal absolute deadline expired");
+    Ok(remaining)
+}
+
+fn read_exact_until(
+    channel: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        channel.set_read_timeout(Some(remaining(deadline)?))?;
+        match channel.read(bytes) {
+            Ok(0) => anyhow::bail!("natal private channel closed"),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    remaining(deadline)?;
+    Ok(())
+}
+
+fn write_all_until(channel: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    while !bytes.is_empty() {
+        channel.set_write_timeout(Some(remaining(deadline)?))?;
+        match channel.write(bytes) {
+            Ok(0) => anyhow::bail!("natal private channel write made no progress"),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    remaining(deadline)?;
+    Ok(())
+}
+
+fn write_frame_until<T: Serialize>(
+    channel: &mut UnixStream,
+    value: &T,
+    deadline: Instant,
+) -> Result<()> {
+    remaining(deadline)?;
+    let bytes = serde_json::to_vec(value)?;
+    anyhow::ensure!(
+        bytes.len() <= BOOTSTRAP_FRAME_LIMIT,
+        "native bootstrap exceeds frame limit"
+    );
+    let length = u32::try_from(bytes.len()).context("native bootstrap exceeds wire length")?;
+    write_all_until(channel, &length.to_le_bytes(), deadline)?;
+    write_all_until(channel, &bytes, deadline)
+}
+
+fn read_frame_until<T: DeserializeOwned>(channel: &mut UnixStream, deadline: Instant) -> Result<T> {
+    let mut length = [0; 4];
+    read_exact_until(channel, &mut length, deadline)?;
+    let length = u32::from_le_bytes(length) as usize;
+    anyhow::ensure!(
+        length <= BOOTSTRAP_FRAME_LIMIT,
+        "native bootstrap exceeds frame limit"
+    );
+    let mut bytes = vec![0; length];
+    read_exact_until(channel, &mut bytes, deadline)?;
+    let value = serde_json::from_slice(&bytes)?;
+    remaining(deadline)?;
+    Ok(value)
 }
 
 pub(super) fn write_frame<T: Serialize>(channel: &mut UnixStream, value: &T) -> Result<()> {
@@ -398,6 +599,9 @@ enum ParentNatalState {
 pub(super) struct ParentNatalGuard {
     state: Arc<(Mutex<ParentNatalState>, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
+    channel: UnixStream,
+    deadline: Instant,
+    admission: RunnerAdmission,
 }
 
 impl ParentNatalGuard {
@@ -407,6 +611,8 @@ impl ParentNatalGuard {
         deadline: Instant,
     ) -> Result<Self> {
         let channel = channel.try_clone()?;
+        let watched_channel = channel.try_clone()?;
+        let watched_admission = admission.clone();
         let state = Arc::new((Mutex::new(ParentNatalState::Pending), Condvar::new()));
         let watched = state.clone();
         let thread = std::thread::Builder::new()
@@ -416,9 +622,9 @@ impl ParentNatalGuard {
                 let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
                 while *state == ParentNatalState::Pending {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() || admission.cancellation_observed() {
+                    if remaining.is_zero() || watched_admission.cancellation_observed() {
                         *state = ParentNatalState::Interrupted;
-                        let _ = channel.shutdown(std::net::Shutdown::Both);
+                        let _ = watched_channel.shutdown(std::net::Shutdown::Both);
                         break;
                     }
                     state = changed
@@ -430,14 +636,25 @@ impl ParentNatalGuard {
         Ok(Self {
             state,
             thread: Some(thread),
+            channel,
+            deadline,
+            admission,
         })
     }
 
     pub(super) fn finish(&mut self) -> Result<()> {
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if *state == ParentNatalState::Finished {
+            return Ok(());
+        }
+        if Instant::now() >= self.deadline || self.admission.cancellation_observed() {
+            *state = ParentNatalState::Interrupted;
+            let _ = self.channel.shutdown(std::net::Shutdown::Both);
+            changed.notify_all();
+        }
         anyhow::ensure!(
-            *state != ParentNatalState::Interrupted,
+            *state == ParentNatalState::Pending,
             "natal deadline or cancellation interrupted startup"
         );
         *state = ParentNatalState::Finished;
@@ -448,7 +665,15 @@ impl ParentNatalGuard {
 
 impl Drop for ParentNatalGuard {
     fn drop(&mut self) {
-        let _ = self.finish();
+        let (lock, changed) = &*self.state;
+        {
+            let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+            if *state != ParentNatalState::Finished {
+                *state = ParentNatalState::Interrupted;
+                let _ = self.channel.shutdown(std::net::Shutdown::Both);
+            }
+            changed.notify_all();
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -464,13 +689,14 @@ struct ChildNatalState {
 struct ChildNatalGuard {
     state: Arc<(Mutex<ChildNatalState>, Condvar)>,
     channel: UnixStream,
-    authorization: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    deadline: Instant,
+    authorization: Option<tokio::sync::oneshot::Receiver<Result<OriginalCommit>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ChildNatalGuard {
     fn start(channel: &UnixStream, deadline: Instant) -> Result<Self> {
-        let reader = channel.try_clone()?;
+        let mut reader = channel.try_clone()?;
         let channel = channel.try_clone()?;
         let state = Arc::new((Mutex::new(ChildNatalState::default()), Condvar::new()));
         let watched = state.clone();
@@ -494,7 +720,7 @@ impl ChildNatalGuard {
                     return;
                 }
                 drop(state);
-                let authorized = (|| -> Result<()> {
+                let authorized = (|| -> Result<OriginalCommit> {
                     let byte = crate::process::receive_natal_authorization_until(
                         &reader,
                         deadline,
@@ -504,20 +730,15 @@ impl ChildNatalGuard {
                                 .released
                         },
                     )
-                    .map_err(|error| match error.kind() {
-                        std::io::ErrorKind::TimedOut => {
-                            anyhow::anyhow!("natal authorization deadline expired")
-                        }
-                        std::io::ErrorKind::Interrupted => {
-                            anyhow::anyhow!("natal bootstrap was released")
-                        }
-                        _ => anyhow::Error::new(error).context("reading execution authorization"),
+                    .map_err(|error| {
+                        anyhow::Error::new(error).context("reading execution authorization")
                     })?;
                     match byte {
-                        Some(1) => Ok(()),
+                        Some(1) => {}
                         None => anyhow::bail!("execution authorization closed"),
                         Some(_) => anyhow::bail!("execution authorization was refused"),
                     }
+                    read_frame_until(&mut reader, deadline)
                 })();
                 let _ = send.send(authorized);
                 let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -535,6 +756,7 @@ impl ChildNatalGuard {
         Ok(Self {
             state,
             channel,
+            deadline,
             authorization: Some(authorization),
             thread: Some(thread),
         })
@@ -649,6 +871,7 @@ mod tests {
             let launched = launch.spawn_child(
                 &storage,
                 Some(&admission),
+                job,
                 |input| {
                     command.stdin(input);
                     let child = command.spawn()?;
@@ -701,41 +924,31 @@ mod tests {
                     .unwrap();
                 },
             );
+            let error = match launched {
+                Err(error) => error,
+                Ok(_) => anyhow::bail!("stalled original bootstrap reached final installation"),
+            };
+            let retired = admission
+                .preparation_retirement()
+                .context("original preparation lost its durable ACK receiver")?;
+            anyhow::ensure!(*retired.borrow() == Some(true) && admission.is_drained(),
+                "original no-target retirement did not acknowledge preparation before releasing the job");
             if hard_wait {
-                let error = match launched {
-                    Err(error) => error,
-                    Ok(_) => {
-                        anyhow::bail!("original hard wait error unexpectedly returned a child")
-                    }
-                };
                 anyhow::ensure!(
-                    directory.join("root-wait-error").exists()
-                        && format!("{error:#}").contains("original root retirement unproven"),
-                    "actual ECHILD was not retained by ManagedLaunch: {error:#}"
+                    directory.join("root-wait-error").exists(),
+                    "actual original ECHILD observation was lost"
                 );
-                let observation =
-                    observation.context("original observer was not bound before publication")?;
+                let observation = observation.context("original observer was not prebound")?;
                 hosted_wait_until(|| observation.exited().unwrap(), Duration::from_secs(5))?;
                 std::fs::write(
                     directory.join("hard-wait-returned"),
-                    format!(
-                        "{error:#}
-{admission:?}"
-                    ),
+                    format!("{error:#}\n{admission:?}"),
                 )?;
                 hosted_wait_until(
                     || directory.join("issuer-release").exists(),
                     Duration::from_secs(10),
                 )?;
-                drop(job);
-                return Ok(());
             }
-            let (_, _, published) = launched?;
-            assert!(
-                published.is_err(),
-                "a stalled pre-ACK child cannot receive target approval"
-            );
-            drop(job);
             return Ok(());
         }
 
@@ -814,7 +1027,7 @@ mod tests {
             let (born, execution, births, creations, coverage): (
                 RunnerIdentity,
                 serde_json::Value,
-                Vec<NativeBirthKey>,
+                Vec<RunnerLaunch>,
                 Vec<super::super::native_create::CreateExecution>,
                 super::super::CreationCoverage,
             ) = read_frame(&mut evidence)?;
@@ -895,9 +1108,12 @@ mod tests {
                         issuer.0.try_wait()?.is_none(),
                         "issuer observation window must remain live"
                     );
-                    assert_eq!(hosted_fence_state(&storage, &row.id)?, [true; 3], "C2 before: actual ECHILD loses reachable fence custody after original root terminal");
+                    hosted_wait_until(
+                        || hosted_fence_state(&storage, &row.id).unwrap() == [false; 3],
+                        Duration::from_secs(2),
+                    )?;
                     assert!(!home.path().join("target-executed").exists());
-                    println!("C2 BEFORE actual original ECHILD; root terminal observed by same prebound pidfd/kqueue; all original fences remain stuck; original ID={} DOB={} g={} PFD={original_profile:?} goal={execution:?}; {}", row.id, row.created_at, born.generation, std::fs::read_to_string(home.path().join("hard-wait-returned"))?);
+                    println!("C2 AFTER actual original ECHILD; same prebound pidfd/kqueue root terminal; original refusal, native removal and preparation durable ACK precede job retirement; original fences explicitly released; ID={} DOB={} g={} PFD={original_profile:?} goal={execution:?}; {}", row.id, row.created_at, born.generation, std::fs::read_to_string(home.path().join("hard-wait-returned"))?);
                     std::fs::write(
                         home.path().join("issuer-release"),
                         b"end original observation window",
@@ -928,21 +1144,21 @@ mod tests {
                 .unwrap();
             assert_eq!(canonical.created_at, row.created_at);
             assert_eq!(canonical.lifecycle_generation, born.generation);
-            assert!(
-                !canonical.runner_journal.proves_runner_quiescent(),
-                "root death/reap cannot fabricate original preparation or group quiescence ACK"
-            );
-            assert!(canonical
-                .runner_journal
-                .launches()
-                .iter()
-                .any(|launch| launch.incarnation == Some(birth)
-                    && launch.generation == born.generation
-                    && Some(Uuid::from_bytes(launch.nonce)) == born.launch_nonce
-                    && launch.profile_identity == Some(original_profile)
-                    && launch.stop_endpoint.is_none()
-                    && launch.registry.is_none()));
-            println!("hosted ManagedLaunch: {stages}; parent_loss={kill_issuer}; actual original death precedes fence release; no target effect; unresolved durable scope retained");
+            if kill_issuer {
+                assert!(!canonical.runner_journal.proves_runner_quiescent());
+                assert!(canonical
+                    .runner_journal
+                    .launches()
+                    .iter()
+                    .any(|launch| launch.incarnation == Some(birth)
+                        && launch.generation == born.generation
+                        && Some(Uuid::from_bytes(launch.nonce)) == born.launch_nonce
+                        && launch.profile_identity == Some(original_profile)));
+            } else {
+                assert!(canonical.runner_journal.proves_runner_quiescent(),
+                    "original no-target and preparation durable ACKs must retire only their own scope");
+            }
+            println!("hosted ManagedLaunch: {stages}; parent_loss={kill_issuer}; actual original root death precedes fence release; no target effect; parent-owned no-target receipt only when original issuer remains alive");
         }
         Ok(())
     }
@@ -1111,6 +1327,23 @@ mod tests {
             write_frame(&mut sender, &"complete execution goal")?;
             if let Some(byte) = authorization {
                 sender.write_all(&[byte])?;
+                if byte == 1 {
+                    write_frame(
+                        &mut sender,
+                        &OriginalCommit {
+                            profile: "default".into(),
+                            born: RunnerIdentity {
+                                pid: 1,
+                                generation: 1,
+                                launch_nonce: None,
+                                incarnation: None,
+                                profile_identity: None,
+                                boot: None,
+                            },
+                            original: serde_json::json!({"frame": "complete original commit"}),
+                        },
+                    )?;
+                }
             }
             drop(sender);
             assert_eq!(

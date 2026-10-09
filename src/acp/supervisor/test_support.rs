@@ -439,7 +439,11 @@ pub(super) async fn run_execution_fixture_child() -> bool {
     let _control_endpoint = bootstrap
         .publish(&stop_endpoint, &mut record, &control)
         .unwrap();
-    bootstrap.await_authorization().await.unwrap();
+    let shared = crate::process::runner::shared::RunnerShared::with_registry_owner(
+        bootstrap.origin(),
+        record,
+    );
+    bootstrap.await_authorization(&shared).await.unwrap();
     std::fs::write(&ready, b"published").unwrap();
     let requested = release.with_file_name("requested");
     tokio::select! {
@@ -513,7 +517,7 @@ pub(crate) async fn published_execution(
             None
         };
         let admission = admission.or(standalone.as_ref()).unwrap();
-        let _custody = queued_custody.unwrap_or_else(|| admission.begin_job());
+        let custody = queued_custody.unwrap_or_else(|| admission.begin_job());
         let generation = admission.origin().unwrap().generation();
         let directory = tempfile::TempDir::new().unwrap();
         let release = directory.path().join("stop");
@@ -544,7 +548,7 @@ pub(crate) async fn published_execution(
         let mut born = None;
         let _entered = runtime.enter();
         let pid = launch
-            .spawn(&storage, &mut command, Some(admission), |identity| {
+            .spawn(&storage, &mut command, Some(admission), custody, |identity| {
                 born = Some(identity);
             })
             .unwrap();

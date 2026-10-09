@@ -15,7 +15,9 @@ pub struct StopResult {
 }
 
 pub fn perform_stop(request: &StopRequest) -> StopResult {
-    match request.instance.stop() {
+    let stopped = crate::session::LaunchOrigin::capture(&request.instance)
+        .and_then(|original| request.instance.stop(&original, |_| Ok(())));
+    match stopped {
         Ok(()) => {
             crate::tmux::refresh_session_cache();
             StopResult {

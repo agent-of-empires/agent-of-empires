@@ -1198,9 +1198,7 @@ pub async fn stop_session(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    // Snapshot profile, session type and current status without mutating, so a
-    // persist failure leaves disk and memory in agreement.
-    let (profile, is_structured, already_stopped, expected) = {
+    let (is_structured, already_stopped, expected) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return session_not_found();
@@ -1213,12 +1211,7 @@ pub async fn stop_session(
             inst.status,
             Status::Stopped | Status::Deleting | Status::Creating
         );
-        (
-            inst.source_profile.clone(),
-            structured,
-            already,
-            inst.clone(),
-        )
+        (structured, already, inst.clone())
     };
 
     if already_stopped {
@@ -1237,6 +1230,7 @@ pub async fn stop_session(
     // Publish the dormant ACK before shutting down the structured worker.
     let native_stop = if is_structured {
         let reserve_state = Arc::clone(&state);
+        let expected = expected.clone();
         let stop = match tokio::task::spawn_blocking(move || {
             let original = reserve_state
                 .capture_operation_origin(&expected)
@@ -1294,16 +1288,6 @@ pub async fn stop_session(
         None
     };
 
-    let inst_clone = if is_structured {
-        None
-    } else {
-        let instances = state.instances.read().await;
-        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        Some(instance.clone())
-    };
-
     if is_structured {
         let stop = native_stop.expect("structured stop reserved its original scope");
         match state.acp_supervisor.shutdown(stop.clone()).await {
@@ -1329,51 +1313,48 @@ pub async fn stop_session(
             ),
         }
     } else {
-        // Plain session: kill the tmux pane and stop (not remove) the Docker
-        // container. `Instance::stop` can block ~10s on `docker stop`, so it
-        // runs off the async runtime.
-        let inst_for_stop = inst_clone.expect("terminal stop retains its cache snapshot");
-        let stop_profile = profile.clone();
-        let stop_id = id.clone();
-        match tokio::task::spawn_blocking(move || {
-            let stop_result = inst_for_stop.stop();
-            let disk_result = Storage::new_unwatched(&stop_profile)
-                .and_then(|storage| storage.load())
-                .map(|instances| {
-                    instances
-                        .into_iter()
-                        .find(|instance| instance.id == stop_id)
-                });
-            (stop_result, disk_result)
+        let source = Arc::clone(&state);
+        let instances = Arc::clone(&state.instances);
+        let epoch = Arc::clone(&state.mutation_epoch);
+        let status_tx = state.status_tx.clone();
+        let stopped = tokio::task::spawn_blocking(move || {
+            let original = source.capture_operation_origin(&expected)?;
+            expected.stop(&original, |emitted| {
+                let mut rows = instances.blocking_write();
+                let Some(slot) = rows.iter_mut().find(|row| {
+                    row.id == emitted.id
+                        && row.created_at == emitted.created_at
+                        && row.same_storage_origin(&emitted)
+                        && (original.recognizes_published_instance(row)
+                            || (row.lifecycle_generation == emitted.lifecycle_generation
+                                && original
+                                    .validate_baseline_at(row, emitted.lifecycle_generation)
+                                    .is_ok()))
+                }) else {
+                    return Ok(None);
+                };
+                let old_status = slot.status;
+                *slot = crate::server::reload::merge_runtime_fields(slot, emitted);
+                slot.plugin_revival_pending = false;
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                publish_status_change(&status_tx, slot, old_status);
+                Ok(Some(slot.clone()))
+            })
         })
-        .await
-        {
-            Ok((stop_result, disk_result)) => {
-                if let Err(e) = stop_result {
-                    tracing::warn!(target: "http.api.sessions", "Stop: session stop failed: {e}");
-                }
-                match disk_result {
-                    Ok(Some(stopped)) => {
-                        let mut instances = state.instances.write().await;
-                        if let Some(live) = instances.iter_mut().find(|instance| instance.id == id)
-                        {
-                            let old_status = live.status;
-                            live.merge_post_start(&stopped);
-                            publish_status_change(&state.status_tx, live, old_status);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(
-                        target: "http.api.sessions",
-                        "Stop: failed to reload lifecycle generation: {e}"
-                    ),
-                }
+        .await;
+        return match stopped {
+            Ok(Ok(Some(emitted))) => Json(SessionResponse::from_instance(
+                &emitted,
+                crate::claude_settings::read_tui_fullscreen(),
+            ))
+            .into_response(),
+            Ok(Ok(None)) => crate::server::api::session_gone_after_persist(),
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", "terminal Stop source operation failed: {error:#}");
+                persist_failed_response()
             }
-            Err(e) => tracing::warn!(
-                target: "http.api.sessions",
-                "Stop: stop join failed: {e}"
-            ),
-        }
+            Err(_) => persist_failed_response(),
+        };
     }
 
     // Re-read so the response reflects the Stopped status.

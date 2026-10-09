@@ -1195,9 +1195,7 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "stop")?;
-    let mut working = inst.clone();
-    working.source_profile = profile.to_string();
-    let session_id = inst.id.clone();
+
     let title = inst.title.clone();
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
     let was_running = tmux_session.exists();
@@ -1212,15 +1210,8 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         return Ok(());
     }
 
-    working.stop()?;
-
-    let landed = storage.load()?.iter().any(|stored| stored.id == session_id);
-    if !landed {
-        bail!(
-            "Session {} was removed by another process before stop could land",
-            title
-        );
-    }
+    let original = crate::session::LaunchOrigin::capture(inst)?;
+    inst.stop(&original, |_| Ok(()))?;
 
     if had_container {
         println!("✓ Stopped session and container: {}", title);

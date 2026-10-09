@@ -3,11 +3,11 @@ use crate::acp::runner_lifecycle::{
     ExecutionAdmission, ExecutionJob, LifecycleTable, NativeResume, PreparationAuthorization,
     ResumeKind,
 };
-use crate::session::runner_journal::{capture_unique_origin, ManagedLaunch};
+use crate::session::runner_journal::{capture_unique_origin, ManagedChild, ManagedLaunch};
 use crate::session::{Instance, Storage};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,7 @@ pub(crate) struct RunnerLaunchFixture {
     admission: ExecutionAdmission,
     job: RefCell<Option<ExecutionJob>>,
     launch: RefCell<Option<ManagedLaunch>>,
-    retired: tokio::sync::watch::Receiver<Option<bool>>,
+
     generation: u64,
     pub(crate) nonce: uuid::Uuid,
     _env: EnvGuard,
@@ -70,7 +70,7 @@ impl RunnerLaunchFixture {
             })
             .expect("actual preparation ACK");
         let generation = prepared.generation();
-        let retired = custody.retirement().clone();
+
         admission
             .set_prepared_origin(prepared, custody)
             .expect("prepared original custody");
@@ -88,7 +88,7 @@ impl RunnerLaunchFixture {
             admission,
             job: RefCell::new(Some(job)),
             launch: RefCell::new(Some(launch)),
-            retired,
+
             generation,
             nonce,
             _env: env,
@@ -112,27 +112,23 @@ impl RunnerLaunchFixture {
         command
     }
 
-    pub(crate) fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
+    pub(crate) fn spawn(&self, command: &mut Command) -> std::io::Result<ManagedChild> {
         let launch = self
             .launch
             .borrow_mut()
             .take()
             .expect("single original launch");
-        let result = launch.spawn_owned(&self.storage, command, &self.admission);
-        drop(self.job.borrow_mut().take());
-        let result = result.map_err(std::io::Error::other);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while self.retired.borrow().is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let mut child = result?;
-        if *self.retired.borrow() != Some(true) {
-            if child.try_wait()?.is_none() {
-                crate::process::kill_process_tree(child.id());
-            }
-            let _ = child.wait();
+        let job = self
+            .job
+            .borrow_mut()
+            .take()
+            .expect("single original constructor job");
+        let mut child = launch
+            .spawn_owned(&self.storage, command, &self.admission, job)
+            .map_err(std::io::Error::other)?;
+        if child.try_wait()?.is_some() {
             return Err(std::io::Error::other(
-                "original preparation retirement has no successful canonical ACK",
+                "original runner exited before fixture handoff",
             ));
         }
         Ok(child)
@@ -277,7 +273,7 @@ pub(super) async fn spawn_runner_with_shim(
 
 #[cfg(debug_assertions)]
 pub(super) struct RunnerGuard {
-    _child: Child,
+    _child: ManagedChild,
     _fixture: RunnerLaunchFixture,
     _temp: tempfile::TempDir,
     pub(super) nonce: uuid::Uuid,

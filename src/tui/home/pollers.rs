@@ -871,7 +871,7 @@ mod hosted_tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    struct RunnerChild(std::process::Child);
+    struct RunnerChild(crate::session::runner_journal::ManagedChild);
     impl Drop for RunnerChild {
         fn drop(&mut self) {
             if self.0.try_wait().is_ok_and(|status| status.is_none()) {

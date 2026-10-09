@@ -369,7 +369,11 @@ pub(super) async fn spawn_runner_detached(
         let storage = &storage;
         let pid = &mut issued.pid;
         let identity = &mut issued.identity;
-        let spawned = launch.spawn(storage, &mut cmd, Some(&admission), |captured| {
+        let custody = issued
+            .custody
+            .take()
+            .expect("single original constructor job");
+        let spawned = launch.spawn(storage, &mut cmd, Some(&admission), custody, |captured| {
             *pid = Some(captured.pid);
             *identity = Some(captured);
         });

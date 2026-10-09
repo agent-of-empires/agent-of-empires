@@ -36,14 +36,12 @@ pub(super) fn ignore_child_reaping_for_hosted_probe() -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, debug_assertions))]
 pub(super) struct OriginalRootDeathObservation {
     fd: std::os::fd::OwnedFd,
     pid: u32,
     observed: std::cell::Cell<bool>,
 }
 
-#[cfg(all(test, debug_assertions))]
 impl OriginalRootDeathObservation {
     pub(super) fn bind(birth: super::ProcessIncarnation) -> anyhow::Result<Self> {
         use std::os::fd::FromRawFd;

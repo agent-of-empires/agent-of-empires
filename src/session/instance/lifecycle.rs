@@ -694,9 +694,16 @@ mod tests {
             })
             .unwrap();
 
-        let began = std::time::Instant::now();
-        assert!(busy.stop().unwrap_err().to_string().contains("busy"));
-        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        let selected = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == busy.id && row.created_at == busy.created_at)
+            .unwrap();
+        let original = crate::session::LaunchOrigin::capture(&selected).unwrap();
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        assert!(selected.stop(&original, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
 
         let mut recursive_start = busy.clone();
         let began = std::time::Instant::now();

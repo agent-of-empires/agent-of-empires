@@ -1002,10 +1002,7 @@ fn drive(
             .context("producer ACK row disappeared")?;
         original.validate_plan_at(&row, owner.generation(), original.plan.trashed)?;
         anyhow::ensure!(
-            row.runner_journal
-                .launches()
-                .iter()
-                .all(|launch| original.births.contains(&launch.birth_key()))
+            super::history_preserves_originals(&original.births, row.runner_journal.launches())
                 && row.runner_journal.create_coverage == original.create_coverage
                 && row.runner_journal.creations.len() == original.creations.len()
                 && row.runner_journal.creations.iter().all(|p| {
