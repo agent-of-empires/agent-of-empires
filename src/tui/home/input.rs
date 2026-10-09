@@ -2519,6 +2519,24 @@ impl HomeView {
             return None;
         }
 
+        // The TODO panel is a modal overlay (registered in
+        // `has_non_live_send_overlay`), so it is routed here, after every dialog
+        // above and after the live-send relay: open, it owns the keyboard. Ctrl+Y
+        // toggles it, but only outside live-send capture so the chord still
+        // reaches the agent when attached, and with exact modifiers (not
+        // Ctrl+Alt+Y).
+        if self.todo_panel.is_some() {
+            self.handle_todo_key(key);
+            return None;
+        }
+        if key.code == KeyCode::Char('y')
+            && key.modifiers == KeyModifiers::CONTROL
+            && !self.is_live_send_capturing()
+        {
+            self.toggle_todo_panel();
+            return None;
+        }
+
         // Drain a queued earned-tip pop now that the home view is idle: every
         // overlay-routing block above has returned. Skipped while searching so it can't
         // interrupt a query, and opening it consumes the keystroke. #2262
@@ -5813,6 +5831,12 @@ impl HomeView {
         // underneath can change. Doing it here covers the drag-select -> right-click ->
         // paste-into-dialog sequence, which never goes through `handle_key`.
         self.clear_preview_selection();
+        // The TODO panel is modal while open: a paste goes into its add field (or
+        // is dropped in navigation mode), never to the pane or a dialog behind it.
+        if self.todo_panel.is_some() {
+            self.todo_panel_handle_paste(text);
+            return;
+        }
         if !self.has_non_live_send_overlay() {
             if let Some(state) = self.live_send.clone() {
                 if let Some(worker) = &self.live_send_worker {

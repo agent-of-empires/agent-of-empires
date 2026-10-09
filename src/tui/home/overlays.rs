@@ -99,6 +99,7 @@ impl HomeView {
             || self.serve_view.is_some()
             || self.settings_view.is_some()
             || self.diff_view.is_some()
+            || self.todo_panel.is_some()
     }
 
     /// True when live-send owns the keyboard, so app-level bindings like
@@ -168,5 +169,6 @@ impl HomeView {
             || self.send_message_dialog.is_some()
             || self.new_dialog.is_some()
             || self.settings_view.is_some()
+            || self.todo_panel.as_ref().is_some_and(|p| p.is_adding())
     }
 }

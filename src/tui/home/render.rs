@@ -1025,6 +1025,17 @@ impl HomeView {
             );
         }
 
+        // The TODO panel floats over the preview region (falling back to the full
+        // area before the first preview is laid out).
+        if self.todo_panel.is_some() {
+            let panel_area = if self.preview_area.width > 0 && self.preview_area.height > 0 {
+                self.preview_area
+            } else {
+                area
+            };
+            self.render_todo_panel(frame, panel_area, theme);
+        }
+
         // Render dialogs on top
         if self.show_help {
             let live_on_enter = self.help_live_on_enter().unwrap_or(matches!(

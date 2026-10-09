@@ -97,6 +97,7 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
         ("Drag", "Select + copy preview (live mode)"),
         ("Click link", "Open underlined preview link or URL"),
         ("Ctrl+K", "Command palette"),
+        ("Ctrl+Y", "Session TODO list"),
         ("\u{1f4a1}", "Tips (badge, or Ctrl+K \u{2192} \"tips\")"),
     ]));
 
