@@ -790,6 +790,19 @@
       ]
     },
     {
+      "id": "sidebar.terminal-focus-handoff",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/terminal-focus-shortcut.spec.ts", "src/hooks/useKeyboardShortcuts.test.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/shortcuts.ts"
+      ]
+    },
+    {
       "id": "app-shell.topbar-dev-badge",
       "kind": "vitest",
       "risk": "low",
@@ -2529,6 +2542,9 @@
       ],
       "components": [
         "web/src/components/acp/Composer.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/shortcuts.ts",
         "web/src/components/acp/recallNav.ts",
         "web/src/components/acp/ComposerControls.tsx"
       ]
