@@ -699,9 +699,11 @@ mod tests {
                         anyhow::bail!("original hard wait error unexpectedly returned a child")
                     }
                 };
-                assert!(error.chain().any(|cause| cause
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.raw_os_error() == Some(libc::ECHILD))));
+                anyhow::ensure!(
+                    directory.join("root-wait-error").exists()
+                        && format!("{error:#}").contains("original root retirement unproven"),
+                    "actual ECHILD was not retained by ManagedLaunch: {error:#}"
+                );
                 let observation =
                     observation.context("original observer was not bound before publication")?;
                 hosted_wait_until(|| observation.exited().unwrap(), Duration::from_secs(5))?;

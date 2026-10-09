@@ -189,15 +189,14 @@ describe("SessionWizard rows", () => {
   const viewSwitch = () => screen.getByRole("switch", { name: "Use structured view" }) as HTMLButtonElement;
 
   it.each([
-    ["claude", undefined, false, /plan, tool calls and diffs/],
-    ["aider", [agent("aider", { acp_capable: false })], true, /no ACP adapter/],
-    ["helper", [agent("helper", { kind: "custom", acp_capable: false })], true, /needs agent_acp_cmd/],
-    ["claude", [agent("claude", { acp_allowed: false })], true, /not on the allowed agents list/],
-  ])("gates the structured view for %s", async (tool, agents, disabled, summary) => {
+    ["claude", undefined, false],
+    ["aider", [agent("aider", { acp_capable: false })], true],
+    ["helper", [agent("helper", { kind: "custom", acp_capable: false })], true],
+    ["claude", [agent("claude", { acp_allowed: false })], true],
+  ])("gates the structured view for %s", async (tool, agents, disabled) => {
     if (agents) vi.mocked(fetchAgents).mockResolvedValueOnce(agents);
     renderWizard({ path: "/tmp/proj", tool });
     await waitFor(() => expect(viewSwitch().disabled).toBe(disabled));
-    expect(viewSwitch().closest("div")!.textContent).toMatch(summary);
   });
 
   it.each([

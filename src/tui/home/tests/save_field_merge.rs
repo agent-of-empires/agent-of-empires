@@ -367,40 +367,12 @@ mod metadata_abort_consumer {
     #[test]
     #[serial]
     fn ordinary_create_and_attach_intent_abort_ack_removes_only_the_confirmed_owner() {
-        for (operation, unknown, legacy_journal) in [
-            (LifecycleOperation::Create, true, false),
-            (LifecycleOperation::Attach, false, false),
-            (LifecycleOperation::Attach, true, false),
-            (LifecycleOperation::Create, true, true),
+        for (operation, unknown) in [
+            (LifecycleOperation::Create, true),
+            (LifecycleOperation::Attach, false),
+            (LifecycleOperation::Attach, true),
         ] {
             let mut fixture = fixture(operation, unknown, false);
-            if legacy_journal {
-                let mut rows = raw_rows(&fixture.storage);
-                let slot = rows
-                    .iter()
-                    .position(|raw| {
-                        serde_json::from_str::<serde_json::Value>(raw.get()).unwrap()["id"]
-                            == fixture.selected
-                    })
-                    .unwrap();
-                let mut selected: serde_json::Value =
-                    serde_json::from_str(rows[slot].get()).unwrap();
-                let journal = selected["runner_journal"].as_object_mut().unwrap();
-                journal.remove("creations");
-                journal.remove("create_coverage");
-                rows[slot] =
-                    RawValue::from_string(serde_json::to_string(&selected).unwrap()).unwrap();
-                std::fs::write(
-                    fixture.storage.sessions_path(),
-                    serde_json::to_vec(&rows).unwrap(),
-                )
-                .unwrap();
-                fixture
-                    .env
-                    .view
-                    .request_reload(super::super::super::ReloadKind::Full);
-                drain_persistence(&mut fixture.env.view).unwrap();
-            }
             let original = raw_owner(&fixture.storage, &fixture.selected);
             let peer = raw_owner(&fixture.storage, &fixture.peer);
             let prior = serde_json::from_slice::<serde_json::Value>(

@@ -3195,6 +3195,7 @@ fn validate_recovery_journal(
 
 /// Hold every distinct save mutex and physical flock until the operation returns.
 pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> R) -> Result<R> {
+    let mut logical_dirs = Vec::with_capacity(storages.len());
     let mut sorted = storages
         .iter()
         .map(|storage| {
@@ -3202,6 +3203,7 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
                 .sessions_path
                 .parent()
                 .context("sessions path has no parent")?;
+            logical_dirs.push(dir);
             Ok((dir.canonicalize()?, storage))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3225,11 +3227,10 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
         .collect();
     sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
     sorted.dedup_by(|(left, _), (right, _)| left == right);
-    let dirs: Vec<&Path> = sorted.iter().map(|(dir, _)| dir.as_path()).collect();
-    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&dirs)?;
-    let files = dirs
-        .into_iter()
-        .map(|dir| {
+    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&logical_dirs)?;
+    let files = sorted
+        .iter()
+        .map(|(dir, _)| {
             let (file, path) = open_existing_storage_lock_file(dir, STORAGE_LOCK_FILENAME)?;
             OpenStorageLock::new(file, path)
         })
@@ -6135,69 +6136,99 @@ mod tests {
 
     #[test]
     fn profile_move_waits_for_original_transition_with_external_aliases() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let app = temp.path().join("app");
-        fs::create_dir_all(app.join("profiles"))?;
-        let _guard = isolate_app_dir_at(&app);
-        let mut stores = Vec::new();
-        for name in ["source", "target"] {
-            let physical = temp.path().join(name);
-            let logical = app.join("profiles").join(name);
-            fs::create_dir(&physical)?;
-            std::os::unix::fs::symlink(&physical, &logical)?;
-            stores.push(Storage::new_for_test_path(
-                name,
-                logical.join("sessions.json"),
-            ));
-        }
-        let target = stores.pop().unwrap();
-        let source = stores.pop().unwrap();
-        let mut before = Instance::new("transition", "/repo/transition");
-        before.source_profile = "source".into();
-        before.group_path = "work".into();
-        source.update(|rows, groups| {
-            rows.push(before.clone());
-            groups.push(Group::new("work", "work"));
-            Ok(())
-        })?;
-        target.update(|_, _| Ok(()))?;
-        let mut after = before.clone();
-        after.group_path = "moved".into();
-        let source_bytes = fs::read(source.sessions_path())?;
-        let target_bytes = fs::read(target.sessions_path())?;
-        let held =
-            acquire_storage_flock(&app, crate::migrations::v027_isolate_sandbox_stores::LOCK)?;
-        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let moving_source = source.clone();
-        let moving_target = target.clone();
-        let worker = std::thread::spawn(move || {
-            let _observer = observe_lock_contention_for_test(contended_tx);
-            let result = moving_source.move_instances_to(
-                &moving_target,
-                &[(before, after)],
-                &GroupMovePlan::single("work", "moved"),
-                |_, _| Ok(()),
+        for metadata_abort in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let _guard = isolate_app_dir_at(&temp.path().join("home"));
+            let app = super::super::get_app_dir()?;
+            fs::create_dir_all(app.join("profiles"))?;
+            let mut stores = Vec::new();
+            for name in ["source", "target"] {
+                let physical = temp.path().join(name);
+                let logical = app.join("profiles").join(name);
+                fs::create_dir(&physical)?;
+                std::os::unix::fs::symlink(&physical, &logical)?;
+                stores.push(Storage::new_for_test_path(
+                    name,
+                    logical.join("sessions.json"),
+                ));
+            }
+            let target = stores.pop().unwrap();
+            let source = stores.pop().unwrap();
+            let mut before = Instance::new("transition", "/repo/transition");
+            before.source_profile = "source".into();
+            before.group_path = "work".into();
+            if metadata_abort {
+                before.runner_journal =
+                    super::super::runner_journal::RunnerExecutionJournal::legacy_unknown();
+                super::super::retained_intents::initialize_legacy_in(&app)?;
+            }
+            source.update(|rows, groups| {
+                rows.push(before.clone());
+                groups.push(Group::new("work", "work"));
+                Ok(())
+            })?;
+            target.update(|_, _| Ok(()))?;
+            let prepared = if metadata_abort {
+                Some(super::super::retained_intents::capture(
+                    &source, &before.id,
+                )?)
+            } else {
+                None
+            };
+            let mut after = before.clone();
+            after.group_path = "moved".into();
+            let source_bytes = fs::read(source.sessions_path())?;
+            let target_bytes = fs::read(target.sessions_path())?;
+            let held =
+                acquire_storage_flock(&app, crate::migrations::v027_isolate_sandbox_stores::LOCK)?;
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let moving_source = source.clone();
+            let moving_target = target.clone();
+            let expected = before.id.clone();
+            let worker = std::thread::spawn(move || {
+                let _observer = observe_lock_contention_for_test(contended_tx);
+                let result = match prepared {
+                    Some(prepared) => super::super::retained_intents::abort(&prepared).map(|_| ()),
+                    None => moving_source
+                        .move_instances_to(
+                            &moving_target,
+                            &[(before, after)],
+                            &GroupMovePlan::single("work", "moved"),
+                            |_, _| Ok(()),
+                        )
+                        .map(|_| ()),
+                };
+                done_tx.send(result).unwrap();
+            });
+            let contended = contended_rx.recv_timeout(Duration::from_secs(2));
+            let unchanged = fs::read(source.sessions_path())? == source_bytes
+                && fs::read(target.sessions_path())? == target_bytes;
+            drop(held);
+            done_rx.recv_timeout(Duration::from_secs(2))??;
+            worker.join().unwrap();
+            assert_eq!(
+                contended
+                    .expect("consumer did not wait for its original application transition fence"),
+                app.join(crate::migrations::v027_isolate_sandbox_stores::LOCK)
             );
-            done_tx.send(result).unwrap();
-        });
-        let contended = contended_rx.recv_timeout(Duration::from_secs(2));
-        let unchanged = fs::read(source.sessions_path())? == source_bytes
-            && fs::read(target.sessions_path())? == target_bytes;
-        drop(held);
-        let moved = done_rx.recv_timeout(Duration::from_secs(2))??;
-        worker.join().unwrap();
-        assert_eq!(
-            contended.expect("move did not wait for its original application transition fence"),
-            app.join(crate::migrations::v027_isolate_sandbox_stores::LOCK)
-        );
-        assert!(
-            unchanged,
-            "move published through the original transition fence"
-        );
-        assert!(source.load()?.is_empty());
-        assert_eq!(target.load()?[0].id, moved[0].id);
-        assert_eq!(target.load()?[0].group_path, "moved");
+            assert!(
+                unchanged,
+                "consumer published through the original transition fence"
+            );
+            assert!(source.load()?.is_empty());
+            if metadata_abort {
+                assert_eq!(fs::read(target.sessions_path())?, target_bytes);
+                let original: Vec<Box<serde_json::value::RawValue>> =
+                    serde_json::from_slice(&source_bytes)?;
+                let retained = super::super::retained_intents::retained_raw_owners_in(&app)?;
+                assert_eq!(retained[0].get(), original[0].get());
+            } else {
+                let target = target.load()?;
+                assert_eq!(target[0].id, expected);
+                assert_eq!(target[0].group_path, "moved");
+            }
+        }
         Ok(())
     }
 

@@ -1178,7 +1178,8 @@ mod tests {
             Some("owner".into()),
         );
         worker_registry::save(&record).unwrap();
-        instance.runner_journal = serde_json::from_value(serde_json::json!({
+        let mut opaque = serde_json::to_value(&instance).unwrap();
+        opaque["runner_journal"] = serde_json::json!({
             "coverage": "complete", "preparations": [],
             "launches": [{
                 "nonce": *uuid::Uuid::new_v4().as_bytes(),
@@ -1187,22 +1188,10 @@ mod tests {
                 "incarnation": crate::process::process_incarnation(pid).unwrap().unwrap(),
                 "profile_identity": storage.original_profile_identity().unwrap(),
             }],
-        })).unwrap();
-        storage
-            .update(|instances, _| {
-                instances
-                    .iter_mut()
-                    .find(|row| row.id == instance.id)
-                    .unwrap()
-                    .runner_journal = instance.runner_journal.clone();
-                instances
-                    .iter_mut()
-                    .find(|row| row.id == instance.id)
-                    .unwrap()
-                    .view = crate::session::View::Terminal;
-                Ok(())
-            })
-            .unwrap();
+        });
+        opaque["view"] = serde_json::to_value(crate::session::View::Terminal).unwrap();
+        let opaque_bytes = serde_json::to_vec(&vec![opaque]).unwrap();
+        std::fs::write(storage.sessions_path(), &opaque_bytes).unwrap();
         std::fs::remove_file(worker_registry::record_path(&instance.id).unwrap()).unwrap();
         // Only storage is authoritative, not this stale consumer snapshot.
         instance.runner_journal = crate::session::runner_journal::RunnerExecutionJournal::new();
@@ -1211,6 +1200,10 @@ mod tests {
         assert!(
             result.is_err(),
             "a live unproven owner must invalidate this reconciliation pass"
+        );
+        assert_eq!(
+            std::fs::read(storage.sessions_path()).unwrap(),
+            opaque_bytes
         );
         let group_was_alive = crate::process::worker::is_process_group_alive(pid);
         drop(child.stdin.take());

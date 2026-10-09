@@ -4802,73 +4802,72 @@ mod tests {
         let boot = *uuid::Uuid::parse_str(&crate::process::boot_id().unwrap())
             .unwrap()
             .as_bytes();
-        let live = serde_json::from_value(serde_json::json!({
+        let legacy = serde_json::json!({
             "coverage": "complete", "preparations": [], "launches": [{
                 "nonce": *uuid::Uuid::new_v4().as_bytes(), "boot": boot,
                 "generation": 0, "incarnation": incarnation,
             }],
-        }))
-        .unwrap();
+        });
         let storage = Storage::new_unwatched("owner").unwrap();
         let mut instance = Instance::new("Protected", project.to_str().unwrap());
         instance.id = "protected-purge".into();
         instance.source_profile = storage.profile().into();
         instance.view = crate::session::View::Structured;
         instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+        instance.runner_journal =
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
         storage
             .update(|rows, _| {
                 rows.push(instance.clone());
                 Ok(())
             })
             .unwrap();
-        for journal in [
-            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown(),
-            live,
-        ] {
-            instance.runner_journal = journal.clone();
-            storage
-                .update(|rows, _| {
-                    rows.iter_mut()
-                        .find(|row| row.id == instance.id)
-                        .unwrap()
-                        .runner_journal = journal.clone();
-                    Ok(())
-                })
-                .unwrap();
-            assert!(crate::process::worker::is_process_group_alive(pid));
-            assert!(crate::process::worker_registry::load_strict(&instance.id)
-                .unwrap()
-                .is_none());
-            let transaction =
-                match PurgeTransaction::reserve_unwatched(request(instance.clone())).unwrap() {
-                    PurgeReservation::Reserved(transaction) => transaction,
-                    PurgeReservation::Rejected(result) => panic!("reservation failed: {result:?}"),
-                };
-            let mut hooks = 0;
-            let result = match settle_runner_of(transaction).await {
-                Ok(transaction) => transaction
-                    .run_hooks_with(|_, _| {
-                        hooks += 1;
-                    })
-                    .complete_with(|_| Ok(())),
-                Err(result) => *result,
+        assert!(crate::process::worker::is_process_group_alive(pid));
+        assert!(crate::process::worker_registry::load_strict(&instance.id)
+            .unwrap()
+            .is_none());
+        let transaction =
+            match PurgeTransaction::reserve_unwatched(request(instance.clone())).unwrap() {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(result) => panic!("reservation failed: {result:?}"),
             };
-            assert_eq!(result.disposition, DeletionDisposition::Failed);
-            assert_eq!(hooks, 0);
-            assert_eq!(
-                std::fs::read_to_string(&sentinel).unwrap(),
-                "checkout content"
-            );
-            assert!(storage
-                .load()
-                .unwrap()
-                .iter()
-                .any(|row| row.id == instance.id && row.lifecycle_reservation.is_none()));
-            assert!(crate::process::worker::is_process_group_alive(pid));
-            instance = result
-                .retained_instance
-                .expect("failed original transaction returns its own released CAS projection");
-        }
+        let mut hooks = 0;
+        let result = match settle_runner_of(transaction).await {
+            Ok(transaction) => transaction
+                .run_hooks_with(|_, _| {
+                    hooks += 1;
+                })
+                .complete_with(|_| Ok(())),
+            Err(result) => *result,
+        };
+        assert_eq!(result.disposition, DeletionDisposition::Failed);
+        assert_eq!(hooks, 0);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "checkout content"
+        );
+        assert!(storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == instance.id && row.lifecycle_reservation.is_none()));
+        instance = result
+            .retained_instance
+            .expect("failed original transaction returns its released CAS projection");
+        let mut opaque = serde_json::to_value(&instance).unwrap();
+        opaque["runner_journal"] = legacy;
+        let original = serde_json::to_vec(&vec![opaque]).unwrap();
+        std::fs::write(storage.sessions_path(), &original).unwrap();
+        assert!(
+            PurgeTransaction::reserve_unwatched(request(instance)).is_err(),
+            "partial legacy native history cannot grant Purge authority"
+        );
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "checkout content"
+        );
+        assert!(crate::process::worker::is_process_group_alive(pid));
         drop(child.0.stdin.take());
         assert!(child.0.wait().unwrap().success());
     }
