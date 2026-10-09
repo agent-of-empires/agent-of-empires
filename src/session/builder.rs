@@ -2529,6 +2529,91 @@ mod tests {
         serde_json::json!({"create_coverage": journal["create_coverage"], "creations": records})
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "real native Git attach proof, hosted Linux only"]
+    #[serial_test::serial]
+    fn hosted_creating_normal_git_is_quiescent_before_unstarted_attach() {
+        crate::session::test_support::require_hosted_creating_native();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
+        let (_parent, build) = hosted_git_creation(&storage, None);
+        let prepared = build.instance;
+        let canonical = storage.load().unwrap().pop().unwrap();
+        let original_journal = serde_json::to_value(&canonical.runner_journal).unwrap();
+        let records = original_journal["creations"].as_array().unwrap();
+        for record in records {
+            assert_eq!(record["session_id"], prepared.id);
+            assert_eq!(
+                record["created_at"],
+                serde_json::to_value(prepared.created_at).unwrap()
+            );
+            assert_eq!(record["generation"], canonical.lifecycle_generation);
+            assert!(record["root_status"].is_number());
+            assert_eq!(record["effect_acknowledged"], true);
+        }
+        println!("normal Git original journal before publication: {original_journal}");
+        let custody = CreationCustody::retained()
+            .into_iter()
+            .find(|original| original.session_id() == prepared.id)
+            .unwrap();
+        custody
+            .retain_ready(CreationReady {
+                instance: prepared,
+                warnings: build.warnings,
+                on_launch_hooks_ran: false,
+            })
+            .unwrap();
+        let published = custody.retry_publication().unwrap();
+        let published_journal = serde_json::to_value(&published.runner_journal).unwrap();
+        assert_eq!(published_journal, original_journal);
+        assert!(published_journal["launches"].as_array().unwrap().is_empty());
+        assert!(published_journal["preparations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(
+            published.runner_journal.proves_runner_quiescent(),
+            "unstarted runner proof: {published_journal}"
+        );
+        assert!(published.runner_journal.proves_quiescent(), "normal Git Create prevents unstarted attach; actual rejecting bits: {published_journal}");
+
+        let frontend_parent = init_repo_with_commit("frontend");
+        let frontend = frontend_parent
+            .path()
+            .join("frontend")
+            .canonicalize()
+            .unwrap();
+        let mut plan = super::super::attach_project::plan(
+            &published,
+            "default",
+            &frontend,
+            super::super::attach_project::ExistingBranch::Refuse,
+        )
+        .unwrap();
+        let acknowledged =
+            super::super::attach_project::reserve_attach(&storage, &published.id, &mut plan)
+                .unwrap();
+        let outcome = super::super::attach_project::quiesce_for_conversion(
+            &storage,
+            &published,
+            &plan,
+            acknowledged,
+        );
+        if let Err(error) = outcome {
+            panic!("normal Git original attach scope refused: {error:#}; published producer journal: {published_journal}");
+        }
+        super::super::attach_project::release_attach(&plan);
+        let retained = storage.load().unwrap().pop().unwrap();
+        assert_eq!(retained.project_path, published.project_path);
+        assert_eq!(retained.worktree_info, published.worktree_info);
+        assert_eq!(
+            serde_json::to_value(&retained.runner_journal).unwrap(),
+            original_journal
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "real native Creating proof, hosted Linux/macOS only"]
@@ -3207,7 +3292,7 @@ mod tests {
             Ok(_) => panic!("workspace creation should fail when no repo has the branch"),
             Err(e) => e,
         };
-        let msg = format!("{err}");
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("repo-a-fail"),
             "first repo name missing from message: {msg}"
@@ -3220,11 +3305,22 @@ mod tests {
             .load()
             .unwrap()
             .into_iter()
-            .find(|row| row.id == prepared.id)
-            .unwrap();
-        assert!(stored.has_pending_worktree_path_claims());
-        assert!(matches!(stored.lifecycle_reservation.unwrap().path_claims,
-            super::super::WorktreePathClaims::Pending(paths) if paths.contains(&workspaces_root.path().join("nonexistent-branch"))));
+            .find(|row| row.id == prepared.id);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                stored.is_none(),
+                "acknowledged withdrawal removes the original row"
+            );
+            assert!(!workspaces_root.path().join("nonexistent-branch").exists());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stored = stored.expect("uncertain native scope retains its original row");
+            assert!(stored.has_pending_worktree_path_claims());
+            assert!(matches!(stored.lifecycle_reservation.unwrap().path_claims,
+                super::super::WorktreePathClaims::Pending(paths) if paths.contains(&workspaces_root.path().join("nonexistent-branch"))));
+        }
     }
 
     #[test]

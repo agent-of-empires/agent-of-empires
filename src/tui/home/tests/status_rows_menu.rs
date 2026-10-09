@@ -213,6 +213,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
         ..status_update(&id, Status::Running, IdleIntent::Clear)
     });
 
+    drain_persistence(&mut env.view).unwrap();
     let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
     let row = reloaded.iter().find(|i| i.id == id).expect("row present");
     assert_eq!(
@@ -374,6 +375,7 @@ fn apply_stop_results_transitions_instance_to_stopped() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(applied, "apply_stop_results never observed the stop result");
+    drain_persistence(&mut env.view).unwrap();
 
     let inst = env.view.get_instance(&id).unwrap();
     assert_eq!(inst.status, Status::Stopped);

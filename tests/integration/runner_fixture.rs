@@ -31,12 +31,8 @@ impl RunnerLaunchFixture {
         let env = EnvGuard::new(&["HOME", "XDG_CONFIG_HOME"])
             .and_set("HOME", home)
             .and_set("XDG_CONFIG_HOME", xdg);
-        let app = crate::session::get_app_dir().expect("isolated app directory");
-        std::fs::write(
-            app.join(".schema_version"),
-            crate::migrations::current_schema_version().to_string(),
-        )
-        .expect("current fixture schema");
+        crate::session::get_app_dir().expect("isolated app directory");
+        crate::migrations::run_migrations().expect("migrate original fixture metadata");
         let storage = Storage::new_unwatched(profile).expect("original fixture profile");
         storage
             .update(|rows, _| {

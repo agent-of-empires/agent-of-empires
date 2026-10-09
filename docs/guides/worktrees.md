@@ -84,7 +84,7 @@ Creation and attach reserve the complete future path set durably before Git, wor
 
 ### Abandoning unresolved intent metadata
 
-When original creation or attach custody is lost, `aoe -p PROFILE session abort-intent FULL_ID` removes only that exact intent row. In the TUI, right-click the unfinished session and choose **Abort metadata; retain resources**, then confirm. Cancelling the confirmation leaves the row unchanged.
+When original creation or attach custody is lost, or a pre-upgrade session has unknown runner history, `aoe -p PROFILE session abort-intent FULL_ID` removes only that exact metadata row. In the TUI, right-click the session and choose **Abort metadata; retain resources**, then confirm. This workflow needs no reboot. Cancelling the confirmation leaves the row unchanged.
 
 This does not stop a process, run destroy hooks, undo creation or purge anything. Before removing the row, aoe durably retains its exact owner, native history and path inventory in `retained-intents.json` outside the profiles. Its ID remains reserved; cleanup continues to exclude its resources in both build namespaces even when no live row owns them. A failed source write keeps both copies until retry.
 
@@ -96,7 +96,7 @@ An externally placed `git worktree lock` is not a deletion guard: aoe locks ever
 
 ### Legacy execution coverage after an upgrade
 
-Sessions whose old build did not record execution history remain protected in the same boot. Existing complete journals are preserved. To establish different-boot coverage:
+Sessions whose old build did not record execution history remain protected in the same boot. To remove their metadata without rebooting, use [metadata-only retirement](#abandoning-unresolved-intent-metadata); resources and unknown native exclusions remain protected. Existing complete journals are preserved. To establish different-boot execution coverage:
 
 1. Stop the old TUI, CLI writers and `aoe serve` processes before upgrading. Open the upgraded build so its migrations durably record the actually observed boot for legacy journals. Keep the migration backups.
 2. Reboot the actual host or VM. Restarting aoe, its daemon or a container does not establish a different host boot.

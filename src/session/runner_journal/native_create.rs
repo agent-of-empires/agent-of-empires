@@ -703,9 +703,10 @@ struct CreateBootstrap {
 pub(crate) fn bootstrap_child() -> Result<()> {
     let input = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) }.try_clone_to_owned()?;
     let mut channel = UnixStream::from(input);
-    let [profile, workspace, identity, lifecycle] = bootstrap::receive_descriptors(&channel)?;
+    let [profile, workspace, identity, lifecycle] =
+        crate::process::receive_bootstrap_descriptors(&channel)?;
     let received: CreateBootstrap = bootstrap::read_frame(&mut channel)?;
-    let [executable, directory] = bootstrap::receive_descriptors::<2>(&channel)?;
+    let [executable, directory] = crate::process::receive_bootstrap_descriptors::<2>(&channel)?;
     let fences = [
         File::from(workspace),
         File::from(identity),
@@ -804,15 +805,15 @@ fn send_anchors(channel: &UnixStream, files: &[File]) -> Result<()> {
 fn receive_anchors(channel: &UnixStream, count: usize) -> Result<Vec<File>> {
     match count {
         0 => Ok(Vec::new()),
-        1 => Ok(bootstrap::receive_descriptors::<1>(channel)?
+        1 => Ok(crate::process::receive_bootstrap_descriptors::<1>(channel)?
             .into_iter()
             .map(File::from)
             .collect()),
-        2 => Ok(bootstrap::receive_descriptors::<2>(channel)?
+        2 => Ok(crate::process::receive_bootstrap_descriptors::<2>(channel)?
             .into_iter()
             .map(File::from)
             .collect()),
-        3 => Ok(bootstrap::receive_descriptors::<3>(channel)?
+        3 => Ok(crate::process::receive_bootstrap_descriptors::<3>(channel)?
             .into_iter()
             .map(File::from)
             .collect()),
@@ -1203,8 +1204,10 @@ mod tests {
         let _home = crate::session::test_support::isolate_home(home.path());
         let storage = Arc::new(Storage::new_unwatched("default").unwrap());
         for cancel_at_admission in [false, true] {
-            let mut prepared =
-                Instance::new("pre-target cancellation", home.path().to_str().unwrap());
+            // The first original Create remains retained after its same-g Undo.
+            // The second cancellation phase must admit a distinct logical session.
+            let title = format!("pre-target cancellation at admission={cancel_at_admission}");
+            let mut prepared = Instance::new(&title, home.path().to_str().unwrap());
             let _custody = CreationCustody::register(storage.clone(), &prepared).unwrap();
             let intent = CreationIntent::reserve_metadata(&storage, &mut prepared).unwrap();
             let owner = intent.borrow_owned_create().unwrap();

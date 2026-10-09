@@ -180,7 +180,16 @@ mod tests {
                 "historical birth data must survive migration"
             );
         }
-        assert_eq!(migrated[1]["runner_journal"], pending);
+        let preparing_journal = &migrated[1]["runner_journal"];
+        for (key, value) in pending.as_object().unwrap() {
+            assert_eq!(
+                &preparing_journal[key], value,
+                "existing preparation data survives"
+            );
+        }
+        let preparing: crate::session::runner_journal::RunnerExecutionJournal =
+            serde_json::from_value(preparing_journal.clone()).unwrap();
+        assert!(!preparing.proves_quiescent());
         let loaded: crate::session::runner_journal::RunnerExecutionJournal =
             serde_json::from_value(journal.clone()).unwrap();
         assert!(!loaded.proves_quiescent());
@@ -249,6 +258,11 @@ mod tests {
         let bytes: serde_json::Value =
             serde_json::from_slice(&fs::read(storage.sessions_path()).unwrap()).unwrap();
         let launch = &bytes[0]["runner_journal"]["launches"][0];
+        assert_eq!(launch["profile_identity"]["device"], 17);
+        assert_eq!(launch["profile_identity"]["inode"], 19);
+        assert_eq!(launch["stop_endpoint"]["device"], 23);
+        assert_eq!(launch["stop_endpoint"]["inode"], 29);
+        assert_eq!(bytes[0]["runner_journal"]["coverage"], "unknown");
         assert_eq!(
             launch["profile_identity"]["birth_time"],
             serde_json::Value::Null

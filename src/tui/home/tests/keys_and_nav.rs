@@ -825,11 +825,9 @@ fn manual_unread_hold_lasts_one_visit() {
     );
     assert!(!env.view.get_instance(&a).unwrap().is_unread());
     env.view.mutate_instance(&a, |inst| inst.mark_unread());
-    assert!(
-        env.view.tick_unread_dwell(t1 + past_dwell * 2)
-            && !env.view.get_instance(&a).unwrap().is_unread(),
-        "a later auto mark must not be suppressed by a stale hold"
-    );
+    assert!(env.view.tick_unread_dwell(t1 + past_dwell * 2));
+    drain_persistence(&mut env.view).unwrap();
+    assert!(!env.view.get_instance(&a).unwrap().is_unread());
 }
 
 #[test]

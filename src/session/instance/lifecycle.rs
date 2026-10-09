@@ -181,16 +181,23 @@ impl Instance {
         restart: bool,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let committed = storage.update_metadata(
+        storage.update_metadata(
             crate::session::MetadataSelection::Session(self.id.as_str().into()),
             |instances, _groups| {
-                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
-                else {
-                    return Ok(false);
-                };
-                if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
-                    return Ok(false);
-                }
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == self.id)
+                    .with_context(|| {
+                        format!("session {} disappeared before launch commit", self.id)
+                    })?;
+                anyhow::ensure!(
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Launch,
+                        generation
+                    ),
+                    "session {} lost its launch reservation or retains pending path claims",
+                    self.id
+                );
                 stored.status = self.status;
                 stored.idle_entered_at = self.idle_entered_at;
                 stored.last_accessed_at = self.last_accessed_at;
@@ -201,16 +208,9 @@ impl Instance {
                     stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
                 }
                 stored.first_launch_names_agent = false;
-                stored
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
-                Ok(true)
+                Ok(())
             },
         )?;
-        anyhow::ensure!(
-            committed,
-            "session {} disappeared or lost its lifecycle reservation before launch commit",
-            self.id
-        );
         self.lifecycle_reservation = None;
         self.first_launch_names_agent = false;
         Ok(())
@@ -286,29 +286,27 @@ impl Instance {
         status: Status,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let committed = storage.update_metadata(
+        storage.update_metadata(
             crate::session::MetadataSelection::Session(self.id.as_str().into()),
             |instances, _groups| {
-                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
-                else {
-                    return Ok(false);
-                };
-                if !stored.lifecycle_reservation_is_owned(operation, generation) {
-                    return Ok(false);
-                }
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == self.id)
+                    .with_context(|| {
+                        format!("session {} disappeared before lifecycle commit", self.id)
+                    })?;
+                anyhow::ensure!(
+                    stored.release_lifecycle_reservation_if_owned(operation, generation),
+                    "session {} lost its lifecycle reservation or retains pending path claims",
+                    self.id
+                );
                 stored.status = status;
                 if status != Status::Idle {
                     stored.idle_entered_at = None;
                 }
-                stored.release_lifecycle_reservation_if_owned(operation, generation);
-                Ok(true)
+                Ok(())
             },
         )?;
-        anyhow::ensure!(
-            committed,
-            "session {} disappeared or lost its lifecycle reservation before commit",
-            self.id
-        );
         self.lifecycle_reservation = None;
         self.status = status;
         if status != Status::Idle {
@@ -323,21 +321,23 @@ impl Instance {
         operation: LifecycleOperation,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let released = storage.update_metadata(
+        storage.update_metadata(
             crate::session::MetadataSelection::Session(self.id.as_str().into()),
             |instances, _groups| {
-                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
-                else {
-                    return Ok(false);
-                };
-                Ok(stored.release_lifecycle_reservation_if_owned(operation, generation))
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == self.id)
+                    .with_context(|| {
+                        format!("session {} disappeared before lifecycle release", self.id)
+                    })?;
+                anyhow::ensure!(
+                    stored.release_lifecycle_reservation_if_owned(operation, generation),
+                    "session {} lost its lifecycle reservation or retains pending path claims",
+                    self.id
+                );
+                Ok(())
             },
         )?;
-        anyhow::ensure!(
-            released,
-            "session {} disappeared or lost its lifecycle reservation before release",
-            self.id
-        );
         self.lifecycle_reservation = None;
         Ok(())
     }
@@ -482,6 +482,50 @@ mod tests {
             path_claims: crate::session::WorktreePathClaims::None,
             custodian: None,
         })
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn refused_durable_release_keeps_pending_claims_and_memory_reservation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::storage::Storage::new_unwatched("refused-release").unwrap();
+        for operation in [LifecycleOperation::Launch, LifecycleOperation::Stop] {
+            for claims in [
+                WorktreePathClaims::Pending(vec!["/protected".into()]),
+                WorktreePathClaims::Unknown(None),
+            ] {
+                let mut original = Instance::new("session", "/protected");
+                original.status = Status::Starting;
+                original.lifecycle_generation = 1;
+                original.lifecycle_reservation = held(
+                    operation,
+                    DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                );
+                original.lifecycle_reservation.as_mut().unwrap().path_claims = claims;
+                original.first_launch_names_agent = true;
+                let source = serde_json::to_vec(&vec![original.clone()]).unwrap();
+                std::fs::write(storage.sessions_path(), &source).unwrap();
+                let mut candidate = storage.load().unwrap().remove(0);
+                candidate.status = Status::Idle;
+                let reservation = candidate.lifecycle_reservation.clone();
+                let result = if operation == LifecycleOperation::Launch {
+                    candidate.commit_lifecycle_launch(&storage, true)
+                } else {
+                    candidate.commit_lifecycle_status(&storage, operation, Status::Stopped)
+                };
+                assert!(result.is_err());
+                assert_eq!(candidate.lifecycle_reservation, reservation);
+                assert_eq!(candidate.status, Status::Idle);
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), source);
+                let persisted = storage.load().unwrap().remove(0);
+                assert_eq!(persisted.status, Status::Starting);
+                assert!(persisted.first_launch_names_agent);
+                assert_eq!(
+                    persisted.lifecycle_reservation,
+                    original.lifecycle_reservation
+                );
+            }
+        }
     }
 
     #[test]

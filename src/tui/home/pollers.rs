@@ -40,7 +40,13 @@ impl HomeView {
                         DeletionDisposition::Failed | DeletionDisposition::Busy
                     )
                 {
-                    tracing::warn!(target: "tui.home", session = %pending.session_id, errors = ?result.errors, "delete result retained while another original request is pending");
+                    let details = if result.errors.is_empty() {
+                        "The original delete is still pending; this request did not complete."
+                            .to_string()
+                    } else {
+                        result.errors.join("; ")
+                    };
+                    self.info_dialog = Some(InfoDialog::new("Delete did not complete", &details));
                     return true;
                 }
                 if result.disposition == DeletionDisposition::Failed {

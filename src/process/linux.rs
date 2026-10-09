@@ -1,7 +1,31 @@
 //! Linux-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
-pub(super) const BOOTSTRAP_RECV_FLAGS: i32 = libc::MSG_CMSG_CLOEXEC;
+
+// SAFETY: the caller retains writable data and control buffers for the receive.
+pub(super) unsafe fn receive_bootstrap_rights(
+    channel: &std::os::unix::net::UnixStream,
+    message: &mut libc::msghdr,
+) -> std::io::Result<isize> {
+    use std::os::fd::AsRawFd;
+    loop {
+        let received =
+            unsafe { libc::recvmsg(channel.as_raw_fd(), message, libc::MSG_CMSG_CLOEXEC) };
+        if received >= 0 {
+            return Ok(received);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+pub(super) fn peer_pid_from_connected_socket(stream: &impl std::os::fd::AsFd) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let pid = getsockopt(stream, PeerCredentials).ok()?.pid();
+    (pid > 0).then_some(pid as u32)
+}
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

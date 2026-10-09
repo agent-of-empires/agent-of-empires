@@ -12,7 +12,7 @@ use crate::session::{
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
-    /// Remove an unresolved create/attach intent's metadata; retain resources and exclusions
+    /// Remove unresolved intent or legacy session metadata; retain resources and exclusions
     AbortIntent(AbortIntentArgs),
 
     /// Start a session's tmux process
@@ -171,7 +171,7 @@ pub struct ArchiveArgs {
 
 #[derive(Args)]
 pub struct AbortIntentArgs {
-    /// Exact full session ID of a pending or unknown create/attach intent
+    /// Exact full ID of an unfinished create/attach intent or session with unknown runner history
     #[arg(value_name = "ID")]
     id: String,
 }

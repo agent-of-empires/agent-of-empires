@@ -53,8 +53,10 @@ if [[ "$RUNNER_OS" == Linux ]]; then
     session::runner_journal::native_create::tests::hosted_create_cancel_retires_actual_original_descendants
     session::builder::tests::hosted_creating_branch_unlink_ack_survives_late_retirement_failure
     session::runner_journal::native_create::external_domain_test::hosted_create_actual_external_ipc_stays_protected_after_cli_exit
+    session::builder::tests::hosted_creating_normal_git_is_quiescent_before_unstarted_attach
   )
 fi
+failed=0
 for proof in "${cases[@]}"; do
   found=0
   while IFS= read -r line; do
@@ -65,7 +67,12 @@ for proof in "${cases[@]}"; do
     exit 1
   fi
   echo "::group::Hosted Creating proof: $proof"
-  "$test_binary" "$proof" --exact --ignored --nocapture --test-threads=1
+  if "$test_binary" "$proof" --exact --ignored --nocapture --test-threads=1; then
+    printf -- '- PASS `%s` (%s)\n' "$proof" "$RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
+  else
+    failed=$((failed + 1))
+    printf -- '- FAIL `%s` (%s)\n' "$proof" "$RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
+  fi
   echo "::endgroup::"
-  printf -- '- PASS \x60%s\x60 (%s)\n' "$proof" "$RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
 done
+[[ "$failed" -eq 0 ]]

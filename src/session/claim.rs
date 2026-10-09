@@ -15,6 +15,7 @@ pub(crate) enum PurgeClaimDecision {
     AlreadyGone,
 }
 
+/// The selected owner must be admitted; filtered raw rows do not prove absence.
 pub(crate) fn decide_purge_claim(
     all: &mut [Instance],
     id: &str,

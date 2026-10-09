@@ -870,7 +870,6 @@ fn restart_profile_move_rejects_target_identity_collision_before_mutation() {
         .to_string()
         .contains("Session already exists with same title and path"));
     assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
-    assert!(!view.restart_cooldown_at.contains_key(&id));
     assert_eq!(
         Storage::new_unwatched("test")
             .unwrap()
@@ -1157,7 +1156,6 @@ fn restart_profile_move_rejects_invalid_targets_before_mutation() {
         .unwrap()
         .contains(&"missing-target".to_string()));
     assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
-    assert!(!view.restart_cooldown_at.contains_key(&id));
 
     let target = Storage::new_unwatched("target").unwrap();
     target
@@ -1183,7 +1181,6 @@ fn restart_profile_move_rejects_invalid_targets_before_mutation() {
         .to_string()
         .contains("Session already exists with same title and path"));
     assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
-    assert!(!view.restart_cooldown_at.contains_key(&id));
     assert_eq!(
         Storage::new_unwatched("test")
             .unwrap()
@@ -1279,6 +1276,7 @@ fn stamp_last_accessed_on_archived_row_unsinks_persistently() {
     );
 
     view.stamp_last_accessed(&id);
+    drain_persistence(&mut view).unwrap();
 
     assert!(
         !view.get_instance(&id).unwrap().is_archived(),
@@ -1518,7 +1516,6 @@ fn restart_profile_move_rejection_leaves_source_tool_state_unchanged() {
     assert_eq!(live.tool, "claude");
     assert_eq!(live.agent_session_id.as_deref(), Some("source-durable-sid"));
     assert!(!view.restart_in_flight.contains_key(&id));
-    assert!(!view.restart_cooldown_at.contains_key(&id));
 }
 
 #[test]
@@ -1758,20 +1755,15 @@ fn archive_completion_uses_captured_id_after_selection_changes() {
     let held = storage
         .acquire_instance_lifecycle_lock(&original_id)
         .unwrap();
-    {
-        let submitted = view.toggle_archive_at_cursor();
-        await_transaction_result(
-            &mut view,
-            submitted.map(|_| super::super::TransactionDisposition::Queued),
-        )
-    }
-    .unwrap();
+    view.toggle_archive_at_cursor().unwrap();
+    assert!(!view.persistence_is_idle());
     assert!(
         !view.get_instance(&original_id).unwrap().is_archived(),
         "queueing must not publish archive before settlement"
     );
     view.select_session_by_id(&peer_id);
     drop(held);
+    drain_persistence(&mut view).unwrap();
     finish_runner_settlements(&mut view);
     let rows = storage.load().unwrap();
     let archived = rows.iter().find(|row| row.id == original_id).unwrap();
@@ -1799,10 +1791,10 @@ fn restart_failed_save_fence_never_starts_or_submits_native_work() {
         .unwrap()
         .set_fail_writes_for_test(true);
     let accepted = env.view.restart_selected_session(
+        None,
         Some("codex"),
         Some("--new-args"),
         Some("replacement"),
-        None,
     );
     assert!(accepted.is_ok());
     assert!(!env.view.restart_in_flight.contains_key(&id));
@@ -1934,7 +1926,7 @@ fn transaction_behind_failed_save_requires_its_own_successful_original_fence() {
         .set_fail_writes_for_test(true);
     env.view.request_save();
     env.view
-        .restart_selected_session(Some("codex"), None, None, None)
+        .restart_selected_session(None, Some("codex"), None, None)
         .unwrap();
     assert!(drain_persistence(&mut env.view).is_err());
     assert!(!env.view.restart_in_flight.contains_key(&id));

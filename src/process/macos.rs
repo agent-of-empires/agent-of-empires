@@ -1,7 +1,12 @@
 //! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
-pub(super) const BOOTSTRAP_RECV_FLAGS: i32 = 0;
+
+pub(super) fn peer_pid_from_connected_socket(stream: &impl std::os::fd::AsFd) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+    let pid = getsockopt(stream, LocalPeerPid).ok()?;
+    (pid > 0).then_some(pid as u32)
+}
 use std::collections::HashMap;
 use std::process::Command;
 // Darwin retains the real original Child/group, but does not claim exhaustive
@@ -166,10 +171,10 @@ pub(super) fn is_process_group_alive(pgid: u32) -> bool {
 
 /// # Safety
 /// `message` must point to live writable data and control buffers.
-pub(crate) unsafe fn reject_truncated_bootstrap_rights(
+pub(super) unsafe fn receive_bootstrap_rights(
     channel: &std::os::unix::net::UnixStream,
     message: &mut libc::msghdr,
-) -> std::io::Result<()> {
+) -> std::io::Result<isize> {
     use std::os::fd::AsRawFd;
 
     let capacity = message.msg_controllen;
@@ -195,7 +200,16 @@ pub(crate) unsafe fn reject_truncated_bootstrap_rights(
             "original descriptor transfer was truncated",
         ));
     }
-    Ok(())
+    loop {
+        let received = unsafe { libc::recvmsg(channel.as_raw_fd(), message, 0) };
+        if received >= 0 {
+            return Ok(received);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 pub(super) use super::unix::{

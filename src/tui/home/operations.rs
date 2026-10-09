@@ -1136,6 +1136,17 @@ impl HomeView {
         if rows.is_empty() {
             return Ok(super::TransactionDisposition::Ignored);
         }
+        for row in &rows {
+            let id = &row.before.id;
+            anyhow::ensure!(
+                !self.transaction_is_pending(id)
+                    && !self.settlement_in_flight.contains_key(id)
+                    && !self.restart_in_flight.contains_key(id)
+                    && !self.recovery_in_flight.contains_key(id)
+                    && !self.has_delete_in_flight(id),
+                "A session in this group has a lifecycle operation in progress"
+            );
+        }
         for row in rows {
             let successor = self.archive_successor_session(&row.before.id);
             self.request_transaction(persistence_transactions::TransactionRequest::Archive {

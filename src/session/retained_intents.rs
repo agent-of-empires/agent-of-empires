@@ -104,8 +104,28 @@ fn owner_id(raw: &RawValue) -> Result<String> {
     .context("retained owner id is not a string")
 }
 
+pub(crate) fn can_abort_metadata(row: &super::Instance) -> bool {
+    row.runner_journal.has_unknown_runner_coverage()
+        || row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+            matches!(
+                lease.op,
+                super::LifecycleOperation::Create | super::LifecycleOperation::Attach
+            ) && lease.path_claims.is_pending()
+        })
+}
+
 fn eligible(raw: &RawValue) -> Result<()> {
     let object = RawObject::parse(raw)?;
+    if let Some(journal) = object.unique("runner_journal")? {
+        if let Ok(journal) = RawObject::parse(journal) {
+            if journal.unique("coverage")?.is_some_and(|coverage| {
+                serde_json::from_str::<String>(coverage.get())
+                    .is_ok_and(|coverage| coverage == "unknown")
+            }) {
+                return Ok(());
+            }
+        }
+    }
     let lease = RawObject::parse(
         object
             .unique("lifecycle_reservation")?
@@ -424,6 +444,49 @@ mod tests {
         );
         std::fs::write(storage.sessions_path(), format!("[{owner}]")).unwrap();
         (env, storage, owner, resource)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_unknown_metadata_can_retire_without_boot_change_or_resource_cleanup() {
+        for coverage in ["unknown", "complete"] {
+            let (_env, storage, _, resource) = fixture();
+            let path = serde_json::to_string(&resource).unwrap();
+            let owner = format!(
+                r#"{{"id":"legacy-owner","created_at":"2000-01-01T00:00:00Z","project_path":{path},"runner_journal":{{"coverage":"{coverage}","boot":null,"launches":[],"preparations":[],"opaque":{{"same":1,"same":2,"number":1e400}}}}}}"#
+            );
+            let source = format!("[{owner}]");
+            std::fs::write(storage.sessions_path(), &source).unwrap();
+            let app = AnchoredDir::open(&super::super::get_app_dir().unwrap()).unwrap();
+            let selected = capture(&storage, "legacy-owner");
+            if coverage == "complete" {
+                assert!(selected.is_err());
+                assert_eq!(
+                    std::fs::read_to_string(storage.sessions_path()).unwrap(),
+                    source
+                );
+                assert!(read_at(&app).unwrap().records.is_empty());
+            } else {
+                abort(&selected.unwrap()).unwrap();
+                assert!(RawDocument::parse(
+                    &std::fs::read_to_string(storage.sessions_path()).unwrap()
+                )
+                .unwrap()
+                .rows
+                .is_empty());
+                let ledger = read_at(&app).unwrap();
+                assert_eq!(ledger.records[0].owner.get(), owner);
+                assert_eq!(
+                    ledger.records[0].source,
+                    storage.original_profile_identity().unwrap()
+                );
+                assert!(ensure_id_available("legacy-owner").is_err());
+            }
+            assert_eq!(
+                std::fs::read(resource.join("history")).unwrap(),
+                b"original bytes"
+            );
+        }
     }
 
     #[test]

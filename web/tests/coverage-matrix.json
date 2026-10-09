@@ -117,6 +117,12 @@
       ]
     },
     {
+      "id": "session.startup-cancellation-retires-original-publication",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-create.spec.ts"]
+    },
+    {
       "id": "session.create-worktree-name-collisions",
       "kind": "live-playwright",
       "risk": "medium",

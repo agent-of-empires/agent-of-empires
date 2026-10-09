@@ -393,7 +393,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 
 ###### **Subcommands:**
 
-* `abort-intent` — Remove an unresolved create/attach intent's metadata; retain resources and exclusions
+* `abort-intent` — Remove unresolved intent or legacy session metadata; retain resources and exclusions
 * `start` — Start a session's tmux process
 * `stop` — Stop session process
 * `restart` — Restart session (or all sessions with `--all`)
@@ -422,13 +422,13 @@ Manage session lifecycle (start, stop, attach, etc.)
 
 ## `aoe session abort-intent`
 
-Remove an unresolved create/attach intent's metadata; retain resources and exclusions
+Remove unresolved intent or legacy session metadata; retain resources and exclusions
 
 **Usage:** `aoe session abort-intent <ID>`
 
 ###### **Arguments:**
 
-* `<ID>` — Exact full session ID of a pending or unknown create/attach intent
+* `<ID>` — Exact full ID of an unfinished create/attach intent or session with unknown runner history
 
 
 

@@ -275,9 +275,9 @@ fn persist_profile(snapshot: &ProfileSaveSnapshot) -> anyhow::Result<Vec<String>
                     stored.name.clone_from(&edited.name);
                     stored.collapsed = edited.collapsed;
                     stored.archived_at = edited.archived_at;
-                } else {
-                    groups.push(edited.clone());
                 }
+                // Group creation is an acknowledged transaction, not a save of a stale
+                // view tree. A peer-deleted group must never be recreated by an overlay.
             }
             Ok(peer_deleted)
         })

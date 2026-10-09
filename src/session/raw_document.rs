@@ -122,6 +122,15 @@ impl Serialize for ArrayEmission<'_> {
 
 // Compare the typed before/after projection, not raw spelling or unknown fields.
 pub(crate) fn patch<'a>(raw: &'a RawValue, before: &Value, after: &Value) -> Result<Emission<'a>> {
+    patch_member(raw, before, after, None)
+}
+
+fn patch_member<'a>(
+    raw: &'a RawValue,
+    before: &Value,
+    after: &Value,
+    array_field: Option<&str>,
+) -> Result<Emission<'a>> {
     if before == after {
         return Ok(Emission::Original(raw));
     }
@@ -139,7 +148,7 @@ pub(crate) fn patch<'a>(raw: &'a RawValue, before: &Value, after: &Value) -> Res
                 object.unique(&name.0)?;
                 if let Some(next) = next {
                     let value = match prior {
-                        Some(prior) => patch(value, prior, next)?,
+                        Some(prior) => patch_member(value, prior, next, Some(name.0.as_ref()))?,
                         None => Emission::Changed(serde_json::value::to_raw_value(next)?),
                     };
                     fields.push((Cow::Borrowed(name.0.as_ref()), value));
@@ -161,27 +170,35 @@ pub(crate) fn patch<'a>(raw: &'a RawValue, before: &Value, after: &Value) -> Res
                 originals.len() == before.len(),
                 "canonical array differs from its typed projection"
             );
+            let mut consumed = vec![false; before.len()];
+            let mut matched = 0;
+            let mut inserted = false;
             let mut values = Vec::with_capacity(after.len());
-            for (index, value) in after.iter().enumerate() {
-                if before.get(index) == Some(value) {
-                    values.push(Emission::Original(originals[index]));
-                } else if let Some(prior) = before.iter().position(|prior| prior == value) {
-                    values.push(Emission::Original(originals[prior]));
-                } else if let Some(prior) = before
-                    .get(index)
-                    .filter(|prior| same_identity(prior, value))
-                {
-                    values.push(patch(originals[index], prior, value)?);
-                } else if let Some((index, prior)) = before
-                    .iter()
-                    .enumerate()
-                    .find(|(_, prior)| same_identity(prior, value))
-                {
-                    values.push(patch(originals[index], prior, value)?);
-                } else {
-                    values.push(Emission::Changed(serde_json::value::to_raw_value(value)?));
+            for value in after {
+                let mut candidate = None;
+                for (index, prior) in before.iter().enumerate() {
+                    if prior == value || same_identity(prior, value, array_field) {
+                        anyhow::ensure!(candidate.is_none(), "ambiguous canonical array member");
+                        candidate = Some(index);
+                    }
                 }
+                values.push(match candidate {
+                    Some(index) => {
+                        anyhow::ensure!(!consumed[index], "canonical array member reused");
+                        consumed[index] = true;
+                        matched += 1;
+                        patch_member(originals[index], &before[index], value, array_field)?
+                    }
+                    None => {
+                        inserted = true;
+                        Emission::Changed(serde_json::value::to_raw_value(value)?)
+                    }
+                });
             }
+            anyhow::ensure!(
+                matched == before.len() || !inserted,
+                "canonical array replacement has no unique survivor correspondence"
+            );
             serde_json::value::to_raw_value(&ArrayEmission(values))?
         }
         _ => serde_json::value::to_raw_value(after)?,
@@ -189,13 +206,92 @@ pub(crate) fn patch<'a>(raw: &'a RawValue, before: &Value, after: &Value) -> Res
     Ok(Emission::Changed(changed))
 }
 
-fn same_identity(before: &Value, after: &Value) -> bool {
-    for key in ["id", "nonce", "path", "name", "worktree_path"] {
-        if let Some(value) = before.get(key) {
-            return after.get(key) == Some(value);
+fn same_identity(before: &Value, after: &Value, array_field: Option<&str>) -> bool {
+    let keys: &[&str] = match array_field {
+        // A repository's checkout path and branch are mutable transaction output.
+        Some("repos") => &["name", "source_path", "main_repo_path"],
+        Some("launches") => &[
+            "nonce",
+            "boot",
+            "generation",
+            "incarnation",
+            "profile_identity",
+        ],
+        Some("preparations") => &["nonce", "boot", "generation"],
+        Some("creations") => &[
+            "format",
+            "nonce",
+            "session_id",
+            "created_at",
+            "generation",
+            "boot",
+            "commitment",
+            "profile_identity",
+        ],
+        _ => {
+            // An unclassified native record has no inferred nonce-only identity.
+            if before.get("nonce").is_some() || after.get("nonce").is_some() {
+                return false;
+            }
+            let mut identified = false;
+            for key in ["id", "path", "name", "worktree_path"] {
+                let prior = before.get(key);
+                let next = after.get(key);
+                if prior != next {
+                    return false;
+                }
+                identified |= prior
+                    .is_some_and(|value| value.as_str().is_some_and(|value| !value.is_empty()));
+            }
+            return identified;
         }
+    };
+    keys.iter().all(|key| {
+        if array_field == Some("repos") {
+            return before.get(*key).is_some_and(|prior| {
+                prior.as_str().is_some_and(|value| !value.is_empty())
+                    && after.get(*key) == Some(prior)
+            });
+        }
+        if *key == "profile_identity" {
+            return same_profile_stamp(before.get(*key), after.get(*key));
+        }
+        if array_field == Some("launches") && *key == "incarnation" {
+            let prior = before.get(*key).unwrap_or(&Value::Null);
+            let next = after.get(*key).unwrap_or(&Value::Null);
+            // A provisional slot may gain its first birth, never a replacement.
+            return prior == next
+                || before.get(*key).is_some()
+                    && prior.is_null()
+                    && next.is_object()
+                    && before.get("profile_identity").is_some_and(Value::is_object);
+        }
+        before.get(*key).is_some() && before.get(*key) == after.get(*key)
+    })
+}
+
+fn same_profile_stamp(before: Option<&Value>, after: Option<&Value>) -> bool {
+    let before = before.unwrap_or(&Value::Null);
+    let after = after.unwrap_or(&Value::Null);
+    if before == after {
+        return true;
     }
-    false
+    // Legacy quarantine adds no birth and retains the original weak dev/ino.
+    if !after.is_object() || after.get("birth_time") != Some(&Value::Null) {
+        return false;
+    }
+    let pair = match before {
+        Value::Array(pair) if pair.len() == 2 => pair[0].as_u64().zip(pair[1].as_u64()),
+        Value::Object(stamp) if stamp.get("birth_time").is_none_or(Value::is_null) => stamp
+            .get("device")
+            .and_then(Value::as_u64)
+            .zip(stamp.get("inode").and_then(Value::as_u64)),
+        _ => None,
+    };
+    pair.is_some_and(|(device, inode)| {
+        after.get("device").and_then(Value::as_u64) == Some(device)
+            && after.get("inode").and_then(Value::as_u64) == Some(inode)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -436,6 +532,332 @@ mod tests {
         assert_eq!(decoded[0].items[0].name, "second");
         assert_eq!(decoded[0].items[1].name, "first");
         assert_eq!(decoded[0].items[1].value, 3);
+        Ok(())
+    }
+    fn emitted_array(raw: &str, before: &Value, after: &Value) -> Result<String> {
+        let raw: Box<RawValue> = serde_json::from_str(raw)?;
+        Ok(serde_json::to_string(&patch(&raw, before, after)?)?)
+    }
+
+    #[test]
+    fn changed_arrays_refuse_ambiguous_or_reused_survivors() -> Result<()> {
+        let raw = r#"[{"name":"same","value":1,"extension":"deleted"},{"name":"same","value":1,"extension":"survivor"}]"#;
+        let same = serde_json::json!({"name":"same","value":1});
+        let before = serde_json::json!([same, same]);
+        for after in [
+            serde_json::json!([same]),
+            serde_json::json!([{"name":"same","value":2}]),
+            serde_json::json!([same, same, {"name":"new","value":3}]),
+        ] {
+            assert!(emitted_array(raw, &before, &after).is_err());
+        }
+        assert_eq!(emitted_array(raw, &before, &before)?, raw);
+        assert_eq!(emitted_array(raw, &before, &serde_json::json!([]))?, "[]");
+        let one = serde_json::json!([same]);
+        assert!(emitted_array(
+            r#"[{"name":"same","value":1,"extension":"original"}]"#,
+            &one,
+            &serde_json::json!([same, same]),
+        )
+        .is_err());
+        // An exact projection must not break a colliding identity tie either.
+        assert!(emitted_array(
+            r#"[{"name":"same","value":1},{"name":"same","value":2}]"#,
+            &serde_json::json!([{"name":"same","value":1},{"name":"same","value":2}]),
+            &one,
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn changed_arrays_distinguish_insertions_deletions_and_unidentified_edits() -> Result<()> {
+        let raw = r#"[{"value":1,"extension":"first"},{"value":2,"extension":"second"}]"#;
+        let before = serde_json::json!([{"value":1},{"value":2}]);
+        let output = emitted_array(raw, &before, &serde_json::json!([{"value":2}]))?;
+        assert_eq!(output, r#"[{"value":2,"extension":"second"}]"#);
+        let output = emitted_array(
+            raw,
+            &before,
+            &serde_json::json!([
+                {"value":2},{"value":1},{"value":3}
+            ]),
+        )?;
+        assert_eq!(
+            output,
+            r#"[{"value":2,"extension":"second"},{"value":1,"extension":"first"},{"value":3}]"#
+        );
+        for after in [
+            serde_json::json!([{"value":1},{"value":3}]),
+            serde_json::json!([{"value":3}]),
+        ] {
+            assert!(emitted_array(raw, &before, &after).is_err());
+        }
+        // No first identifier may override another identifying component.
+        assert!(emitted_array(
+            r#"[{"id":"shared","name":"a","value":1},{"id":"shared","name":"b","value":2}]"#,
+            &serde_json::json!([{"id":"shared","name":"a","value":1},{"id":"shared","name":"b","value":2}]),
+            &serde_json::json!([{"id":"shared","name":"unknown","value":3}]),
+        ).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_repo_geometry_reorder_and_append_keep_original_extensions() -> Result<()> {
+        use crate::session::WorkspaceRepo;
+        let raw = r#"{"repos":[{"name":"shared","source_path":"/src/a","branch":"old","worktree_path":"/old/a","main_repo_path":"/src/a","managed_by_aoe":true,"extension":{"same":1,"same":2,"number":1e400}},{"name":"shared","source_path":"/src/b","branch":"old","worktree_path":"/old/b","main_repo_path":"/src/b","managed_by_aoe":true,"extension":"b"}]}"#;
+        #[derive(Deserialize, Serialize)]
+        struct Workspace {
+            repos: Vec<WorkspaceRepo>,
+        }
+        let mut typed: Workspace = serde_json::from_str(raw)?;
+        let before = serde_json::to_value(&typed)?;
+        typed.repos.swap(0, 1);
+        typed.repos[1].worktree_path = "/moved/a".into();
+        typed.repos[1].branch = "renamed".into();
+        typed.repos[0].base_branch_override = Some("main".into());
+        let mut added = typed.repos[0].clone();
+        added.name = "added".into();
+        added.source_path = "/src/c".into();
+        added.main_repo_path = "/src/c".into();
+        added.worktree_path = "/new/c".into();
+        typed.repos.push(added);
+        let after = serde_json::to_value(&typed)?;
+        let raw: Box<RawValue> = serde_json::from_str(raw)?;
+        let output = serde_json::to_string(&patch(&raw, &before, &after)?)?;
+        let output: Box<RawValue> = serde_json::from_str(&output)?;
+        let object = RawObject::parse(&output)?;
+        let repos: Vec<&RawValue> = serde_json::from_str(object.unique("repos")?.unwrap().get())?;
+        assert_eq!(
+            RawObject::parse(repos[0])?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            r#""b""#
+        );
+        assert_eq!(
+            RawObject::parse(repos[1])?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            r#"{"same":1,"same":2,"number":1e400}"#
+        );
+        assert!(RawObject::parse(repos[2])?.unique("extension")?.is_none());
+        let decoded: Workspace = serde_json::from_str(output.get())?;
+        assert_eq!(decoded.repos, typed.repos);
+        Ok(())
+    }
+
+    #[test]
+    fn native_array_correspondence_uses_complete_original_tuples() -> Result<()> {
+        let launch = serde_json::json!({
+            "nonce":[1,2],"boot":[3,4],"generation":5,
+            "incarnation":{"pid":6,"start":[7,8]},"profile_identity":{"dev":9,"ino":10,"btime":11},
+            "stop_endpoint":null,"registry":null
+        });
+        let creation = serde_json::json!({
+            "format":1,"nonce":"native","session_id":"session","created_at":"original",
+            "generation":5,"boot":[3,4],"commitment":[12,13],
+            "profile_identity":{"dev":9,"ino":10,"btime":11},
+            "births":[],"effect_acknowledged":false
+        });
+        for (field, original, components) in [
+            (
+                "launches",
+                launch,
+                vec![
+                    "nonce",
+                    "boot",
+                    "generation",
+                    "incarnation",
+                    "profile_identity",
+                ],
+            ),
+            (
+                "preparations",
+                serde_json::json!({"nonce":[1,2],"boot":[3,4],"generation":5}),
+                vec!["nonce", "boot", "generation"],
+            ),
+            (
+                "creations",
+                creation,
+                vec![
+                    "format",
+                    "nonce",
+                    "session_id",
+                    "created_at",
+                    "generation",
+                    "boot",
+                    "commitment",
+                    "profile_identity",
+                ],
+            ),
+        ] {
+            let mut second = original.clone();
+            second["generation"] = serde_json::json!(50);
+            let before = serde_json::json!({(field): [original, second]});
+            let mut raw = before.clone();
+            raw[field][0]["extension"] = serde_json::json!("first");
+            raw[field][1]["extension"] = serde_json::json!("second");
+            let raw: Box<RawValue> = serde_json::value::to_raw_value(&raw)?;
+            let mut after = serde_json::json!({(field): [second, original]});
+            let status = if field == "creations" {
+                "effect_acknowledged"
+            } else {
+                "registry"
+            };
+            if field != "preparations" {
+                after[field][0][status] = serde_json::json!(true);
+            }
+            let output = serde_json::to_value(patch(&raw, &before, &after)?)?;
+            assert_eq!(output[field][0]["extension"], "second");
+            assert_eq!(output[field][1]["extension"], "first");
+            for component in components {
+                let mut replaced = original.clone();
+                replaced[component] = serde_json::json!("replacement");
+                assert!(
+                    patch(&raw, &before, &serde_json::json!({(field):[replaced]})).is_err(),
+                    "{field}.{component}"
+                );
+            }
+            let mut duplicate_raw = serde_json::json!({(field):[original,original]});
+            duplicate_raw[field][0]["extension"] = serde_json::json!("deleted");
+            duplicate_raw[field][1]["extension"] = serde_json::json!("survivor");
+            let duplicate_raw = serde_json::value::to_raw_value(&duplicate_raw)?;
+            assert!(patch(
+                &duplicate_raw,
+                &serde_json::json!({(field):[original,original]}),
+                &serde_json::json!({(field):[original]})
+            )
+            .is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provisional_native_slot_accepts_only_its_unique_first_birth() -> Result<()> {
+        let pending = serde_json::json!({
+            "nonce":[1,2],"boot":[3,4],"generation":5,"incarnation":null,
+            "profile_identity":{"dev":6,"ino":7,"btime":8},
+            "stop_endpoint":null,"registry":null
+        });
+        let mut actual = pending.clone();
+        actual["incarnation"] =
+            serde_json::json!({"pid":9,"start":[10,11],"group":9,"namespace":[12,13]});
+        let before = serde_json::json!({"launches":[pending]});
+        let mut raw = before.clone();
+        raw["launches"][0]["extension"] = serde_json::json!("original");
+        let raw = serde_json::value::to_raw_value(&raw)?;
+        let output = serde_json::to_value(patch(
+            &raw,
+            &before,
+            &serde_json::json!({"launches":[actual]}),
+        )?)?;
+        assert_eq!(output["launches"][0]["extension"], "original");
+        assert_eq!(output["launches"][0]["incarnation"], actual["incarnation"]);
+        for component in ["nonce", "boot", "generation", "profile_identity"] {
+            let mut foreign = actual.clone();
+            foreign[component] = serde_json::json!("foreign");
+            assert!(patch(&raw, &before, &serde_json::json!({"launches":[foreign]})).is_err());
+        }
+        for raw_before in [
+            serde_json::json!({"launches":[pending,pending]}),
+            serde_json::json!({"launches":[pending,actual]}),
+        ] {
+            let raw_before_bytes = serde_json::value::to_raw_value(&raw_before)?;
+            assert!(patch(
+                &raw_before_bytes,
+                &raw_before,
+                &serde_json::json!({"launches":[actual]})
+            )
+            .is_err());
+        }
+        let born = serde_json::json!({"launches":[actual]});
+        let born_bytes = serde_json::value::to_raw_value(&born)?;
+        let mut replacement = actual.clone();
+        replacement["incarnation"]["start"] = serde_json::json!([100, 101]);
+        for invalid in [pending, replacement] {
+            assert!(patch(
+                &born_bytes,
+                &born,
+                &serde_json::json!({"launches":[invalid]})
+            )
+            .is_err());
+        }
+        // Reordering an already-born record alongside its distinct pending slot is safe.
+        let mut other_pending = actual.clone();
+        other_pending["nonce"] = serde_json::json!([20, 21]);
+        other_pending["incarnation"] = Value::Null;
+        let mixed_before = serde_json::json!({"launches":[actual,other_pending]});
+        let mut mixed_raw = mixed_before.clone();
+        mixed_raw["launches"][0]["extension"] = serde_json::json!("born");
+        mixed_raw["launches"][1]["extension"] = serde_json::json!("pending");
+        let mut other_actual = other_pending;
+        other_actual["incarnation"] =
+            serde_json::json!({"pid":22,"start":[23,24],"group":22,"namespace":[25,26]});
+        let output = serde_json::to_value(patch(
+            &serde_json::value::to_raw_value(&mixed_raw)?,
+            &mixed_before,
+            &serde_json::json!({"launches":[other_actual,actual]}),
+        )?)?;
+        assert_eq!(output["launches"][0]["extension"], "pending");
+        assert_eq!(output["launches"][1]["extension"], "born");
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_import_composition_handles_moves_and_refuses_ambiguous_survivors() -> Result<()> {
+        #[derive(Deserialize, Serialize)]
+        struct Owner {
+            id: String,
+            project_path: String,
+            repos: Vec<crate::session::WorkspaceRepo>,
+        }
+        let row = r#"{"id":"owner","project_path":"/old","repos":[{"name":"repo","source_path":"/source","main_repo_path":"/source","worktree_path":"/old/repo","branch":"old","managed_by_aoe":false,"extension":"first"}]}"#;
+        let (source, mut rows) =
+            RowDocument::project::<Owner>(RawDocument::parse(&format!("[{row}]"))?, "id")?;
+        rows[0].project_path = "/moved".into();
+        rows[0].repos[0].worktree_path = "/moved/repo".into();
+        rows[0].repos[0].branch = "renamed".into();
+        let imported = source.compose_row("owner", &rows[0])?;
+        let (target, _) = RowDocument::project::<Owner>(RawDocument::parse("[]")?, "id")?;
+        let output = target.render(
+            &rows,
+            |row| row.id.as_str(),
+            None,
+            HashMap::from([("owner", imported)]),
+        )?;
+        let raw = RawDocument::parse(std::str::from_utf8(&output)?)?;
+        let object = RawObject::parse(&raw.rows[0])?;
+        let repos: Vec<&RawValue> = serde_json::from_str(object.unique("repos")?.unwrap().get())?;
+        assert_eq!(
+            RawObject::parse(repos[0])?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            r#""first""#
+        );
+        let decoded: Vec<Owner> = serde_json::from_slice(&output)?;
+        assert_eq!(decoded[0].project_path, "/moved");
+        assert_eq!(decoded[0].repos[0].worktree_path, "/moved/repo");
+        // Construct the duplicate raw members without deserializing their extensions.
+        let owner_object: Box<RawValue> = serde_json::from_str(row)?;
+        let owner_object = RawObject::parse(&owner_object)?;
+        let members: Vec<&RawValue> =
+            serde_json::from_str(owner_object.unique("repos")?.unwrap().get())?;
+        let duplicated = format!(
+            r#"[{{"id":"owner","project_path":"/old","repos":[{},{}]}}]"#,
+            members[0].get(),
+            members[0].get().replace("first", "second")
+        );
+        let (source, mut rows) =
+            RowDocument::project::<Owner>(RawDocument::parse(&duplicated)?, "id")?;
+        rows[0].repos.remove(0);
+        assert!(source.compose_row("owner", &rows[0]).is_err());
+        assert_eq!(
+            source.raw.rows[0].get(),
+            &duplicated[1..duplicated.len() - 1]
+        );
         Ok(())
     }
 }

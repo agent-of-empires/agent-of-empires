@@ -300,8 +300,10 @@ impl HomeView {
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|g| {
-                            self.creating_provisional_profile.as_deref() != Some(name.as_str())
-                                || !self.creating_provisional_group_paths.contains(&g.path)
+                            self.persistence.group_edits.contains_key(name)
+                                && (self.creating_provisional_profile.as_deref()
+                                    != Some(name.as_str())
+                                    || !self.creating_provisional_group_paths.contains(&g.path))
                         })
                         .collect(),
                     deletions: self
@@ -1214,7 +1216,9 @@ impl HomeView {
                     self.select_session_by_id(&next);
                 } else {
                     self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
-                    self.update_selected();
+                    self.selected_session = None;
+                    self.selected_group = None;
+                    self.selected_group_profile = None;
                 }
             }
             TransactionEffect::Restored { id, outcome } => {
@@ -1498,7 +1502,7 @@ impl HomeView {
         });
         if self.search_active && !self.search_query.value().is_empty() && !preserve_live_selection {
             self.update_search();
-        } else if !self.search_matches.is_empty() {
+        } else if self.search_active || !self.search_matches.is_empty() {
             self.refresh_search_matches();
         }
         if !preserve_live_selection {
@@ -1513,6 +1517,58 @@ impl HomeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn acknowledged_equal_generation_publishes_metadata_without_losing_runtime() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("lane").unwrap();
+        let mut seed = Instance::new("before", "/tmp/before");
+        seed.lifecycle_generation = 1;
+        let id = seed.id.clone();
+        storage
+            .update(|rows, _| {
+                rows.push(seed);
+                Ok(())
+            })
+            .unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("lane".into()),
+            AvailableTools::with_tools(&[]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        drain(&mut view);
+        view.instances.get_mut(&id).unwrap().last_error = Some("live runtime".into());
+        let generation = view.instances[&id].lifecycle_generation;
+        storage
+            .update(|rows, _| {
+                rows[0].title = "acknowledged".into();
+                rows[0].group_path = "committed-group".into();
+                rows[0].archive();
+                Ok(())
+            })
+            .unwrap();
+        let acknowledged = storage.load().unwrap().remove(0);
+        assert_eq!(acknowledged.lifecycle_generation, generation);
+        view.project_transaction_rows(vec![acknowledged]);
+        let current = &view.instances[&id];
+        assert_eq!(current.title, "acknowledged");
+        assert_eq!(current.group_path, "committed-group");
+        assert!(current.is_archived());
+        assert_eq!(current.last_error.as_deref(), Some("live runtime"));
+        let before = serde_json::to_value(current).unwrap();
+        let mut obsolete = current.clone();
+        obsolete.lifecycle_generation = generation.checked_sub(1).unwrap();
+        obsolete.title = "obsolete plan".into();
+        obsolete.last_error = Some("obsolete runtime".into());
+        view.project_transaction_rows(vec![obsolete]);
+        assert_eq!(serde_json::to_value(&view.instances[&id]).unwrap(), before);
+        assert_eq!(
+            view.instances[&id].last_error.as_deref(),
+            Some("live runtime")
+        );
+    }
 
     #[test]
     #[serial_test::serial]

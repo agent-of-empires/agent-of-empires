@@ -86,6 +86,10 @@ mod platform {
         pgid != 0 && super::worker::is_pid_alive_and_ours(pgid)
     }
 
+    pub(super) fn peer_pid_from_connected_socket(_: &impl std::os::fd::AsFd) -> Option<u32> {
+        None
+    }
+
     pub(super) fn process_group_has_live_members(_pgrp: u32) -> std::io::Result<bool> {
         Ok(false)
     }
@@ -156,15 +160,16 @@ pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
     #[cfg(not(target_os = "macos"))]
     let _ = cmd;
 }
-
-#[cfg(target_os = "macos")]
-pub(crate) use macos::reject_truncated_bootstrap_rights;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use platform::HAS_CODEX_MANAGED_PREFERENCES;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) const BOOTSTRAP_RECV_FLAGS: i32 = platform::BOOTSTRAP_RECV_FLAGS;
+pub(crate) use unix::receive_bootstrap_descriptors;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) const BOOTSTRAP_RECV_FLAGS: i32 = 0;
+pub(crate) fn receive_bootstrap_descriptors<const N: usize>(
+    _: &std::os::unix::net::UnixStream,
+) -> anyhow::Result<[std::os::fd::OwnedFd; N]> {
+    anyhow::bail!("native bootstrap descriptor reception is unsupported on this platform")
+}
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 

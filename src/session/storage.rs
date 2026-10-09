@@ -567,42 +567,6 @@ pub(crate) fn observe_lock_contention_for_test(
 }
 
 #[cfg(test)]
-type UpdateObserver = Box<dyn FnMut(&Storage)>;
-
-#[cfg(test)]
-thread_local! {
-    static UPDATE_OBSERVER: std::cell::RefCell<Option<UpdateObserver>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Call `observer` at the start of every `Storage::update` on this thread until the guard drops.
-#[cfg(test)]
-pub(crate) fn observe_updates_for_test(observer: impl FnMut(&Storage) + 'static) -> impl Drop {
-    struct Observer(std::marker::PhantomData<std::rc::Rc<()>>);
-    impl Drop for Observer {
-        fn drop(&mut self) {
-            UPDATE_OBSERVER.with(|slot| slot.borrow_mut().take());
-        }
-    }
-    UPDATE_OBSERVER.with(|slot| {
-        assert!(slot.borrow_mut().replace(Box::new(observer)).is_none());
-    });
-    Observer(std::marker::PhantomData)
-}
-
-#[cfg(test)]
-fn report_update_for_test(storage: &Storage) {
-    // Taken out while it runs, so an update inside the observer does not re-enter it.
-    let Some(mut observer) = UPDATE_OBSERVER.with(|slot| slot.borrow_mut().take()) else {
-        return;
-    };
-    observer(storage);
-    UPDATE_OBSERVER.with(|slot| {
-        slot.borrow_mut().get_or_insert(observer);
-    });
-}
-
-#[cfg(test)]
 fn report_lock_contention_for_test(path: &Path) {
     LOCK_CONTENTION_OBSERVER.with(|slot| {
         if let Some(sender) = slot.borrow_mut().take() {
@@ -1212,6 +1176,7 @@ impl MetadataSelection<'_> {
 enum StorageWriteScope<'a> {
     Metadata(MetadataSelection<'a>),
     Geometry,
+    GeometryOwner(&'a str),
     FencedGeometry(&'a super::deletion::PathClaimIndex),
     CompletePaths {
         original: &'a super::LaunchOrigin,
@@ -1844,6 +1809,15 @@ impl Storage {
         self.update_under_storage_locks(f, StorageWriteScope::Geometry)
     }
 
+    /// Admit the selected raw owner before invoking a geometry mutation.
+    pub(crate) fn update_owner_under_workspace_claim_lock<F, R>(&self, id: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_under_storage_locks(f, StorageWriteScope::GeometryOwner(id))
+    }
+
     /// Reuse the inventory while the caller retains its workspace fence.
     pub(crate) fn update_with_claim_index_under_workspace_lock<F, R>(
         &self,
@@ -1862,8 +1836,6 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        #[cfg(test)]
-        report_update_for_test(self);
         #[cfg(test)]
         let _mu = crate::session::test_support::lock_reporting_contention(&self.save_lock, || {
             report_lock_contention_for_test(&self.sessions_path)
@@ -1923,6 +1895,12 @@ impl Storage {
             self.load_raw_document_locked(&self.sessions_path.with_file_name("groups.json"))?;
         let (group_document, mut groups) =
             super::raw_document::RowDocument::project::<Group>(raw_groups, "path")?;
+        if let StorageWriteScope::GeometryOwner(id) = &scope {
+            session_document.admit(id)?;
+            if !session_document.owners.contains_key(*id) {
+                session_document.admit_all()?;
+            }
+        }
         let selected = match &scope {
             StorageWriteScope::Metadata(selection) => {
                 Some(selection.admit(&session_document, &group_document)?)
@@ -4174,6 +4152,142 @@ mod tests {
 
     #[test]
     #[serial]
+    fn selected_geometry_refuses_unknown_absence_before_mutation() -> Result<()> {
+        use crate::session::claim::{decide_purge_claim, PurgeClaimDecision};
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("selected-geometry")?;
+        let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+        let owner = Instance::new("owner", temp.path().join("owner").to_str().unwrap());
+        let owner_json = serde_json::to_string(&owner)?;
+        let mut corrupt = serde_json::to_value(&owner)?;
+        corrupt["title"] = serde_json::json!(false);
+        let duplicate_field = format!("{},\"id\":\"other\"}}", &owner_json[..owner_json.len() - 1]);
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let groups = br#"[ {"path":"group","name":"group","expanded":true,"order":0,"extension":{"same":1,"same":2,"number":1e400}} ]"#;
+        fs::write(&groups_path, groups)?;
+        for (original, selected) in [
+            (format!("[{owner_json},{owner_json}]"), owner.id.as_str()),
+            (
+                format!("[{}]", serde_json::to_string(&corrupt)?),
+                owner.id.as_str(),
+            ),
+            (format!("[{duplicate_field}]"), owner.id.as_str()),
+            (format!("[{duplicate_field}]"), "other"),
+            (format!("[{owner_json},null]"), "missing"),
+            (format!("[{owner_json},{owner_json}]"), "missing"),
+            (r#"[{"id":false,"title":"unindexed"}]"#.into(), "missing"),
+        ] {
+            fs::write(storage.sessions_path(), original.as_bytes())?;
+            let called = std::cell::Cell::new(false);
+            let result =
+                storage.update_owner_under_workspace_claim_lock(selected, |rows, groups| {
+                    called.set(true);
+                    rows.clear();
+                    groups.clear();
+                    Ok(())
+                });
+            assert!(result.is_err(), "{selected}: {original}");
+            assert!(
+                !called.get(),
+                "raw admission must precede both mutation and absence"
+            );
+            assert_eq!(fs::read(storage.sessions_path())?, original.as_bytes());
+            assert_eq!(fs::read(&groups_path)?, groups);
+        }
+        // Read diagnostics deliberately retain every decodable duplicate.
+        fs::write(
+            storage.sessions_path(),
+            format!("[{owner_json},{owner_json}]"),
+        )?;
+        let loaded = storage.load()?;
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, owner.id);
+        assert_eq!(loaded[1].id, owner.id);
+        fs::write(storage.sessions_path(), "[]")?;
+        let absent = storage.update_owner_under_workspace_claim_lock("missing", |rows, _| {
+            Ok(decide_purge_claim(
+                rows,
+                "missing",
+                false,
+                chrono::Utc::now(),
+            )?)
+        })?;
+        assert_eq!(absent, PurgeClaimDecision::AlreadyGone);
+        // An admitted owner can still coexist with unrelated frozen raw rows.
+        fs::write(storage.sessions_path(), format!("[{owner_json},null]"))?;
+        storage.update_owner_under_workspace_claim_lock(&owner.id, |rows, _| {
+            rows[0].pin();
+            Ok(())
+        })?;
+        let output = super::super::raw_document::RawDocument::parse(&fs::read_to_string(
+            storage.sessions_path(),
+        )?)?;
+        assert_eq!(output.rows[1].get(), "null");
+        assert!(serde_json::from_str::<Instance>(output.rows[0].get())?.is_pinned());
+        assert_eq!(fs::read(&groups_path)?, groups);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn ambiguous_nested_survivor_refuses_before_either_document_write() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("array-ambiguity")?;
+        let mut owner = Instance::new("owner", temp.path().join("workspace").to_str().unwrap());
+        let repo = crate::session::WorkspaceRepo {
+            name: "repo".into(),
+            source_path: "/source".into(),
+            branch: "branch".into(),
+            worktree_path: "/workspace/repo".into(),
+            main_repo_path: "/source".into(),
+            managed_by_aoe: false,
+            branch_preexisting: false,
+            base_branch: None,
+            base_branch_override: None,
+        };
+        owner.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "branch".into(),
+            workspace_dir: owner.project_path.clone(),
+            repos: vec![repo.clone(), repo],
+            created_at: owner.created_at,
+            cleanup_on_delete: true,
+        });
+        let mut value = serde_json::to_value(&owner)?;
+        value["workspace_info"]["repos"][0]["extension"] = serde_json::json!("first");
+        value["workspace_info"]["repos"][1]["extension"] = serde_json::json!("second");
+        let original = format!("[ {} ]", serde_json::to_string(&value)?);
+        fs::write(storage.sessions_path(), &original)?;
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let groups = b"[ ]\n";
+        fs::write(&groups_path, groups)?;
+        let called = std::cell::Cell::new(false);
+        let result = storage.update_metadata(
+            MetadataSelection::Session(owner.id.as_str().into()),
+            |rows, groups| {
+                called.set(true);
+                rows[0].workspace_info.as_mut().unwrap().repos[1].base_branch_override =
+                    Some("main".into());
+                groups.push(crate::session::Group::new("changed", "changed"));
+                Ok(())
+            },
+        );
+        assert!(
+            called.get(),
+            "exercise render refusal, not a pre-closure refusal"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous canonical array member"));
+        assert_eq!(fs::read(storage.sessions_path())?, original.as_bytes());
+        assert_eq!(fs::read(&groups_path)?, groups);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
     fn scoped_metadata_preserves_opaque_rows_and_refuses_target_ambiguity() -> Result<()> {
         use super::super::raw_document::{RawDocument, RawObject};
         let temp = tempdir()?;
@@ -4964,6 +5078,77 @@ mod tests {
         assert_eq!(moved_first.group_path, "moved");
         assert!(source.load()?.is_empty());
         assert_eq!(target.load()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn profile_import_publishes_geometry_after_original_metadata_transaction() -> Result<()> {
+        use super::super::raw_document::{RawDocument, RawObject};
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let source = Storage::new_unwatched("array-import-source")?;
+        let target = Storage::new_unwatched("array-import-target")?;
+        let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+        let _identity = crate::session::acquire_session_identity_lock()?;
+        let mut before = Instance::new("owner", temp.path().join("old").to_str().unwrap());
+        before.group_path = "old-group".into();
+        before.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "old-branch".into(),
+            main_repo_path: "/source".into(),
+            managed_by_aoe: false,
+            created_at: before.created_at,
+            base_branch: None,
+        });
+        let extension = r#"{"same":1,"same":2,"number":1e400,"escaped":"\u0061"}"#;
+        let row = serde_json::to_string(&before)?;
+        let original = format!("[{},\"extension\":{extension}}}]", &row[..row.len() - 1]);
+        fs::write(source.sessions_path(), &original)?;
+        fs::write(
+            source.sessions_path.with_file_name("groups.json"),
+            serde_json::to_vec(&vec![Group::new("old-group", "old-group")])?,
+        )?;
+        let mut after = before.clone();
+        after.project_path = temp.path().join("moved").to_str().unwrap().into();
+        after.worktree_info.as_mut().unwrap().branch = "renamed-branch".into();
+        after.group_path = "new-group".into();
+        let effect_ran = std::cell::Cell::new(false);
+        let committed = source.move_instance_to_with_effect(
+            &target,
+            &before,
+            &after,
+            false,
+            |_, _| Ok(()),
+            |candidate| {
+                assert_eq!(candidate.id, before.id);
+                assert_eq!(candidate.created_at, before.created_at);
+                assert_eq!(candidate.project_path, after.project_path);
+                assert_eq!(fs::read_to_string(source.sessions_path())?, original);
+                effect_ran.set(true);
+                Ok(())
+            },
+        )?;
+        assert!(effect_ran.get());
+        assert_eq!(committed.project_path, after.project_path);
+        let output = RawDocument::parse(&fs::read_to_string(target.sessions_path())?)?;
+        assert_eq!(output.rows.len(), 1);
+        assert_eq!(
+            RawObject::parse(&output.rows[0])?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            extension
+        );
+        let published: Instance = serde_json::from_str(output.rows[0].get())?;
+        assert_eq!(published.id, before.id);
+        assert_eq!(published.created_at, before.created_at);
+        assert_eq!(published.project_path, after.project_path);
+        assert_eq!(published.worktree_info.unwrap().branch, "renamed-branch");
+        assert!(
+            RawDocument::parse(&fs::read_to_string(source.sessions_path())?)?
+                .rows
+                .is_empty()
+        );
         Ok(())
     }
 

@@ -41,8 +41,9 @@ impl Drop for PromptReservation {
     }
 }
 pub(super) struct RegistryOwner {
-    pub(super) storage: crate::session::Storage,
+    pub(super) original: Arc<crate::session::runner_journal::LaunchOrigin>,
     pub(super) record: std::sync::Mutex<worker_registry::WorkerRecord>,
+    pub(super) retiring: AtomicBool,
 }
 
 impl RegistryOwner {
@@ -56,8 +57,12 @@ impl RegistryOwner {
                 .record
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            anyhow::ensure!(
+                !owner.retiring.load(Ordering::Acquire),
+                "original native registry is retiring"
+            );
             crate::session::runner_journal::update_owned_registry_record(
-                &owner.storage,
+                &owner.original,
                 &mut record,
                 effect,
             )
@@ -74,8 +79,15 @@ impl RegistryOwner {
                 .record
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            owner.storage.verify_profile_identity()?;
-            anyhow::Ok(worker_registry::delete_if_owned_by(&record))
+            owner.retiring.store(true, Ordering::Release);
+            owner.original.validate_record_birth(&record)?;
+            owner.original.with_storage(|_, row| {
+                anyhow::ensure!(
+                    row.runner_journal.owns_record(&record),
+                    "retirement lost its original published registry witness"
+                );
+                anyhow::Ok(worker_registry::delete_if_owned_by(&record))
+            })
         })
         .await
         .context("owned native metadata retirement job")?
@@ -925,11 +937,15 @@ impl RunnerShared {
                     .record
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
+                anyhow::ensure!(
+                    !owner.retiring.load(Ordering::Acquire),
+                    "original native registry is retiring"
+                );
                 let nonce = record
                     .launch_nonce
                     .context("runner prompt has no original nonce")?;
                 crate::session::runner_journal::admit_runner_prompt(
-                    &owner.storage,
+                    owner.original.storage(),
                     &record.session_id,
                     record.pid,
                     record.generation,

@@ -220,6 +220,15 @@ impl ExecutionAdmission {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    // The natal watchdog must not wait behind the authorization write's mutex.
+    pub(crate) fn cancellation_observed(&self) -> bool {
+        match self.inner.state.try_lock() {
+            Ok(state) => state.cancelled,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().cancelled,
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
+    }
+
     pub(crate) async fn cancelled(&self) {
         loop {
             let changed = self.inner.changed.notified();
@@ -1678,5 +1687,15 @@ mod tests {
             6,
             "only the actual published birth advances generation"
         );
+    }
+
+    #[test]
+    fn natal_cancellation_observation_does_not_wait_for_authorization_mutex() {
+        let admission = ExecutionAdmission::new();
+        let state = admission.inner.state.lock().unwrap();
+        assert!(!admission.cancellation_observed());
+        drop(state);
+        admission.cancel();
+        assert!(admission.cancellation_observed());
     }
 }

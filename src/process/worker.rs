@@ -49,12 +49,8 @@ pub fn peer_pid_from_socket(path: &Path) -> Option<u32> {
     peer_pid_from_connected_socket(&stream)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn peer_pid_from_connected_socket(stream: &impl std::os::fd::AsFd) -> Option<u32> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let creds = getsockopt(stream, PeerCredentials).ok()?;
-    let pid = creds.pid();
-    (pid > 0).then_some(pid as u32)
+    crate::process::platform::peer_pid_from_connected_socket(stream)
 }
 
 #[cfg(target_os = "macos")]
@@ -63,19 +59,8 @@ pub fn peer_pid_from_socket(path: &Path) -> Option<u32> {
     peer_pid_from_connected_socket(&stream)
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn peer_pid_from_connected_socket(stream: &impl std::os::fd::AsFd) -> Option<u32> {
-    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
-    let pid = getsockopt(stream, LocalPeerPid).ok()?;
-    (pid > 0).then_some(pid as u32)
-}
-
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn peer_pid_from_socket(_path: &Path) -> Option<u32> {
-    None
-}
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-pub(crate) fn peer_pid_from_connected_socket(_stream: &impl std::os::fd::AsFd) -> Option<u32> {
     None
 }
 

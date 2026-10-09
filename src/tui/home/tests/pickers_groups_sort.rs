@@ -663,7 +663,7 @@ fn test_delete_group_with_sessions_updates_groups_field() {
             submitted.map(|_| super::super::TransactionDisposition::Queued),
         )
     }
-    .unwrap();
+    .unwrap_err();
     {
         view.request_save();
         drain_persistence(&mut view)

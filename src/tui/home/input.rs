@@ -4817,15 +4817,10 @@ impl HomeView {
                     switch_view,
                 );
                 if let super::Item::Session { id, .. } = &self.flat_items[idx] {
-                    if self.get_instance(id).is_some_and(|row| {
-                        row.lifecycle_reservation.as_ref().is_some_and(|lease| {
-                            matches!(
-                                lease.op,
-                                crate::session::LifecycleOperation::Create
-                                    | crate::session::LifecycleOperation::Attach
-                            ) && lease.path_claims.is_pending()
-                        })
-                    }) {
+                    if self
+                        .get_instance(id)
+                        .is_some_and(crate::session::retained_intents::can_abort_metadata)
+                    {
                         menu = menu.with_abort_intent();
                     }
                 }

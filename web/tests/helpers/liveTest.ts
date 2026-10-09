@@ -78,25 +78,25 @@ export async function bootDashboard(page: Page, handle: ServeHandle, path = "/")
 
 export const test = base.extend<LiveFixtures>({
   spawnServe: async ({}, use, testInfo) => {
-    const handles: Array<{ handle: ServeHandle; acp?: boolean }> = [];
+    const handles: ServeHandle[] = [];
     await use(async (opts = {}) => {
       const handle = await spawnAoeServe({
         ...opts,
         workerIndex: testInfo.workerIndex,
         parallelIndex: testInfo.parallelIndex,
       });
-      handles.push({ handle, acp: opts.acp });
+      handles.push(handle);
       return handle;
     });
     if (testInfo.status !== testInfo.expectedStatus) {
-      for (const { handle, acp } of handles) if (acp) await attachServeDiagnostics(testInfo, handle).catch(() => {});
+      for (const handle of handles) await attachServeDiagnostics(testInfo, handle).catch(() => {});
     }
-    const results = await Promise.allSettled(handles.map(({ handle }) => handle.stop()));
+    const results = await Promise.allSettled(handles.map((handle) => handle.stop()));
     const errors: unknown[] = [];
     for (const [index, result] of results.entries()) {
       if (result.status === "rejected") {
         errors.push(result.reason);
-        await attachServeDiagnostics(testInfo, handles[index].handle).catch((error) => errors.push(error));
+        await attachServeDiagnostics(testInfo, handles[index]).catch((error) => errors.push(error));
       }
     }
     if (errors.length) throw new AggregateError(errors, "live server teardown failed");

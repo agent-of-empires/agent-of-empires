@@ -39,7 +39,6 @@ struct RunnerLaunch {
     incarnation: Option<crate::process::ProcessIncarnation>,
     profile_identity: Option<super::storage::DirectoryIdentity>,
     stop_endpoint: Option<SocketEndpointIdentity>,
-    #[serde(default)]
     registry: Option<RegistryWitness>,
 }
 
@@ -254,6 +253,10 @@ impl RunnerExecutionJournal {
             creations: Vec::new(),
             create_coverage: CreationCoverage::Owned,
         }
+    }
+
+    pub(crate) fn has_unknown_runner_coverage(&self) -> bool {
+        matches!(self.coverage, Coverage::Unknown { .. })
     }
 
     fn launches(&self) -> &[RunnerLaunch] {
@@ -1569,6 +1572,17 @@ impl ManagedLaunch {
                 command.stdin(std::process::Stdio::null());
                 Ok((child.id(), child))
             },
+            |child| {
+                tokio::runtime::Handle::current().block_on(async {
+                    if child.try_wait()?.is_none() {
+                        let killed = child.start_kill();
+                        child.wait().await.with_context(|| {
+                            format!("reaping original runner after kill {killed:?}")
+                        })?;
+                    }
+                    Ok(())
+                })
+            },
             capture,
         )?;
         tokio::spawn(async move {
@@ -1585,7 +1599,7 @@ impl ManagedLaunch {
         command: &mut std::process::Command,
         admission: &crate::acp::runner_lifecycle::ExecutionAdmission,
     ) -> Result<std::process::Child> {
-        let (mut child, _, published) = self.spawn_child(
+        let (child, _, published) = self.spawn_child(
             storage,
             Some(admission),
             |input| {
@@ -1594,13 +1608,18 @@ impl ManagedLaunch {
                 command.stdin(std::process::Stdio::null());
                 Ok((Some(child.id()), child))
             },
+            |child| {
+                if child.try_wait()?.is_none() {
+                    let killed = child.kill();
+                    child.wait().with_context(|| {
+                        format!("reaping original runner after kill {killed:?}")
+                    })?;
+                }
+                Ok(())
+            },
             |_| {},
         )?;
-        if let Err(error) = published {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
+        published?;
         Ok(child)
     }
 
@@ -1609,6 +1628,7 @@ impl ManagedLaunch {
         storage: &Storage,
         admission: Option<&crate::acp::runner_lifecycle::ExecutionAdmission>,
         spawn: impl FnOnce(std::process::Stdio) -> Result<(Option<u32>, C)>,
+        abort_and_reap: impl FnOnce(&mut C) -> Result<()>,
         mut capture: impl FnMut(crate::acp::runner_lifecycle::RunnerIdentity),
     ) -> Result<(C, Option<u32>, Result<()>)> {
         let boot = current_boot().context("verified boot identity is unavailable")?;
@@ -1698,8 +1718,14 @@ impl ManagedLaunch {
             admission.record_produced_origin(&origin, pending.clone(), None)?;
             let origin = pending;
             let (mut authorization, input) = std::os::unix::net::UnixStream::pair()?;
+            let mut watchdog = bootstrap::ParentNatalGuard::start(
+                &authorization,
+                admission.clone(),
+                std::time::Instant::now() + bootstrap::NATAL_LIFETIME,
+            )?;
             let input: std::os::fd::OwnedFd = input.into();
-            let (pid, child) = spawn(std::process::Stdio::from(input))?;
+            let (pid, mut child) = spawn(std::process::Stdio::from(input))?;
+            let mut authorization_attempted = false;
             let published = (|| -> Result<()> {
                 let pid = pid.context("runner exited before identification")?;
                 let profile_identity = storage.original_profile_identity()?;
@@ -1753,10 +1779,33 @@ impl ManagedLaunch {
                     identity,
                     [&workspace_fence, &identity_fence, &lifecycle_fence],
                 )?;
-                admission.authorize(identity, || authorization.write_all(&[1]))?;
+                admission.authorize(identity, || {
+                    authorization_attempted = true;
+                    authorization.write_all(&[1])
+                })?;
+                watchdog.finish()?;
                 Ok(())
             })();
             drop(authorization);
+            let published = match published {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let error = if authorization_attempted {
+                        error.context("authorization delivery is ambiguous; full native group retirement remains unproven")
+                    } else {
+                        error
+                    };
+                    if let Err(reap_error) = abort_and_reap(&mut child) {
+                        // Keep issuer custody when root death cannot be established.
+                        std::mem::forget((child, workspace_fence, identity_fence, lifecycle_fence));
+                        return Err(error.context(format!(
+                            "original root retirement unproven: {reap_error:#}"
+                        )));
+                    }
+                    Err(error)
+                }
+            };
+            drop(watchdog);
             Ok((child, pid, published))
         })();
         launched
@@ -1875,10 +1924,12 @@ fn publish_registry_under_original_fences<T>(
 }
 
 pub(crate) fn update_owned_registry_record(
-    storage: &Storage,
+    original: &LaunchOrigin,
     record: &mut crate::process::worker_registry::WorkerRecord,
     effect: impl FnOnce(&mut crate::process::worker_registry::WorkerRecord) -> Result<()>,
 ) -> Result<()> {
+    let storage = original.storage();
+    original.validate_record_birth(record)?;
     let _workspace = super::acquire_session_workspace_claim_lock()?;
     let _identity = super::acquire_session_identity_lock()?;
     storage.verify_profile_identity()?;
@@ -1897,6 +1948,7 @@ pub(crate) fn update_owned_registry_record(
             .iter_mut()
             .find(|row| row.id == record.session_id)
             .context("self-update original session disappeared")?;
+        original.validate_row(row)?;
         let launch = row
             .runner_journal
             .launches_mut()

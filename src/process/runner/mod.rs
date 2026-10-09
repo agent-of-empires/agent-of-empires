@@ -181,8 +181,9 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let _control_endpoint = bootstrap.publish(&stop_endpoint, &mut record, &control_socket)?;
     let control_listener = _control_endpoint.listener();
     let owner = Arc::new(shared::RegistryOwner {
-        storage: bootstrap.storage().clone(),
+        original: bootstrap.origin(),
         record: std::sync::Mutex::new(record),
+        retiring: std::sync::atomic::AtomicBool::new(false),
     });
     let shared = Arc::new(RunnerShared::new(Some(owner.clone())));
     let stop_request =
@@ -190,46 +191,65 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             shared.admit_stop(idle)
         });
     tokio::pin!(stop_request);
-    tokio::select! {
-        requested = &mut stop_request => {
-            let mut accepted = requested?;
-            if !accepted.forced() {
-                #[cfg(debug_assertions)]
-                let gate = accepted.isolated_retirement_gate();
-                let retirement = async {
-                    #[cfg(debug_assertions)]
-                    gate.await?;
-                    owner.retire().await
-                };
-                tokio::pin!(retirement);
-                if accepted.can_upgrade() {
-                    tokio::select! {
-                        biased;
-                        upgrade = accepted.accept_force_upgrade() => {
-                            if let Err(error) = upgrade {
-                                warn!(target: "acp.runner", session = %args.session_id, %error, "early original Stop upgrade refused");
-                                let _ = retirement.await;
-                            }
-                        }
-                        _ = &mut retirement => {}
-                    }
-                } else {
-                    let _ = retirement.await;
-                }
-            }
-            anyhow::ensure!(
-                crate::process::worker::kill_own_process_group_if_leader(our_pid),
-                "early Stop could not retire its original native group"
-            );
-            return Ok(());
+    let startup = {
+        let authorization = bootstrap.await_authorization();
+        tokio::pin!(authorization);
+        tokio::select! {
+            requested = &mut stop_request => requested.map(Some),
+            authorized = &mut authorization => authorized.map(|()| None),
         }
-        authorized = bootstrap.await_authorization() => authorized?,
+    };
+    let startup = match startup {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return match owner.retire().await {
+                Ok(true) => Err(error),
+                Ok(false) => {
+                    Err(error.context("published native record retirement remains unproven"))
+                }
+                Err(retirement) => Err(error.context(format!(
+                    "published native record retirement failed: {retirement:#}"
+                ))),
+            };
+        }
+    };
+    if let Some(mut accepted) = startup {
+        if !accepted.forced() {
+            #[cfg(debug_assertions)]
+            let gate = accepted.isolated_retirement_gate();
+            let retirement = async {
+                #[cfg(debug_assertions)]
+                gate.await?;
+                owner.retire().await
+            };
+            tokio::pin!(retirement);
+            if accepted.can_upgrade() {
+                tokio::select! {
+                    biased;
+                    upgrade = accepted.accept_force_upgrade() => {
+                        if let Err(error) = upgrade {
+                            warn!(target: "acp.runner", session = %args.session_id, %error, "early original Stop upgrade refused");
+                            let _ = retirement.await;
+                        }
+                    }
+                    _ = &mut retirement => {}
+                }
+            } else {
+                let _ = retirement.await;
+            }
+        }
+        drain_registry_before_exit(&args.session_id, &owner).await;
+        anyhow::ensure!(
+            crate::process::worker::kill_own_process_group_if_leader(our_pid),
+            "early Stop could not retire its original native group"
+        );
+        return Ok(());
     }
 
     let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
         Ok(handles) => handles,
         Err(e) => {
-            let _ = owner.retire().await;
+            drain_registry_before_exit(&args.session_id, &owner).await;
             return Err(e).with_context(|| format!("spawning agent {:?}", args.agent_argv));
         }
     };
@@ -355,9 +375,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                             false
                         }
                     };
-                    if force_now && !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
-                        let _ = agent_child.start_kill();
-                        let _ = agent_child.wait().await;
+                    if force_now {
+                        drain_registry_before_exit(&session_id, &owner).await;
+                        if !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
+                            let _ = agent_child.start_kill();
+                            let _ = agent_child.wait().await;
+                        }
                     }
                 }
                 Err(error) => {
@@ -410,7 +433,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
         reason = &mut watchdog_rx => {
             if let Ok(reason) = reason {
-                stop_endpoint.cleanup();
                 self_terminate_agent_tree(reason, &session_id, &owner, &mut agent_child).await;
             }
         }
@@ -423,7 +445,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
-    let _ = owner.retire().await;
+    drain_registry_before_exit(&session_id, &owner).await;
     stop_endpoint.cleanup();
     if !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
         let _ = agent_child.start_kill();
@@ -503,6 +525,19 @@ async fn run_watchdog(
     }
 }
 
+async fn drain_registry_before_exit(session_id: &str, owner: &Arc<shared::RegistryOwner>) {
+    // Serialize the native exit behind every record rewrite and its canonical CAS.
+    match owner.retire().await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(target: "acp.runner", session = %session_id, "original native registry retirement remains unproven")
+        }
+        Err(error) => {
+            warn!(target: "acp.runner", session = %session_id, "original native registry retirement failed: {error:#}")
+        }
+    }
+}
+
 async fn self_terminate_agent_tree(
     reason: WatchdogShutdown,
     session_id: &str,
@@ -516,7 +551,7 @@ async fn self_terminate_agent_tree(
         "runner abandoned; terminating agent tree"
     );
 
-    let _ = owner.retire().await;
+    drain_registry_before_exit(session_id, owner).await;
 
     #[cfg(unix)]
     if let Some(agent_pid) = agent_child.id() {

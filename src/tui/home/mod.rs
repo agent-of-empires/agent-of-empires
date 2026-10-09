@@ -595,15 +595,21 @@ impl HomeView {
             .transpose()
     }
     fn project_transaction_rows(&mut self, rows: Vec<Instance>) {
+        // Callers have matched the original transaction guards to the worker ACK.
+        // A cross-profile commit changes storage origin, not the process runtime owner.
         for mut row in rows {
-            if let Some(current) = self.instances.get_mut(&row.id).filter(|current| {
-                current.created_at == row.created_at && current.same_storage_origin(&row)
-            }) {
-                if current.lifecycle_generation >= row.lifecycle_generation {
-                    current.merge_runtime_for_profile_move(&row);
+            if let Some(current) = self
+                .instances
+                .get_mut(&row.id)
+                .filter(|current| current.created_at == row.created_at)
+            {
+                if current.lifecycle_generation > row.lifecycle_generation {
                     continue;
                 }
                 row.merge_runtime_for_profile_move(current);
+                if row.is_archived() {
+                    row.settle_archived_status();
+                }
             }
             self.instances.insert(row.id.clone(), row);
         }

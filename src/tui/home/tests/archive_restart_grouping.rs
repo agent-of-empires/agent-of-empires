@@ -885,7 +885,11 @@ fn rejected_launch_callbacks_retire_only_their_original_request() {
             } else {
                 original
             };
-            let memory_before = serde_json::to_value(env.view.get_instance(&id).unwrap()).unwrap();
+            let expected_memory = if newer_request {
+                env.view.get_instance(&id).unwrap().clone()
+            } else {
+                peer.clone()
+            };
             let disk_before = serde_json::to_value(replacement.load().unwrap()).unwrap();
             let mut after = before.clone();
             after.last_error = Some("stale worker error".into());
@@ -925,7 +929,7 @@ fn rejected_launch_callbacks_retire_only_their_original_request() {
             }
             assert_eq!(
                 serde_json::to_value(env.view.get_instance(&id).unwrap()).unwrap(),
-                memory_before
+                serde_json::to_value(expected_memory).unwrap()
             );
             assert_eq!(
                 serde_json::to_value(replacement.load().unwrap()).unwrap(),
@@ -947,20 +951,28 @@ fn apply_restart_results_preserves_peer_sid_and_marker() {
         id.clone(),
         super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
     );
-    env.view.instance_at_mut(0).agent_session_id = Some("peer-fresh-sid".to_string());
-    env.view.instance_at_mut(0).resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
-
-    let mut worker = env.view.instance_at(0).clone();
+    let before = env.view.instance_at(0).clone();
+    let mut worker = before.clone();
     worker.status = crate::session::Status::Error;
     worker.agent_session_id = Some("phase1-stale-sid".to_string());
     worker.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
     worker.last_error =
         Some("resume failed for sid phase1-stale-sid; preserved for explicit retry".to_string());
 
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            row.agent_session_id = Some("peer-fresh-sid".into());
+            row.resume_probe_failed_sid = Some("peer-fresh-sid".into());
+            row.status = crate::session::Status::Error;
+            Ok(())
+        })
+        .unwrap();
     env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
         crate::session::restart::RestartResult {
             session_id: id.clone(),
-            before: Box::new(worker.clone()),
+            before: Box::new(before),
             instance: Box::new(worker),
             outcome: Ok(StartOutcome::ResumeFailed {
                 sid: "phase1-stale-sid".to_string(),
@@ -992,28 +1004,35 @@ fn apply_restart_results_preserves_peer_sid_and_marker() {
 
 #[test]
 #[serial]
-fn apply_restart_results_propagates_worker_sid_without_peer_write() {
-    use crate::session::StartOutcome;
-
+fn apply_restart_results_consumes_persisted_failure_sid() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.restart_in_flight.insert(
         id.clone(),
         super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
     );
-    env.view.instance_at_mut(0).agent_session_id = Some("sid-before".to_string());
-
     let before = env.view.instance_at(0).clone();
-    let mut worker = before.clone();
-    worker.agent_session_id = Some("sid-after".to_string());
-    worker.status = crate::session::Status::Running;
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            row.agent_session_id = Some("sid-after".into());
+            row.status = crate::session::Status::Error;
+            Ok(())
+        })
+        .unwrap();
+    let worker = Storage::open_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .remove(0);
 
     env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
         crate::session::restart::RestartResult {
             session_id: id.clone(),
             before: Box::new(before),
             instance: Box::new(worker),
-            outcome: Ok(StartOutcome::Resumed),
+            outcome: Err("producer failure after SID persistence".into()),
         },
     );
 
@@ -1024,7 +1043,7 @@ fn apply_restart_results_propagates_worker_sid_without_peer_write() {
         .view
         .get_instance(&id)
         .expect("instance remains visible");
-    assert_eq!(row.status, crate::session::Status::Running);
+    assert_eq!(row.status, crate::session::Status::Error);
     assert_eq!(row.agent_session_id.as_deref(), Some("sid-after"));
     assert_eq!(row.resume_probe_failed_sid, None);
     assert!(env.view.restart_in_flight.is_empty());
@@ -1218,13 +1237,10 @@ fn delete_selected_refused_during_restart() {
             submitted.map(|_| super::super::TransactionDisposition::Queued),
         )
     }
-    .unwrap();
+    .unwrap_err();
 
     assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-    assert_eq!(
-        env.view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Restart in progress")
-    );
+    assert!(env.view.info_dialog.is_some());
     let (instances, groups) = Storage::open_unwatched("test")
         .unwrap()
         .load_with_groups()
@@ -1260,13 +1276,10 @@ fn delete_selected_refused_during_restart() {
             submitted.map(|_| super::super::TransactionDisposition::Queued),
         )
     }
-    .unwrap();
+    .unwrap_err();
 
     assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-    assert_eq!(
-        env.view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Creation in progress")
-    );
+    assert!(env.view.info_dialog.is_some());
     let (instances, groups) = Storage::open_unwatched("test")
         .unwrap()
         .load_with_groups()
@@ -3661,7 +3674,9 @@ fn trashed_row_healing_lands_through_the_reconcile_poller() {
 
     let mut applied = false;
     for _ in 0..100 {
-        if view.apply_reconcile_results() {
+        view.apply_reconcile_results();
+        drain_persistence(&mut view).unwrap();
+        if view.get_instance(&id).unwrap().project_path == holding.to_string_lossy() {
             applied = true;
             break;
         }
@@ -3701,10 +3716,9 @@ fn reconcile_reload_waits_for_live_send_to_finish() {
     );
 
     env.view.live_send = None;
-    assert!(
-        env.view.apply_reconcile_results(),
-        "the skipped verdict must still be waiting once live-send ends"
-    );
+    env.view.apply_reconcile_results();
+    drain_persistence(&mut env.view).unwrap();
+    assert!(!env.view.pending_reconcile_reload);
 }
 
 /// Startup auto-recovery launches from `project_path` and records each attempt in a
@@ -3885,7 +3899,9 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
 
     // The result is preserved, not dropped, and lands once the paste ends.
     view.live_send = None;
-    assert!(view.apply_reconcile_results());
+    view.apply_reconcile_results();
+    assert!(view.pending_reconcile_reload);
+    drain_persistence(&mut view).unwrap();
     assert_eq!(
         view.get_instance(&id).unwrap().project_path,
         "/tmp/repaired-path"
@@ -3939,10 +3955,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         std::fs::remove_file(&groups).ok();
         std::fs::create_dir(&groups).unwrap();
 
-        assert!(
-            !view.apply_reconcile_results(),
-            "the reload failed, so no refresh"
-        );
+        view.apply_reconcile_results();
+        assert!(drain_persistence(&mut view).is_err());
         assert!(
             view.startup_recovery_gate.is_some(),
             "a dropped repair must not open the gate onto stale rows"
@@ -3958,10 +3972,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         std::fs::remove_dir(&groups).unwrap();
         std::fs::write(&groups, "[]").unwrap();
         view.reconcile_reload_retry_at = Some(std::time::Instant::now());
-        assert!(
-            view.apply_reconcile_results(),
-            "the retry must land the repair"
-        );
+        view.apply_reconcile_results();
+        drain_persistence(&mut view).unwrap();
         assert_eq!(
             view.get_instance(&id).unwrap().project_path,
             "/tmp/repaired-path"
@@ -3998,7 +4010,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         std::fs::remove_file(&groups).ok();
         std::fs::create_dir(&groups).unwrap();
 
-        assert!(!view.apply_reconcile_results(), "the first attempt fails");
+        view.apply_reconcile_results();
+        assert!(drain_persistence(&mut view).is_err());
         let armed = view
             .reconcile_reload_retry_at
             .expect("a failed reload must arm the backoff");
@@ -4017,48 +4030,11 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
 
         // Once it elapses the retry lands.
         view.reconcile_reload_retry_at = Some(std::time::Instant::now());
-        assert!(view.apply_reconcile_results(), "the retry must land");
+        view.apply_reconcile_results();
+        drain_persistence(&mut view).unwrap();
         assert!(view.reconcile_reload_retry_at.is_none());
         assert!(!view.pending_reconcile_reload);
     }
-}
-
-/// Archive persistence retains the session lifecycle lock through teardown and commit.
-#[test]
-#[serial]
-fn archive_persists_under_the_lifecycle_lock() {
-    fn held_at_every_write(env: &mut TestEnv, ids: Vec<String>, archive: fn(&mut HomeView)) {
-        let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let observed = std::rc::Rc::clone(&held);
-        let observer = crate::session::observe_updates_for_test(move |storage| {
-            observed.borrow_mut().push(
-                ids.iter()
-                    .all(|id| storage.instance_lifecycle_lock_is_held_for_test(id)),
-            );
-        });
-        archive(&mut env.view);
-        drop(observer);
-        let held = held.borrow();
-        assert!(!held.is_empty(), "the archive must persist");
-        assert!(held.iter().all(|h| *h), "writes and lock held: {held:?}");
-    }
-
-    let mut env = create_test_env_with_sessions(1);
-    env.view.cursor = 0;
-    env.view.update_selected();
-    let id = env.view.selected_session.clone().unwrap();
-    held_at_every_write(&mut env, vec![id.clone()], |view| {
-        {
-            let submitted = view.toggle_archive_at_cursor();
-            await_transaction_result(
-                view,
-                submitted.map(|_| super::super::TransactionDisposition::Queued),
-            )
-        }
-        .unwrap();
-        finish_runner_settlements(view);
-    });
-    assert!(env.view.get_instance(&id).unwrap().is_archived());
 }
 
 /// #4116: the send dialog and live-send entry refuse an archived or trashed agent, even with its

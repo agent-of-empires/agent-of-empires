@@ -17,12 +17,14 @@ pub(super) struct DetachedLaunch {
     pub nonce: uuid::Uuid,
     pub native_store: Option<crate::session::ExecutionBinding>,
     owner: Option<(crate::acp::runner_lifecycle::ExecutionAdmission, String)>,
+    custody: Option<crate::acp::runner_lifecycle::ExecutionJob>,
     runtime: tokio::runtime::Handle,
 }
 
 impl DetachedLaunch {
     pub fn commit(&mut self) {
         self.owner = None;
+        drop(self.custody.take());
     }
 
     pub async fn retire(&mut self) -> anyhow::Result<()> {
@@ -46,6 +48,7 @@ impl DetachedLaunch {
             }
         }
         self.owner = None;
+        drop(self.custody.take());
         Ok(())
     }
 }
@@ -57,7 +60,9 @@ impl Drop for DetachedLaunch {
         };
         let nonce = self.nonce;
         let identity = self.identity;
+        let custody = self.custody.take();
         self.runtime.spawn(async move {
+            let _custody = custody;
             let settled = match identity {
                 Some(identity) => crate::session::runner_journal::settle_captured_ticket(&id, identity, true).await,
                 None => match admission.origin() {
@@ -344,10 +349,10 @@ pub(super) async fn spawn_runner_detached(
         nonce,
         native_store,
         owner: None,
+        custody: Some(custody),
         runtime: tokio::runtime::Handle::current(),
     };
     let (mut issued, spawned) = tokio::task::spawn_blocking(move || {
-        let _custody = custody;
         let mut issued = issued;
         let Some(origin) = admission.origin() else {
             return (

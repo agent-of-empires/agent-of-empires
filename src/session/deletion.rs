@@ -374,7 +374,7 @@ impl PurgeTransaction {
         let now = Utc::now();
         let mut reserved = None;
         let mut rejected = None;
-        storage.update_under_workspace_claim_lock(|instances, _groups| {
+        storage.update_owner_under_workspace_claim_lock(&id, |instances, _groups| {
             if let Some(stored) = instances.iter().find(|instance| instance.id == id) {
                 if cleanup == PurgeCleanup::SidecarsOnly
                     && (expected_trashed_at.is_none() || stored.trashed_at != expected_trashed_at)
@@ -627,7 +627,7 @@ impl PurgeTransaction {
         let generation = self.generation;
         let mut retained = None;
         self.storage
-            .update_under_workspace_claim_lock(|instances, _groups| {
+            .update_owner_under_workspace_claim_lock(&id, |instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                     self.native_stop
                         .current_projection()
@@ -651,7 +651,7 @@ impl PurgeTransaction {
         let was_trashed = self.was_trashed;
         let mut outcome = None;
         self.storage
-            .update_under_workspace_claim_lock(|instances, _groups| {
+            .update_owner_under_workspace_claim_lock(&id, |instances, _groups| {
                 let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) else {
                     outcome = Some((CompletionGate::AlreadyGone, None));
                     return Ok(());
@@ -751,49 +751,51 @@ impl PurgeTransaction {
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut commit = None;
-        if let Err(error) = self
-            .storage
-            .update_under_workspace_claim_lock(|instances, _groups| {
-                let Some(index) = instances.iter().position(|instance| instance.id == id) else {
-                    commit = Some((CompletionGate::AlreadyGone, None));
-                    return Ok(());
-                };
-                let acknowledged = self.native_stop.current_projection();
-                if self
-                    .original
-                    .validate_native_history(&instances[index])
-                    .is_err()
-                    || (acknowledged
-                        .validate_baseline_at(&instances[index], generation)
+        if let Err(error) =
+            self.storage
+                .update_owner_under_workspace_claim_lock(&id, |instances, _groups| {
+                    let Some(index) = instances.iter().position(|instance| instance.id == id)
+                    else {
+                        commit = Some((CompletionGate::AlreadyGone, None));
+                        return Ok(());
+                    };
+                    let acknowledged = self.native_stop.current_projection();
+                    if self
+                        .original
+                        .validate_native_history(&instances[index])
                         .is_err()
-                        && acknowledged
-                            .validate_restored_at(&instances[index], generation)
-                            .is_err())
-                {
-                    commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-                    return Ok(());
-                }
-                let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                    was_trashed,
-                    instances[index].is_trashed(),
-                ) || (self.cleanup == PurgeCleanup::SidecarsOnly
-                    && instances[index].trashed_at != self.request.instance.trashed_at);
-                let owns = instances[index]
-                    .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-                if restored {
-                    instances[index].release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
-                    );
-                    commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-                } else if !owns {
-                    commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-                } else {
-                    instances.remove(index);
-                    commit = Some((CompletionGate::Proceed, None));
-                }
-                Ok(())
-            })
+                        || (acknowledged
+                            .validate_baseline_at(&instances[index], generation)
+                            .is_err()
+                            && acknowledged
+                                .validate_restored_at(&instances[index], generation)
+                                .is_err())
+                    {
+                        commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
+                        return Ok(());
+                    }
+                    let restored = crate::session::claim::purge_restored_row_must_be_kept(
+                        was_trashed,
+                        instances[index].is_trashed(),
+                    ) || (self.cleanup == PurgeCleanup::SidecarsOnly
+                        && instances[index].trashed_at != self.request.instance.trashed_at);
+                    let owns = instances[index]
+                        .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
+                    if restored {
+                        instances[index].release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Purge,
+                            generation,
+                        );
+                        commit =
+                            Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
+                    } else if !owns {
+                        commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
+                    } else {
+                        instances.remove(index);
+                        commit = Some((CompletionGate::Proceed, None));
+                    }
+                    Ok(())
+                })
         {
             return Err(Box::new(DeletionResult::rejected(
                 id,
@@ -903,33 +905,35 @@ impl PurgeTransaction {
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut commit = None;
-        let commit_result = self
-            .storage
-            .update_under_workspace_claim_lock(|instances, _groups| {
-                let Some(index) = instances.iter().position(|instance| instance.id == id) else {
-                    commit = Some((CompletionGate::AlreadyGone, None));
-                    return Ok(());
-                };
-                let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                    was_trashed,
-                    instances[index].is_trashed(),
-                );
-                let owns = instances[index]
-                    .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-                if restored {
-                    instances[index].release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
+        let commit_result =
+            self.storage
+                .update_owner_under_workspace_claim_lock(&id, |instances, _groups| {
+                    let Some(index) = instances.iter().position(|instance| instance.id == id)
+                    else {
+                        commit = Some((CompletionGate::AlreadyGone, None));
+                        return Ok(());
+                    };
+                    let restored = crate::session::claim::purge_restored_row_must_be_kept(
+                        was_trashed,
+                        instances[index].is_trashed(),
                     );
-                    commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-                } else if !owns {
-                    commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-                } else {
-                    instances.remove(index);
-                    commit = Some((CompletionGate::Proceed, None));
-                }
-                Ok(())
-            });
+                    let owns = instances[index]
+                        .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
+                    if restored {
+                        instances[index].release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Purge,
+                            generation,
+                        );
+                        commit =
+                            Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
+                    } else if !owns {
+                        commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
+                    } else {
+                        instances.remove(index);
+                        commit = Some((CompletionGate::Proceed, None));
+                    }
+                    Ok(())
+                });
         self.lifecycle_lock = None;
         match commit_result {
             Err(error) => {
@@ -1021,18 +1025,21 @@ impl Drop for PurgeTransaction {
                 let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&id) else {
                     return;
                 };
-                let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
-                    if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
-                        stop.current_projection()
-                            .validate_baseline_at(stored, generation)?;
-                        stop.original().validate_native_history(stored)?;
-                        stored.release_lifecycle_reservation_if_owned(
-                            LifecycleOperation::Purge,
-                            generation,
-                        );
-                    }
-                    Ok(())
-                });
+                let _ =
+                    storage.update_owner_under_workspace_claim_lock(&id, |instances, _groups| {
+                        if let Some(stored) =
+                            instances.iter_mut().find(|instance| instance.id == id)
+                        {
+                            stop.current_projection()
+                                .validate_baseline_at(stored, generation)?;
+                            stop.original().validate_native_history(stored)?;
+                            stored.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Purge,
+                                generation,
+                            );
+                        }
+                        Ok(())
+                    });
             });
     }
 }

@@ -2130,10 +2130,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn a_failed_attach_moves_the_sessions_worktree_back() {
+    fn a_failed_git_attach_retains_the_moved_worktree_and_original_claim() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = isolated_profile(temp.path(), "attach-rollback");
         let (inst, plan) = blocked_worktree_attach(temp.path(), "attach-rollback");
+        let moved = plan.workspace_dir().join("backend");
+        let blocked = plan.added_worktree.clone();
+        let paths = plan.path_claims.clone();
 
         assert!(
             plan.moves_session,
@@ -2147,16 +2150,31 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let Err(_err) = attach_planned(&storage, &inst.id, &inst, plan) else {
+        let Err(error) = attach_planned(&storage, &inst.id, &inst, plan) else {
             panic!("the added repo's worktree cannot be created over a non-empty directory");
         };
 
-        let restored = Path::new(&inst.project_path).join("wip.txt");
-        assert!(
-            restored.exists(),
-            "the session's worktree must be moved back, with its uncommitted work"
+        assert!(format!("{error:#}").contains("could not create a worktree for 'frontend'"));
+        // A failed Git effect is not proof that every effect was absent/retired.
+        // Keep the real moved checkout and durable intent, rather than minting Undo authority.
+        assert!(!Path::new(&inst.project_path).exists());
+        assert_eq!(
+            std::fs::read_to_string(moved.join("wip.txt")).unwrap(),
+            "in progress"
         );
-        assert_eq!(std::fs::read_to_string(restored).unwrap(), "in progress");
+        assert_eq!(
+            std::fs::read_to_string(blocked.join("in-the-way.txt")).unwrap(),
+            "x"
+        );
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == inst.id)
+            .unwrap();
+        assert_eq!(stored.project_path, inst.project_path);
+        assert!(matches!(stored.lifecycle_reservation.unwrap().path_claims,
+            super::super::WorktreePathClaims::Pending(retained) if retained == paths));
     }
 
     #[cfg(unix)]

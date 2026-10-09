@@ -1,5 +1,5 @@
 import { expect, type Locator, type Page, type TestInfo } from "@playwright/test";
-import { readFileSync, existsSync, readdirSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, writeFileSync, openSync, fstatSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { fakeAcpScriptPath, listSessions, seedSessionViaAoeAdd, type ServeHandle } from "./aoeServe";
 import type { ServeOptions } from "./liveTest";
@@ -290,6 +290,28 @@ export async function attachServeDiagnostics(
     for (const file of readdirSync(workers, { withFileTypes: true })) {
       if (file.isFile() && file.name.endsWith(".log")) {
         await attach(`worker.${file.name}`, () => tail(readFileSync(join(workers, file.name), "utf8"), 64_000));
+      }
+      if (file.isFile() && file.name.endsWith(".json")) {
+        const path = join(workers, file.name);
+        let fd: number | undefined;
+        try {
+          fd = openSync(path, "r");
+          const stamp = fstatSync(fd, { bigint: true });
+          await testInfo.attach(`worker.${file.name}`, {
+            body: readFileSync(fd, "utf8"),
+            contentType: "application/json",
+          });
+          await testInfo.attach(`worker.${file.name}.physical-file`, {
+            body: JSON.stringify({
+              device: String(stamp.dev),
+              inode: String(stamp.ino),
+              birth_time_ns: String(stamp.birthtimeNs),
+            }),
+            contentType: "application/json",
+          });
+        } finally {
+          if (fd !== undefined) closeSync(fd);
+        }
       }
     }
   }
