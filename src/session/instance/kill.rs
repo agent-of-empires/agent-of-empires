@@ -352,7 +352,11 @@ impl Instance {
             .find(|row| row.id == self.id)
             .context("session disappeared before stop")?;
         lifecycle.source_profile = profile.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        lifecycle.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Stop,
+            Some(Status::Stopped),
+        )?;
         self.stop_poller();
         let teardown = lifecycle.kill_locked().and_then(|()| {
             let mut current = storage
@@ -738,6 +742,80 @@ mod tests {
         assert!(
             !inst.session_id_poller_is_running(),
             "the poller stops before the pane it watches does"
+        );
+    }
+
+    /// A TUI watching this row treats a pane that dies under a live status as an
+    /// agent crash and marks it Error, so the stored status must already read
+    /// Stopped when the pane receives its kill signal, as the TUI's own stop does.
+    #[test]
+    #[serial_test::serial]
+    fn stop_stores_stopped_before_the_pane_is_killed() {
+        if crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "stop-stores-stopped-first";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new("stop-order", "/tmp/test");
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Running;
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let snapshot = temp.path().join("sessions-at-kill.json");
+        let script = format!(
+            "trap 'find {root} -name sessions.json -exec cat {{}} + > {out}; exit 0' TERM HUP; \
+             while :; do sleep 0.05; done",
+            root = temp.path().display(),
+            out = snapshot.display(),
+        );
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &name])
+            .output();
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh",
+                "-c",
+            ])
+            .arg(&script)
+            .output()
+            .expect("tmux");
+        assert!(created.status.success(), "the test needs a real pane");
+        crate::tmux::refresh_session_cache();
+
+        inst.stop().expect("stop");
+
+        let at_kill = std::fs::read_to_string(&snapshot).expect("the pane saw its kill signal");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&at_kill).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["id"] == inst.id.as_str())
+            .expect("the row is stored");
+        assert_eq!(
+            row["status"],
+            serde_json::to_value(Status::Stopped).unwrap(),
+            "the stored status is Stopped before the pane dies"
         );
     }
 }
