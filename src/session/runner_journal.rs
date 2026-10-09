@@ -3536,7 +3536,6 @@ async fn settle_selected_owned(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::process::CommandExt;
 
     #[test]
     #[serial_test::serial]
@@ -3734,10 +3733,9 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn cancellation_recognizes_only_the_actual_stop_ack_and_retires_its_preparation() {
+    async fn cancellation_metadata_ack_does_not_retire_unproven_preparation() {
         use crate::acp::runner_lifecycle::{
-            AdmitError, LifecycleTable, NativeResume, PreparationAuthorization, ResumeKind,
-            StopDecision,
+            LifecycleTable, NativeResume, PreparationAuthorization, ResumeKind, StopDecision,
         };
         use std::sync::Mutex;
 
@@ -3793,7 +3791,13 @@ mod tests {
             issued
                 .set_prepared_origin(prepared.clone(), preparation)
                 .unwrap();
-            let retirement = issued.preparation_retirement().unwrap();
+            let mut retirement = issued.preparation_retirement().unwrap();
+            let preparations = storage
+                .load()
+                .unwrap()
+                .remove(0)
+                .runner_journal
+                .preparations;
             let stop = reserve_stop_from_origin(prepared, false).unwrap();
             assert!(matches!(
                 lifecycle
@@ -3820,86 +3824,30 @@ mod tests {
                 .await
                 .is_err());
             drop(job);
-            tokio::time::timeout(
+            assert!(tokio::time::timeout(
                 Duration::from_secs(5),
-                PreparationCustody::await_retired(retirement),
+                PreparationCustody::await_retired(retirement.clone()),
             )
             .await
             .unwrap()
-            .unwrap();
+            .is_err());
+            assert_eq!(*retirement.borrow_and_update(), Some(false));
+            assert!(issued.cancellation_observed());
+            assert!(issued.check_active().is_err());
             assert!(lifecycle.lock().unwrap().abandon(&lease));
             if !early_ack {
                 acknowledge();
             }
-            settle(stop.clone()).await.unwrap();
-            release_owned_stop(&stop).unwrap();
             let canonical = capture_unique_origin(&row.id).unwrap();
             assert!(stop.cancellation_origin().same_scope(&canonical));
-            assert!(
-                !stop.original().same_scope(&canonical),
-                "native original is never promoted to the metadata ACK"
-            );
-            let retry = lifecycle
-                .lock()
-                .unwrap()
-                .admit(&row.id, ResumeKind::Spawn)
-                .unwrap();
-            let retried = lifecycle.lock().unwrap().execution_admission(&retry);
-            retried.set_origin(canonical.clone()).unwrap();
-            let refused = canonical
-                .prepare(&NativeResume::Spawn, &retried, |commit| {
-                    PreparationAuthorization::acquire(
-                        lifecycle.lock().unwrap(),
-                        &retry,
-                        &canonical,
-                        false,
-                        commit,
-                    )
-                })
-                .unwrap_err();
-            assert!(matches!(
-                refused.downcast_ref::<AdmitError>(),
-                Some(AdmitError::Cancelled(_))
-            ));
-            assert_eq!(
-                storage.load().unwrap()[0].lifecycle_generation,
-                stop.generation()
-            );
-            assert!(lifecycle.lock().unwrap().abandon(&retry));
-
-            let mut replacement = Instance::new("replacement", temporary.path().to_str().unwrap());
-            replacement.id = row.id.clone();
-            replacement.source_profile = "ack".into();
-            replacement.lifecycle_generation = stop.generation() + 1;
-            storage
-                .update(|rows, _| {
-                    rows[0] = replacement.clone();
-                    Ok(())
-                })
-                .unwrap();
+            assert!(!stop.original().same_scope(&canonical));
             let before = std::fs::read(storage.sessions_path()).unwrap();
-            assert!(stop
-                .update_projection(
-                    |row| {
-                        row.command = "late old ACK".into();
-                        Ok(())
-                    },
-                    Ok
-                )
-                .is_err());
+            assert!(settle(stop.clone()).await.is_err());
             assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
-            assert!(!stop
-                .cancellation_origin()
-                .same_scope(&capture_unique_origin(&replacement.id).unwrap()));
-        }
-    }
-
-    struct ChildGuard(std::process::Child);
-
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let retained = storage.load().unwrap().remove(0);
+            assert_eq!(retained.runner_journal.preparations, preparations);
+            assert!(retained
+                .lifecycle_reservation_is_owned(LifecycleOperation::Stop, stop.generation()));
         }
     }
 
@@ -3931,97 +3879,6 @@ mod tests {
         assert_eq!(current.project_path, expected.project_path);
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn stale_trash_settlement_never_stops_replacement() {
-        let temporary = tempfile::TempDir::new_in("/tmp").unwrap();
-        let _app_dir = super::super::test_support::isolate_app_dir_at(temporary.path());
-        super::super::create_profile("proof").unwrap();
-        let storage = Storage::open_unwatched("proof").unwrap();
-        let mut row = Instance::new("replacement", temporary.path().to_str().unwrap());
-        let old_generation = row
-            .try_acquire_lifecycle_reservation(
-                LifecycleOperation::Trash,
-                Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
-            )
-            .unwrap();
-        let id = row.id.clone();
-        storage
-            .update(|rows, _| {
-                rows.push(row.clone());
-                Ok(())
-            })
-            .unwrap();
-        let old_stop =
-            OwnedStop::from_claim(&storage, &row, LifecycleOperation::Trash, old_generation)
-                .unwrap();
-        let child = ChildGuard(
-            std::process::Command::new("sleep")
-                .arg("60")
-                .process_group(0)
-                .spawn()
-                .unwrap(),
-        );
-        let incarnation = crate::process::process_incarnation(child.0.id())
-            .unwrap()
-            .unwrap();
-        let nonce = Uuid::new_v4();
-        let boot = current_boot().unwrap();
-        storage
-            .update(|rows, _| {
-                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
-                assert!(row.release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Trash,
-                    old_generation
-                ));
-                let generation = row
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Launch,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
-                    )
-                    .unwrap();
-                row.runner_journal = RunnerExecutionJournal {
-                    creations: Vec::new(),
-                    create_coverage: CreationCoverage::Owned,
-                    coverage: Coverage::Complete,
-                    preparations: Vec::new(),
-                    launches: vec![RunnerLaunch {
-                        phase: NativeLaunchPhase::Armed,
-                        nonce: *nonce.as_bytes(),
-                        boot,
-                        generation,
-                        incarnation: Some(incarnation),
-                        profile_identity: Some(storage.original_profile_identity().unwrap()),
-                        stop_endpoint: None,
-                        registry: None,
-                    }],
-                };
-                row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
-                Ok(())
-            })
-            .unwrap();
-        let endpoint =
-            std::os::unix::net::UnixListener::bind(stop_socket(&id, child.0.id()).unwrap())
-                .unwrap();
-        endpoint.set_nonblocking(true).unwrap();
-        let outcome = settle(old_stop).await;
-        assert!(outcome.is_err());
-        assert!(
-            matches!(endpoint.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-            "stale Trash sent a stop request to the replacement execution"
-        );
-        let retained = storage
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|row| row.id == id)
-            .unwrap();
-        assert!(retained.lifecycle_generation > old_generation);
-        assert_eq!(retained.runner_journal.launches[0].nonce, *nonce.as_bytes());
-        assert!(crate::process::worker::is_process_group_alive(child.0.id()));
-    }
     #[tokio::test]
     #[serial_test::serial]
     async fn launch_origin_rejects_transient_stop_and_profile_replacement() {
@@ -4082,7 +3939,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn preparation_retirement_requires_last_issued_job_and_keeps_stop_generation() {
+    async fn last_issued_job_keeps_unproven_preparation_and_stop_generation() {
         use crate::acp::runner_lifecycle::{AdmissionRetirement, LifecycleTable, ResumeKind};
         use std::sync::Arc;
         let temporary = tempfile::tempdir().unwrap();
@@ -4125,6 +3982,7 @@ mod tests {
         issued.set_prepared_origin(prepared, preparation).unwrap();
         let retirement = issued.preparation_retirement().unwrap();
         let claimed = storage.load().unwrap().remove(0);
+        let preparations = claimed.runner_journal.preparations.clone();
         let before = std::fs::read(storage.sessions_path()).unwrap();
         assert!(reserve_owned_stop(&storage, &claimed, true).is_err());
         assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
@@ -4176,16 +4034,18 @@ mod tests {
         );
         assert_eq!(*retirement.borrow(), None);
         drop(workspace);
-        drain.await.unwrap();
-        settle(stop_generation.clone()).await.unwrap();
+        assert!(drain.await.is_err());
+        assert_eq!(*retirement.borrow(), Some(false));
         assert!(!lifecycle.lock().unwrap().is_owned(&row.id));
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        assert!(settle(stop_generation.clone()).await.is_err());
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
         let final_row = storage.load().unwrap().remove(0);
-        assert!(final_row.runner_journal.preparations.is_empty());
+        assert_eq!(final_row.runner_journal.preparations, preparations);
         assert!(final_row.lifecycle_reservation_is_owned(
             LifecycleOperation::Stop,
             stop_generation.generation()
         ));
-        release_owned_stop(&stop_generation).unwrap();
     }
 
     #[test]

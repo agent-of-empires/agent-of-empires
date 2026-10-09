@@ -259,3 +259,108 @@ fn superseded_runner_exits_without_deleting_replacement_record() {
         "superseded runner deleted the replacement runner's registry record"
     );
 }
+
+#[test]
+#[serial_test::parallel]
+fn stale_trash_settlement_never_stops_replacement() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(stale_trash_settlement_never_stops_replacement),
+    ) {
+        return;
+    }
+    use crate::session::runner_journal::{settle, verify_published_runner, OwnedStop};
+    use crate::session::{Instance, LifecycleOperation, Storage, View};
+
+    let scratch = Scratch::new("stale-trash");
+    let (home, xdg) = (&scratch.0, &scratch.0);
+    let _env = super::environment::EnvGuard::new(&["HOME", "XDG_CONFIG_HOME"])
+        .and_set("HOME", home)
+        .and_set("XDG_CONFIG_HOME", xdg);
+    crate::session::get_app_dir().unwrap();
+    crate::migrations::run_migrations().unwrap();
+    let storage = Storage::new_unwatched("main").unwrap();
+    let mut row = Instance::new("replacement", home.to_str().unwrap());
+    row.view = View::Structured;
+    row.source_profile = "main".into();
+    let old_generation = row
+        .try_acquire_lifecycle_reservation(
+            LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    let id = row.id.clone();
+    storage
+        .update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })
+        .unwrap();
+    let old_stop =
+        OwnedStop::from_claim(&storage, &row, LifecycleOperation::Trash, old_generation).unwrap();
+    storage
+        .update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            assert!(
+                row.release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Trash,
+                    old_generation,
+                )
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(home, xdg, "main", &id);
+    let workers = app_dir(home, xdg).join("acp-workers");
+    let socket = workers.join(format!("{id}.sock"));
+    let record = workers.join(format!("{id}.json"));
+    let mut child = launch
+        .spawn(launch.command().args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--session-id",
+            &id,
+            "--agent-name",
+            "fake-agent",
+            "--cwd",
+            home.to_str().unwrap(),
+            "--",
+            "cat",
+        ]))
+        .unwrap();
+    let agent_pid = agent_pid_of(child.id());
+    assert!(pid_alive(agent_pid));
+    let generation = launch.produced_origin().generation();
+    verify_published_runner(
+        launch.original_storage(),
+        &id,
+        launch.nonce,
+        child.id(),
+        generation,
+    )
+    .unwrap();
+    let sessions_before = std::fs::read(storage.sessions_path()).unwrap();
+    let registry_before = std::fs::read(&record).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(runtime.block_on(settle(old_stop)).is_err());
+    assert_eq!(
+        std::fs::read(storage.sessions_path()).unwrap(),
+        sessions_before
+    );
+    assert_eq!(std::fs::read(&record).unwrap(), registry_before);
+    let retained = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(retained.lifecycle_generation > old_generation);
+
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(pid_alive(agent_pid));
+}

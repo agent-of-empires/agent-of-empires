@@ -268,7 +268,6 @@ mod tests {
         }
     }
 
-    /// A stored, isolated session plus a live poller to stop it with.
     fn fixture(profile: &str) -> (crate::session::Storage, TestPoller, Instance) {
         let storage = crate::session::Storage::new_unwatched(profile).unwrap();
         let mut instance = Instance::new("Test Session", "/tmp/test-project");
@@ -278,6 +277,12 @@ mod tests {
                 instances.push(instance.clone());
                 Ok(())
             })
+            .unwrap();
+        let instance = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == instance.id)
             .unwrap();
         (storage, TestPoller(Some(StopPoller::new())), instance)
     }
@@ -293,8 +298,6 @@ mod tests {
         panic!("timed out waiting for stop result");
     }
 
-    /// A request is in flight until its result lands, and stopping writes the
-    /// durable `Stopped` status.
     #[test]
     #[serial_test::serial]
     fn stop_tracks_its_request_and_persists_the_status() {

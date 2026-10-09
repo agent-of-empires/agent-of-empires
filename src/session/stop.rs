@@ -61,6 +61,12 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let instance = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
         let request = StopRequest {
             session_id: id.clone(),
             instance,
