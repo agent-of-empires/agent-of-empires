@@ -192,26 +192,17 @@ pub(crate) fn attest_observed_default_store(
     true
 }
 
-/// Promote a Claude binding that only reserved its conversation id to
-/// `Observed` once that id's transcript exists in the store the launch
-/// resolved, returning whether it did.
+/// Whether a reserved (`Preallocated`) Claude id has its transcript in the
+/// binding's own store, which proves it names a resumable conversation.
 ///
-/// A terminal Claude launch reserves the id up front (`Preallocated`) and leans
-/// on a one-shot hook sidecar to confirm the conversation afterwards. That
-/// sidecar is unlinked after a single read and survives neither a resume nor a
-/// `/tmp` wipe, so a long-lived session can stay `Preallocated` for good and be
-/// refused as a fork parent ("send a message first") despite holding a
-/// complete, resumable transcript. The transcript on disk is the durable proof
-/// the sidecar was standing in for: when it is present, the id provably names a
-/// resumable conversation, so the binding is known. Only a host single-store
-/// Claude binding is probed, because a container store is not on this
-/// filesystem; existence is read exactly as the resume-arm check does
-/// ([`claude_host_transcript_confirmed_absent`]), so forkability cannot claim a
-/// conversation `--resume` would then miss. Only the provenance moves.
-pub(crate) fn confirm_claude_conversation_from_transcript(
-    binding: &mut ConversationBinding,
+/// The hook sidecar that otherwise confirms a reserved id survives neither a
+/// resume nor a `/tmp` wipe, so without this a session can stay `Preallocated`
+/// for good and be refused as a fork parent despite holding a complete
+/// transcript. Existence uses the same probe as the `--resume` arm.
+pub(super) fn transcript_confirms_reserved_claude_conversation(
+    binding: &ConversationBinding,
 ) -> bool {
-    if binding.is_known() {
+    if binding.provenance != ConversationProvenance::Preallocated {
         return false;
     }
     let Some(execution) = binding.execution.as_ref() else {
@@ -223,16 +214,89 @@ pub(crate) fn confirm_claude_conversation_from_transcript(
     let Some(store) = single_store(&execution.stores) else {
         return false;
     };
-    let present = !crate::session::capture::claude_host_transcript_confirmed_absent(
+    !crate::session::capture::claude_host_transcript_confirmed_absent(
         &execution.cwd.to_string_lossy(),
         &binding.session_id,
         &[],
         Some(store),
-    );
-    if present {
-        binding.provenance = ConversationProvenance::Observed;
+    )
+}
+
+/// Confirms, from inside a live pane's sidecar poller, the reserved Claude id
+/// the row held when the poller started, for a pane whose sidecar never
+/// reports it.
+///
+/// The confirmation names the row's own id under its recorded execution, so it
+/// claims nothing new, and the sync path's ownership, exclusion and
+/// compare-and-set checks still decide it. The poller only re-sends an
+/// observation that changed, so a refused confirmation is not retried every
+/// tick.
+pub(super) struct ReservedClaudeConfirmation {
+    binding: ConversationBinding,
+    active: ActiveExecution,
+    superseded: std::cell::Cell<bool>,
+    confirmed: std::cell::OnceCell<crate::session::poller::SessionIdObservation>,
+}
+
+impl ReservedClaudeConfirmation {
+    pub(super) fn for_instance(instance: &Instance) -> Option<Self> {
+        if !matches!(instance.resume_intent, ResumeIntent::Default) {
+            return None;
+        }
+        let active = instance.active_execution.as_ref()?;
+        let binding = instance.agent_session_binding.as_ref().filter(|binding| {
+            instance.agent_session_id.as_deref() == Some(binding.session_id.as_str())
+                && binding.provenance == ConversationProvenance::Preallocated
+                && binding.execution.as_ref() == Some(&active.binding)
+        })?;
+        Some(Self {
+            binding: binding.clone(),
+            active: active.clone(),
+            superseded: std::cell::Cell::new(false),
+            confirmed: std::cell::OnceCell::new(),
+        })
     }
-    present
+
+    /// Passes the sidecar's fresh observation through, falling back to the
+    /// transcript only while the sidecar has named no other conversation, so a
+    /// `/clear` the sidecar reported is never reverted to the reserved id.
+    /// `published` reads the sidecar at any age: Claude only rewrites it on
+    /// session start and prompt submission, so a `/clear` followed by an idle
+    /// pane is older than the fresh read accepts.
+    pub(super) fn observe(
+        &self,
+        fresh: Option<crate::session::poller::SessionIdObservation>,
+        published: impl FnOnce() -> Option<crate::session::poller::SessionIdObservation>,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        if let Some(observation) = fresh {
+            if observation.sid != self.binding.session_id {
+                self.superseded.set(true);
+            }
+            return Some(observation);
+        }
+        if !self.superseded.get()
+            && published().is_some_and(|observation| observation.sid != self.binding.session_id)
+        {
+            self.superseded.set(true);
+        }
+        if self.superseded.get() {
+            return None;
+        }
+        if let Some(confirmed) = self.confirmed.get() {
+            return Some(confirmed.clone());
+        }
+        if !transcript_confirms_reserved_claude_conversation(&self.binding) {
+            return None;
+        }
+        let execution = self.binding.execution.clone()?;
+        let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(
+            self.binding.session_id.clone(),
+            None,
+        );
+        observation.execution = Some(self.active.clone());
+        observation.scope_to(execution);
+        Some(self.confirmed.get_or_init(|| observation).clone())
+    }
 }
 
 fn single_store(stores: &[PathBuf]) -> Option<&std::path::Path> {
@@ -2754,10 +2818,8 @@ mod tests {
         assert_eq!(marker(&binding), None);
     }
 
-    /// A reserved Claude id becomes known the moment its transcript is on disk,
-    /// so a long-lived session whose one-shot hook sidecar is gone is still
-    /// forkable; nothing else makes it known, and nothing else about the binding
-    /// moves.
+    /// Only a reserved host Claude id whose transcript is in its own store is
+    /// confirmed; an id nothing reserved still needs explicit qualification.
     #[test]
     fn preallocated_claude_binding_is_confirmed_by_its_transcript() {
         let store = tempfile::tempdir().unwrap();
@@ -2773,47 +2835,123 @@ mod tests {
         std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(project_dir.join(format!("{present}.jsonl")), "data\n").unwrap();
 
-        let preallocated = |sid: &str, agent: &str, filesystem: &str| ConversationBinding {
-            session_id: sid.into(),
-            execution: Some(ExecutionBinding {
-                agent: agent.into(),
-                stores: vec![store.path().to_path_buf()],
-                configuration: Vec::new(),
-                cwd: cwd.clone().into(),
-                cwd_filesystem: "host".into(),
-                filesystem: filesystem.into(),
-                exported_default_store: None,
-            }),
-            provenance: ConversationProvenance::Preallocated,
-            transcript_path: None,
-        };
-
-        // The transcript proves the conversation, so the reserved id is promoted.
-        let mut binding = preallocated(present, "claude", "host");
-        assert!(confirm_claude_conversation_from_transcript(&mut binding));
-        assert_eq!(binding.provenance, ConversationProvenance::Observed);
-        assert!(binding.is_known());
-
-        // No transcript, a container store (not on this filesystem), and a
-        // non-Claude agent each leave the id reserved.
-        for (sid, agent, filesystem) in [
-            (absent, "claude", "host"),
-            (present, "claude", "container:session"),
-            (present, "codex", "host"),
+        use ConversationProvenance::{Preallocated, Unknown};
+        let second = store.path().join("second");
+        // (sid, agent, filesystem, provenance, extra store, confirmed)
+        for (sid, agent, filesystem, provenance, extra, confirmed) in [
+            (present, "claude", "host", Preallocated, None, true),
+            (absent, "claude", "host", Preallocated, None, false),
+            // A container store is not on this filesystem.
+            (
+                present,
+                "claude",
+                "container:session",
+                Preallocated,
+                None,
+                false,
+            ),
+            (present, "codex", "host", Preallocated, None, false),
+            (present, "claude", "host", Unknown, None, false),
+            (
+                present,
+                "claude",
+                "host",
+                Preallocated,
+                Some(&second),
+                false,
+            ),
         ] {
-            let mut binding = preallocated(sid, agent, filesystem);
-            assert!(
-                !confirm_claude_conversation_from_transcript(&mut binding),
-                "sid={sid} agent={agent} filesystem={filesystem}"
+            let binding = ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(ExecutionBinding {
+                    agent: agent.into(),
+                    stores: std::iter::once(store.path().to_path_buf())
+                        .chain(extra.cloned())
+                        .collect(),
+                    configuration: Vec::new(),
+                    cwd: cwd.clone().into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: filesystem.into(),
+                    exported_default_store: None,
+                }),
+                provenance: provenance.clone(),
+                transcript_path: None,
+            };
+            assert_eq!(
+                transcript_confirms_reserved_claude_conversation(&binding),
+                confirmed,
+                "sid={sid} agent={agent} filesystem={filesystem} provenance={provenance:?} extra={extra:?}"
             );
-            assert_eq!(binding.provenance, ConversationProvenance::Preallocated);
+        }
+    }
+
+    /// The transcript fallback confirms the reserved id only while the sidecar,
+    /// fresh or stale, names no other conversation, and once it does the
+    /// fallback stays off, so a `/clear` is never reverted.
+    #[test]
+    fn reserved_claude_confirmation_defers_to_any_other_published_id() {
+        let root = tempfile::tempdir().unwrap();
+        let reserved = "019342ab-1234-7def-8901-abcdef012345";
+        let other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let mut inst = super::super::test_helpers::reserved_claude_instance(root.path(), reserved);
+        // The recorded routing marker is not part of execution identity, so only
+        // scoping to the recorded copy keeps it.
+        inst.agent_session_binding
+            .as_mut()
+            .and_then(|binding| binding.execution.as_mut())
+            .unwrap()
+            .exported_default_store = Some(true);
+        let sidecar = |sid: &str| {
+            Some(crate::session::poller::SessionIdObservation::instance_sidecar(sid.into(), None))
+        };
+        let confirmation = ReservedClaudeConfirmation::for_instance(&inst).unwrap();
+        assert_eq!(
+            confirmation.observe(None, || None),
+            None,
+            "no transcript yet"
+        );
+        super::super::test_helpers::write_reserved_claude_transcript(&inst, reserved);
+
+        // (fresh sidecar, any-age sidecar, confirms the reserved id)
+        for (fresh, published, confirms) in [
+            (None, None, true),
+            (None, Some(reserved), true),
+            (None, Some(other), false),
+        ] {
+            let confirmation = ReservedClaudeConfirmation::for_instance(&inst).unwrap();
+            let observed =
+                confirmation.observe(fresh.and_then(sidecar), || published.and_then(sidecar));
+            assert_eq!(
+                observed
+                    .as_ref()
+                    .map(|observation| observation.sid.as_str()),
+                confirms.then_some(reserved),
+                "fresh={fresh:?} published={published:?}"
+            );
+            if confirms {
+                let binding = observed.unwrap().conversation_binding().unwrap();
+                assert!(binding.is_known());
+                assert_eq!(
+                    binding.execution,
+                    inst.active_execution.as_ref().map(|a| a.binding.clone())
+                );
+                assert_eq!(
+                    binding.execution.unwrap().exported_default_store,
+                    Some(true)
+                );
+            }
         }
 
-        // An already-known binding is left untouched.
-        let mut known = preallocated(present, "claude", "host");
-        known.provenance = ConversationProvenance::Asserted;
-        assert!(!confirm_claude_conversation_from_transcript(&mut known));
-        assert_eq!(known.provenance, ConversationProvenance::Asserted);
+        let confirmation = ReservedClaudeConfirmation::for_instance(&inst).unwrap();
+        assert_eq!(
+            confirmation.observe(sidecar(other), || None),
+            sidecar(other)
+        );
+        assert_eq!(
+            confirmation.observe(None, || None),
+            None,
+            "latched after a /clear"
+        );
     }
 
     fn hermes_fixture() -> (tempfile::TempDir, NativeLaunchInputs, rusqlite::Connection) {
