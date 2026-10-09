@@ -8,8 +8,9 @@ mod publish;
 mod requests;
 mod sink;
 mod teardown;
+
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -24,9 +25,7 @@ use tracing::warn;
 use super::acp_client::{AcpClient, AcpError, SpawnConfig};
 use super::agent_registry::AgentRegistry;
 pub use super::runner_lifecycle::ResumeKind;
-use super::runner_lifecycle::{
-    Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
-};
+use super::runner_lifecycle::{Lease, LifecycleTable, RunnerIdentity, WorkerPhase};
 use super::state::AcpSessionId;
 use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
@@ -113,6 +112,7 @@ enum WorkerKind {
 #[derive(Clone)]
 pub(super) struct PendingContextReset {
     pub(super) profile: String,
+    pub(super) generation: u64,
     pub(super) reason: String,
     pub(super) transactions: Vec<String>,
 }
@@ -140,8 +140,14 @@ impl From<WorkerPhase> for AcpWorkerState {
 
 pub(crate) enum ResumeReservationOutcome {
     Reserved(ResumeReservation),
-    /// The session is already running or mid-resume.
-    AlreadyPresent,
+    AlreadyPresent(PresentResume),
+}
+
+pub(crate) struct PresentResume {
+    lease: Lease,
+    issued: super::runner_lifecycle::ExecutionAdmission,
+    baseline: Arc<crate::session::LaunchOrigin>,
+    _custody: super::runner_lifecycle::ExecutionJob,
 }
 
 pub struct Supervisor<S: BroadcastSink> {
@@ -151,7 +157,6 @@ pub struct Supervisor<S: BroadcastSink> {
     next_seqs: Arc<SeqMap>,
     /// Owner of every runner epoch. Lock order: `workers` before `lifecycle`.
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
-    process_control: Arc<dyn ProcessControl>,
     launcher: Launcher,
     /// Agents whose first spawn finished; until then spawns serialize on a
     /// per-agent lock so a lazy adapter install is not raced.
@@ -176,25 +181,79 @@ pub struct Supervisor<S: BroadcastSink> {
     max_concurrent_workers: u32,
 }
 
-/// RAII guard over a `Starting` or `Respawning` epoch; dropping it before
-/// install abandons the epoch so a failed resume cannot pin the session.
+impl<S: BroadcastSink> Clone for Supervisor<S> {
+    fn clone(&self) -> Self {
+        Self {
+            sink: self.sink.clone(),
+            registry: self.registry.clone(),
+            workers: self.workers.clone(),
+            next_seqs: self.next_seqs.clone(),
+            lifecycle: self.lifecycle.clone(),
+            launcher: self.launcher.clone(),
+            warmed_up_agents: self.warmed_up_agents.clone(),
+            agent_warmup_locks: self.agent_warmup_locks.clone(),
+            worker_notify: self.worker_notify.clone(),
+            #[cfg(test)]
+            worker_waits: self.worker_waits.clone(),
+            respawn_pending: self.respawn_pending.clone(),
+            incompatible_binaries: self.incompatible_binaries.clone(),
+            force_respawn: self.force_respawn.clone(),
+            startup_failures: self.startup_failures.clone(),
+            pending_context_resets: self.pending_context_resets.clone(),
+            respawned_in_place: self.respawned_in_place.clone(),
+            max_concurrent_workers: self.max_concurrent_workers,
+        }
+    }
+}
+
+struct ResumeObservation(Option<super::runner_lifecycle::ExecutionAdmission>);
+
+impl Drop for ResumeObservation {
+    fn drop(&mut self) {
+        if let Some(issued) = &self.0 {
+            issued.cancel();
+        }
+    }
+}
+
+/// Retains admission until installation or retirement of a built execution.
 pub(crate) struct ResumeReservation {
     lease: Lease,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
+    execution: Option<RunnerIdentity>,
+    issued: super::runner_lifecycle::ExecutionAdmission,
+    custody: Option<super::runner_lifecycle::ExecutionJob>,
+    retirement_required: bool,
 }
 
 impl ResumeReservation {
     pub(crate) fn lease(&self) -> &Lease {
         &self.lease
     }
+    pub(crate) fn execution(&self) -> Option<RunnerIdentity> {
+        self.issued.snapshot().or(self.execution)
+    }
+    pub(crate) fn execution_admission(&self) -> super::runner_lifecycle::ExecutionAdmission {
+        self.issued.clone()
+    }
+    pub(crate) fn installed(&mut self) {
+        self.retirement_required = false;
+    }
 }
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
-        if lock_recover(&self.lifecycle).abandon(&self.lease) {
-            self.notify.notify_waiters();
+        if self.retirement_required {
+            self.issued
+                .retire(super::runner_lifecycle::AdmissionRetirement {
+                    lease: self.lease.clone(),
+                    lifecycle: Arc::clone(&self.lifecycle),
+                    notify: Arc::clone(&self.notify),
+                    execution: self.execution,
+                });
         }
+        drop(self.custody.take());
     }
 }
 
@@ -212,6 +271,15 @@ pub enum SandboxContinuation {
     Persisted,
     ImportTerminal,
     Fresh,
+}
+
+pub(crate) struct AttachRequest {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub additional_dirs: Vec<PathBuf>,
+    pub in_flight_turn: bool,
+    pub sandbox: Option<SandboxInfo>,
+    pub origin: Arc<crate::session::LaunchOrigin>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,9 +305,9 @@ pub struct SpawnRequest {
     pub fork_from: Option<String>,
     pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
-    /// The stored row's profile. Every production launch sets it, and the launch rechecks that
-    /// row before and after the handshake (#4116).
-    pub source_profile: Option<String>,
+    /// Original instance authority prepared before backend selection or sandbox effects.
+    /// Unmanaged transports have no authority to publish a native managed runner.
+    pub origin: Option<Arc<crate::session::LaunchOrigin>>,
     pub yolo_mode: bool,
     /// Explicit ACP mode applied after the handshake; wins over `yolo_mode`.
     pub acp_mode_id: Option<String>,
@@ -265,7 +333,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 chrono::Utc::now().timestamp_millis().max(1) as u64,
             ))),
-            process_control: Arc::new(SystemProcessControl),
             launcher: Arc::new(|config, session_id| Box::pin(AcpClient::spawn(config, session_id))),
             warmed_up_agents: Arc::default(),
             agent_warmup_locks: Arc::default(),
@@ -304,14 +371,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             .and_then(|(_, identity)| identity)
     }
 
+    pub(crate) fn running_origin(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<crate::session::runner_journal::LaunchOrigin>> {
+        lock_recover(&self.lifecycle).running_origin(session_id)
+    }
+
     fn mark_incompatible_binary(&self, session_id: &str, binary: &str) {
         lock_recover(&self.incompatible_binaries)
             .insert(session_id.to_string(), binary.to_string());
-    }
-
-    /// A user-initiated resume overrides a stop kept from a resume that failed before install.
-    pub fn forget_stale_cancel(&self, session_id: &str) {
-        lock_recover(&self.lifecycle).forget_stale_cancel(session_id);
     }
 
     pub fn request_respawn(&self, session_id: &str) {
@@ -359,11 +428,14 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Drop per-session bookkeeping for a deleted session.
-    pub fn forget_session(&self, session_id: &str) {
+    pub fn forget_session(&self, original: &crate::session::LaunchOrigin) {
+        if !lock_recover(&self.lifecycle).forget(original) {
+            return;
+        }
+        let session_id = original.session_id();
         if let Ok(mut guard) = self.next_seqs.lock() {
             guard.remove(session_id);
         }
-        lock_recover(&self.lifecycle).forget(session_id);
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
     }
@@ -443,7 +515,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn respawned_worker_rejects_the_prior_generation() {
+        let (_home, _temporary) = isolate_home();
         let sup = Supervisor::new(VecSink::new());
         let first = sup.test_insert_worker("s-generation").await;
         let second = sup.test_respawn_worker("s-generation").await;
@@ -460,7 +534,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn bookkeeping_sets_track_and_drain() {
+        let (_home, _temporary) = isolate_home();
         let sup = Supervisor::new(VecSink::new());
         sup.mark_incompatible_binary("s-claude-1", "claude-agent-acp");
         sup.mark_incompatible_binary("s-claude-2", "claude-agent-acp");

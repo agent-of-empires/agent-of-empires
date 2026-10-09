@@ -31,3 +31,7 @@ pub mod tmux;
 pub mod tui;
 pub mod update;
 mod util;
+
+#[cfg(test)]
+#[path = "../tests/integration/runner_tests.rs"]
+mod runner_tests;

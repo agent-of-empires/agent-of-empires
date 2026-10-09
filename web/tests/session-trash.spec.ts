@@ -1,5 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import type { Locator, Page } from "@playwright/test";
+import { sessionResponse } from "./helpers/sessions";
 import {
   confirmDelete,
   installTrashMocks,
@@ -128,7 +129,16 @@ test.describe("Multi-session workspace trash", () => {
     await page.route(/\/api\/sessions\/[^/]+\/(stop|start)$/, (r) => {
       const [, id, verb] = new URL(r.request().url()).pathname.match(/sessions\/([^/]+)\/(\w+)$/)!;
       lifecycle.push(`${verb} ${id}`);
-      return r.fulfill({ json: { id } });
+      return r.fulfill({
+        json: sessionResponse({
+          id,
+          project_path: "/tmp/repo",
+          group_path: id === "sess-b" ? "beta" : "gamma",
+          branch: "feat/x",
+          main_repo_path: "/tmp/repo",
+          status: verb === "stop" ? "Stopped" : "Running",
+        }),
+      });
     });
     await page.goto("/");
     // A two-session row is labelled by its branch, so gamma is the row naming neither single session.
@@ -297,6 +307,62 @@ test.describe("Empty Trash", () => {
 // back to the dashboard. The dialog's checkbox-to-DELETE-body mapping is
 // covered by the DeleteSessionDialog vitest.
 test.describe("Delete active session", () => {
+  test("pending delete retains the active row and route until a successful retry", async ({ page }) => {
+    const handle = await installTrashMocks(page, [
+      {
+        id: "sess-pending",
+        title: "story-delete-pending",
+        projectPath: "/tmp/story",
+        trashed: false,
+        status: "Running",
+        deleteToTrash: false,
+      },
+    ]);
+    let pending = true;
+    await page.route("**/api/workspaces", async (route) => {
+      if (route.request().method() === "DELETE" && pending) {
+        pending = false;
+        await route.fulfill({
+          status: 409,
+          json: { error: "teardown_pending", message: "runner execution is still live" },
+        });
+      } else {
+        await route.fallback();
+      }
+    });
+    await page.goto("/session/sess-pending");
+    const row = sessionRows(page).filter({ hasText: "story-delete-pending" }).first();
+    await expect(row).toBeVisible();
+    // Freeze list polling so it cannot repair an incorrect local Error transition.
+    let freezePolling = true;
+    await page.route("**/api/sessions", async (route) => {
+      if (freezePolling && route.request().method() === "GET") {
+        await route.abort();
+      } else {
+        await route.fallback();
+      }
+    });
+    const refused = page.waitForResponse(
+      (response) => response.url().endsWith("/api/workspaces") && response.status() === 409,
+    );
+    const dialog = await openDeleteDialogFromRow(page, row);
+    await confirmDelete(dialog);
+    await refused;
+    await expect(dialog).toHaveCount(0);
+    await expect(page).toHaveURL(/\/session\/sess-pending/);
+    await expect(row).toBeVisible();
+    await expect(page.getByRole("alert").filter({ hasText: "runner execution is still live" })).toContainText(
+      "runner execution is still live",
+    );
+    await expect(row.locator(".text-status-running").first()).toBeVisible();
+    await expect(row.locator(".text-status-error")).toHaveCount(0);
+    expect(handle.deletedIds).toEqual([]);
+    freezePolling = false;
+    await confirmDelete(await openDeleteDialogFromRow(page, row));
+    await expect.poll(() => handle.deletedIds).toEqual(["sess-pending"]);
+    await expect(page).not.toHaveURL(/\/session\/sess-pending/);
+    await expect(row).toHaveCount(0);
+  });
   test("deleting the active session removes the row and falls back to /", async ({ page }) => {
     const handle = await installTrashMocks(page, [
       {

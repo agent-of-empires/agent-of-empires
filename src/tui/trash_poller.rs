@@ -4,6 +4,7 @@
 //! worktree into the holding area, so it runs on a worker thread and the main
 //! loop drains results each frame.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::TryRecvError;
 
 use crate::session::trash::perform_trash;
@@ -18,12 +19,59 @@ impl SessionScoped for TrashResult {
 
 pub struct TrashPoller {
     worker: TrackedWorker<TrashRequest, TrashResult>,
+    claims: HashMap<String, VecDeque<(String, u64)>>,
 }
 
 impl TrashPoller {
     pub fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
         Self {
-            worker: TrackedWorker::spawn("aoe-trash-poller", |request| perform_trash(&request)),
+            worker: TrackedWorker::spawn("aoe-trash-poller", move |request: TrashRequest| {
+                let settled = (|| -> anyhow::Result<()> {
+                    let runtime = runtime.as_ref().map_err(|error| {
+                        anyhow::anyhow!("could not create trash worker runtime: {error}")
+                    })?;
+                    let native = crate::session::runner_journal::OwnedStop::from_claim(
+                        &request.storage,
+                        &request.instance,
+                        crate::session::LifecycleOperation::Trash,
+                        request.generation,
+                    )?;
+                    runtime.block_on(crate::session::runner_journal::settle(native))
+                })();
+                if let Err(error) = settled {
+                    let _ = (|| -> anyhow::Result<()> {
+                        let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+                        let _identity = crate::session::acquire_session_identity_lock()?;
+                        let storage = &request.storage;
+                        storage.verify_profile_identity()?;
+                        let _lifecycle =
+                            storage.acquire_instance_lifecycle_lock(&request.session_id)?;
+                        storage.update_under_workspace_claim_lock(|instances, _groups| {
+                            crate::session::claim::release_trash_reservation(
+                                instances,
+                                &request.session_id,
+                                request.generation,
+                            );
+                            Ok(())
+                        })
+                    })();
+                    return TrashResult {
+                        session_id: request.session_id.clone(),
+                        relocation: None,
+                        relocate_warning: Some(format!(
+                            "runner execution could not be settled; checkout retained: {error:#}"
+                        )),
+                        authoritative: None,
+                    };
+                }
+                // The sync operation reloads the owned reservation and current
+                // journal under its canonical locks before any physical move.
+                perform_trash(&request)
+            }),
+            claims: HashMap::new(),
         }
     }
 
@@ -33,20 +81,40 @@ impl TrashPoller {
     ) -> Self {
         Self {
             worker: TrackedWorker::spawn("aoe-trash-poller-test", handler),
+            claims: HashMap::new(),
         }
     }
 
     pub fn request_trash(&mut self, request: TrashRequest) {
+        self.claims
+            .entry(request.session_id.clone())
+            .or_default()
+            .push_back((request.instance.source_profile.clone(), request.generation));
         self.worker.request(request.session_id.clone(), request);
     }
 
     pub fn try_recv_result(&mut self) -> Result<TrashResult, TryRecvError> {
-        self.worker.try_recv()
+        let result = self.worker.try_recv()?;
+        if let Some(claims) = self.claims.get_mut(&result.session_id) {
+            claims.pop_front();
+            if claims.is_empty() {
+                self.claims.remove(&result.session_id);
+            }
+        }
+        Ok(result)
     }
 
+    pub(crate) fn owned_generation(&self, profile: &str, id: &str) -> Option<u64> {
+        self.claims
+            .get(id)?
+            .iter()
+            .rev()
+            .find_map(|(source, generation)| (source == profile).then_some(*generation))
+    }
     /// Relocations that never landed, for logging as deferred once the worker is
     /// known dead. The rows stay trashed; a later reconcile pass moves them.
     pub fn take_pending(&mut self) -> Vec<String> {
+        self.claims.clear();
         self.worker.take_pending()
     }
 
@@ -73,7 +141,7 @@ mod tests {
     impl Drop for TestPoller {
         fn drop(&mut self) {
             if let Some(poller) = self.0.take() {
-                let _ = poller.worker.finish_for_test();
+                let _ = poller.worker.finish();
             }
         }
     }
@@ -117,6 +185,7 @@ mod tests {
         let session_id = instance.id.clone();
 
         poller.request_trash(TrashRequest {
+            storage: crate::session::Storage::open_unwatched(&instance.source_profile).unwrap(),
             session_id: session_id.clone(),
             instance,
             generation,

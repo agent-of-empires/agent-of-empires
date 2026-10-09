@@ -1432,6 +1432,23 @@ fn a_selected_session_carries_its_agent_and_modes() {
         "nor does a cautious source turn the yolo default off"
     );
 }
+#[test]
+#[serial_test::serial]
+fn merge_inherited_agent_restores_its_configured_sandbox_default() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    fs::write(crate::session::get_app_dir().unwrap().join("config.toml"),
+        "[session]\ndefault_tool = \"settl\"\nyolo_mode_default = true\n[sandbox]\nenabled_by_default = true\n").unwrap();
+    let mut dialog =
+        NewSessionDialog::new_with_tools(vec!["settl", "claude"], TEST_PATH.to_string());
+    dialog.docker_available = true;
+    dialog.yolo_mode_default = true;
+    assert_eq!(dialog.selected_tool(), "settl");
+    assert!(!dialog.sandbox_enabled);
+    dialog.inherit_session(&source_session("claude", false, false));
+    assert_eq!(dialog.selected_tool(), "claude");
+    assert!(dialog.yolo_mode);
+    assert!(dialog.sandbox_enabled);
+}
 
 /// The view follows the source session where the agent can back a structured one, over the
 /// configured default in either direction.

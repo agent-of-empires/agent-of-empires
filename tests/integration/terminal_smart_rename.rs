@@ -97,13 +97,12 @@ fn seed_instance(title: &str) -> Instance {
     seeded
 }
 
-/// Create a real tmux pane and type a line into it (no Enter, so it is not run
-/// as a shell command) so the capture has first-turn text.
+/// A real POSIX pane holds the typed first turn without executing it.
 fn create_pane(name: &str, typed: &str) {
     let status = Command::new("tmux")
         .arg("-S")
         .arg(tmux_socket())
-        .args(["new-session", "-d", "-s", name])
+        .args(["new-session", "-d", "-s", name, "/bin/sh", "-i"])
         .status()
         .expect("tmux new-session");
     assert!(status.success(), "tmux new-session failed for {name}");

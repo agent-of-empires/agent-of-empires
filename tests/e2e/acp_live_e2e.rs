@@ -401,15 +401,29 @@ fn start_daemon(h: &TuiTestHarness) -> u16 {
     port
 }
 
-fn wait_for_session_loads(log: &Path, minimum: usize) -> usize {
+fn wait_for_session_loads(h: &TuiTestHarness, id: &str, minimum: usize) -> usize {
+    let app_dir = app_dir_in(h.home_path());
+    let log = app_dir.join("fake-acp.log");
+    let sessions = app_dir.join("profiles/default/sessions.json");
     wait_until(Duration::from_secs(75), Duration::from_millis(50), || {
-        let contents = std::fs::read_to_string(log).unwrap_or_default();
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
         let loads = contents
             .matches("handleRequest method=session/load")
             .count();
-        (loads >= minimum)
+        let rows: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sessions).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .ok_or_else(|| format!("session {id} disappeared"))?;
+        let selected = row["agent_session_id"].as_str();
+        let assigned = row["acp_session_id"].as_str();
+        (loads >= minimum && selected.is_some() && assigned == selected)
             .then_some(loads)
-            .ok_or_else(|| format!("worker did not load the session: {contents}"))
+            .ok_or_else(|| format!("worker load not committed: selected={selected:?}, assigned={assigned:?}, log={contents}"))
     })
 }
 
@@ -436,10 +450,7 @@ fn selected_claude_store_survives_terminal_handoff() {
         );
     });
 
-    assert_eq!(
-        wait_for_session_loads(&app_dir_in(h.home_path()).join("fake-acp.log"), 1),
-        1
-    );
+    assert_eq!(wait_for_session_loads(&h, &id, 1), 1);
     let capture = wait_for_capture(
         &capture_dir,
         "CLAUDE_CONFIG_DIR",
@@ -459,7 +470,6 @@ fn selected_claude_store_survives_stop_and_respawn() {
     let (h, selected, capture_dir, id) = asserted_claude_store_harness("handoff_respawn");
     let port = start_daemon(&h);
     let base = format!("http://127.0.0.1:{port}/api/sessions/{id}");
-    let log = app_dir_in(h.home_path()).join("fake-acp.log");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let response = reqwest::Client::new()
@@ -473,7 +483,7 @@ fn selected_claude_store_survives_stop_and_respawn() {
             response.text().await.unwrap()
         );
     });
-    assert_eq!(wait_for_session_loads(&log, 1), 1);
+    assert_eq!(wait_for_session_loads(&h, &id, 1), 1);
     let captures_before: Vec<_> = capture_files(&capture_dir)
         .into_iter()
         .map(|(path, _)| path.file_name().unwrap().to_owned())
@@ -499,7 +509,7 @@ fn selected_claude_store_survives_stop_and_respawn() {
             response.text().await.unwrap()
         );
     });
-    assert_eq!(wait_for_session_loads(&log, 2), 2);
+    assert_eq!(wait_for_session_loads(&h, &id, 2), 2);
     let respawned = capture_files(&capture_dir)
         .into_iter()
         .any(|(path, capture)| {

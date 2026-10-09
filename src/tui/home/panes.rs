@@ -10,7 +10,7 @@ impl HomeView {
         size: Option<(u16, u16)>,
     ) -> anyhow::Result<()> {
         self.try_mutate_instance(id, |inst| inst.start_terminal_with_size(size))?;
-        self.save()?;
+        self.request_save();
         Ok(())
     }
 
@@ -107,32 +107,33 @@ impl HomeView {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) {
-        if self.get_instance(id).is_none() {
-            return;
-        }
-        self.attach_after_restart.insert(id.to_string());
-        if !self.restart_in_flight.insert(id.to_string()) {
-            return;
-        }
-        self.mutate_instance(id, |inst| {
-            inst.status = crate::session::Status::Starting;
-            inst.last_error = None;
-            inst.last_start_time = Some(std::time::Instant::now());
-        });
-        let Some(instance) = self.get_instance(id).cloned() else {
+        let Some(instance) = self.get_instance(id) else {
             return;
         };
-        self.restart_poller
-            .request_restart(crate::session::restart::RestartRequest {
-                session_id: id.to_string(),
-                instance,
+        if self
+            .restart_in_flight
+            .get(id)
+            .is_some_and(|origin| origin.matches(instance))
+        {
+            self.attach_after_restart.insert(id.to_owned());
+            return;
+        }
+        let row = match self.capture_transaction_row(id) {
+            Ok(row) => row,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new("Restart Failed", &format!("{error:#}")));
+                return;
+            }
+        };
+        if let Err(error) =
+            self.request_transaction(persistence_transactions::TransactionRequest::Launch {
+                row,
                 size,
-                wake_message: String::new(),
                 skip_on_launch,
-                bound_hooks: false,
-                discard_sandbox_container: false,
-                conversation_carry: None,
-            });
+            })
+        {
+            self.info_dialog = Some(InfoDialog::new("Restart Failed", &format!("{error:#}")));
+        }
     }
 
     pub fn get_terminal_mode(&self, session_id: &str) -> TerminalMode {

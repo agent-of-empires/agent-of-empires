@@ -303,7 +303,7 @@ done
                 inst
             })
             .collect();
-        let owned = Owned::new(&owned_instances, Vec::new());
+        let owned = Owned::new(&owned_instances, Vec::new()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         stub(dir.path(), LISTING, 101, 2, "none");
         let list = run_owned(dir.path(), &owned).await.unwrap();

@@ -39,7 +39,7 @@ Workers are tied to the daemon lifetime, with no reattach socket or durable runn
 
 ## Host APIs and events
 
-The host exposes capability-checked RPCs for the plugin event bus, private session metadata, plugin settings, session listing, UI state, ACP capability discovery, and plugin-created sessions; the methods and payloads are in the [Plugin API reference](../../plugin-api.md). The event bus uses the protocol-neutral store in `src/events/` with its own schema and replay cursor. Session writes take the storage lock and become visible to other processes on their next reload. Each caller's plugin id comes from its host context, never from request parameters.
+The host exposes capability-checked RPCs for the plugin event bus, private session metadata, plugin settings, session listing, UI state, ACP capability discovery, and plugin-created sessions; the methods and payloads are in the [Plugin API reference](../../plugin-api.md). The event bus uses the protocol-neutral store in `src/events/` with its own schema and replay cursor. Session writes take the storage lock and become visible to other processes on their next reload. Session listing and metadata RPCs require an existing profile; a removed or renamed profile fails instead of being recreated. Each caller's plugin id comes from its host context, never from request parameters.
 
 ## Unattended plugin sessions
 

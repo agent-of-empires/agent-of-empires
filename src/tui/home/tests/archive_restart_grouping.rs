@@ -22,7 +22,17 @@ fn archive_advances_cursor_to_next_session() {
             other => panic!("expected a session row below the cursor, got {other:?}"),
         };
 
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            {
+                let submitted = env.view.toggle_archive_at_cursor();
+                await_transaction_result(
+                    &mut env.view,
+                    submitted.map(|_| super::super::TransactionDisposition::Queued),
+                )
+            }
+            .unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         assert!(
             env.view.get_instance(&id).unwrap().is_archived(),
@@ -57,7 +67,17 @@ fn archive_advances_cursor_to_next_session() {
             other => panic!("expected a session row above the cursor, got {other:?}"),
         };
 
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            {
+                let submitted = env.view.toggle_archive_at_cursor();
+                await_transaction_result(
+                    &mut env.view,
+                    submitted.map(|_| super::super::TransactionDisposition::Queued),
+                )
+            }
+            .unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         assert!(env.view.get_instance(&id).unwrap().is_archived());
         assert_eq!(
@@ -77,7 +97,17 @@ fn archive_advances_cursor_to_next_session() {
             other => panic!("expected a second session row, got {other:?}"),
         };
         env.view.select_session_by_id(&parked_id);
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            {
+                let submitted = env.view.toggle_archive_at_cursor();
+                await_transaction_result(
+                    &mut env.view,
+                    submitted.map(|_| super::super::TransactionDisposition::Queued),
+                )
+            }
+            .unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
         assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
 
         // Archive the remaining active session. The only session row left below
@@ -87,7 +117,17 @@ fn archive_advances_cursor_to_next_session() {
             id, parked_id,
             "selection must have fallen back to the active row"
         );
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            {
+                let submitted = env.view.toggle_archive_at_cursor();
+                await_transaction_result(
+                    &mut env.view,
+                    submitted.map(|_| super::super::TransactionDisposition::Queued),
+                )
+            }
+            .unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         assert!(env.view.get_instance(&id).unwrap().is_archived());
         assert_eq!(
@@ -107,7 +147,17 @@ fn archive_advances_cursor_to_next_session() {
         env.view.update_selected();
         let id = env.view.selected_session.clone().unwrap();
 
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            {
+                let submitted = env.view.toggle_archive_at_cursor();
+                await_transaction_result(
+                    &mut env.view,
+                    submitted.map(|_| super::super::TransactionDisposition::Queued),
+                )
+            }
+            .unwrap();
+            finish_runner_settlements(&mut env.view);
+        };
 
         assert!(env.view.get_instance(&id).unwrap().is_archived());
         assert_eq!(
@@ -132,13 +182,33 @@ fn unarchive_keeps_selection() {
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        {
+            let submitted = env.view.toggle_archive_at_cursor();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     assert!(env.view.get_instance(&id).unwrap().is_archived());
 
     // The archive advanced the cursor to the neighbor; navigate back onto
     // the archived row (visible because the section is expanded) to restore.
     env.view.select_session_by_id(&id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        {
+            let submitted = env.view.toggle_archive_at_cursor();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
         "second toggle unarchives"
@@ -202,10 +272,14 @@ fn restart_selected_session_skips_sunk_and_transient_rows() {
         }
         env.view.mutate_instance(&id, sink);
 
-        assert!(env
-            .view
-            .restart_selected_session(None, None, None, None)
-            .is_ok());
+        assert!({
+            let submitted = env.view.restart_selected_session(None, None, None, None);
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .is_ok());
         assert!(
             still_sunk(env.view.instance_at(0)),
             "{label}: restart must leave the row's own state alone"
@@ -232,7 +306,13 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     assert!(env.view.instance_at(0).is_snoozed(), "pre-condition");
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = {
+        let submitted = env.view.restart_selected_session(None, None, None, None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    };
     assert!(result.is_ok());
     assert!(
         !env.view.instance_at(0).is_snoozed(),
@@ -263,7 +343,13 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     let now = std::time::Instant::now();
     env.view.restart_cooldown_at.insert(id.clone(), now);
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = {
+        let submitted = env.view.restart_selected_session(None, None, None, None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    };
     assert!(result.is_ok());
     let stored = env.view.restart_cooldown_at.get(&id).copied().unwrap();
     assert_eq!(
@@ -306,9 +392,16 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
         })
         .unwrap();
 
-    env.view
-        .restart_selected_session(None, Some("codex"), None, None)
-        .unwrap();
+    {
+        let submitted = env
+            .view
+            .restart_selected_session(None, Some("codex"), None, None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
 
     let inst = env.view.instance_at(0);
     assert_eq!(inst.tool, "codex");
@@ -425,9 +518,14 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
     };
     let restart = |env: &mut TestEnv, tool: Option<&str>| {
         env.view.restart_cooldown_at.clear();
-        env.view
-            .restart_selected_session(None, tool, None, None)
-            .unwrap();
+        {
+            let submitted = env.view.restart_selected_session(None, tool, None, None);
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !env.view.apply_restart_results() {
             assert!(
@@ -436,6 +534,7 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        drain_persistence(&mut env.view).unwrap();
     };
 
     for (tool, removal_fails, expected_removals, case) in [
@@ -529,9 +628,16 @@ fn restart_selected_session_account_swap_keeps_the_conversation() {
             })
             .unwrap();
 
-        env.view
-            .restart_selected_session(None, Some(new_tool), None, None)
-            .unwrap();
+        {
+            let submitted = env
+                .view
+                .restart_selected_session(None, Some(new_tool), None, None);
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
 
         let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
         let row = disk.iter().find(|i| i.id == id).unwrap();
@@ -587,9 +693,16 @@ fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
     crate::tmux::status_rules::install_from_config("test", &config);
     crate::tmux::status_rules::install_from_config("other", &crate::session::Config::default());
 
-    env.view
-        .restart_selected_session(None, Some("gjc"), None, None)
-        .unwrap();
+    {
+        let submitted = env
+            .view
+            .restart_selected_session(None, Some("gjc"), None, None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     // The restart worker re-resolves the profile's config, reinstalling its registry
     // entries; it must finish before the guards restore them.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -711,8 +824,14 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
     .unwrap();
     view.update_selected();
     view.selected_session = Some(id.clone());
-    view.restart_selected_session(None, Some("codex"), None, None)
-        .unwrap();
+    {
+        let submitted = view.restart_selected_session(None, Some("codex"), None, None);
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     let mut applied = false;
     for _ in 0..120 {
         if view.apply_restart_results() {
@@ -721,6 +840,7 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    drain_persistence(&mut view).unwrap();
     let _ = crate::tmux::tmux_command()
         .args(["kill-session", "-t", &name])
         .output();
@@ -739,26 +859,120 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
 
 #[test]
 #[serial]
+fn rejected_launch_callbacks_retire_only_their_original_request() {
+    for recovery in [false, true] {
+        for newer_request in [false, true] {
+            let mut env = create_test_env_with_sessions(1);
+            let before = env.view.instance_at(0).clone();
+            let id = before.id.clone();
+            let original = super::super::RequestOrigin::capture(&before).unwrap();
+            let profile = crate::session::get_profile_dir_path("test").unwrap();
+            std::fs::rename(&profile, profile.with_file_name("displaced-test")).unwrap();
+            let replacement = Storage::new_unwatched("test").unwrap();
+            let mut peer = Instance::new("replacement", "/tmp/replacement");
+            peer.id = id.clone();
+            peer.source_profile = "test".into();
+            replacement
+                .update(|rows, _| {
+                    rows.push(peer);
+                    Ok(())
+                })
+                .unwrap();
+            let peer = replacement.load().unwrap().remove(0);
+            let pending = if newer_request {
+                env.view.instances.insert(id.clone(), peer.clone());
+                super::super::RequestOrigin::capture(&peer).unwrap()
+            } else {
+                original
+            };
+            let expected_memory = if newer_request {
+                env.view.get_instance(&id).unwrap().clone()
+            } else {
+                peer.clone()
+            };
+            let disk_before = serde_json::to_value(replacement.load().unwrap()).unwrap();
+            let mut after = before.clone();
+            after.last_error = Some("stale worker error".into());
+            let result = Err("launch could not publish".to_string());
+            if recovery {
+                env.view.recovery_in_flight.insert(id.clone(), pending);
+                let (tx, rx) = std::sync::mpsc::channel();
+                env.view.recovery_rx = Some(rx);
+                tx.send(super::super::RecoveryUpdate {
+                    instance_id: id.clone(),
+                    title: before.title.clone(),
+                    before: Box::new(before),
+                    instance: Box::new(after),
+                    result,
+                })
+                .unwrap();
+                assert_eq!(env.view.apply_recovery_updates(), !newer_request);
+                drain_persistence(&mut env.view).unwrap();
+                assert_eq!(env.view.recovery_in_flight.contains_key(&id), newer_request);
+            } else {
+                env.view.restart_in_flight.insert(id.clone(), pending);
+                env.view.attach_after_restart.insert(id.clone());
+                env.view.restart_poller =
+                    crate::tui::restart_poller::RestartPoller::with_result_for_test(
+                        crate::session::restart::RestartResult {
+                            session_id: id.clone(),
+                            before: Box::new(before),
+                            instance: Box::new(after),
+                            outcome: result,
+                        },
+                    );
+                assert_eq!(env.view.apply_restart_results(), !newer_request);
+                drain_persistence(&mut env.view).unwrap();
+                assert_eq!(env.view.restart_in_flight.contains_key(&id), newer_request);
+                assert_eq!(env.view.attach_after_restart.contains(&id), newer_request);
+                assert!(env.view.take_restarted_attaches().is_empty());
+            }
+            assert_eq!(
+                serde_json::to_value(env.view.get_instance(&id).unwrap()).unwrap(),
+                serde_json::to_value(expected_memory).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(replacement.load().unwrap()).unwrap(),
+                disk_before
+            );
+            assert_eq!(env.view.info_dialog.is_some(), !newer_request);
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn apply_restart_results_preserves_peer_sid_and_marker() {
     use crate::session::StartOutcome;
 
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
-    env.view.restart_in_flight.insert(id.clone());
-    env.view.instance_at_mut(0).agent_session_id = Some("peer-fresh-sid".to_string());
-    env.view.instance_at_mut(0).resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
-
-    let mut worker = env.view.instance_at(0).clone();
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
+    let before = env.view.instance_at(0).clone();
+    let mut worker = before.clone();
     worker.status = crate::session::Status::Error;
     worker.agent_session_id = Some("phase1-stale-sid".to_string());
     worker.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
     worker.last_error =
         Some("resume failed for sid phase1-stale-sid; preserved for explicit retry".to_string());
 
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            row.agent_session_id = Some("peer-fresh-sid".into());
+            row.resume_probe_failed_sid = Some("peer-fresh-sid".into());
+            row.status = crate::session::Status::Error;
+            Ok(())
+        })
+        .unwrap();
     env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
         crate::session::restart::RestartResult {
             session_id: id.clone(),
-            before: Box::new(worker.clone()),
+            before: Box::new(before),
             instance: Box::new(worker),
             outcome: Ok(StartOutcome::ResumeFailed {
                 sid: "phase1-stale-sid".to_string(),
@@ -767,6 +981,7 @@ fn apply_restart_results_preserves_peer_sid_and_marker() {
     );
 
     assert!(env.view.apply_restart_results());
+    drain_persistence(&mut env.view).unwrap();
 
     let row = env
         .view
@@ -789,35 +1004,46 @@ fn apply_restart_results_preserves_peer_sid_and_marker() {
 
 #[test]
 #[serial]
-fn apply_restart_results_propagates_worker_sid_without_peer_write() {
-    use crate::session::StartOutcome;
-
+fn apply_restart_results_consumes_persisted_failure_sid() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
-    env.view.restart_in_flight.insert(id.clone());
-    env.view.instance_at_mut(0).agent_session_id = Some("sid-before".to_string());
-
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
     let before = env.view.instance_at(0).clone();
-    let mut worker = before.clone();
-    worker.agent_session_id = Some("sid-after".to_string());
-    worker.status = crate::session::Status::Running;
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            row.agent_session_id = Some("sid-after".into());
+            row.status = crate::session::Status::Error;
+            Ok(())
+        })
+        .unwrap();
+    let worker = Storage::open_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .remove(0);
 
     env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
         crate::session::restart::RestartResult {
             session_id: id.clone(),
             before: Box::new(before),
             instance: Box::new(worker),
-            outcome: Ok(StartOutcome::Resumed),
+            outcome: Err("producer failure after SID persistence".into()),
         },
     );
 
     assert!(env.view.apply_restart_results());
+    drain_persistence(&mut env.view).unwrap();
 
     let row = env
         .view
         .get_instance(&id)
         .expect("instance remains visible");
-    assert_eq!(row.status, crate::session::Status::Running);
+    assert_eq!(row.status, crate::session::Status::Error);
     assert_eq!(row.agent_session_id.as_deref(), Some("sid-after"));
     assert_eq!(row.resume_probe_failed_sid, None);
     assert!(env.view.restart_in_flight.is_empty());
@@ -876,8 +1102,11 @@ fn restart_then_attach_queues_the_cascade_and_attaches_after_launch() {
             },
         );
 
-        env.view.restart_then_attach(&id, None, false);
-        assert!(env.view.restart_in_flight.contains(&id), "{case}");
+        {
+            env.view.restart_then_attach(&id, None, false);
+            drain_persistence(&mut env.view).unwrap();
+        };
+        assert!(env.view.restart_in_flight.contains_key(&id), "{case}");
         assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Starting);
         assert_eq!(
             disk_generation(&env.view),
@@ -886,6 +1115,7 @@ fn restart_then_attach_queues_the_cascade_and_attaches_after_launch() {
         );
 
         assert!(env.view.apply_restart_results(), "{case}");
+        drain_persistence(&mut env.view).unwrap();
         let expected = if attaches { vec![id.clone()] } else { vec![] };
         assert_eq!(env.view.take_restarted_attaches(), expected, "{case}");
         assert!(env.view.attach_after_restart.is_empty(), "{case}");
@@ -925,9 +1155,18 @@ fn restart_selected_session_skips_when_already_in_flight() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
-    env.view.restart_in_flight.insert(id.clone());
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = {
+        let submitted = env.view.restart_selected_session(None, None, None, None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    };
     assert!(result.is_ok());
     assert!(
         env.view.restart_cooldown_at.is_empty(),
@@ -940,6 +1179,47 @@ fn restart_selected_session_skips_when_already_in_flight() {
     );
 }
 
+#[test]
+#[serial]
+fn rejected_duplicate_delete_is_visible_before_the_other_ack_is_consumed() {
+    use crate::tui::dialogs::DeleteOptions;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    let storage = env.view.storages.get("test").unwrap().clone();
+    storage
+        .update_metadata(
+            crate::session::MetadataSelection::Session(id.as_str().into()),
+            |rows, _| {
+                rows.iter_mut().find(|row| row.id == id).unwrap().title =
+                    "Changed original goal".into();
+                Ok(())
+            },
+        )
+        .unwrap();
+    let durable = std::fs::read(storage.sessions_path()).unwrap();
+    env.view.delete_selected(&DeleteOptions::default()).unwrap();
+    env.view.delete_selected(&DeleteOptions::default()).unwrap();
+    assert_eq!(env.view.deletes_in_flight.len(), 2);
+    let other_request = *env.view.deletes_in_flight.keys().max().unwrap();
+    wait_for_native_fixture("first real deletion refusal", || {
+        env.view.apply_deletion_results().then_some(())
+    });
+    assert!(
+        env.view.info_dialog.is_some(),
+        "a real refusal must remain visible"
+    );
+    assert!(env.view.deletes_in_flight.contains_key(&other_request));
+    assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Deleting);
+    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), durable);
+    wait_for_native_fixture("second real deletion refusal", || {
+        env.view.apply_deletion_results();
+        env.view.deletes_in_flight.is_empty().then_some(())
+    });
+    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), durable);
+}
+
 /// Deleting a row whose restart cascade is still running would fire docker commands
 /// against the container the worker is creating, so the delete must be refused visibly.
 #[test]
@@ -950,7 +1230,10 @@ fn delete_selected_refused_during_restart() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
-    env.view.restart_in_flight.insert(id.clone());
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
 
     let result = env.view.delete_selected(&DeleteOptions::default());
     assert!(result.is_ok());
@@ -982,21 +1265,23 @@ fn delete_selected_refused_during_restart() {
     env.view.selected_group_profile = Some("test".to_string());
     env.view.info_dialog = None;
 
-    env.view
-        .delete_group_with_sessions(&GroupDeleteOptions {
+    {
+        let submitted = env.view.delete_group_with_sessions(&GroupDeleteOptions {
             delete_sessions: true,
             delete_worktrees: false,
             delete_branches: false,
             delete_containers: false,
             force_delete_worktrees: false,
-        })
-        .unwrap();
+        });
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap_err();
 
     assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-    assert_eq!(
-        env.view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Restart in progress")
-    );
+    assert!(env.view.info_dialog.is_some());
     let (instances, groups) = Storage::open_unwatched("test")
         .unwrap()
         .load_with_groups()
@@ -1008,32 +1293,40 @@ fn delete_selected_refused_during_restart() {
         let storage = env.view.storages.get("test").unwrap();
         storage
             .update(|instances, _groups| {
-                instances
+                let row = instances
                     .iter_mut()
                     .find(|instance| instance.id == id)
-                    .unwrap()
-                    .status = crate::session::Status::Creating;
+                    .unwrap();
+                row.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Create,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .map_err(anyhow::Error::new)?;
+                row.status = crate::session::Status::Creating;
                 Ok(())
             })
             .unwrap();
     }
     env.view.info_dialog = None;
 
-    env.view
-        .delete_group_with_sessions(&GroupDeleteOptions {
+    {
+        let submitted = env.view.delete_group_with_sessions(&GroupDeleteOptions {
             delete_sessions: true,
             delete_worktrees: false,
             delete_branches: false,
             delete_containers: false,
             force_delete_worktrees: false,
-        })
-        .unwrap();
+        });
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap_err();
 
     assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-    assert_eq!(
-        env.view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Creation in progress")
-    );
+    assert!(env.view.info_dialog.is_some());
     let (instances, groups) = Storage::open_unwatched("test")
         .unwrap()
         .load_with_groups()
@@ -1287,7 +1580,17 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
     env.view.update_selected();
     assert_eq!(env.view.selected_group.as_deref(), Some("beta"));
 
-    env.view.archive_selected_group().unwrap();
+    {
+        {
+            let submitted = env.view.archive_selected_group();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
 
     assert!(
         env.view
@@ -1379,7 +1682,11 @@ fn p_key_pins_project_on_header() {
     env.view.update_selected();
 
     assert!(!env.view.is_project_label_pinned("alpha"));
-    env.view.handle_key(key(KeyCode::Char('p')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('p')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.is_project_label_pinned("alpha"),
         "p on a project header should pin it"
@@ -1423,7 +1730,11 @@ fn p_key_opens_projects_dialog_off_project_header() {
     env.view.cursor = 0;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('p')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('p')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.projects_dialog.is_some(),
         "p off a project header should open the projects dialog"
@@ -1553,7 +1864,11 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             "{case}: pin gate"
         );
 
-        view.handle_key(key(KeyCode::Char('p')), None);
+        {
+            let result = view.handle_key(key(KeyCode::Char('p')), None);
+            drain_persistence(&mut view).unwrap();
+            result
+        };
 
         assert_eq!(
             view.is_project_label_pinned("scratch"),
@@ -2229,10 +2544,22 @@ fn group_by_toggle_preserves_selected_session() {
             Some(target_id.as_str())
         );
 
-        env.view.handle_key(key(KeyCode::Char('g')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('g')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         // 'g' opens the picker; pick Project to apply the flip.
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Enter), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Down), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
+        {
+            let result = env.view.handle_key(key(KeyCode::Enter), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(env.view.group_by, GroupByMode::Project);
         assert_eq!(
             env.view.selected_session.as_deref(),
@@ -2274,9 +2601,21 @@ fn group_by_toggle_preserves_selected_session() {
         );
 
         // Open the sort picker and pick Attention (one down from Newest).
-        env.view.handle_key(key(KeyCode::Char('o')), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Enter), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('o')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
+        {
+            let result = env.view.handle_key(key(KeyCode::Down), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
+        {
+            let result = env.view.handle_key(key(KeyCode::Enter), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(env.view.sort_order, SortOrder::Attention);
         assert_eq!(
             env.view.selected_session.as_deref(),
@@ -2304,30 +2643,47 @@ fn profile_move_group_metadata_survives_reload() {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        let moved = {
+        let mut moved = {
             let mut inst = Instance::new("moved", "/tmp/moved");
             inst.id = "moved".to_string();
             inst.source_profile = "alpha".to_string();
             inst.group_path = "work".to_string();
             inst
         };
-        view.instances.insert(moved.id.clone(), moved);
-        view.pending_added
-            .entry("alpha".to_string())
-            .or_default()
-            .insert("moved".to_string());
+        moved.storage_origin = Some(std::sync::Arc::new(view.storages["alpha"].clone()));
+        view.add_instance(moved);
         view.group_trees.insert(
             "alpha".to_string(),
             GroupTree::new_with_groups(&view.cloned_instances(), &[]),
         );
-        view.save().unwrap();
+        {
+            view.request_save();
+            drain_persistence(&mut view)
+        }
+        .unwrap();
 
         view.group_trees
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
         let requested = view.instances["moved"].clone();
-        view.move_to_profile("moved", "beta", requested, None, false)
-            .unwrap();
+        (|| -> anyhow::Result<()> {
+            let row = view.capture_transaction_row("moved")?;
+            let target = view
+                .storages
+                .get("beta")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("fixture target storage missing"))?;
+            let submitted = view.request_transaction(
+                super::super::persistence_transactions::TransactionRequest::Move {
+                    row,
+                    target,
+                    requested: Box::new(requested),
+                    account_swap: false,
+                },
+            );
+            await_transaction_result(&mut view, submitted)
+        })()
+        .unwrap();
     }
 
     let reloaded =
@@ -2598,12 +2954,22 @@ fn archived_section_nests_by_project_in_project_mode() {
             .find(|i| i.title == "beta-error")
             .map(|i| i.id.clone())
             .unwrap();
-        env.view
-            .apply_user_action(&alpha_id, |inst| inst.archive())
-            .unwrap();
-        env.view
-            .apply_user_action(&beta_id, |inst| inst.archive())
-            .unwrap();
+        {
+            let submitted = env.view.apply_user_action(&alpha_id, |inst| inst.archive());
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        {
+            let submitted = env.view.apply_user_action(&beta_id, |inst| inst.archive());
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         env.view.archived_section_collapsed = false;
         env.view.flat_items = env.view.build_flat_items();
 
@@ -2715,12 +3081,22 @@ fn archived_section_nests_by_project_in_project_mode() {
             .unwrap();
         // Archive alpha first, then beta. archived_at is `Utc::now()` at the
         // moment of `archive()`, so beta is strictly more recent than alpha.
-        env.view
-            .apply_user_action(&alpha_id, |inst| inst.archive())
-            .unwrap();
-        env.view
-            .apply_user_action(&beta_id, |inst| inst.archive())
-            .unwrap();
+        {
+            let submitted = env.view.apply_user_action(&alpha_id, |inst| inst.archive());
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        {
+            let submitted = env.view.apply_user_action(&beta_id, |inst| inst.archive());
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         env.view.archived_section_collapsed = false;
 
         let first_sub_folder = |env: &TestEnv| -> Option<String> {
@@ -2783,12 +3159,22 @@ fn archived_section_nests_by_project_in_project_mode() {
             .find(|i| i.title == "beta-error")
             .map(|i| i.id.clone())
             .unwrap();
-        env.view
-            .apply_user_action(&alpha_id, |inst| inst.archive())
-            .unwrap();
-        env.view
-            .apply_user_action(&beta_id, |inst| inst.archive())
-            .unwrap();
+        {
+            let submitted = env.view.apply_user_action(&alpha_id, |inst| inst.archive());
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        {
+            let submitted = env.view.apply_user_action(&beta_id, |inst| inst.archive());
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         env.view.archived_section_collapsed = false;
         // Collapse only alpha's archived sub-folder.
         env.view
@@ -2837,9 +3223,14 @@ fn archived_section_nests_by_project_in_project_mode() {
             .find(|i| i.title == "alpha-running")
             .map(|i| i.id.clone())
             .unwrap();
-        env.view
-            .apply_user_action(&alpha_id, |inst| inst.archive())
-            .unwrap();
+        {
+            let submitted = env.view.apply_user_action(&alpha_id, |inst| inst.archive());
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         env.view.archived_section_collapsed = true;
         env.view.flat_items = env.view.build_flat_items();
 
@@ -3330,7 +3721,9 @@ fn trashed_row_healing_lands_through_the_reconcile_poller() {
 
     let mut applied = false;
     for _ in 0..100 {
-        if view.apply_reconcile_results() {
+        view.apply_reconcile_results();
+        drain_persistence(&mut view).unwrap();
+        if view.get_instance(&id).unwrap().project_path == holding.to_string_lossy() {
             applied = true;
             break;
         }
@@ -3370,10 +3763,9 @@ fn reconcile_reload_waits_for_live_send_to_finish() {
     );
 
     env.view.live_send = None;
-    assert!(
-        env.view.apply_reconcile_results(),
-        "the skipped verdict must still be waiting once live-send ends"
-    );
+    env.view.apply_reconcile_results();
+    drain_persistence(&mut env.view).unwrap();
+    assert!(!env.view.pending_reconcile_reload);
 }
 
 /// Startup auto-recovery launches from `project_path` and records each attempt in a
@@ -3554,7 +3946,9 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
 
     // The result is preserved, not dropped, and lands once the paste ends.
     view.live_send = None;
-    assert!(view.apply_reconcile_results());
+    view.apply_reconcile_results();
+    assert!(view.pending_reconcile_reload);
+    drain_persistence(&mut view).unwrap();
     assert_eq!(
         view.get_instance(&id).unwrap().project_path,
         "/tmp/repaired-path"
@@ -3608,10 +4002,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         std::fs::remove_file(&groups).ok();
         std::fs::create_dir(&groups).unwrap();
 
-        assert!(
-            !view.apply_reconcile_results(),
-            "the reload failed, so no refresh"
-        );
+        view.apply_reconcile_results();
+        assert!(drain_persistence(&mut view).is_err());
         assert!(
             view.startup_recovery_gate.is_some(),
             "a dropped repair must not open the gate onto stale rows"
@@ -3627,10 +4019,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         std::fs::remove_dir(&groups).unwrap();
         std::fs::write(&groups, "[]").unwrap();
         view.reconcile_reload_retry_at = Some(std::time::Instant::now());
-        assert!(
-            view.apply_reconcile_results(),
-            "the retry must land the repair"
-        );
+        view.apply_reconcile_results();
+        drain_persistence(&mut view).unwrap();
         assert_eq!(
             view.get_instance(&id).unwrap().project_path,
             "/tmp/repaired-path"
@@ -3667,7 +4057,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         std::fs::remove_file(&groups).ok();
         std::fs::create_dir(&groups).unwrap();
 
-        assert!(!view.apply_reconcile_results(), "the first attempt fails");
+        view.apply_reconcile_results();
+        assert!(drain_persistence(&mut view).is_err());
         let armed = view
             .reconcile_reload_retry_at
             .expect("a failed reload must arm the backoff");
@@ -3686,119 +4077,11 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
 
         // Once it elapses the retry lands.
         view.reconcile_reload_retry_at = Some(std::time::Instant::now());
-        assert!(view.apply_reconcile_results(), "the retry must land");
+        view.apply_reconcile_results();
+        drain_persistence(&mut view).unwrap();
         assert!(view.reconcile_reload_retry_at.is_none());
         assert!(!view.pending_reconcile_reload);
     }
-}
-
-/// #4116: TUI archive, single and group, persists while holding each session's lifecycle lock,
-/// which `aoe send` takes to relaunch or type, so no send lands between teardown and archive.
-#[test]
-#[serial]
-fn archive_persists_under_the_lifecycle_lock() {
-    fn held_at_every_write(env: &mut TestEnv, ids: Vec<String>, archive: fn(&mut HomeView)) {
-        let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let observed = std::rc::Rc::clone(&held);
-        let observer = crate::session::observe_updates_for_test(move |storage| {
-            observed.borrow_mut().push(
-                ids.iter()
-                    .all(|id| storage.instance_lifecycle_lock_is_held_for_test(id)),
-            );
-        });
-        archive(&mut env.view);
-        drop(observer);
-        let held = held.borrow();
-        assert!(!held.is_empty(), "the archive must persist");
-        assert!(held.iter().all(|h| *h), "writes and lock held: {held:?}");
-    }
-
-    let mut env = create_test_env_with_sessions(1);
-    env.view.cursor = 0;
-    env.view.update_selected();
-    let id = env.view.selected_session.clone().unwrap();
-    held_at_every_write(&mut env, vec![id.clone()], |view| {
-        view.toggle_archive_at_cursor().unwrap();
-    });
-    assert!(env.view.get_instance(&id).unwrap().is_archived());
-
-    let mut env = create_test_env_with_group_sessions();
-    let group_row = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
-        .expect("work group row");
-    env.view.cursor = group_row;
-    env.view.update_selected();
-    let ids = env.view.active_sessions_in_selected_group();
-    assert_eq!(ids.len(), 3);
-    held_at_every_write(&mut env, ids.clone(), |view| {
-        view.archive_selected_group().unwrap();
-    });
-    for id in &ids {
-        assert!(env.view.get_instance(id).unwrap().is_archived());
-    }
-}
-
-/// Group archive takes lifecycle locks in sorted id order, so against startup cleanup (which
-/// holds the lowest id and waits for the rest) it blocks holding nothing, whatever the stored
-/// order. The peer holds the lowest id and, once the archive contends on it, records whether
-/// the archive already holds a higher one.
-#[test]
-#[serial]
-fn group_archive_takes_lifecycle_locks_in_sorted_order() {
-    let mut env = create_test_env_with_group_sessions();
-    env.view.instances.sort_by(|a, _, b, _| b.cmp(a));
-    let group_row = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
-        .expect("work group row");
-    env.view.cursor = group_row;
-    env.view.update_selected();
-    let mut ids = env.view.active_sessions_in_selected_group();
-    assert!(ids.len() >= 2 && !ids.is_sorted(), "stored order: {ids:?}");
-    ids.sort();
-    let profile = env.view.get_instance(&ids[0]).unwrap().effective_profile();
-
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (contended_tx, contended_rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
-    let peer = std::thread::spawn(move || {
-        let storage = Storage::new_unwatched(&profile).unwrap();
-        let lowest = storage.acquire_instance_lifecycle_lock(&ids[0]).unwrap();
-        held_tx.send(()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let contended = loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            match contended_rx.recv_timeout(remaining) {
-                Ok(path) if path.to_string_lossy().contains(&ids[0]) => break true,
-                Ok(_) => continue,
-                Err(_) => break false,
-            }
-        };
-        let held_higher: Vec<String> = ids[1..]
-            .iter()
-            .filter(|id| storage.instance_lifecycle_lock_is_held_for_test(id))
-            .cloned()
-            .collect();
-        drop(lowest);
-        (contended, held_higher)
-    });
-    held_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap();
-    let observer = crate::session::observe_lock_contention_for_test(contended_tx);
-    env.view.archive_selected_group().unwrap();
-    drop(observer);
-
-    let (contended, held_higher) = peer.join().unwrap();
-    assert!(contended, "the archive must wait on the lowest id's lock");
-    assert!(
-        held_higher.is_empty(),
-        "archive held {held_higher:?} while waiting for a lower id"
-    );
 }
 
 /// #4116: the send dialog and live-send entry refuse an archived or trashed agent, even with its
@@ -3818,7 +4101,14 @@ fn tui_send_refuses_a_shelved_live_pane() {
         for live_send in [false, true] {
             let mut env = create_test_env_with_sessions(1);
             let inst = env.view.instance_at(0).clone();
-            env.view.apply_user_action(&inst.id, shelve).unwrap();
+            {
+                let submitted = env.view.apply_user_action(&inst.id, shelve);
+                await_transaction_result(
+                    &mut env.view,
+                    submitted.map(|_| super::super::TransactionDisposition::Queued),
+                )
+            }
+            .unwrap();
             let pane = crate::tmux::Session::generate_name(&inst.id, &inst.title);
             let created = crate::tmux::tmux_command()
                 .args(["new-session", "-d", "-s", &pane, "sleep", "60"])

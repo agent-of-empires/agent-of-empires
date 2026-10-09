@@ -4,67 +4,50 @@
 use super::*;
 
 impl HomeView {
-    /// Atomic per-action mutate: update memory once, then merge the user-owned
-    /// diff under the storage flock. Roll memory back if persistence fails.
-    pub(in crate::tui) fn apply_user_action<F>(&mut self, id: &str, mutate: F) -> anyhow::Result<()>
+    /// Stage a concrete field diff. The worker writes it and ACKs before any dependent continuation.
+    pub(in crate::tui) fn apply_user_action<F>(
+        &mut self,
+        id: &str,
+        mutate: F,
+    ) -> anyhow::Result<super::TransactionDisposition>
     where
         F: FnOnce(&mut Instance),
     {
-        let Some(profile) = self
-            .instances
-            .get(id)
-            .map(|instance| instance.source_profile.clone())
-        else {
-            return Ok(());
+        self.apply_user_action_after(
+            id,
+            mutate,
+            persistence_transactions::MetadataContinuation::None,
+        )
+    }
+    pub(super) fn apply_user_action_after<F>(
+        &mut self,
+        id: &str,
+        mutate: F,
+        after: persistence_transactions::MetadataContinuation,
+    ) -> anyhow::Result<super::TransactionDisposition>
+    where
+        F: FnOnce(&mut Instance),
+    {
+        let Some(before) = self.get_instance(id).cloned() else {
+            return Ok(super::TransactionDisposition::Ignored);
         };
-        let Some(in_memory) = self.instances.get_mut(id) else {
-            return Ok(());
-        };
-        let before = in_memory.clone();
-        mutate(in_memory);
-        let after = in_memory.clone();
-
-        let id_owned = id.to_string();
-        let result = if let Some(storage) = self.storages.get(&profile) {
-            storage.update(|instances, _groups| {
-                if let Some(disk) = instances
-                    .iter_mut()
-                    .find(|instance| instance.id == id_owned)
-                {
-                    disk.merge_user_action_diff(&before, &after);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            })
-        } else {
-            tracing::warn!(
-                target: "tui.home",
-                profile = %profile,
-                id = %id_owned,
-                "apply_user_action: no storage registered for profile; in-memory mutation will not persist"
-            );
-            Ok(true)
-        };
-        match result {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                let added = self
-                    .pending_added
-                    .get(&profile)
-                    .is_some_and(|pending| pending.contains(id));
-                if !added {
-                    self.drop_peer_deleted_rows(&[id.to_string()]);
-                }
-                Ok(())
-            }
-            Err(error) => {
-                if let Some(slot) = self.instances.get_mut(id) {
-                    *slot = before;
-                }
-                Err(error)
-            }
-        }
+        let row = persistence_transactions::RowCapture::capture(before.clone())?;
+        let save = self.capture_save_snapshot();
+        let mut edited = before;
+        mutate(&mut edited);
+        let revision = self.record_row_edit(&edited.source_profile, id);
+        self.instances.insert(id.to_owned(), edited.clone());
+        self.enqueue_transaction(
+            persistence_transactions::TransactionRequest::Metadata {
+                edits: vec![persistence_transactions::MetadataEdit {
+                    row,
+                    after: edited,
+                    revision,
+                }],
+                after,
+            },
+            save,
+        )
     }
 
     /// Clear the unread marker because the user engaged with the session (live-send, attach,
@@ -130,72 +113,44 @@ impl HomeView {
         false
     }
 
-    /// Bulk `apply_user_action`: one `Storage::update` per affected
-    /// profile (single flock cycle), grouping ids by `source_profile`.
+    /// Batch concrete row diffs; profile storage writes remain on the FIFO worker.
     pub(in crate::tui) fn bulk_apply_user_action<F>(
         &mut self,
         ids: &[String],
         mutate: F,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<super::TransactionDisposition>
     where
         F: Fn(&mut Instance),
     {
-        let mut by_profile: HashMap<String, Vec<(String, Instance, Instance)>> = HashMap::new();
+        let save = self.capture_save_snapshot();
+        let mut edits = Vec::with_capacity(ids.len());
         for id in ids {
-            let Some(inst) = self.instances.get_mut(id) else {
-                continue;
-            };
-            let pre = inst.clone();
-            mutate(inst);
-            let post = inst.clone();
-            by_profile
-                .entry(post.source_profile.clone())
-                .or_default()
-                .push((id.clone(), pre, post));
-        }
-        let mut peer_deleted: Vec<String> = Vec::new();
-        for (profile, items) in by_profile {
-            let Some(storage) = self.storages.get(&profile) else {
-                tracing::warn!(
-                    target: "tui.home",
-                    profile = %profile,
-                    count = items.len(),
-                    "bulk_apply_user_action: no storage registered for profile; in-memory mutations will not persist"
-                );
-                continue;
-            };
-            let added: HashSet<String> = self
-                .pending_added
-                .get(&profile)
-                .cloned()
-                .unwrap_or_default();
-            let res = storage.update(|insts, _groups| {
-                let mut missing: Vec<String> = Vec::new();
-                for (id, pre, post) in &items {
-                    if let Some(disk) = insts.iter_mut().find(|i| i.id == *id) {
-                        disk.merge_user_action_diff(pre, post);
-                    } else if !added.contains(id) {
-                        missing.push(id.clone());
-                    }
-                }
-                Ok(missing)
-            });
-            match res {
-                Ok(missing) => peer_deleted.extend(missing),
-                Err(e) => {
-                    for (id, pre, _post) in items {
-                        if let Some(slot) = self.instances.get_mut(&id) {
-                            *slot = pre;
-                        }
-                    }
-                    return Err(e);
-                }
+            if let Some(before) = self.get_instance(id).cloned() {
+                let row = persistence_transactions::RowCapture::capture(before.clone())?;
+                let mut after = before;
+                mutate(&mut after);
+                edits.push(persistence_transactions::MetadataEdit {
+                    row,
+                    after,
+                    revision: 0,
+                });
             }
         }
-        if !peer_deleted.is_empty() {
-            self.drop_peer_deleted_rows(&peer_deleted);
+        if edits.is_empty() {
+            return Ok(super::TransactionDisposition::Ignored);
         }
-        Ok(())
+        for edit in &mut edits {
+            edit.revision = self.record_row_edit(&edit.after.source_profile, &edit.after.id);
+            self.instances
+                .insert(edit.after.id.clone(), edit.after.clone());
+        }
+        self.enqueue_transaction(
+            persistence_transactions::TransactionRequest::Metadata {
+                edits,
+                after: persistence_transactions::MetadataContinuation::None,
+            },
+            save,
+        )
     }
 
     /// Like `mutate_instance` but fallible: applies `f` to a clone and writes back only on

@@ -10,13 +10,12 @@
 //!
 //! These spawn a real runner with `cat` as a trivial long-lived fake agent
 //! (it blocks reading stdin, which the runner keeps open). The runner is
-//! spawned WITHOUT `setsid` here (only the daemon sets that up in
-//! production), so it takes the non-group-leader fallback teardown path,
-//! which is safe under the test's own process group, and is exactly the
-//! path where the superseded-delete bug lived.
+//! spawned in its own process group, with its real birth durably published
+//! before authorization, just like the managed production runner.
 
+use crate::session::runner_journal::ManagedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// App data dir for the debug binary under this test's env. The runner sees
@@ -57,31 +56,37 @@ impl Drop for Scratch {
 
 /// Spawn a runner with `cat` as the fake agent and wait until it has
 /// written its registry record. Returns the child and the record path.
-fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -> (Child, PathBuf) {
+fn spawn_runner_and_wait_for_record(
+    home: &Path,
+    xdg: &Path,
+    session_id: &str,
+) -> (ManagedChild, PathBuf) {
     let workers = app_dir(home, xdg).join("acp-workers");
     let socket = workers.join(format!("{session_id}.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
-    let bin = env!("CARGO_BIN_EXE_aoe");
-    let mut child = Command::new(bin)
-        .args([
-            "__acp-runner",
-            "--socket",
-            socket.to_str().unwrap(),
-            "--session-id",
-            session_id,
-            "--agent-name",
-            "fake-agent",
-            "--cwd",
-            home.to_str().unwrap(),
-            "--",
-            "cat",
-        ])
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", xdg)
-        // Shrink the watchdog poll so an orphan dies in well under a second.
-        .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-        .spawn()
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(home, xdg, "main", session_id);
+    let mut child = launch
+        .spawn(
+            launch
+                .command()
+                .args([
+                    "--socket",
+                    socket.to_str().unwrap(),
+                    "--session-id",
+                    session_id,
+                    "--agent-name",
+                    "fake-agent",
+                    "--cwd",
+                    home.to_str().unwrap(),
+                    "--",
+                    "cat",
+                ])
+                .env("HOME", home)
+                .env("XDG_CONFIG_HOME", xdg)
+                // Shrink the watchdog poll so an orphan dies in well under a second.
+                .env("AOE_ACP_WATCHDOG_POLL_MS", "150"),
+        )
         .expect("spawn acp runner");
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -91,6 +96,7 @@ fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -
         }
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             panic!(
                 "runner never wrote its registry record at {}",
                 record.display()
@@ -102,7 +108,7 @@ fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -
 }
 
 /// Wait for `child` to exit within `secs`, killing + panicking otherwise.
-fn assert_exits_within(child: &mut Child, secs: u64, what: &str) {
+fn assert_exits_within(child: &mut ManagedChild, secs: u64, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         if child.try_wait().unwrap().is_some() {
@@ -110,6 +116,7 @@ fn assert_exits_within(child: &mut Child, secs: u64, what: &str) {
         }
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             panic!("{what}");
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -163,6 +170,12 @@ fn assert_pid_gone_within(pid: u32, secs: u64, what: &str) {
 #[test]
 #[serial_test::parallel]
 fn orphaned_runner_self_terminates_when_record_deleted() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(orphaned_runner_self_terminates_when_record_deleted),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -201,6 +214,12 @@ fn orphaned_runner_self_terminates_when_record_deleted() {
 #[test]
 #[serial_test::parallel]
 fn superseded_runner_exits_without_deleting_replacement_record() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(superseded_runner_exits_without_deleting_replacement_record),
+    ) {
+        return;
+    }
     if cfg!(not(unix)) {
         return;
     }
@@ -239,4 +258,109 @@ fn superseded_runner_exits_without_deleting_replacement_record() {
         record.exists(),
         "superseded runner deleted the replacement runner's registry record"
     );
+}
+
+#[test]
+#[serial_test::parallel]
+fn stale_trash_settlement_never_stops_replacement() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(stale_trash_settlement_never_stops_replacement),
+    ) {
+        return;
+    }
+    use crate::session::runner_journal::{settle, verify_published_runner, OwnedStop};
+    use crate::session::{Instance, LifecycleOperation, Storage, View};
+
+    let scratch = Scratch::new("stale-trash");
+    let (home, xdg) = (&scratch.0, &scratch.0);
+    let _env = super::environment::EnvGuard::new(&["HOME", "XDG_CONFIG_HOME"])
+        .and_set("HOME", home)
+        .and_set("XDG_CONFIG_HOME", xdg);
+    crate::session::get_app_dir().unwrap();
+    crate::migrations::run_migrations().unwrap();
+    let storage = Storage::new_unwatched("main").unwrap();
+    let mut row = Instance::new("replacement", home.to_str().unwrap());
+    row.view = View::Structured;
+    row.source_profile = "main".into();
+    let old_generation = row
+        .try_acquire_lifecycle_reservation(
+            LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    let id = row.id.clone();
+    storage
+        .update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })
+        .unwrap();
+    let old_stop =
+        OwnedStop::from_claim(&storage, &row, LifecycleOperation::Trash, old_generation).unwrap();
+    storage
+        .update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            assert!(
+                row.release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Trash,
+                    old_generation,
+                )
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let launch = super::runner_fixture::RunnerLaunchFixture::new(home, xdg, "main", &id);
+    let workers = app_dir(home, xdg).join("acp-workers");
+    let socket = workers.join(format!("{id}.sock"));
+    let record = workers.join(format!("{id}.json"));
+    let mut child = launch
+        .spawn(launch.command().args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--session-id",
+            &id,
+            "--agent-name",
+            "fake-agent",
+            "--cwd",
+            home.to_str().unwrap(),
+            "--",
+            "cat",
+        ]))
+        .unwrap();
+    let agent_pid = agent_pid_of(child.id());
+    assert!(pid_alive(agent_pid));
+    let generation = launch.produced_origin().generation();
+    verify_published_runner(
+        launch.original_storage(),
+        &id,
+        launch.nonce,
+        child.id(),
+        generation,
+    )
+    .unwrap();
+    let sessions_before = std::fs::read(storage.sessions_path()).unwrap();
+    let registry_before = std::fs::read(&record).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(runtime.block_on(settle(old_stop)).is_err());
+    assert_eq!(
+        std::fs::read(storage.sessions_path()).unwrap(),
+        sessions_before
+    );
+    assert_eq!(std::fs::read(&record).unwrap(), registry_before);
+    let retained = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(retained.lifecycle_generation > old_generation);
+
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(pid_alive(agent_pid));
 }

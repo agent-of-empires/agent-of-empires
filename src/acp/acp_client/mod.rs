@@ -94,7 +94,7 @@ pub struct AcpClient {
     /// Kills an in-proc agent when the client drops.
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
     /// The detached runner this client launched, which its lease owns.
-    runner_pid: Option<u32>,
+    runner_identity: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
     pub(crate) native_store: Option<crate::session::ExecutionBinding>,
 }
 
@@ -205,7 +205,7 @@ impl Launch {
             cmd_tx: Some(cmd_tx),
             pending_responders,
             _child: child,
-            runner_pid: None,
+            runner_identity: None,
             native_store: None,
         };
         (client, ready_rx)
@@ -224,7 +224,7 @@ impl AcpClient {
             cmd_tx,
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
-            runner_pid: None,
+            runner_identity: None,
             native_store: None,
         };
         (client, event_tx)
@@ -260,15 +260,25 @@ impl AcpClient {
             .expect("recorder acknowledgement");
     }
 
-    /// Attached and stdio clients have none.
+    /// Runner execution captured by this client, if any.
     pub fn runner_pid(&self) -> Option<u32> {
-        self.runner_pid
+        self.runner_identity.map(|identity| identity.pid)
     }
 
-    #[cfg(test)]
-    pub fn with_runner_pid(mut self, pid: u32) -> Self {
-        self.runner_pid = Some(pid);
-        self
+    pub fn launch_nonce(&self) -> Option<uuid::Uuid> {
+        self.runner_identity
+            .and_then(|identity| identity.launch_nonce)
+    }
+
+    pub(crate) fn runner_identity(&self) -> Option<crate::acp::runner_lifecycle::RunnerIdentity> {
+        self.runner_identity
+    }
+
+    pub(crate) fn capture_runner(
+        &mut self,
+        identity: crate::acp::runner_lifecycle::RunnerIdentity,
+    ) {
+        self.runner_identity = Some(identity);
     }
 
     /// A client that spawns nothing, for structured view state tests.
@@ -406,15 +416,44 @@ impl AcpClient {
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
-            // A fresh spawn overwrites the registry entry, so reap any prior
-            // runner's process group first or its children leak (#1689).
-            crate::process::worker_registry::terminate_and_wait(&session_id.0).await;
             let runner_sandbox = sandbox.as_ref().map(|(handle, _)| handle);
-            let (runner_pid, native_store) =
-                spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
-            let mut client = Self::connect_via_socket(socket_path, launch(sandbox)).await?;
-            client.runner_pid = Some(runner_pid);
-            client.native_store = native_store;
+            let mut issued =
+                spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
+                    .await?;
+            let admission = config
+                .execution_admission
+                .as_ref()
+                .expect("detached spawn validated its original admission");
+            let connected = tokio::select! {
+                result = Self::connect_via_socket(socket_path, launch(sandbox), issued.nonce) => result,
+                _ = admission.cancelled() => Err(AcpError::Spawn("native launch admission was cancelled".into())),
+            };
+            let mut client = match connected {
+                Ok(client) => client,
+                Err(error) => {
+                    let identity = issued.identity;
+                    let settled = match issued.retire().await {
+                        Ok(()) => true,
+                        Err(unproven) => {
+                            tracing::warn!(target: "acp", nonce = %issued.nonce, "failed launch remains protected: {unproven:#}");
+                            false
+                        }
+                    };
+                    return Err(AcpError::IssuedExecution {
+                        identity,
+                        launch_nonce: issued.nonce,
+                        settled,
+                        source: Box::new(error),
+                    });
+                }
+            };
+            client.capture_runner(
+                issued
+                    .identity
+                    .expect("successful detached spawn has a captured birth"),
+            );
+            client.native_store = issued.native_store.take();
+            issued.commit();
             return Ok(client);
         }
 
@@ -441,7 +480,11 @@ impl AcpClient {
     /// Dial a runner's control socket, which carries the whole transport
     /// (#2977). The runner owns the agent, so dropping this client leaves the
     /// worker running.
-    async fn connect_via_socket(socket_path: PathBuf, launch: Launch) -> Result<Self, AcpError> {
+    async fn connect_via_socket(
+        socket_path: PathBuf,
+        launch: Launch,
+        expected_nonce: uuid::Uuid,
+    ) -> Result<Self, AcpError> {
         let control_path = crate::process::worker::control_socket_sibling(&socket_path);
         // Debug-only #1890 hook: fail a fresh handshake after the runner is up.
         #[cfg(debug_assertions)]
@@ -470,6 +513,7 @@ impl AcpClient {
             label.clone(),
             terminal_claim.clone(),
             prompt_in_flight.clone(),
+            expected_nonce,
         )
         .await
         .map_err(|error| {
@@ -510,6 +554,7 @@ impl AcpClient {
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
         source_profile: Option<String>,
+        launch_nonce: uuid::Uuid,
     ) -> Result<Self, AcpError> {
         // The binary name keeps the compatibility gate active on reattach; an
         // unknown agent maps to `Other` anyway.
@@ -536,7 +581,7 @@ impl AcpClient {
             default_model: None,
             mcp_servers: Vec::new(),
         };
-        Self::connect_via_socket(socket_path, launch).await
+        Self::connect_via_socket(socket_path, launch, launch_nonce).await
     }
 
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), AcpError> {

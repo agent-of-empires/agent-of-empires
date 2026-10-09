@@ -95,6 +95,18 @@ impl Instance {
         self.start_with_size_opts(size, false).map(|_| ())
     }
 
+    /// Retain the actual reservation ACK as well as this start's final emission.
+    pub(crate) fn start_acknowledged(
+        &mut self,
+    ) -> Result<(
+        Option<std::sync::Arc<crate::session::LaunchOrigin>>,
+        std::sync::Arc<crate::session::LaunchOrigin>,
+    )> {
+        let mut reserved = None;
+        let _sid_outcome = self.start_with_size_opts_owned(None, false, Some(&mut reserved))?;
+        Ok((reserved, crate::session::LaunchOrigin::capture(self)?))
+    }
+
     /// Start the session, optionally skipping on_launch hooks (e.g. when they
     /// already ran in the background creation poller).
     pub fn start_with_size_opts(
@@ -102,21 +114,43 @@ impl Instance {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) -> Result<LaunchSidOutcome> {
+        self.start_with_size_opts_owned(size, skip_on_launch, None)
+    }
+
+    fn start_with_size_opts_owned(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        acknowledgement: Option<&mut Option<std::sync::Arc<crate::session::LaunchOrigin>>>,
+    ) -> Result<LaunchSidOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
+        let storage = match &self.storage_origin {
+            Some(storage) => storage.clone(),
+            None => {
+                let storage = std::sync::Arc::new(
+                    crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
+                        .context("failed to open lifecycle lock storage")?,
+                );
+                self.storage_origin = Some(storage.clone());
+                storage
+            }
+        };
+        storage.verify_profile_identity()?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
             .context("failed to acquire instance launch title lock")?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
-        self.reconcile_from_disk();
+        anyhow::ensure!(
+            self.try_reconcile_from_disk(true)?,
+            "session disappeared before native launch"
+        );
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
@@ -134,6 +168,7 @@ impl Instance {
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
+            acknowledgement,
         )?;
 
         // The durable reservation excludes peer launches while user hooks run. Both flocks must be
@@ -554,23 +589,27 @@ impl Instance {
 
         // Apply status bar options in a background thread to avoid blocking
         // the TUI on the multiple tmux subprocess calls they require.
-        let session_name = session_name.to_string();
+        let storage = self.original_storage()?;
+        let tmux_session = crate::tmux::Session::from_name(session_name);
+        tmux_session.primary_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
         let instance_id_for_log = self.id.clone();
-        let title = self.title.clone();
-        let branch = self.worktree_info.as_ref().map(|w| w.branch.clone());
-        let sandbox = self.sandbox_display();
-        let options_profile = profile.to_string();
+        let generation = self.lifecycle_generation;
+        let execution = self.active_execution.clone();
         match std::thread::Builder::new()
             .name(format!("finalize-tmux-{}", instance_id_for_log))
             .spawn(move || {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::tmux::status_bar::apply_all_tmux_options(
-                        &session_name,
-                        &title,
-                        branch.as_deref(),
-                        sandbox.as_ref(),
-                        &options_profile,
-                    );
+                    if let Err(error) = crate::session::runner_journal::with_current_execution_row(
+                        &storage, &instance_id_for_log, generation, execution.as_ref(), |current| {
+                            let branch = current.worktree_info.as_ref().map(|worktree| worktree.branch.as_str())
+                                .or_else(|| current.workspace_info.as_ref().map(|workspace| workspace.branch.as_str()));
+                            let sandbox = current.sandbox_display();
+                            crate::tmux::status_bar::apply_all_tmux_options(
+                                &tmux_session, &current.title, branch, sandbox.as_ref(), storage.profile());
+                            Ok(())
+                        }) {
+                        tracing::debug!(target: "session.store", %error, "discarding stale deferred tmux options");
+                    }
                 })) {
                     tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
                 }
@@ -579,7 +618,7 @@ impl Instance {
             Ok(_handle) => {}
             Err(e) => {
                 tracing::error!(target: "session.store",
-                    session = %instance_id_for_log,
+                    session = %self.id,
                     error = %e,
                     "Failed to spawn finalize-tmux thread"
                 );
@@ -694,7 +733,9 @@ mod tests {
                 let profile = "start-blocked";
                 let mut inst = Instance::new(label, "/tmp/x");
                 inst.source_profile = profile.to_string();
-                crate::session::instance::test_helpers::seed_disk_for_sidecar_test(profile, &inst);
+                crate::session::instance::test_helpers::seed_disk_for_sidecar_test(
+                    profile, &mut inst,
+                );
                 crate::session::storage::Storage::new_unwatched(profile)
                     .unwrap()
                     .update(|rows, _| {

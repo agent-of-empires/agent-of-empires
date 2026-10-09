@@ -24,15 +24,35 @@ fn test_uppercase_p_picker_switch_profile() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    view.handle_key(key(KeyCode::Char('P')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('P')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(view.profile_picker_dialog.is_some());
-    view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(view.profile_picker_dialog.is_none());
 
-    view.handle_key(key(KeyCode::Char('P')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('P')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     // The active profile is selected; a trailing entry prevents end-of-list clamping.
-    view.handle_key(key(KeyCode::Down), None);
-    let action = view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
+    let action = {
+        let result = view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert_eq!(action, None);
     assert_eq!(view.active_profile, Some("second".to_string()));
     assert!(view.profile_picker_dialog.is_none());
@@ -51,7 +71,11 @@ fn test_has_dialog_includes_overlays() {
     assert!(view.has_dialog(), "info dialog");
     view.info_dialog = None;
 
-    view.handle_key(key(KeyCode::Char('s')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('s')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(view.settings_view.is_some(), "`s` opens settings");
     assert!(view.has_dialog(), "settings view");
 }
@@ -65,10 +89,11 @@ fn test_terminal_view_keys() {
     {
         let mut empty = create_test_env_empty();
         assert!(
-            empty
-                .view
-                .handle_key(key(KeyCode::Char('T')), None)
-                .is_none(),
+            {
+                let result = empty.view.handle_key(key(KeyCode::Char('T')), None);
+                drain_persistence(&mut empty.view).unwrap();
+                result.is_none()
+            },
             "Shift+T with no sessions is a no-op"
         );
     }
@@ -76,27 +101,55 @@ fn test_terminal_view_keys() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
     assert_eq!(view.view_mode, ViewMode::Structured);
-    let action = view.handle_key(key(KeyCode::Enter), None);
+    let action = {
+        let result = view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(matches!(action, Some(Action::AttachSession(_))));
-    let action = view.handle_key(key(KeyCode::Char('T')), None);
+    let action = {
+        let result = view.handle_key(key(KeyCode::Char('T')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
     assert_eq!(view.view_mode, ViewMode::Structured);
 
-    view.handle_key(key(KeyCode::Char('t')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('t')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert_eq!(view.view_mode, ViewMode::Terminal);
-    let action = view.handle_key(key(KeyCode::Char('T')), None);
+    let action = {
+        let result = view.handle_key(key(KeyCode::Char('T')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
     assert_eq!(view.view_mode, ViewMode::Terminal);
-    let action = view.handle_key(key(KeyCode::Enter), None);
+    let action = {
+        let result = view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
 
     assert!(view.info_dialog.is_none());
-    view.handle_key(key(KeyCode::Char('d')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('d')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(view.info_dialog.is_some());
     assert!(view.unified_delete_dialog.is_none());
     view.info_dialog = None;
 
-    view.handle_key(key(KeyCode::Char('t')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('t')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert_eq!(view.view_mode, ViewMode::Structured);
 }
 
@@ -116,7 +169,11 @@ fn switching_view_retargets_capture_worker_pane() {
         "a selected session must resolve a pane"
     );
 
-    view.handle_key(key(KeyCode::Char('t')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('t')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert_eq!(view.view_mode, ViewMode::Terminal);
     let terminal_pane = view.displayed_pane_tmux_name();
     assert!(terminal_pane.is_some());
@@ -189,7 +246,10 @@ fn group_header_count_tracks_trash_and_restore() {
         .map(|i| i.id.clone())
         .expect("a direct work session");
 
-    env.view.trash_session_by_id(&target);
+    {
+        env.view.trash_session_by_id(&target);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert_eq!(
         work_count(&env),
         2,
@@ -197,7 +257,17 @@ fn group_header_count_tracks_trash_and_restore() {
     );
 
     env.view.select_session_by_id(&target);
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        {
+            let submitted = env.view.toggle_archive_at_cursor();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     assert_eq!(work_count(&env), 3, "restored session returns to the count");
 }
 
@@ -257,7 +327,14 @@ fn test_delete_selected_group_updates_groups_field() {
         .group_exists("work"));
 
     // Delete the group (this moves sessions to default)
-    env.view.delete_selected_group().unwrap();
+    {
+        let submitted = env.view.delete_selected_group();
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
 
     // Verify the group is removed from group_tree
     assert!(!env
@@ -274,7 +351,11 @@ fn test_delete_selected_group_updates_groups_field() {
     assert!(!group_paths.contains(&"work/projects"));
 
     // A reload from storage agrees with the in-memory tree.
-    env.view.reload().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
     let reloaded_groups: Vec<_> = env
         .view
         .all_groups()
@@ -293,8 +374,52 @@ fn test_delete_selected_group_updates_groups_field() {
     assert_eq!(reloaded_groups, tree_groups);
 }
 
-/// Archiving a manual group archives every session under it, including
-/// nested subgroups, and leaves sessions outside the group untouched.
+#[test]
+#[serial]
+fn group_archive_refuses_before_queuing_any_new_member() {
+    let mut env = create_test_env_with_group_sessions();
+    env.view.cursor = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .unwrap();
+    env.view.update_selected();
+    let mut members = env.view.active_sessions_in_selected_group();
+    members.sort();
+    let pending = members.last().unwrap().clone();
+    let origin =
+        crate::tui::home::RequestOrigin::capture(env.view.get_instance(&pending).unwrap()).unwrap();
+    env.view
+        .settlement_in_flight
+        .insert(pending.clone(), origin);
+    let storage = Storage::open_unwatched("test").unwrap();
+    let before = serde_json::to_value(storage.load().unwrap()).unwrap();
+
+    assert!({
+        let submitted = env.view.archive_selected_group();
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .is_err());
+
+    for member in members {
+        let instance = env.view.get_instance(&member).unwrap();
+        assert!(!instance.is_archived());
+        assert_eq!(
+            env.view.settlement_in_flight.contains_key(&member),
+            member == pending
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(storage.load().unwrap()).unwrap(),
+        before
+    );
+}
+
+/// Archiving a manual group includes nested members but not unrelated sessions.
 #[test]
 #[serial]
 fn test_archive_selected_group_archives_all_members() {
@@ -315,7 +440,17 @@ fn test_archive_selected_group_archives_all_members() {
     // "work" holds two direct sessions plus one in the nested "work/projects".
     assert_eq!(env.view.active_sessions_in_selected_group().len(), 3);
 
-    env.view.archive_selected_group().unwrap();
+    {
+        {
+            let submitted = env.view.archive_selected_group();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
 
     for inst in env.view.instances() {
         let in_work = inst.group_path == "work" || inst.group_path.starts_with("work/");
@@ -325,50 +460,6 @@ fn test_archive_selected_group_archives_all_members() {
             "session {} (group {:?}) archived state should match group membership",
             inst.title,
             inst.group_path
-        );
-    }
-}
-
-/// Locks #1868: bulk archive persists synchronously even though tmux teardown runs
-/// off-thread. Real tmux state is asserted in `tests/e2e/archive_restore.rs`.
-#[test]
-#[serial]
-fn test_archive_selected_group_widened_teardown_persists_synchronously() {
-    let mut env = create_test_env_with_group_sessions();
-
-    for (i, item) in env.view.flat_items.iter().enumerate() {
-        if let Item::Group { path, .. } = item {
-            if path == "work" {
-                env.view.cursor = i;
-                env.view.update_selected();
-                break;
-            }
-        }
-    }
-    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-    let work_ids: Vec<String> = env.view.active_sessions_in_selected_group();
-    assert_eq!(work_ids.len(), 3);
-
-    let result = env.view.archive_selected_group();
-    assert!(
-        result.is_ok(),
-        "archive_selected_group must return Ok even when the off-thread \
-         teardown is fire-and-forget; got {:?}",
-        result
-    );
-
-    for id in &work_ids {
-        let inst = env
-            .view
-            .instances()
-            .find(|i| &i.id == id)
-            .expect("group member must still exist after archive");
-        assert!(
-            inst.is_archived(),
-            "session {} ({}) must have archived_at set synchronously \
-             on the input thread before archive_selected_group returns",
-            inst.title,
-            id
         );
     }
 }
@@ -418,7 +509,17 @@ fn test_archive_selected_group_project_mode() {
     assert_eq!(view.selected_group.as_deref(), Some("alpha"));
     assert_eq!(view.active_sessions_in_selected_group().len(), 2);
 
-    view.archive_selected_group().unwrap();
+    {
+        {
+            let submitted = view.archive_selected_group();
+            await_transaction_result(
+                &mut view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        finish_runner_settlements(&mut view);
+    };
 
     for inst in view.instances() {
         let in_alpha = inst.project_path == "/tmp/alpha";
@@ -457,7 +558,17 @@ fn test_prompt_archive_selected_group() {
 
     // Confirm, which archives the group and clears the prompt.
     env.view.confirm_dialog = None;
-    env.view.archive_selected_group().unwrap();
+    {
+        {
+            let submitted = env.view.archive_selected_group();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
 
     // With every member archived, a second prompt is a silent no-op.
     env.view.prompt_archive_selected_group();
@@ -466,7 +577,7 @@ fn test_prompt_archive_selected_group() {
 
 #[test]
 #[serial]
-fn test_delete_group_with_sessions_updates_groups_field() {
+fn busy_hidden_member_refuses_group_delete_without_any_metadata_write() {
     use crate::tui::dialogs::GroupDeleteOptions;
 
     let temp = TempDir::new().unwrap();
@@ -484,6 +595,8 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now(),
+        path_claims: crate::session::WorktreePathClaims::None,
+        custodian: None,
     });
     storage
         .update(|instances, groups| {
@@ -535,6 +648,8 @@ fn test_delete_group_with_sessions_updates_groups_field() {
     assert_eq!(view.selected_group.as_deref(), Some("work"));
     assert_eq!(view.selected_group_profile.as_deref(), Some("test"));
 
+    let before = std::fs::read(storage.sessions_path()).unwrap();
+    let other_before = std::fs::read(other_storage.sessions_path()).unwrap();
     let options = GroupDeleteOptions {
         delete_sessions: true,
         delete_worktrees: false,
@@ -542,79 +657,30 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         delete_containers: false,
         force_delete_worktrees: false,
     };
-    view.delete_group_with_sessions(&options).unwrap();
-    view.save().unwrap();
-    let during_delete = storage.load().unwrap();
-    assert_eq!(during_delete.len(), 1);
-    assert_ne!(
-        during_delete[0].status,
-        Status::Deleting,
-        "save persisted the transient Deleting status"
-    );
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !view.apply_deletion_results() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    {
+        let submitted = view.delete_group_with_sessions(&options);
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
     }
-    assert!(
-        view.info_dialog.is_some(),
-        "busy purge result was not delivered"
-    );
-
-    let persisted = storage.load().unwrap();
-    assert_eq!(persisted.len(), 1);
-    assert!(persisted[0].group_path.is_empty());
-    assert_ne!(persisted[0].status, Status::Deleting);
-    storage
-        .update(|instances, _| {
-            instances.clear();
-            Ok(())
-        })
-        .unwrap();
-
-    view.reload().unwrap();
-    let tree = view.group_trees.get("test").unwrap();
-    assert!(!tree.group_exists("work"));
-    assert!(!tree.group_exists("work/projects"));
-    assert!(tree.group_exists("workbench"), "near-prefix group removed");
-
-    let (_, groups) = storage.load_with_groups().unwrap();
-    assert!(!groups
-        .iter()
-        .any(|group| group.path == "work" || group.path.starts_with("work/")));
-    assert!(groups.iter().any(|group| group.path == "workbench"));
-    let (_, other_groups) = other_storage.load_with_groups().unwrap();
-    assert!(other_groups.iter().any(|group| group.path == "work"));
-    assert!(other_groups
-        .iter()
-        .any(|group| group.path == "work/projects"));
-    let mut creating = Instance::new("creating-member", "/tmp/creating");
-    creating.source_profile = "test".to_string();
-    creating.group_path = "creating".to_string();
-    creating.status = Status::Creating;
-    let creating_id = creating.id.clone();
-    view.add_instance(creating);
-    view.rebuild_group_trees();
-    view.selected_group = Some("creating".to_string());
-    view.selected_group_profile = Some("test".to_string());
-    view.info_dialog = None;
-
-    view.delete_group_with_sessions(&options).unwrap();
-    assert_eq!(view.selected_group.as_deref(), Some("creating"));
+    .unwrap_err();
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
+    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
     assert_eq!(
-        view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Creation in progress")
+        std::fs::read(other_storage.sessions_path()).unwrap(),
+        other_before
     );
-
-    view.mutate_instance(&creating_id, |instance| {
-        instance.status = Status::Deleting;
-    });
-    view.save().unwrap();
-    assert!(!storage
-        .load()
-        .unwrap()
-        .iter()
-        .any(|instance| instance.id == creating_id));
+    let persisted = storage.load().unwrap();
+    assert_eq!(persisted[0].group_path, "work/projects");
+    assert_eq!(persisted[0].lifecycle_generation, 1);
+    assert!(view.group_trees["test"].group_exists("work"));
+    assert!(view.group_trees["test"].group_exists("work/projects"));
+    assert!(view.group_trees["test"].group_exists("workbench"));
 }
 
 #[test]
@@ -640,7 +706,11 @@ fn test_group_collapsed_state_persists_across_reload() {
 
     env.view.cursor = group_idx;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(*collapsed, "group should be collapsed after Enter");
     }
@@ -665,7 +735,11 @@ fn test_group_collapsed_state_persists_across_reload() {
     );
 
     // Reload (simulates the periodic refresh); the group index may change.
-    env.view.reload().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
     let still_collapsed = env.view.flat_items.iter().find_map(|item| match item {
         Item::Group {
             path, collapsed, ..
@@ -723,7 +797,11 @@ fn test_derived_group_collapsed_state_persists_to_config() {
         // Enter routes through toggle_group_collapsed, which persists.
         env.view.cursor = group_idx;
         env.view.update_selected();
-        env.view.handle_key(key(KeyCode::Enter), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Enter), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert!(
             saved_paths().contains(&group_path),
             "{mode:?}: the collapsed folder path should be persisted to app_state"
@@ -785,10 +863,22 @@ fn test_list_width_steps_and_clamps() {
         let mut env = create_test_env_empty();
         env.view.sidebar_position = position;
         assert_eq!(env.view.list_width, 35);
-        env.view.handle_key(key(KeyCode::Char('<')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('<')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(env.view.list_width, after_left, "{position:?}: `<`");
-        env.view.handle_key(key(KeyCode::Char('>')), None);
-        env.view.handle_key(key(KeyCode::Char('>')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('>')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('>')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(env.view.list_width, after_right, "{position:?}: `>`");
     }
 
@@ -833,7 +923,11 @@ fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
     assert!(env.view.has_non_live_send_overlay());
 
     // Esc closes without attaching.
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.attach_project_dialog.is_none());
     assert!(!env.view.has_dialog());
     assert!(!env.view.has_non_live_send_overlay());
@@ -923,8 +1017,8 @@ fn add_project_dispatches_to_the_poller_and_refuses_a_second_attach() {
         .add_project_to_session(&id, std::path::Path::new("/tmp/some-repo"));
     assert!(dispatched.is_ok(), "dispatch must not block on the attach");
     assert!(
-        env.view.attach_project_in_flight.contains(&id),
-        "the in-flight marker is what suppresses a concurrent attach"
+        env.view.transaction_is_pending(&id) && !env.view.attach_project_in_flight.contains_key(&id),
+        "the queued original transaction suppresses concurrent attach before any native in-flight marker"
     );
     assert!(
         env.view
@@ -953,7 +1047,10 @@ fn apply_attach_project_results_reports_and_clears_the_marker() {
         let expect_ok = outcome.is_ok();
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
-        env.view.attach_project_in_flight.insert(id.clone());
+        env.view.attach_project_in_flight.insert(
+            id.clone(),
+            super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+        );
         env.view.attach_project_poller =
             crate::tui::attach_project_poller::AttachProjectPoller::with_result_for_test(
                 crate::tui::attach_project_poller::AttachProjectResult {
@@ -966,8 +1063,15 @@ fn apply_attach_project_results_reports_and_clears_the_marker() {
             env.view.apply_attach_project_results(),
             "a delivered result has to repaint"
         );
+        if expect_ok {
+            assert!(
+                env.view.attach_project_in_flight.contains_key(&id),
+                "native result is not a reload ACK"
+            );
+        }
+        drain_persistence(&mut env.view).unwrap();
         assert!(
-            !env.view.attach_project_in_flight.contains(&id),
+            !env.view.attach_project_in_flight.contains_key(&id),
             "the marker must clear, or the session stays unattachable forever"
         );
         let dialog = env
@@ -1003,31 +1107,62 @@ fn test_shift_o_opens_sort_picker_in_strict_mode() {
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 
     // Shift+O: opens the sort picker.
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.sort_picker_dialog.is_some());
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     // Some terminals drop the SHIFT modifier and send bare uppercase. Cover
     // that too.
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::NONE), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::NONE), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.sort_picker_dialog.is_some());
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     // Ctrl+o also opens the picker in strict mode.
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.sort_picker_dialog.is_some());
-    env.view.handle_key(key(KeyCode::Esc), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Esc), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     // Plain lowercase 'o' must not cycle sort in strict mode: it falls through to the
     // typing-guard per the "no destructive lowercase" rule. A single unguarded
     // `Char('o') => cycle` arm silently changed the sort whenever the user typed it as text.
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(env.view.sort_picker_dialog.is_none());
 
     // Sort order is unchanged because no selection was confirmed.
@@ -1058,7 +1193,11 @@ fn test_strict_mode_h_collapses_group() {
     env.view.cursor = group_idx;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('h')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('h')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(
@@ -1096,7 +1235,11 @@ fn test_non_strict_h_snoozes_only_in_attention_sort() {
         .expect("setup should produce a session in Attention sort");
     env.view.cursor = session_idx;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Char('h')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('h')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.snooze_duration_dialog.is_some(),
         "`h` in Attention sort must open the snooze duration dialog"
@@ -1118,7 +1261,11 @@ fn test_non_strict_h_snoozes_only_in_attention_sort() {
         .expect("setup should produce a group in Newest sort");
     env.view.cursor = group_idx;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Char('h')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('h')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(
             *collapsed,
@@ -1139,7 +1286,11 @@ fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
     env.view.cursor = running;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('w')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('w')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.snooze_duration_dialog.is_none(),
@@ -1165,7 +1316,11 @@ fn test_non_strict_w_on_running_jumps_to_idle_in_attention_sort() {
     env.view.cursor = running;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('w')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('w')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.snooze_duration_dialog.is_none(),
@@ -1224,7 +1379,11 @@ fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
 
     let mut visited = Vec::new();
     for _ in 0..expected.len() {
-        env.view.handle_key(key(KeyCode::Char('w')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('w')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         visited.push(
             env.view
                 .selected_session
@@ -1291,7 +1450,11 @@ fn test_non_strict_w_on_collapsed_project_group_reveals_idle_in_attention_sort()
     view.cursor = alpha_group;
     view.update_selected();
 
-    view.handle_key(key(KeyCode::Char('w')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('w')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
 
     assert!(
         view.snooze_duration_dialog.is_none(),
@@ -1317,10 +1480,14 @@ fn test_strict_mode_ctrl_g_opens_group_picker() {
     env.view.strict_hotkeys = true;
     env.view.group_by = GroupByMode::Manual;
 
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.group_picker_dialog.is_some(),
         "Ctrl+G in strict mode should open the group picker"
@@ -1330,11 +1497,23 @@ fn test_strict_mode_ctrl_g_opens_group_picker() {
         "Ctrl+G must not leak into the typing-guard catch-all"
     );
     // Down + Enter switches to Project.
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(env.view.group_by, GroupByMode::Project);
 
-    env.view.handle_key(key(KeyCode::Char('g')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('g')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.group_picker_dialog.is_none(),
         "bare 'g' in strict mode must NOT open the group picker (typing-guard contract)"
@@ -1364,25 +1543,38 @@ fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
 
     // Shift+T toggles the view (primary action), no terminal attach.
     assert_eq!(env.view.view_mode, ViewMode::Structured);
-    let shift_t = env
-        .view
-        .handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), None);
+    let shift_t = {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(env.view.view_mode, ViewMode::Terminal);
     assert!(
         !matches!(shift_t, Some(Action::AttachTerminal(_, _))),
         "Shift+T must toggle view, not attach terminal"
     );
     // Reset to Structured view.
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(env.view.view_mode, ViewMode::Structured);
 
     // Ctrl+T quick-attaches the paired terminal (secondary action) and must
     // NOT toggle the view.
-    let ctrl_t = env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
-        None,
-    );
+    let ctrl_t = {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         matches!(ctrl_t, Some(Action::AttachTerminal(_, _))),
         "Ctrl+T in strict mode must quick-attach the paired terminal"
@@ -1395,8 +1587,13 @@ fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
 
     // Shift+N opens the plain new-session dialog (no prefill from selection).
     assert!(env.view.new_dialog.is_none());
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.new_dialog.is_some(),
         "Shift+N must open the new-session dialog"
@@ -1406,10 +1603,14 @@ fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
     // Ctrl+N opens the new-from-selection dialog. It also routes through
     // open_new_session_dialog, so the dialog opening with CTRL intact is what proves the
     // secondary arm fired.
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.new_dialog.is_some(),
         "Ctrl+N in strict mode must open the new-from-selection dialog"
@@ -1430,8 +1631,13 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
 
     // Shift+D opens the delete confirmation (primary uppercase action).
     assert!(env.view.unified_delete_dialog.is_none());
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.unified_delete_dialog.is_some(),
         "Shift+D must open the delete dialog"
@@ -1441,10 +1647,14 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     // Ctrl+D routes to diff, not delete. The test session's path is not a real worktree, so
     // the diff view may fail to open or open empty; either way Ctrl+D must never reach
     // open_delete_for_selected. Clear any takeover it leaves so the next keypress lands.
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.unified_delete_dialog.is_none(),
         "Ctrl+D in strict mode must NOT open the delete dialog (it targets diff)"
@@ -1454,8 +1664,13 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
 
     // Shift+R opens the rename dialog (primary uppercase action).
     assert!(env.view.rename_dialog.is_none());
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.rename_dialog.is_some(),
         "Shift+R must open the rename dialog"
@@ -1463,10 +1678,14 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     env.view.rename_dialog = None;
 
     // Ctrl+R routes to the serve arm, NOT rename.
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.rename_dialog.is_none(),
         "Ctrl+R in strict mode must NOT open the rename dialog (it targets serve)"
@@ -1477,8 +1696,13 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     // P follows the same relocation rule as D/R/T/N, so in strict mode Shift+P opens
     // projects and Ctrl+P opens profiles.
     assert!(env.view.projects_dialog.is_none());
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.projects_dialog.is_some(),
         "Shift+P in strict mode must open the projects dialog"
@@ -1491,10 +1715,14 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
 
     // Ctrl+P opens the profile picker, NOT projects.
     assert!(env.view.profile_picker_dialog.is_none());
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.profile_picker_dialog.is_some(),
         "Ctrl+P in strict mode must open the profile picker"
@@ -1517,18 +1745,30 @@ fn test_command_palette_diff_invokes_diff_in_strict_mode() {
     env.view.update_selected();
 
     // Open the palette and filter to the diff command.
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.command_palette.is_some(),
         "Ctrl+K opens the palette"
     );
     for ch in "diff view".chars() {
-        env.view.handle_key(key(KeyCode::Char(ch)), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char(ch)), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
     }
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     // The diff action ran (opened the diff view, or raised an info dialog if the
     // temp path isn't a real git repo). Crucially, it did NOT delete.
@@ -1551,17 +1791,29 @@ fn test_f5_and_e_both_open_restart_dialog() {
     env.view.cursor = 0;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::F(5)), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::F(5)), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     let f5_opened = env.view.restart_dialog.is_some();
     env.view.restart_dialog = None;
 
     env.view.strict_hotkeys = false;
-    env.view.handle_key(key(KeyCode::Char('e')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('e')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     let lower_e_opened = env.view.restart_dialog.is_some();
     env.view.restart_dialog = None;
 
     env.view.strict_hotkeys = true;
-    env.view.handle_key(key(KeyCode::Char('E')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('E')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     let upper_e_opened = env.view.restart_dialog.is_some();
 
     assert!(f5_opened, "F5 should open the restart dialog");
@@ -1605,11 +1857,23 @@ fn test_o_key_flat_items_follow_sort_order() {
         let mut env = create_test_env_with_mixed_sessions();
         assert_eq!(env.view.sort_order, SortOrder::Newest);
 
-        env.view.handle_key(key(KeyCode::Char('o')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('o')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         for _ in 0..downs {
-            env.view.handle_key(key(KeyCode::Down), None);
+            {
+                let result = env.view.handle_key(key(KeyCode::Down), None);
+                drain_persistence(&mut env.view).unwrap();
+                result
+            };
         }
-        env.view.handle_key(key(KeyCode::Enter), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Enter), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
 
         assert_eq!(env.view.sort_order, order);
         assert_eq!(work_group_titles(&env.view), expected);
@@ -1622,8 +1886,16 @@ fn test_o_key_flat_items_follow_sort_order() {
         ('t', SortOrder::Attention),
         ('n', SortOrder::Newest),
     ] {
-        env.view.handle_key(key(KeyCode::Char('o')), None);
-        env.view.handle_key(key(KeyCode::Char(letter)), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('o')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
+        {
+            let result = env.view.handle_key(key(KeyCode::Char(letter)), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(env.view.sort_order, expected, "{letter}");
     }
     assert_eq!(work_group_titles(&env.view), ["Apple", "Mango", "Zebra"]);
@@ -1649,9 +1921,21 @@ fn test_o_key_clamps_cursor_when_list_shrinks() {
     assert!(filtered_count < initial_items);
 
     // Open the sort picker and pick Attention (one entry down from Newest).
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('o')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Down), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
+    {
+        let result = env.view.handle_key(key(KeyCode::Enter), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(env.view.sort_order, SortOrder::Attention);
 
     let valid_max = env.view.flat_items.len().saturating_sub(1);
@@ -1729,8 +2013,13 @@ fn test_ctrl_arrows_move_a_session_under_custom_sort() {
     env.view.cursor = first;
     env.view.update_selected();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     let moved: Vec<String> = work_group_titles(&env.view)
         .into_iter()
         .map(str::to_string)
@@ -1751,8 +2040,13 @@ fn test_ctrl_arrows_move_a_session_under_custom_sort() {
         "order is persisted, not recomputed"
     );
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(work_group_titles(&env.view), original);
 }
 
@@ -1794,8 +2088,13 @@ fn test_ctrl_arrows_do_not_reorder_under_a_computed_sort() {
     env.view.cursor = first;
     env.view.update_selected();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert_eq!(work_group_titles(&env.view), before);
     assert!(
@@ -1834,27 +2133,42 @@ fn test_alt_arrows_jump_between_just_finished_sessions() {
         (1, Status::Idle, Some(stale)),
         (2, Status::Running, None),
     ] {
-        env.view
-            .apply_user_action(&ids[idx], |inst| {
+        {
+            let submitted = env.view.apply_user_action(&ids[idx], |inst| {
                 inst.status = status;
                 inst.idle_entered_at = entered;
-            })
-            .unwrap();
+            });
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
     }
     env.view.rebuild_flat_items();
     env.view.cursor = 0;
     env.view.update_selected();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(
         env.view.selected_session,
         Some(ids[2].clone()),
         "walked past the stale row onto the working one"
     );
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_ne!(
         env.view.selected_session,
         Some(ids[1].clone()),
@@ -1900,8 +2214,13 @@ fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
     env.view.update_selected();
 
     // Above "work" sits the ungrouped bucket, so moving up leaves the group.
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(
         env.view.get_instance(&top).map(|i| i.group_path.clone()),
         Some(String::new()),
@@ -1909,8 +2228,13 @@ fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
     );
 
     // And back again, landing at the top of the group it re-enters.
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(
         env.view.get_instance(&top).map(|i| i.group_path.clone()),
         Some("work".to_string())
@@ -1959,8 +2283,13 @@ fn test_ctrl_arrows_move_a_group_among_its_siblings() {
     env.view.update_selected();
     assert_eq!(env.view.selected_group.as_deref(), Some("alpha"));
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(group_names(&env.view), ["beta", "alpha", "gamma"]);
 
     env.view.rebuild_flat_items();
@@ -2014,8 +2343,13 @@ fn test_ctrl_down_stops_at_the_last_group() {
     env.view.update_selected();
 
     for _ in 0..3 {
-        env.view
-            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        {
+            let result = env
+                .view
+                .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
     }
 
     assert_eq!(
@@ -2047,19 +2381,29 @@ fn test_alt_arrows_leave_live_send_before_jumping() {
         .collect();
     assert!(ids.len() >= 3);
 
-    env.view
-        .apply_user_action(&ids[2], |inst| {
+    {
+        let submitted = env.view.apply_user_action(&ids[2], |inst| {
             inst.status = Status::Idle;
             inst.idle_entered_at = Some(Utc::now() - ChronoDuration::minutes(1));
-        })
-        .unwrap();
+        });
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     env.view.rebuild_flat_items();
     env.view.cursor = 0;
     env.view.update_selected();
     env.view.live_send = Some(live_send_state(&ids[0], "relaying", "aoe_test_live_jump"));
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(env.view.live_send.is_none(), "left the relay");
     assert_eq!(
@@ -2111,8 +2455,13 @@ fn test_row_moves_are_refused_outside_manual_grouping() {
     env.view.cursor = first.0;
     env.view.update_selected();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert_eq!(
         membership(&env.view),
@@ -2153,8 +2502,13 @@ fn test_moving_a_group_without_a_stored_row_persists() {
         .expect("alpha header");
     env.view.cursor = header;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let (_, stored) = Storage::open_unwatched("test")
         .unwrap()
@@ -2192,7 +2546,11 @@ fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Storage);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
     Storage::open_unwatched("test")
         .unwrap()
         .update(|_, groups| {
@@ -2209,8 +2567,13 @@ fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
         .expect("alpha header");
     env.view.cursor = header;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let (_, stored) = Storage::open_unwatched("test")
         .unwrap()
@@ -2299,7 +2662,11 @@ fn test_cross_group_move_lands_in_an_empty_neighbour() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Storage);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
     env.view.apply_sort_order(SortOrder::Custom);
 
     let moving = env
@@ -2324,8 +2691,13 @@ fn test_cross_group_move_lands_in_an_empty_neighbour() {
     env.view.cursor = at;
     env.view.update_selected();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert_eq!(
         env.view.get_instance(&moving).map(|i| i.group_path.clone()),
@@ -2394,7 +2766,11 @@ fn test_a_peer_swap_does_not_leave_duplicate_indices() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Storage);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
 
     // A peer swaps b and c behind this view's back; the view still believes 0/1/2.
     Storage::open_unwatched("test")
@@ -2417,8 +2793,13 @@ fn test_a_peer_swap_does_not_leave_duplicate_indices() {
         .expect("a1 row");
     env.view.cursor = at;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let (rows, _) = Storage::open_unwatched("test")
         .unwrap()
@@ -2487,8 +2868,13 @@ fn test_a_move_does_not_resurrect_a_group_a_peer_deleted() {
         .expect("a1 row");
     env.view.cursor = at;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let (rows, groups) = Storage::open_unwatched("test")
         .unwrap()
@@ -2542,7 +2928,11 @@ fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Storage);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
 
     // The peer moves a1 out of work behind this view's back.
     Storage::open_unwatched("test")
@@ -2563,8 +2953,13 @@ fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
         .expect("a1 row");
     env.view.cursor = at;
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let (rows, _) = Storage::open_unwatched("test")
         .unwrap()
@@ -2642,9 +3037,7 @@ fn test_a_failed_expansion_still_settles_the_list() {
     assert!(env.view.status_flash.is_some(), "the failure is explained");
 }
 
-/// The boundary half of a move runs in a second transaction, after the first has reported
-/// the row against the edge of its group. A peer that regroups the row in between must not
-/// have its change overwritten by a membership decided from the earlier read.
+// A peer regrouping the row invalidates the captured source membership.
 #[test]
 #[serial]
 fn test_a_boundary_move_rechecks_the_anchor_against_the_store() {
@@ -2668,9 +3061,13 @@ fn test_a_boundary_move_rechecks_the_anchor_against_the_store() {
         })
         .unwrap();
 
-    env.view
-        .move_session_across_groups(&a, 1)
-        .expect("the boundary move is dropped, not failed");
+    {
+        env.view.selected_group = None;
+        env.view.selected_session = Some(a.clone());
+        let submitted = env.view.move_row_at_cursor(1);
+        await_transaction_result(&mut env.view, submitted)
+    }
+    .expect("the boundary move is dropped, not failed");
 
     let (rows, _) = Storage::open_unwatched("test")
         .unwrap()
@@ -2744,7 +3141,11 @@ fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
         "an empty group's header carries no profile, which is the case under test"
     );
 
-    view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+    {
+        let result = view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
 
     assert_eq!(
         stored_group_order("test"),
@@ -2841,22 +3242,31 @@ fn test_ctrl_alt_arrows_do_not_jump_out_of_live_send() {
     assert!(ids.len() >= 3);
 
     // The same fixture the Alt+Down jump lands on, so a jump here would be unmistakable.
-    env.view
-        .apply_user_action(&ids[2], |inst| {
+    {
+        let submitted = env.view.apply_user_action(&ids[2], |inst| {
             inst.status = Status::Idle;
             inst.idle_entered_at = Some(Utc::now() - ChronoDuration::minutes(1));
-        })
-        .unwrap();
+        });
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     env.view.rebuild_flat_items();
     env.view.cursor = 0;
     env.view.update_selected();
     let before = env.view.selected_session.clone();
     env.view.live_send = Some(live_send_state(&ids[0], "relaying", "aoe_test_ctrl_alt"));
 
-    env.view.handle_key(
-        KeyEvent::new(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::CONTROL),
-        None,
-    );
+    {
+        let result = env.view.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::CONTROL),
+            None,
+        );
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert_eq!(
         env.view.selected_session, before,
@@ -2887,7 +3297,11 @@ fn test_a_session_moves_up_into_an_implicit_parent_group() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Storage);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
     env.view.apply_sort_order(SortOrder::Custom);
     let stored_groups = || {
         Storage::open_unwatched("test")
@@ -2923,8 +3337,13 @@ fn test_a_session_moves_up_into_an_implicit_parent_group() {
         .position(|i| matches!(i, Item::Session { id: row, .. } if *row == id))
         .expect("c1 row");
     env.view.update_selected();
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+    {
+        let result = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     let (rows, _) = Storage::open_unwatched("test")
         .unwrap()
@@ -2947,7 +3366,11 @@ fn test_a_session_moves_up_into_an_implicit_parent_group() {
         "and it is drawn under the cursor"
     );
 
-    env.view.reload_storage_only().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Storage);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
     assert_eq!(
         env.view
             .get_instance(&id)

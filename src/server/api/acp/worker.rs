@@ -77,26 +77,6 @@ async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<
     })
 }
 
-/// The memory check runs before the handler's awaits, during which a peer such as
-/// `aoe session archive` or `aoe rm --purge` can shelve or remove the stored row, so
-/// recheck it right before spawning.
-async fn refuse_if_stored_row_shelved(
-    state: &AppState,
-    instance: &crate::session::Instance,
-) -> Option<Response> {
-    match crate::server::api::load_persisted_instance(state, &instance.source_profile, &instance.id)
-        .await
-    {
-        // A purge removes the row while the cache may still hold it.
-        Ok(None) => Some(session_not_found()),
-        Ok(Some(stored)) => stored
-            .ensure_startable()
-            .err()
-            .map(crate::server::api::start_blocked_response),
-        Err(resp) => Some(resp),
-    }
-}
-
 pub async fn spawn_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -133,12 +113,84 @@ pub async fn spawn_acp(
         return crate::server::api::start_blocked_response(blocked);
     }
 
+    let origin = match state.capture_operation_origin(&instance) {
+        Ok(origin) => origin,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("original launch authority is no longer valid: {error}"),
+            )
+                .into_response()
+        }
+    };
+    let rate_limit_resume_resets_at = rate_limit_resume_probe(&state, &id).await;
+    let reservation = match state
+        .acp_supervisor
+        .begin_resume(
+            &id,
+            crate::acp::runner_lifecycle::NativeResume::Spawn,
+            origin.clone(),
+            true,
+        )
+        .await
+    {
+        Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => reservation,
+        Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(present)) => {
+            let Some(resets_at) = rate_limit_resume_resets_at else {
+                return supervisor_error_response(
+                    "spawn failed",
+                    &SupervisorError::AlreadyRunning(id),
+                );
+            };
+            drop(_guard);
+            tracing::debug!(target: "http.api.acp", session = %id,
+                "manual rate-limit spawn joined present resume after releasing instance lock");
+            let operation = tokio::spawn(async move {
+                if let Err(error) = state.acp_supervisor.wait_for_present_resume(&present).await {
+                    return supervisor_error_response("original worker is not ready", &error);
+                }
+                let instance_lock = state.instance_lock(&id).await;
+                let _instance_guard = instance_lock.lock_owned().await;
+                let original = match state.acp_supervisor.wait_for_present_resume(&present).await {
+                    Ok(original) => original,
+                    Err(error) => {
+                        return supervisor_error_response("original worker changed", &error)
+                    }
+                };
+                let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
+                if let Err(error) = install_rate_limit_continuation(
+                    &state,
+                    original,
+                    [Some(origin), None],
+                    _submission,
+                )
+                .await
+                {
+                    return (StatusCode::CONFLICT, error.to_string()).into_response();
+                }
+                state
+                    .acp_supervisor
+                    .publish_rate_limit_auto_resumed(&id, resets_at, true);
+                Json(SpawnAcpResponse {
+                    session_id: id,
+                    agent,
+                    status: "running",
+                })
+                .into_response()
+            });
+            return operation.await.unwrap_or_else(|error| {
+                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            });
+        }
+        Err(error) => return supervisor_error_response("spawn failed", &error),
+    };
+    let _body_custody = reservation.execution_admission().begin_job();
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
     let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
         &state.mutation_epoch,
-        &id,
+        reservation.execution_admission(),
         false,
     )
     .await
@@ -152,11 +204,7 @@ pub async fn spawn_acp(
                 .into_response();
         }
     };
-    let rate_limit_resume_resets_at = rate_limit_resume_probe(&state, &id).await;
 
-    // An explicit resume overrides a stop kept from a resume that failed
-    // before it installed; only the reconciler's fallback must honor it.
-    state.acp_supervisor.forget_stale_cancel(&id);
     let request = SpawnRequest {
         additional_dirs: req.additional_dirs,
         provider_env: req
@@ -165,21 +213,30 @@ pub async fn spawn_acp(
             .map(|p| (p.key, p.value))
             .collect(),
         model: req.model.or_else(|| instance.agent_model.clone()),
-        ..spawn_request_for(&instance, agent.clone(), sandbox_info)
+        ..spawn_request_for(&instance, agent.clone(), sandbox_info, Arc::clone(&origin))
     };
-    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
-        return resp;
-    }
-    match state.acp_supervisor.spawn(request).await {
-        Ok(()) => {}
-        Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
-        Err(e) => return supervisor_error_response("spawn failed", &e),
+    let launched = reservation.execution_admission();
+    let prepared_publication = launched.origin();
+    if let Err(error) = state.acp_supervisor.spawn_inner(request, reservation).await {
+        return supervisor_error_response("spawn failed", &error);
     }
     if let Some(resets_at) = rate_limit_resume_resets_at {
-        // Continue the rate-limit-interrupted turn once the worker is live.
-        let _ = install_rate_limit_continuation(&state, &id, _submission).await;
-        // The manual breadcrumb is the budget's disarm step, so it fires
-        // whether or not a queued prompt superseded the continuation.
+        let Some(original) = launched.origin() else {
+            return supervisor_error_response(
+                "original worker authority disappeared",
+                &SupervisorError::SpawnCancelled(id),
+            );
+        };
+        if let Err(error) = install_rate_limit_continuation(
+            &state,
+            original,
+            [Some(origin), prepared_publication],
+            _submission,
+        )
+        .await
+        {
+            return (StatusCode::CONFLICT, error.to_string()).into_response();
+        }
         state
             .acp_supervisor
             .publish_rate_limit_auto_resumed(&id, resets_at, true);
@@ -210,10 +267,66 @@ pub async fn shutdown_acp(
     else {
         return session_not_found();
     };
-    match state.acp_supervisor.shutdown(&id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => supervisor_error_response("shutdown failed", &e),
-    }
+    let Some(instance) = crate::server::api::find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    let original = match state.capture_operation_origin(&instance) {
+        Ok(original) => original,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
+    let operation = tokio::spawn(async move {
+        let _submission_guard = _submission;
+        let stop = match tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::reserve_stop_from_origin(original, false)
+        })
+        .await
+        {
+            Ok(Ok(stop)) => stop,
+            Ok(Err(error)) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }
+        };
+        match state.acp_supervisor.shutdown(stop.clone()).await {
+            Ok(()) => {
+                let instances = Arc::clone(&state.instances);
+                let epoch = Arc::clone(&state.mutation_epoch);
+                let finished = tokio::task::spawn_blocking(move || {
+                    crate::session::runner_journal::finish_owned_stop(&stop, |stored| {
+                        let mut rows = instances.blocking_write();
+                        let slot = rows
+                            .iter_mut()
+                            .find(|row| row.id == stop.session_id())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("shutdown original view row disappeared")
+                            })?;
+                        anyhow::ensure!(
+                            stop.original().recognizes_published_instance(slot)
+                                || stop
+                                    .current_projection()
+                                    .recognizes_published_instance(slot),
+                            "shutdown original view row was superseded"
+                        );
+                        *slot = crate::server::reload::merge_runtime_fields(slot, stored.clone());
+                        epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+                .await;
+                match finished {
+                    Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+                    Ok(Err(error)) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+                    Err(error) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                    }
+                }
+            }
+            Err(error) => supervisor_error_response("shutdown failed", &error),
+        }
+    });
+    operation.await.unwrap_or_else(|error| {
+        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+    })
 }
 
 /// One `GET /api/acp/agents` entry; `name` is a valid switch-agent target.
@@ -306,45 +419,72 @@ async fn check_switch_target(
 /// resolve, which is the rule `Instance::swap_tool` already applies.
 async fn persist_agent_switch(
     state: &AppState,
-    profile: &str,
-    id: &str,
+    issuance: crate::acp::runner_lifecycle::ExecutionAdmission,
+    cached_original: Arc<crate::session::LaunchOrigin>,
     target: &str,
     model: Option<&str>,
-) {
-    let switch = |inst: &mut crate::session::Instance| {
-        inst.agent_name = Some(target.to_string());
-        inst.acp_session_id = None;
-        inst.import_pending = None;
-        inst.acp_effort = None;
-        inst.agent_model = model.map(str::to_string);
-    };
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            switch(inst);
-        }
-    }
-    match crate::session::Storage::new(profile, state.file_watch.clone()) {
-        Ok(storage) => {
-            if let Err(e) = storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    switch(inst);
-                }
-                Ok(())
-            }) {
-                tracing::error!(
-                    target: "http.api.acp",
-                    session = %id,
-                    "failed to persist agent_name after switch: {e}"
+) -> Result<(), Response> {
+    let original = issuance.origin().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "backend switch lost its issued original",
+        )
+            .into_response()
+    })?;
+    let instances = Arc::clone(&state.instances);
+    let epoch = Arc::clone(&state.mutation_epoch);
+    let target = target.to_owned();
+    let model = model.map(str::to_owned);
+    let custody = issuance.begin_job();
+    tokio::task::spawn_blocking(move || {
+        let _custody = custody;
+        original.update_storage(
+            |_, row| {
+                let rows = instances.blocking_write();
+                let index = rows
+                    .iter()
+                    .position(|row| row.id == original.session_id())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("backend switch original view row disappeared")
+                    })?;
+                anyhow::ensure!(
+                    cached_original.recognizes_published_instance(&rows[index])
+                        || original.recognizes_published_instance(&rows[index]),
+                    "backend switch cache original was superseded"
                 );
-            }
-        }
-        Err(e) => tracing::error!(
-            target: "http.api.acp",
-            session = %id,
-            "failed to open storage to persist agent_name after switch: {e}"
-        ),
-    }
+                issuance.commit_effect(|| {
+                    row.agent_name = Some(target);
+                    row.acp_session_id = None;
+                    row.import_pending = None;
+                    row.acp_effort = None;
+                    row.agent_model = model;
+                    Ok((rows, index, row.clone()))
+                })
+            },
+            |(mut rows, index, emitted)| {
+                let slot = &mut rows[index];
+                *slot = crate::server::reload::merge_runtime_fields(slot, emitted);
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("original backend metadata job failed: {error}"),
+        )
+            .into_response()
+    })?
+    .map_err(|error| {
+        (
+            StatusCode::CONFLICT,
+            format!("original backend metadata was superseded: {error}"),
+        )
+            .into_response()
+    })?;
+    Ok(())
 }
 
 /// Move a structured session to another ACP backend, keeping the transcript.
@@ -379,147 +519,252 @@ pub async fn switch_acp_agent(
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
     }
+    let origin = match state.capture_operation_origin(&instance) {
+        Ok(origin) => origin,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("original switch authority is no longer valid: {error}"),
+            )
+                .into_response()
+        }
+    };
+    let cached_original = origin.clone();
     let from_agent = match check_switch_target(&state, &instance, &target).await {
         Ok(agent) => agent,
         Err(resp) => return resp,
     };
     let before_seq = state.acp_event_store.highest_seq(&id);
-
-    if let Err(e) = state
-        .acp_supervisor
-        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+    let operation = tokio::spawn(async move {
+        let _submission_guard = _submission;
+        let stop = match tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::reserve_stop_from_origin(origin, false)
+        })
         .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("shutdown failed before agent switch: {e}"),
-        )
-            .into_response();
-    }
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.acp_load_session_capable = None;
-        }
-    }
+        {
+            Ok(Ok(stop)) => stop,
+            Ok(Err(error)) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }
+        };
 
-    let inst_lock = state.instance_lock(&id).await;
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
-        &state.instances,
-        &state.mutation_epoch,
-        &inst_lock,
-        &id,
-        false,
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(e) => {
+        if let Err(e) = state
+            .acp_supervisor
+            .shutdown_and_wait(stop.clone(), std::time::Duration::from_secs(5))
+            .await
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("sandbox container ensure failed: {e}"),
+                format!("shutdown failed before agent switch: {e}"),
             )
                 .into_response();
         }
-    };
-
-    let model = req.model.clone();
-    state.acp_supervisor.forget_stale_cancel(&id);
-    // A new backend starts a fresh session. Effort vocabularies are
-    // adapter-specific, so the old pick is dropped too.
-    let request = SpawnRequest {
-        model: model.clone(),
-        effort: None,
-        effort_explicit: false,
-        stored_acp_session_id: None,
-        fork_from: None,
-        seed_history_replay: false,
-        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
-        claude_store_pin: None,
-        ..spawn_request_for(&instance, target.clone(), sandbox_info)
-    };
-    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
-        return resp;
-    }
-    if let Err(e) = state.acp_supervisor.spawn(request).await {
-        return supervisor_error_response("spawn failed", &e);
-    }
-    state
-        .telemetry_structured
-        .agent_switches
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    persist_agent_switch(
-        &state,
-        &instance.source_profile,
-        &id,
-        &target,
-        model.as_deref(),
-    )
-    .await;
-
-    let reason = req
-        .reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .unwrap_or("manual")
-        .to_string();
-    let switch_seq =
-        state
+        let instances = Arc::clone(&state.instances);
+        let epoch = Arc::clone(&state.mutation_epoch);
+        let publication_stop = stop.clone();
+        let publication_baseline = cached_original.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            publication_stop.with_scope(|stored| {
+                let mut rows = instances.blocking_write();
+                let slot = rows
+                    .iter_mut()
+                    .find(|row| row.id == publication_stop.session_id())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("backend switch original view row disappeared")
+                    })?;
+                anyhow::ensure!(
+                    publication_baseline.recognizes_published_instance(slot)
+                        || publication_stop
+                            .current_projection()
+                            .recognizes_published_instance(slot),
+                    "backend switch original view row was superseded before its Stop ACK"
+                );
+                *slot = crate::server::reload::merge_runtime_fields(slot, stored.clone());
+                slot.acp_load_session_capable = None;
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(anyhow::anyhow!(
+                "original backend Stop publication failed: {error}"
+            ))
+        }) {
+            return (StatusCode::CONFLICT, error.to_string()).into_response();
+        }
+        let origin = stop.cancellation_origin();
+        let retirement_stop = stop.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::release_owned_stop(&retirement_stop)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }
+        }
+        let reservation = match state
             .acp_supervisor
-            .publish_agent_switched(&id, from_agent, target.clone(), reason);
+            .begin_resume(
+                &id,
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                origin,
+                true,
+            )
+            .await
+        {
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => {
+                reservation
+            }
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(_)) => {
+                return (StatusCode::CONFLICT, "backend switch was superseded").into_response()
+            }
+            Err(error) => {
+                return supervisor_error_response("backend switch preparation failed", &error)
+            }
+        };
+        let issuance = reservation.execution_admission();
+        let _body_custody = issuance.begin_job();
 
-    Json(SwitchAgentResponse {
-        session_id: id,
-        agent: target,
-        before_seq,
-        switch_seq,
-        status: "running".to_string(),
+        let inst_lock = state.instance_lock(&id).await;
+        let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
+            &state.instances,
+            &state.mutation_epoch,
+            &inst_lock,
+            issuance.clone(),
+            false,
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("sandbox container ensure failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let model = req.model.clone();
+        // A new backend starts a fresh session. Effort vocabularies are
+        // adapter-specific, so the old pick is dropped too.
+        let request = SpawnRequest {
+            model: model.clone(),
+            effort: None,
+            effort_explicit: false,
+            stored_acp_session_id: None,
+            fork_from: None,
+            seed_history_replay: false,
+            sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
+            claude_store_pin: None,
+            ..spawn_request_for(
+                &instance,
+                target.clone(),
+                sandbox_info,
+                issuance
+                    .origin()
+                    .expect("prepared backend switch owns its source"),
+            )
+        };
+        if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
+            return supervisor_error_response("spawn failed", &e);
+        }
+        state
+            .telemetry_structured
+            .agent_switches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Err(response) =
+            persist_agent_switch(&state, issuance, cached_original, &target, model.as_deref()).await
+        {
+            return response;
+        }
+
+        let reason = req
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("manual")
+            .to_string();
+        let switch_seq =
+            state
+                .acp_supervisor
+                .publish_agent_switched(&id, from_agent, target.clone(), reason);
+
+        Json(SwitchAgentResponse {
+            session_id: id,
+            agent: target,
+            before_seq,
+            switch_seq,
+            status: "running".to_string(),
+        })
+        .into_response()
+    });
+    operation.await.unwrap_or_else(|error| {
+        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
     })
-    .into_response()
 }
 
 /// The adapter's always-present model entry, which the CLI resolves to the
 /// running provider's own default.
 const PROVIDER_DEFAULT_MODEL: &str = "default";
 
-/// Record the pick in memory and on disk from one mutation. Written before the
-/// respawn, because the container reconcile and the spawn request both read it
-/// off the row. The model is pinned to `default` rather than cleared: model ids
-/// are provider-specific, and a resumed session otherwise keeps the model its
-/// transcript last ran on, which the new provider may not serve.
-///
-/// Disk first, and the error is returned rather than logged: a respawn from a
-/// memory row the disk never got would be undone by the next reload, leaving
-/// the live worker on a provider the stored session does not name.
+/// Commit the provider pick through the same settled Stop, preserving the conversation.
 async fn persist_provider_switch(
     state: &AppState,
-    profile: &str,
-    id: &str,
+    stop: Arc<crate::session::runner_journal::OwnedStop>,
     provider: &str,
-) -> anyhow::Result<()> {
-    let switch = |inst: &mut crate::session::Instance| {
-        inst.agent_provider = Some(provider.to_string());
-        inst.agent_model = Some(PROVIDER_DEFAULT_MODEL.to_string());
-    };
-    crate::session::Storage::new(profile, state.file_watch.clone())?.update(
-        |instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                switch(inst);
-            }
-            Ok(())
-        },
-    )?;
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        switch(inst);
-        // A disk snapshot read before the write above would otherwise land
-        // after it and restore the old provider and model.
-        state
-            .mutation_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-    Ok(())
+) -> Result<crate::session::Instance, Response> {
+    let instances = Arc::clone(&state.instances);
+    let epoch = state.mutation_epoch.clone();
+    let provider = provider.to_owned();
+    tokio::task::spawn_blocking(move || {
+        stop.update_projection(
+            |row| {
+                let rows = instances.blocking_write();
+                let index = rows
+                    .iter()
+                    .position(|row| row.id == stop.session_id())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("provider switch original view row disappeared")
+                    })?;
+                anyhow::ensure!(
+                    stop.original().recognizes_published_instance(&rows[index])
+                        || stop
+                            .current_projection()
+                            .recognizes_published_instance(&rows[index]),
+                    "provider switch original view row was superseded"
+                );
+                anyhow::ensure!(
+                    row.runner_journal.proves_quiescent(),
+                    "provider switch worker is not settled"
+                );
+                row.agent_provider = Some(provider);
+                row.agent_model = Some(PROVIDER_DEFAULT_MODEL.to_owned());
+                Ok((rows, index, row.clone()))
+            },
+            |(mut rows, index, emitted)| {
+                let slot = &mut rows[index];
+                *slot = crate::server::reload::merge_runtime_fields(slot, emitted.clone());
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(emitted)
+            },
+        )
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response())?
+    .map_err(|error| {
+        (
+            StatusCode::CONFLICT,
+            format!("provider switch was not saved: {error}"),
+        )
+            .into_response()
+    })
 }
 
 /// Re-route a structured session to another LLM provider, keeping the
@@ -565,11 +810,8 @@ pub async fn switch_acp_provider(
     else {
         return session_not_found();
     };
-    // Held from the first read through the respawn, as `spawn_acp` takes it:
-    // between the shutdown and the persisted pick the reconciler would
-    // otherwise resume the worker off the old row, and win.
     let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
+    let _guard = inst_lock.lock_owned().await;
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
@@ -606,80 +848,128 @@ pub async fn switch_acp_provider(
         );
     }
 
-    if let Err(e) = state
-        .acp_supervisor
-        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+    let original = match state.capture_operation_origin(&instance) {
+        Ok(original) => original,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
+    let operation = tokio::spawn(async move {
+        let _submission_guard = _submission;
+        let _instance_guard = _guard;
+        let stop = match tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::reserve_stop_from_origin(original, false)
+        })
         .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("shutdown failed before provider switch: {e}"),
-        )
-            .into_response();
-    }
-    // `shutdown_and_wait` gives up at its deadline without saying so. A
-    // teardown it could not prove must not have its row rewritten or its
-    // container discarded underneath it.
-    if state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent {
-        return super::super::api_error(
-            StatusCode::CONFLICT,
-            "worker_not_stopped",
-            "the previous worker has not finished stopping; retry the switch shortly",
-        );
-    }
-
-    let model_cleared = instance
-        .agent_model
-        .as_deref()
-        .is_some_and(|model| model != PROVIDER_DEFAULT_MODEL);
-    if let Err(e) = persist_provider_switch(&state, &instance.source_profile, &id, &provider).await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to persist the provider switch: {e}"),
-        )
-            .into_response();
-    }
-
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
-        &state.instances,
-        &state.mutation_epoch,
-        &id,
-        false,
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("sandbox container ensure failed: {e}"),
-            )
-                .into_response();
+        {
+            Ok(Ok(stop)) => stop,
+            Ok(Err(error)) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }
+        };
+        let stopped = match state
+            .acp_supervisor
+            .shutdown_and_wait(stop.clone(), std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(()) => {
+                state.acp_supervisor.worker_state(&id).await
+                    == crate::daemon::AcpWorkerState::Absent
+            }
+            Err(SupervisorError::TeardownPending(_)) => false,
+            Err(error) => {
+                return supervisor_error_response("shutdown failed before provider switch", &error)
+            }
+        };
+        if !stopped {
+            return super::super::api_error(
+                StatusCode::CONFLICT,
+                "worker_not_stopped",
+                "the previous worker has not finished stopping; retry the switch shortly",
+            );
         }
-    };
+        let model_cleared = instance
+            .agent_model
+            .as_deref()
+            .is_some_and(|model| model != PROVIDER_DEFAULT_MODEL);
+        let instance = match persist_provider_switch(&state, stop.clone(), &provider).await {
+            Ok(instance) => instance,
+            Err(response) => return response,
+        };
+        let origin = stop.cancellation_origin();
+        let retirement_stop = stop.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::release_owned_stop(&retirement_stop)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }
+        }
+        let reservation = match state
+            .acp_supervisor
+            .begin_resume(
+                &id,
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                origin,
+                true,
+            )
+            .await
+        {
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(reservation)) => {
+                reservation
+            }
+            Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(_)) => {
+                return (StatusCode::CONFLICT, "provider switch was superseded").into_response();
+            }
+            Err(error) => {
+                return supervisor_error_response("provider switch preparation failed", &error)
+            }
+        };
+        let issuance = reservation.execution_admission();
+        let _body_custody = issuance.begin_job();
+        let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
+            &state.instances,
+            &state.mutation_epoch,
+            issuance.clone(),
+            false,
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("sandbox container ensure failed: {error}"),
+                )
+                    .into_response()
+            }
+        };
+        let request = spawn_request_for(
+            &instance,
+            agent,
+            sandbox_info,
+            issuance
+                .origin()
+                .expect("prepared provider switch owns its original"),
+        );
+        if let Err(error) = state.acp_supervisor.spawn_inner(request, reservation).await {
+            return supervisor_error_response("spawn failed after provider switch", &error);
+        }
 
-    state.acp_supervisor.forget_stale_cancel(&id);
-    // Everything that names the conversation survives: the provider changes
-    // where the tokens are served from, not which transcript is resumed.
-    let Some(instance) = find_instance(&state, &id).await else {
-        return session_not_found();
-    };
-    let request = spawn_request_for(&instance, agent, sandbox_info);
-    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
-        return resp;
-    }
-    if let Err(e) = state.acp_supervisor.spawn(request).await {
-        return supervisor_error_response("spawn failed after provider switch", &e);
-    }
-
-    Json(SwitchProviderResponse {
-        session_id: id,
-        provider,
-        model_cleared,
-        status: "running".to_string(),
+        Json(SwitchProviderResponse {
+            session_id: id,
+            provider,
+            model_cleared,
+            status: "running".to_string(),
+        })
+        .into_response()
+    });
+    operation.await.unwrap_or_else(|error| {
+        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
     })
-    .into_response()
 }
 
 #[cfg(test)]
@@ -711,7 +1001,12 @@ mod tests {
             );
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
-            persist_agent_switch(&state, profile, &id, "codex", requested).await;
+            let original = crate::session::runner_journal::capture_unique_origin(&id).unwrap();
+            let issuance = crate::acp::runner_lifecycle::ExecutionAdmission::new();
+            issuance.set_origin(original.clone()).unwrap();
+            persist_agent_switch(&state, issuance, original, "codex", requested)
+                .await
+                .unwrap();
 
             let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
             let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");
@@ -731,11 +1026,7 @@ mod tests {
         }
     }
 
-    /// The pick reaches both stores, and the model resets to the provider's
-    /// default: ids are provider-specific, and a resumed transcript would
-    /// otherwise keep its old one. Everything naming the conversation survives, because the
-    /// provider changes where the tokens come from, not which transcript is
-    /// resumed.
+    /// Provider routing resets the model but preserves the conversation.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_provider_switch_persists_the_pick_and_resets_the_model() {
@@ -757,10 +1048,13 @@ mod tests {
             );
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
-            persist_provider_switch(&state, profile, &id, provider)
+            let original = crate::session::runner_journal::capture_unique_origin(&id).unwrap();
+            let stop =
+                crate::session::runner_journal::reserve_stop_from_origin(original, false).unwrap();
+            persist_provider_switch(&state, stop.clone(), provider)
                 .await
                 .expect("persisting the pick");
-
+            crate::session::runner_journal::release_owned_stop(&stop).unwrap();
             let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
             let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");
             assert_eq!(
@@ -800,9 +1094,13 @@ mod tests {
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let stale = crate::server::test_support::load_instances_from_disk_for_test(profile);
-        persist_provider_switch(&state, profile, &id, "vertex")
+        let original = crate::session::runner_journal::capture_unique_origin(&id).unwrap();
+        let stop =
+            crate::session::runner_journal::reserve_stop_from_origin(original, false).unwrap();
+        persist_provider_switch(&state, stop.clone(), "vertex")
             .await
             .expect("persisting the pick");
+        crate::session::runner_journal::release_owned_stop(&stop).unwrap();
         crate::server::reload::reload_state_instances_from_disk(
             &state,
             stale,
@@ -813,9 +1111,280 @@ mod tests {
         .await;
 
         let instance = find_instance(&state, &id).await.expect("instance");
-        let request = spawn_request_for(&instance, "claude".to_string(), None);
-        assert_eq!(request.provider.as_deref(), Some("vertex"));
-        assert_eq!(request.model.as_deref(), Some(PROVIDER_DEFAULT_MODEL));
+        assert_eq!(instance.agent_provider.as_deref(), Some("vertex"));
+        assert_eq!(
+            instance.agent_model.as_deref(),
+            Some(PROVIDER_DEFAULT_MODEL)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_contended_provider_publication_does_not_hold_the_cache() {
+        use crate::session::test_support::{isolate_app_dir, EnvGuard};
+        let _app_dir = isolate_app_dir();
+        let mut instance = crate::session::Instance::new("provider-lock", "/tmp/aoe-provider-lock");
+        instance.view = crate::session::View::Structured;
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        let original = crate::session::runner_journal::capture_unique_origin(&id).unwrap();
+        let stop =
+            crate::session::runner_journal::reserve_stop_from_origin(original, false).unwrap();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("contended");
+        let _marker_env = EnvGuard::set(&[("AOE_E2E_STORAGE_LOCK_CONTENDED", marker.clone())]);
+        let workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
+        let publication = tokio::spawn({
+            let state = Arc::clone(&state);
+            let stop = stop.clone();
+            async move { persist_provider_switch(&state, stop, "vertex").await }
+        });
+        let contended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let cache_available = state.instances.try_write().is_ok();
+        drop(workspace);
+        tokio::time::timeout(std::time::Duration::from_secs(5), publication)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        crate::session::runner_journal::release_owned_stop(&stop).unwrap();
+        contended.expect("publisher must reach the held physical fence");
+        assert!(
+            cache_available,
+            "a physical-lock waiter must not prevent cache readers or writers"
+        );
+        assert_eq!(
+            find_instance(&state, &id)
+                .await
+                .unwrap()
+                .agent_provider
+                .as_deref(),
+            Some("vertex")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_without_a_worker_preserves_the_next_stop_and_rejects_a_stale_reload() {
+        use crate::session::test_support::isolate_app_dir;
+        let _app_dir = isolate_app_dir();
+        let mut instance =
+            crate::session::Instance::new("shutdown-empty", "/tmp/aoe-shutdown-empty");
+        instance.view = crate::session::View::Structured;
+        instance.status = crate::session::Status::Idle;
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let stale = crate::server::test_support::load_instances_from_disk_for_test("default");
+
+        let shutdown = shutdown_acp(State(Arc::clone(&state)), Path(id.clone()))
+            .await
+            .into_response();
+        assert_eq!(shutdown.status(), StatusCode::NO_CONTENT);
+        let acknowledged =
+            crate::server::test_support::load_instances_from_disk_for_test("default")
+                .into_iter()
+                .find(|instance| instance.id == id)
+                .unwrap();
+        crate::server::reload::reload_state_instances_from_disk(
+            &state,
+            stale,
+            Vec::new(),
+            crate::server::state::StatusSource::DiskOnly,
+            read_epoch,
+        )
+        .await;
+        assert_eq!(
+            find_instance(&state, &id)
+                .await
+                .unwrap()
+                .lifecycle_generation,
+            acknowledged.lifecycle_generation,
+            "a pre-shutdown reload cannot replace the canonical Stop acknowledgement"
+        );
+        let stopped =
+            crate::server::api::sessions::stop_session(State(Arc::clone(&state)), Path(id.clone()))
+                .await
+                .into_response();
+        assert_eq!(
+            stopped.status(),
+            StatusCode::OK,
+            "shutdown must leave a usable canonical origin"
+        );
+        assert_eq!(
+            find_instance(&state, &id).await.unwrap().status,
+            crate::session::Status::Stopped
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_shutdown_still_publishes_its_canonical_ack() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut instance =
+            crate::session::Instance::new("shutdown-cancel", "/tmp/aoe-shutdown-cancel");
+        instance.view = crate::session::View::Structured;
+        instance.status = crate::session::Status::Idle;
+        let id = instance.id.clone();
+        let initial_generation = instance.lifecycle_generation;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        let workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
+        {
+            let mut request =
+                std::pin::pin!(shutdown_acp(State(Arc::clone(&state)), Path(id.clone())));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(request.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(workspace);
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.session_service.prompt_submission_for_session(&id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(completed);
+        let acknowledged =
+            crate::server::test_support::load_instances_from_disk_for_test("default")
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+        assert_eq!(acknowledged.lifecycle_generation, initial_generation + 1);
+        assert!(acknowledged.lifecycle_reservation.is_none());
+        assert_eq!(
+            find_instance(&state, &id)
+                .await
+                .unwrap()
+                .lifecycle_generation,
+            acknowledged.lifecycle_generation
+        );
+        let stopped =
+            crate::server::api::sessions::stop_session(State(Arc::clone(&state)), Path(id.clone()))
+                .await
+                .into_response();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        assert_eq!(
+            find_instance(&state, &id).await.unwrap().status,
+            crate::session::Status::Stopped
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_provider_switch_keeps_its_instance_guard_until_original_refusal() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut instance =
+            crate::session::Instance::new("provider-cancel", "/tmp/aoe-provider-cancel");
+        instance.view = crate::session::View::Structured;
+        let id = instance.id.clone();
+        let generation = instance.lifecycle_generation;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let storage = crate::session::Storage::open_unwatched("default").unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        let held_workers = state.acp_supervisor.test_hold_worker_map().await;
+        let request = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                switch_acp_provider(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SwitchProviderRequest {
+                        provider: "vertex".into(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let storage = storage.clone();
+                let row_id = id.clone();
+                let reserved = tokio::task::spawn_blocking(move || {
+                    storage
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == row_id)
+                        .unwrap()
+                        .lifecycle_generation
+                        > generation
+                })
+                .await
+                .unwrap();
+                if reserved {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual Stop reservation must commit before cancellation");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let instance_lock = state.instance_lock(&id).await;
+        assert!(
+            instance_lock.try_lock().is_err(),
+            "owned switch must still exclude another instance mutation"
+        );
+        let original_dir = storage.sessions_path().parent().unwrap().to_owned();
+        std::fs::rename(
+            &original_dir,
+            original_dir.with_file_name("retained-provider-original"),
+        )
+        .unwrap();
+        let mut replacement =
+            crate::session::Instance::new("replacement", "/tmp/aoe-provider-peer");
+        replacement.id = id.clone();
+        replacement.view = crate::session::View::Structured;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![replacement]);
+        let replacement_storage = crate::session::Storage::open_unwatched("default").unwrap();
+        let expected = std::fs::read(replacement_storage.sessions_path()).unwrap();
+        drop(held_workers);
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.session_service.prompt_submission_for_session(&id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(completed);
+        assert!(instance_lock.try_lock().is_ok());
+        assert_eq!(
+            std::fs::read(replacement_storage.sessions_path()).unwrap(),
+            expected,
+            "rejected original must not mutate the replacement"
+        );
+        assert_eq!(
+            find_instance(&state, &id).await.unwrap().agent_provider,
+            None
+        );
     }
 
     /// The switch tears the worker down, so a busy worker, or one whose last

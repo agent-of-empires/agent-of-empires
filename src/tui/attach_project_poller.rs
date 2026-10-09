@@ -23,8 +23,11 @@ impl AttachProjectPoller {
         }
     }
 
-    pub fn request_attach(&self, request: AttachProjectRequest) {
-        self.worker.request(request);
+    pub fn request_attach(
+        &self,
+        request: AttachProjectRequest,
+    ) -> Result<(), std::sync::mpsc::SendError<AttachProjectRequest>> {
+        self.worker.try_request(request)
     }
 
     /// Non-blocking poll for a finished attach. Surfaces `Disconnected` rather

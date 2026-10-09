@@ -68,16 +68,32 @@ impl Default for ReconcilePoller {
 /// view reloads from the returned verdict rather than from a local-change
 /// notification.
 fn sweep(profiles: &[String]) -> bool {
-    let mut changed = false;
+    let mut storages = Vec::with_capacity(profiles.len());
     for profile in profiles {
-        match crate::session::trash::reconcile_trashed_profile(profile) {
-            Ok(healed) => changed |= !healed.is_empty(),
-            Err(error) => tracing::warn!(
-                target: "tui.home",
-                profile = %profile,
-                "trash reconciliation skipped: {error}",
-            ),
+        match crate::session::Storage::open_unwatched(profile) {
+            Ok(storage) => storages.push(storage),
+            Err(error) => {
+                tracing::warn!(target: "tui.home", %profile, %error, "trash target could not be opened");
+            }
         }
+    }
+    let mut changed = false;
+    for storage in &storages {
+        match storage.reconcile_filesystem_claims() {
+            Ok(reconciled) => changed |= reconciled,
+            Err(error) => {
+                tracing::warn!(target: "tui.home", profile = storage.profile(), %error, "filesystem claims retained after uncertain reconciliation")
+            }
+        }
+    }
+    changed |= match crate::session::trash::reconcile_trashed_profiles(&storages) {
+        Ok(healed) => !healed.is_empty(),
+        Err(error) => {
+            tracing::warn!(target: "tui.home", "trash reconciliation skipped: {error}");
+            false
+        }
+    };
+    for profile in profiles {
         changed |= crate::session::worktree_reconcile::reconcile_profile(profile);
     }
     changed
@@ -122,7 +138,7 @@ mod tests {
             })
             .unwrap();
 
-        assert!(sweep(&["default".to_string()]));
+        assert!(sweep(&["absent".to_string(), "default".to_string()]));
         let healed = storage
             .load()
             .unwrap()
@@ -134,7 +150,9 @@ mod tests {
             healed.pre_trash_project_path.as_deref(),
             project.path().join("feat").to_str(),
         );
-        // Idempotent: a second pass has nothing left to do.
-        assert!(!sweep(&["default".to_string()]));
+        assert!(!sweep(&["default".to_string(), "absent".to_string()]));
+        assert!(!crate::session::get_profile_dir_path("absent")
+            .unwrap()
+            .exists());
     }
 }

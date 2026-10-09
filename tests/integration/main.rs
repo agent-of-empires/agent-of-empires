@@ -1,9 +1,9 @@
 //! Consolidated integration-test binary.
 //!
-//! Each previous `tests/<name>.rs` lives here as a submodule. Cargo links one
-//! binary instead of one per file, which cuts test-build wall time
-//! substantially. New integration tests go here, not as loose files under
-//! `tests/`. Tests run as `cargo test --test integration [<module>::<test>]`.
+//! Public integration modules share one binary to reduce linking cost. Run
+//! them with `cargo test --test integration [<module>::<test>]`. Native runner
+//! transport cases use the private issuer through `src/lib.rs`; build `aoe`
+//! with the same features, then run `cargo test --lib runner_tests`.
 //!
 //! Environment writers use the default `#[serial]` key; all other tests use
 //! default `#[parallel]` so readers cannot overlap a writer. Fixtures that
@@ -33,7 +33,6 @@ mod storage_concurrency;
 mod terminal_smart_rename;
 mod tmux_reachability;
 mod tmux_send_keys;
-mod tui_attach_detach;
 mod update_command;
 mod worktree_integration;
 
@@ -48,15 +47,6 @@ mod acp_session_import;
 
 mod acp_provider_respawn;
 
-#[cfg(debug_assertions)]
-mod acp_midturn_resume;
-
-#[cfg(debug_assertions)]
-mod acp_silent_orphan;
-
-#[cfg(debug_assertions)]
-mod acp_runner_control;
-mod acp_runner_orphan;
 mod agent_lifecycle_cli;
 mod build_cache_config;
 mod build_version_rerun;

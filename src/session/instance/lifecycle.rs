@@ -1,5 +1,4 @@
-//! Cross-process lifecycle reservations: the generation-stamped lock that
-//! keeps two aoe processes from launching or killing the same session.
+//! Durable lifecycle exclusion is independent of native execution authority.
 
 use super::*;
 
@@ -13,6 +12,8 @@ pub enum LifecycleOperation {
     Purge,
     Restore,
     Trash,
+    Attach,
+    Create,
 }
 
 impl LifecycleOperation {
@@ -45,15 +46,30 @@ impl std::fmt::Display for LifecycleReservationError {
 impl std::error::Error for LifecycleReservationError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", content = "paths", rename_all = "snake_case")]
+pub enum WorktreePathClaims {
+    None,
+    Pending(Vec<std::path::PathBuf>),
+    Unknown(Option<Vec<std::path::PathBuf>>),
+}
+
+impl WorktreePathClaims {
+    pub(crate) fn is_pending(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecycleReservation {
     pub op: LifecycleOperation,
     pub generation: u64,
     pub at: DateTime<Utc>,
+    pub path_claims: WorktreePathClaims,
+    pub custodian: Option<crate::process::OriginalCustodianBirth>,
 }
 
 impl Instance {
-    /// Longer than any bounded hook, teardown, or worktree move. A crashed owner cannot retain the
-    /// reservation forever.
+    /// Claims-free lifecycle leases expire after a crashed owner.
     pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
     /// Acquire exclusive durable ownership of the next lifecycle generation.
@@ -64,7 +80,9 @@ impl Instance {
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
         if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
-            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+            reservation.path_claims.is_pending()
+                || (reservation.generation == self.lifecycle_generation
+                    && (now - reservation.at) < ttl)
         }) {
             return Err(LifecycleReservationError::Busy(reservation.op));
         }
@@ -78,6 +96,8 @@ impl Instance {
             op: operation,
             generation,
             at: now,
+            path_claims: WorktreePathClaims::None,
+            custodian: None,
         });
         Ok(generation)
     }
@@ -95,13 +115,23 @@ impl Instance {
             )
     }
 
-    pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
+    pub fn has_active_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
         matches!(
             &self.lifecycle_reservation,
             Some(reservation)
-                if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
+                if reservation.path_claims.is_pending()
+                    || (reservation.generation == self.lifecycle_generation
+                        && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL)
         )
+    }
+
+    /// Reconciliation must not respawn a purge-reserved session.
+    pub fn is_purge_reserved(&self, now: DateTime<Utc>) -> bool {
+        self.has_active_lifecycle_reservation(now)
+            && self
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.op == LifecycleOperation::Purge)
     }
 
     pub fn release_lifecycle_reservation_if_owned(
@@ -109,7 +139,9 @@ impl Instance {
         operation: LifecycleOperation,
         generation: u64,
     ) -> bool {
-        if self.lifecycle_reservation_is_owned(operation, generation) {
+        if self.lifecycle_reservation_is_owned(operation, generation)
+            && !self.has_pending_worktree_path_claims()
+        {
             self.lifecycle_reservation = None;
             true
         } else {
@@ -117,8 +149,13 @@ impl Instance {
         }
     }
 
-    /// Clear a crashed owner's expired reservation. The generation is
-    /// deliberately retained as the monotonic cache/result revision.
+    pub(crate) fn has_pending_worktree_path_claims(&self) -> bool {
+        self.lifecycle_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.path_claims.is_pending())
+    }
+
+    /// Clock expiry cannot settle pending filesystem effects.
     pub fn clear_expired_lifecycle_reservation(
         &mut self,
         ttl: chrono::Duration,
@@ -127,7 +164,8 @@ impl Instance {
         if matches!(
             &self.lifecycle_reservation,
             Some(reservation)
-                if reservation.generation == self.lifecycle_generation
+                if !reservation.path_claims.is_pending()
+                    && reservation.generation == self.lifecycle_generation
                     && (now - reservation.at) >= ttl
         ) {
             self.lifecycle_reservation = None;
@@ -143,31 +181,36 @@ impl Instance {
         restart: bool,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let committed = storage.update(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
-            };
-            if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
-                return Ok(false);
-            }
-            stored.status = self.status;
-            stored.idle_entered_at = self.idle_entered_at;
-            stored.last_accessed_at = self.last_accessed_at;
-            stored.sandbox_info = self.sandbox_info.clone();
-            stored.capture_started_at = self.capture_started_at;
-            stored.active_execution = self.active_execution.clone();
-            if restart && stored.agent_session_id == self.agent_session_id {
-                stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
-            }
-            stored.first_launch_names_agent = false;
-            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
-            Ok(true)
-        })?;
-        anyhow::ensure!(
-            committed,
-            "session {} disappeared or lost its lifecycle reservation before launch commit",
-            self.id
-        );
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == self.id)
+                    .with_context(|| {
+                        format!("session {} disappeared before launch commit", self.id)
+                    })?;
+                anyhow::ensure!(
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Launch,
+                        generation
+                    ),
+                    "session {} lost its launch reservation or retains pending path claims",
+                    self.id
+                );
+                stored.status = self.status;
+                stored.idle_entered_at = self.idle_entered_at;
+                stored.last_accessed_at = self.last_accessed_at;
+                stored.sandbox_info = self.sandbox_info.clone();
+                stored.capture_started_at = self.capture_started_at;
+                stored.active_execution = self.active_execution.clone();
+                if restart && stored.agent_session_id == self.agent_session_id {
+                    stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
+                }
+                stored.first_launch_names_agent = false;
+                Ok(())
+            },
+        )?;
         self.lifecycle_reservation = None;
         self.first_launch_names_agent = false;
         Ok(())
@@ -178,32 +221,47 @@ impl Instance {
         storage: &crate::session::storage::Storage,
         operation: LifecycleOperation,
         status: Option<Status>,
+        acknowledgement: Option<&mut Option<std::sync::Arc<crate::session::LaunchOrigin>>>,
     ) -> Result<u64> {
         let now = Utc::now();
         let mut acquired = None;
-        storage.update(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(());
-            };
-            let generation = stored
-                .try_acquire_lifecycle_reservation(operation, Self::LIFECYCLE_RESERVATION_TTL, now)
-                .map_err(|error| match error {
-                    LifecycleReservationError::Busy(holder) => {
-                        anyhow::anyhow!("session {} is {}", self.id, holder.busy_reason())
+        let mut receipt = None;
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    return Ok(());
+                };
+                let generation = stored
+                    .try_acquire_lifecycle_reservation(
+                        operation,
+                        Self::LIFECYCLE_RESERVATION_TTL,
+                        now,
+                    )
+                    .map_err(|error| match error {
+                        LifecycleReservationError::Busy(holder) => {
+                            anyhow::anyhow!("session {} is {}", self.id, holder.busy_reason())
+                        }
+                        LifecycleReservationError::GenerationOverflow => {
+                            anyhow::anyhow!("session {} lifecycle generation overflow", self.id)
+                        }
+                    })?;
+                if let Some(status) = status {
+                    stored.status = status;
+                    if status != Status::Idle {
+                        stored.idle_entered_at = None;
                     }
-                    LifecycleReservationError::GenerationOverflow => {
-                        anyhow::anyhow!("session {} lifecycle generation overflow", self.id)
-                    }
-                })?;
-            if let Some(status) = status {
-                stored.status = status;
-                if status != Status::Idle {
-                    stored.idle_entered_at = None;
                 }
-            }
-            acquired = Some((generation, stored.lifecycle_reservation.clone()));
-            Ok(())
-        })?;
+                if acknowledgement.is_some() {
+                    let mut emitted = stored.clone();
+                    emitted.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+                    receipt = Some(crate::session::LaunchOrigin::capture(&emitted)?);
+                }
+                acquired = Some((generation, stored.lifecycle_reservation.clone()));
+                Ok(())
+            },
+        )?;
         let Some((generation, reservation)) = acquired else {
             anyhow::bail!("session {} no longer exists", self.id);
         };
@@ -215,6 +273,9 @@ impl Instance {
                 self.idle_entered_at = None;
             }
         }
+        if let Some(destination) = acknowledgement {
+            *destination = receipt;
+        }
         Ok(generation)
     }
 
@@ -225,25 +286,27 @@ impl Instance {
         status: Status,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let committed = storage.update(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
-            };
-            if !stored.lifecycle_reservation_is_owned(operation, generation) {
-                return Ok(false);
-            }
-            stored.status = status;
-            if status != Status::Idle {
-                stored.idle_entered_at = None;
-            }
-            stored.release_lifecycle_reservation_if_owned(operation, generation);
-            Ok(true)
-        })?;
-        anyhow::ensure!(
-            committed,
-            "session {} disappeared or lost its lifecycle reservation before commit",
-            self.id
-        );
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == self.id)
+                    .with_context(|| {
+                        format!("session {} disappeared before lifecycle commit", self.id)
+                    })?;
+                anyhow::ensure!(
+                    stored.release_lifecycle_reservation_if_owned(operation, generation),
+                    "session {} lost its lifecycle reservation or retains pending path claims",
+                    self.id
+                );
+                stored.status = status;
+                if status != Status::Idle {
+                    stored.idle_entered_at = None;
+                }
+                Ok(())
+            },
+        )?;
         self.lifecycle_reservation = None;
         self.status = status;
         if status != Status::Idle {
@@ -258,17 +321,23 @@ impl Instance {
         operation: LifecycleOperation,
     ) -> Result<()> {
         let generation = self.lifecycle_generation;
-        let released = storage.update(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(false);
-            };
-            Ok(stored.release_lifecycle_reservation_if_owned(operation, generation))
-        })?;
-        anyhow::ensure!(
-            released,
-            "session {} disappeared or lost its lifecycle reservation before release",
-            self.id
-        );
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == self.id)
+                    .with_context(|| {
+                        format!("session {} disappeared before lifecycle release", self.id)
+                    })?;
+                anyhow::ensure!(
+                    stored.release_lifecycle_reservation_if_owned(operation, generation),
+                    "session {} lost its lifecycle reservation or retains pending path claims",
+                    self.id
+                );
+                Ok(())
+            },
+        )?;
         self.lifecycle_reservation = None;
         Ok(())
     }
@@ -344,12 +413,17 @@ impl Instance {
         operation: LifecycleOperation,
     ) -> Result<bool> {
         let generation = self.lifecycle_generation;
-        storage.update(|instances, _groups| {
-            Ok(instances
-                .iter()
-                .find(|instance| instance.id == self.id)
-                .is_some_and(|stored| stored.lifecycle_reservation_is_owned(operation, generation)))
-        })
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                Ok(instances
+                    .iter()
+                    .find(|instance| instance.id == self.id)
+                    .is_some_and(|stored| {
+                        stored.lifecycle_reservation_is_owned(operation, generation)
+                    }))
+            },
+        )
     }
 
     fn reservation_is_current(&self, storage: &crate::session::storage::Storage) -> Result<bool> {
@@ -405,7 +479,53 @@ mod tests {
             op,
             generation: 1,
             at,
+            path_claims: crate::session::WorktreePathClaims::None,
+            custodian: None,
         })
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn refused_durable_release_keeps_pending_claims_and_memory_reservation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::storage::Storage::new_unwatched("refused-release").unwrap();
+        for operation in [LifecycleOperation::Launch, LifecycleOperation::Stop] {
+            for claims in [
+                WorktreePathClaims::Pending(vec!["/protected".into()]),
+                WorktreePathClaims::Unknown(None),
+            ] {
+                let mut original = Instance::new("session", "/protected");
+                original.status = Status::Starting;
+                original.lifecycle_generation = 1;
+                original.lifecycle_reservation = held(
+                    operation,
+                    DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                );
+                original.lifecycle_reservation.as_mut().unwrap().path_claims = claims;
+                original.first_launch_names_agent = true;
+                let source = serde_json::to_vec(&vec![original.clone()]).unwrap();
+                std::fs::write(storage.sessions_path(), &source).unwrap();
+                let mut candidate = storage.load().unwrap().remove(0);
+                candidate.status = Status::Idle;
+                let reservation = candidate.lifecycle_reservation.clone();
+                let result = if operation == LifecycleOperation::Launch {
+                    candidate.commit_lifecycle_launch(&storage, true)
+                } else {
+                    candidate.commit_lifecycle_status(&storage, operation, Status::Stopped)
+                };
+                assert!(result.is_err());
+                assert_eq!(candidate.lifecycle_reservation, reservation);
+                assert_eq!(candidate.status, Status::Idle);
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), source);
+                let persisted = storage.load().unwrap().remove(0);
+                assert_eq!(persisted.status, Status::Starting);
+                assert!(persisted.first_launch_names_agent);
+                assert_eq!(
+                    persisted.lifecycle_reservation,
+                    original.lifecycle_reservation
+                );
+            }
+        }
     }
 
     #[test]
@@ -421,6 +541,7 @@ mod tests {
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap_err();
         assert!(missing.to_string().contains("no longer exists"));
@@ -436,6 +557,7 @@ mod tests {
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap();
         let generation = instance.lifecycle_generation;
@@ -540,6 +662,7 @@ mod tests {
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             );
             assert_eq!(result.is_ok(), *allowed, "{}", instance.title);
         }
@@ -571,9 +694,16 @@ mod tests {
             })
             .unwrap();
 
-        let began = std::time::Instant::now();
-        assert!(busy.stop().unwrap_err().to_string().contains("busy"));
-        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        let selected = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == busy.id && row.created_at == busy.created_at)
+            .unwrap();
+        let original = crate::session::LaunchOrigin::capture(&selected).unwrap();
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        assert!(selected.stop(&original, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
 
         let mut recursive_start = busy.clone();
         let began = std::time::Instant::now();
@@ -606,6 +736,7 @@ mod tests {
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
+            None,
         )
         .unwrap();
         let reserved_gen = inst.lifecycle_generation;
@@ -654,19 +785,26 @@ mod tests {
         let mut first = Instance::new("first", "/tmp/test");
         first.source_profile = profile.into();
         first.first_launch_names_agent = true;
-        let mut held_copy = first.clone();
         storage
             .update(|instances, _groups| {
                 instances.push(first.clone());
                 Ok(())
             })
             .unwrap();
+        first = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == first.id)
+            .unwrap();
+        let mut held_copy = first.clone();
 
         first
             .acquire_lifecycle_reservation(
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap();
         assert!(
@@ -683,7 +821,7 @@ mod tests {
         assert!(!disk.first_launch_names_agent);
         assert!(!first.first_launch_names_agent);
 
-        assert!(held_copy.try_reconcile_from_disk().unwrap());
+        assert!(held_copy.try_reconcile_from_disk(false).unwrap());
         assert!(
             !held_copy.first_launch_names_agent,
             "a restart from a stale copy must not name the agent again"
@@ -698,6 +836,7 @@ mod tests {
         let storage =
             crate::session::storage::Storage::new_unwatched("lifecycle-launch-commit").unwrap();
         let mut committed = Instance::new("committed", "/tmp/test");
+        committed.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         let mut stale = Instance::new("stale", "/tmp/test");
         let mut overflow = Instance::new("overflow", "/tmp/test");
         overflow.lifecycle_generation = u64::MAX;
@@ -708,17 +847,32 @@ mod tests {
             })
             .unwrap();
 
+        let mut own_reservation = None;
         committed
             .acquire_lifecycle_reservation(
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                Some(&mut own_reservation),
             )
             .unwrap();
+        let own_reservation =
+            own_reservation.expect("successful real CAS must return its exact receipt");
+        let reserved_cache = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == committed.id)
+            .unwrap();
+        let cached_scope = crate::session::LaunchOrigin::capture(&reserved_cache).unwrap();
         let reserved_generation = committed.lifecycle_generation;
         let capture_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
         committed.status = Status::Running;
         committed.capture_started_at = Some(capture_floor);
+        committed.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "committed",
+            Some("/workspace/committed"),
+        ));
         committed.commit_lifecycle_launch(&storage, false).unwrap();
         let disk = storage
             .load()
@@ -730,12 +884,28 @@ mod tests {
         assert_eq!(disk.lifecycle_generation, committed.lifecycle_generation);
         assert_eq!(disk.status, Status::Running);
         assert_eq!(disk.capture_started_at, Some(capture_floor));
+        let own_commit = crate::session::LaunchOrigin::capture(&committed).unwrap();
+        assert_eq!(own_reservation.generation(), own_commit.generation());
+        assert!(own_reservation.recognizes_published_snapshot(&cached_scope));
+        assert!(
+            !own_commit.recognizes_published_snapshot(&cached_scope),
+            "same counter alone must not translate a different execution plan"
+        );
+        assert!(
+            own_reservation.with_storage(|_, _| Ok(())).is_err(),
+            "the earlier actual ACK must not authorize the new canonical plan"
+        );
+        assert!(
+            own_commit.with_storage(|_, _| Ok(())).is_ok(),
+            "only the actual committed plan may publish canonical effects"
+        );
 
         stale
             .acquire_lifecycle_reservation(
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap();
         let stale_token = stale.lifecycle_generation;
@@ -754,8 +924,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let error = stale.commit_lifecycle_launch(&storage, false).unwrap_err();
-        assert!(error.to_string().contains("lost its lifecycle reservation"));
+        stale.commit_lifecycle_launch(&storage, false).unwrap_err();
         let disk = storage
             .load()
             .unwrap()
@@ -776,6 +945,7 @@ mod tests {
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
+                None,
             )
             .unwrap_err()
             .to_string()
@@ -790,35 +960,6 @@ mod tests {
         assert_eq!(overflow.status, Status::Idle);
         assert_eq!(disk.lifecycle_generation, u64::MAX);
         assert_eq!(disk.status, Status::Idle);
-    }
-
-    #[test]
-    fn lifecycle_reservation_roundtrips_and_legacy_rows_default_to_none() {
-        let fresh = Instance::new("s", "/tmp/x");
-        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
-        assert!(!fresh_json.contains("lifecycle_reservation"));
-        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
-        assert_eq!(parsed.lifecycle_reservation, None);
-
-        let mut instance = Instance::new("s", "/tmp/x");
-        let now = Utc::now();
-        let generation = instance
-            .try_acquire_lifecycle_reservation(
-                LifecycleOperation::Purge,
-                Instance::LIFECYCLE_RESERVATION_TTL,
-                now,
-            )
-            .expect("free row grants the lease");
-        let json = serde_json::to_string(&instance).expect("serialize");
-        let back: Instance = serde_json::from_str(&json).expect("round-trip");
-        assert_eq!(
-            back.lifecycle_reservation,
-            Some(LifecycleReservation {
-                op: LifecycleOperation::Purge,
-                generation,
-                at: now,
-            })
-        );
     }
 
     #[test]
@@ -879,6 +1020,56 @@ mod tests {
             .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, old_generation,));
         assert!(
             instance.lifecycle_reservation_is_owned(LifecycleOperation::Restore, new_generation,)
+        );
+    }
+    /// The reconciler skips a row a purge holds, so the next tick does not
+    /// respawn the runner the purge just settled from the registry. A
+    /// reservation that has expired, or that another operation owns, is not a
+    /// purge and must still let the row resume.
+    #[test]
+    fn only_a_fresh_purge_reservation_marks_the_row_as_purging() {
+        let now = Utc::now();
+        let mut instance = Instance::new("Reconciler", "/tmp/reconciler");
+        assert!(
+            !instance.is_purge_reserved(now),
+            "a row with no reservation is resumable"
+        );
+
+        instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .unwrap();
+        assert!(
+            !instance.is_purge_reserved(now),
+            "a launch reservation is not a purge and must not hide the row"
+        );
+
+        assert!(
+            instance.release_lifecycle_reservation_if_owned(
+                LifecycleOperation::Launch,
+                instance.lifecycle_generation,
+            ),
+            "the launch reservation is released before the purge takes the row"
+        );
+        instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .unwrap();
+        assert!(
+            instance.is_purge_reserved(now),
+            "a fresh purge reservation must keep the reconciler off this row"
+        );
+
+        let later = now + Instance::LIFECYCLE_RESERVATION_TTL + chrono::Duration::seconds(1);
+        assert!(
+            !instance.is_purge_reserved(later),
+            "an expired purge reservation releases the row again"
         );
     }
 }

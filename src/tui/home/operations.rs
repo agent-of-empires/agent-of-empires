@@ -1,16 +1,13 @@
 //! Session operations for HomeView (create, delete, rename)
 
-use crate::session::builder::{self, InstanceParams};
-use crate::session::conversation_carry;
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
+    acquire_session_identity_lock, acquire_session_workspace_claim_lock, Instance, Item,
+    LifecycleOperation, StartBlocked, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
-use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
-use crate::tui::restart_poller::RestartRequest;
+use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog};
 
-use super::HomeView;
+use super::{persistence_transactions, HomeView};
 
 /// Matches instances whose `group_path` is `group_path` or nests beneath it,
 /// optionally scoped to one profile. `prefix` must be `"{group_path}/"`; callers
@@ -26,17 +23,16 @@ fn group_membership<'a>(
     }
 }
 
-enum PersistGroupDelete {
-    Ready(Vec<Instance>),
-    Creating,
-    Restarting,
-}
-
-fn rekey_tmux_after_persist(id: &str, old_title: &str, new_title: &str) -> Option<String> {
+pub(super) fn rekey_tmux_after_persist(
+    id: &str,
+    old_title: &str,
+    new_title: &str,
+    target: anyhow::Result<Option<crate::tmux::Session>>,
+) -> Option<String> {
     if old_title == new_title {
         return None;
     }
-    match crate::tmux::rekey_session(id, old_title, new_title) {
+    match crate::tmux::rekey_session(id, new_title, target) {
         Ok(_) => None,
         Err(error) => {
             tracing::warn!(target: "tui.home", session = %id, "tmux rename failed after persistence: {error}");
@@ -63,7 +59,7 @@ fn humanize_minutes(m: u32) -> String {
 /// `rename(2)` behind `git worktree move` fails while an agent or a sandbox
 /// container (alive even when Idle) holds the dir. Stopping the session clears both.
 #[derive(Debug, PartialEq, Eq)]
-enum WorktreeRenameBlock {
+pub(super) enum WorktreeRenameBlock {
     /// The session's agent is busy (running, starting, etc.).
     ActiveAgent,
     /// A sandbox container is running and mounting the worktree dir.
@@ -72,7 +68,7 @@ enum WorktreeRenameBlock {
 
 /// Whether the move must be blocked, and why; `None` when it is safe. Status takes
 /// precedence over the container reason.
-fn worktree_rename_block(
+pub(super) fn worktree_rename_block(
     status: Status,
     is_sandboxed: bool,
     container_running: bool,
@@ -86,7 +82,7 @@ fn worktree_rename_block(
     }
 }
 
-fn worktree_rename_block_message(reason: &WorktreeRenameBlock) -> &'static str {
+pub(super) fn worktree_rename_block_message(reason: &WorktreeRenameBlock) -> &'static str {
     match reason {
         WorktreeRenameBlock::ActiveAgent => "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
         WorktreeRenameBlock::SandboxContainer => "This sandbox session's container is mounting the worktree directory, so it can't be moved to match the new name. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
@@ -223,65 +219,6 @@ impl HomeView {
         }
     }
 
-    pub(super) fn create_session(&mut self, data: NewSessionData) -> anyhow::Result<String> {
-        let target_profile = data.profile.clone();
-
-        // In unified mode, all instances are loaded, so use them for title dedup.
-        // For the target profile, filter to that profile's instances.
-        let existing_titles: Vec<&str> = self
-            .instances()
-            .filter(|i| i.source_profile == target_profile)
-            .map(|i| i.title.as_str())
-            .collect();
-        let existing_branches: Vec<&str> = self
-            .instances()
-            .filter(|i| i.source_profile == target_profile)
-            .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
-            .collect();
-
-        // `structured` is applied post-build (mirrors the web create
-        // handler); read it off before the params conversion consumes data.
-        let structured = data.structured;
-        let params = InstanceParams::from(data);
-
-        let build_result = builder::build_instance(
-            params,
-            &existing_titles,
-            &existing_branches,
-            &target_profile,
-        )?;
-        let mut instance = build_result.instance;
-        instance.source_profile = target_profile.clone();
-        if structured {
-            builder::structured::apply_structured_choice(&mut instance);
-        }
-        let session_id = instance.id.clone();
-
-        // Ensure target profile storage exists
-        if !self.storages.contains_key(&target_profile) {
-            self.storages.insert(
-                target_profile.clone(),
-                Storage::new(&target_profile, self.file_watch.clone())?,
-            );
-        }
-
-        self.add_instance(instance.clone());
-        self.rebuild_group_trees();
-        if !instance.group_path.is_empty() {
-            if let Some(tree) = self.group_trees.get_mut(&target_profile) {
-                tree.create_group(&instance.group_path);
-            }
-        }
-        self.save()?;
-
-        self.reload()?;
-        // reload()'s selection fallback lands on the nearest index, often the new
-        // session's group folder, so pin the selection the caller attaches to. Same as
-        // the async branch in apply_creation_results.
-        self.select_and_reveal_session(&session_id);
-        Ok(session_id)
-    }
-
     /// A trashed/archived row's agent was stopped deliberately, so refuse a start
     /// visibly and point at the restore key instead of swallowing the press.
     pub(in crate::tui) fn refuse_start_if_shelved(&mut self, id: &str) -> bool {
@@ -332,21 +269,21 @@ impl HomeView {
         new_tool: Option<&str>,
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::TransactionDisposition> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
-            None => return Ok(()),
+            None => return Ok(super::TransactionDisposition::Ignored),
         };
 
         // A cascade for this row is already on the worker. The 1.5s debounce below does
         // not cover a deliberate second press during a multi-second pull, and a duplicate
         // request would restart the row into the container the first one is building.
-        if self.restart_in_flight.contains(&id) {
-            return Ok(());
+        if self.restart_in_flight.contains_key(&id) || self.transaction_is_pending(&id) {
+            return Ok(super::TransactionDisposition::Ignored);
         }
 
         if self.refuse_start_if_shelved(&id) {
-            return Ok(());
+            return Ok(super::TransactionDisposition::Ignored);
         }
 
         // Skip transient rows. Snoozed rows only skip when the user is
@@ -361,10 +298,10 @@ impl HomeView {
                 let wake_snooze = snoozed && !in_attention;
                 (skip, wake_snooze)
             }
-            None => return Ok(()),
+            None => return Ok(super::TransactionDisposition::Ignored),
         };
         if skip {
-            return Ok(());
+            return Ok(super::TransactionDisposition::Ignored);
         }
 
         // Spam-debounce. Holding `e` or pressing it twice fast otherwise
@@ -372,256 +309,21 @@ impl HomeView {
         let now = std::time::Instant::now();
         if let Some(prev) = self.restart_cooldown_at.get(&id) {
             if now.duration_since(*prev) < std::time::Duration::from_millis(1500) {
-                return Ok(());
+                return Ok(super::TransactionDisposition::Ignored);
             }
         }
-        let restart_edit_baseline = self
-            .get_instance(&id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        let current_profile = restart_edit_baseline.source_profile.clone();
-        let profile_move_target = new_profile
-            .filter(|target| *target != current_profile.as_str())
-            .map(str::to_string);
-        if let Some(target_profile) = profile_move_target.as_ref() {
-            let profiles = list_profiles()?;
-            if !profiles.contains(target_profile) {
-                anyhow::bail!("Profile '{}' does not exist", target_profile);
-            }
-        }
-
-        // Identity-changing edits follow the global lock order: app-wide identity, then
-        // session title and source lifecycle. Hold both through the profile transaction.
-        let profile_move_identity = if profile_move_target.is_some() {
-            Some(acquire_session_identity_lock()?)
-        } else {
-            None
-        };
-        let profile_move_guards = if profile_move_target.is_some() {
-            Some(self.lock_session_mutation_and_reload(&id)?)
-        } else {
-            None
-        };
-        let restart_edit_authoritative = self
-            .get_instance(&id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        if let Some(target_profile) = profile_move_target.as_deref() {
-            let target_rows = Storage::open(target_profile, self.file_watch.clone())?.load()?;
-            if is_duplicate_session(
-                target_rows.iter(),
-                &restart_edit_authoritative.title,
-                &restart_edit_authoritative.project_path,
-                None,
-            ) {
-                return Err(duplicate_session_error(&restart_edit_authoritative.title));
-            }
-        }
-
-        let tool_swapped = new_tool.is_some_and(|tool| tool != restart_edit_authoritative.tool);
-        // Decided against the pre-swap row: once the swap has run, the outgoing
-        // account's config root is no longer reachable from the instance.
-        let swap_kind = match new_tool.filter(|_| tool_swapped) {
-            Some(tool) => conversation_carry::classify(
-                &restart_edit_authoritative,
-                profile_move_target.as_deref().unwrap_or(&current_profile),
-                tool,
-            ),
-            None => conversation_carry::ToolSwap::Park,
-        };
-        let (account_swap, mut carry_plan) = match swap_kind {
-            conversation_carry::ToolSwap::Park => (false, None),
-            conversation_carry::ToolSwap::KeepConversation(carry) => (true, carry),
-        };
-
-        // A cross-profile restart stages on a detached candidate: do not persist a tool
-        // swap into the source row before the target transaction accepts it.
-        if let Some(target_profile) = profile_move_target.as_deref() {
-            if !self.storages.contains_key(target_profile) {
-                self.storages.insert(
-                    target_profile.to_string(),
-                    Storage::open(target_profile, self.file_watch.clone())?,
-                );
-            }
-
-            let mut requested = restart_edit_authoritative.clone();
-            if wake_snooze {
-                requested.unsnooze();
-            }
-            if let Some(target_tool) = new_tool {
-                if target_tool != restart_edit_authoritative.tool.as_str() {
-                    if account_swap {
-                        requested.swap_account(target_tool);
-                    } else {
-                        requested.swap_tool(target_tool);
-                    }
-                }
-            }
-            if let Some(command) = new_command_override {
-                requested.command = command.to_string();
-            }
-            if let Some(extra) = new_extra_args {
-                requested.extra_args = extra.to_string();
-            }
-            self.move_to_profile(
-                &id,
-                target_profile,
-                requested,
-                Some(&restart_edit_authoritative),
-                account_swap,
-            )?;
-            // The committed row is the authority the launch resumes from, and
-            // the capture pollers can have refreshed its conversation since the
-            // snapshot the plan froze; see `ConversationCarry::retarget`.
-            if let Some(carry) = carry_plan.as_mut() {
-                if let Some(moved) = self.get_instance(&id) {
-                    carry.retarget(conversation_carry::conversation_ids(moved));
-                }
-            }
-            self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
-        } else {
-            // Outside Attention sort, restart on a snoozed row clears the
-            // snooze flag so persisted state matches the visible restart.
-            if wake_snooze {
-                self.mutate_instance(&id, |inst| inst.unsnooze());
-            }
-
-            if let Some(target_tool) = new_tool {
-                let current_tool = self
-                    .get_instance(&id)
-                    .map(|i| i.tool.clone())
-                    .unwrap_or_default();
-                if target_tool != current_tool {
-                    if account_swap {
-                        self.mutate_instance(&id, |inst| inst.swap_account(target_tool));
-                    } else {
-                        self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
-                    }
-                    let disk_ids = self.persist_tool_swap(&id, target_tool, account_swap);
-                    if let Some(carry) = carry_plan.as_mut() {
-                        carry.retarget(disk_ids);
-                    }
-                }
-            }
-            if let Some(command) = new_command_override {
-                self.mutate_instance(&id, |inst| {
-                    inst.command = command.to_string();
-                });
-            }
-            if let Some(extra) = new_extra_args {
-                self.mutate_instance(&id, |inst| {
-                    inst.extra_args = extra.to_string();
-                });
-            }
-        }
-        self.restart_cooldown_at.insert(id.clone(), now);
-        self.mutate_instance(&id, |inst| inst.touch_last_accessed());
-
-        // Persist profile/tool/command and the access timestamp while the durable row
-        // still carries its prior lifecycle. The worker owns the Starting reservation;
-        // publishing that status here would make it reject its own request.
-        self.save()?;
-        // The canonical profile locks are already released; publish the final launch
-        // edit while identity, title and lifecycle are still guarded.
-        drop(profile_move_identity);
-        drop(profile_move_guards);
-
-        // The cascade shells out to docker and runs the before_start hook, so it stays
-        // off the event loop: show Starting locally, let the worker reserve and persist
-        // it, and reconcile through `apply_restart_results`.
-        let size = crate::terminal::get_size();
-
-        // Starting plus a fresh last_start_time keeps the StatusPoller from flipping the
-        // row to Error before the worker finishes.
-        self.mutate_instance(&id, |inst| {
-            inst.status = Status::Starting;
-            inst.last_error = None;
-            inst.last_start_time = Some(std::time::Instant::now());
-        });
-
-        let Some(instance) = self.get_instance(&id).cloned() else {
-            return Ok(());
-        };
-
-        // Resolve the wake message on the main thread (config access). Empty is
-        // the documented opt-out; the worker skips the wake-up then.
-        let wake_message = crate::session::resolve_config(&instance.source_profile)
-            .map(|c| c.session.restart_wake_message.clone())
-            .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
-
-        self.restart_in_flight.insert(id.clone());
-        self.restart_poller.request_restart(RestartRequest {
-            session_id: id,
-            instance,
-            size,
-            wake_message,
-            skip_on_launch: false,
-            bound_hooks: true,
-            discard_sandbox_container: tool_swapped,
-            conversation_carry: carry_plan,
-        });
-        Ok(())
-    }
-
-    /// Land an engine swap's session bookkeeping on the disk row.
-    ///
-    /// `account_swap` picks which swap the disk row takes: the parking one, or the one
-    /// that keeps the conversation because only the account changed. Returns the
-    /// conversation ids the disk row held before the swap, which a carry uses in place
-    /// of the ones its plan froze; see
-    /// [`crate::session::conversation_carry::ConversationCarry::retarget`].
-    ///
-    /// `save()` leaves `agent_session_id` and friends to their CAS writers, so without
-    /// this write `reconcile_from_disk` restores the old engine's sid and the new engine
-    /// resumes a foreign one. It runs against the disk row because the capture pollers
-    /// may hold a fresher sid than this snapshot; parking whatever disk holds is what
-    /// makes a swap-back restore the real conversation. Best-effort: a failed write
-    /// leaves the stale sid and the restart's resume probe recovers by starting fresh.
-    fn persist_tool_swap(&self, id: &str, new_tool: &str, account_swap: bool) -> Vec<String> {
-        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
-            return Vec::new();
-        };
-        let Some(storage) = self.storages.get(&profile) else {
-            tracing::warn!(
-                target: "tui.home",
-                profile = %profile,
-                id = %id,
-                "persist_tool_swap: no storage registered for profile; \
-                 the old engine's session id stays on disk"
-            );
-            return Vec::new();
-        };
-        let id_owned = id.to_string();
-        let new_tool = new_tool.to_string();
-        let row_profile = profile.clone();
-        let observed = storage.update(|instances, _groups| {
-            let mut observed = Vec::new();
-            if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
-                observed = crate::session::conversation_carry::conversation_ids(disk);
-                // `source_profile` is `skip_serializing`, so a storage-loaded row
-                // resolves `agent_detect_as` against the default profile and would pin
-                // the wrong built-in; `detect_as` is not in `reconcile_from_disk`'s carry
-                // set, so the next launch reads that value. Restore it before the swap.
-                disk.source_profile = row_profile.clone();
-                if account_swap {
-                    disk.swap_account(&new_tool);
-                } else {
-                    disk.swap_tool(&new_tool);
-                }
-            }
-            Ok(observed)
-        });
-        match observed {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::error!(
-                    target: "tui.home",
-                    id = %id,
-                    "persist_tool_swap: failed to move the old engine's session state aside: {e}"
-                );
-                Vec::new()
-            }
-        }
+        let row = self.capture_transaction_row(&id)?;
+        let target = self.capture_transaction_target(new_profile, &row.before.source_profile)?;
+        self.restart_cooldown_at.insert(id, now);
+        self.request_transaction(persistence_transactions::TransactionRequest::Restart {
+            row,
+            target,
+            tool: new_tool.map(str::to_owned),
+            extra: new_extra_args.map(str::to_owned),
+            command: new_command_override.map(str::to_owned),
+            wake_snooze,
+            size: crate::terminal::get_size(),
+        })
     }
 
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
@@ -630,7 +332,7 @@ impl HomeView {
 
             // Deleting a row mid-restart would fire docker commands against the
             // container the restart worker is creating and orphan resources.
-            if self.restart_in_flight.contains(&id) {
+            if self.restart_in_flight.contains_key(&id) {
                 self.info_dialog = Some(InfoDialog::new(
                     "Restart in progress",
                     "This session is still restarting. Wait for it to finish before deleting.",
@@ -657,217 +359,177 @@ impl HomeView {
         Ok(())
     }
 
-    pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {
-        if let Some(group_path) = self.selected_group.take() {
-            let owning_profile = self.selected_group_profile.take();
-            let prefix = format!("{}/", group_path);
-            let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
-            let ids_to_clear: Vec<String> = self
-                .instances
-                .values()
-                .filter(|i| is_member(i))
-                .map(|i| i.id.clone())
-                .collect();
-            self.bulk_apply_user_action(&ids_to_clear, |inst| {
-                inst.group_path = String::new();
-            })?;
-
-            self.rebuild_group_trees();
-            if let Some(profile) = &owning_profile {
-                self.delete_group_in_profile(profile, &group_path);
-            } else {
-                let profiles: Vec<String> = self.group_trees.keys().cloned().collect();
-                for profile in profiles {
-                    self.delete_group_in_profile(&profile, &group_path);
-                }
-            }
-            self.save()?;
-
-            self.reload()?;
-        }
-        Ok(())
-    }
-
-    /// Commit one profile's group deletion before any purge is queued, so a watcher
-    /// reload or a restart cannot rebuild the group from an unchanged `groups.json`.
-    /// Blockers are re-checked against durable rows because a Creating member may exist
-    /// only on disk. `Status::Deleting` stays an in-memory overlay owned by
-    /// `PurgeTransaction`.
-    fn persist_group_delete_with_sessions(
+    pub(super) fn delete_selected_group(
         &mut self,
-        profile: &str,
-        group_path: &str,
-    ) -> anyhow::Result<PersistGroupDelete> {
-        let prefix = format!("{group_path}/");
-        let storage = self
-            .storages
-            .get(profile)
-            .ok_or_else(|| anyhow::anyhow!("No storage registered for profile '{profile}'"))?;
-        let restart_in_flight = &self.restart_in_flight;
-        let mut outcome = storage.update(|instances, groups| {
-            let mut has_creating = false;
-            let mut has_restarting = false;
-            for instance in instances.iter().filter(|instance| {
-                instance.group_path == group_path || instance.group_path.starts_with(&prefix)
-            }) {
-                has_creating |= instance.status == Status::Creating;
-                has_restarting |= restart_in_flight.contains(&instance.id);
-            }
-            if has_creating {
-                return Ok(PersistGroupDelete::Creating);
-            }
-            if has_restarting {
-                return Ok(PersistGroupDelete::Restarting);
-            }
-
-            let mut members = Vec::new();
-            for instance in instances.iter_mut() {
-                if instance.group_path == group_path || instance.group_path.starts_with(&prefix) {
-                    members.push(instance.clone());
-                    instance.group_path.clear();
-                }
-            }
-            groups.retain(|group| group.path != group_path && !group.path.starts_with(&prefix));
-            Ok(PersistGroupDelete::Ready(members))
-        })?;
-        if let PersistGroupDelete::Ready(members) = &mut outcome {
-            for instance in members {
-                instance.source_profile.clear();
-                instance.source_profile.push_str(profile);
-            }
-            if let Some(tree) = self.group_trees.get_mut(profile) {
-                tree.delete_group(group_path);
-            }
-        }
-        Ok(outcome)
+    ) -> anyhow::Result<super::TransactionDisposition> {
+        let Some(path) = self.selected_group.clone() else {
+            return Ok(super::TransactionDisposition::Ignored);
+        };
+        let names = self
+            .selected_group_profile
+            .clone()
+            .map(|p| vec![p])
+            .unwrap_or_else(|| self.group_trees.keys().cloned().collect());
+        let profiles = names
+            .into_iter()
+            .map(|p| {
+                self.storages
+                    .get(&p)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("Original group profile unavailable: {p}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.request_transaction(persistence_transactions::TransactionRequest::DeleteGroup {
+            profiles,
+            path,
+            restarting: self.restart_in_flight.keys().cloned().collect(),
+            options: None,
+        })
     }
 
     pub(super) fn delete_group_with_sessions(
         &mut self,
         options: &GroupDeleteOptions,
+    ) -> anyhow::Result<super::TransactionDisposition> {
+        let Some(path) = self.selected_group.clone() else {
+            return Ok(super::TransactionDisposition::Ignored);
+        };
+        let names = self
+            .selected_group_profile
+            .clone()
+            .map(|p| vec![p])
+            .unwrap_or_else(|| self.group_trees.keys().cloned().collect());
+        let profiles = names
+            .into_iter()
+            .map(|p| {
+                self.storages
+                    .get(&p)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("Original group profile unavailable: {p}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.request_transaction(persistence_transactions::TransactionRequest::DeleteGroup {
+            profiles,
+            path,
+            restarting: self.restart_in_flight.keys().cloned().collect(),
+            options: Some(persistence_transactions::GroupDeleteOptionsOwned {
+                worktrees: options.delete_worktrees,
+                branches: options.delete_branches,
+                containers: options.delete_containers,
+                force_worktrees: options.force_delete_worktrees,
+            }),
+        })
+    }
+
+    pub(super) fn prepare_force_removal(
+        &self,
+        instance: &Instance,
+    ) -> anyhow::Result<super::PendingForceRemoval> {
+        if let Some((request_id, pending)) = self
+            .deletes_in_flight
+            .iter()
+            .find(|(_, pending)| pending.session_id == instance.id)
+        {
+            anyhow::ensure!(
+                pending.matches(instance),
+                "The original deletion no longer matches this incarnation"
+            );
+            return Ok(super::PendingForceRemoval::Existing {
+                request_id: *request_id,
+                control: pending.control.clone(),
+            });
+        }
+        let (owner, control) = crate::session::deletion::PurgeOwner::issue(instance)?;
+        Ok(super::PendingForceRemoval::Standalone {
+            instance: Box::new(instance.clone()),
+            owner,
+            control,
+        })
+    }
+
+    pub(super) fn force_remove_session(
+        &mut self,
+        target: super::PendingForceRemoval,
     ) -> anyhow::Result<()> {
-        if let Some(group_path) = self.selected_group.take() {
-            let owning_profile = self.selected_group_profile.take();
-            let (member_ids, has_creating) = {
-                let prefix = format!("{group_path}/");
-                let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
-                let mut member_ids = Vec::new();
-                let mut has_creating = false;
-                for instance in self.instances().filter(|instance| is_member(instance)) {
-                    member_ids.push(instance.id.clone());
-                    has_creating |= instance.status == Status::Creating;
-                }
-                (member_ids, has_creating)
-            };
-            if has_creating {
-                self.selected_group = Some(group_path);
-                self.selected_group_profile = owning_profile;
-                self.info_dialog = Some(InfoDialog::new(
-                    "Creation in progress",
-                    "A session in this group is still being created. Wait for it to finish before deleting the group.",
-                ));
-                return Ok(());
-            }
-
-            if member_ids
-                .iter()
-                .any(|session_id| self.restart_in_flight.contains(session_id))
-            {
-                self.selected_group = Some(group_path);
-                self.selected_group_profile = owning_profile;
-                self.info_dialog = Some(InfoDialog::new(
-                    "Restart in progress",
-                    "A session in this group is still restarting. Wait for it to finish before deleting the group.",
-                ));
-                return Ok(());
-            }
-
-            let profiles: Vec<String> = owning_profile
-                .as_ref()
-                .map(|profile| vec![profile.clone()])
-                .unwrap_or_else(|| self.group_trees.keys().cloned().collect());
-            let mut sessions_to_delete = Vec::new();
-            for profile in profiles {
-                match self.persist_group_delete_with_sessions(&profile, &group_path) {
-                    Ok(PersistGroupDelete::Ready(mut members)) => {
-                        sessions_to_delete.append(&mut members);
-                    }
-                    Ok(PersistGroupDelete::Creating) => {
-                        self.selected_group = Some(group_path);
-                        self.selected_group_profile = owning_profile;
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Creation in progress",
-                            "A session in this group is still being created. Wait for it to finish before deleting the group.",
-                        ));
-                        return Ok(());
-                    }
-                    Ok(PersistGroupDelete::Restarting) => {
-                        self.selected_group = Some(group_path);
-                        self.selected_group_profile = owning_profile;
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Restart in progress",
-                            "A session in this group is still restarting. Wait for it to finish before deleting the group.",
-                        ));
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        self.selected_group = Some(group_path);
-                        self.selected_group_profile = owning_profile;
-                        return Err(error);
-                    }
+        use crate::session::deletion::ForceIntent;
+        match target {
+            super::PendingForceRemoval::Existing {
+                request_id,
+                control,
+            } => {
+                let pending = self
+                    .deletes_in_flight
+                    .get_mut(&request_id)
+                    .ok_or_else(|| anyhow::anyhow!("The original deletion is no longer pending"))?;
+                let current = self
+                    .instances
+                    .get(&pending.session_id)
+                    .ok_or_else(|| anyhow::anyhow!("The original session is no longer visible"))?;
+                anyhow::ensure!(
+                    pending.matches(current),
+                    "The original deletion no longer matches this incarnation"
+                );
+                match control.request_force() {
+                    ForceIntent::Accepted | ForceIntent::AlreadyRequested => pending.attempt.forced = true,
+                    ForceIntent::TooLate => anyhow::bail!("The original deletion has already started hooks or commit; Force cannot change its cleanup"),
+                    ForceIntent::Closed => anyhow::bail!("The original deletion has finished; Force cannot retarget another owner"),
                 }
             }
-            sessions_to_delete.sort_by(|left, right| left.id.cmp(&right.id));
-
-            for instance in sessions_to_delete {
-                let session_id = instance.id.clone();
-                if let Some(current) = self.instances.get_mut(&session_id) {
-                    current.status = Status::Deleting;
-                    current.group_path.clear();
-                }
-                let delete_worktree =
-                    options.delete_worktrees && instance.has_managed_worktree_or_workspace();
-                let delete_branch =
-                    options.delete_branches && instance.has_managed_worktree_or_workspace();
-                let delete_sandbox = options.delete_containers
-                    && instance
-                        .sandbox_info
-                        .as_ref()
-                        .is_some_and(|sandbox| sandbox.enabled);
-                self.request_deletion(DeletionRequest {
-                    session_id,
-                    instance,
-                    delete_worktree,
-                    delete_branch,
-                    delete_sandbox,
-                    force_delete: options.force_delete_worktrees,
-                    detach_hooks: true,
-                    // No per-session keep-scratch toggle in the group-delete
-                    // UX, so scratch dirs always go.
-                    keep_scratch: false,
-                });
+            super::PendingForceRemoval::Standalone {
+                instance,
+                owner,
+                control,
+            } => {
+                anyhow::ensure!(
+                    !self.has_delete_in_flight(&instance.id),
+                    "A deletion started after confirmation; retry against its original owner"
+                );
+                let current = self
+                    .instances
+                    .get(&instance.id)
+                    .ok_or_else(|| anyhow::anyhow!("The original session is no longer visible"))?;
+                anyhow::ensure!(
+                    control.matches(current),
+                    "The confirmed original session changed before Force removal"
+                );
+                let pending =
+                    super::PendingDeletion::from_control(&instance, true, control.clone())?;
+                anyhow::ensure!(
+                    control.request_force() == ForceIntent::Accepted,
+                    "The confirmed force owner is no longer available"
+                );
+                self.set_instance_status(&instance.id, Status::Deleting);
+                let request_id = self.deletion_poller.request_force_remove(*instance, owner);
+                self.deletes_in_flight.insert(request_id, pending);
             }
-
-            self.rebuild_flat_items();
         }
         Ok(())
     }
 
     pub(super) fn request_deletion(&mut self, request: DeletionRequest) {
-        self.deletes_in_flight.insert(
-            request.session_id.clone(),
-            super::DeleteAttempt {
-                forced: request.force_delete,
-                trashed_at: request.instance.trashed_at,
-            },
-        );
-        self.deletion_poller.request_deletion(request);
+        let (pending, owner) =
+            match super::PendingDeletion::capture(&request.instance, request.force_delete) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    self.info_dialog =
+                        Some(InfoDialog::new("Delete refused", &format!("{error:#}")));
+                    return;
+                }
+            };
+        let request_id = self.deletion_poller.request_deletion(request, owner);
+        self.deletes_in_flight.insert(request_id, pending);
+    }
+
+    fn has_delete_in_flight(&self, session_id: &str) -> bool {
+        self.deletes_in_flight
+            .values()
+            .any(|pending| pending.session_id == session_id)
     }
 
     /// Whether a trashed row's last delete was forced, when it failed in the row's current
     /// trash lifecycle and no other delete for it is in flight.
     pub(super) fn failed_delete_forced(&self, inst: &Instance) -> Option<bool> {
-        if self.deletes_in_flight.contains_key(&inst.id) {
+        if self.has_delete_in_flight(&inst.id) {
             return None;
         }
         self.failed_deletes
@@ -876,73 +538,18 @@ impl HomeView {
             .map(|attempt| attempt.forced)
     }
 
-    /// Force-remove a session from storage, for rows stuck in Deleting. Worktree and
-    /// branch cleanup are skipped because the original deletion already attempted them;
-    /// tmux and sandbox teardown run off-thread so a hung call cannot block input.
-    pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        let instance = self.instances.get(session_id).cloned();
-        self.failed_deletes.remove(session_id);
-        self.remove_instance(session_id);
-        self.rebuild_group_trees();
-        self.save()?;
-        self.reload()?;
-
-        if let Some(inst) = instance {
-            spawn_force_teardown(inst);
-        }
-        Ok(())
-    }
-
-    /// Remove a trashed row whose forced delete failed, skipping worktree and branch
-    /// cleanup. The guarded transaction runs on the drop worker, since a peer purge can
-    /// hold the lifecycle lock for its whole teardown; `apply_drop_results` lands it.
+    /// Retain filesystem artifacts while the canonical Purge worker settles the original.
     fn drop_failed_trashed_session(&mut self, inst: &Instance) {
-        self.deletes_in_flight.insert(
-            inst.id.clone(),
-            super::DeleteAttempt {
-                forced: true,
-                trashed_at: inst.trashed_at,
-            },
-        );
-        self.set_instance_status(&inst.id, Status::Deleting);
-        self.drop_poller.request(
-            inst.id.clone(),
-            DropRequest {
-                instance: inst.clone(),
-            },
-        );
-    }
-
-    pub fn apply_drop_results(&mut self) -> bool {
-        let Ok(result) = self.drop_poller.try_recv() else {
-            return false;
+        let (pending, owner) = match super::PendingDeletion::capture(inst, true) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new("Delete refused", &format!("{error:#}")));
+                return;
+            }
         };
-        let inst = result.instance;
-        self.deletes_in_flight.remove(&inst.id);
-        self.failed_deletes.remove(&inst.id);
-        match result.dropped {
-            Ok(true) => {
-                self.instances.shift_remove(&inst.id);
-                self.rebuild_group_trees();
-                spawn_force_teardown(inst);
-            }
-            Ok(false) => {
-                self.set_instance_status(&inst.id, inst.status);
-                self.info_dialog = Some(InfoDialog::new(
-                    "Session not removed",
-                    &format!(
-                        "'{}' changed in another process (restored, re-trashed or busy), so it was kept.",
-                        inst.title
-                    ),
-                ));
-            }
-            Err(e) => {
-                self.set_instance_status(&inst.id, inst.status);
-                tracing::error!(target: "tui.home", session = %inst.id, "empty trash drop failed: {e}");
-            }
-        }
-        self.rebuild_flat_items();
-        true
+        self.set_instance_status(&inst.id, Status::Deleting);
+        let request_id = self.deletion_poller.request_drop(inst.clone(), owner);
+        self.deletes_in_flight.insert(request_id, pending);
     }
 
     pub(super) fn group_has_managed_worktrees(
@@ -973,249 +580,51 @@ impl HomeView {
         &mut self,
         new_group: Option<&str>,
         new_profile: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let ctx = match self.group_rename_context.take() {
-            Some(ctx) => ctx,
-            None => return Ok(()),
+    ) -> anyhow::Result<super::TransactionDisposition> {
+        let Some(ctx) = self.group_rename_context.take() else {
+            return Ok(super::TransactionDisposition::Ignored);
         };
-
-        let new_path = match new_group {
-            Some(g) if !g.is_empty() && g != ctx.old_path => g,
-            _ if new_profile.is_none() => return Ok(()), // nothing changed
-            _ => &ctx.old_path,                          // profile-only change
-        };
-
-        // Defense-in-depth: reject duplicate names (dialog validates inline, but guard here too)
-        let target_profile = new_profile.unwrap_or(&ctx.old_profile);
-        let profile_changed = target_profile != ctx.old_profile;
-        if new_path != ctx.old_path {
-            if let Some(tree) = self.group_trees.get(target_profile) {
-                if tree.group_exists(new_path) {
-                    anyhow::bail!(
-                        "A group named '{}' already exists in profile '{}'",
-                        new_path,
-                        target_profile
-                    );
-                }
-            }
+        let new_path = new_group
+            .filter(|g| !g.is_empty())
+            .unwrap_or(&ctx.old_path)
+            .to_owned();
+        if new_path == ctx.old_path && new_profile.is_none_or(|p| p == ctx.old_profile) {
+            return Ok(super::TransactionDisposition::Ignored);
         }
-
-        if profile_changed {
-            let profiles = list_profiles()?;
-            if !profiles.contains(&target_profile.to_string()) {
-                anyhow::bail!("Profile '{}' does not exist", target_profile);
-            }
-        }
-
-        let old_prefix = format!("{}/", ctx.old_path);
-
-        let is_member = group_membership(&ctx.old_path, &old_prefix, Some(&ctx.old_profile));
-        let mut affected_ids: Vec<String> = self
+        let source = self
+            .storages
+            .get(&ctx.old_profile)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Original group profile unavailable"))?;
+        let target = self.capture_transaction_target(new_profile, &ctx.old_profile)?;
+        let prefix = format!("{}/", ctx.old_path);
+        let members = self
             .instances
             .values()
-            .filter(|instance| is_member(instance))
-            .map(|instance| instance.id.clone())
-            .collect();
-        if profile_changed {
-            affected_ids.sort();
-        }
+            .filter(|r| {
+                r.source_profile == ctx.old_profile
+                    && (r.group_path == ctx.old_path || r.group_path.starts_with(&prefix))
+            })
+            .cloned()
+            .map(persistence_transactions::RowCapture::capture)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.request_transaction(persistence_transactions::TransactionRequest::Group {
+            source,
+            target,
+            old_path: ctx.old_path,
+            new_path,
+            members,
+        })
+    }
 
-        if profile_changed {
-            // Refuse every transient member before taking any guard or
-            // publishing any part of the batch.
-            for id in &affected_ids {
-                let instance = self
-                    .get_instance(id)
-                    .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
-                anyhow::ensure!(
-                    instance.status != Status::Creating,
-                    "Cannot move group while session {id} is being created"
-                );
-                anyhow::ensure!(
-                    instance.status != Status::Deleting,
-                    "Cannot move group while session {id} is being deleted"
-                );
-                anyhow::ensure!(
-                    !instance.has_fresh_lifecycle_reservation(chrono::Utc::now()),
-                    "Cannot move group while session {id} has a lifecycle operation in progress"
-                );
-            }
-
-            let identity_guard = acquire_session_identity_lock()?;
-            affected_ids.sort();
-            let mut mutation_guards = Vec::with_capacity(affected_ids.len());
-            for id in &affected_ids {
-                mutation_guards.push(self.lock_session_mutation_and_reload(id)?);
-                let authoritative = self
-                    .get_instance(id)
-                    .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
-                anyhow::ensure!(
-                    authoritative.status != Status::Creating,
-                    "Cannot move group while session {id} is being created"
-                );
-                anyhow::ensure!(
-                    authoritative.status != Status::Deleting,
-                    "Cannot move group while session {id} is being deleted"
-                );
-                anyhow::ensure!(
-                    !authoritative.has_fresh_lifecycle_reservation(chrono::Utc::now()),
-                    "Cannot move group while session {id} has a lifecycle operation in progress"
-                );
-                anyhow::ensure!(
-                    authoritative.source_profile == ctx.old_profile && is_member(authoritative),
-                    "Group membership changed while the cross-profile move was pending"
-                );
-            }
-
-            // Build the requested diffs only from rows reloaded under their
-            // retained source lifecycle guards.
-            let mut changes = Vec::with_capacity(affected_ids.len());
-            for id in &affected_ids {
-                let before = self
-                    .get_instance(id)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
-                let new_group_path = if new_path != ctx.old_path {
-                    if before.group_path == ctx.old_path {
-                        new_path.to_string()
-                    } else {
-                        let rest = before
-                            .group_path
-                            .strip_prefix(&old_prefix)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Group membership changed while the cross-profile move was pending"
-                                )
-                            })?;
-                        format!("{new_path}/{rest}")
-                    }
-                } else {
-                    before.group_path.clone()
-                };
-                let mut after = before.clone();
-                after.group_path = new_group_path;
-                changes.push((before, after));
-            }
-
-            let target_profile = new_profile.expect("profile_changed requires a target profile");
-            if !self.storages.contains_key(target_profile) {
-                self.storages.insert(
-                    target_profile.to_string(),
-                    Storage::open(target_profile, self.file_watch.clone())?,
-                );
-            }
-            // Run the transaction for its durable effect only: the reload below
-            // republishes the moved rows and re-merges runtime-only state onto them.
-            {
-                let source = self
-                    .storages
-                    .get(&ctx.old_profile)
-                    .ok_or_else(|| anyhow::anyhow!("Source profile storage is not loaded"))?;
-                let target = self
-                    .storages
-                    .get(target_profile)
-                    .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
-                let group_move = GroupMovePlan::subtree(&ctx.old_path, new_path);
-                source.move_instances_to(
-                    target,
-                    &changes,
-                    &group_move,
-                    |instances, candidates| {
-                        for (index, candidate) in candidates.iter().enumerate() {
-                            let duplicate_in_target = is_duplicate_session(
-                                instances.iter(),
-                                &candidate.title,
-                                &candidate.project_path,
-                                None,
-                            );
-                            let duplicate_in_batch = is_duplicate_session(
-                                candidates[..index].iter(),
-                                &candidate.title,
-                                &candidate.project_path,
-                                None,
-                            );
-                            if duplicate_in_target || duplicate_in_batch {
-                                return Err(duplicate_session_error(&candidate.title));
-                            }
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-            self.reload_preserving_profile_move_runtime(&affected_ids)?;
-            drop(identity_guard);
-            drop(mutation_guards);
-            return Ok(());
-        }
-
-        // Same-profile group edits keep their existing per-row persistence
-        // behavior.
-        for id in &affected_ids {
-            let Some(before) = self.get_instance(id).cloned() else {
-                continue;
-            };
-            let new_group_path = if new_path != ctx.old_path {
-                if before.group_path == ctx.old_path {
-                    new_path.to_string()
-                } else {
-                    match before.group_path.strip_prefix(&old_prefix) {
-                        Some(rest) => format!("{new_path}/{rest}"),
-                        None => continue,
-                    }
-                }
-            } else {
-                before.group_path
-            };
-            self.apply_user_action(id, |instance| {
-                instance.group_path = new_group_path;
-            })?;
-        }
-
-        let path_changed = new_path != ctx.old_path;
-
-        // Capture old_path and its descendants before the rebuild, which derives groups
-        // from `instance.group_path`, already migrated by the loop above.
-        let stale_paths: Vec<String> = if path_changed || profile_changed {
-            let prefix = format!("{}/", ctx.old_path);
-            self.group_trees
-                .get(&ctx.old_profile)
-                .map(|tree| {
-                    tree.get_all_groups()
-                        .into_iter()
-                        .map(|g| g.path)
-                        .filter(|p| p == &ctx.old_path || p.starts_with(&prefix))
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![ctx.old_path.clone()])
-        } else {
-            Vec::new()
-        };
-
-        // Rebuild trees from the updated instance list
-        self.rebuild_group_trees();
-
-        if path_changed {
-            if let Some(tree) = self.group_trees.get_mut(&ctx.old_profile) {
-                tree.rename_group(&ctx.old_path, new_path);
-            }
-        }
-        if path_changed || profile_changed {
-            self.pending_group_deletions
-                .entry(ctx.old_profile.clone())
-                .or_default()
-                .extend(stale_paths);
-        }
-
-        // When moving to a different profile, ensure the new path exists in the target tree
-        if let Some(tp) = new_profile {
-            if let Some(tree) = self.group_trees.get_mut(tp) {
-                tree.create_group(new_path);
-            }
-        }
-
-        self.save()?;
-        self.reload()?;
-        Ok(())
+    pub(super) fn submit_runner_settlement(
+        &mut self,
+        origin: super::RequestOrigin,
+        request: crate::tui::stop_poller::SettlementRequest,
+    ) {
+        self.settlement_in_flight
+            .insert(request.session_id.clone(), origin);
+        self.settlement_poller.request(request);
     }
 
     /// Edit the selected session's worktree workdir name: move the worktree directory
@@ -1224,106 +633,27 @@ impl HomeView {
         &mut self,
         new_name: &str,
         rename_branch: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::TransactionDisposition> {
         let Some(id) = self.selected_session.clone() else {
-            return Ok(());
+            return Ok(super::TransactionDisposition::Ignored);
         };
-        let live = self
-            .get_instance(&id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        let source_profile = live.source_profile.clone();
-        let _identity_lock = acquire_session_identity_lock()?;
-        let storage = Storage::new(&source_profile, self.file_watch.clone())?;
-        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
-        let authoritative_instances = storage.load()?;
-        let mut authoritative = authoritative_instances
-            .iter()
-            .find(|instance| instance.id == id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        authoritative.source_profile.clone_from(&source_profile);
-        authoritative.merge_runtime_from_reload(&live);
-        self.instances.insert(id.clone(), authoritative.clone());
-        let worktree_info = authoritative.worktree_info.clone();
-        let status = authoritative.status;
-        let project_path = authoritative.project_path.clone();
-        let is_sandboxed = authoritative.is_sandboxed();
-        let Some(worktree_info) = worktree_info else {
-            anyhow::bail!("Session does not use a worktree");
-        };
-        let duplicate_path = crate::session::worktree_edit::target_worktree_path(
-            std::path::Path::new(&project_path),
-            new_name,
-        )
-        .unwrap_or_else(|| std::path::PathBuf::from(&project_path))
-        .to_string_lossy()
-        .into_owned();
-        if duplicate_path.trim_end_matches('/') != project_path.trim_end_matches('/')
-            && is_duplicate_session(
-                authoritative_instances.iter(),
-                &authoritative.title,
-                &duplicate_path,
-                Some(&id),
-            )
-        {
-            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                "Rename Failed",
-                &duplicate_session_error(&authoritative.title).to_string(),
-            ));
-            return Ok(());
-        }
-        if status.blocks_worktree_edit() {
-            anyhow::bail!("Stop the session before editing its workdir name");
-        }
-        // A sandbox container stays up while Idle and bind-mounts the worktree, so the
-        // move would hit EBUSY and a reused container would keep the old path; `status`
-        // alone does not see this. Gated on the directory actually moving, since the
-        // helper discards a stopped container. See #2117, #2414.
-        if crate::session::worktree_edit::worktree_move_required(
-            std::path::Path::new(&project_path),
-            new_name,
-        ) && crate::session::worktree_edit::ensure_sandbox_container_released(&id, is_sandboxed)
-        {
-            anyhow::bail!(
-                "Stop the session before editing its workdir name: its sandbox container is \
-                 mounting the worktree directory"
-            );
-        }
+        self.set_worktree_name_by_id(&id, new_name, rename_branch)
+    }
 
-        let outcome = crate::session::worktree_edit::edit_worktree_workdir(
-            crate::session::worktree_edit::WorktreeEditRequest {
-                worktree_info: &worktree_info,
-                current_path: std::path::Path::new(&project_path),
-                new_name,
-                rename_branch,
-            },
-        )?;
-        let new_path = outcome.new_path.to_string_lossy().to_string();
-        let new_branch = outcome.new_branch.clone();
-
-        // A container's mounts and working dir are baked in at create time and do not
-        // follow a host-side `git worktree move`, so drop it and force a fresh create on
-        // the next start. Only when the dir moved. Mirrors `rename_selected` (#2117).
-        let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
-        if dir_moved {
-            crate::session::worktree_edit::discard_sandbox_container_after_move(&id, is_sandboxed);
-        }
-
-        self.apply_user_action(&id, |inst| {
-            inst.project_path = new_path.clone();
-            if let Some(branch) = &new_branch {
-                if let Some(wt) = inst.worktree_info.as_mut() {
-                    wt.branch = branch.clone();
-                }
-            }
-        })?;
-        drop(_identity_lock);
-
-        self.rebuild_group_trees();
-        self.save()?;
-        self.reload()?;
-        Ok(())
+    pub(super) fn set_worktree_name_by_id(
+        &mut self,
+        id: &str,
+        new_name: &str,
+        rename_branch: bool,
+    ) -> anyhow::Result<super::TransactionDisposition> {
+        let row = self.capture_transaction_row(id)?;
+        let settled = self.settled_edit.take();
+        self.request_transaction(persistence_transactions::TransactionRequest::Workdir {
+            row,
+            name: new_name.to_owned(),
+            rename_branch,
+            settled,
+        })
     }
 
     /// Attach a repo to `id` and, when a worker is live, restart it so the agent can see
@@ -1340,7 +670,7 @@ impl HomeView {
         &mut self,
         id: &str,
         repo_path: &std::path::Path,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::TransactionDisposition> {
         let Some(instance) = self.get_instance(id).cloned() else {
             anyhow::bail!("Session no longer exists");
         };
@@ -1373,23 +703,16 @@ impl HomeView {
         }
         // One attach per session at a time: a second would race the first one's
         // worktree creation and its worker bounce.
-        if self.attach_project_in_flight.contains(id) {
+        if self.attach_project_in_flight.contains_key(id) || self.transaction_is_pending(id) {
             anyhow::bail!("An attach is already running for this session; wait for it to finish");
         }
-
-        // Everything blocking runs on the poller thread: `git worktree add` alone takes
-        // seconds, and the fetch, submodule init, worker bounce and container removal
-        // behind it take longer. `apply_attach_project_results` reloads and reports.
-        self.attach_project_in_flight.insert(id.to_string());
-        self.attach_project_poller.request_attach(
-            crate::session::attach_project::AttachProjectRequest {
-                session_id: id.to_string(),
-                profile: instance.source_profile.clone(),
+        let row = self.capture_transaction_row(id)?;
+        self.request_transaction(
+            persistence_transactions::TransactionRequest::AttachProject {
+                row,
                 repo_path: repo_path.to_path_buf(),
-                is_sandboxed: instance.is_sandboxed(),
             },
-        );
-        Ok(())
+        )
     }
 
     pub(super) fn rename_selected(
@@ -1398,330 +721,32 @@ impl HomeView {
         new_group: Option<&str>,
         new_profile: Option<&str>,
         rename_branch: bool,
-    ) -> anyhow::Result<()> {
-        if let Some(id) = &self.selected_session {
-            let id = id.clone();
+    ) -> anyhow::Result<super::TransactionDisposition> {
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(super::TransactionDisposition::Ignored);
+        };
+        self.rename_session_by_id(&id, new_title, new_group, new_profile, rename_branch)
+    }
 
-            let live = self
-                .get_instance(&id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-            let title_changed_by_user = !new_title.is_empty() && new_title != live.title;
-            // The app-wide identity guard covers profile-changing renames too; the
-            // existing-session guards nest beneath it, title -> lifecycle -> Storage.
-            let _identity_lock = acquire_session_identity_lock()?;
-            let _mutation_guards = self.lock_session_mutation_and_reload(&id)?;
-            let previous = self
-                .get_instance(&id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-            let current_profile = previous.source_profile.clone();
-            let current_title = previous.title.clone();
-            let current_group = previous.group_path.clone();
-
-            // Empty or dialog-unchanged text means preserve the authoritative
-            // source title, never the snapshot captured before the locks.
-            let effective_title = if !title_changed_by_user {
-                current_title.clone()
-            } else {
-                new_title.to_string()
-            };
-            let effective_group = match new_group {
-                None => current_group.clone(),
-                Some(group) => group.to_string(),
-            };
-
-            let target_profile = new_profile.unwrap_or(&current_profile);
-            if target_profile != current_profile {
-                let profiles = list_profiles()?;
-                if !profiles.contains(&target_profile.to_string()) {
-                    anyhow::bail!("Profile '{}' does not exist", target_profile);
-                }
-            }
-
-            let tied = self.tie_workdir_applies_for(&id);
-            let tied_edit = tied && (current_title != effective_title || rename_branch);
-            let duplicate_path = if tied_edit {
-                crate::session::worktree_edit::derived_worktree_path(
-                    std::path::Path::new(&previous.project_path),
-                    &effective_title,
-                )
-            } else {
-                previous.project_path.clone()
-            };
-            let pair_changed = current_title != effective_title
-                || target_profile != current_profile
-                || duplicate_path.trim_end_matches('/')
-                    != previous.project_path.trim_end_matches('/');
-            if pair_changed {
-                let candidates = if let Some(storage) = self.storages.get(target_profile) {
-                    storage.load()?
-                } else {
-                    Storage::open(target_profile, self.file_watch.clone())?.load()?
-                };
-                if is_duplicate_session(
-                    candidates.iter(),
-                    &effective_title,
-                    &duplicate_path,
-                    Some(&id),
-                ) {
-                    let error = duplicate_session_error(&effective_title);
-                    if target_profile != current_profile {
-                        return Err(error);
-                    }
-                    self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                        "Rename Failed",
-                        &error.to_string(),
-                    ));
-                    return Ok(());
-                }
-            }
-
-            // Tied mode (#1927): a worktree session's directory leaf follows its title,
-            // so move the directory in lockstep before persisting the new title. Gated on
-            // a stopped session; a running one warns and renames nothing.
-            let mut new_path: Option<String> = None;
-            let mut new_branch: Option<String> = None;
-            // Fire when the title changed (dir follows it) OR the user opted to
-            let current_instance = self
-                .get_instance(&id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-            let cross_profile_target = new_profile
-                .filter(|target| *target != current_instance.source_profile.as_str())
-                .map(str::to_string);
-            let mut projected_move = current_instance.clone();
-            projected_move.title = effective_title.clone();
-            projected_move.group_path = effective_group.clone();
-
-            if let Some(target_profile) = cross_profile_target.as_deref() {
-                let profiles = list_profiles()?;
-                if !profiles.contains(&target_profile.to_string()) {
-                    anyhow::bail!("Profile '{}' does not exist", target_profile);
-                }
-                if (current_title != effective_title || rename_branch)
-                    && self.tie_workdir_applies_for(&id)
-                {
-                    let leaf =
-                        crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
-                    if let Some(path) = crate::session::worktree_edit::target_worktree_path(
-                        std::path::Path::new(&projected_move.project_path),
-                        &leaf,
-                    ) {
-                        projected_move.project_path = path.to_string_lossy().to_string();
-                    }
-                    if rename_branch {
-                        if let Some(worktree) = projected_move.worktree_info.as_mut() {
-                            worktree.branch =
-                                crate::session::builder::git_sanitize_branch_name(&leaf);
-                        }
-                    }
-                }
-
-                // Advisory preflight before any worktree, container, or branch
-                // effect. The dual-locked transaction repeats this check.
-                let target_storage = Storage::open(target_profile, self.file_watch.clone())?;
-                let target_rows = target_storage.load()?;
-                if is_duplicate_session(
-                    target_rows.iter(),
-                    &projected_move.title,
-                    &projected_move.project_path,
-                    None,
-                ) {
-                    return Err(duplicate_session_error(&projected_move.title));
-                }
-            }
-            // Fire when the title changed (the dir follows it) or the user asked to
-            // rename the branch, which is allowed even with the title unchanged.
-            if tied_edit && cross_profile_target.is_none() {
-                let snapshot = self.get_instance(&id).map(|i| {
-                    (
-                        i.worktree_info.clone(),
-                        i.status,
-                        i.project_path.clone(),
-                        i.is_sandboxed(),
-                    )
-                });
-                if let Some((Some(worktree_info), status, project_path, is_sandboxed)) = snapshot {
-                    let leaf =
-                        crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
-                    let container_holds_worktree = !status.blocks_worktree_edit()
-                        && crate::session::worktree_edit::worktree_move_required(
-                            std::path::Path::new(&project_path),
-                            &leaf,
-                        )
-                        && crate::session::worktree_edit::ensure_sandbox_container_released(
-                            &id,
-                            is_sandboxed,
-                        );
-                    if let Some(reason) =
-                        worktree_rename_block(status, is_sandboxed, container_holds_worktree)
-                    {
-                        let body = worktree_rename_block_message(&reason);
-                        self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                            "Stop the Session to Rename",
-                            body,
-                        ));
-                        return Ok(());
-                    }
-                    match crate::session::worktree_edit::edit_worktree_workdir(
-                        crate::session::worktree_edit::WorktreeEditRequest {
-                            worktree_info: &worktree_info,
-                            current_path: std::path::Path::new(&project_path),
-                            new_name: &leaf,
-                            rename_branch,
-                        },
-                    ) {
-                        Ok(outcome) => {
-                            let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
-                            new_path = Some(outcome.new_path.to_string_lossy().to_string());
-                            new_branch = outcome.new_branch;
-                            if dir_moved {
-                                crate::session::worktree_edit::discard_sandbox_container_after_move(
-                                    &id,
-                                    is_sandboxed,
-                                );
-                            }
-                        }
-                        Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
-                        Err(e) => {
-                            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                                "Rename Failed",
-                                &format!("Could not move the worktree directory: {e}"),
-                            ));
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-
-            // Cross-profile worktree and container effects run inside the dual-profile
-            // transaction; tmux rekeying waits until persistence and publication succeed.
-            if let Some(target_profile) = cross_profile_target.as_deref() {
-                if !self.storages.contains_key(target_profile) {
-                    self.storages.insert(
-                        target_profile.to_string(),
-                        Storage::open(target_profile, self.file_watch.clone())?,
-                    );
-                }
-                let tied_edit = (current_title != effective_title || rename_branch)
-                    && self.tie_workdir_applies_for(&id);
-                let effect_instance = current_instance.clone();
-                let effect_id = id.clone();
-                let effect_title = effective_title.clone();
-                self.move_to_profile_with_effect(
-                    &id,
-                    target_profile,
-                    projected_move,
-                    Some(&current_instance),
-                    false,
-                    move |candidate| {
-                        if tied_edit {
-                            if let Some(worktree_info) = effect_instance.worktree_info.as_ref() {
-                                let leaf = crate::session::worktree_edit::worktree_leaf_from_title(
-                                    &effect_title,
-                                );
-                                let container_holds_worktree =
-                                    !candidate.status.blocks_worktree_edit()
-                                        && crate::session::worktree_edit::worktree_move_required(
-                                            std::path::Path::new(
-                                                &effect_instance.project_path,
-                                            ),
-                                            &leaf,
-                                        )
-                                        && crate::session::worktree_edit::ensure_sandbox_container_released(
-                                            &effect_id,
-                                            candidate.is_sandboxed(),
-                                        );
-                                if let Some(reason) = worktree_rename_block(
-                                    candidate.status,
-                                    candidate.is_sandboxed(),
-                                    container_holds_worktree,
-                                ) {
-                                    anyhow::bail!("{}", worktree_rename_block_message(&reason));
-                                }
-                                match crate::session::worktree_edit::edit_worktree_workdir(
-                                    crate::session::worktree_edit::WorktreeEditRequest {
-                                        worktree_info,
-                                        current_path: std::path::Path::new(
-                                            &effect_instance.project_path,
-                                        ),
-                                        new_name: &leaf,
-                                        rename_branch,
-                                    },
-                                ) {
-                                    Ok(outcome) => {
-                                        // Both sides derive the leaf from the same
-                                        // title through `target_worktree_path`, so the
-                                        // published row and the directory that moved must
-                                        // agree; assert it so a drift in either sanitizer
-                                        // fails loudly instead of stranding the row.
-                                        debug_assert_eq!(
-                                            outcome.new_path,
-                                            std::path::Path::new(&candidate.project_path),
-                                            "published project_path must match the moved worktree directory"
-                                        );
-                                        if outcome.new_path
-                                            != std::path::Path::new(&effect_instance.project_path)
-                                        {
-                                            crate::session::worktree_edit::discard_sandbox_container_after_move(
-                                                &effect_id,
-                                                candidate.is_sandboxed(),
-                                            );
-                                        }
-                                    }
-                                    Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
-                                    Err(error) => return Err(error.into()),
-                                }
-                            }
-                        }
-                        Ok(())
-                    },
-                )?;
-                self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
-                drop(_identity_lock);
-                let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
-                drop(_mutation_guards);
-                if let Some(warning) = tmux_warning {
-                    self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
-                }
-                return Ok(());
-            }
-
-            self.apply_user_action(&id, |inst| {
-                inst.title = effective_title.clone();
-                inst.group_path = effective_group.clone();
-                if let Some(path) = &new_path {
-                    inst.project_path = path.clone();
-                }
-                if let Some(branch) = &new_branch {
-                    if let Some(wt) = inst.worktree_info.as_mut() {
-                        wt.branch = branch.clone();
-                    }
-                }
-            })?;
-            drop(_identity_lock);
-            let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
-            drop(_mutation_guards);
-
-            // Rebuild group trees and create group if needed
-            self.rebuild_group_trees();
-            if !effective_group.is_empty() {
-                let profile = self
-                    .get_instance(&id)
-                    .map(|i| i.source_profile.clone())
-                    .unwrap_or_else(|| self.config_profile());
-                if let Some(tree) = self.group_trees.get_mut(&profile) {
-                    tree.create_group(&effective_group);
-                }
-            }
-            self.save()?;
-            self.reload()?;
-            if let Some(warning) = tmux_warning {
-                self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
-            }
-        }
-        Ok(())
+    pub(super) fn rename_session_by_id(
+        &mut self,
+        id: &str,
+        new_title: &str,
+        new_group: Option<&str>,
+        new_profile: Option<&str>,
+        rename_branch: bool,
+    ) -> anyhow::Result<super::TransactionDisposition> {
+        let row = self.capture_transaction_row(id)?;
+        let target = self.capture_transaction_target(new_profile, &row.before.source_profile)?;
+        let settled = self.settled_edit.take();
+        self.request_transaction(persistence_transactions::TransactionRequest::Rename {
+            row,
+            target,
+            title: new_title.to_owned(),
+            group: new_group.map(str::to_owned),
+            rename_branch,
+            settled,
+        })
     }
 
     /// Snooze keybind: an already-snoozed row wakes immediately, otherwise the duration
@@ -1731,26 +756,33 @@ impl HomeView {
     /// tier 99, renders it italic+dim with a `z ` prefix and the remaining time, and it
     /// wakes lazily when the timer elapses. The duration is resolved at snooze time, so
     /// changing the config default does not extend one in flight.
-    pub(super) fn toggle_snooze_at_cursor(&mut self) -> anyhow::Result<Option<String>> {
+    pub(super) fn toggle_snooze_at_cursor(
+        &mut self,
+    ) -> anyhow::Result<super::TransactionDisposition> {
         let Some(id) = self.selected_session.clone() else {
-            return Ok(None);
+            return Ok(super::TransactionDisposition::Ignored);
         };
         let (is_snoozed, title) = {
             let inst = self.instances.get(&id);
             match inst {
                 Some(i) => (i.is_snoozed(), i.title.clone()),
-                None => return Ok(None),
+                None => return Ok(super::TransactionDisposition::Ignored),
             }
         };
         if is_snoozed {
-            self.apply_user_action(&id, |inst| inst.unsnooze())?;
-            self.rebuild_flat_items();
-            return Ok(Some(format!("Woke: {}", title)));
+            return self.apply_user_action_after(
+                &id,
+                |inst| inst.unsnooze(),
+                persistence_transactions::MetadataContinuation::Snooze {
+                    id: id.clone(),
+                    message: format!("Woke: {title}"),
+                },
+            );
         }
 
         self.pending_snooze_session = Some(id);
         self.snooze_duration_dialog = Some(crate::tui::dialogs::SnoozeDurationDialog::new(&title));
-        Ok(None)
+        Ok(super::TransactionDisposition::Ignored)
     }
 
     /// Apply a snooze with an explicit duration, on the picker's submit. The only place
@@ -1760,48 +792,53 @@ impl HomeView {
         &mut self,
         id: &str,
         minutes: u32,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<super::TransactionDisposition> {
         let title = self
             .instances
             .get(id)
             .map(|i| i.title.clone())
             .unwrap_or_default();
-        self.apply_user_action(id, |inst| inst.snooze(minutes))?;
-        self.rebuild_flat_items();
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            self.select_top_attention(None);
-        }
-        Ok(Some(format!(
-            "Snoozed for {}: {}",
-            humanize_minutes(minutes),
-            title
-        )))
+        self.apply_user_action_after(
+            id,
+            |inst| inst.snooze(minutes),
+            persistence_transactions::MetadataContinuation::Snooze {
+                id: id.to_owned(),
+                message: format!("Snoozed for {}: {}", humanize_minutes(minutes), title),
+            },
+        )
     }
 
     /// Toggle the favorite flag on the cursor's session. Favorite survives an unsnooze
     /// but not an archive; that mutual exclusion lives in `Instance::archive()`.
-    pub(super) fn toggle_favorite_at_cursor(&mut self) -> anyhow::Result<()> {
+    pub(super) fn toggle_favorite_at_cursor(
+        &mut self,
+    ) -> anyhow::Result<super::TransactionDisposition> {
         let Some(id) = self.selected_session.clone() else {
-            return Ok(());
+            return Ok(super::TransactionDisposition::Ignored);
         };
         let is_fav = match self.instances.get(&id) {
             Some(i) => i.is_favorited(),
-            None => return Ok(()),
+            None => return Ok(super::TransactionDisposition::Ignored),
         };
-        if is_fav {
-            self.apply_user_action(&id, |inst| inst.unfavorite())?;
-        } else {
-            self.apply_user_action(&id, |inst| inst.favorite())?;
-        }
-        self.rebuild_flat_items();
-        Ok(())
+        self.apply_user_action_after(
+            &id,
+            |inst| {
+                if is_fav {
+                    inst.unfavorite()
+                } else {
+                    inst.favorite()
+                }
+            },
+            persistence_transactions::MetadataContinuation::Reseat(id.clone()),
+        )?;
+        Ok(super::TransactionDisposition::Queued)
     }
 
     /// The session the cursor should land on once the cursor's row is archived: the
     /// nearest visible non-archived session below, else above. Rows inside collapsed
     /// groups and rows already under the Archived section are not candidates, so the
     /// cursor never jumps into either. `None` leaves the caller to clamp the index.
-    fn archive_successor_session(&self, archiving_id: &str) -> Option<String> {
+    pub(super) fn archive_successor_session(&self, archiving_id: &str) -> Option<String> {
         let candidate = |item: &Item| -> Option<String> {
             let Item::Session { id, .. } = item else {
                 return None;
@@ -1827,107 +864,58 @@ impl HomeView {
 
     /// Manual unread toggle (`U`), symmetric in both directions. The row's
     /// `theme.unread` color is the feedback, so there is no toast. No-op when disabled.
-    pub(super) fn toggle_unread_at_cursor(&mut self) -> anyhow::Result<()> {
+    pub(super) fn toggle_unread_at_cursor(
+        &mut self,
+    ) -> anyhow::Result<super::TransactionDisposition> {
         if !crate::session::unread_enabled() {
-            return Ok(());
+            return Ok(super::TransactionDisposition::Ignored);
         }
         let Some(id) = self.selected_session.clone() else {
-            return Ok(());
+            return Ok(super::TransactionDisposition::Ignored);
         };
         if !self.instances.contains_key(&id) {
-            return Ok(());
+            return Ok(super::TransactionDisposition::Ignored);
         }
-        self.apply_user_action(&id, |inst| inst.toggle_unread())?;
-        // Hold the row for the current visit so the dwell cannot undo a fresh `u`; the
-        // hold is released once the cursor leaves (see `tick_unread_dwell`).
-        if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
-            self.manual_unread_hold = Some(id.clone());
-        } else if self.manual_unread_hold.as_deref() == Some(id.as_str()) {
-            self.manual_unread_hold = None;
-        }
-        self.rebuild_flat_items();
-        // Under Attention sort the toggle changes the row's rank, so reseat the cursor
-        // by id to keep the next action on this session.
-        self.select_session_by_id(&id);
-        Ok(())
+        self.apply_user_action_after(
+            &id,
+            |inst| inst.toggle_unread(),
+            persistence_transactions::MetadataContinuation::Unread(id.clone()),
+        )?;
+        Ok(super::TransactionDisposition::Queued)
     }
 
     /// Toggle archive on the cursor's session. Archive tears down every tmux session
     /// (agent plus ancillary) but keeps worktree, branch and container. Unarchive does
     /// not respawn: press `e`, or send a message to auto-unarchive. See #1868.
-    pub(super) fn toggle_archive_at_cursor(&mut self) -> anyhow::Result<()> {
+    pub(super) fn toggle_archive_at_cursor(
+        &mut self,
+    ) -> anyhow::Result<super::TransactionDisposition> {
         let Some(id) = self.selected_session.clone() else {
-            return Ok(());
+            return Ok(super::TransactionDisposition::Ignored);
         };
-        // A trashed row cannot be meaningfully archived, so `z` on it restores the
-        // session from the trash instead. See #2489.
-        if matches!(self.instances.get(&id), Some(i) if i.is_trashed()) {
+        self.toggle_archive_by_id(&id)
+    }
+
+    pub(super) fn toggle_archive_by_id(
+        &mut self,
+        id: &str,
+    ) -> anyhow::Result<super::TransactionDisposition> {
+        let row = self.capture_transaction_row(id)?;
+        if self.settled_edit.is_none() && row.before.is_trashed() {
             self.restore_selected_from_trash();
-            return Ok(());
+            return Ok(super::TransactionDisposition::Queued);
         }
-        let is_archived = match self.instances.get(&id) {
-            Some(i) => i.is_archived(),
-            None => return Ok(()),
-        };
-        if is_archived {
-            self.apply_user_action(&id, |inst| inst.unarchive())?;
-            self.rebuild_flat_items();
-            // Re-seat the cursor on the unarchived row: the rebuild moves it from tier
-            // 99 to its real tier. It stays Stopped until the user restarts it with `e`.
-            self.select_session_by_id(&id);
-            return Ok(());
+        if self.settled_edit.is_none() && row.before.is_archived() {
+            return self.apply_user_action(id, |r| r.unarchive());
         }
-
-        // Tear down all tmux before flipping archived (#1868), holding the lifecycle lock
-        // through the archive so `aoe send` cannot relaunch or type into the session between.
-        let lifecycle_lock = match self.instances.get(&id) {
-            Some(inst) => {
-                let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
-                let lock = storage.acquire_instance_lifecycle_lock(&id)?;
-                inst.stop_all_tmux_sessions_locked(&storage);
-                Some(lock)
-            }
-            None => None,
-        };
-
-        // Decide where the cursor lands before the row sinks, against the pre-archive
-        // list. Only the non-Attention branch uses it; Attention re-picks from the top.
-        let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
-            .then(|| self.archive_successor_session(&id))
-            .flatten();
-
-        self.apply_user_action(&id, |inst| inst.archive())?;
-        drop(lifecycle_lock);
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            // Attention sort is a triage flow: the cursor advances to the next item
-            // that needs attention, which is always a live row.
-            self.rebuild_flat_items();
-            self.select_top_attention(None);
-            // select_top_attention is a no-op when no session row is visible, which
-            // would strand the selection on the now-invisible archived row and leave the
-            // cursor past the list; clamp and re-resolve like the fallback below.
-            if self.selected_session.as_deref() == Some(id.as_str()) {
-                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
-                self.update_selected();
-            }
-        } else {
-            // Advance to the next session rather than following the archived row into
-            // the section: archiving reads as "done with this one". The preview retargets
-            // itself each frame and the worker drops stale frames, so there is no
-            // dead-pane flash (#2025). The section is not revealed; its count is the
-            // feedback.
-            self.rebuild_flat_items();
-            match successor {
-                Some(next) => self.select_session_by_id(&next),
-                None => {
-                    // No other active session: clamp and let `update_selected` resolve
-                    // whatever sits at the cursor now (usually the Archived header).
-                    self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
-                    self.update_selected();
-                }
-            }
-        }
-        Ok(())
+        let settled = self.settled_edit.take();
+        let successor = self.archive_successor_session(id);
+        self.request_transaction(persistence_transactions::TransactionRequest::Archive {
+            row,
+            settled,
+            reveal: false,
+            successor,
+        })
     }
 
     /// Move a session to the trash and set `trashed_at`, keeping durable artifacts so it
@@ -1939,73 +927,15 @@ impl HomeView {
     /// relocation, runs on the `TrashPoller` and is reconciled by
     /// [`apply_trash_results`](crate::tui::home::HomeView::apply_trash_results): a live
     /// bind mount makes the worktree move fail EBUSY, but `docker stop` blocks for the
-    /// container's grace period, which froze the input thread inline (#1496). A
-    /// structured-view worker is reaped by the daemon reconciler once the row reads
-    /// trashed.
+    /// container's grace period, which froze the input thread inline (#1496).
+    /// The trash worker settles the durable runner journal before teardown.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
-        let Some((profile, mut request_instance)) = self
-            .instances
-            .get(id)
-            .map(|instance| (instance.source_profile.clone(), instance.clone()))
-        else {
-            return;
-        };
-        let Some(storage) = self.storages.get(&profile) else {
-            tracing::warn!(
-                target: "tui.session",
-                session = %id,
-                "trash failed: no storage registered for profile {profile}"
-            );
-            return;
-        };
-        let acquisition = (|| -> anyhow::Result<_> {
-            let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
-            storage.update(|instances, _groups| {
-                let stored = instances
-                    .iter_mut()
-                    .find(|instance| instance.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
-                let generation = stored
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Trash,
-                        crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
-                    )
-                    .map_err(anyhow::Error::new)?;
-                stored.trash();
-                Ok((
-                    generation,
-                    stored.lifecycle_reservation.clone(),
-                    stored.trashed_at,
-                ))
-            })
-        })();
-        let (generation, reservation, trashed_at) = match acquisition {
-            Ok(acquired) => acquired,
-            Err(error) => {
-                tracing::warn!(target: "tui.session", session = %id, "trash failed: {error}");
-                return;
-            }
-        };
-
-        // Copy the durable stamp so later lifecycle checks match the stored row.
-        request_instance.trashed_at = trashed_at;
-        request_instance.lifecycle_generation = generation;
-        request_instance.lifecycle_reservation = reservation.clone();
-        if let Some(instance) = self.instances.get_mut(id) {
-            instance.trashed_at = trashed_at;
-            instance.lifecycle_generation = generation;
-            instance.lifecycle_reservation = reservation;
+        let result = self.capture_transaction_row(id).and_then(|row| {
+            self.request_transaction(persistence_transactions::TransactionRequest::Trash(row))
+        });
+        if let Err(error) = result {
+            self.info_dialog = Some(InfoDialog::new("Trash Failed", &format!("{error:#}")));
         }
-        self.trash_poller
-            .request_trash(crate::session::trash::TrashRequest {
-                session_id: id.to_string(),
-                instance: request_instance,
-                generation,
-            });
-        self.rebuild_flat_items();
-        self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
-        self.update_selected();
     }
 
     /// Restore the selected trashed session, clearing `trashed_at` so it returns to its
@@ -2015,69 +945,18 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
-        let Some((profile, owned_trash_generation)) =
-            self.instances.get(&id).filter(|i| i.is_trashed()).map(|i| {
-                let generation = i
-                    .lifecycle_reservation
-                    .as_ref()
-                    .filter(|reservation| reservation.op == LifecycleOperation::Trash)
-                    .map(|reservation| reservation.generation);
-                (i.source_profile.clone(), generation)
-            })
-        else {
+        let Some(row) = self.get_instance(&id).filter(|r| r.is_trashed()) else {
             return;
         };
-        // Restore bypasses the generic user-action diff because lifecycle ownership,
-        // worktree movement and the durable untrash must stay under the per-instance
-        // flock.
-        let outcome = {
-            let Some(storage) = self.storages.get(&profile) else {
-                tracing::warn!(
-                    target: "tui.home",
-                    profile = %profile,
-                    id = %id,
-                    "restore: no storage registered for profile"
-                );
-                return;
-            };
-            restore_from_trash_with_storage(storage, &id, owned_trash_generation)
-        };
-        match outcome {
-            RestoreFromTrash::Restored {
-                project_path,
-                pre_trash_project_path,
-            } => {
-                if let Some(inst) = self.instances.get_mut(&id) {
-                    inst.project_path = project_path;
-                    inst.pre_trash_project_path = pre_trash_project_path;
-                    inst.untrash();
-                    inst.lifecycle_reservation = None;
-                }
-                self.rebuild_flat_items();
-                self.select_session_by_id(&id);
-            }
-            RestoreFromTrash::AlreadyGone => {
-                self.drop_peer_deleted_rows(std::slice::from_ref(&id));
-                self.rebuild_flat_items();
-            }
-            RestoreFromTrash::Busy(reason) => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Restore Failed",
-                    &format!("Session is {reason}, so it was not restored."),
-                ));
-            }
-            RestoreFromTrash::WorktreeFailed { reason } => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Restore Failed",
-                    &format!("Could not restore the worktree: {reason}"),
-                ));
-            }
-            RestoreFromTrash::PersistFailed => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Restore Failed",
-                    "Could not persist the restore. Try again.",
-                ));
-            }
+        let owned_generation = self.trash_poller.owned_generation(&row.source_profile, &id);
+        let result = self.capture_transaction_row(&id).and_then(|row| {
+            self.request_transaction(persistence_transactions::TransactionRequest::Restore {
+                row,
+                owned_generation,
+            })
+        });
+        if let Err(error) = result {
+            self.info_dialog = Some(InfoDialog::new("Restore Failed", &format!("{error:#}")));
         }
     }
 
@@ -2145,10 +1024,8 @@ impl HomeView {
         }
         for inst in trashed {
             let id = inst.id.clone();
-            // A restart cascade still on the worker would race the teardown against the
-            // container it is creating; skip the row, as `delete_selected` does. A second
-            // delete would also overwrite the force level tracked for the first.
-            if self.restart_in_flight.contains(&id) || self.deletes_in_flight.contains_key(&id) {
+            // Do not race teardown with a restart or another pending delete.
+            if self.restart_in_flight.contains_key(&id) || self.has_delete_in_flight(&id) {
                 continue;
             }
             let force_delete = match self.failed_delete_forced(&inst) {
@@ -2246,79 +1123,80 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group: persist runs inline, then tmux
-    /// teardown runs off-thread. Confirmation upstream. See #1868.
-    pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
-        let ids = self.active_sessions_in_selected_group();
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let kill_targets: Vec<_> = ids
+    /// Queue each original group member for reversible, proven-quiescent archive.
+    pub(super) fn archive_selected_group(
+        &mut self,
+    ) -> anyhow::Result<super::TransactionDisposition> {
+        let mut ids = self.active_sessions_in_selected_group();
+        ids.sort();
+        let rows = ids
             .iter()
-            .filter_map(|id| self.instances.get(id).cloned())
-            .collect();
-        // Persist under every member's lifecycle lock so `aoe send` cannot relaunch or type
-        // into one mid-archive, and tear down only after: a send that won the lock finishes
-        // first and its pane is then killed. Locks go in sorted id order, like every other
-        // multi-lock holder (startup reservation cleanup), so two holders cannot close a cycle.
-        let mut lock_order: Vec<_> = kill_targets.iter().collect();
-        lock_order.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut lifecycle_locks = Vec::with_capacity(lock_order.len());
-        for inst in lock_order {
-            let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
-            lifecycle_locks.push(storage.acquire_instance_lifecycle_lock(&inst.id)?);
+            .map(|id| self.capture_transaction_row(id))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            return Ok(super::TransactionDisposition::Ignored);
         }
-        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
-        drop(lifecycle_locks);
-        // Off-thread tmux teardown so N x 4 shellouts don't block the input
-        // thread. Mirrors `force_remove_session`.
-        std::thread::spawn(move || {
-            for inst in kill_targets {
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions()
-                })) {
-                    tracing::error!(
-                        target: "session.tmux_cleanup",
-                        session_id = %inst.id,
-                        "archive_selected_group tmux teardown panicked: {:?}",
-                        panic
-                    );
-                }
-            }
-        });
-        self.reveal_archived_section();
-        self.rebuild_flat_items();
-        // The project header vanishes once its last active member is archived, so the
-        // cursor's old index may point past the list end; clamp and re-resolve.
-        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
-            self.cursor = self.flat_items.len() - 1;
+        for row in &rows {
+            let id = &row.before.id;
+            anyhow::ensure!(
+                !self.transaction_is_pending(id)
+                    && !self.settlement_in_flight.contains_key(id)
+                    && !self.restart_in_flight.contains_key(id)
+                    && !self.recovery_in_flight.contains_key(id)
+                    && !self.has_delete_in_flight(id),
+                "A session in this group has a lifecycle operation in progress"
+            );
         }
-        self.update_selected();
-        Ok(())
+        for row in rows {
+            let successor = self.archive_successor_session(&row.before.id);
+            self.request_transaction(persistence_transactions::TransactionRequest::Archive {
+                row,
+                settled: None,
+                reveal: true,
+                successor,
+            })?;
+        }
+        Ok(super::TransactionDisposition::Queued)
     }
 }
 
 /// Outcome of a TUI restore-from-trash driven directly against storage. See #2541.
-enum RestoreFromTrash {
-    Restored {
-        project_path: String,
-        pre_trash_project_path: Option<String>,
-    },
+pub(super) enum RestoreFromTrash {
+    Restored,
     AlreadyGone,
     Busy(String),
-    WorktreeFailed {
-        reason: String,
-    },
+    WorktreeFailed { reason: String },
     PersistFailed,
 }
 
-/// Restore under one per-instance lifecycle flock. Acquisition, worktree move,
-/// and durable commit therefore form one serialized transition.
-fn restore_from_trash_with_storage(
+/// Restore under workspace -> identity -> lifecycle locks.
+pub(super) fn restore_from_trash_with_storage(
     storage: &Storage,
     id: &str,
     owned_trash_generation: Option<u64>,
+    before: &Instance,
 ) -> RestoreFromTrash {
+    let _workspace_claim_lock = match acquire_session_workspace_claim_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore workspace claim lock failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
+    let _identity_lock = match acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore identity lock failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
+    let storage = match storage.reopen_preserving_watch() {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore profile open failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
     let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(id) {
         Ok(lock) => lock,
         Err(error) => {
@@ -2326,7 +1204,18 @@ fn restore_from_trash_with_storage(
             return RestoreFromTrash::PersistFailed;
         }
     };
-    let decision = match storage.update(|instances, _groups| {
+    let decision = match storage.update_under_workspace_claim_lock(|instances, _groups| {
+        let original = instances
+            .iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Original restore row disappeared"))?;
+        anyhow::ensure!(
+            original.created_at == before.created_at
+                && original.same_storage_origin(before)
+                && (original.lifecycle_generation == before.lifecycle_generation
+                    || owned_trash_generation == Some(original.lifecycle_generation)),
+            "Original restore row changed"
+        );
         let decision = match owned_trash_generation {
             Some(generation) => crate::session::claim::decide_restore_claim_after_trash(
                 instances,
@@ -2354,11 +1243,11 @@ fn restore_from_trash_with_storage(
         }
     };
 
-    let loaded = match storage.load() {
+    let loaded = match storage.load_strict_for_worktree_ownership_locked() {
         Ok(all) => all.into_iter().find(|instance| instance.id == id),
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore load failed: {error}");
-            let _ = storage.update(|instances, _groups| {
+            let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                     stored.release_lifecycle_reservation_if_owned(
                         LifecycleOperation::Restore,
@@ -2370,130 +1259,110 @@ fn restore_from_trash_with_storage(
             return RestoreFromTrash::PersistFailed;
         }
     };
-    let Some(mut instance) = loaded else {
+    let Some(snapshot) = loaded else {
         return RestoreFromTrash::AlreadyGone;
     };
-
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut instance)
-    {
-        let _ = storage.update(|instances, _groups| {
-            if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
-                stored.release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Restore,
-                    generation,
-                );
-            }
-            Ok(())
-        });
-        return RestoreFromTrash::WorktreeFailed { reason };
+    if !snapshot.lifecycle_reservation_is_owned(LifecycleOperation::Restore, generation) {
+        return RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string());
     }
-    let restored_path = instance.project_path.clone();
-    let restored_pre = instance.pre_trash_project_path.clone();
-
-    match storage.update(|instances, _groups| {
-        Ok(crate::session::claim::finalize_restore_commit(
-            instances,
-            id,
-            generation,
-            &restored_path,
-            &restored_pre,
-        ))
-    }) {
-        Ok(crate::session::claim::RestoreCommit::Committed) => RestoreFromTrash::Restored {
-            project_path: restored_path,
-            pre_trash_project_path: restored_pre,
-        },
-        Ok(crate::session::claim::RestoreCommit::Superseded) => {
-            RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string())
+    let needs_move = snapshot
+        .pre_trash_project_path
+        .as_ref()
+        .is_some_and(|original| original != &snapshot.project_path);
+    // Inventory reads precede the profile storage flock.
+    if needs_move {
+        let paths = [
+            std::path::PathBuf::from(&snapshot.project_path),
+            std::path::PathBuf::from(snapshot.pre_trash_project_path.as_ref().unwrap()),
+        ];
+        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+            crate::session::deletion::SessionPathOwner {
+                profile: storage.profile(),
+                session_id: id,
+            },
+            &paths,
+        ) {
+            let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|row| row.id == id) {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Restore,
+                        generation,
+                    );
+                }
+                Ok(())
+            });
+            return RestoreFromTrash::WorktreeFailed {
+                reason: format!("worktree ownership could not be verified: {error}"),
+            };
         }
-        Ok(crate::session::claim::RestoreCommit::AlreadyGone) => RestoreFromTrash::AlreadyGone,
+    }
+    let result = storage.update_under_workspace_claim_lock(|instances, _groups| {
+        let Some(stored) = instances.iter_mut().find(|row| row.id == id) else {
+            return Ok(RestoreFromTrash::AlreadyGone);
+        };
+        if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Restore, generation)
+            || !restore_plan_unchanged(&snapshot, stored)
+        {
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
+            return Ok(RestoreFromTrash::Busy(
+                crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
+            ));
+        }
+        let mut instance = stored.clone();
+        instance.source_profile = storage.profile().to_owned();
+        if let crate::session::trash::RestoreOutcome::Failed { reason } =
+            crate::session::trash::restore_worktree_location(&mut instance)
+        {
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
+            return Ok(RestoreFromTrash::WorktreeFailed { reason });
+        }
+        let restored_path = instance.project_path;
+        let restored_pre = instance.pre_trash_project_path;
+        anyhow::ensure!(
+            crate::session::claim::finalize_restore_commit(
+                instances,
+                id,
+                generation,
+                &restored_path,
+                &restored_pre,
+            ) == crate::session::claim::RestoreCommit::Committed,
+            "restore reservation was superseded during worktree move",
+        );
+        Ok(RestoreFromTrash::Restored)
+    });
+    match result {
+        Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {error}");
+            let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|row| row.id == id) {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Restore,
+                        generation,
+                    );
+                }
+                Ok(())
+            });
             RestoreFromTrash::PersistFailed
         }
     }
 }
 
-pub(in crate::tui) struct DropRequest {
-    instance: Instance,
-}
-
-pub(in crate::tui) struct DropResult {
-    instance: Instance,
-    dropped: anyhow::Result<bool>,
-}
-
-impl crate::tui::worker::SessionScoped for DropResult {
-    fn session_id(&self) -> &str {
-        &self.instance.id
-    }
-}
-
-/// Remove the durable row under its lifecycle lock and purge claim, and only while it is
-/// still in the trash lifecycle the failure was recorded in, so a peer restore between
-/// confirm and submit keeps the row and its processes.
-pub(super) fn perform_drop(request: DropRequest) -> DropResult {
-    let inst = request.instance;
-    let id = inst.id.as_str();
-    let dropped = (|| -> anyhow::Result<bool> {
-        let storage = Storage::open_unwatched(&inst.source_profile)?;
-        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
-        let mut dropped = false;
-        storage.update(|instances, _groups| {
-            let same_lifecycle = instances
-                .iter()
-                .any(|stored| stored.id == id && stored.trashed_at == inst.trashed_at);
-            if same_lifecycle
-                && matches!(
-                    crate::session::claim::decide_purge_claim(
-                        instances,
-                        id,
-                        true,
-                        chrono::Utc::now()
-                    )?,
-                    crate::session::claim::PurgeClaimDecision::Claimed(_)
-                )
-            {
-                instances.retain(|stored| stored.id != id);
-                dropped = true;
-            }
-            Ok(())
-        })?;
-        Ok(dropped)
-    })();
-    DropResult {
-        instance: inst,
-        dropped,
-    }
-}
-
-/// Tear down a removed session's tmux and sandbox off-thread so a hung call cannot block
-/// input.
-fn spawn_force_teardown(inst: Instance) {
-    std::thread::spawn(move || {
-        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            inst.kill_all_tmux_sessions_without_lifecycle_row()
-        })) {
-            tracing::error!(
-                target: "session.delete",
-                session_id = %inst.id,
-                "force_remove tmux teardown panicked: {:?}",
-                panic
-            );
-        }
-        if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
-            let container = crate::containers::DockerContainer::from_session_id(&inst.id);
-            if let crate::containers::Teardown::Failed(e) = container.teardown(&inst.id) {
-                tracing::warn!(
-                    target: "session.delete",
-                    session_id = %inst.id,
-                    "force_remove container teardown failed: {}",
-                    e
-                );
-            }
-        }
-    });
+fn restore_plan_unchanged(snapshot: &Instance, durable: &Instance) -> bool {
+    snapshot.is_trashed() == durable.is_trashed()
+        && snapshot.project_path == durable.project_path
+        && snapshot.pre_trash_project_path == durable.pre_trash_project_path
+        && snapshot.worktree_info == durable.worktree_info
+        && snapshot.scratch == durable.scratch
+        && snapshot
+            .workspace_info
+            .as_ref()
+            .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+            == durable
+                .workspace_info
+                .as_ref()
+                .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+        && snapshot.is_sandboxed() == durable.is_sandboxed()
 }
 
 #[cfg(test)]

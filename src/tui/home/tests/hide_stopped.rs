@@ -57,7 +57,11 @@ fn header_text(view: &HomeView, group: &str) -> String {
 }
 
 fn press_y(env: &mut TestEnv) {
-    env.view.handle_key(key(KeyCode::Char('y')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('y')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 }
 
 #[test]
@@ -221,7 +225,11 @@ fn the_selection_finds_its_own_header_when_rows_above_it_also_drop_out() {
 fn strict_mode_toggles_on_shift_y() {
     let mut env = env_with_stopped(true);
     env.view.strict_hotkeys = true;
-    env.view.handle_key(key(KeyCode::Char('Y')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('Y')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(header_text(&env.view, "util").contains("util (1/3)"));
 }
 
@@ -281,7 +289,11 @@ fn custom_moves_wait_until_stopped_sessions_are_shown() {
         .map(|i| (i.id.clone(), i.sort_index, i.group_path.clone()))
         .collect();
 
-    env.view.move_row_at_cursor(1).unwrap();
+    {
+        let submitted = env.view.move_row_at_cursor(1);
+        await_transaction_result(&mut env.view, submitted)
+    }
+    .unwrap();
     assert!(env
         .view
         .status_flash_text()
@@ -303,7 +315,11 @@ fn custom_moves_wait_until_stopped_sessions_are_shown() {
     env.view.cursor = group_row;
     env.view.update_selected();
     env.view.status_flash = None;
-    env.view.move_row_at_cursor(1).unwrap();
+    {
+        let submitted = env.view.move_row_at_cursor(1);
+        await_transaction_result(&mut env.view, submitted)
+    }
+    .unwrap();
     assert!(
         !env.view
             .status_flash_text()
@@ -313,7 +329,11 @@ fn custom_moves_wait_until_stopped_sessions_are_shown() {
 
     press_y(&mut env);
     select_session(&mut env, "util-live");
-    env.view.move_row_at_cursor(-1).unwrap();
+    {
+        let submitted = env.view.move_row_at_cursor(-1);
+        await_transaction_result(&mut env.view, submitted)
+    }
+    .unwrap();
     let moved: Vec<_> = env
         .view
         .instances
@@ -383,7 +403,11 @@ fn each_profile_counts_its_own_copy_of_a_group() {
     view.group_by = GroupByMode::Manual;
     view.rebuild_flat_items();
     view.update_selected();
-    view.handle_key(key(KeyCode::Char('y')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('y')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
 
     let header_for = |profile: &str| {
         let item = view
@@ -501,7 +525,11 @@ fn live_send_ends_when_its_session_is_hidden() {
             Ok(())
         })
         .unwrap();
-    env.view.reload_storage_only().unwrap();
+    {
+        env.view.request_reload(super::super::ReloadKind::Storage);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
 
     assert!(!session_titles(&env.view).contains(&"util-live".to_string()));
     assert!(env.view.live_send.is_none(), "live-send ends with its row");
@@ -641,7 +669,11 @@ fn w_skips_an_unread_session_the_filter_hides() {
     press_y(&mut env);
     let live = select_session(&mut env, "util-live");
 
-    env.view.handle_key(key(KeyCode::Char('w')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('w')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(env.view.selected_session.as_deref(), Some(live.as_str()));
     assert_eq!(
         cursor_row_session(&env.view).as_deref(),
@@ -651,7 +683,11 @@ fn w_skips_an_unread_session_the_filter_hides() {
     env.view.info_dialog = None;
     press_y(&mut env);
     select_session(&mut env, "util-live");
-    env.view.handle_key(key(KeyCode::Char('w')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('w')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert_eq!(
         env.view.selected_session.as_deref(),
         Some(hidden.as_str()),
@@ -674,12 +710,23 @@ fn restoring_a_session_the_filter_hides_selects_its_own_header() {
     let cases: [(&str, Shelve); 2] = [
         ("archive", |view, id| {
             view.select_session_by_id(id);
-            view.toggle_archive_at_cursor().unwrap();
+            {
+                let submitted = view.toggle_archive_at_cursor();
+                await_transaction_result(
+                    view,
+                    submitted.map(|_| super::super::TransactionDisposition::Queued),
+                )
+            }
+            .unwrap();
+            finish_runner_settlements(view);
             assert!(view.get_instance(id).unwrap().is_archived());
         }),
         ("trash", |view, id| {
             view.selected_session = Some(id.to_string());
-            view.trash_session_by_id(id);
+            {
+                view.trash_session_by_id(id);
+                drain_persistence(view).unwrap();
+            };
             assert!(view.get_instance(id).unwrap().is_trashed());
         }),
     ];
@@ -697,7 +744,14 @@ fn restoring_a_session_the_filter_hides_selects_its_own_header() {
             "{case}: on the shelf"
         );
 
-        env.view.toggle_archive_at_cursor().unwrap();
+        {
+            let submitted = env.view.toggle_archive_at_cursor();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
 
         let inst = env.view.get_instance(&id).unwrap();
         assert!(

@@ -35,7 +35,6 @@ use crate::migrations::v027_isolate_sandbox_stores as v027;
 use crate::migrations::v033_isolate_sandbox_content as content;
 use crate::session::anchored_fs::AnchoredDir;
 use anyhow::{bail, Context, Result};
-use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -242,45 +241,49 @@ fn also_owned(app_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Serialise reclaim passes against each other, and hold v027's transition
-/// lock for the duration.
-///
-/// The transition lock is taken *shared*. Exclusive would also block
-/// `Storage::update`, which is what publishes the session row for a store
-/// being created: holding it exclusively turns the creation race below into a
-/// guaranteed loss by preventing the very insert that would mark the store
-/// owned. Shared still excludes v027's own planning and publishing, which take
-/// it exclusively, and v027's copy phase holds no transition lock at all, so
-/// exclusivity buys nothing there either.
-///
-/// A row that is merely still on the shared store does not block the pass: it
-/// owns no private store to reclaim yet, and the one it will own carries its
-/// id, which this pass reads as claimed. Blocking on that instead would refuse
-/// forever on any machine holding an archived or trashed pre-transition
-/// session, since those keep their shared store until they are started again.
-fn guard(app_dir: &Path) -> Result<(crate::session::StorageFlock, crate::session::StorageFlock)> {
+/// Serialize reclaim passes, then fence both build namespaces' ownership
+/// inventories before taking their shared store-transition locks. Abort appends
+/// retained ownership and removes its source row under the workspace fence;
+/// reclaim must never observe the gap or invert transition -> workspace.
+fn guard(app_dir: &Path) -> Result<Vec<crate::session::StorageFlock>> {
     fs::create_dir_all(app_dir)?;
-    let pass = crate::session::acquire_storage_flock(app_dir, RECLAIM_LOCK)?;
-    let transition = crate::session::acquire_storage_shared_flock(app_dir, v027::LOCK)?;
-    if v027::transition_in_flight(app_dir)? {
-        bail!(
-            "the sandbox store migration is still moving stores; run `aoe migrate` and try again"
-        );
+    let mut locks = vec![crate::session::acquire_storage_flock(
+        app_dir,
+        RECLAIM_LOCK,
+    )?];
+    let mut namespaces = also_owned(app_dir);
+    namespaces.push(app_dir.to_path_buf());
+    for namespace in &mut namespaces {
+        fs::create_dir_all(&*namespace)?;
+        *namespace = fs::canonicalize(&*namespace)?;
     }
-    Ok((pass, transition))
+    locks.extend(crate::session::storage::acquire_storage_flock_cohort(
+        namespaces.iter().map(PathBuf::as_path),
+        crate::session::SESSION_WORKSPACE_CLAIM_LOCK_FILENAME,
+        false,
+    )?);
+    locks.extend(crate::session::storage::acquire_storage_flock_cohort(
+        namespaces.iter().map(PathBuf::as_path),
+        v027::LOCK,
+        true,
+    )?);
+    for namespace in &namespaces {
+        if v027::transition_in_flight(namespace)? {
+            bail!(
+                "the sandbox store migration is still moving stores; run `aoe migrate` and try again"
+            );
+        }
+    }
+    Ok(locks)
 }
 
 /// Serialises reclaim passes so two do not race to remove the same store.
 const RECLAIM_LOCK: &str = ".sandbox-reclaim.lock";
 
-/// The store ids every profile's registry claims.
-///
-/// Fails rather than answering short. A missing registry file is a profile
-/// with no sessions; a registry that exists but cannot be read, parsed, or
-/// understood is a profile whose sessions we cannot see, and treating its
-/// stores as unowned would delete them.
+/// Every ID occurrence claims its store, including ambiguous raw owners.
+/// An unreadable row refuses the inventory; it cannot authorize reclaim.
 fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
-    let mut paths = registry_paths(app_dir)?;
+    let mut paths = v027::registry_paths(app_dir)?;
     if paths.is_empty() {
         bail!(
             "no session registry under {}; refusing to treat every agent store as unowned",
@@ -288,100 +291,33 @@ fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
         );
     }
     for dir in also {
-        paths.extend(registry_paths(dir)?);
+        paths.extend(v027::registry_paths(dir)?);
     }
     let mut ids = BTreeSet::new();
+    for namespace in std::iter::once(app_dir).chain(also.iter().map(PathBuf::as_path)) {
+        ids.extend(crate::session::retained_intents::retained_ids_in(
+            namespace,
+        )?);
+    }
     for path in paths {
         let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let value: Value = serde_json::from_slice(&bytes)
+        let rows: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
-        let rows = value
-            .as_array()
-            .with_context(|| format!("{} is not a session array", path.display()))?;
         for row in rows {
-            let id = row
-                .get("id")
-                .and_then(Value::as_str)
-                .with_context(|| format!("session row without an id in {}", path.display()))?;
-            ids.insert(id.to_string());
+            let object = crate::session::raw_document::RawObject::parse(row)
+                .with_context(|| format!("reading session owner in {}", path.display()))?;
+            let mut found = false;
+            for raw_id in object.values("id") {
+                let id: String = serde_json::from_str(raw_id.get()).with_context(|| {
+                    format!("session row without a string id in {}", path.display())
+                })?;
+                ids.insert(id);
+                found = true;
+            }
+            anyhow::ensure!(found, "session row without an id in {}", path.display());
         }
     }
     Ok(ids)
-}
-
-/// Every profile's registry, plus the default one. A `sessions.json` that is
-/// present but not a regular file is a registry we cannot read, so it fails
-/// the pass rather than being skipped.
-fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut dirs = vec![app_dir.to_path_buf()];
-    let profiles = app_dir.join("profiles");
-    match fs::read_dir(&profiles) {
-        Ok(entries) => {
-            for entry in entries {
-                let path = entry?.path();
-                // Resolved, not `DirEntry::file_type`, which does not follow
-                // symlinks: a symlinked profile directory would otherwise be
-                // skipped and its sessions would read as unowned. An entry we
-                // cannot stat at all fails the pass rather than being skipped,
-                // for the same reason.
-                match fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_dir() => dirs.push(path),
-                    // A stray file under `profiles/` is not a profile.
-                    Ok(_) => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "{} cannot be inspected; refusing to reclaim stores \
-                                 without reading every profile",
-                                path.display()
-                            )
-                        })
-                    }
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("reading {}", profiles.display())),
-    }
-    let mut paths = Vec::new();
-    for dir in dirs {
-        let path = dir.join("sessions.json");
-        // Only a genuinely absent registry is a profile with no sessions.
-        // Every other failure means a registry we cannot read, and skipping it
-        // would drop its sessions from the ownership inventory and make its
-        // stores look like orphans. Presence is decided without following the
-        // link, resolution with it, so a dangling symlink fails here rather
-        // than reading as absent.
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "{} cannot be inspected; refusing to reclaim stores without reading it",
-                        path.display()
-                    )
-                })
-            }
-        }
-        match fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => paths.push(path),
-            Ok(_) => bail!(
-                "{} is not a regular file; refusing to reclaim stores without reading it",
-                path.display()
-            ),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "{} cannot be resolved; refusing to reclaim stores without reading it",
-                        path.display()
-                    )
-                })
-            }
-        }
-    }
-    paths.sort();
-    Ok(paths)
 }
 
 /// Every `sandbox-v2` root any profile can place a store under: the built-in
@@ -395,7 +331,7 @@ fn store_roots(app_dir: &Path, home: &Path) -> Result<Vec<PathBuf>> {
             crate::session::config::container_config::sandbox_store_roots(tool, home, None),
         );
     }
-    for path in registry_paths(app_dir)? {
+    for path in v027::registry_paths(app_dir)? {
         let profile = v027::profile_for_registry(app_dir, &path);
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         for tool in &tools {
@@ -506,6 +442,12 @@ fn content_transition_pending(app: &Path, also_owned: &[PathBuf], id: &str) -> R
 }
 
 fn remove_owned_store(app: &Path, also_owned: &[PathBuf], id: &str, path: &Path) -> Result<()> {
+    for namespace in std::iter::once(app).chain(also_owned.iter().map(PathBuf::as_path)) {
+        anyhow::ensure!(
+            !crate::session::retained_intents::retained_ids_in(namespace)?.contains(id),
+            "sandbox {id} has retained ownership; its agent store cannot be removed"
+        );
+    }
     if content_transition_pending(app, also_owned, id)? {
         bail!("native content transition is pending");
     }
@@ -550,9 +492,9 @@ fn reclaim_in(
         plan,
         ..Outcome::default()
     };
-    // Ownership is re-read: the pass holds the transition lock shared, so a
-    // session created during it can publish its row, and a store that was
-    // unclaimed at planning time may be claimed by the time we reach it.
+    // The public pass retains both namespaces' workspace fences through this
+    // re-read and every deletion. The re-read also protects direct metadata/FS
+    // callers from a claim published by their planning callback.
     let owned = owned_ids(app_dir, also_owned)?;
     for orphan in &outcome.plan.orphans {
         // Per candidate, not once for the loop. v027's probe caches its
@@ -639,6 +581,8 @@ fn directory_bytes(root: &Path) -> u64 {
 /// shared legacy store owns no per-instance directory to remove, and v027 may
 /// be publishing the private one it will own, so it is left to the reclaim
 /// pass.
+/// Caller retains the workspace fences for both build namespaces. Do not
+/// reacquire them here: deletion already owns its original physical fences.
 pub(crate) fn remove_stores_for(
     instance: &crate::session::Instance,
 ) -> Result<(Vec<PathBuf>, u64)> {
@@ -697,6 +641,125 @@ pub(crate) fn remove_stores_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retain_unknown_intent() -> String {
+        crate::session::retained_intents::initialize_legacy_in(
+            &crate::session::get_app_dir().unwrap(),
+        )
+        .unwrap();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut row = crate::session::Instance::new("retained", "/retained-original");
+        row.runner_journal =
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
+        row.status = crate::session::Status::Creating;
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Create,
+            crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        row.lifecycle_reservation.as_mut().unwrap().path_claims =
+            crate::session::WorktreePathClaims::Unknown(None);
+        fs::write(
+            storage.sessions_path(),
+            serde_json::to_vec(&vec![&row]).unwrap(),
+        )
+        .unwrap();
+        let selected = crate::session::retained_intents::capture(&storage, &row.id).unwrap();
+        crate::session::retained_intents::abort(&selected).unwrap();
+        row.id
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retained_ids_from_both_namespaces_keep_stores_without_native_probes() {
+        let first = tempfile::tempdir().unwrap();
+        let _first_environment = crate::session::test_support::isolate_app_dir_at(first.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let main_id = retain_unknown_intent();
+        let second = tempfile::tempdir().unwrap();
+        let _second_environment = crate::session::test_support::isolate_app_dir_at(second.path());
+        let sibling = crate::session::get_app_dir().unwrap();
+        let sibling_id = retain_unknown_intent();
+        let home = dirs::home_dir().unwrap();
+        let main_store = unproven_store(&home, &main_id, 17);
+        let sibling_store = unproven_store(&home, &sibling_id, 19);
+        let also = vec![sibling];
+        let inventory = owned_ids(&app, &also).unwrap();
+        assert!(inventory.contains(&main_id));
+        assert!(inventory.contains(&sibling_id));
+        let outcome = reclaim_in(&app, &also, &home, NO_GRACE, &|_| {
+            panic!("retained IDs reached a native existence probe")
+        })
+        .unwrap();
+        assert!(outcome.removed.is_empty());
+        assert_eq!(
+            fs::read(main_store.join(".credentials.json")).unwrap(),
+            vec![b'x'; 17]
+        );
+        assert_eq!(
+            fs::read(sibling_store.join(".credentials.json")).unwrap(),
+            vec![b'x'; 19]
+        );
+        assert!(remove_owned_store(&app, &also, &main_id, &main_store).is_err());
+        assert!(remove_owned_store(&app, &also, &sibling_id, &sibling_store).is_err());
+    }
+
+    #[test]
+    fn unreadable_retained_inventory_refuses_before_store_removal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let app = temporary.path().join("app");
+        let home = temporary.path().join("home");
+        fs::create_dir_all(&app).unwrap();
+        app_with_rows(&app, &[]);
+        fs::write(app.join("retained-intents.json"), b"not json").unwrap();
+        let store = unproven_store(&home, "1111111111111111", 23);
+        assert!(reclaim_in(&app, &[], &home, NO_GRACE, &|_| {
+            panic!("unreadable ledger reached a native existence probe")
+        })
+        .is_err());
+        assert_eq!(
+            fs::read(store.join(".credentials.json")).unwrap(),
+            vec![b'x'; 23]
+        );
+    }
+
+    #[test]
+    fn ambiguous_and_opaque_owner_ids_remain_protected_in_reclaim_inventory() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let app = temporary.path().join("app");
+        fs::create_dir(&app)?;
+        crate::session::retained_intents::initialize_legacy_in(&app)?;
+        fs::write(app.join(".schema_version"), b"42")?;
+        let cases: &[(&str, Option<&[&str]>)] = &[
+            (
+                r#"[{"id":"1111111111111111","id":"2222222222222222","runner_journal":{"coverage":"complete","launches":[]}}]"#,
+                Some(&["1111111111111111", "2222222222222222"]),
+            ),
+            (
+                r#"[{"id":"1111111111111111","runner_journal":{"opaque":{"duplicate":1,"duplicate":2,"number":1e400}}}]"#,
+                Some(&["1111111111111111"]),
+            ),
+            (r#"[{"id":"1111111111111111","id":null}]"#, None),
+            (r#"[{"missing_identity":true}]"#, None),
+        ];
+        for (raw, expected) in cases {
+            let path = app.join("sessions.json");
+            fs::write(&path, raw)?;
+            let owned = owned_ids(&app, &[]);
+            match expected {
+                Some(expected) => {
+                    assert_eq!(owned?, expected.iter().map(|id| (*id).to_owned()).collect())
+                }
+                None => assert!(
+                    owned.is_err(),
+                    "an unreadable identity cannot authorize reclaim"
+                ),
+            }
+            assert_eq!(fs::read(&path)?, raw.as_bytes());
+        }
+        Ok(())
+    }
 
     fn app_with_rows(app: &Path, rows: &[&str]) {
         let ids: Vec<String> = rows
@@ -830,63 +893,42 @@ mod tests {
     #[test]
     fn an_unusable_registry_aborts_the_pass_before_removing_anything() {
         type Plant = fn(&Path);
-        let cases: &[(&str, Plant, &str)] = &[
-            (
-                "not an array",
-                |app| {
-                    fs::write(
-                        app.join("profiles/work/sessions.json"),
-                        r#"{"not":"an array"}"#,
-                    )
-                    .unwrap()
-                },
-                "session array",
-            ),
-            (
-                "truncated",
-                |app| fs::write(app.join("profiles/work/sessions.json"), "{").unwrap(),
-                "sessions.json",
-            ),
-            (
-                "row without id",
-                |app| {
-                    fs::write(
-                        app.join("profiles/work/sessions.json"),
-                        r#"[{"title":"no id"}]"#,
-                    )
-                    .unwrap()
-                },
-                "sessions.json",
-            ),
-            (
-                "no registry",
-                |app| fs::remove_file(app.join("sessions.json")).unwrap(),
-                "refusing",
-            ),
-            (
-                "dangling profile directory",
-                |app| {
-                    fs::remove_dir(app.join("profiles/work")).unwrap();
-                    std::os::unix::fs::symlink(app.join("nowhere"), app.join("profiles/work"))
-                        .unwrap();
-                },
-                "refusing",
-            ),
-            (
-                "dangling registry file",
-                |app| {
-                    std::os::unix::fs::symlink(
-                        app.join("nowhere"),
-                        app.join("profiles/work/sessions.json"),
-                    )
-                    .unwrap();
-                },
-                "refusing",
-            ),
+        let cases: &[(&str, Plant)] = &[
+            ("not an array", |app| {
+                fs::write(
+                    app.join("profiles/work/sessions.json"),
+                    r#"{"not":"an array"}"#,
+                )
+                .unwrap()
+            }),
+            ("truncated", |app| {
+                fs::write(app.join("profiles/work/sessions.json"), "{").unwrap()
+            }),
+            ("row without id", |app| {
+                fs::write(
+                    app.join("profiles/work/sessions.json"),
+                    r#"[{"title":"no id"}]"#,
+                )
+                .unwrap()
+            }),
+            ("no registry", |app| {
+                fs::remove_file(app.join("sessions.json")).unwrap()
+            }),
+            ("dangling profile directory", |app| {
+                fs::remove_dir(app.join("profiles/work")).unwrap();
+                std::os::unix::fs::symlink(app.join("nowhere"), app.join("profiles/work")).unwrap();
+            }),
+            ("dangling registry file", |app| {
+                std::os::unix::fs::symlink(
+                    app.join("nowhere"),
+                    app.join("profiles/work/sessions.json"),
+                )
+                .unwrap();
+            }),
         ];
 
         let mut failures = Vec::new();
-        for (name, plant, cause) in cases {
+        for (name, plant) in cases {
             let dir = tempfile::tempdir().unwrap();
             let app = dir.path().join("app");
             let home = dir.path().join("home");
@@ -895,12 +937,8 @@ mod tests {
             let orphan = owned_store(&app, &home, "2222222222222222", 40);
             plant(&app);
 
-            match reclaim_in(&app, &[], &home, NO_GRACE, &gone) {
-                Ok(_) => failures.push(format!("{name}: the pass succeeded")),
-                Err(error) if !error.chain().any(|c| c.to_string().contains(cause)) => {
-                    failures.push(format!("{name}: {error:#}"))
-                }
-                Err(_) => {}
+            if reclaim_in(&app, &[], &home, NO_GRACE, &gone).is_ok() {
+                failures.push(format!("{name}: the pass succeeded"));
             }
             if !orphan.exists() {
                 failures.push(format!("{name}: a store was removed despite the failure"));

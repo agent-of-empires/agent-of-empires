@@ -1,5 +1,7 @@
 //! Domain core for creating a session.
 
+use anyhow::Context;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::session::Instance;
@@ -83,6 +85,26 @@ pub(crate) async fn spawn_structured_session(
     service: &Arc<SessionService>,
     spec: StructuredSessionSpec,
 ) -> anyhow::Result<SpawnOutcome> {
+    let mut spec = spec;
+    if spec.profile.is_empty() {
+        spec.profile = service.primary_storage.profile().to_owned();
+    }
+    let primary = service.primary_storage.clone();
+    let requested_profile = spec.profile.clone();
+    let file_watch = service.file_watch.clone();
+    let storage = tokio::task::spawn_blocking(move || {
+        let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+        let _identity = crate::session::acquire_session_identity_lock()?;
+        let storage = if requested_profile == primary.profile() {
+            primary.as_ref().clone()
+        } else {
+            crate::session::Storage::open_or_create(&requested_profile, file_watch)?
+        };
+        storage.verify_profile_identity()?;
+        anyhow::Ok(storage)
+    })
+    .await
+    .context("admitting original creation profile task")??;
     let instances = service.instances.read().await;
     let existing_titles: Vec<String> = instances.iter().map(|i| i.title.clone()).collect();
     let existing_branches: Vec<String> = instances
@@ -91,12 +113,9 @@ pub(crate) async fn spawn_structured_session(
         .collect();
     drop(instances);
 
-    let file_watch_for_create = service.file_watch.clone();
-
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
         use crate::session::Config;
-        use crate::session::Storage;
 
         let StructuredSessionSpec {
             title,
@@ -199,7 +218,7 @@ pub(crate) async fn spawn_structured_session(
             fork_seed,
         };
 
-        let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
+        let build_result = builder::build_instance(params, &title_refs, &branch_refs, &storage)?;
         let mut instance = build_result.instance;
         instance.source_profile = profile.clone();
         instance.created_by_plugin = created_by_plugin;
@@ -214,8 +233,7 @@ pub(crate) async fn spawn_structured_session(
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
         let build_warnings = build_result.warnings;
-        let created_worktree = build_result.created_worktree;
-        let created_workspace_worktrees = build_result.created_workspace_worktrees;
+        let creation_intent = build_result.creation_intent;
 
         // Apply per-session sandbox overrides from the request body.
         if let Some(ref mut sandbox) = instance.sandbox_info {
@@ -317,45 +335,89 @@ pub(crate) async fn spawn_structured_session(
 
             agent_effort
         };
+        creation_intent.refresh_prepared(&instance).context("Creation intent changed; its durable claim and resources remain retained")?;
 
-        // Run on_create hooks now that the worktree exists, before the session is persisted
-        // or started.
+        // Run creation hooks after the complete plan is durable.
         if let Err(e) = crate::server::api::sessions::run_create_hooks(
             &mut instance,
+            &creation_intent,
             &hook_plan,
             std::path::Path::new(&original_path),
             progress.as_deref(),
         ) {
-            builder::cleanup_instance(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
-            );
+            tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
             let hint = hook_plan
                 .hooks
                 .as_ref()
                 .and_then(|h| h.origin_hint("on_create"))
                 .map(|hint| format!("\n{hint}"))
                 .unwrap_or_default();
-            return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
+            return Err(builder::finish_failed_creation(&storage, &instance, anyhow::anyhow!("on_create hook failed: {e:#}{hint}")));
         }
 
         if let Some(progress) = &progress {
             progress.set_stage(crate::server::create_progress::CreateStage::Starting);
         }
 
-        // Anything that fails between here and the final `Ok(..)` would otherwise orphan
-        // the scratch directory `build_instance` already provisioned (Storage::new,
-        // storage.update, instance.start). Wrap the tail in an IIFE-equivalent closure so
-        // we can run cleanup on Err once, regardless of which step tripped.
-        let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
-            let to_persist = instance.clone();
-            storage.update(|all, _groups| {
-                all.push(to_persist);
-                Ok(())
-            })?;
+        let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
+                return Err(error);
+            }
+        };
+        let ownership_locks = match crate::session::acquire_session_identity_lock() {
+            Ok(lock) => {
+                builder::CleanupOwnershipLocks::from_held(_workspace_claim_lock, lock)
+            }
+            Err(error) => {
+                drop(_workspace_claim_lock);
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
+                return Err(error);
+            }
+        };
+        if let Err(error) = storage.verify_profile_identity() {
+            tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
+            return Err(error);
+        }
+        if let Err(error) = crate::session::validate_managed_workspace(&instance) {
+            tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
+            return Err(anyhow::anyhow!(
+                "Managed workspace validation failed before the session was persisted: {error}"
+            ));
+        }
+        let manages_worktree = instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|worktree| worktree.managed_by_aoe)
+            || instance.workspace_info.is_some();
+        if manages_worktree {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
+            );
+            if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+                crate::session::deletion::SessionPathOwner { profile: storage.profile(), session_id: &instance.id },
+                &candidate_paths,
+            ) {
+                tracing::warn!(target: "session.create", "Creation ownership and resources retained: original native quiescence is unproven");
+                return Err(anyhow::anyhow!(
+                    "Session path is already claimed by another session: {error}"
+                ));
+            }
+        }
+        // Creation ownership is immutable even if launch reconciliation changes `instance`.
+        let created = instance.clone();
+        let mut published = false;
+        let persist_and_start = || -> anyhow::Result<()> {
+            instance = builder::publish_prepared_creation_under_workspace_claim_lock(
+                &storage, &created, &creation_intent, |_all, _groups| Ok(()),
+            )?;
+            published = true;
+            drop(ownership_locks);
 
             // Acp-mode sessions are not backed by tmux; the structured view supervisor
             // spawns the ACP agent on demand.
@@ -366,22 +428,10 @@ pub(crate) async fn spawn_structured_session(
             Ok(())
         };
 
-        if let Err(e) = persist_and_start() {
-            // Guarded the same way as the deletion path.
-            if instance.scratch {
-                let scratch_path = std::path::PathBuf::from(&instance.project_path);
-                if crate::session::scratch::is_scratch_path(&scratch_path) {
-                    if let Err(rm_err) = std::fs::remove_dir_all(&scratch_path) {
-                        tracing::warn!(
-                            target: "http.api.sessions",
-                            "Failed to clean up orphan scratch dir {} after create failure: {}",
-                            scratch_path.display(),
-                            rm_err
-                        );
-                    }
-                }
-            }
-            return Err(e);
+        if let Err(error) = persist_and_start() {
+            tracing::warn!(target: "http.api.sessions", session = %created.id, metadata_published = published,
+                "Retaining failed-create metadata and resources: launch failure does not prove native quiescence: {error:#}");
+            return Err(error.context("Creation resources retained for recovery by their original owner"));
         }
 
         Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
@@ -411,6 +461,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.command.clone(),
                     instance.import_pending == Some(true),
                     instance.fork_pending.clone(),
+                    crate::session::LaunchOrigin::capture(&instance),
                 ))
             } else {
                 None
@@ -437,8 +488,17 @@ pub(crate) async fn spawn_structured_session(
                 command,
                 seed_history_replay,
                 fork_from,
+                original,
             )) = acp_spawn_target
             {
+                let admission = original.map(|original| {
+                    service.acp_supervisor.begin_resume(
+                        &id,
+                        crate::acp::runner_lifecycle::NativeResume::Spawn,
+                        original,
+                        false,
+                    )
+                });
                 let agent = service
                     .acp_supervisor
                     .pick_agent_for_tool(
@@ -461,12 +521,33 @@ pub(crate) async fn spawn_structured_session(
                         .is_some_and(|i| i.pending_initial_turn.is_some())
                 };
                 tokio::spawn(async move {
+                    let admission = match admission {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            supervisor.publish_startup_error(&id, error.to_string());
+                            return;
+                        }
+                    };
+                    let reservation = match admission.await {
+                        Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(
+                            reservation,
+                        )) => reservation,
+                        Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent(_)) => {
+                            return
+                        }
+                        Err(error) => {
+                            supervisor.publish_startup_error(&id, error.to_string());
+                            return;
+                        }
+                    };
+                    let issuance = reservation.execution_admission();
+                    let _body_custody = issuance.begin_job();
                     let inst_lock = service_for_check.instance_lock(&id).await;
                     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
                         &service_for_check.instances,
                         &service_for_check.mutation_epoch,
                         &inst_lock,
-                        &id,
+                        issuance.clone(),
                         true,
                     )
                     .await
@@ -483,32 +564,34 @@ pub(crate) async fn spawn_structured_session(
                             return;
                         }
                     };
-                    let source_profile_for_spawn = Some(source_profile.clone());
                     match supervisor
-                        .spawn(crate::acp::supervisor::SpawnRequest {
-                            session_id: id.clone(),
-                            agent: agent.clone(),
-                            tool,
-                            cwd,
-                            additional_dirs: vec![],
-                            provider_env: vec![],
-                            // A pick is made on a live session, never at create.
-                            provider: None,
-                            model,
-                            effort,
-                            effort_explicit,
-                            stored_acp_session_id,
-                            fork_from,
-                            sandbox_continuation:
-                                crate::acp::supervisor::SandboxContinuation::Persisted,
-                            sandbox_info,
-                            source_profile: source_profile_for_spawn,
-                            yolo_mode,
-                            acp_mode_id,
-                            agent_command_override: command_override,
-                            seed_history_replay,
-                            claude_store_pin: None,
-                        })
+                        .spawn_inner(
+                            crate::acp::supervisor::SpawnRequest {
+                                session_id: id.clone(),
+                                agent: agent.clone(),
+                                tool,
+                                cwd,
+                                additional_dirs: vec![],
+                                provider_env: vec![],
+                                // A pick is made on a live session, never at create.
+                                provider: None,
+                                model,
+                                effort,
+                                effort_explicit,
+                                stored_acp_session_id,
+                                fork_from,
+                                sandbox_continuation:
+                                    crate::acp::supervisor::SandboxContinuation::Persisted,
+                                sandbox_info,
+                                origin: issuance.origin(),
+                                yolo_mode,
+                                acp_mode_id,
+                                agent_command_override: command_override,
+                                seed_history_replay,
+                                claude_store_pin: None,
+                            },
+                            reservation,
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -585,8 +668,15 @@ mod tests {
 
         let _home = crate::session::test_support::isolate_app_dir();
         let old = crate::session::Instance::new("old", "/tmp/old");
-        crate::server::test_support::seed_instances_on_disk_for_test("test", vec![old.clone()]);
-        let state = crate::server::test_support::build_test_app_state(vec![old]);
+        let occupant_dir = tempfile::tempdir().unwrap();
+        let mut occupant =
+            crate::session::Instance::new("occupant", occupant_dir.path().to_str().unwrap());
+        occupant.id = "occupant".to_string();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "test",
+            vec![old.clone(), occupant.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![old, occupant]);
         // Capacity prevents an external agent launch without bypassing creation or persistence.
         state.acp_supervisor.test_insert_worker("occupant").await;
         let epoch = state

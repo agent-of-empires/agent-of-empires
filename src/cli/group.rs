@@ -130,15 +130,18 @@ async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
         name.clone()
     };
 
-    storage.update(|instances, groups| {
-        let mut group_tree = GroupTree::new_with_groups(instances, groups);
-        if group_tree.group_exists(&group_path) {
-            bail!("Group already exists: {}", group_path);
-        }
-        group_tree.create_group(&group_path);
-        *groups = group_tree.get_all_groups();
-        Ok(())
-    })?;
+    storage.update_metadata(
+        crate::session::MetadataSelection::Group(std::borrow::Cow::Borrowed(&group_path)),
+        |instances, groups| {
+            let mut group_tree = GroupTree::new_with_groups(instances, groups);
+            if group_tree.group_exists(&group_path) {
+                bail!("Group already exists: {}", group_path);
+            }
+            group_tree.create_group(&group_path);
+            *groups = group_tree.get_all_groups();
+            Ok(())
+        },
+    )?;
 
     println!("✓ Created group: {}", group_path);
     Ok(())
@@ -149,37 +152,41 @@ async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
     let name = args.name.trim().to_string();
     let force = args.force;
 
-    let session_count = storage.update(|instances, groups| {
-        let mut group_tree = GroupTree::new_with_groups(instances, groups);
-        if !group_tree.group_exists(&name) {
-            bail!("Group not found: {}", name);
-        }
+    let session_count = storage.update_metadata(
+        crate::session::MetadataSelection::Subtree(std::borrow::Cow::Borrowed(&name)),
+        |instances, groups| {
+            let mut group_tree = GroupTree::new_with_groups(instances, groups);
+            if !group_tree.group_exists(&name) {
+                bail!("Group not found: {}", name);
+            }
 
-        let session_count = instances
-            .iter()
-            .filter(|i| i.group_path == name || i.group_path.starts_with(&format!("{}/", name)))
-            .count();
+            let session_count = instances
+                .iter()
+                .filter(|i| i.group_path == name || i.group_path.starts_with(&format!("{}/", name)))
+                .count();
 
-        if session_count > 0 {
-            if !force {
-                bail!(
+            if session_count > 0 {
+                if !force {
+                    bail!(
                     "Group '{}' contains {} sessions. Use --force to move them to default group.",
                     name,
                     session_count
                 );
-            }
+                }
 
-            for inst in instances.iter_mut() {
-                if inst.group_path == name || inst.group_path.starts_with(&format!("{}/", name)) {
-                    inst.group_path = String::new();
+                for inst in instances.iter_mut() {
+                    if inst.group_path == name || inst.group_path.starts_with(&format!("{}/", name))
+                    {
+                        inst.group_path = String::new();
+                    }
                 }
             }
-        }
 
-        group_tree.delete_group(&name);
-        *groups = group_tree.get_all_groups();
-        Ok(session_count)
-    })?;
+            group_tree.delete_group(&name);
+            *groups = group_tree.get_all_groups();
+            Ok(session_count)
+        },
+    )?;
 
     println!("✓ Deleted group: {}", name);
     if force && session_count > 0 {
@@ -194,20 +201,26 @@ async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {
     let identifier = args.identifier.trim().to_string();
     let group = args.group.trim().to_string();
 
-    let old_group = storage.update(|instances, groups| {
-        let old = super::patch_instance(instances, &identifier, |inst| {
-            let old = inst.group_path.clone();
-            inst.group_path = group.clone();
-            Ok(old)
-        })?;
+    let old_group = storage.update_metadata(
+        crate::session::MetadataSelection::GroupAssignment {
+            identifier: std::borrow::Cow::Borrowed(&identifier),
+            group: std::borrow::Cow::Borrowed(&group),
+        },
+        |instances, groups| {
+            let old = super::patch_instance(instances, &identifier, |inst| {
+                let old = inst.group_path.clone();
+                inst.group_path = group.clone();
+                Ok(old)
+            })?;
 
-        if !group.is_empty() {
-            let mut group_tree = GroupTree::new_with_groups(instances, groups);
-            group_tree.create_group(&group);
-            *groups = group_tree.get_all_groups();
-        }
-        Ok(old)
-    })?;
+            if !group.is_empty() {
+                let mut group_tree = GroupTree::new_with_groups(instances, groups);
+                group_tree.create_group(&group);
+                *groups = group_tree.get_all_groups();
+            }
+            Ok(old)
+        },
+    )?;
 
     if old_group.is_empty() {
         println!("✓ Moved session to group: {}", group);

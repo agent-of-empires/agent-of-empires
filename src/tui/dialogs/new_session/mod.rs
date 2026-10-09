@@ -641,6 +641,16 @@ impl NewSessionDialog {
             return;
         }
         self.set_tool(&source.tool);
+        if !self.sandbox_enabled
+            && self.docker_available
+            && !self.selected_tool_host_only()
+            && self
+                .resolve_config_for_path(&self.profile)
+                .sandbox
+                .enabled_by_default
+        {
+            self.set_sandbox_enabled(true);
+        }
         self.inherit_modes(source.is_structured(), source.is_sandboxed());
     }
 

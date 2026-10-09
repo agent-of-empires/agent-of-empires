@@ -99,31 +99,36 @@ pub fn claim_idle_stop(
     now: DateTime<Utc>,
     threshold_secs: u32,
 ) -> anyhow::Result<Option<Instance>> {
-    let storage = Storage::new(profile, file_watch)?;
-    storage.update(|instances, _groups| {
-        let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
-            return Ok(None);
-        };
-        // Defense in depth: never stop a structured view row through the plain-session path, even
-        // if a caller reached here without going through `idle_reap_candidates` (which already
-        // excludes structured view sessions).
-        if inst.is_structured() {
-            return Ok(None);
-        }
-        let eligible = should_auto_stop_session(
-            now,
-            inst.status,
-            inst.idle_entered_at,
-            inst.last_accessed_at,
-            false,
-            threshold_secs,
-        );
-        if !eligible {
-            return Ok(None);
-        }
-        inst.status = Status::Stopped;
-        Ok(Some(inst.clone()))
-    })
+    // Strict, for the same reason as the ACP idle reconciler: a deleted
+    // profile must not come back from a stale reap candidate.
+    let storage = Storage::open(profile, file_watch)?;
+    storage.update_metadata(
+        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(session_id)),
+        |instances, _groups| {
+            let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
+                return Ok(None);
+            };
+            // Defense in depth: never stop a structured view row through the plain-session path, even
+            // if a caller reached here without going through `idle_reap_candidates` (which already
+            // excludes structured view sessions).
+            if inst.is_structured() {
+                return Ok(None);
+            }
+            let eligible = should_auto_stop_session(
+                now,
+                inst.status,
+                inst.idle_entered_at,
+                inst.last_accessed_at,
+                false,
+                threshold_secs,
+            );
+            if !eligible {
+                return Ok(None);
+            }
+            inst.status = Status::Stopped;
+            Ok(Some(inst.clone()))
+        },
+    )
 }
 
 #[cfg(test)]

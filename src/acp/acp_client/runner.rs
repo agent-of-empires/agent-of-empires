@@ -10,6 +10,73 @@ use super::spawn::{
     SpawnConfig,
 };
 
+/// Construction guard: cancellation can retire only this issued execution ticket.
+pub(super) struct DetachedLaunch {
+    pub pid: Option<u32>,
+    pub identity: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+    pub nonce: uuid::Uuid,
+    pub native_store: Option<crate::session::ExecutionBinding>,
+    owner: Option<(crate::acp::runner_lifecycle::ExecutionAdmission, String)>,
+    custody: Option<crate::acp::runner_lifecycle::ExecutionJob>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl DetachedLaunch {
+    pub fn commit(&mut self) {
+        self.owner = None;
+        drop(self.custody.take());
+    }
+
+    pub async fn retire(&mut self) -> anyhow::Result<()> {
+        let Some((admission, id)) = self.owner.as_ref() else {
+            return Ok(());
+        };
+        match self.identity {
+            Some(identity) => {
+                crate::session::runner_journal::settle_captured_ticket(id, identity, true).await?
+            }
+            None => {
+                crate::session::runner_journal::settle_nonce(
+                    crate::session::runner_journal::JournalScope::Launch(
+                        admission.origin().ok_or_else(|| {
+                            anyhow::anyhow!("native launch lost its original scope")
+                        })?,
+                    ),
+                    self.nonce,
+                )
+                .await?
+            }
+        }
+        self.owner = None;
+        drop(self.custody.take());
+        Ok(())
+    }
+}
+
+impl Drop for DetachedLaunch {
+    fn drop(&mut self) {
+        let Some((admission, id)) = self.owner.take() else {
+            return;
+        };
+        let nonce = self.nonce;
+        let identity = self.identity;
+        let custody = self.custody.take();
+        self.runtime.spawn(async move {
+            let _custody = custody;
+            let settled = match identity {
+                Some(identity) => crate::session::runner_journal::settle_captured_ticket(&id, identity, true).await,
+                None => match admission.origin() {
+                    Some(origin) => crate::session::runner_journal::settle_nonce(crate::session::runner_journal::JournalScope::Launch(origin), nonce).await,
+                    None => Err(anyhow::anyhow!("native launch lost its original scope")),
+                },
+            };
+            if let Err(error) = settled {
+                warn!(target: "acp", session = %id, %nonce, "cancelled launch remains protected: {error:#}");
+            }
+        });
+    }
+}
+
 /// Deadline for the runner socket to appear. 10s suffices in production, but
 /// a debug-build cold start under CI load blows past it deterministically, so
 /// debug builds honor `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS`.
@@ -52,12 +119,24 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
 /// The runner owns the agent subprocess and outlives the daemon, so no `Child`
 /// handle is kept: the daemon reaches it over the unix socket, and the OS keeps
 /// it alive across `aoe serve` restarts.
-pub(super) fn spawn_runner_detached(
+pub(super) async fn spawn_runner_detached(
     config: &SpawnConfig,
     socket_path: &std::path::Path,
     session_id: String,
     session_sandbox: Option<&SessionSandbox>,
-) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
+) -> Result<DetachedLaunch, AcpError> {
+    let profile = config
+        .managed_profile
+        .as_deref()
+        .ok_or_else(|| AcpError::Spawn("detached runner has no stored owner".into()))?;
+    let launch = crate::session::runner_journal::ManagedLaunch::new(
+        crate::session::deletion::SessionPathOwner {
+            profile,
+            session_id: &session_id,
+        },
+        config.generation,
+    )
+    .map_err(|error| AcpError::Spawn(format!("runner authorization: {error:#}")))?;
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
@@ -154,12 +233,11 @@ pub(super) fn spawn_runner_detached(
     if !provider_keys.is_empty() {
         cmd.arg("--provider-env-keys").arg(provider_keys.join(","));
     }
-    if let Some(profile) = config.source_profile.as_deref().filter(|s| !s.is_empty()) {
-        cmd.arg("--source-profile").arg(profile);
-    }
+
     if let Some(stored) = &config.stored_acp_session_id {
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
+    launch.configure(cmd.as_std_mut());
     cmd.arg("--generation").arg(config.generation.to_string());
     cmd.arg("--");
     if let Some(s) = &sandbox_argv {
@@ -245,11 +323,8 @@ pub(super) fn spawn_runner_detached(
         }
     }
 
-    // The runner writes its own log file. Inheriting our stdio would put
-    // per-session noise in debug.log and leave the runner reading EOF on its
-    // own stdin once the daemon dies.
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+    // Runner logs independently of its daemon.
+    cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
     info!(
@@ -263,21 +338,68 @@ pub(super) fn spawn_runner_detached(
     );
 
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
-    let mut child = cmd.spawn().map_err(|e| {
-        warn!(
-            target: "acp.protocol.spawn",
-            session = %session_id,
-            "runner spawn failed: {e}"
-        );
-        AcpError::Spawn(format!("spawn runner: {e}"))
+    let nonce = launch.nonce();
+    let admission = config.execution_admission.clone().ok_or_else(|| {
+        AcpError::Spawn("managed launch requires its original native admission".into())
     })?;
-    let pid = child
-        .id()
-        .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
-    // Reap it, so a finished runner does not linger as a zombie that still
-    // answers `kill(pid, 0)` and keeps a teardown from proving it gone.
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
-    Ok((pid, native_store))
+    let custody = admission.begin_job();
+    let issued = DetachedLaunch {
+        pid: None,
+        identity: None,
+        nonce,
+        native_store,
+        owner: None,
+        custody: Some(custody),
+        runtime: tokio::runtime::Handle::current(),
+    };
+    let (mut issued, spawned) = tokio::task::spawn_blocking(move || {
+        let mut issued = issued;
+        let Some(origin) = admission.origin() else {
+            return (
+                issued,
+                Err(anyhow::anyhow!(
+                    "managed launch lost its original native scope"
+                )),
+            );
+        };
+        let storage = origin.storage().clone();
+        issued.owner = Some((admission.clone(), session_id));
+        let runtime = issued.runtime.clone();
+        let _entered = runtime.enter();
+        let storage = &storage;
+        let pid = &mut issued.pid;
+        let identity = &mut issued.identity;
+        let custody = issued
+            .custody
+            .take()
+            .expect("single original constructor job");
+        let spawned = launch.spawn(storage, &mut cmd, Some(&admission), custody, |captured| {
+            *pid = Some(captured.pid);
+            *identity = Some(captured);
+        });
+        (issued, spawned)
+    })
+    .await
+    .map_err(|error| AcpError::Spawn(format!("runner launch task: {error}")))?;
+    match spawned {
+        Ok(pid) => issued.pid = Some(pid),
+        Err(error) => {
+            let settled = match issued.retire().await {
+                Ok(()) => true,
+                Err(unproven) => {
+                    warn!(target: "acp", %nonce, "partial launch remains protected: {unproven:#}");
+                    false
+                }
+            };
+            return Err(AcpError::IssuedExecution {
+                identity: issued.identity,
+                launch_nonce: nonce,
+                settled,
+                source: Box::new(AcpError::Spawn(format!(
+                    "spawn authorized runner: {error:#}"
+                ))),
+            });
+        }
+    }
+    Ok(issued)
 }

@@ -343,7 +343,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
 
     // `_terminal_guard` restores the terminal on drop.
     drop(terminal);
-    result
+    drop(_terminal_guard);
+    let retired = app.shutdown_settlements().await;
+    result.and(retired)
 }
 
 #[cfg(test)]

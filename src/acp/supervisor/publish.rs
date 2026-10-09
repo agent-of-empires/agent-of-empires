@@ -344,7 +344,9 @@ mod tests {
     use crate::process::worker_registry;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn seq_counters_are_per_session_hydratable_and_forgettable() {
+        let (_home, _temporary) = isolate_home();
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
         sup.hydrate_seqs([("s-hydrated".to_string(), 42)]);
@@ -382,7 +384,7 @@ mod tests {
             Event::RateLimitAutoResumed { resets_at: ts, .. } if *ts == resets_at
         ));
 
-        sup.forget_session("s-1");
+        sup.forget_session(&crate::acp::supervisor::test_support::stored_origin("s-1"));
         assert_eq!(next_seq(&sup.next_seqs, "s-1"), 1);
     }
 

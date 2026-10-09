@@ -773,7 +773,7 @@ fn apply_terminal_title(
     let identity_lock = crate::session::acquire_session_identity_lock()?;
     let _session_title_lock = crate::session::storage::acquire_session_title_lock(&id)?;
     let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
-    let rekey = storage.update(|instances, _groups| {
+    let rekey = storage.update_metadata(crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id)), |instances, _groups| {
         let mut rekey = None;
         if let Some(index) = instances.iter().position(|instance| instance.id == id) {
             instances[index].smart_rename_attempted = true;
@@ -795,7 +795,7 @@ fn apply_terminal_title(
                     tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
                 } else if should_write {
                     let instance = &mut instances[index];
-                    rekey = Some((instance.title.clone(), title.clone()));
+                    rekey = Some((crate::tmux::capture_rekey_session(&id, &instance.title), title.clone()));
                     tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
                     instance.title = title.clone();
                     instance.last_auto_title = Some(title.clone());
@@ -804,12 +804,13 @@ fn apply_terminal_title(
         }
         Ok(rekey)
     })?;
-    drop(identity_lock);
-    if let Some((old_title, new_title)) = rekey {
-        if let Err(error) = crate::tmux::rekey_session(&id, &old_title, &new_title) {
+
+    if let Some((target, new_title)) = rekey {
+        if let Err(error) = crate::tmux::rekey_session(&id, &new_title, target) {
             tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
         }
     }
+    drop(identity_lock);
     Ok(())
 }
 
@@ -1234,8 +1235,10 @@ mod serve {
         let lock = state.instance_lock(id).await;
         let _serialized = lock.lock().await;
 
-        let storage = match crate::session::storage::Storage::new(profile, state.file_watch.clone())
-        {
+        let storage = match crate::session::storage::Storage::open(
+            profile,
+            state.file_watch.clone(),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "smart_rename", session = %id, "storage open failed: {e}");
@@ -1244,16 +1247,13 @@ mod serve {
                 )));
             }
         };
-        // Own copies for the closure below: `storage.update` runs inside `spawn_blocking`, whose
-        // body must be `'static + Send`, so the borrowed `id`/`new_title` cannot cross the thread
-        // boundary.
         let id_owned = id.to_string();
         let title_owned = new_title.to_string();
         let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let identity_lock = crate::session::acquire_session_identity_lock()?;
             let session_title_lock =
                 crate::session::storage::acquire_session_title_lock(&id_owned)?;
-            let wrote = storage.update(|instances, _groups| {
+            let wrote = storage.update_metadata(crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id_owned)), |instances, _groups| {
                 let Some(index) = instances
                     .iter()
                     .position(|instance| instance.id == id_owned)
@@ -1266,9 +1266,6 @@ mod serve {
                 if !title_is_auto_overwritable(&instances[index], force) {
                     return Ok(Err(skipped("Session was renamed in the meantime")));
                 }
-                // Manual and automatic rename paths share one domain predicate; exclude this row
-                // explicitly so a future no-op policy change cannot make the row collide with
-                // itself.
                 let path = instances[index].project_path.clone();
                 if crate::session::is_duplicate_session(
                     instances.iter(),
@@ -1282,8 +1279,6 @@ mod serve {
                     ))));
                 }
                 instances[index].title = title_owned.clone();
-                // Last owned use of `title_owned`: move it into the field rather than cloning a
-                // second time.
                 instances[index].last_auto_title = Some(title_owned);
                 Ok(Ok(true))
             })?;

@@ -257,6 +257,109 @@ struct Target {
 struct Registry {
     path: PathBuf,
     value: Value,
+    raw: crate::session::raw_document::RawDocument,
+    before: BTreeMap<usize, Value>,
+}
+
+impl Registry {
+    fn validate(&self) -> Result<()> {
+        let rows = self
+            .value
+            .as_array()
+            .context("session registry must be an array")?;
+        anyhow::ensure!(
+            rows.len() == self.raw.rows.len(),
+            "registry projection differs from raw rows"
+        );
+        let owners = self.raw.owners("id");
+        let current =
+            u64::from(crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION);
+        for (index, raw) in self.raw.rows.iter().enumerate() {
+            let object = crate::session::raw_document::RawObject::parse(raw)?;
+            let sandbox = object.sandbox_enabled()?;
+            let row = &rows[index];
+            let generation = row
+                .get("sandbox_store_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if !sandbox && row.get("sandbox_store_transition_paths").is_none() {
+                continue;
+            }
+            for field in [
+                "id",
+                "tool",
+                "detect_as",
+                "sandbox_store_generation",
+                "sandbox_store_transition_paths",
+                "trashed_at",
+                "archived_at",
+            ] {
+                object.unique(field)?;
+            }
+            let id: String = serde_json::from_str(
+                object
+                    .unique("id")?
+                    .context("sandbox owner has no id")?
+                    .get(),
+            )?;
+            crate::session::validate_instance_id(&id)?;
+            let slot = owners
+                .get(&id)
+                .context("sandbox owner disappeared from raw inventory")?;
+            anyhow::ensure!(
+                slot.count == 1 && !slot.ambiguous && slot.index == index,
+                "ambiguous sandbox owner {id}"
+            );
+            if let Some(generation) = object.unique("sandbox_store_generation")? {
+                let _: Option<u64> = serde_json::from_str(generation.get())?;
+            }
+            if sandbox && generation < current {
+                if let Some(paths) = object.unique("sandbox_store_transition_paths")? {
+                    let paths: Vec<&serde_json::value::RawValue> =
+                        serde_json::from_str(paths.get())?;
+                    for path in paths {
+                        let path = crate::session::raw_document::RawObject::parse(path)?;
+                        path.unique("source")?;
+                        path.unique("destination")?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        if self.before.is_empty() {
+            return Ok(());
+        }
+        let rows = self
+            .value
+            .as_array()
+            .context("session registry must be an array")?;
+        let changes = self
+            .before
+            .iter()
+            .map(|(&index, before)| {
+                let row = rows.get(index).context("changed session row disappeared")?;
+                Ok((index, before, transition_metadata(row)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bytes = self.raw.render_value_changes(&changes)?;
+        crate::session::atomic_write(&self.path, &bytes)?;
+        sync_parent(&self.path)
+    }
+}
+
+fn transition_metadata(row: &Value) -> Value {
+    Value::Object(
+        ["sandbox_store_generation", "sandbox_store_transition_paths"]
+            .into_iter()
+            .filter_map(|field| {
+                row.get(field)
+                    .map(|value| (field.to_owned(), value.clone()))
+            })
+            .collect(),
+    )
 }
 
 pub fn run() -> Result<()> {
@@ -314,6 +417,16 @@ pub(crate) fn migrate_instance(id: &str) -> Result<()> {
     )
 }
 
+/// Caller retains both namespaces' actual workspace fences; never reacquire them.
+pub(crate) fn migrate_instance_under_workspace_locks(id: &str) -> Result<()> {
+    reconcile_scoped_with_workspace(
+        false,
+        Some(id),
+        &batched_running_probe(false),
+        &reap_migrated_container,
+        true,
+    )
+}
 /// [`migrate_instance`] with the container probes injected, so a test can
 /// drive the launch-time move end to end with no container runtime.
 #[cfg(test)]
@@ -334,6 +447,16 @@ fn reconcile_scoped(
     is_running: &RunningProbe<'_>,
     reap: &ReapProbe<'_>,
 ) -> Result<()> {
+    reconcile_scoped_with_workspace(announce, only, is_running, reap, false)
+}
+
+fn reconcile_scoped_with_workspace(
+    announce: bool,
+    only: Option<&str>,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+    workspace_held: bool,
+) -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     if !transition_may_be_pending(&app_dir, !announce && only.is_none())? {
         return Ok(());
@@ -346,14 +469,14 @@ fn reconcile_scoped(
         position: 1,
         total: 1,
     });
-    run_in(
+    run_in_with_workspace(
         &app_dir,
         &home,
         is_running,
         reap,
         defer_requested() || (!announce && only.is_none()),
         announce,
-        only,
+        (only, workspace_held),
     )?;
     progress::report(progress::Event::Finished {
         version: 27,
@@ -469,22 +592,47 @@ fn run_in(
     announce: bool,
     only: Option<&str>,
 ) -> Result<()> {
+    run_in_with_workspace(
+        app_dir,
+        home,
+        is_running,
+        reap,
+        defer_stores,
+        announce,
+        (only, false),
+    )
+}
+
+fn run_in_with_workspace(
+    app_dir: &Path,
+    home: &Path,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+    defer_stores: bool,
+    announce: bool,
+    (only, workspace_held): (Option<&str>, bool),
+) -> Result<()> {
     progress::step("reading session registries");
     fs::create_dir_all(app_dir)?;
     // A scoped pass that finds its cohort mid-transition in another process
     // waits for that pass and looks again; the row is then usually current.
     for _ in 0..SCOPED_RETRIES {
-        match run_pass(
+        match run_pass_with_workspace(
             app_dir,
             home,
             is_running,
             reap,
             defer_stores,
             announce,
-            only,
+            (only, workspace_held),
         )? {
             PassOutcome::Done => return Ok(()),
             PassOutcome::WaitFor(root) => {
+                anyhow::ensure!(
+                    !workspace_held,
+                    "sandbox store {} is moving; release original admission and retry",
+                    root.display()
+                );
                 progress::step(format!(
                     "waiting for another process to finish moving {}",
                     root.display()
@@ -513,14 +661,13 @@ enum PassOutcome {
     WaitFor(PathBuf),
 }
 
-/// The lock a pass holds on one legacy root while it copies and publishes the
-/// stores under it. Per root rather than global, so a copy that takes minutes
-/// blocks neither registry writes nor moves under other roots; the transition
-/// lock covers only planning and publishing.
+/// The lock a pass holds on one legacy root while it copies and publishes its
+/// stores. Planning and publication retain workspace before transition and
+/// registry fences. Copying releases transition/registry; its physical mutation
+/// retains workspace so a metadata abort cannot revoke the source owner midway.
 ///
-/// Lock order is cohort, then transition, then registry. A holder of the
-/// transition lock therefore never waits for a cohort lock: `run_pass` only
-/// tries it, and leaves a busy root pending.
+/// Blocking cohort acquisition precedes workspace. A workspace/transition holder
+/// only tries cohorts; borrowed native admission never waits on a held cohort.
 fn cohort_lock_name(root: &Path) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
@@ -567,10 +714,11 @@ fn copy_gate(root: &Path) {
     #[cfg(not(test))]
     let _ = root;
 }
-
-/// One pass over the registries: plan under the transition and registry
-/// locks, copy under the cohort locks alone, then reacquire the former,
-/// revalidate the plan against the registries as they are now, and publish.
+/// One pass over the registries: plan under workspace, transition and registry
+/// fences, then release transition/registry for the copy. Each physical store
+/// mutation holds workspace after the copy seam, and publication reacquires
+/// workspace before transition to revalidate the combined ownership inventory.
+#[cfg(test)]
 fn run_pass(
     app_dir: &Path,
     home: &Path,
@@ -580,6 +728,32 @@ fn run_pass(
     announce: bool,
     only: Option<&str>,
 ) -> Result<PassOutcome> {
+    run_pass_with_workspace(
+        app_dir,
+        home,
+        is_running,
+        reap,
+        defer_stores,
+        announce,
+        (only, false),
+    )
+}
+
+fn run_pass_with_workspace(
+    app_dir: &Path,
+    home: &Path,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+    defer_stores: bool,
+    announce: bool,
+    (only, workspace_held): (Option<&str>, bool),
+) -> Result<PassOutcome> {
+    let mut workspace_locks = if workspace_held {
+        None
+    } else {
+        Some(lock_workspace_namespaces(app_dir)?)
+    };
+    ensure_no_retained_owners(app_dir)?;
     let mut transition_lock = Some(crate::session::acquire_storage_flock(app_dir, LOCK)?);
     let planned_paths = registry_paths(app_dir)?;
     let registry_dirs = registry_dirs_of(&planned_paths);
@@ -602,10 +776,11 @@ fn run_pass(
     let mut cleanup_roots = BTreeSet::new();
     let mut needs_registry_write = false;
     let mut defer_source_retirement = false;
-    let row_ids_by_root = collect_row_ids_by_root(&registries, app_dir, home)?;
+    let configs = registry_configs(&registries, app_dir)?;
+    let row_ids_by_root = collect_row_ids_by_root(&registries, &configs, home)?;
 
     for (registry_index, registry) in registries.iter_mut().enumerate() {
-        let profile = profile_for_registry(app_dir, &registry.path);
+        let config = &configs[registry_index];
         let Some(rows) = registry.value.as_array_mut() else {
             continue;
         };
@@ -631,7 +806,12 @@ fn run_pass(
                     crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
                 )
             {
-                if clear_transition_metadata(row) {
+                if row.get("sandbox_store_transition_paths").is_some() {
+                    registry
+                        .before
+                        .entry(row_index)
+                        .or_insert_with(|| transition_metadata(row));
+                    clear_transition_metadata(row);
                     needs_registry_write = true;
                 }
                 continue;
@@ -640,61 +820,24 @@ fn run_pass(
             // refuses to retire under. The pass-wide flag would block every
             // unrelated root on a machine with one archived session.
             let parked = row_is_parked(row) && only != Some(id.as_str());
-            let Some(tool) = row.get("tool").and_then(Value::as_str) else {
-                defer_source_retirement = true;
-                continue;
-            };
-            let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-            let detect_as = row
-                .get("detect_as")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
-            let Some(agent) = crate::agents::get_agent(tool)
-                .or_else(|| detect_as.and_then(crate::agents::get_agent))
+            let stored_plans = transition_paths(row)
+                .with_context(|| format!("validating v027 transition plan for {id}"))?;
+            let Some(StorePlan {
+                old_private,
+                paths: fresh_plans,
+            }) = configured_store_plan(row, config, home, stored_plans.as_deref())?
             else {
                 defer_source_retirement = true;
                 continue;
             };
-            let declared = config.session.agent_config_dir_for(tool, home);
-            let mut fresh_plans =
-                crate::session::config::container_config::sandbox_store_migration_paths(
-                    agent.name,
-                    home,
-                    declared.as_deref(),
-                    &id,
-                )?;
-            let stored_plans = transition_paths(row)
-                .with_context(|| format!("validating v027 transition plan for {id}"))?;
-            let stored_private = stored_plans.as_ref().is_some_and(|plans| {
-                plans.iter().all(|(source, _)| {
-                    source.file_name().is_some_and(|name| name == id.as_str())
-                        && source
-                            .parent()
-                            .and_then(Path::file_name)
-                            .is_some_and(|name| name == "sandbox")
-                })
-            });
-            let old_private = agent.name == "codex" || stored_private;
-            if old_private {
-                for (shared, _) in &mut fresh_plans {
-                    *shared = shared.join(&id);
-                }
-            }
-            let mut plans = if let Some(stored) = stored_plans.as_ref() {
-                if stored.len() != fresh_plans.len()
-                    || stored.iter().zip(&fresh_plans).any(
-                        |((source, destination), (fresh_source, fresh_destination))| {
-                            !same_authorized_path(destination, fresh_destination)
-                                || !same_authorized_path(source, fresh_source)
-                        },
-                    )
-                {
+            let has_stored_plans = stored_plans.is_some();
+            let mut plans = if let Some(stored) = stored_plans {
+                if !same_store_paths(&stored, &fresh_plans) {
                     bail!(
                         "v027 checkpointed transition plan is outside the expected sandbox roots for {id}; restore the previous session.agent_config_dir before retrying"
                     );
                 }
-                stored.clone()
+                stored
             } else {
                 fresh_plans
             };
@@ -707,7 +850,7 @@ fn run_pass(
                                 shared.display()
                             );
                         }
-                        if stored_plans.is_none() {
+                        if !has_stored_plans {
                             *shared = fs::canonicalize(&*shared)?;
                         }
                     }
@@ -717,7 +860,7 @@ fn run_pass(
                             .with_context(|| format!("inspecting {}", shared.display()))
                     }
                 }
-                if stored_plans.is_none() {
+                if !has_stored_plans {
                     *destination = resolve_existing_ancestor(destination)
                         .unwrap_or_else(|| destination.clone());
                 }
@@ -732,18 +875,37 @@ fn run_pass(
             // A parked row is carried only as a cohort member; it publishes
             // nothing this pass, so it gets neither the drift checkpoint nor
             // the pending stamp.
-            if stored_plans.is_none() && !parked {
+            if !has_stored_plans && !parked {
+                registry
+                    .before
+                    .entry(row_index)
+                    .or_insert_with(|| transition_metadata(row));
                 set_transition_paths(row, &plans);
                 needs_registry_write = true;
             }
             known_sources.extend(plans.iter().map(|(shared, _)| shared.clone()));
             known_sources.extend(cleanup_roots.iter().cloned());
             if plans.is_empty() {
+                if generation
+                    != u64::from(
+                        crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
+                    )
+                    || row.get("sandbox_store_transition_paths").is_some()
+                {
+                    registry
+                        .before
+                        .entry(row_index)
+                        .or_insert_with(|| transition_metadata(row));
+                }
                 mark_current(row, generation, &mut needs_registry_write);
                 continue;
             }
             let pending_generation = if old_private { 0 } else { 1 };
             if !parked && generation != u64::from(pending_generation) {
+                registry
+                    .before
+                    .entry(row_index)
+                    .or_insert_with(|| transition_metadata(row));
                 set_generation(row, pending_generation);
                 needs_registry_write = true;
             }
@@ -844,9 +1006,7 @@ fn run_pass(
     }
     if needs_registry_write {
         for registry in &registries {
-            let bytes = serde_json::to_vec_pretty(&registry.value)?;
-            crate::session::atomic_write(&registry.path, &bytes)?;
-            sync_parent(&registry.path)?;
+            registry.checkpoint()?;
         }
     }
     if !known_sources.is_empty() {
@@ -966,11 +1126,12 @@ fn run_pass(
                 }
             }
         }
-        // Copies must not hold the transition lock: `Storage::update` takes
-        // it shared in every profile, so a copy under it stalls unrelated
-        // session and group writes for its whole duration.
+        // Copies do not retain transition/registry fences. Their individual
+        // physical mutations retain workspace, so metadata abort cannot append
+        // an exclusion in the middle of changing that owner's store.
         registry_locks = None;
         transition_lock = None;
+        workspace_locks = None;
     }
     let wait_for = only.and_then(|wanted| {
         cohorts
@@ -1007,6 +1168,12 @@ fn run_pass(
             if gated_roots.insert(root.clone()) {
                 copy_gate(root);
             }
+            let _workspace = if workspace_held {
+                None
+            } else {
+                Some(lock_workspace_namespaces(app_dir)?)
+            };
+            ensure_no_retained_owners(app_dir)?;
             // Reaped before the move: a rename leaves no source for a
             // container that came up since the probe, and nothing can put one
             // back. Removing without force fails on a live container.
@@ -1106,6 +1273,12 @@ fn run_pass(
             if gated_roots.insert(target.cleanup_root.clone()) {
                 copy_gate(&target.cleanup_root);
             }
+            let _workspace = if workspace_held {
+                None
+            } else {
+                Some(lock_workspace_namespaces(app_dir)?)
+            };
+            ensure_no_retained_owners(app_dir)?;
             if !publish_store(
                 shared,
                 &target.private,
@@ -1136,6 +1309,10 @@ fn run_pass(
     // registries and a fresh liveness answer: rows may have changed and a
     // container may have come up during the copy.
     if transition_lock.is_none() {
+        if !workspace_held {
+            workspace_locks = Some(lock_workspace_namespaces(app_dir)?);
+        }
+        ensure_no_retained_owners(app_dir)?;
         transition_lock = Some(crate::session::acquire_storage_flock(app_dir, LOCK)?);
         // A profile created during the copy is locked too, since every
         // registry read below is written back.
@@ -1146,10 +1323,16 @@ fn run_pass(
         dirs.dedup();
         registry_locks = Some(lock_registry_dirs(&dirs)?);
     }
-    let _held = (transition_lock, registry_locks, cohort_locks);
+    let _held = (
+        workspace_locks,
+        transition_lock,
+        registry_locks,
+        cohort_locks,
+    );
     refresh_liveness();
     let mut fresh = load_registries(app_dir)?;
-    let fresh_ids_by_root = collect_row_ids_by_root(&fresh, app_dir, home)?;
+    let fresh_configs = registry_configs(&fresh, app_dir)?;
+    let fresh_ids_by_root = collect_row_ids_by_root(&fresh, &fresh_configs, home)?;
     for root in &cleanup_roots {
         let planned = row_ids_by_root.get(root);
         let arrived = fresh_ids_by_root
@@ -1167,7 +1350,19 @@ fn run_pass(
     }
     let mut published_rows: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
     for key in std::mem::take(&mut ready_rows) {
-        match locate_planned_row(&registries, &fresh, key) {
+        let fresh_key = match locate_planned_row(&registries, &fresh, key) {
+            Some(fresh_key)
+                if checkpoint_matches_config(
+                    &fresh[fresh_key.0].value[fresh_key.1],
+                    &fresh_configs[fresh_key.0],
+                    home,
+                )? =>
+            {
+                Some(fresh_key)
+            }
+            _ => None,
+        };
+        match fresh_key {
             Some(fresh_key) => {
                 published_rows.insert(key, fresh_key);
                 ready_rows.insert(key);
@@ -1290,34 +1485,47 @@ fn run_pass(
 
     for key in &ready_rows {
         let (registry, row) = published_rows[key];
-        if let Some(value) = fresh[registry]
+        let registry = &mut fresh[registry];
+        if let Some(value) = registry
             .value
             .as_array_mut()
             .and_then(|rows| rows.get_mut(row))
         {
-            set_generation(
-                value,
-                crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
-            );
+            let current =
+                crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+            if value
+                .get("sandbox_store_generation")
+                .and_then(Value::as_u64)
+                != Some(u64::from(current))
+            {
+                registry
+                    .before
+                    .entry(row)
+                    .or_insert_with(|| transition_metadata(value));
+                set_generation(value, current);
+            }
         }
     }
     for registry in &mut fresh {
         if let Some(rows) = registry.value.as_array_mut() {
-            for row in rows {
+            for (index, row) in rows.iter_mut().enumerate() {
                 if row.get("sandbox_store_generation").and_then(Value::as_u64)
                     == Some(u64::from(
                         crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
                     ))
+                    && row.get("sandbox_store_transition_paths").is_some()
                 {
+                    registry
+                        .before
+                        .entry(index)
+                        .or_insert_with(|| transition_metadata(row));
                     clear_transition_metadata(row);
                 }
             }
         }
     }
     for registry in &fresh {
-        let bytes = serde_json::to_vec_pretty(&registry.value)?;
-        crate::session::atomic_write(&registry.path, &bytes)?;
-        sync_parent(&registry.path)?;
+        registry.checkpoint()?;
     }
 
     let done = ready_rows.len();
@@ -1360,6 +1568,49 @@ fn run_pass(
     })
 }
 
+/// Retained ownership and live profile rows share the actual workspace fences.
+/// Acquire both build namespaces in stable order, always before transition locks.
+pub(super) fn lock_workspace_namespaces(
+    app_dir: &Path,
+) -> Result<Vec<crate::session::StorageFlock>> {
+    let mut namespaces = vec![app_dir.to_path_buf()];
+    if let Some(sibling) = crate::session::sibling_namespace_app_dir() {
+        namespaces.push(sibling);
+    }
+    for namespace in &mut namespaces {
+        fs::create_dir_all(&*namespace)?;
+        *namespace = fs::canonicalize(&*namespace)?;
+    }
+    crate::session::acquire_storage_flock_cohort(
+        namespaces.iter().map(PathBuf::as_path),
+        crate::session::SESSION_WORKSPACE_CLAIM_LOCK_FILENAME,
+        false,
+    )
+}
+
+/// A caller borrowing workspace must never wait for a cohort held by a mover
+/// that needs that workspace to publish.
+pub(super) fn try_lock_cohort_under_workspace(
+    app_dir: &Path,
+    root: &Path,
+) -> Result<Option<crate::session::StorageFlock>> {
+    try_acquire_cohort_lock(app_dir, root)
+}
+
+/// IDs are immutable exclusions, not rows from which native authority may be built.
+/// With only an ID inventory the removed owner's custom/shared roots are unknown;
+/// no physical migration may prove those roots unclaimed by ignoring that owner.
+pub(super) fn ensure_no_retained_owners(app_dir: &Path) -> Result<()> {
+    let sibling = crate::session::sibling_namespace_app_dir();
+    for namespace in std::iter::once(app_dir).chain(sibling.as_deref()) {
+        anyhow::ensure!(
+            crate::session::retained_intents::retained_ids_in(namespace)?.is_empty(),
+            "retained intent resources and exclusions remain protected; sandbox stores cannot be migrated"
+        );
+    }
+    Ok(())
+}
+
 fn registry_dirs_of(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = paths
         .iter()
@@ -1372,28 +1623,111 @@ fn registry_dirs_of(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 pub(super) fn lock_registry_dirs(dirs: &[PathBuf]) -> Result<Vec<crate::session::StorageFlock>> {
-    dirs.iter()
-        .map(|dir| {
-            crate::session::acquire_storage_flock(dir, crate::session::STORAGE_LOCK_FILENAME)
+    crate::session::acquire_storage_flock_cohort(
+        dirs.iter().map(PathBuf::as_path),
+        crate::session::STORAGE_LOCK_FILENAME,
+        false,
+    )
+}
+
+struct StorePlan {
+    old_private: bool,
+    paths: Vec<(PathBuf, PathBuf)>,
+}
+
+fn registry_configs(registries: &[Registry], app: &Path) -> Result<Vec<crate::session::Config>> {
+    registries
+        .iter()
+        .map(|registry| {
+            crate::session::config::profile_config::resolve_config(&profile_for_registry(
+                app,
+                &registry.path,
+            ))
         })
         .collect()
 }
 
-/// Every legacy source each sandboxed row reads, by canonical root. The plan
-/// is made from one snapshot and publication checks another: a root that
-/// gained a reader in between is not retired.
+fn configured_store_plan(
+    row: &Value,
+    config: &crate::session::Config,
+    home: &Path,
+    stored: Option<&[(PathBuf, PathBuf)]>,
+) -> Result<Option<StorePlan>> {
+    let (Some(id), Some(tool)) = (
+        row.get("id").and_then(Value::as_str),
+        row.get("tool").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let detect_as = row
+        .get("detect_as")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
+    let Some(agent) =
+        crate::agents::get_agent(tool).or_else(|| detect_as.and_then(crate::agents::get_agent))
+    else {
+        return Ok(None);
+    };
+    let declared = config.session.agent_config_dir_for(tool, home);
+    let mut paths = crate::session::config::container_config::sandbox_store_migration_paths(
+        agent.name,
+        home,
+        declared.as_deref(),
+        id,
+    )?;
+    let old_private = agent.name == "codex"
+        || stored.is_some_and(|paths| {
+            paths.iter().all(|(source, _)| {
+                source.file_name().is_some_and(|name| name == id)
+                    && source
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "sandbox")
+            })
+        });
+    if old_private {
+        for (source, _) in &mut paths {
+            *source = source.join(id);
+        }
+    }
+    Ok(Some(StorePlan { old_private, paths }))
+}
+
+fn same_store_paths(stored: &[(PathBuf, PathBuf)], expected: &[(PathBuf, PathBuf)]) -> bool {
+    stored.len() == expected.len()
+        && stored.iter().zip(expected).all(
+            |((source, destination), (fresh_source, fresh_destination))| {
+                same_authorized_path(source, fresh_source)
+                    && same_authorized_path(destination, fresh_destination)
+            },
+        )
+}
+
+fn checkpoint_matches_config(
+    row: &Value,
+    config: &crate::session::Config,
+    home: &Path,
+) -> Result<bool> {
+    let stored = transition_paths(row)?;
+    let Some(plan) = configured_store_plan(row, config, home, stored.as_deref())? else {
+        return Ok(false);
+    };
+    Ok(stored
+        .as_ref()
+        .is_some_and(|stored| same_store_paths(stored, &plan.paths)))
+}
+
 fn collect_row_ids_by_root(
     registries: &[Registry],
-    app_dir: &Path,
+    configs: &[crate::session::Config],
     home: &Path,
 ) -> Result<BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>>> {
     let mut row_ids_by_root: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> = BTreeMap::new();
-    for registry in registries {
-        let profile = profile_for_registry(app_dir, &registry.path);
+    for (registry, config) in registries.iter().zip(configs) {
         let Some(rows) = registry.value.as_array() else {
             continue;
         };
-        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         for row in rows {
             if !row
                 .pointer("/sandbox_info/enabled")
@@ -1402,34 +1736,20 @@ fn collect_row_ids_by_root(
             {
                 continue;
             }
-            let (Some(id), Some(tool)) = (
-                row.get("id").and_then(Value::as_str),
-                row.get("tool").and_then(Value::as_str),
-            ) else {
+            let Some(id) = row.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            if crate::session::validate_instance_id(id).is_err() {
-                continue;
-            }
-            let detect_as = row
-                .get("detect_as")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
-            let Some(agent) = crate::agents::get_agent(tool)
-                .or_else(|| detect_as.and_then(crate::agents::get_agent))
-            else {
+            crate::session::validate_instance_id(id)?;
+            let stored = transition_paths(row)?;
+            let Some(plan) = configured_store_plan(row, config, home, stored.as_deref())? else {
                 continue;
             };
-            let declared = config.session.agent_config_dir_for(tool, home);
-            for (source, _) in
-                crate::session::config::container_config::sandbox_store_migration_paths(
-                    agent.name,
-                    home,
-                    declared.as_deref(),
-                    id,
-                )?
-            {
+            for (source, _) in plan.paths {
+                let source = if plan.old_private {
+                    source.parent().unwrap_or(&source).to_path_buf()
+                } else {
+                    source
+                };
                 let root = fs::canonicalize(&source).unwrap_or(source);
                 row_ids_by_root
                     .entry(root)
@@ -1441,11 +1761,7 @@ fn collect_row_ids_by_root(
     Ok(row_ids_by_root)
 }
 
-/// Where the planned row `key` (a registry and row index into `planned`) is
-/// in `fresh`, if it is still there with the plan this pass copied under: the
-/// same id, the same pending generation and the same transition paths.
-/// Looked up by registry path and row id, since a concurrent write may have
-/// reordered rows or added a registry.
+/// Match a fresh owner only while its original transition scope remains admitted.
 fn locate_planned_row(
     planned: &[Registry],
     fresh: &[Registry],
@@ -1464,8 +1780,21 @@ fn locate_planned_row(
         .position(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))?;
     let fresh_row = &fresh[fresh_index].value[fresh_row_index];
     let same = |field: &str| row.get(field) == fresh_row.get(field);
-    (same("sandbox_store_generation") && same("sandbox_store_transition_paths"))
-        .then_some((fresh_index, fresh_row_index))
+    [
+        "created_at",
+        "tool",
+        "detect_as",
+        "sandbox_info",
+        "project_path",
+        "workspace_info",
+        "archived_at",
+        "trashed_at",
+        "sandbox_store_generation",
+        "sandbox_store_transition_paths",
+    ]
+    .iter()
+    .all(|field| same(field))
+    .then_some((fresh_index, fresh_row_index))
 }
 
 /// The one line a bare start says about pending work. `movable` rows move on
@@ -1573,24 +1902,50 @@ fn set_generation(row: &mut Value, generation: u8) {
     }
 }
 
-pub(super) fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
+/// Enumerate every readable original registry; only proven absence is empty.
+pub(crate) fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = vec![app_dir.to_path_buf()];
     let profiles = app_dir.join("profiles");
-    match fs::read_dir(&profiles) {
-        Ok(entries) => {
-            for entry in entries {
-                let path = entry?.path().join("sessions.json");
-                if path.is_file() {
-                    paths.push(path);
+    match fs::symlink_metadata(&profiles) {
+        Ok(_) => {
+            anyhow::ensure!(
+                fs::metadata(&profiles)?.is_dir(),
+                "{} is not a profile directory",
+                profiles.display()
+            );
+            for entry in fs::read_dir(&profiles)? {
+                let path = entry?.path();
+                let metadata = fs::metadata(&path).with_context(|| {
+                    format!("cannot resolve original profile {}", path.display())
+                })?;
+                if metadata.is_dir() {
+                    dirs.push(path);
                 }
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("reading {}", profiles.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", profiles.display()))
+        }
     }
-    let default = app_dir.join("sessions.json");
-    if default.is_file() {
-        paths.push(default);
+    let mut paths = Vec::new();
+    for dir in dirs {
+        let path = dir.join("sessions.json");
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting {}", path.display()))
+            }
+        }
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("cannot resolve original registry {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "{} is not a regular registry",
+            path.display()
+        );
+        paths.push(path);
     }
     paths.sort();
     Ok(paths)
@@ -1600,9 +1955,20 @@ fn load_registry_paths(paths: Vec<PathBuf>) -> Result<Vec<Registry>> {
     paths
         .into_iter()
         .map(|path| {
-            let value = serde_json::from_slice(&fs::read(&path)?)
+            let bytes = fs::read(&path)?;
+            let raw =
+                crate::session::raw_document::RawDocument::parse(std::str::from_utf8(&bytes)?)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+            let value = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
-            Ok(Registry { path, value })
+            let registry = Registry {
+                path,
+                value,
+                raw,
+                before: BTreeMap::new(),
+            };
+            registry.validate()?;
+            Ok(registry)
         })
         .collect()
 }
@@ -2295,6 +2661,236 @@ fn sync_parent(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    #[test]
+    fn copied_layout_checkpoint_refuses_fresh_configured_root() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let home = temporary.path();
+        let mut config = serde_json::to_value(crate::session::Config::default())?;
+        config["session"]["agent_config_dir"]["gemini"] = serde_json::json!(home.join("source-a"));
+        let original: crate::session::Config = serde_json::from_value(config.clone())?;
+        let mut row = serde_json::json!({"id":"e17a000000000099","tool":"gemini","sandbox_info":{"enabled":true}});
+        let plan = configured_store_plan(&row, &original, home, None)?.unwrap();
+        set_transition_paths(&mut row, &plan.paths);
+        assert!(checkpoint_matches_config(&row, &original, home)?);
+        config["session"]["agent_config_dir"]["gemini"] = serde_json::json!(home.join("source-b"));
+        let changed: crate::session::Config = serde_json::from_value(config)?;
+        assert!(!checkpoint_matches_config(&row, &changed, home)?);
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn deferred_layout_checkpoints_preserve_raw_owners_and_unrelated_registries() -> Result<()> {
+        use crate::session::raw_document::{RawDocument, RawObject};
+
+        let (_temporary, _environment, app, home) = isolated();
+        fs::create_dir_all(&app)?;
+        crate::session::retained_intents::initialize_legacy_in(&app)?;
+        fs::write(app.join(".schema_version"), b"42")?;
+        let source = home.join(".gemini/sandbox/history/original.json");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::write(&source, b"retained original")?;
+        let journal = r#"{"coverage":"unknown","launches":[{"partial_native":{"same":1,"same":2,"number":1.2300e+02,"escaped":"\u0061"}}]}"#;
+        let owner = format!(
+            r#"{{"id":"e17a000000000031","tool":"gemini","sandbox_info":{{"enabled":true}},"sandbox_store_generation":1,"runner_journal":{journal}}}"#
+        );
+        let peer = format!(r#"{{"id":"e17a000000000032","runner_journal":{journal}}}"#);
+        let frozen = r#"{"id":"frozen-left","id":"frozen-right","sandbox_info":{"enabled":false},"opaque":{"x":1,"x":2,"huge":1e400}}"#;
+        let sessions = app.join("sessions.json");
+        fs::write(&sessions, format!("[{owner},{peer},{frozen}]"))?;
+        let untouched = app.join("profiles/untouched/sessions.json");
+        fs::create_dir_all(untouched.parent().unwrap())?;
+        let untouched_bytes = format!("[\n{peer}\n]");
+        fs::write(&untouched, &untouched_bytes)?;
+
+        for _ in 0..2 {
+            super::run_in(
+                &app,
+                &home,
+                &|_| panic!("deferred metadata checkpoint reached a native probe"),
+                &|_| panic!("deferred metadata checkpoint reached retirement"),
+                true,
+                false,
+                None,
+            )?;
+            let bytes = fs::read(&sessions)?;
+            let document = RawDocument::parse(std::str::from_utf8(&bytes)?)?;
+            let selected = RawObject::parse(&document.rows[0])?;
+            assert_eq!(selected.unique("runner_journal")?.unwrap().get(), journal);
+            assert!(selected.unique("sandbox_store_transition_paths")?.is_some());
+            assert_eq!(document.rows[1].get(), peer);
+            assert_eq!(document.rows[2].get(), frozen);
+            assert_eq!(fs::read(&untouched)?, untouched_bytes.as_bytes());
+            assert_eq!(fs::read(&source)?, b"retained original");
+            assert!(!home.join(".gemini/sandbox-v2").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ambiguous_layout_claims_refuse_before_probe_or_checkpoint() -> Result<()> {
+        let (_temporary, _environment, app, home) = isolated();
+        fs::create_dir_all(&app)?;
+        crate::session::retained_intents::initialize_legacy_in(&app)?;
+        fs::write(app.join(".schema_version"), b"42")?;
+        let source = home.join(".gemini/sandbox/history/original");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::write(&source, b"original")?;
+        let path = app.join("sessions.json");
+        let base = r#""id":"e17a000000000051","tool":"gemini","sandbox_info":{"enabled":true},"sandbox_store_generation":1"#;
+        for rows in [
+            format!(r#"[{{{base},"id":"e17a000000000052"}}]"#),
+            format!("[{{{base}}},{{{base}}}]"),
+            format!(r#"[{{{base},"sandbox_store_generation":2}}]"#),
+            r#"[{"id":"e17a000000000051","sandbox_info":{"enabled":true,"enabled":false}}]"#.into(),
+            r#"[{"tool":"gemini","sandbox_info":{"enabled":true},"sandbox_store_generation":1}]"#
+                .into(),
+        ] {
+            fs::write(&path, &rows)?;
+            assert!(super::run_in(
+                &app,
+                &home,
+                &|_| panic!("ambiguous owner reached native probe"),
+                &|_| panic!("ambiguous owner reached retirement"),
+                true,
+                false,
+                None
+            )
+            .is_err());
+            assert_eq!(fs::read(&path)?, rows.as_bytes());
+            assert_eq!(fs::read(&source)?, b"original");
+            assert!(!home.join(".gemini/sandbox-v2").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_registry_entries_refuse_inventory() -> Result<()> {
+        for shape in 0..4 {
+            let temporary = tempfile::tempdir()?;
+            let app = temporary.path();
+            let profiles = app.join("profiles");
+            let absent = app.join("absent");
+            match shape {
+                0 => std::os::unix::fs::symlink(&absent, app.join("sessions.json"))?,
+                1 => fs::create_dir_all(profiles.join("source/sessions.json"))?,
+                2 => std::os::unix::fs::symlink(&absent, &profiles)?,
+                _ => {
+                    fs::create_dir(&profiles)?;
+                    std::os::unix::fs::symlink(&absent, profiles.join("source"))?;
+                }
+            }
+            assert!(
+                registry_paths(app).is_err(),
+                "unresolved registry shape {shape}"
+            );
+            assert!(!absent.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_layout_owner_must_retain_its_original_native_scope() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("sessions.json");
+        let fields = r#""sandbox_store_generation":1,"sandbox_store_transition_paths":[{"source":"/original","destination":"/isolated"}]"#;
+        let id = "e17a000000000081";
+        let original = format!(
+            r#"[{{"id":"{id}","tool":"gemini","sandbox_info":{{"enabled":true}},{fields}}}]"#
+        );
+        fs::write(&path, &original)?;
+        let planned = load_registry_paths(vec![path.clone()])?;
+        for changed in [
+            format!(
+                r#"[{{"id":"{id}","tool":"gemini","sandbox_info":{{"enabled":false}},{fields}}}]"#
+            ),
+            format!(
+                r#"[{{"id":"e17a000000000082","id":"{id}","tool":"gemini","sandbox_info":{{"enabled":false}},{fields}}}]"#
+            ),
+            format!(
+                r#"[{{"id":"{id}","tool":"claude","sandbox_info":{{"enabled":true}},{fields}}}]"#
+            ),
+            format!(
+                r#"[{{"id":"{id}","tool":"gemini","sandbox_info":{{"enabled":true}},"archived_at":"2026-10-09T00:00:00Z",{fields}}}]"#
+            ),
+        ] {
+            fs::write(&path, &changed)?;
+            if let Ok(fresh) = load_registry_paths(vec![path.clone()]) {
+                assert!(locate_planned_row(&planned, &fresh, (0, 0)).is_none());
+            }
+            assert_eq!(fs::read(&path)?, changed.as_bytes());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retained_owner_refuses_layout_and_content_migration_before_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::retained_intents::initialize_legacy_in(&app).unwrap();
+        let home = dirs::home_dir().unwrap();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut owner = crate::session::Instance::new("retained", "/original");
+        owner.runner_journal =
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
+        owner.status = crate::session::Status::Creating;
+        owner
+            .try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Create,
+                crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        owner.lifecycle_reservation.as_mut().unwrap().path_claims =
+            crate::session::WorktreePathClaims::Unknown(None);
+        fs::write(
+            storage.sessions_path(),
+            serde_json::to_vec(&vec![&owner]).unwrap(),
+        )
+        .unwrap();
+        let selected = crate::session::retained_intents::capture(&storage, &owner.id).unwrap();
+        crate::session::retained_intents::abort(&selected).unwrap();
+        let source = home.join(".gemini/sandbox");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("original"), b"ORIGINAL").unwrap();
+        let before = fs::read(storage.sessions_path()).unwrap();
+        assert!(run_pass(
+            &app,
+            &home,
+            &|_| panic!("retained owner reached a native liveness probe"),
+            &|_| panic!("retained owner reached container retirement"),
+            false,
+            false,
+            None,
+        )
+        .is_err());
+        assert!(
+            super::super::v033_isolate_sandbox_content::ensure_fresh_content(
+                &app,
+                &home,
+                &owner.id,
+                "gemini",
+                &[],
+                &crate::session::Config::default(),
+                Path::new("/original"),
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::v033_isolate_sandbox_content::retain_legacy_original(
+                &source,
+                source.parent().unwrap(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(source.join("original")).unwrap(), b"ORIGINAL");
+        assert_eq!(fs::read(storage.sessions_path()).unwrap(), before);
+        assert!(!app.join(JOURNAL).exists());
+    }
 
     /// [`super::run_in`] with every container reported reaped, which is what
     /// each case below assumes unless it drives the probe itself. Shadowing
@@ -2629,9 +3225,7 @@ mod tests {
         assert!(!app.join(JOURNAL).exists());
     }
 
-    /// The documented recipe end to end: `AOE_DEFER_SANDBOX_MIGRATION=1` on a
-    /// pre-v27 install commits the schema version (so the next start reaches
-    /// the reconcile path) while the store stays put and the row stays pending.
+    /// Deferral advances the schema without moving a legacy sandbox store.
     #[test]
     #[serial_test::serial]
     fn deferring_through_the_runner_advances_the_schema_and_keeps_the_store() {
@@ -2639,7 +3233,10 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
         fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"one","title":"Legacy sandbox","project_path":"/tmp/legacy-sandbox","created_at":"2020-01-01T00:00:00Z","tool":"gemini","sandbox_info":{"enabled":true,"image":"fixture-image","container_name":"aoe-fixture-one"}}]"#,
+        ).unwrap();
         fs::write(app.join(".schema_version"), b"26").unwrap();
 
         assert!(!defer_requested_by(None));
@@ -2650,15 +3247,13 @@ mod tests {
         let result = super::super::run_migrations_announced(None);
         result.unwrap();
 
-        // The runner commits the build's target version, not v27 in
-        // particular: a later migration in the chain must not fail this test.
         assert_eq!(
             fs::read_to_string(app.join(".schema_version"))
                 .unwrap()
                 .trim(),
             super::super::CURRENT_VERSION.to_string()
         );
-        assert!(!super::super::has_pending_migrations());
+        assert!(!super::super::has_pending_migrations().unwrap());
         assert!(transition_may_be_pending(&app, false).unwrap());
         assert!(home.join(".gemini/sandbox").is_dir());
         assert!(!home.join(".gemini/sandbox-v2").exists());
@@ -3605,7 +4200,7 @@ gemini = "{}"
         fs::write(legacy.join("data"), b"data").unwrap();
         let rows = serde_json::json!([
             {"id":"1111111111111111","tool":"missing-agent","sandbox_info":{"enabled":true}},
-            {"tool":"missing-agent","sandbox_info":{"enabled":true}},
+
             {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true}}
         ]);
         fs::write(
@@ -3618,7 +4213,7 @@ gemini = "{}"
 
         let rows: Value = read_rows(&app);
         assert!(rows[0].get("sandbox_store_generation").is_none());
-        assert_eq!(rows[2]["sandbox_store_generation"], 2);
+        assert_eq!(rows[1]["sandbox_store_generation"], 2);
         assert_eq!(
             fs::read(home.join(".gemini/sandbox-v2/2222222222222222/data")).unwrap(),
             b"data"
@@ -3631,7 +4226,7 @@ gemini = "{}"
         let repaired = serde_json::json!([
             {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
             {"id":"3333333333333333","tool":"gemini","sandbox_info":{"enabled":true}},
-            rows[2].clone()
+            rows[1].clone()
         ]);
         fs::write(
             app.join("sessions.json"),

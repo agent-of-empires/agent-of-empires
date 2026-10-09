@@ -286,7 +286,12 @@ fn test_create_session_in_all_mode_is_findable() {
         structured: false,
     };
 
-    let session_id = view.create_session(data).unwrap();
+    let session_id = {
+        view.request_creation(data, None);
+        drain_creation_result(&mut view)
+            .ok_or_else(|| anyhow::anyhow!("Original creation did not publish"))
+    }
+    .unwrap();
 
     // In unified view, the session IS findable (fixes #419)
     assert!(
@@ -366,7 +371,11 @@ fn test_save_preserves_per_profile_collapsed_state() {
     );
 
     // Save and reload to verify persistence
-    view.save().unwrap();
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
 
     // Reload from disk and verify alpha's collapsed state survived
     let (_, groups_a) = storage_a.load_with_groups().unwrap();
@@ -446,7 +455,14 @@ fn test_group_delete_scoped_to_owning_profile() {
     view.confirm_dialog = None;
 
     select_work(&mut view, "alpha");
-    view.delete_selected_group().unwrap();
+    {
+        let submitted = view.delete_selected_group();
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(
         !view.group_trees.get("alpha").unwrap().group_exists("work"),
         "alpha's 'work' group should be deleted"
@@ -512,8 +528,14 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
         })
         .unwrap();
 
-    view.rename_selected("main branch", None, None, false)
-        .unwrap();
+    {
+        let submitted = view.rename_selected("main branch", None, None, false);
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("identity collision must fail the actual worker acknowledgement");
     assert!(view.info_dialog.is_some());
     assert_eq!(view.get_instance(&target_id).unwrap().title, "throwaway");
     assert_eq!(
@@ -522,7 +544,14 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     );
 
     view.info_dialog = None;
-    view.rename_selected("", Some("work"), None, false).unwrap();
+    {
+        let submitted = view.rename_selected("", Some("work"), None, false);
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(view.info_dialog.is_none());
     assert_eq!(view.get_instance(&target_id).unwrap().group_path, "work");
     let stored = storage.load().unwrap();
@@ -552,11 +581,21 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
             Ok(())
         })
         .unwrap();
-    view.reload().unwrap();
+    {
+        view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut view)
+    }
+    .unwrap();
     view.selected_session = Some(tied_id.clone());
     view.info_dialog = None;
-    view.rename_selected("main branch", None, None, false)
-        .unwrap();
+    {
+        let submitted = view.rename_selected("main branch", None, None, false);
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("identity collision must fail the actual worker acknowledgement");
     assert!(
         view.info_dialog.is_some(),
         "tied derived-destination collision must be rejected"
@@ -595,9 +634,14 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     )
     .unwrap();
     unified.selected_session = Some(source_id.clone());
-    let error = unified
-        .rename_selected("occupied", None, Some("beta"), false)
-        .expect_err("target-profile identity collision must reject the transaction");
+    let error = {
+        let submitted = unified.rename_selected("occupied", None, Some("beta"), false);
+        await_transaction_result(
+            &mut unified,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("target-profile identity collision must reject the transaction");
     assert!(
         error
             .to_string()
@@ -617,20 +661,58 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     assert_eq!(beta.load().unwrap().len(), 1);
 }
 
-/// Changing a session's profile via the rename dialog must transfer its group metadata in
-/// the same storage transaction, or the source reloads an empty duplicate while the target
-/// row renders under a separately created group.
 #[test]
 #[serial]
-fn test_rename_profile_change_prunes_source_group() {
+fn settled_profile_move_preserves_groups_and_shutdown() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
 
-    // alpha has one session in "work"; beta exists but is empty.
+    let repo = temp.path().join("repo");
+    let checkout = temp.path().join("a1");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["commit", "--allow-empty", "-qm", "fixture"][..],
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "fixture",
+            checkout.to_str().unwrap(),
+        ][..],
+    ] {
+        let output = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::write(checkout.join("sentinel"), b"uncommitted").unwrap();
     let storage_a = Storage::new_unwatched("alpha").unwrap();
-    let mut inst_a = Instance::new("A1", "/tmp/a");
+    let mut inst_a = Instance::new("A1", checkout.to_str().unwrap());
+    inst_a.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "fixture".into(),
+        main_repo_path: repo.to_str().unwrap().into(),
+        managed_by_aoe: true,
+        created_at: inst_a.created_at,
+        base_branch: None,
+    });
+    inst_a.status = crate::session::Status::Stopped;
     inst_a.group_path = "work".to_string();
     let id = inst_a.id.clone();
     let tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
@@ -650,12 +732,24 @@ fn test_rename_profile_change_prunes_source_group() {
     view.flat_items = view.build_flat_items();
     view.selected_session = Some(id.clone());
 
-    // Move the session alpha -> beta, keeping the same group name.
-    view.rename_selected("", None, Some("beta"), false).unwrap();
+    {
+        let submitted = view.rename_selected("Moved", None, Some("beta"), false);
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
+    finish_runner_settlements(&mut view);
 
     let moved = view.get_instance(&id).unwrap();
     assert_eq!(moved.source_profile, "beta");
     assert_eq!(moved.group_path, "work");
+    assert_eq!(moved.title, "Moved");
+    assert_eq!(
+        std::fs::read(std::path::Path::new(&moved.project_path).join("sentinel")).unwrap(),
+        b"uncommitted"
+    );
     assert!(
         view.group_trees.get("beta").unwrap().group_exists("work"),
         "beta should own the 'work' group after the move"
@@ -678,6 +772,16 @@ fn test_rename_profile_change_prunes_source_group() {
         .unwrap();
     assert!(!source_groups.iter().any(|group| group.path == "work"));
     assert!(target_groups.iter().any(|group| group.path == "work"));
+    assert!(storage_a.load().unwrap().is_empty());
+    assert_eq!(
+        Storage::open_unwatched("beta").unwrap().load().unwrap()[0].id,
+        id
+    );
+    view.settlement_poller
+        .take_shutdown()
+        .unwrap()
+        .finish()
+        .expect("a consumed Stop must not retire against the removed source row");
 }
 
 #[test]
@@ -697,7 +801,11 @@ fn test_shift_n_opens_prefilled_dialog_from_session() {
     env.view.cursor = work_session_idx;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('N')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('N')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
@@ -733,7 +841,11 @@ fn test_shift_n_carries_the_selected_sessions_agent_but_not_its_yolo() {
         env.view.cursor = row;
         env.view.update_selected();
 
-        env.view.handle_key(key(KeyCode::Char('N')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('N')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
         assert_eq!(dialog.group_value(), "work");
         assert_eq!(dialog.path_value(), "/tmp/work");
@@ -760,7 +872,11 @@ fn test_shift_n_opens_prefilled_dialog_from_group() {
     env.view.cursor = group_idx;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('N')), None);
+    {
+        let result = env.view.handle_key(key(KeyCode::Char('N')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(dialog.group_value(), "work");
     // The group has a member at "/tmp/work", so the path is borrowed from it
@@ -786,8 +902,11 @@ fn test_group_context_menu_new_session_prefills_path() {
     env.view.update_selected();
 
     // The group right-click menu's "New Session" routes here.
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+    {
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+        drain_persistence(&mut env.view).unwrap();
+    };
     let dialog = env
         .view
         .new_dialog
@@ -818,8 +937,11 @@ fn test_group_context_menu_new_session_project_mode_and_no_agents() {
     env.view.cursor = group_idx;
     env.view.update_selected();
 
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+    {
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+        drain_persistence(&mut env.view).unwrap();
+    };
     let dialog = env
         .view
         .new_dialog
@@ -833,8 +955,11 @@ fn test_group_context_menu_new_session_project_mode_and_no_agents() {
 
     env.view.new_dialog = None;
     env.view.available_tools = AvailableTools::with_tools(&[]);
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+    {
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(
         env.view.new_dialog.is_none(),
         "no agents means the new-session form must not open"
@@ -868,8 +993,11 @@ fn test_session_context_menu_new_session_prefills_from_session() {
 
     // The session right-click menu's "New Session" routes here, prefilling the
     // dialog from the right-clicked session's repo path and group (issue #2023).
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+    {
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+        drain_persistence(&mut env.view).unwrap();
+    };
     let dialog = env
         .view
         .new_dialog

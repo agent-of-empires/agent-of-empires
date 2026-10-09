@@ -148,18 +148,23 @@ fn failing_start_state(
 #[tokio::test]
 async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker() {
     let _app_dir = crate::session::test_support::isolate_app_dir();
-    use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+    use crate::acp::supervisor::ResumeReservationOutcome;
 
     let id = "sess-3172".to_string();
     let state = structured_state(&id, false);
     let reservation = match state
         .acp_supervisor
-        .begin_resume(&id, ResumeKind::Spawn)
+        .begin_resume(
+            &id,
+            crate::acp::runner_lifecycle::NativeResume::Spawn,
+            crate::acp::supervisor::test_support::stored_origin(&id),
+            false,
+        )
         .await
         .expect("begin_resume must not error under capacity")
     {
         ResumeReservationOutcome::Reserved(r) => r,
-        ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        ResumeReservationOutcome::AlreadyPresent(_) => panic!("expected a fresh reservation"),
     };
 
     let mut waits = state.acp_supervisor.watch_worker_waits();
@@ -790,10 +795,17 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
                 };
                 // B is blocked on the guard, so the queue is still empty here
                 // and the producer must decide the continuation stands.
+                let original = state
+                    .capture_operation_origin(&state.instances.read().await[0])
+                    .unwrap();
                 let outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
-                    &state, &id, submission,
+                    &state,
+                    original,
+                    [None, None],
+                    submission,
                 )
-                .await;
+                .await
+                .unwrap();
                 assert!(matches!(
                     outcome,
                     crate::server::acp_reconciler::ContinuationOutcome::Stands

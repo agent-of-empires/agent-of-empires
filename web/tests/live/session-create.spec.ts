@@ -1,12 +1,26 @@
 // Creating sessions against a real server: the wizard, scratch sessions, the palette, directory browsing, worktrees.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
 import { basename, dirname, join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { listSessions, seedSessionViaAoeAdd, waitForSessions, waitForView } from "../helpers/aoeServe";
-import { postPrompt, startAcpSession, waitForReplayContains, waitForStructuredView } from "../helpers/acp";
+import {
+  fakeAcpScriptPath,
+  listSessions,
+  resolveAoeBinary,
+  seedSessionViaAoeAdd,
+  waitForSessions,
+  waitForView,
+} from "../helpers/aoeServe";
+import {
+  attachServeDiagnostics,
+  postPrompt,
+  startAcpSession,
+  waitForReplayContains,
+  waitForStructuredView,
+} from "../helpers/acp";
 import { gitEnv, initWorkingRepo } from "../helpers/gitFixture";
 
 const PALETTE_PLACEHOLDER = "Search actions, sessions, settings…";
@@ -58,6 +72,48 @@ test.describe("wizard", () => {
     await waitForView(serve.baseUrl, sessions[0]!.id, "structured");
   });
 
+  test("daemon cancellation during real runner initialization leaves CLI Stop able to retire its publication", async ({
+    page,
+    spawnServe,
+  }, testInfo) => {
+    const serve = await spawnServe({ acp: true, fakeAcpScript: { initializeWaitForRelease: true, turns: [] } });
+    const wizard = await openWizard(page, serve);
+    await pickScratch(wizard);
+    await wizard.getByRole("button", { name: /Launch session/ }).click();
+    const [session] = await waitForSessions(serve.baseUrl);
+    const entered = `${fakeAcpScriptPath(serve.home)}.initialize-entered`;
+    await expect.poll(() => existsSync(entered), { timeout: 15_000 }).toBe(true);
+    const sessionsPath = join(serve.appDir, "profiles", "main", "sessions.json");
+    const readRow = () =>
+      JSON.parse(readFileSync(sessionsPath, "utf8")).find((row: { id: string }) => row.id === session!.id);
+    const original = readRow();
+    expect(original.runner_journal.coverage).toBe("complete");
+    expect(original.runner_journal.create_coverage).toBe("owned");
+    expect(original.runner_journal.creations).toEqual([]);
+    expect(original.runner_journal.launches).toHaveLength(1);
+    expect(original.runner_journal.launches[0].stop_endpoint).not.toBeNull();
+    expect(original.runner_journal.launches[0].registry).not.toBeNull();
+    await attachServeDiagnostics(testInfo, serve);
+    const exited = once(serve.proc, "exit", { signal: AbortSignal.timeout(30_000) });
+    expect(serve.proc.kill("SIGTERM")).toBe(true);
+    await exited;
+    const stopped = spawnSync(resolveAoeBinary(), ["acp", "stop", session!.id], {
+      env: serve.env,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    expect(stopped.error).toBeUndefined();
+    expect(stopped.status, stopped.stderr).toBe(0);
+    const settled = readRow();
+    expect(settled.runner_journal.launches).toEqual([]);
+    expect(settled.runner_journal.preparations).toEqual([]);
+    expect(settled.lifecycle_generation).toBe(original.lifecycle_generation + 1);
+    expect(settled.lifecycle_reservation ?? null).toBeNull();
+    expect(existsSync(join(serve.appDir, "acp-workers", `${session!.id}.json`))).toBe(false);
+    await attachServeDiagnostics(testInfo, serve);
+    await serve.stop();
+  });
+
   test("wizard auto-approve starts Codex in full-access mode", async ({ page, spawnServe }) => {
     const serve = await spawnServe({ acp: true, extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" } });
     const wizard = await openWizard(page, serve);
@@ -100,7 +156,7 @@ test.describe("wizard", () => {
 // #1324
 test.describe("scratch sessions", () => {
   test("deleting a scratch session removes its scratch dir", async ({ page, spawnServe }) => {
-    const serve = await spawnServe();
+    const serve = await spawnServe({ acp: true });
     const wizard = await openWizard(page, serve);
     await pickScratch(wizard);
     await wizard.getByRole("button", { name: /Launch session/ }).click();

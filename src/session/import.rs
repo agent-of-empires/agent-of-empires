@@ -60,10 +60,9 @@ pub struct Owned {
 }
 
 impl Owned {
-    /// A plain project path is not owned: a user's own agent run there is importable. Only stored
-    /// ids and AoE-provisioned dirs (scratch, managed worktree, workspace) are. `worktree_markers`
-    /// comes from [`worktree_dir_markers`], which loads config and so belongs off the runtime.
-    pub fn new(instances: &[Instance], worktree_markers: Vec<String>) -> Self {
+    /// Exclude AoE conversations and provisioned or reserved paths, not plain project paths.
+    /// `worktree_markers` comes from config; unknown filesystem intents refuse listing.
+    pub fn new(instances: &[Instance], worktree_markers: Vec<String>) -> anyhow::Result<Self> {
         let ids = instances
             .iter()
             .flat_map(|i| {
@@ -73,7 +72,7 @@ impl Owned {
                     .cloned()
             })
             .collect();
-        let dirs = instances
+        let mut dirs: Vec<PathBuf> = instances
             .iter()
             .filter(|i| {
                 i.scratch
@@ -83,11 +82,27 @@ impl Owned {
             .map(|i| PathBuf::from(&i.project_path))
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
-        Self {
+        for instance in instances {
+            match instance
+                .lifecycle_reservation
+                .as_ref()
+                .map(|lease| &lease.path_claims)
+            {
+                Some(crate::session::WorktreePathClaims::Pending(paths))
+                | Some(crate::session::WorktreePathClaims::Unknown(Some(paths))) => {
+                    dirs.extend(paths.iter().cloned())
+                }
+                Some(crate::session::WorktreePathClaims::Unknown(None)) => {
+                    anyhow::bail!("filesystem intent is unknown for session {}", instance.id)
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
             ids,
             dirs,
             worktree_markers,
-        }
+        })
     }
 
     pub fn excludes(&self, session_id: &str, cwd: &str) -> bool {
@@ -229,6 +244,32 @@ mod tests {
             updated_at: updated_at.map(str::to_string),
             cwd_exists: true,
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_intents_protect_importable_paths_and_refuse_unknown_ownership() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let future = home.path().join("future");
+        let mut prepared = Instance::new("reserved", future.to_str().unwrap());
+        let _intent =
+            crate::session::builder::CreationIntent::reserve(&storage, &mut prepared).unwrap();
+        let rows = storage.load().unwrap();
+        let owned = Owned::new(&rows, Vec::new()).unwrap();
+        assert!(owned.excludes("external", future.join("sub").to_str().unwrap()));
+        assert!(!owned.excludes("external", home.path().join("unrelated").to_str().unwrap()));
+        let mut unknown = rows;
+        unknown[0]
+            .lifecycle_reservation
+            .as_mut()
+            .unwrap()
+            .path_claims = crate::session::WorktreePathClaims::Unknown(None);
+        assert!(Owned::new(&unknown, Vec::new()).is_err());
+        let plain = Instance::new("external", home.path().to_str().unwrap());
+        let owned = Owned::new(&[plain], Vec::new()).unwrap();
+        assert!(!owned.excludes("external", home.path().to_str().unwrap()));
     }
 
     #[test]

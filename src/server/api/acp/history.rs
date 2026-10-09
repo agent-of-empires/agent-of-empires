@@ -307,7 +307,8 @@ pub(crate) async fn importable_sessions(
     let owned = {
         let instances = state.instances.read().await;
         Owned::new(&instances, markers)
-    };
+    }
+    .map_err(|error| ListSessionsError::Failed(error.to_string()))?;
     if !matches!(agent, "claude" | "claude-code") {
         let listed =
             crate::acp::session_listing::list_agent_sessions(agent, profile, &owned).await?;

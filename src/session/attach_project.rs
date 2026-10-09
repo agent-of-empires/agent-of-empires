@@ -33,6 +33,8 @@ pub struct AttachOutcome {
     pub moved_to: Option<String>,
     /// The workspace the session now has, as persisted.
     pub workspace_info: WorkspaceInfo,
+    /// The actual original-FDA projection acknowledged by this attach commit.
+    pub(crate) original: std::sync::Arc<super::LaunchOrigin>,
 }
 
 /// The directory leaf an attached repo is known by.
@@ -320,7 +322,7 @@ fn plan_conversion(
     })
 }
 
-/// Validate the request and create the worktree, without persisting anything.
+/// Validate the request and resolve worktree locations without writing anything.
 pub fn plan(
     instance: &super::Instance,
     profile: &str,
@@ -421,6 +423,7 @@ pub fn plan(
     }
 
     Ok(AttachPlan {
+        path_claims: attach_path_claims(&conversion, &workspace_dir, &worktree_path)?,
         // Appending to an existing workspace leaves `project_path` alone; the
         // other two shapes move the session into a new workspace directory.
         moves_session: !matches!(conversion, Conversion::Append { .. }),
@@ -431,13 +434,15 @@ pub fn plan(
         added_branch: plan,
         added_worktree: worktree_path,
         init_submodules: config.worktree.init_submodules,
+        reservation_generation: None,
+        original: super::LaunchOrigin::capture(instance)?,
+        scope: None,
     })
 }
 
 /// A validated attach, with nothing written yet.
 pub struct AttachPlan {
-    /// True when the session's working directory changes, so the caller has to stop the session
-    /// around [`execute`] and start it again afterwards.
+    /// A changed working directory requires stopping around `attach_planned`.
     pub moves_session: bool,
     conversion: Conversion,
     workspace_dir: PathBuf,
@@ -446,6 +451,10 @@ pub struct AttachPlan {
     added_branch: BranchPlan,
     added_worktree: PathBuf,
     init_submodules: bool,
+    reservation_generation: Option<u64>,
+    path_claims: Vec<PathBuf>,
+    original: std::sync::Arc<super::LaunchOrigin>,
+    scope: Option<std::sync::Arc<super::runner_journal::OwnedStop>>,
 }
 
 impl AttachPlan {
@@ -453,10 +462,234 @@ impl AttachPlan {
     pub fn workspace_dir(&self) -> &Path {
         &self.workspace_dir
     }
+    pub(crate) fn native_scope(&self) -> Result<std::sync::Arc<super::runner_journal::OwnedStop>> {
+        self.scope
+            .clone()
+            .context("attach must retain its actual reserved native scope")
+    }
 }
 
-/// Do the filesystem work for a validated plan, without persisting anything.
-pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedAttach> {
+fn attach_path_claims(
+    conversion: &Conversion,
+    workspace: &Path,
+    added: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut candidates = vec![workspace.to_path_buf(), added.to_path_buf()];
+    match conversion {
+        Conversion::MoveIn { from, primary, .. } => {
+            candidates.push(from.clone());
+            candidates.push(PathBuf::from(&primary.worktree_path));
+        }
+        Conversion::WorktreePrimary { primary, .. } => {
+            candidates.push(PathBuf::from(&primary.worktree_path));
+        }
+        Conversion::Append { .. } => {}
+    }
+    for path in &mut candidates {
+        *path = crate::session::deletion::resolve_claim_path(path)
+            .context("could not resolve the complete attach filesystem plan")?;
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+pub(crate) fn preflight_move_ownership(
+    owner: crate::session::deletion::SessionPathOwner<'_>,
+    plan: &AttachPlan,
+) -> Result<()> {
+    let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    preflight_move_ownership_locked(owner, plan)
+}
+
+fn preflight_move_ownership_locked(
+    owner: crate::session::deletion::SessionPathOwner<'_>,
+    plan: &AttachPlan,
+) -> Result<()> {
+    if let Conversion::MoveIn { from, .. } = &plan.conversion {
+        let claimed = crate::session::deletion::paths_in_use_except(&[owner]);
+        anyhow::ensure!(
+            !claimed.covers(from),
+            "primary checkout is shared or its ownership is unknown"
+        );
+    }
+    ensure_attach_destinations(
+        owner,
+        &[plan.workspace_dir.clone(), plan.added_worktree.clone()],
+    )
+}
+
+// A prospective child does not mutate its peer-owned ancestor. Source ownership
+// remains symmetric; destination ownership is directional, including missing paths.
+
+fn ensure_attach_destinations(
+    owner: crate::session::deletion::SessionPathOwner<'_>,
+    candidates: &[PathBuf],
+) -> Result<()> {
+    let paths = match crate::session::deletion::paths_in_use_except(&[owner]) {
+        crate::session::deletion::PathsInUse::Known(paths) => paths,
+        crate::session::deletion::PathsInUse::Unknown(reason) => bail!("{reason}"),
+    };
+    for candidate in candidates {
+        let candidate = crate::session::deletion::resolve_claim_path(candidate)
+            .context("could not resolve attach destination safely")?;
+        for peer in &paths.established {
+            anyhow::ensure!(
+                !crate::session::deletion::resolve_claim_path(peer)
+                    .context("could not resolve peer claim safely")?
+                    .starts_with(&candidate),
+                "Attach path is already claimed by another session"
+            );
+        }
+        for peer in &paths.pending {
+            let peer = crate::session::deletion::resolve_claim_path(peer)
+                .context("could not resolve pending filesystem intent safely")?;
+            anyhow::ensure!(
+                !peer.starts_with(&candidate) && !candidate.starts_with(&peer),
+                "Attach path overlaps a pending filesystem operation"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reserve before stopping anything; no global flock survives the stop/wait.
+pub(crate) fn reserve_attach(
+    storage: &Storage,
+    session_id: &str,
+    plan: &mut AttachPlan,
+) -> Result<std::sync::Arc<super::LaunchOrigin>> {
+    let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    anyhow::ensure!(
+        storage.same_origin_as(plan.original.storage()) && session_id == plan.original.session_id(),
+        "attach replaced its original physical owner"
+    );
+    storage.verify_profile_identity()?;
+    let _lifecycle = storage.acquire_instance_lifecycle_lock(session_id)?;
+    preflight_move_ownership_locked(
+        crate::session::deletion::SessionPathOwner {
+            profile: storage.profile(),
+            session_id,
+        },
+        plan,
+    )?;
+    let acknowledged =
+        storage.update_under_workspace_claim_lock(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == session_id)
+                .context("session disappeared before attach")?;
+            plan.original
+                .validate_baseline_at(row, plan.original.generation())?;
+            if let Conversion::MoveIn { from, primary, .. } = &plan.conversion {
+                anyhow::ensure!(
+                    Path::new(&row.project_path) == from
+                        && row.worktree_info.as_ref().is_some_and(|worktree| worktree
+                            .managed_by_aoe
+                            && worktree.branch == primary.branch
+                            && canonical(Path::new(&worktree.main_repo_path))
+                                == Path::new(&primary.main_repo_path)),
+                    "session checkout changed before attach reservation"
+                );
+            }
+            row.try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Attach,
+                super::Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )?;
+            let custodian = crate::process::OriginalCustodianBirth::capture(storage, row)?;
+            let reservation = row
+                .lifecycle_reservation
+                .as_mut()
+                .context("attach did not acquire its lease")?;
+            reservation.path_claims = super::WorktreePathClaims::Pending(plan.path_claims.clone());
+            reservation.custodian = Some(custodian);
+            super::LaunchOrigin::capture(row)
+        })?;
+    plan.reservation_generation = Some(acknowledged.generation());
+    plan.scope = Some(super::runner_journal::OwnedStop::from_attach(
+        plan.original.clone(),
+        acknowledged.clone(),
+    )?);
+    Ok(acknowledged)
+}
+
+/// Release an attach rejected before any filesystem execution.
+pub(crate) fn release_attach(plan: &AttachPlan) {
+    let Ok(scope) = plan.native_scope() else {
+        return;
+    };
+    release_unstarted_claims(&scope, &plan.path_claims);
+}
+
+fn release_unstarted_claims(scope: &super::runner_journal::OwnedStop, paths: &[PathBuf]) {
+    let result = scope.with_scope(|_| {
+        scope.storage().complete_path_claims_under_workspace_lock(
+            &scope.current_projection(),
+            paths,
+            |rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == scope.session_id())
+                    .context("original attach row disappeared during release")?;
+                row.lifecycle_reservation = None;
+                super::LaunchOrigin::capture(row)
+            },
+        )
+    });
+    if let Err(error) = result {
+        tracing::debug!(session = %scope.session_id(), %error, "changed attach scope was preserved during release");
+    }
+}
+
+fn ensure_attach_owner(
+    row: &super::Instance,
+    expected: &super::Instance,
+    generation: u64,
+    quiescent: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        row.id == expected.id
+            && row.created_at == expected.created_at
+            && row.lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Attach,
+                generation
+            )
+            && row.project_path == expected.project_path
+            && row.worktree_info == expected.worktree_info
+            && row.workspace_info.as_ref().map(|workspace| (
+                &workspace.branch,
+                &workspace.workspace_dir,
+                &workspace.repos,
+                workspace.cleanup_on_delete,
+            )) == expected.workspace_info.as_ref().map(|workspace| (
+                &workspace.branch,
+                &workspace.workspace_dir,
+                &workspace.repos,
+                workspace.cleanup_on_delete,
+            ))
+            && (!quiescent || row.runner_journal.proves_quiescent()),
+        "session, attach reservation or runner execution changed"
+    );
+    Ok(())
+}
+fn execute_for_session(
+    instance: &super::Instance,
+    plan: AttachPlan,
+    owner: crate::session::deletion::SessionPathOwner<'_>,
+    attach_generation: u64,
+) -> Result<PreparedAttach> {
+    preflight_move_ownership(owner, &plan)?;
+    let scope = plan.native_scope()?;
+    scope.with_scope(|row| {
+        ensure_attach_owner(row, instance, attach_generation, plan.moves_session)?;
+        anyhow::ensure!(row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+            matches!(&lease.path_claims, super::WorktreePathClaims::Pending(paths) if paths == &plan.path_claims)
+        }), "attach lost its complete filesystem intent");
+        Ok(())
+    })?;
     let AttachPlan {
         conversion,
         workspace_dir,
@@ -465,12 +698,13 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
         added_branch: plan,
         added_worktree: worktree_path,
         init_submodules,
+        original,
+        path_claims,
         ..
     } = plan;
     let git_wt = GitWorktree::new(main_repo_path.clone())?.with_init_submodules(init_submodules);
 
-    // Order matters for rollback: the workspace directory first (so there is something to clean
-    // up), then the session's own repo, then the new one.
+    // Persistent intent protects the filesystem phase without global flocks.
     let created_dir = !workspace_dir.exists();
     std::fs::create_dir_all(&workspace_dir)
         .with_context(|| format!("could not create the workspace {}", workspace_dir.display()))?;
@@ -480,9 +714,6 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
         ..Undo::default()
     };
 
-    // `moved_to` is the session's new working directory, which is the workspace root, not the
-    // primary's worktree inside it: that is where a session created multi-repo starts, and it is
-    // what `attach_planned` persists as `project_path`.
     let moved_to = (!matches!(conversion, Conversion::Append { .. }))
         .then(|| workspace_dir.to_string_lossy().to_string());
 
@@ -491,8 +722,10 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
         Conversion::MoveIn { primary, from, .. } => {
             let to = PathBuf::from(&primary.worktree_path);
             let primary_git = GitWorktree::new(PathBuf::from(&primary.main_repo_path))?;
-            if let Err(e) = primary_git.move_worktree(from, &to) {
-                undo.run();
+            let moved = primary_git.move_worktree(from, &to);
+            if let Err(e) = moved {
+                undo.uncertain = true;
+                undo.run_preserving_claimed(&scope, &path_claims);
                 return Err(e).with_context(|| {
                     format!(
                         "could not move this session's worktree into {}",
@@ -515,7 +748,8 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
             if let Err(e) =
                 primary_git.create_worktree(&primary.branch, &to, *create_branch, base.as_deref())
             {
-                undo.run();
+                undo.uncertain = true;
+                undo.run_preserving_claimed(&scope, &path_claims);
                 return Err(e).with_context(|| {
                     format!(
                         "could not create a worktree for this session's own repo in {}",
@@ -540,7 +774,8 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
     ) {
         Ok(w) => w,
         Err(e) => {
-            undo.run();
+            undo.uncertain = true;
+            undo.run_preserving_claimed(&scope, &path_claims);
             return Err(e)
                 .with_context(|| format!("could not create a worktree for '{repo_name}'"));
         }
@@ -593,17 +828,19 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
             warnings,
             moved_to,
             workspace_info: workspace_info.clone(),
+            original,
         },
         workspace_info,
         undo,
+        scope,
+        path_claims,
     })
 }
 
-/// Filesystem work done by [`execute`], in the order it has to be undone.
+/// Filesystem changes owned by one attach attempt.
 #[derive(Default)]
 struct Undo {
-    /// Only set when [`execute`] created it, so appending to an existing workspace
-    /// never removes the directory the session already lives in.
+    /// Set only for a directory this attempt created.
     workspace_dir: Option<PathBuf>,
     /// `(main_repo, moved_to, move_back_to)`.
     moved_primary: Option<(String, PathBuf, PathBuf)>,
@@ -611,47 +848,104 @@ struct Undo {
     created_primary: Option<(String, PathBuf, Option<String>)>,
     /// `(main_repo, worktree, branch_to_delete)`.
     added: Option<(String, PathBuf, Option<String>)>,
+    uncertain: bool,
 }
 
 impl Undo {
-    /// Best effort throughout: the original failure is the error worth reporting, and a leftover
-    /// worktree is recoverable with `aoe worktree cleanup`.
-    fn run(&self) {
+    fn run_preserving_claimed(&self, scope: &super::runner_journal::OwnedStop, paths: &[PathBuf]) {
+        let rollback = (|| -> Result<()> {
+            let claimed = scope.with_scope(|row| {
+                anyhow::ensure!(
+                    self.moved_primary.is_none() || row.runner_journal.proves_quiescent(),
+                    "moving a checkout back requires proven native quiescence"
+                );
+                anyhow::ensure!(row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+                    matches!(&lease.path_claims, super::WorktreePathClaims::Pending(stored) if stored == paths)
+                }), "rollback lost its complete filesystem intent");
+                Ok(crate::session::deletion::paths_in_use_except(&[
+                    crate::session::deletion::SessionPathOwner {
+                        profile: scope.storage().profile(), session_id: scope.session_id(),
+                    },
+                ]))
+            })?;
+            self.run_filtered(&claimed)?;
+            scope.with_scope(|_| {
+                scope.storage().complete_path_claims_under_workspace_lock(
+                    &scope.current_projection(),
+                    paths,
+                    |rows, _| {
+                        let row = rows
+                            .iter_mut()
+                            .find(|row| row.id == scope.session_id())
+                            .context("original attach row disappeared after rollback")?;
+                        row.lifecycle_reservation = None;
+                        super::LaunchOrigin::capture(row)
+                    },
+                )
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = rollback {
+            tracing::warn!(target: "session.attach", session = scope.session_id(),
+                "retaining filesystem intent and recoverable attach artifacts: {error:#}");
+        }
+    }
+
+    fn run_filtered(&self, claimed: &crate::session::deletion::PathsInUse) -> Result<()> {
+        anyhow::ensure!(
+            !self.uncertain,
+            "failed Git effect has no complete rollback proof"
+        );
+        let mut failure = None;
         for (main_repo, worktree, branch) in [self.added.as_ref(), self.created_primary.as_ref()]
             .into_iter()
             .flatten()
         {
-            if let Ok(git) = GitWorktree::new(PathBuf::from(main_repo)) {
-                let _ = git.remove_worktree(worktree, true);
+            let removed = (|| -> Result<()> {
+                anyhow::ensure!(
+                    !claimed.covers(worktree),
+                    "rollback worktree is claimed or unknown"
+                );
+                let git = GitWorktree::new(PathBuf::from(main_repo))?;
+                git.remove_worktree(worktree, true)?;
                 if let Some(branch) = branch {
-                    let _ = git.delete_branch(branch);
+                    git.delete_branch(branch)?;
                 }
+                Ok(())
+            })();
+            if let Err(error) = removed {
+                failure.get_or_insert(error);
             }
         }
-        // Putting the session's own worktree back is the one step that matters for user data: until
-        // it lands, `project_path` names a directory that does not exist.
         if let Some((main_repo, from, back_to)) = &self.moved_primary {
-            match GitWorktree::new(PathBuf::from(main_repo)) {
-                Ok(git) => {
-                    if let Err(e) = git.move_worktree(from, back_to) {
-                        tracing::error!(
-                            target: "session.attach",
-                            from = %from.display(),
-                            to = %back_to.display(),
-                            "could not move the session's worktree back after a failed attach: {e:#}"
-                        );
-                    }
-                }
-                Err(e) => tracing::error!(
-                    target: "session.attach",
-                    "could not open {main_repo} to move the session's worktree back: {e:#}"
-                ),
+            let moved = (|| -> Result<()> {
+                anyhow::ensure!(
+                    !claimed.covers(from) && !claimed.covers(back_to),
+                    "rollback move endpoint is claimed or unknown"
+                );
+                GitWorktree::new(PathBuf::from(main_repo))?.move_worktree(from, back_to)?;
+                Ok(())
+            })();
+            if let Err(error) = moved {
+                failure.get_or_insert(error);
             }
         }
         if let Some(dir) = &self.workspace_dir {
-            // `remove_dir`, not `remove_dir_all`: if anything is still in there
-            // the removal must fail loudly rather than take it with us.
-            let _ = std::fs::remove_dir(dir);
+            let removed = (|| -> Result<()> {
+                anyhow::ensure!(
+                    !claimed.covers(dir),
+                    "rollback workspace is claimed or unknown"
+                );
+                std::fs::remove_dir(dir)
+                    .with_context(|| format!("removing empty workspace {}", dir.display()))
+            })();
+            if let Err(error) = removed {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
@@ -662,14 +956,11 @@ pub struct PreparedAttach {
     /// The workspace the session becomes, ready for the caller to persist.
     pub workspace_info: WorkspaceInfo,
     undo: Undo,
+    scope: std::sync::Arc<super::runner_journal::OwnedStop>,
+    path_claims: Vec<PathBuf>,
 }
 
 impl PreparedAttach {
-    /// Undo every filesystem change this attach made.
-    pub fn rollback(&self) {
-        self.undo.run();
-    }
-
     /// Where the session's working directory ends up, for the caller to persist
     /// alongside `workspace_info`.
     pub fn project_path(&self) -> &str {
@@ -695,77 +986,205 @@ pub fn attach(
     attach_planned(storage, session_id, instance, plan)
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_ATTACH_EXECUTE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 /// Execute an already-validated plan and persist it.
 pub fn attach_planned(
     storage: &Storage,
     session_id: &str,
     instance: &super::Instance,
-    plan: AttachPlan,
+    mut plan: AttachPlan,
 ) -> Result<AttachOutcome> {
-    // A publication that has not been drained yet would be flushed after the
-    // move with the stale cwd, re-qualifying the old directory after the
-    // commit. Flush it first so the durable recheck sees the row as it will
-    // stand at the commit.
-    if plan.moves_session {
-        match instance.flush_published_conversation(storage) {
-            Some(crate::session::SidWrite::Applied) | None => {}
-            // The flush read this row's own publication and the owner keeps the
-            // sid, so the refusal is final: no publication of ours is waiting.
-            // (What the poller still has queued is invisible here: the callers
-            // hand `attach_planned` an instance loaded from disk, which carries
-            // no poller.)
-            Some(crate::session::SidWrite::OwnershipConflict) => {
-                tracing::debug!(
-                    target: "session.attach",
-                    instance = %instance.id,
-                    "converting with a sid another row owns",
-                );
-            }
-            Some(outcome) => anyhow::bail!(
-                "'{}' has an undrained conversation publication ({outcome:?}); drain it or \
-                 clear the resume target before converting",
-                instance.title
-            ),
-        }
-    }
-    let prepared = execute(instance, plan)?;
-
-    let id = session_id.to_string();
-    let workspace = prepared.workspace_info.clone();
-    let new_project_path = prepared.project_path().to_string();
-    let converted = prepared.outcome.moved_to.is_some();
-    let persisted = storage.update(|instances, _groups| {
-        let inst = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .with_context(|| format!("session not found: {id}"))?;
+    let mut unstarted = plan
+        .scope
+        .clone()
+        .map(|scope| (scope, plan.path_claims.clone()));
+    let mut filesystem_started = false;
+    let result: Result<AttachOutcome> = (|| {
+        let mut workspace_claim_lock =
+            Some(crate::session::acquire_session_workspace_claim_lock()?);
+        let identity_lock = crate::session::acquire_session_identity_lock()?;
+        let storage = &storage.reopen_preserving_watch()?;
         anyhow::ensure!(
-            !converted || !conversation_cannot_follow(inst),
-            "'{}' now resumes a conversation bound to its current working directory; \
-             conversion cannot be committed",
-            inst.title
+            storage.same_origin_as(plan.original.storage()),
+            "attach replaced its original physical profile"
         );
-        inst.workspace_info = Some(workspace);
-        if converted {
-            // The session now works in the workspace directory, and its old single-repo worktree
-            // record is superseded by the entry for that same repo inside `workspace_info.repos`.
-            inst.project_path = new_project_path;
-            inst.worktree_info = None;
+        let owner = crate::session::deletion::SessionPathOwner {
+            profile: storage.profile(),
+            session_id,
+        };
+        // Lock order: workspace claim -> identity -> lifecycle -> profile namespace.
+        let mut lifecycle_lock = Some(storage.acquire_instance_lifecycle_lock(session_id)?);
+        let profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
+
+        if plan.moves_session {
+            match instance.flush_published_conversation(storage) {
+                Some(crate::session::SidWrite::Applied) | None => {}
+                // The flush read this row's own publication and the owner keeps the
+                // sid, so the refusal is final: no publication of ours is waiting.
+                // (What the poller still has queued is invisible here: the callers
+                // hand `attach_planned` an instance loaded from disk, which carries
+                // no poller.)
+                Some(crate::session::SidWrite::OwnershipConflict) => {
+                    tracing::debug!(
+                        target: "session.attach",
+                        instance = %instance.id,
+                        "converting with a sid another row owns",
+                    );
+                }
+                Some(outcome) => anyhow::bail!(
+                    "'{}' has an undrained conversation publication ({outcome:?}); drain it or \
+                 clear the resume target before converting",
+                    instance.title
+                ),
+            }
         }
-        Ok(())
-    });
+        let acknowledged =
+            storage.update_under_workspace_claim_lock(|instances, _groups| {
+                let row = instances
+                    .iter_mut()
+                    .find(|candidate| candidate.id == session_id)
+                    .with_context(|| format!("session not found: {session_id}"))?;
+                if let Some(generation) = plan.reservation_generation {
+                    plan.native_scope()?
+                        .current_projection()
+                        .validate_baseline_at(row, generation)?;
+                    anyhow::ensure!(
+                        row.lifecycle_reservation_is_owned(
+                            crate::session::LifecycleOperation::Attach,
+                            generation
+                        ),
+                        "attach reservation was superseded before execution"
+                    );
+                    anyhow::ensure!(
+                        row.lifecycle_reservation.as_ref().is_some_and(|lease| {
+                            matches!(&lease.path_claims, super::WorktreePathClaims::Pending(paths) if paths == &plan.path_claims)
+                        }), "attach filesystem intent differs from its complete original plan"
+                    );
+                } else {
+                    plan.original
+                        .validate_baseline_at(row, plan.original.generation())?;
+                    row.try_acquire_lifecycle_reservation(
+                        crate::session::LifecycleOperation::Attach,
+                        super::Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )?;
+                    let custodian = crate::process::OriginalCustodianBirth::capture(storage, row)?;
+                    let reservation = row.lifecycle_reservation.as_mut().context("attach did not acquire its lease")?;
+                    reservation.path_claims = super::WorktreePathClaims::Pending(plan.path_claims.clone());
+                    reservation.custodian = Some(custodian);
+                }
+                if plan.moves_session {
+                    anyhow::ensure!(
+                        row.runner_journal.proves_quiescent(),
+                        "runner execution is not proven quiescent"
+                    );
+                }
+                super::LaunchOrigin::capture(row)
+            })?;
+        let attach_generation = acknowledged.generation();
 
-    if let Err(e) = persisted {
-        prepared.rollback();
-        return Err(e).with_context(|| {
-            format!(
-                "could not record the attached repo; undid the worktree at {}",
-                prepared.outcome.repo.worktree_path
-            )
+        if plan.scope.is_none() {
+            plan.reservation_generation = Some(attach_generation);
+            plan.scope = Some(super::runner_journal::OwnedStop::from_attach(
+                plan.original.clone(),
+                acknowledged.clone(),
+            )?);
+        }
+        unstarted = Some((plan.native_scope()?, plan.path_claims.clone()));
+
+        if let Err(error) = preflight_move_ownership_locked(owner, &plan) {
+            anyhow::bail!("Attach path is already claimed by another session: {error}");
+        }
+        drop(workspace_claim_lock.take());
+        drop(identity_lock);
+        drop(lifecycle_lock.take());
+        // Rollback reacquires the same fence order; no global lock spans Git.
+        drop(profile_namespace_lock);
+        filesystem_started = true;
+        let mut prepared = match execute_for_session(instance, plan, owner, attach_generation) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        AFTER_ATTACH_EXECUTE.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
         });
-    }
+        let converted = prepared.outcome.moved_to.is_some();
+        let new_project_path = prepared.project_path().to_owned();
+        let workspace = prepared.workspace_info;
+        let persisted = (|| -> Result<std::sync::Arc<super::LaunchOrigin>> {
+            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            anyhow::ensure!(
+                Path::new(&prepared.outcome.repo.worktree_path).exists(),
+                "attached worktree disappeared before publication"
+            );
+            let mut candidate_paths = Vec::with_capacity(workspace.repos.len() + 1);
+            candidate_paths.push(PathBuf::from(&workspace.workspace_dir));
+            candidate_paths.extend(
+                workspace
+                    .repos
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
+            );
+            ensure_attach_destinations(owner, &candidate_paths)?;
+            let _lifecycle = storage.acquire_instance_lifecycle_lock(session_id)?;
+            let _namespace = crate::session::storage::acquire_profile_namespace_lock()?;
+            storage.complete_path_claims_under_workspace_lock(
+                &prepared.scope.current_projection(),
+                &prepared.path_claims,
+                |instances, _groups| {
+                    let row = instances
+                        .iter_mut()
+                        .find(|row| row.id == session_id)
+                        .context("session disappeared before attach publication")?;
+                    ensure_attach_owner(row, instance, attach_generation, converted)?;
+                    anyhow::ensure!(
+                    !converted || !conversation_cannot_follow(row),
+                    "conversation is bound to the current checkout; conversion cannot be committed"
+                );
+                    row.workspace_info = Some(workspace);
+                    if converted {
+                        row.project_path = new_project_path;
+                        row.worktree_info = None;
+                    }
+                    row.lifecycle_reservation = None;
+                    super::LaunchOrigin::capture(row)
+                },
+            )
+        })();
+        let acknowledged = match persisted {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                prepared
+                    .undo
+                    .run_preserving_claimed(&prepared.scope, &prepared.path_claims);
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not record attach; recoverable worktrees may remain at {}",
+                        prepared.outcome.repo.worktree_path
+                    )
+                });
+            }
+        };
+        prepared.outcome.original = acknowledged;
 
-    Ok(prepared.outcome)
+        Ok(prepared.outcome)
+    })();
+    if result.is_err() && !filesystem_started {
+        if let Some((scope, paths)) = unstarted {
+            release_unstarted_claims(&scope, &paths);
+        }
+    }
+    result
 }
 
 /// Whether an attach has to stop the session before it can land.
@@ -783,61 +1202,173 @@ pub struct Quiesced {
     /// A structured worker was signalled to stop. Its restart marker is
     /// deliberately not written here; see [`quiesce_for_conversion`].
     pub worker_was_running: bool,
-    /// Generation of the stopped worker, so the restart marker written after
-    /// the move authorizes only that runner's respawn.
-    pub worker_generation: u64,
+    /// Complete native birth captured before settlement, never the SDK lease epoch.
+    pub worker_identity: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
     /// The tmux session was killed, so the pane has to be recreated.
     pub pane_was_live: bool,
 }
-
-/// Stop everything holding the session's current working directory.
-pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> Result<Quiesced> {
-    let mut quiesced = Quiesced::default();
-
-    // The worker registry only exists in a build with the structured view, and
-    // without it there is no ACP worker to stop.
-    if let Ok(Some(record)) = crate::process::worker_registry::load(&instance.id) {
-        crate::process::worker_registry::delete(&instance.id).ok();
-        crate::process::worker::terminate_process_group(record.pid);
-        quiesced.worker_was_running = true;
-        quiesced.worker_generation = record.generation;
+// A captured record is an execution ticket, not a license to stop its replacement.
+pub(crate) async fn settle_for_conversion(
+    storage: &Storage,
+    id: &str,
+    record: Option<&crate::process::worker_registry::WorkerRecord>,
+    plan: &AttachPlan,
+) -> Result<()> {
+    let scope = plan.native_scope()?;
+    anyhow::ensure!(
+        storage.same_origin_as(scope.storage()) && id == scope.session_id(),
+        "attach settlement replaced its original owner"
+    );
+    if let Some(record) = record {
+        scope.original().validate_record_birth(record)?;
     }
-
-    if instance.tmux_session().is_ok_and(|s| s.exists()) {
-        instance.kill_clean().with_context(|| {
-            format!(
-                "could not stop '{}' before moving it into a workspace",
-                instance.title
-            )
-        })?;
-        quiesced.pane_was_live = true;
-    }
-
-    reset_sandbox_container(storage, &instance.id, instance.is_sandboxed())?;
-    Ok(quiesced)
+    crate::session::runner_journal::settle_if_idle(scope).await
 }
 
-/// Start the session again, in whatever directory it now has.
-pub fn resume_after_conversion(
+/// Stop everything holding the session's current working directory.
+pub fn quiesce_for_conversion(
     storage: &Storage,
-    session_id: &str,
+    instance: &super::Instance,
+    plan: &AttachPlan,
+    acknowledged: std::sync::Arc<super::LaunchOrigin>,
+) -> Result<(Quiesced, std::sync::Arc<super::LaunchOrigin>)> {
+    let result = (|| -> Result<(Quiesced, std::sync::Arc<super::LaunchOrigin>)> {
+        let generation = plan
+            .reservation_generation
+            .context("attach must be reserved before stopping")?;
+        {
+            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            let storage = storage.reopen_preserving_watch()?;
+            let _lifecycle = storage.acquire_instance_lifecycle_lock(&instance.id)?;
+            preflight_move_ownership_locked(
+                crate::session::deletion::SessionPathOwner {
+                    profile: storage.profile(),
+                    session_id: &instance.id,
+                },
+                plan,
+            )?;
+            let row = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == instance.id)
+                .context("session disappeared before attach stop")?;
+            anyhow::ensure!(
+                row.lifecycle_reservation_is_owned(
+                    crate::session::LifecycleOperation::Attach,
+                    generation
+                ) && row.project_path == instance.project_path
+                    && row.worktree_info == instance.worktree_info,
+                "session or attach reservation changed before stop"
+            );
+        }
+        let mut quiesced = Quiesced::default();
+        // Registry metadata is only a restart hint, never authority to signal a PID.
+        let record = crate::process::worker_registry::load_strict(&instance.id)?;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(settle_for_conversion(
+                storage,
+                &instance.id,
+                record.as_ref(),
+                plan,
+            ))?;
+        {
+            let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            let storage = storage.reopen_preserving_watch()?;
+            let _lifecycle = storage.acquire_instance_lifecycle_lock(&instance.id)?;
+            let row = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == instance.id)
+                .context("session disappeared before attach stop")?;
+            anyhow::ensure!(
+                row.lifecycle_reservation_is_owned(
+                    crate::session::LifecycleOperation::Attach,
+                    generation
+                ),
+                "attach reservation was superseded before stop"
+            );
+            anyhow::ensure!(
+                row.runner_journal.proves_quiescent(),
+                "runner execution is not proven quiescent"
+            );
+            if instance.tmux_session().is_ok_and(|s| s.exists()) {
+                let stopped = instance.kill_clean_locked();
+                storage.update_under_workspace_claim_lock(|rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == instance.id)
+                        .context("session disappeared after attach stop")?;
+                    anyhow::ensure!(
+                        row.lifecycle_reservation_is_owned(
+                            crate::session::LifecycleOperation::Attach,
+                            generation
+                        ),
+                        "attach reservation was superseded during stop"
+                    );
+                    row.status = if stopped.is_ok() {
+                        super::Status::Stopped
+                    } else {
+                        super::Status::Error
+                    };
+                    Ok(())
+                })?;
+                stopped.with_context(|| {
+                    format!(
+                        "could not stop '{}' before moving it into a workspace",
+                        instance.title
+                    )
+                })?;
+                quiesced.pane_was_live = true;
+            }
+        }
+        if let Some(record) = record {
+            anyhow::ensure!(
+                crate::process::worker_registry::delete_if_owned_by(&record),
+                "could not retire the settled worker registry entry"
+            );
+            quiesced.worker_was_running = true;
+            quiesced.worker_identity = Some(crate::acp::runner_lifecycle::RunnerIdentity {
+                pid: record.pid,
+                generation: record.generation,
+                launch_nonce: record.launch_nonce,
+                incarnation: record.incarnation,
+                profile_identity: record.profile_identity,
+                boot: record.boot,
+            });
+        }
+        let acknowledged = if instance.is_sandboxed() {
+            let scope = plan.native_scope()?;
+            reset_sandbox_container(&scope)?;
+            scope.current_projection()
+        } else {
+            acknowledged
+        };
+        Ok((quiesced, acknowledged))
+    })();
+    if result.is_err() {
+        release_attach(plan);
+    }
+    result
+}
+
+/// Resume only the original-FDA projection acknowledged by the attach transaction.
+pub fn resume_after_conversion(
+    mut original: std::sync::Arc<super::LaunchOrigin>,
     quiesced: Quiesced,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-
     if quiesced.pane_was_live {
-        match storage
-            .load()
-            .ok()
-            .and_then(|all| all.into_iter().find(|i| i.id == session_id))
-        {
-            Some(instance) => {
+        match original.with_storage(|_, row| Ok(row)) {
+            Ok(instance) => {
                 let before = instance.clone();
                 let result = super::restart::perform_restart(super::restart::RestartRequest {
-                    session_id: session_id.to_string(),
+                    session_id: original.session_id().to_owned(),
                     instance,
                     size: None,
-                    // No wake-up keys.
                     wake_message: String::new(),
                     skip_on_launch: false,
                     bound_hooks: true,
@@ -847,50 +1378,61 @@ pub fn resume_after_conversion(
                 match result.outcome {
                     Ok(_) => {
                         let after = *result.instance;
-                        let id = session_id.to_string();
-                        // The same compare-and-swap merge the TUI's restart poller uses, so the
-                        // cascade's mutations (container id, cleared stale agent session id) land
-                        // without clobbering a peer's concurrent edit.
-                        if let Err(e) = storage.update(|instances, _groups| {
-                            if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+                        match super::LaunchOrigin::capture(&after).and_then(|acknowledged| {
+                            acknowledged.update_storage(|_, slot| {
                                 slot.merge_post_restart_with_baseline(&before, &after);
-                            }
-                            Ok(())
+                                Ok(())
+                            }, Ok)?;
+                            Ok(acknowledged)
                         }) {
-                            warnings.push(format!(
-                                "the session restarted but its record could not be updated ({e:#})"
-                            ));
+                            Ok(acknowledged) => original = acknowledged,
+                            Err(e) => warnings.push(format!(
+                                "the session restarted but its original record could not be updated ({e:#})"
+                            )),
                         }
                     }
                     Err(e) => warnings.push(format!(
-                        "the session could not be started again in its new directory ({e}); \
-                         start it from the session list"
+                        "the session could not be started again in its new directory ({e}); start it from the session list"
                     )),
                 }
             }
-            None => warnings
-                .push("the session disappeared before it could be started again".to_string()),
+            Err(e) => warnings.push(format!(
+                "the original session changed before it could be started again ({e:#})"
+            )),
         }
     }
-
     if quiesced.worker_was_running {
-        crate::process::worker_registry::mark_restart_pending(
-            session_id,
-            quiesced.worker_generation,
-        );
+        let pending = original.with_storage(|_, _| {
+            let identity = quiesced
+                .worker_identity
+                .context("stopped worker has no captured native birth")?;
+            if let Some(record) =
+                crate::process::worker_registry::load_strict(original.session_id())?
+            {
+                anyhow::ensure!(
+                    identity.matches_record(&record),
+                    "stopped worker registry was replaced before its restart marker"
+                );
+            }
+            crate::process::worker_registry::mark_restart_pending(
+                original.session_id(),
+                identity.generation,
+            );
+            Ok(())
+        });
+        if let Err(e) = pending {
+            warnings.push(format!(
+                "the original worker could not be scheduled to restart ({e:#})"
+            ));
+        }
     }
-
     warnings
 }
 
 /// A TUI-initiated attach, handed to a background worker thread.
 pub struct AttachProjectRequest {
-    pub session_id: String,
-    pub profile: String,
+    pub original: std::sync::Arc<super::LaunchOrigin>,
     pub repo_path: PathBuf,
-    /// Snapshotted by the caller so the worker does not have to re-derive it,
-    /// and so the container reset is skipped without a `docker` call.
-    pub is_sandboxed: bool,
 }
 
 /// Result of [`perform_attach_project`], already phrased for the user.
@@ -903,7 +1445,7 @@ pub struct AttachProjectResult {
 
 /// Everything about an attach that must not run on the TUI render thread.
 pub fn perform_attach_project(request: AttachProjectRequest) -> AttachProjectResult {
-    let session_id = request.session_id.clone();
+    let session_id = request.original.session_id().to_owned();
     let outcome = attach_and_restart(request);
     AttachProjectResult {
         session_id,
@@ -913,16 +1455,15 @@ pub fn perform_attach_project(request: AttachProjectRequest) -> AttachProjectRes
 
 /// Plan, stop, convert, start again.
 fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
-    let storage = Storage::open_unwatched(&request.profile).map_err(|e| format!("{e:#}"))?;
-    let instances = storage.load().map_err(|e| format!("{e:#}"))?;
-    let instance = instances
-        .iter()
-        .find(|i| i.id == request.session_id)
-        .ok_or_else(|| format!("session not found: {}", request.session_id))?;
-
-    let plan = plan(
-        instance,
-        &request.profile,
+    let original = request.original;
+    let storage = original.storage();
+    let id = original.session_id();
+    let instance = original
+        .with_storage(|_, row| Ok(row))
+        .map_err(|e| format!("{e:#}"))?;
+    let mut plan = plan(
+        &instance,
+        storage.profile(),
         &request.repo_path,
         // The TUI picker has no place to confirm reusing a branch, so it takes the safe path and
         // refuses; `aoe session add-project --attach-existing-branch` is the way to opt in.
@@ -930,18 +1471,20 @@ fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
     )
     .map_err(|e| format!("{e:#}"))?;
 
-    let restarts = needs_restart(&plan, request.is_sandboxed);
-    let quiesced = if restarts {
-        quiesce_for_conversion(&storage, instance).map_err(|e| format!("{e:#}"))?
+    plan.original = original.clone();
+    let reserved = reserve_attach(storage, id, &mut plan).map_err(|e| format!("{e:#}"))?;
+    let restarts = needs_restart(&plan, instance.is_sandboxed());
+    let (quiesced, reserved) = if restarts {
+        quiesce_for_conversion(storage, &instance, &plan, reserved).map_err(|e| format!("{e:#}"))?
     } else {
-        Quiesced::default()
+        (Quiesced::default(), reserved)
     };
 
-    let outcome = match attach_planned(&storage, &request.session_id, instance, plan) {
+    let outcome = match attach_planned(storage, id, &instance, plan) {
         Ok(outcome) => outcome,
         Err(e) => {
             // The session was stopped for an attach that then failed.
-            resume_after_conversion(&storage, &request.session_id, quiesced);
+            resume_after_conversion(reserved, quiesced);
             return Err(format!("{e:#}"));
         }
     };
@@ -967,59 +1510,103 @@ fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
             "\n\nThe agent is already working in this directory, so nothing was restarted.",
         );
     }
-    for warning in resume_after_conversion(&storage, &request.session_id, quiesced) {
+    for warning in resume_after_conversion(outcome.original.clone(), quiesced) {
         message.push_str(&format!("\n\nWarning: {warning}"));
     }
 
     Ok(message)
 }
 
-/// Drop a sandbox session's container so its next start mounts the new repo.
-pub fn reset_sandbox_container(
-    storage: &Storage,
-    session_id: &str,
-    is_sandboxed: bool,
-) -> Result<()> {
-    if !is_sandboxed {
-        return Ok(());
-    }
-
-    match crate::containers::DockerContainer::from_session_id(session_id).discard() {
-        crate::containers::Teardown::Removed => tracing::info!(
-            target: "containers.runtime",
-            session = %session_id,
-            "removed the sandbox container after attaching a repo; it is recreated with the new mount set on next start"
-        ),
-        crate::containers::Teardown::AlreadyGone => {}
-        crate::containers::Teardown::Failed(e) => {
-            bail!("could not remove the old container: {e}")
-        }
-    }
-
-    let id = session_id.to_string();
-    let cleared = storage.update(|instances, _groups| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            if let Some(sandbox) = inst.sandbox_info.as_mut() {
+/// Clear only this attach receipt's sandbox, and emit its actual metadata CAS ACK.
+fn reset_sandbox_container(scope: &super::runner_journal::OwnedStop) -> Result<()> {
+    scope.update_projection(
+        |row| {
+            anyhow::ensure!(
+                row.is_sandboxed(),
+                "original attach row is no longer sandboxed"
+            );
+            match crate::containers::DockerContainer::from_session_id(scope.session_id()).discard()
+            {
+                crate::containers::Teardown::Removed | crate::containers::Teardown::AlreadyGone => {
+                }
+                crate::containers::Teardown::Failed(error) => {
+                    bail!("could not remove the old container: {error}")
+                }
+            }
+            if let Some(sandbox) = row.sandbox_info.as_mut() {
                 sandbox.container_id = None;
                 sandbox.container_workdir = None;
             }
-        }
-        Ok(())
-    });
-    if let Err(e) = cleared {
-        tracing::warn!(
-            target: "containers.runtime",
-            session = %session_id,
-            "could not clear the container pins after attaching a repo: {e:#}"
-        );
-    }
-    Ok(())
+            Ok(())
+        },
+        Ok,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::{Instance, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+
+    #[test]
+    fn uncertain_attach_undo_keeps_the_original_workspace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let undo = Undo {
+            workspace_dir: Some(workspace.clone()),
+            uncertain: true,
+            ..Undo::default()
+        };
+        let claimed = crate::session::deletion::PathsInUse::Known(
+            crate::session::deletion::WorktreePathInventory::default(),
+        );
+        assert!(undo.run_filtered(&claimed).is_err());
+        assert!(workspace.is_dir());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_destinations_keep_directionality_but_refuse_uncertain_aliases() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::TempDir::new_in("/tmp").unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        crate::session::create_profile("attach-owner").unwrap();
+        crate::session::create_profile("attach-peer").unwrap();
+        let storage = crate::session::Storage::open_unwatched("attach-peer").unwrap();
+        let root = temporary.path().join("checkout");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let peer = Instance::new("peer", root.to_str().unwrap());
+        storage
+            .update(|rows, _| {
+                rows.push(peer.clone());
+                Ok(())
+            })
+            .unwrap();
+        let owner = crate::session::deletion::SessionPathOwner {
+            profile: "attach-owner",
+            session_id: "owner",
+        };
+        let _workspace = crate::session::acquire_session_workspace_claim_lock().unwrap();
+        let _identity = crate::session::acquire_session_identity_lock().unwrap();
+        assert!(ensure_attach_destinations(owner, &[root.join("child")]).is_ok());
+        assert!(ensure_attach_destinations(owner, std::slice::from_ref(&root)).is_err());
+        assert!(ensure_attach_destinations(owner, &[temporary.path().join("new")]).is_ok());
+        let dangling = temporary.path().join("dangling");
+        symlink(temporary.path().join("absent"), &dangling).unwrap();
+        assert!(ensure_attach_destinations(owner, std::slice::from_ref(&dangling)).is_err());
+        let claimed_alias = temporary.path().join("claimed-alias");
+        symlink(&root, &claimed_alias).unwrap();
+        storage
+            .update_under_workspace_claim_lock(|rows, _| {
+                rows[0].project_path = claimed_alias.to_str().unwrap().to_owned();
+                Ok(())
+            })
+            .unwrap();
+        std::fs::remove_file(&claimed_alias).unwrap();
+        symlink(temporary.path().join("absent"), &claimed_alias).unwrap();
+        assert!(ensure_attach_destinations(owner, &[temporary.path().join("new")]).is_err());
+    }
 
     fn workspace_instance() -> Instance {
         let mut inst = Instance::new("WS", "/tmp/ws");
@@ -1043,51 +1630,170 @@ mod tests {
         inst
     }
 
+    fn managed_attach_fixture(temp: &Path, profile: &str) -> (Instance, PathBuf) {
+        let backend = temp.join("src/backend");
+        let frontend = temp.join("src/frontend");
+        let checkout = temp.join("detached-checkout");
+        init_repo(&backend);
+        init_repo(&frontend);
+        git_in(
+            &backend,
+            &["worktree", "add", "-b", "featx", checkout.to_str().unwrap()],
+        );
+        std::fs::write(checkout.join("wip.txt"), "keep my work").unwrap();
+        let mut instance = Instance::new("Attach", checkout.to_str().unwrap());
+        instance.source_profile = profile.to_owned();
+        instance.storage_origin = Some(std::sync::Arc::new(
+            Storage::new_unwatched(profile).unwrap(),
+        ));
+        instance.worktree_info = Some(WorktreeInfo {
+            branch: "featx".to_owned(),
+            main_repo_path: backend.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        (instance, frontend)
+    }
+
     #[test]
-    fn plan_refuses_states_that_are_never_attachable() {
-        use super::super::Status;
-        type Setup = fn(&mut Instance);
-        // Each refusal must win over the not-a-git-repo error; a Running session reaches it.
-        let cases: [(Setup, &str); 6] = [
-            (|i| i.scratch = true, "scratch session"),
-            (
-                |i| i.status = Status::Creating,
-                "being created or is being deleted",
-            ),
-            (
-                |i| i.status = Status::Deleting,
-                "being created or is being deleted",
-            ),
-            (|i| i.trashed_at = Some(Utc::now()), "in the trash"),
-            (|i| i.archived_at = Some(Utc::now()), "archived"),
-            (|i| i.status = Status::Running, "not a git repository"),
-        ];
-        for (setup, want) in cases {
-            let mut inst = Instance::new("Attach", "/tmp/attach");
-            setup(&mut inst);
-            let Err(err) = plan(
-                &inst,
-                "default",
-                Path::new("/tmp/definitely-not-a-repo"),
+    #[serial_test::serial]
+    fn attach_accepts_missing_destination_below_peer_but_rejects_peer_at_or_below_destination() {
+        for relation in ["ancestor", "equal", "descendant"] {
+            let temp = tempfile::tempdir().unwrap();
+            let _guard = isolated_profile(temp.path(), "attach-destination");
+            let (instance, frontend) = managed_attach_fixture(temp.path(), "attach-destination");
+            let planned = plan(
+                &instance,
+                "attach-destination",
+                &frontend,
                 ExistingBranch::Refuse,
-            ) else {
-                panic!("{want}: must be refused");
+            )
+            .unwrap();
+            let destination = planned.workspace_dir().to_path_buf();
+            let parent = destination.parent().unwrap();
+            std::fs::create_dir_all(parent).unwrap();
+            std::fs::write(parent.join("peer-content"), "untouched").unwrap();
+            let peer_path = match relation {
+                "ancestor" => parent.to_path_buf(),
+                "equal" => destination.clone(),
+                _ => destination.join("peer-child"),
             };
-            let msg = format!("{err:#}");
-            assert!(msg.contains(want), "{want}: {msg}");
+            let peer = Instance::new("Peer", peer_path.to_str().unwrap());
+            let storage = Storage::open_unwatched("attach-destination").unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.extend([instance.clone(), peer]);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!destination.exists());
+            let result = perform_attach_project(AttachProjectRequest {
+                original: super::super::LaunchOrigin::capture(&instance).unwrap(),
+                repo_path: frontend,
+            });
+            if relation == "ancestor" {
+                assert!(result.outcome.is_ok(), "{:?}", result.outcome);
+                assert_eq!(
+                    std::fs::read_to_string(destination.join("backend/wip.txt")).unwrap(),
+                    "keep my work"
+                );
+                assert!(destination.join("frontend/.git").exists());
+                assert!(!Path::new(&instance.project_path).exists());
+                let stored = storage
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.id == instance.id)
+                    .unwrap();
+                assert_eq!(Path::new(&stored.project_path), destination);
+            } else {
+                assert!(result.outcome.is_err());
+                assert!(!destination.exists());
+                assert_eq!(
+                    std::fs::read_to_string(Path::new(&instance.project_path).join("wip.txt"))
+                        .unwrap(),
+                    "keep my work"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(parent.join("peer-content")).unwrap(),
+                "untouched"
+            );
         }
     }
 
     #[test]
     #[serial_test::serial]
-    fn reset_sandbox_container_is_a_no_op_without_a_sandbox() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        crate::session::create_profile("attach-noop").expect("profile");
-        let storage = Storage::open_unwatched("attach-noop").expect("storage");
+    fn foreign_movein_checkout_is_refused_before_stopping_the_worker() {
+        use std::os::unix::process::CommandExt;
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = isolated_profile(temp.path(), "attach-owner");
+        crate::session::create_profile("attach-peer").unwrap();
+        let (instance, frontend) = managed_attach_fixture(temp.path(), "attach-owner");
+        let storage = Storage::open_unwatched("attach-owner").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut peer = Instance::new("Peer", &instance.project_path);
+        peer.id = instance.id.clone();
+        Storage::open_unwatched("attach-peer")
+            .unwrap()
+            .update(|rows, _| {
+                rows.push(peer);
+                Ok(())
+            })
+            .unwrap();
+        let mut child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            instance.id.clone(),
+            child.0.id(),
+            temp.path().join("unused.sock"),
+            "test".into(),
+            "test".into(),
+            PathBuf::from(&instance.project_path),
+            None,
+            vec![],
+            vec![],
+            None,
+            Some("attach-owner".into()),
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let result = perform_attach_project(AttachProjectRequest {
+            original: super::super::LaunchOrigin::capture(&instance).unwrap(),
+            repo_path: frontend,
+        });
+        let still_running = child.0.try_wait().unwrap().is_none();
+        assert!(result.outcome.is_err());
         assert!(
-            reset_sandbox_container(&storage, "no-such-session", false).is_ok(),
-            "an unsandboxed session must not touch the container runtime"
+            still_running,
+            "a foreign checkout refusal must precede worker stop"
+        );
+        assert!(crate::process::worker_registry::load(&instance.id)
+            .unwrap()
+            .is_some());
+        let stored = storage.load().unwrap().pop().unwrap();
+        assert_eq!(stored.lifecycle_generation, 0);
+        assert!(stored.lifecycle_reservation.is_none());
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&instance.project_path).join("wip.txt")).unwrap(),
+            "keep my work"
         );
     }
 
@@ -1164,6 +1870,9 @@ mod tests {
             cleanup_on_delete: true,
         });
 
+        inst.storage_origin = Some(std::sync::Arc::new(
+            Storage::open_unwatched("attach-append").unwrap(),
+        ));
         let plan = plan(&inst, "attach-append", &frontend, ExistingBranch::Refuse)
             .expect("attaching to a workspace session must be accepted");
         assert!(
@@ -1172,9 +1881,17 @@ mod tests {
         );
         assert_eq!(plan.workspace_dir(), workspace);
 
-        let prepared = execute(&inst, plan).expect("the worktree must be created");
+        let storage = Storage::open_unwatched("attach-append").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let prepared =
+            attach_planned(&storage, &inst.id, &inst, plan).expect("the worktree must be created");
         assert!(
-            prepared.outcome.moved_to.is_none(),
+            prepared.moved_to.is_none(),
             "nothing moved, so there is no new project_path to report"
         );
         assert!(workspace.join("frontend/.git").exists());
@@ -1203,6 +1920,7 @@ mod tests {
         let frontend = temp.path().join("src/frontend");
         init_repo(&backend);
         init_repo(&frontend);
+
         std::fs::write(backend.join("wip.txt"), "unsaved").unwrap();
 
         let inst = Instance::new("Dirty Session", backend.to_str().unwrap());
@@ -1223,15 +1941,161 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn a_failed_attach_moves_the_sessions_worktree_back() {
+    fn attach_releases_its_reservation_after_publication() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let _guard = isolated_profile(temp.path(), "attach-rollback");
-
+        let _guard = isolated_profile(temp.path(), "attach-release");
         let backend = temp.path().join("src/backend");
         let frontend = temp.path().join("src/frontend");
+        let workspace = temp.path().join("ws");
         init_repo(&backend);
         init_repo(&frontend);
-        let session_wt = temp.path().join("src/backend-featx");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let backend_wt = workspace.join("backend");
+        git_in(
+            &backend,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "existing",
+                backend_wt.to_str().unwrap(),
+            ],
+        );
+        let mut instance = Instance::new("Workspace", workspace.to_str().unwrap());
+        instance.workspace_info = Some(WorkspaceInfo {
+            branch: "existing".to_string(),
+            workspace_dir: workspace.to_string_lossy().to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "backend".to_string(),
+                source_path: backend.to_string_lossy().to_string(),
+                branch: "existing".to_string(),
+                worktree_path: backend_wt.to_string_lossy().to_string(),
+                main_repo_path: backend.to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+        });
+        let storage = Storage::open_unwatched("attach-release").unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+        let attach_plan = plan(
+            &instance,
+            "attach-release",
+            &frontend,
+            ExistingBranch::Refuse,
+        )
+        .expect("the attach plan should be valid");
+        attach_planned(&storage, &instance.id, &instance, attach_plan)
+            .expect("the attach should publish");
+        let stored = storage.load().unwrap().into_iter().next().unwrap();
+        assert!(
+            stored.lifecycle_reservation.is_none(),
+            "a published attach must release its exact reservation"
+        );
+        assert!(workspace.join("frontend/.git").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_attach_claim_refuses_a_late_peer_writer_before_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-late-claim");
+        let backend = temp.path().join("src/backend");
+        let frontend = temp.path().join("src/frontend");
+        let workspace = temp.path().join("ws");
+        init_repo(&backend);
+        init_repo(&frontend);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let backend_wt = workspace.join("backend");
+        git_in(
+            &backend,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "existing",
+                backend_wt.to_str().unwrap(),
+            ],
+        );
+        let mut instance = Instance::new("Workspace", workspace.to_str().unwrap());
+        instance.workspace_info = Some(WorkspaceInfo {
+            branch: "existing".to_string(),
+            workspace_dir: workspace.to_string_lossy().to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "backend".to_string(),
+                source_path: backend.to_string_lossy().to_string(),
+                branch: "existing".to_string(),
+                worktree_path: backend_wt.to_string_lossy().to_string(),
+                main_repo_path: backend.to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+        });
+        let storage = Storage::open_unwatched("attach-late-claim").unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+        let peer_storage = Storage::new_unwatched("attach-late-peer").unwrap();
+        let attach_plan = plan(
+            &instance,
+            "attach-late-claim",
+            &frontend,
+            ExistingBranch::Refuse,
+        )
+        .expect("the attach plan should be valid");
+        let claimed_path = attach_plan.added_worktree.clone();
+        let peer_claimed_path = claimed_path.clone();
+        AFTER_ATTACH_EXECUTE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut row = Instance::new("peer", peer_claimed_path.to_str().unwrap());
+                row.source_profile = "attach-late-peer".to_string();
+                assert!(peer_storage
+                    .update(|instances, _groups| {
+                        instances.push(row);
+                        Ok(())
+                    })
+                    .is_err());
+                assert!(peer_storage.load().unwrap().is_empty());
+            }));
+        });
+        attach_planned(&storage, &instance.id, &instance, attach_plan).unwrap();
+        assert!(claimed_path.join(".git").exists());
+        let stored = storage.load().unwrap().into_iter().next().unwrap();
+        assert!(stored.lifecycle_reservation.is_none());
+        assert!(stored
+            .workspace_info
+            .unwrap()
+            .repos
+            .iter()
+            .any(|repo| Path::new(&repo.worktree_path) == claimed_path));
+    }
+
+    /// A worktree session whose attach moves its own checkout, with the added
+    /// repo's worktree slot blocked by a non-empty directory so the attach fails
+    /// after that move.
+    fn blocked_worktree_attach(temp: &Path, profile: &str) -> (Instance, AttachPlan) {
+        let backend = temp.join("src/backend");
+        let frontend = temp.join("src/frontend");
+        init_repo(&backend);
+        init_repo(&frontend);
+        let session_wt = temp.join("src/backend-featx");
         git_in(
             &backend,
             &[
@@ -1253,32 +2117,129 @@ mod tests {
             base_branch: None,
         });
 
-        let plan = plan(&inst, "attach-rollback", &frontend, ExistingBranch::Refuse)
+        inst.storage_origin = Some(std::sync::Arc::new(
+            Storage::open_unwatched(profile).unwrap(),
+        ));
+        let plan = plan(&inst, profile, &frontend, ExistingBranch::Refuse)
             .expect("the attach itself is valid");
+        let blocker = plan.workspace_dir().join("frontend");
+        std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(blocker.join("in-the-way.txt"), "x").unwrap();
+        (inst, plan)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_git_attach_retains_the_moved_worktree_and_original_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-rollback");
+        let (inst, plan) = blocked_worktree_attach(temp.path(), "attach-rollback");
+        let moved = plan.workspace_dir().join("backend");
+        let blocked = plan.added_worktree.clone();
+        let paths = plan.path_claims.clone();
+
         assert!(
             plan.moves_session,
             "a worktree session's directory moves, so the caller has to stop it"
         );
 
-        let blocker = plan.workspace_dir().join("frontend");
-        std::fs::create_dir_all(&blocker).unwrap();
-        std::fs::write(blocker.join("in-the-way.txt"), "x").unwrap();
-
-        let Err(err) = execute(&inst, plan) else {
+        let storage = Storage::open_unwatched("attach-rollback").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let Err(error) = attach_planned(&storage, &inst.id, &inst, plan) else {
             panic!("the added repo's worktree cannot be created over a non-empty directory");
         };
-        assert!(
-            format!("{err:#}").contains("frontend"),
-            "the error should name the repo that failed: {err:#}"
-        );
-        assert!(
-            session_wt.join("wip.txt").exists(),
-            "the session's worktree must be moved back, with its uncommitted work"
-        );
+
+        assert!(format!("{error:#}").contains("could not create a worktree for 'frontend'"));
+        // A failed Git effect is not proof that every effect was absent/retired.
+        // Keep the real moved checkout and durable intent, rather than minting Undo authority.
+        assert!(!Path::new(&inst.project_path).exists());
         assert_eq!(
-            std::fs::read_to_string(session_wt.join("wip.txt")).unwrap(),
+            std::fs::read_to_string(moved.join("wip.txt")).unwrap(),
             "in progress"
         );
+        assert_eq!(
+            std::fs::read_to_string(blocked.join("in-the-way.txt")).unwrap(),
+            "x"
+        );
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == inst.id)
+            .unwrap();
+        assert_eq!(stored.project_path, inst.project_path);
+        assert!(matches!(stored.lifecycle_reservation.unwrap().path_claims,
+            super::super::WorktreePathClaims::Pending(retained) if retained == paths));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn failed_attach_retains_moved_checkouts_when_rollback_authority_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = isolated_profile(temp.path(), "attach-rollback-fence");
+        crate::session::create_profile("attach-rollback-peer").unwrap();
+        let (instance, plan) = blocked_worktree_attach(temp.path(), "attach-rollback-fence");
+        let paths = plan.path_claims.clone();
+        let added = plan.added_worktree.clone();
+        std::fs::remove_file(added.join("in-the-way.txt")).unwrap();
+        std::fs::remove_dir(&added).unwrap();
+        let moved = plan.workspace_dir().join("backend");
+        let original = PathBuf::from(&instance.project_path);
+        let storage = Storage::open_unwatched("attach-rollback-fence").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let moved_for_hook = moved.clone();
+        let original_for_hook = original.clone();
+        AFTER_ATTACH_EXECUTE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(!original_for_hook.exists());
+                assert_eq!(
+                    std::fs::read_to_string(moved_for_hook.join("wip.txt")).unwrap(),
+                    "in progress"
+                );
+                std::fs::write(
+                    crate::session::get_profile_dir_path("attach-rollback-peer")
+                        .unwrap()
+                        .join("sessions.json"),
+                    "{ not json",
+                )
+                .unwrap();
+            }));
+        });
+        assert!(attach_planned(&storage, &instance.id, &instance, plan).is_err());
+        assert!(
+            !original.exists(),
+            "unknown ownership must not move the checkout back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(moved.join("wip.txt")).unwrap(),
+            "in progress"
+        );
+        assert!(
+            added.join(".git").exists(),
+            "unknown ownership must not remove the added worktree"
+        );
+        let retained = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == instance.id)
+            .unwrap();
+        assert_eq!(retained.project_path, instance.project_path);
+        assert_eq!(retained.created_at, instance.created_at);
+        assert!(retained.lifecycle_reservation.as_ref().is_some_and(|lease| {
+            matches!(&lease.path_claims, super::super::WorktreePathClaims::Pending(retained_paths) if retained_paths == &paths)
+        }));
     }
 
     #[test]
@@ -1313,9 +2274,20 @@ mod tests {
         });
         inst.base_branch_override = Some("upstream/main".to_string());
 
+        inst.storage_origin = Some(std::sync::Arc::new(
+            Storage::open_unwatched("attach-diff-base").unwrap(),
+        ));
         let plan = plan(&inst, "attach-diff-base", &frontend, ExistingBranch::Refuse)
             .expect("the attach itself is valid");
-        let prepared = execute(&inst, plan).expect("the worktree must be created");
+        let storage = Storage::open_unwatched("attach-diff-base").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let prepared =
+            attach_planned(&storage, &inst.id, &inst, plan).expect("the worktree must be created");
 
         let primary = prepared
             .workspace_info

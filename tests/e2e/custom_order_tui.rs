@@ -69,8 +69,19 @@ fn test_tui_custom_sort_reorders_and_persists() {
     // Put the cursor on the first of the two and move it past the second.
     h.send_keys("Down");
     h.send_keys("C-Down");
-    h.wait_for(&before[1]);
-    let moved = order_on_screen(&h);
+    let expected = vec![before[1].clone(), before[0].clone()];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let moved = loop {
+        let order = order_on_screen(&h);
+        if order == expected {
+            break order;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reorder was not acknowledged: {order:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     assert_eq!(
         moved,
         vec![before[1].clone(), before[0].clone()],

@@ -475,6 +475,33 @@ impl RuntimeBase {
         }
         let output = self.probe_output(&mut cmd)?;
 
+        self.finish_create_output(image, output)
+    }
+
+    pub(crate) fn run_owned_create(
+        &self,
+        name: &str,
+        image: &str,
+        config: &ContainerConfig,
+        intent: &crate::session::builder::CreationIntent,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<String> {
+        let args = self.build_create_args(name, image, config);
+        intent.retain_container_goal(&args);
+        let mut command = intent.owned_command(self.binary)?;
+        command.args(&args);
+        if self.binary == "podman" {
+            command.env_remove("INVOCATION_ID");
+        }
+        let (_, inherit) = docker_env_args(&config.environment);
+        command.envs(inherit);
+        let output = intent.run_owned_output(&mut command, Some(cancel))?;
+        let id = self.finish_create_output(image, output)?;
+        intent.acknowledge_container_result(&id);
+        Ok(id)
+    }
+
+    fn finish_create_output(&self, image: &str, output: std::process::Output) -> Result<String> {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::debug!(target: "containers.runtime", "stderr: {}", stderr);

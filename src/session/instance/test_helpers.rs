@@ -219,8 +219,10 @@ pub(super) fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf 
     dir
 }
 
-pub(super) fn seed_disk_for_sidecar_test(profile: &str, inst: &Instance) {
-    let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+pub(super) fn seed_disk_for_sidecar_test(profile: &str, inst: &mut Instance) {
+    let storage =
+        std::sync::Arc::new(crate::session::storage::Storage::new_unwatched(profile).unwrap());
+    inst.storage_origin = Some(storage.clone());
     let snapshot = inst.clone();
     storage
         .update(|i, g| {

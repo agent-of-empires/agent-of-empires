@@ -61,7 +61,9 @@ struct Update {
     id: String,
     sid: String,
     expected_prior: crate::session::instance::ConversationState,
-    profile: String,
+    storage: Arc<Storage>,
+    expected_generation: u64,
+    expected_created_at: chrono::DateTime<chrono::Utc>,
     observation: SessionIdObservation,
     confirms_omp_pin: bool,
 }
@@ -93,7 +95,7 @@ pub(crate) fn drain_and_persist_session_ids_lifecycle_locked(
 
 fn drain_and_persist_session_ids_inner(
     instances: &mut [Instance],
-    file_watch: &Arc<FileWatchService>,
+    _file_watch: &Arc<FileWatchService>,
     lifecycle_already_locked: bool,
 ) -> SessionIdSyncOutcome {
     let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
@@ -116,6 +118,12 @@ fn drain_and_persist_session_ids_inner(
         }
     }
     for inst in instances.iter() {
+        let Ok(storage) = inst.original_storage() else {
+            continue;
+        };
+        if storage.verify_profile_identity().is_err() {
+            continue;
+        }
         let Some(observation) = drain_poller(inst) else {
             continue;
         };
@@ -219,7 +227,9 @@ fn drain_and_persist_session_ids_inner(
             id: inst.id.clone(),
             sid,
             expected_prior: inst.conversation_state(),
-            profile: inst.source_profile.clone(),
+            storage,
+            expected_generation: inst.lifecycle_generation,
+            expected_created_at: inst.created_at,
             observation,
             confirms_omp_pin,
         });
@@ -312,27 +322,57 @@ fn drain_and_persist_session_ids_inner(
 
     let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
     for update in &updates {
-        let ownership: anyhow::Result<_> = if lifecycle_already_locked || update.confirms_omp_pin {
+        let namespace_guards = if lifecycle_already_locked {
+            Ok(None)
+        } else {
+            (|| -> anyhow::Result<_> {
+                let workspace = crate::session::acquire_session_workspace_claim_lock()?;
+                let identity = crate::session::acquire_session_identity_lock()?;
+                update.storage.verify_profile_identity()?;
+                Ok(Some((workspace, identity)))
+            })()
+        };
+        let ownership: anyhow::Result<_> = if let Err(error) = namespace_guards.as_ref() {
+            Err(anyhow::anyhow!(
+                "capture original authority unavailable: {error}"
+            ))
+        } else if lifecycle_already_locked || update.confirms_omp_pin {
             Ok(None)
         } else {
             (|| {
-                let storage = Storage::new(&update.profile, file_watch.clone())?;
+                let storage = update.storage.clone();
+                storage.verify_profile_identity()?;
                 let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
-                let generation = storage.update(|instances, _groups| {
-                    let Some(instance) = instances
-                        .iter_mut()
-                        .find(|instance| instance.id == update.id)
-                    else {
-                        anyhow::bail!("session disappeared before capture");
-                    };
-                    instance
-                        .try_acquire_lifecycle_reservation(
-                            crate::session::LifecycleOperation::Capture,
-                            Instance::LIFECYCLE_RESERVATION_TTL,
-                            chrono::Utc::now(),
-                        )
-                        .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
-                })?;
+                let generation = storage.update_metadata(
+                    crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                        &update.id,
+                    )),
+                    |instances, _groups| {
+                        let Some(instance) = instances
+                            .iter_mut()
+                            .find(|instance| instance.id == update.id)
+                        else {
+                            anyhow::bail!("session disappeared before capture");
+                        };
+                        anyhow::ensure!(
+                            instance.created_at == update.expected_created_at,
+                            "capture original row was replaced"
+                        );
+                        if instance.lifecycle_generation != update.expected_generation
+                            || !update.expected_prior.matches(instance)
+                        {
+                            return Ok(None);
+                        }
+                        instance
+                            .try_acquire_lifecycle_reservation(
+                                crate::session::LifecycleOperation::Capture,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                chrono::Utc::now(),
+                            )
+                            .map(Some)
+                            .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
+                    },
+                )?;
                 Ok(Some((storage, lifecycle_lock, generation)))
             })()
         };
@@ -345,27 +385,30 @@ fn drain_and_persist_session_ids_inner(
                 );
                 SidWrite::Failed
             }
+            Ok(Some((_, _, None))) => SidWrite::Skipped,
             Ok(_) => persist_session_to_storage(
-                &update.profile,
+                &update.storage,
                 &update.id,
                 &update.observation,
                 &update.expected_prior,
-                file_watch,
             ),
         };
-        if let Ok(Some((storage, _lifecycle_lock, generation))) = ownership {
-            let released = storage.update(|instances, _groups| {
-                let Some(instance) = instances
-                    .iter_mut()
-                    .find(|instance| instance.id == update.id)
-                else {
-                    return Ok(false);
-                };
-                Ok(instance.release_lifecycle_reservation_if_owned(
-                    crate::session::LifecycleOperation::Capture,
-                    generation,
-                ))
-            });
+        if let Ok(Some((storage, _lifecycle_lock, Some(generation)))) = ownership {
+            let released = storage.update_metadata(
+                crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&update.id)),
+                |instances, _groups| {
+                    let Some(instance) = instances
+                        .iter_mut()
+                        .find(|instance| instance.id == update.id)
+                    else {
+                        return Ok(false);
+                    };
+                    Ok(instance.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Capture,
+                        generation,
+                    ))
+                },
+            );
             match released {
                 Ok(true) => {
                     capture_generations.push((update.id.clone(), generation));
@@ -410,9 +453,11 @@ fn drain_and_persist_session_ids_inner(
                 filtered_ids.insert(update.id.clone());
             }
             SidWrite::Skipped | SidWrite::PinnedForeign => {
-                if let Some(mut rb) =
-                    reload_skipped_from_disk(&update.profile, &update.id, file_watch)
-                {
+                if let Some(mut rb) = reload_skipped_from_disk(
+                    &update.storage,
+                    &update.id,
+                    update.expected_created_at,
+                ) {
                     if !update.confirms_omp_pin
                         && rb.conversation.session_id.as_deref() == Some(update.sid.as_str())
                     {
@@ -426,9 +471,9 @@ fn drain_and_persist_session_ids_inner(
                                     }
                                 ) {
                                     if let Some(current) = reload_skipped_from_disk(
-                                        &update.profile,
+                                        &update.storage,
                                         &update.id,
-                                        file_watch,
+                                        update.expected_created_at,
                                     ) {
                                         rb = current;
                                     }
@@ -702,13 +747,14 @@ fn request_poller_retry(instances: &[Instance], id: &str) {
 }
 
 fn reload_skipped_from_disk(
-    profile: &str,
+    storage: &Storage,
     id: &str,
-    file_watch: &Arc<FileWatchService>,
+    created_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<Rollback> {
-    let storage = Storage::new(profile, file_watch.clone()).ok()?;
     let disk_insts = storage.load().ok()?;
-    let disk_inst = disk_insts.iter().find(|i| i.id == id)?;
+    let disk_inst = disk_insts
+        .iter()
+        .find(|i| i.id == id && i.created_at == created_at)?;
     Some(Rollback {
         id: id.to_string(),
         conversation: disk_inst.conversation_state(),
@@ -805,8 +851,9 @@ mod tests {
         EnvGuard::set(&pairs)
     }
 
-    fn seed_instance_on_disk(profile: &str, inst: &Instance) {
-        let storage = Storage::new_unwatched(profile).unwrap();
+    fn seed_instance_on_disk(profile: &str, inst: &mut Instance) {
+        let storage = Arc::new(Storage::new_unwatched(profile).unwrap());
+        inst.storage_origin = Some(storage.clone());
         let on_disk = inst.clone();
         storage
             .update(|i, g| {
@@ -818,9 +865,15 @@ mod tests {
             .unwrap();
     }
 
-    fn seed_instances_on_disk(profile: &str, insts: &[&Instance]) {
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let owned: Vec<Instance> = insts.iter().map(|i| (*i).clone()).collect();
+    fn seed_instances_on_disk(profile: &str, insts: &mut [&mut Instance]) {
+        let storage = Arc::new(Storage::new_unwatched(profile).unwrap());
+        let owned: Vec<Instance> = insts
+            .iter_mut()
+            .map(|instance| {
+                instance.storage_origin = Some(storage.clone());
+                (**instance).clone()
+            })
+            .collect();
         storage
             .update(|i, g| {
                 *i = owned.clone();
@@ -917,7 +970,7 @@ mod tests {
         let sid = "019342ab-1234-7def-8901-abcdef012340";
         let generation = "launch-exact";
         let mut inst = pinned_omp_instance(profile, sid, generation);
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
         attach_poller_with_omp_update(&mut inst, sid, generation);
 
         let file_watch = FileWatchService::noop();
@@ -953,7 +1006,7 @@ mod tests {
                 inst.active_execution = None;
             }
             let expected = inst.conversation_state();
-            seed_instance_on_disk(profile, &inst);
+            seed_instance_on_disk(profile, &mut inst);
             match case {
                 "legacy" => attach_poller_with_legacy_omp_update(&mut inst, sid),
                 "stale" => attach_poller_with_omp_update(&mut inst, sid, "launch-stale"),
@@ -986,7 +1039,7 @@ mod tests {
         let generation = "launch-observed";
         let mut inst = pinned_omp_instance(profile, sid, generation);
         let original = inst.conversation_state();
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
         let storage = Storage::new_unwatched(profile).unwrap();
         let peer_pin = "019342ab-1234-7def-8901-abcdef012348";
         storage
@@ -1039,7 +1092,7 @@ mod tests {
         inst.source_profile = profile.to_string();
         inst.tool = "omp".to_string();
         inst.omp_capture_generation = Some(stale_generation.to_string());
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
         Storage::new_unwatched(profile)
             .unwrap()
             .update(|instances, _groups| {
@@ -1084,7 +1137,7 @@ mod tests {
         inst.source_profile = profile.to_string();
         inst.tool = "omp".to_string();
         inst.omp_capture_generation = Some("launch-stale-memory".to_string());
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
         Storage::new_unwatched(profile)
             .unwrap()
             .update(|instances, _groups| {
@@ -1115,7 +1168,7 @@ mod tests {
         inst.source_profile = profile.to_string();
         inst.agent_session_id = None;
         inst.resume_probe_failed_sid = Some("old-failed".to_string());
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let fresh = "019342ab-1234-7def-8901-abcdef012345";
         attach_poller_with_update(&mut inst, fresh);
@@ -1164,7 +1217,7 @@ mod tests {
                     excluded.to_string(),
                 ));
             configure(&mut inst);
-            seed_instance_on_disk(&profile, &inst);
+            seed_instance_on_disk(&profile, &mut inst);
             attach_poller_with_update(&mut inst, observed);
 
             let file_watch = FileWatchService::noop();
@@ -1197,8 +1250,10 @@ mod tests {
             op: crate::session::LifecycleOperation::Trash,
             generation: 1,
             at: chrono::Utc::now(),
+            path_claims: crate::session::WorktreePathClaims::None,
+            custodian: None,
         });
-        seed_instance_on_disk(profile, &instance);
+        seed_instance_on_disk(profile, &mut instance);
         attach_poller_with_update(&mut instance, sid);
 
         let file_watch = FileWatchService::noop();
@@ -1233,7 +1288,7 @@ mod tests {
         let mut thief = Instance::new("thief-title", "/tmp/x");
         thief.source_profile = "sync-collision".to_string();
         thief.agent_session_id = None;
-        seed_instances_on_disk("sync-collision", &[&owner, &thief]);
+        seed_instances_on_disk("sync-collision", &mut [&mut owner, &mut thief]);
         attach_poller_with_update(&mut thief, owned);
 
         let file_watch = FileWatchService::noop();
@@ -1262,7 +1317,7 @@ mod tests {
         let mut claimant = Instance::new("claimant-title", "/tmp/x");
         claimant.source_profile = profile.to_string();
         claimant.agent_session_id = None;
-        seed_instances_on_disk(profile, &[&owner, &claimant]);
+        seed_instances_on_disk(profile, &mut [&mut owner, &mut claimant]);
 
         attach_poller_with_update(&mut claimant, contested);
 
@@ -1356,7 +1411,7 @@ mod tests {
             }),
             container: None,
         });
-        seed_instances_on_disk(profile, &[&owner, &claimant]);
+        seed_instances_on_disk(profile, &mut [&mut owner, &mut claimant]);
         crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
         let observed = crate::session::capture::read_pi_session_observation(
             &claimant.id,
@@ -1429,7 +1484,7 @@ mod tests {
             capture: None,
             container: None,
         });
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let poller = SessionPoller::new(
             format!("test-tmux-{}", inst.id),
@@ -1488,7 +1543,7 @@ mod tests {
             id_only.source_profile = profile.to_string();
             id_only.tool = "pi".into();
             id_only.active_execution = Some(active);
-            seed_instances_on_disk(&profile, &[&qualified, &id_only]);
+            seed_instances_on_disk(&profile, &mut [&mut qualified, &mut id_only]);
 
             let qualified_poller = SessionPoller::new(
                 format!("test-tmux-{}", qualified.id),
@@ -1563,7 +1618,7 @@ mod tests {
         let mut b = Instance::new("peer-b-title", "/tmp/x");
         b.source_profile = "sync-samebatch".to_string();
         b.agent_session_id = None;
-        seed_instances_on_disk("sync-samebatch", &[&a, &b]);
+        seed_instances_on_disk("sync-samebatch", &mut [&mut a, &mut b]);
         attach_poller_with_update(&mut b, contested);
 
         let file_watch = FileWatchService::noop();
@@ -1596,7 +1651,7 @@ mod tests {
             let mut inst = Instance::new("cli-capture-title", "/tmp/x");
             inst.source_profile = profile.to_string();
             inst.agent_session_id = initial.map(str::to_string);
-            seed_instance_on_disk(profile, &inst);
+            seed_instance_on_disk(profile, &mut inst);
             if let Some(observed) = observed {
                 attach_poller_with_update(&mut inst, observed);
             }
@@ -1634,7 +1689,7 @@ mod tests {
         inst.tool = "pi".to_string();
         inst.agent_session_id = Some("pi-launch-conversation".to_string());
         inst.mark_pi_extension_launched_for_test();
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let poller = SessionPoller::new(
             format!("test-tmux-{}", inst.id),
@@ -1684,7 +1739,8 @@ mod tests {
             inst.mark_pi_extension_launched_for_test();
             let mut on_disk = inst.clone();
             on_disk.agent_session_id = Some(disk_sid.to_string());
-            seed_instance_on_disk(profile, &on_disk);
+            seed_instance_on_disk(profile, &mut on_disk);
+            inst.storage_origin = on_disk.storage_origin.clone();
             inst.agent_session_id = Some(old.to_string());
 
             // No sidecar exists: only the observation carries the path.
@@ -1738,7 +1794,7 @@ mod tests {
         inst.source_profile = profile.to_string();
         inst.tool = "pi".to_string();
         inst.agent_session_id = Some(sid.to_string());
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let poller = SessionPoller::new(
             format!("test-tmux-{}", inst.id),
@@ -1796,7 +1852,7 @@ mod tests {
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,
         });
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(
             sid.to_string(),
@@ -1871,7 +1927,7 @@ mod tests {
         let mut inst = Instance::new("pi-path-in-cas", "/tmp/pi-path-in-cas");
         inst.source_profile = profile.to_string();
         inst.tool = "pi".to_string();
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
         let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(
             sid.into(),
             Some(path.clone()),
@@ -1931,7 +1987,7 @@ mod tests {
             container: None,
         };
         inst.active_execution = Some(execution.clone());
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
         let mut peer_execution = execution.clone();
         peer_execution.launch_id = uuid::Uuid::new_v4().to_string();
         peer_execution.binding.stores = vec!["/tmp/peer-pi-store".into()];
@@ -2000,7 +2056,7 @@ mod tests {
         inst.tool = "pi".to_string();
         inst.agent_session_id = Some(sid.to_string());
         inst.mark_pi_extension_launched_for_test();
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let published = "/home/u/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_01a05234-8889-72e2-a7c9-7ebc27b25b78.jsonl";
         // The sidecar is already gone: only the observation carries the path.
@@ -2041,7 +2097,7 @@ mod tests {
         let mut inst = Instance::new("cli-capture-late-title", "/tmp/x");
         inst.source_profile = profile.to_string();
         inst.agent_session_id = None;
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let fresh = "019342ab-1234-7def-8901-abcdef999999";
         let poller = SessionPoller::new(
@@ -2093,7 +2149,7 @@ mod tests {
         let mut inst = Instance::new("cli-capture-newest-title", "/tmp/x");
         inst.source_profile = profile.to_string();
         inst.agent_session_id = None;
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let older = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
         let newer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
@@ -2128,7 +2184,7 @@ mod tests {
         let profile = "sync-sticky-stop-flush";
         let mut inst = Instance::new("sticky-stop-flush", "/tmp/x");
         inst.source_profile = profile.to_string();
-        seed_instance_on_disk(profile, &inst);
+        seed_instance_on_disk(profile, &mut inst);
 
         let sid = "019342ab-1234-7def-8901-cccccccccccc";
         let newer = "019342ab-1234-7def-8901-dddddddddddd";

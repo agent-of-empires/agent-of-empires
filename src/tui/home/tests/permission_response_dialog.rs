@@ -48,7 +48,11 @@ fn a_opens_permission_dialog_only_for_supported_agents() {
             id
         });
         env.view.selected_session = selected;
-        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        let _ = {
+            let result = env.view.handle_key(key(KeyCode::Char('a')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         assert_eq!(
             env.view.permission_response_dialog.is_some(),
             dialog,
@@ -71,7 +75,11 @@ fn structured_session_reuses_the_permission_dialog() {
         .insert(id.clone(), pending(&nonce));
     env.view.selected_session = Some(id.clone());
 
-    let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+    let _ = {
+        let result = env.view.handle_key(key(KeyCode::Char('a')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.permission_response_dialog.is_some(),
@@ -101,7 +109,11 @@ fn choice_list_approval_is_routed_to_the_structured_view() {
     env.view.structured_pending_approvals.get_mut(&id).unwrap()[0].choice = true;
     env.view.selected_session = Some(id.clone());
 
-    let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+    let _ = {
+        let result = env.view.handle_key(key(KeyCode::Char('a')), None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
 
     assert!(
         env.view.permission_response_dialog.is_none(),

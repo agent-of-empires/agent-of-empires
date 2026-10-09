@@ -69,7 +69,7 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
     for inst in &mut instances {
         inst.update_status_once(None, None);
-        inst.self_heal_session_id(profile, &contended);
+        inst.self_heal_session_id(&contended);
     }
 
     let counts = count_by_status(&instances);

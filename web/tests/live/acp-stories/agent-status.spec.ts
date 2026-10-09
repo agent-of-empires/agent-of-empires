@@ -1,8 +1,9 @@
 // Agent status surfaces: rate-limit parking, plan progress, and startup failures.
 
 import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { Page } from "@playwright/test";
-import { test, expect } from "../../helpers/liveTest";
+import { test, expect, authHeaders, bootDashboard } from "../../helpers/liveTest";
 import {
   chunk,
   endTurn,
@@ -85,6 +86,170 @@ test("a later rejection still reports the reset captured on an earlier turn", as
       });
   await expect.poll(resets, { timeout: 30_000, intervals: [200, 500, 1000] }).toEqual([reset, reset]);
   await expectResetBanner(page, reset, 30_000);
+});
+
+test("manual rate-limit spawn joins an automatic SDK resume and continues the original prompt", async ({
+  page,
+  spawnServe,
+}, testInfo) => {
+  test.setTimeout(120_000);
+  const original = "keep working on the sdk original task";
+  const probe = "verify the next sdk turn";
+  const serve = await spawnServe({
+    acp: true,
+    sdkAcp: true,
+    authMode: "passphrase",
+    preloginViaHarness: true,
+    extraEnv: (home) => ({
+      SHIM_RATE_LIMIT_RESUME_STATE: join(home, "sdk-resume-state"),
+      SHIM_RATE_LIMIT_RESUME_PROMPTS: join(home, "sdk-resume-prompts.jsonl"),
+    }),
+    seedFn: (seed) => {
+      seed.env.AOE_LOG_LEVEL = "debug";
+      seedSessionViaAoeAdd({ title: "rl-present-sdk" })(seed);
+    },
+  });
+  const request = (path: string, init: RequestInit = {}) =>
+    fetch(`${serve.baseUrl}${path}`, {
+      ...init,
+      headers: { ...authHeaders(serve), "Content-Type": "application/json", ...init.headers },
+    });
+  const listing = async () => {
+    const response = await request("/api/sessions");
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    return (Array.isArray(body) ? body : body.sessions) as { id: string; title: string; acp_worker_state?: string }[];
+  };
+  const session = (await listing()).find((row) => row.title === "rl-present-sdk");
+  expect(session).toBeDefined();
+  const sessionId = session!.id;
+  const settings = await request("/api/settings").then((response) => response.json());
+  const updated = await request("/api/settings", {
+    method: "PATCH",
+    body: JSON.stringify({ acp: { ...settings.acp, rate_limit_auto_resume: true } }),
+  });
+  expect(updated.status).toBe(200);
+  expect((await request("/api/settings").then((response) => response.json())).acp.rate_limit_auto_resume).toBe(true);
+  const enabled = await request(`/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
+  expect(enabled.status).toBe(200);
+  await expect
+    .poll(async () => (await listing()).find((row) => row.id === sessionId)?.acp_worker_state, { timeout: 30_000 })
+    .toBe("running");
+  await bootDashboard(page, serve, `/session/${encodeURIComponent(sessionId)}`);
+  const composer = page.getByRole("textbox", { name: /Send a message/i });
+  await composer.fill(original);
+  await composer.press("Enter");
+  await expect(page.getByText(/Rate-limited/i)).toBeVisible({ timeout: 15_000 });
+  const state = join(serve.home, "sdk-resume-state");
+  const entered = `${state}.initialize.entered`;
+  const prompts = join(serve.home, "sdk-resume-prompts.jsonl");
+  const replay = async () => {
+    const response = await request(`/api/sessions/${sessionId}/acp/replay?since=0`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      frames: {
+        event?: { RateLimitAutoResumed?: { manual?: boolean }; AcpSessionAssigned?: unknown };
+      }[];
+    };
+    return body.frames;
+  };
+  const canonical = () => {
+    const rows = JSON.parse(readFileSync(join(serve.appDir, "profiles", "main", "sessions.json"), "utf8")) as {
+      id: string;
+      lifecycle_generation: number;
+      runner_journal: {
+        launches: {
+          nonce: number[];
+          boot: number[];
+          generation: number;
+          incarnation: unknown;
+          profile_identity: unknown;
+        }[];
+      };
+    }[];
+    return rows.find((row) => row.id === sessionId)!;
+  };
+  const births = (row: ReturnType<typeof canonical>) =>
+    row.runner_journal.launches.map(({ nonce, boot, generation, incarnation, profile_identity }) => ({
+      nonce,
+      boot,
+      generation,
+      incarnation,
+      profile_identity,
+    }));
+  try {
+    await expect.poll(() => existsSync(entered), { timeout: 75_000, intervals: [100, 200, 500] }).toBe(true);
+    const held = JSON.parse(readFileSync(entered, "utf8")) as { pid: number; turnCursor: number };
+    expect(held.turnCursor).toBe(1);
+    const before = await replay();
+    expect(before.filter((frame) => frame.event?.RateLimitAutoResumed?.manual === false)).toHaveLength(1);
+    expect(before.filter((frame) => frame.event?.AcpSessionAssigned !== undefined)).toHaveLength(1);
+    const admitted = canonical();
+    expect(admitted.lifecycle_generation).toBeGreaterThan(0);
+    expect(births(admitted)).toContainEqual(
+      expect.objectContaining({
+        generation: admitted.lifecycle_generation,
+        incarnation: expect.any(Object),
+        profile_identity: expect.any(Object),
+      }),
+    );
+    const manual = request(`/api/sessions/${sessionId}/acp/spawn`, {
+      method: "POST",
+      body: "{}",
+      signal: AbortSignal.timeout(20_000),
+    }).then(
+      (response) => ({ response }),
+      (error: unknown) => ({ error }),
+    );
+    await expect
+      .poll(
+        () => {
+          const path = join(serve.appDir, "debug.log");
+          return (
+            existsSync(path) &&
+            readFileSync(path, "utf8")
+              .split("\n")
+              .some(
+                (line) =>
+                  line.includes("manual rate-limit spawn joined present resume after releasing instance lock") &&
+                  line.includes(sessionId),
+              )
+          );
+        },
+        { timeout: 10_000, intervals: [100, 200, 500] },
+      )
+      .toBe(true);
+    writeFileSync(`${state}.initialize.release`, "release");
+    const result = await manual;
+    if ("error" in result) throw result.error;
+    expect(result.response.status).toBe(200);
+    expect(await result.response.json()).toMatchObject({ session_id: sessionId, status: "running" });
+    await expect
+      .poll(async () => JSON.stringify(await replay()), { timeout: 30_000 })
+      .toContain(`sdk resumed: ${original}`);
+    expect((await replay()).filter((frame) => frame.event?.RateLimitAutoResumed?.manual === true)).toHaveLength(1);
+    await composer.fill(probe);
+    await composer.press("Enter");
+    await expect
+      .poll(async () => JSON.stringify(await replay()), { timeout: 15_000 })
+      .toContain(`sdk resumed: ${probe}`);
+    const records = readFileSync(prompts, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { pid: number; text: string });
+    expect(records.map((record) => record.text)).toEqual([original, original, probe]);
+    expect(records[0].pid).not.toBe(held.pid);
+    expect(records[1].pid).toBe(held.pid);
+    expect(records[2].pid).toBe(held.pid);
+    const after = canonical();
+    expect(after.lifecycle_generation).toBe(admitted.lifecycle_generation);
+    expect(births(after)).toEqual(births(admitted));
+    expect((await replay()).filter((frame) => frame.event?.AcpSessionAssigned !== undefined)).toHaveLength(2);
+    await testInfo.attach("sdk-resume-prompts", { path: prompts, contentType: "application/jsonl" });
+    await testInfo.attach("sdk-held-initialize", { path: entered, contentType: "application/json" });
+  } finally {
+    writeFileSync(`${state}.initialize.release`, "release");
+  }
 });
 
 test("sidebar row shows a rate-limited indicator after a park", async ({ page, spawnServe }) => {

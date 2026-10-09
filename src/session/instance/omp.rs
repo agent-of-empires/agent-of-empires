@@ -408,7 +408,7 @@ impl Instance {
         expected_prior: Option<&str>,
     ) -> bool {
         let storage =
-            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::open(profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
                     tracing::warn!(
@@ -419,17 +419,20 @@ impl Instance {
                     return false;
                 }
             };
-        let outcome = storage.update(|instances, _groups| {
-            let Some(instance) = instances.iter_mut().find(|instance| instance.id == self.id)
-            else {
-                return Ok(SidWrite::Failed);
-            };
-            if instance.omp_capture_generation.as_deref() != expected_prior {
-                return Ok(SidWrite::Skipped);
-            }
-            instance.omp_capture_generation = Some(generation.to_string());
-            Ok(SidWrite::Applied)
-        });
+        let outcome = storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _groups| {
+                let Some(instance) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    return Ok(SidWrite::Failed);
+                };
+                if instance.omp_capture_generation.as_deref() != expected_prior {
+                    return Ok(SidWrite::Skipped);
+                }
+                instance.omp_capture_generation = Some(generation.to_string());
+                Ok(SidWrite::Applied)
+            },
+        );
         if matches!(outcome, Ok(SidWrite::Applied)) {
             self.omp_capture_generation = Some(generation.to_string());
             return true;
@@ -449,7 +452,7 @@ impl Instance {
     }
 
     /// Last-chance exact-pane OMP capture while the old pane still exists.
-    pub(super) fn capture_omp_before_restart(&mut self, profile: &str) {
+    pub(super) fn capture_omp_before_restart(&mut self) {
         self.reconcile_from_disk();
         if self.source_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp)
             || (self.is_sandboxed() && self.omp_capture_generation.is_none())
@@ -459,12 +462,14 @@ impl Instance {
         let Some(observation) = self.try_retroactive_capture() else {
             return;
         };
+        let Ok(storage) = self.original_storage() else {
+            return;
+        };
         match persist_session_to_storage(
-            profile,
+            &storage,
             &self.id,
             &observation,
             &self.conversation_state(),
-            &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => {
                 self.apply_conversation_observation(&observation);

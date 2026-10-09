@@ -3,6 +3,44 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "session.lifecycle-refusal-keeps-running-ui",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-context-menu.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/hooks/useSidebarTriage.ts",
+        "web/src/components/sidebar/useSidebarSelection.ts",
+        "web/src/lib/sidebarBulk.ts",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
+      "id": "session.lifecycle-refusal-preserves-authoritative-state",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/api.test.ts",
+        "src/hooks/useAcpSession.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx"
+      ],
+      "components": ["web/src/lib/api.ts", "web/src/hooks/useAcpSession.ts", "web/src/hooks/useSidebarTriage.ts"]
+    },
+    {
+      "id": "session.workspace-delete-pending-preserves-running-before-retry",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/lib/trashActions.ts", "web/src/lib/api.ts"]
+    },
+    {
+      "id": "session.workspace-delete-teardown-pending",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/trashActions.test.ts", "src/lib/api.test.ts"],
+      "components": ["web/src/lib/trashActions.ts", "web/src/lib/api.ts"]
+    },
+    {
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",
@@ -77,6 +115,12 @@
         "web/src/components/ContentSplit.tsx",
         "web/src/components/TerminalConnectionBanners.tsx"
       ]
+    },
+    {
+      "id": "session.startup-cancellation-retires-original-publication",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-create.spec.ts"]
     },
     {
       "id": "session.create-worktree-name-collisions",
@@ -3335,6 +3379,17 @@
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/hooks/useRespawnSession.ts"]
+    },
+    {
+      "id": "story.rate-limit-present-sdk-continuation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "src/server/api/acp/worker.rs",
+        "src/acp/supervisor.rs"
+      ]
     },
     {
       "id": "story.rate-limit-reset-across-turns",

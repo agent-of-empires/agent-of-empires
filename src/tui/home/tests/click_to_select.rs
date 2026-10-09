@@ -121,7 +121,17 @@ fn single_click_on_archived_row_selects_without_reviving() {
     env.view.cursor = 0;
     env.view.update_selected();
     let archived_id = env.view.selected_session.clone().unwrap();
-    env.view.toggle_archive_at_cursor().unwrap();
+    {
+        {
+            let submitted = env.view.toggle_archive_at_cursor();
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
+        finish_runner_settlements(&mut env.view);
+    };
     assert!(
         env.view.get_instance(&archived_id).unwrap().is_archived(),
         "precondition: the session must be archived"

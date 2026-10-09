@@ -40,6 +40,8 @@ pub(super) fn compaction_chunk(id: &str, text: &str) -> SessionUpdate {
 /// Build a minimal host (non-sandboxed) `SpawnConfig` for env tests.
 pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
     SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -87,6 +89,8 @@ pub(super) fn reset_fake_spawn_config(
     cwd: &std::path::Path,
 ) -> SpawnConfig {
     SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "codex".into(),

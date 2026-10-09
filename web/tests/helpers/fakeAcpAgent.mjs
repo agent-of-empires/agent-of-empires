@@ -443,6 +443,16 @@ async function handleRequest(msg) {
 
   switch (method) {
     case "initialize": {
+      if (script.initializeWaitForRelease) {
+        const scriptPath = process.env.FAKE_ACP_SCRIPT;
+        if (!scriptPath) throw new Error("initialize gate requires FAKE_ACP_SCRIPT");
+        writeFileSync(`${scriptPath}.initialize-entered`, String(process.pid));
+        const deadline = Date.now() + 30_000;
+        while (!existsSync(`${scriptPath}.initialize-release`)) {
+          if (Date.now() >= deadline) throw new Error("initialize gate was not released");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
       // script.promptCapabilities overrides the all-false defaults.
       const result = script.promptCapabilities
         ? {

@@ -61,15 +61,10 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
-      # tests/integration/acp_smoke.rs spawns the Node ACP shim under
-      # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
-      # so its deps must be installed before the integration crate runs. Only
-      # the core-rest leg runs the integration binary; the web-e2e leg uses
-      # the fake ACP agent under web/tests/helpers/ instead, and bare-core does
-      # not exercise the shim. Node here is a test-runtime dependency, not a
-      # build one: core-rest's `cargo build` never invokes npm.
+      # Native runner tests use the Node ACP shim in both core test legs.
+      # This is a test-runtime dependency, not a cargo build dependency.
       - name: Install ACP shim deps
-        if: matrix.leg == 'core-rest'
+        if: matrix.leg != 'web-e2e'
         working-directory: acp-worker/test-shim
         run: npm ci
       # web-e2e: just the e2e binary, and the only leg that builds the
@@ -124,19 +119,31 @@ jobs:
           mkdir -p /tmp/aoe-real
           ln -sfn /tmp/aoe-real /tmp/aoe-link
           echo "TMPDIR=/tmp/aoe-link" >> "$GITHUB_ENV"
-      # core-rest: the full default-feature suite minus e2e (lib + bins +
-      # the consolidated integration binary). The daemon is core, so this
-      # leg covers it end to end with no dashboard bundle and no npm in the
-      # build. Without `e2e-tests` the e2e target is gated off, so it is
-      # skipped here while every non-e2e test binary stays auto-discovered.
-      # nextest runs one process per test and the test binaries concurrently,
-      # so no test can pass on state an earlier one left behind.
+      - name: Hosted Creating/Undo (Linux tracked execution and same-g withdrawal)
+        if: ${{ !cancelled() && matrix.leg == 'core-rest' }}
+        shell: bash
+        run: bash scripts/run-hosted-creating-proofs.sh
+      - name: Upload hosted Creating proof outcomes (Linux)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() && matrix.leg == 'core-rest' }}
+        with:
+          name: hosted-creating-Linux
+          path: ${{ runner.temp }}/hosted-creating-Linux.log
+          if-no-files-found: error
+          retention-days: 14
+      # Keep the full suite running after a failed native proof, with the same feature set.
       - name: Cargo test (default features, everything except e2e)
-        if: matrix.leg == 'core-rest'
-        # Echo the temp root so a silently-dropped TMPDIR is visible in the log
-        # rather than passing as a green run with the guard gone.
+        if: ${{ !cancelled() && matrix.leg == 'core-rest' }}
+        env:
+          AOE_CI_ORIGINAL_PURGE_FORCE: "1"
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/aoe-full-suite-home"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          mkdir -p "$XDG_CONFIG_HOME"
+          cargo build --bin aoe
           cargo nextest run --no-fail-fast
       # bare-core: the three no-default-features feature corners. `web` is not
       # a default feature, so these runs are also the dashboard-off compile
@@ -155,6 +162,7 @@ jobs:
       - name: Cargo test (bare core, no default features)
         if: matrix.leg == 'bare-core'
         run: |
+          cargo build --no-default-features --bin aoe
           cargo nextest run --no-default-features --lib --bins --no-fail-fast
           cargo test --no-default-features --features e2e-tests --test e2e -- \
             --test-threads=3 cli:: new_session::
@@ -278,11 +286,36 @@ jobs:
         if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         with:
           node-version: '22'
+      - name: Install ACP shim deps
+        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
+        working-directory: acp-worker/test-shim
+        run: npm ci
+      - name: Hosted Creating/Undo (Darwin real launch and uncertain-scope refusal)
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || steps.macos.outputs.run == 'true') }}
+        shell: bash
+        run: bash scripts/run-hosted-creating-proofs.sh --features e2e-tests
+      - name: Upload hosted Creating proof outcomes (Darwin)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || steps.macos.outputs.run == 'true') }}
+        with:
+          name: hosted-creating-macOS
+          path: ${{ runner.temp }}/hosted-creating-macOS.log
+          if-no-files-found: error
+          retention-days: 14
       - name: Cargo test (macOS, lib + bins)
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
-        run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || steps.macos.outputs.run == 'true') }}
+        env:
+          AOE_CI_ORIGINAL_PURGE_FORCE: "1"
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/aoe-full-suite-home"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          mkdir -p "$XDG_CONFIG_HOME"
+          cargo build --features e2e-tests --bin aoe
+          cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, acp live-daemon e2e)
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || steps.macos.outputs.run == 'true') }}
         run: cargo test --features e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
       - name: Skipped on pull requests
         if: github.event_name == 'pull_request' && steps.macos.outputs.run != 'true'
@@ -514,6 +547,9 @@ jobs:
           save-if: true
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install ACP SDK test shim
+        working-directory: acp-worker/test-shim
+        run: npm ci
       # Debug build instead of --release: --release with LTO and
       # codegen-units=1 cost ~6 min on the GitHub runner; debug builds
       # the same binary in ~2 min with no relevant runtime difference

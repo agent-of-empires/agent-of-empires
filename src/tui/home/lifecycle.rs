@@ -52,7 +52,7 @@ impl HomeView {
         };
 
         for profile_name in &profile_names {
-            let storage = Storage::new(profile_name, file_watch.clone())?;
+            let storage = Storage::open(profile_name, file_watch.clone())?;
             let (mut instances, groups) = storage.load_with_groups()?;
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
@@ -67,7 +67,7 @@ impl HomeView {
                 .iter()
                 .filter(|instance| {
                     instance.lifecycle_reservation.is_some()
-                        && !instance.has_fresh_lifecycle_reservation(now)
+                        && !instance.has_active_lifecycle_reservation(now)
                 })
                 .map(|instance| instance.id.clone())
                 .collect();
@@ -84,16 +84,21 @@ impl HomeView {
                 // `retain` can empty this when every lock failed; writing then would
                 // rewrite sessions.json and notify subscribers for no change.
                 if !expired.is_empty() {
-                    let cleared = storage.update(|disk, _groups| {
-                        for id in &expired {
-                            if let Some(stored) =
-                                disk.iter_mut().find(|candidate| &candidate.id == id)
-                            {
-                                stored.clear_expired_lifecycle_reservation(ttl, now);
+                    let cleared = storage.update_metadata(
+                        crate::session::MetadataSelection::Sessions(std::borrow::Cow::Borrowed(
+                            &expired,
+                        )),
+                        |disk, _groups| {
+                            for id in &expired {
+                                if let Some(stored) =
+                                    disk.iter_mut().find(|candidate| &candidate.id == id)
+                                {
+                                    stored.clear_expired_lifecycle_reservation(ttl, now);
+                                }
                             }
-                        }
-                        Ok(())
-                    });
+                            Ok(())
+                        },
+                    );
                     if cleared.is_ok() {
                         for instance in &mut instances {
                             if expired.contains(&instance.id) {
@@ -191,15 +196,8 @@ impl HomeView {
         );
         let view_mode = ViewMode::default();
 
-        let disk_watch = DiskWatchState {
-            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            handles: HashMap::new(),
-        };
-
-        let config_watch = ConfigWatchState {
-            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            handles: HashMap::new(),
-        };
+        let (persistence_worker, disk_watch, config_watch) =
+            persistence_worker::spawn(std::sync::Arc::clone(&file_watch));
 
         let mut view = Self {
             storages,
@@ -208,6 +206,7 @@ impl HomeView {
             pending_deletions: HashMap::new(),
             pending_group_deletions: HashMap::new(),
             pending_added: HashMap::new(),
+            persistence: persistence_lane::PersistenceLane::new(persistence_worker),
             group_trees,
             legacy_duplicate_reports,
             flat_items: Vec::new(),
@@ -259,6 +258,8 @@ impl HomeView {
             help_scroll: 0,
             new_dialog: None,
             confirm_dialog: None,
+            pending_creation_confirmation: None,
+            pending_claim_abort_confirmation: None,
             unified_delete_dialog: None,
             group_delete_options_dialog: None,
             rename_dialog: None,
@@ -304,6 +305,7 @@ impl HomeView {
             pending_live_send_target: live_send::LiveSendTarget::Agent,
             live_send: None,
             live_send_worker: None,
+            live_send_effects: std::sync::Arc::new(std::sync::Mutex::new(())),
             preview_capture_worker: None,
             preview_capture_target: None,
             preview_worker_pulse: None,
@@ -376,30 +378,30 @@ impl HomeView {
             deletes_in_flight: HashMap::new(),
             failed_deletes: HashMap::new(),
             stop_poller: StopPoller::new(),
+            settlement_poller: crate::tui::stop_poller::SettlementPoller::new()?,
+            settlement_in_flight: std::collections::HashMap::new(),
+            settled_edit: None,
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
-            drop_poller: crate::tui::worker::TrackedWorker::spawn(
-                "aoe-drop-poller",
-                super::operations::perform_drop,
-            ),
             reconcile_poller: make_reconcile(),
             startup_recovery_gate: None,
             pending_reconcile_reload: false,
             reconcile_reload_retry_at: None,
             restart_poller: RestartPoller::new(),
-            restart_in_flight: std::collections::HashSet::new(),
+            restart_in_flight: std::collections::HashMap::new(),
             attach_after_restart: std::collections::HashSet::new(),
             restarted_attaches: Vec::new(),
             store_move_poller: crate::tui::store_move_poller::StoreMovePoller::new(),
             store_move_in_flight: None,
             store_move_bypass: None,
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
-            attach_project_in_flight: std::collections::HashSet::new(),
+            attach_project_in_flight: std::collections::HashMap::new(),
             creation_poller: CreationPoller::new(),
             creation_cancel: None,
-            on_launch_hooks_ran: HashSet::new(),
+            on_launch_hooks_ran: HashMap::new(),
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
             creating_provisional_group_paths: HashSet::new(),
+            creating_provisional_profile: None,
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),
@@ -460,7 +462,7 @@ impl HomeView {
             group_totals: HashMap::new(),
             recovery_rx: None,
             recovery_lock: None,
-            recovery_in_flight: std::collections::HashSet::new(),
+            recovery_in_flight: HashMap::new(),
             restart_cooldown_at: std::collections::HashMap::new(),
             tool_configs: user_config
                 .as_ref()
@@ -486,20 +488,22 @@ impl HomeView {
             ));
         }
 
-        // Clean up orphaned Creating instances from a prior crash
-        let orphan_ids: Vec<String> = view
+        let unfinished = view
             .instances
             .values()
-            .filter(|i| i.status == crate::session::Status::Creating)
-            .map(|i| i.id.clone())
-            .collect();
-        for id in &orphan_ids {
-            view.remove_instance(id);
-        }
-        if !orphan_ids.is_empty() {
-            tracing::info!(target: "tui.home", "Cleaned up {} orphaned creating sessions", orphan_ids.len());
-            if let Err(e) = view.save() {
-                tracing::warn!(target: "tui.home", "Failed to save view state: {e}");
+            .filter(|instance| {
+                instance.status == crate::session::Status::Creating
+                    || instance.has_pending_worktree_path_claims()
+            })
+            .count();
+        if unfinished != 0 {
+            let message = format!("{unfinished} unfinished filesystem operations are retained. Their original ownership proof is required before releasing claims or removing resources.");
+            tracing::warn!(target: "tui.home", "{message}");
+            if view.info_dialog.is_none() {
+                view.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Unfinished operations retained",
+                    &message,
+                ));
             }
         }
 
@@ -609,224 +613,18 @@ impl HomeView {
         Ok(view)
     }
 
-    /// Full reload: status-hook config-cache refresh plus storage, for the 5s heartbeat
-    /// and event-driven sites (attach-return, save+reload pairs, profile switch).
-    /// Watcher-driven ticks call `reload_storage_only`, since the disk watcher only fires
-    /// on `sessions.json` / `groups.json` and the config watcher drives
-    /// `refresh_from_config`.
-    pub fn reload(&mut self) -> anyhow::Result<()> {
-        self.refresh_status_hook_config_cache();
-        self.reload_storage_only()
-    }
-
-    /// Storage-only reload: profile rediscovery, per-profile load, tree rebuild and cursor
-    /// restore. Skips the status-hook config-cache refresh, which the full `reload()`
-    /// drives. Used by watcher and live-send heartbeat ticks.
-    pub(in crate::tui) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
-        use crate::session::list_profiles;
-
-        let mut all_instances = Vec::new();
-
-        let current_profiles = match list_profiles() {
-            Ok(profiles) => profiles,
-            Err(error) => {
-                tracing::warn!(
-                    target: "tui.file_watch",
-                    error = %error,
-                    "list_profiles failed during reload_storage_only; reusing loaded storages for watcher rewires"
-                );
-                let mut keys: Vec<String> = self.storages.keys().cloned().collect();
-                keys.sort();
-                keys
-            }
-        };
-
-        // Asymmetric rewire mirroring `HomeView::new`: config rewire covers the full
-        // `list_profiles()` set so peer config edits surface to the picker UI and
-        // status-hook cache in any mode, while disk rewire is scoped (unified mode tracks
-        // every profile, single-profile stays bounded to `self.storages.keys()`). The
-        // helpers are set-diff idempotent, so the unconditional call is a no-op on a stable
-        // profile set.
-        self.rewire_config_subscriptions(&current_profiles);
-        if self.active_profile.is_some() {
-            let mut active_only: Vec<String> = self.storages.keys().cloned().collect();
-            active_only.sort();
-            self.rewire_disk_subscriptions(&active_only);
-        } else {
-            self.rewire_disk_subscriptions(&current_profiles);
-        }
-
-        // Storage rebuild is unified mode only: single-profile mode keeps the scope set at
-        // startup, with only the active profile in memory.
-        if self.active_profile.is_none() {
-            for name in &current_profiles {
-                if !self.storages.contains_key(name) {
-                    self.storages
-                        .insert(name.clone(), Storage::new(name, self.file_watch.clone())?);
-                }
-            }
-            self.storages.retain(|k, _| current_profiles.contains(k));
-        }
-
-        // Collect per-profile state without publishing it, so duplicate detection (#3459)
-        // can run journal-guided repairs before anything reaches the unified map.
-        type ProfileLoads = Vec<(String, Vec<Instance>, Vec<Group>)>;
-        let collect_loads = |storages: &HashMap<String, Storage>,
-                             prev: &indexmap::IndexMap<String, Instance>|
-         -> anyhow::Result<ProfileLoads> {
-            let mut loads = Vec::new();
-            for (profile_name, storage) in storages {
-                let (mut instances, groups) = storage.load_with_groups()?;
-                for inst in &mut instances {
-                    inst.source_profile = profile_name.clone();
-                    if let Some(previous) = prev.get(&inst.id) {
-                        // Field-ownership rules (generation-governed vs
-                        // runtime-only) live on merge_runtime_from_reload.
-                        inst.merge_runtime_from_reload(previous);
-                    }
-                }
-                loads.push((profile_name.clone(), instances, groups));
-            }
-            Ok(loads)
-        };
-        let mut loads = collect_loads(&self.storages, &self.instances)?;
-        let loads_view: Vec<(&str, &[Instance])> = loads
-            .iter()
-            .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
-            .collect();
-        let storages_view: Vec<(&str, &Storage)> = self
-            .storages
-            .iter()
-            .map(|(name, storage)| (name.as_str(), storage))
-            .collect();
-        let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
-        if outcome.repaired {
-            // Durable state changed under lock; reload so exactly one row per
-            // session is published.
-            loads = collect_loads(&self.storages, &self.instances)?;
-        }
-        log_legacy_duplicates_once(&outcome.reports);
-        self.legacy_duplicate_reports = outcome.reports;
-
-        for (profile_name, instances, groups) in &loads {
-            // Rebuild this profile's tree from disk, preserving any collapsed
-            // state that was toggled in-memory but not yet on disk
-            let mut new_tree = GroupTree::new_with_groups(instances, groups);
-            if let Some(old_tree) = self.group_trees.get(profile_name) {
-                for g in old_tree.get_all_groups() {
-                    if g.collapsed {
-                        new_tree.set_collapsed(&g.path, true);
-                    }
-                }
-            }
-            self.group_trees.insert(profile_name.clone(), new_tree);
-            all_instances.extend(instances.iter().cloned());
-        }
-
-        // Remove trees for profiles that no longer exist
-        let storage_keys: Vec<String> = self.storages.keys().cloned().collect();
-        self.group_trees.retain(|k, _| storage_keys.contains(k));
-
-        // Snapshot the in-flight Creating stub before `self.instances` is overwritten: a
-        // save may have persisted it, but while it is memory-only it would vanish.
-        let creating_stub_snapshot: Option<Instance> = self
-            .creating_stub_id
-            .as_ref()
-            .and_then(|id| self.instances.get(id).cloned());
-
-        self.instances = Self::build_instances_map(all_instances);
-
-        if let Some(stub) = creating_stub_snapshot {
-            self.instances.entry(stub.id.clone()).or_insert(stub);
-        }
-
-        // Refresh the project registry so project view's empty pinned headers
-        // and pin indicators reflect the current on-disk registry.
-        self.refresh_registered_projects();
-
-        // Drop memoized remote-owner lookups so a `git remote add` since the last reload is
-        // picked up on the next org-mode rebuild instead of sticking with a stale owner (or
-        // a stale "no owner"). Cheap: local `.git/config` only, on a multi-second cadence.
-        self.remote_owner_cache.borrow_mut().clear();
-
-        self.rebuild_flat_items_keeping_cursor();
-
-        // Storage rebuilds and search re-scoring must not move the live-send
-        // selection. Teardown reconciles it with the latest projection.
-        let preserve_live_selection = self.live_send.as_ref().is_some_and(|state| {
-            self.selected_session.as_deref() == Some(state.session_id.as_str())
-        });
-
-        if self.search_active && !self.search_query.value().is_empty() {
-            if preserve_live_selection {
-                self.refresh_search_matches();
-            } else {
-                self.update_search();
-            }
-        } else if !self.search_matches.is_empty() {
-            // Recalculate match indices without moving the cursor
-            self.refresh_search_matches();
-        }
-
-        if !preserve_live_selection {
-            self.update_selected();
-        }
-        if let Some(state) = self.live_send.clone() {
-            self.end_live_send_on_drift(&state);
-        }
-        Ok(())
-    }
-
-    /// Forwards to [`DiskWatchState::rewire`], lending it the
-    /// `file_watch` Arc and `reload_failure_state` owned by `HomeView`.
     pub(in crate::tui) fn rewire_disk_subscriptions(&mut self, current: &[String]) {
-        self.disk_watch
-            .rewire(&self.file_watch, current, &mut self.reload_failure_state);
+        self.request_watch_rewire(persistence_worker::WatchTargets {
+            disk: Some(current.to_vec()),
+            config: None,
+        });
     }
 
-    /// Forwards to [`ConfigWatchState::rewire`], lending it the
-    /// `file_watch` Arc and `reload_failure_state` owned by `HomeView`.
     pub(in crate::tui) fn rewire_config_subscriptions(&mut self, current: &[String]) {
-        self.config_watch
-            .rewire(&self.file_watch, current, &mut self.reload_failure_state);
-    }
-
-    /// Rewire disk and config subscriptions after a successful profile delete. Surfaces a
-    /// `Watcher Warning` dialog when `list_profiles()` cannot enumerate profiles, since the
-    /// dialog is the delete path's only user-facing signal; the next successful reload
-    /// repairs watcher state.
-    pub(in crate::tui) fn rewire_after_profile_delete(&mut self, profile_name: &str) {
-        match crate::session::list_profiles() {
-            Ok(profiles) => {
-                let disk_targets: Vec<String> = if self.active_profile.is_some() {
-                    let mut keys: Vec<String> = self.storages.keys().cloned().collect();
-                    keys.sort();
-                    keys
-                } else {
-                    profiles.clone()
-                };
-                self.rewire_disk_subscriptions(&disk_targets);
-                self.rewire_config_subscriptions(&profiles);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "tui.file_watch",
-                    profile = %profile_name,
-                    op = "delete_profile",
-                    error = %e,
-                    "list_profiles failed during rewire after profile delete; watcher state will repair on next reload"
-                );
-                if self.info_dialog.is_none() {
-                    self.info_dialog = Some(InfoDialog::new(
-                        WATCHER_WARNING_TITLE,
-                        &format!(
-                            "Profile '{}' was deleted but the watcher rewire could not enumerate profiles: {}\n\nThe next successful reload will repair watcher state.",
-                            profile_name, e
-                        ),
-                    ));
-                }
-            }
-        }
+        self.request_watch_rewire(persistence_worker::WatchTargets {
+            disk: None,
+            config: Some(current.to_vec()),
+        });
     }
 
     /// Open or refresh the `Reload Failed` dialog from the current
@@ -877,10 +675,7 @@ impl HomeView {
         true
     }
 
-    /// Recovery-edge cleanup: clear a stale `Reload Failed` dialog once every reload source
-    /// is healthy, returning `true` when cleared so the caller can redraw. The
-    /// `Watcher Warning` dialog from `rewire_after_profile_delete` is deliberately outside
-    /// `reload_failure_state` and left for the user to dismiss.
+    /// Clear the reload warning once every reload source has recovered.
     pub(in crate::tui) fn try_clear_recovered_reload_dialog(&mut self) -> bool {
         if !self.reload_failure_state.has_any_failure()
             && self

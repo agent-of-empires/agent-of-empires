@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::Args;
 
-use crate::session::{Instance, LifecycleOperation, Storage};
+use crate::session::{acquire_session_identity_lock, Instance, LifecycleOperation, Storage};
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -81,88 +81,153 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     if config.session.delete_to_trash && !args.purge {
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&removed_id)
-            .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
-        let trash_generation = storage.update(|all_instances, _groups| {
-            let stored = all_instances
-                .iter_mut()
-                .find(|instance| instance.id == removed_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Session {removed_title} was removed by another process before it could be trashed"
-                    )
+        let (trash_generation, plan) = {
+            let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+            let _identity_lock = acquire_session_identity_lock()?;
+            let _lifecycle_lock = storage
+                .acquire_instance_lifecycle_lock(&removed_id)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to acquire instance trash lock: {error}")
                 })?;
-            let generation = stored
-                .try_acquire_lifecycle_reservation(
-                    LifecycleOperation::Trash,
-                    Instance::LIFECYCLE_RESERVATION_TTL,
-                    Utc::now(),
-                )
-                .map_err(|error| anyhow::anyhow!("Session {removed_title}: {error}"))?;
-            stored.trash();
-            Ok(generation)
-        })?;
-        if let Err(error) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {error}");
-        }
-        inst.kill_ancillary_tmux_sessions_locked();
-
-        let mut inst = inst;
-        inst.trash();
-        inst.source_profile = storage.profile().to_string();
-        match crate::session::trash::prepare_trashed_worktree(&mut inst) {
-            crate::session::trash::RelocateOutcome::Relocated { .. } => {
-                let reloc = crate::session::trash::TrashRelocation {
-                    new_project_path: inst.project_path.clone(),
-                    pre_trash_project_path: inst.pre_trash_project_path.clone(),
-                };
-                let mut decided: Option<crate::session::claim::RelocationCommit> = None;
-                let update_result = storage.update(|all_instances, _groups| {
-                    decided = Some(crate::session::claim::commit_trash_relocation(
-                        all_instances,
-                        &removed_id,
-                        trash_generation,
-                        &reloc,
-                    ));
-                    Ok(())
-                });
-                if let Err(e) = &update_result {
-                    eprintln!(
-                        "  Note: could not persist the trash relocation ({e}); it will be reconciled on next load."
-                    );
-                }
-                if matches!(
-                    decided,
-                    Some(crate::session::claim::RelocationCommit::Superseded)
-                ) {
-                    match crate::session::trash::undo_raced_relocation(&inst, &reloc) {
-                        crate::session::trash::RestoreOutcome::Failed { reason } => {
-                            eprintln!(
-                                "  Note: a concurrent restore superseded the trash; could not move the worktree back ({reason})."
-                            );
-                        }
-                        _ => {
-                            eprintln!(
-                                "  Note: a concurrent restore superseded the trash; the worktree was left in place."
+            let snapshot = storage
+                .load_strict_for_worktree_ownership_locked()?
+                .into_iter()
+                .find(|row| row.id == removed_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Session {removed_title} disappeared before trash")
+                })?;
+            ensure_trash_paths_unclaimed(&storage, &snapshot)?;
+            storage.update_under_workspace_claim_lock(|all_instances, _groups| {
+                let stored = all_instances
+                    .iter_mut()
+                    .find(|instance| instance.id == removed_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Session {removed_title} disappeared before trash")
+                    })?;
+                anyhow::ensure!(
+                    trash_plan_unchanged(&snapshot, stored),
+                    "Session {removed_title} changed before trash"
+                );
+                let generation = stored
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("Session {removed_title}: {error}"))?;
+                stored.trash();
+                Ok((generation, stored.clone()))
+            })?
+        };
+        // The durable claim excludes launches while every flock is released for the stop wait.
+        let native = crate::session::runner_journal::OwnedStop::from_claim(
+            &storage,
+            &plan,
+            LifecycleOperation::Trash,
+            trash_generation,
+        )?;
+        let settled = crate::session::runner_journal::settle(native).await;
+        let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
+        let _identity_lock = acquire_session_identity_lock()?;
+        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&removed_id)?;
+        let snapshot = storage
+            .load_strict_for_worktree_ownership_locked()?
+            .into_iter()
+            .find(|row| row.id == removed_id)
+            .ok_or_else(|| anyhow::anyhow!("Session {removed_title} disappeared during trash"))?;
+        anyhow::ensure!(
+            snapshot.is_trashed()
+                && snapshot
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Trash, trash_generation)
+                && trash_plan_unchanged(&plan, &snapshot),
+            "Session {removed_title} lost its trash reservation or relocation plan"
+        );
+        if let Err(error) = settled {
+            release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
+            eprintln!(
+                "  Note: left worktree in place because runner shutdown is unproven ({error})."
+            );
+        } else {
+            if let Err(error) = ensure_trash_paths_unclaimed(&storage, &snapshot) {
+                storage.update_under_workspace_claim_lock(|all_instances, _groups| {
+                    if let Some(stored) = all_instances.iter_mut().find(|row| row.id == removed_id)
+                    {
+                        if stored.lifecycle_reservation_is_owned(
+                            LifecycleOperation::Trash,
+                            trash_generation,
+                        ) {
+                            stored.untrash();
+                            stored.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Trash,
+                                trash_generation,
                             );
                         }
                     }
-                    println!(
-                        "  Session was restored by another process; it was not moved to the trash."
+                    Ok(())
+                })?;
+                return Err(error);
+            }
+            let outcome = storage.update_under_workspace_claim_lock(|all_instances, _groups| {
+                let stored = all_instances
+                    .iter()
+                    .find(|row| row.id == removed_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Session {removed_title} disappeared before relocation")
+                    })?;
+                anyhow::ensure!(
+                    stored.is_trashed()
+                        && stored.lifecycle_reservation_is_owned(
+                            LifecycleOperation::Trash,
+                            trash_generation
+                        )
+                        && trash_plan_unchanged(&snapshot, stored),
+                    "Session {removed_title} lost its trash reservation or relocation plan"
+                );
+                if !stored.runner_journal.proves_quiescent() {
+                    crate::session::claim::release_trash_reservation(
+                        all_instances,
+                        &removed_id,
+                        trash_generation,
                     );
-                    return Ok(());
+                    return Ok(crate::session::trash::RelocateOutcome::Failed {
+                        reason: "durable runner history does not prove checkout quiescence"
+                            .to_string(),
+                    });
                 }
-            }
-            crate::session::trash::RelocateOutcome::Failed { reason } => {
+                let mut instance = stored.clone();
+                instance.source_profile = storage.profile().to_string();
+                instance.kill_all_tmux_sessions_locked();
+                let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+                if matches!(
+                    outcome,
+                    crate::session::trash::RelocateOutcome::Relocated { .. }
+                ) {
+                    let relocation = crate::session::trash::TrashRelocation {
+                        new_project_path: instance.project_path.clone(),
+                        pre_trash_project_path: instance.pre_trash_project_path.clone(),
+                    };
+                    anyhow::ensure!(
+                        crate::session::claim::commit_trash_relocation(
+                            all_instances,
+                            &removed_id,
+                            trash_generation,
+                            &relocation,
+                        ) == crate::session::claim::RelocationCommit::Persisted,
+                        "Session {removed_title} lost its trash reservation during relocation"
+                    );
+                } else {
+                    crate::session::claim::release_trash_reservation(
+                        all_instances,
+                        &removed_id,
+                        trash_generation,
+                    );
+                }
+                Ok(outcome)
+            })?;
+            if let crate::session::trash::RelocateOutcome::Failed { reason } = outcome {
                 eprintln!("  Note: left worktree in place ({reason}).");
-                release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
-            }
-            crate::session::trash::RelocateOutcome::Skipped => {
-                release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
             }
         }
-
         println!(
             "  Moved session to trash: {} (from profile '{}')",
             removed_title,
@@ -207,6 +272,20 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 .first()
                 .map(String::as_str)
                 .unwrap_or("Session purge was refused");
+            anyhow::bail!("{detail}: {removed_title}");
+        }
+    };
+    // Same barrier as the daemon and the TUI: a structured session's runner has
+    // to be proven dead before the hooks play, since `on_destroy` scripts are
+    // the user's and are not idempotent.
+    let transaction = match crate::session::deletion::settle_runner_of(transaction).await {
+        Ok(transaction) => transaction,
+        Err(result) => {
+            let detail = result
+                .errors
+                .first()
+                .map(String::as_str)
+                .unwrap_or("The session's agent could not be proven dead");
             anyhow::bail!("{detail}: {removed_title}");
         }
     };
@@ -292,8 +371,56 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     Ok(())
 }
 
+fn trash_plan_unchanged(snapshot: &Instance, durable: &Instance) -> bool {
+    snapshot.is_trashed() == durable.is_trashed()
+        && snapshot.project_path == durable.project_path
+        && snapshot.pre_trash_project_path == durable.pre_trash_project_path
+        && snapshot.worktree_info == durable.worktree_info
+        && snapshot.scratch == durable.scratch
+        && snapshot
+            .workspace_info
+            .as_ref()
+            .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+            == durable
+                .workspace_info
+                .as_ref()
+                .map(|workspace| (&workspace.workspace_dir, &workspace.repos))
+        && snapshot.is_sandboxed() == durable.is_sandboxed()
+}
+
+fn ensure_trash_paths_unclaimed(storage: &Storage, instance: &Instance) -> Result<()> {
+    if !instance.has_managed_worktree_or_workspace() {
+        return Ok(());
+    }
+    let mut paths = vec![std::path::PathBuf::from(&instance.project_path)];
+    if let Some(workspace) = &instance.workspace_info {
+        paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+    }
+    paths.extend(
+        instance
+            .all_repos()
+            .iter()
+            .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+    );
+    if let Some(original) = &instance.pre_trash_project_path {
+        paths.push(std::path::PathBuf::from(original));
+    } else if let Some(holding) = crate::session::trash::trash_holding_path(
+        std::path::Path::new(&instance.project_path),
+        &instance.id,
+    ) {
+        paths.push(holding);
+    }
+    crate::session::deletion::ensure_unclaimed_paths(
+        crate::session::deletion::SessionPathOwner { profile: storage.profile(), session_id: &instance.id },
+        &paths,
+    ).map_err(|error| anyhow::anyhow!(
+        "Session {} was not moved to trash because worktree ownership could not be verified: {error}",
+        instance.title,
+    ))
+}
+
 fn release_trash_reservation_best_effort(storage: &Storage, removed_id: &str, generation: u64) {
-    let _ = storage.update(|all_instances, _groups| {
+    let _ = storage.update_under_workspace_claim_lock(|all_instances, _groups| {
         crate::session::claim::release_trash_reservation(all_instances, removed_id, generation);
         Ok(())
     });

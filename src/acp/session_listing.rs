@@ -48,6 +48,7 @@ async fn list_with_spec(
         agent,
         profile.to_string(),
         tmp.path().to_path_buf(),
+        None,
     )
     .await
     .map_err(|e| ListSessionsError::Failed(e.to_string()))?;
@@ -70,12 +71,14 @@ async fn list_with_spec(
         fork_from: None,
         sandbox_info: None,
         source_profile: Some(profile.to_string()),
+        managed_profile: None,
         mcp_servers: Vec::new(),
         seed_history_replay: false,
         generation: 0,
         artifact_dir: None,
         claude_store_pin: None,
         base_host_environment,
+        execution_admission: None,
     };
     list_native_sessions(config, owned).await
 }

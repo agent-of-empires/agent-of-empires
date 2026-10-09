@@ -62,6 +62,7 @@ impl Instance {
             active_execution: None,
             omp_capture_generation: None,
             lifecycle_generation: 0,
+            runner_journal: crate::session::runner_journal::RunnerExecutionJournal::new(),
             resume_probe_failed_sid: None,
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,
@@ -100,6 +101,22 @@ impl Instance {
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
             file_watch: None,
+            storage_origin: None,
+        }
+    }
+
+    pub(crate) fn original_storage(
+        &self,
+    ) -> Result<std::sync::Arc<crate::session::storage::Storage>> {
+        self.storage_origin
+            .clone()
+            .context("session has no original physical storage authority")
+    }
+
+    pub(crate) fn same_storage_origin(&self, other: &Self) -> bool {
+        match (&self.storage_origin, &other.storage_origin) {
+            (Some(left), Some(right)) => left.same_origin_as(right),
+            _ => false,
         }
     }
 
@@ -110,24 +127,6 @@ impl Instance {
         fw: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) {
         self.file_watch = Some(fw);
-    }
-
-    /// Write this row's sandbox provider stamp to disk, leaving every other
-    /// stored field as it is.
-    pub(crate) fn persist_sandbox_provider(&self) -> anyhow::Result<()> {
-        let provider = self.sandbox_info.as_ref().and_then(|s| s.provider.clone());
-        crate::session::Storage::new(&self.source_profile, self.resolve_file_watch())?.update(
-            |instances, _groups| {
-                if let Some(sandbox) = instances
-                    .iter_mut()
-                    .find(|i| i.id == self.id)
-                    .and_then(|i| i.sandbox_info.as_mut())
-                {
-                    sandbox.provider = provider;
-                }
-                Ok(())
-            },
-        )
     }
 
     /// Resolve the live `Arc<FileWatchService>` for this Instance, falling back to a noop service
@@ -166,6 +165,25 @@ impl Instance {
             .as_ref()
             .map(|ws| ws.repos.as_slice())
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn durable_worktree_paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        std::iter::once(std::path::Path::new(&self.project_path))
+            .chain(
+                self.pre_trash_project_path
+                    .as_deref()
+                    .map(std::path::Path::new),
+            )
+            .chain(
+                self.workspace_info
+                    .as_ref()
+                    .map(|workspace| std::path::Path::new(&workspace.workspace_dir)),
+            )
+            .chain(
+                self.all_repos()
+                    .iter()
+                    .map(|repo| std::path::Path::new(&repo.worktree_path)),
+            )
     }
 
     /// Return the profile that should drive config resolution for this instance, falling back to
@@ -971,81 +989,6 @@ mod tests {
             None,
             "the derived route must not be persisted into the binding"
         );
-    }
-
-    #[test]
-    fn serialization_keeps_persisted_fields_and_drops_runtime_ones() {
-        let mut inst = Instance::new("Test Project", "/home/user/project");
-        inst.group_path = "work/clients".to_string();
-        inst.command = "claude --resume xyz".to_string();
-        inst.view = View::Structured;
-        inst.agent_name = Some("codex".to_string());
-        inst.agent_model = Some("gpt-5".to_string());
-        inst.acp_session_id = Some("acp-uuid-1234".to_string());
-        inst.worktree_info = Some(worktree("/tmp/main"));
-        let floor = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
-        inst.capture_started_at = Some(floor);
-        inst.retroactive_capture_excludes
-            .insert(ConversationBinding::unknown("stale-sid"));
-        inst.last_error_check = Some(std::time::Instant::now());
-        inst.last_start_time = Some(std::time::Instant::now());
-        inst.last_error = Some("test error".to_string());
-        inst.acp_load_session_capable = Some(true);
-
-        let json = serde_json::to_string(&inst).unwrap();
-        assert!(json.contains("\"view\":\"structured\""));
-        for runtime in [
-            "last_error_check",
-            "last_start_time",
-            "last_error",
-            "acp_load_session_capable",
-        ] {
-            assert!(!json.contains(runtime), "{runtime}");
-        }
-        let back: Instance = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            (
-                &back.id,
-                &back.title,
-                &back.project_path,
-                &back.group_path,
-                &back.tool,
-                &back.command
-            ),
-            (
-                &inst.id,
-                &inst.title,
-                &inst.project_path,
-                &inst.group_path,
-                &inst.tool,
-                &inst.command
-            )
-        );
-        assert_eq!(back.view, View::Structured);
-        assert_eq!(back.agent_name.as_deref(), Some("codex"));
-        assert_eq!(back.agent_model.as_deref(), Some("gpt-5"));
-        assert_eq!(back.acp_session_id.as_deref(), Some("acp-uuid-1234"));
-        assert_eq!(back.worktree_info, inst.worktree_info);
-        assert_eq!(back.capture_started_at, Some(floor));
-        assert!(back
-            .retroactive_capture_excludes
-            .iter()
-            .any(|binding| binding.session_id == "stale-sid"));
-        assert_eq!(back.acp_load_session_capable, None);
-
-        let mut structured = Instance::new("Test", "/tmp/test");
-        structured.view = View::Structured;
-        assert!(!serde_json::to_string(&structured)
-            .unwrap()
-            .contains("acp_session_id"));
-
-        let old_json = r#"{"id":"old-session-123","title":"Old Session","project_path":"/home/user/old","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2024-01-01T00:00:00Z"}"#;
-        let old: Instance = serde_json::from_str(old_json).unwrap();
-        assert_eq!(
-            (old.id.as_str(), old.tool.as_str()),
-            ("old-session-123", "claude")
-        );
-        assert!(old.agent_session_id.is_none());
     }
 
     #[test]

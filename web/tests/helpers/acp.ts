@@ -1,5 +1,5 @@
 import { expect, type Locator, type Page, type TestInfo } from "@playwright/test";
-import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, writeFileSync, openSync, fstatSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { fakeAcpScriptPath, listSessions, seedSessionViaAoeAdd, type ServeHandle } from "./aoeServe";
 import type { ServeOptions } from "./liveTest";
@@ -252,22 +252,67 @@ export async function waitForSettingsLoaded(page: Page): Promise<void> {
   await expect.poll(async () => (await profileSelect.inputValue()).length, { timeout: 10_000 }).toBeGreaterThan(0);
 }
 
-/** Attach the daemon debug.log tail and fake-acp.log; call before the server's HOME is deleted. */
-export async function attachServeDiagnostics(testInfo: TestInfo, serve: { home: string }): Promise<void> {
-  const attach = (name: string, read: () => string) => {
+/** Capture retained files as diagnostics, never as native-death authority. */
+export async function attachServeDiagnostics(
+  testInfo: TestInfo,
+  serve: Pick<ServeHandle, "home" | "appDir">,
+): Promise<void> {
+  const attach = (name: string, read: () => string, contentType = "text/plain") => {
     let body: string;
     try {
       body = read();
     } catch (e) {
       return testInfo.attach(`${name}.read-error`, { body: String(e), contentType: "text/plain" });
     }
-    return testInfo.attach(name, { body, contentType: "text/plain" });
+    return testInfo.attach(name, { body, contentType });
   };
-  const debugLog = debugLogPath(serve.home);
-  if (debugLog) await attach("debug.log", () => tail(readFileSync(debugLog, "utf8"), 64_000));
-  else
-    await testInfo.attach("debug.log.missing", { body: `no debug.log under ${serve.home}`, contentType: "text/plain" });
-  const fakeLog = join(serve.home, "fake-acp.log");
-  if (existsSync(fakeLog)) await attach("fake-acp.log", () => readFileSync(fakeLog, "utf8"));
-  else await testInfo.attach("fake-acp.log.missing", { body: `expected at ${fakeLog}`, contentType: "text/plain" });
+  await attach("debug.log", () => tail(readFileSync(join(serve.appDir, "debug.log"), "utf8"), 64_000));
+  for (const name of ["fake-acp.log", "serve.log"]) {
+    const path = join(serve.home, name);
+    if (existsSync(path)) await attach(name, () => tail(readFileSync(path, "utf8"), 64_000));
+  }
+  const profiles = join(serve.appDir, "profiles");
+  try {
+    for (const profile of readdirSync(profiles, { withFileTypes: true })) {
+      if (profile.isDirectory()) {
+        await attach(
+          `profiles.${encodeURIComponent(profile.name)}.sessions.json`,
+          () => readFileSync(join(profiles, profile.name, "sessions.json"), "utf8"),
+          "application/json",
+        );
+      }
+    }
+  } catch (error) {
+    await testInfo.attach("profiles.read-error", { body: String(error), contentType: "text/plain" });
+  }
+  const workers = join(serve.appDir, "acp-workers");
+  if (existsSync(workers)) {
+    for (const file of readdirSync(workers, { withFileTypes: true })) {
+      if (file.isFile() && file.name.endsWith(".log")) {
+        await attach(`worker.${file.name}`, () => tail(readFileSync(join(workers, file.name), "utf8"), 64_000));
+      }
+      if (file.isFile() && file.name.endsWith(".json")) {
+        const path = join(workers, file.name);
+        let fd: number | undefined;
+        try {
+          fd = openSync(path, "r");
+          const stamp = fstatSync(fd, { bigint: true });
+          await testInfo.attach(`worker.${file.name}`, {
+            body: readFileSync(fd, "utf8"),
+            contentType: "application/json",
+          });
+          await testInfo.attach(`worker.${file.name}.physical-file`, {
+            body: JSON.stringify({
+              device: String(stamp.dev),
+              inode: String(stamp.ino),
+              birth_time_ns: String(stamp.birthtimeNs),
+            }),
+            contentType: "application/json",
+          });
+        } finally {
+          if (fd !== undefined) closeSync(fd);
+        }
+      }
+    }
+  }
 }

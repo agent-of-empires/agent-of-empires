@@ -70,7 +70,9 @@ pub use flags::{is_valid_session_color, SessionBucket, StartBlocked, SESSION_COL
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
-pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
+pub use lifecycle::{
+    LifecycleOperation, LifecycleReservation, LifecycleReservationError, WorktreePathClaims,
+};
 
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
@@ -81,9 +83,7 @@ pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
 #[cfg(test)]
 pub(crate) use test_helpers::install_aliases;
-pub(crate) use tmux_session::{
-    duplicate_session_error, find_duplicate_session, is_duplicate_session, AgentSeed,
-};
+pub(crate) use tmux_session::{duplicate_session_error, is_duplicate_session, AgentSeed};
 
 /// Why a session can never resume, decided from the registry before any runtime probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +296,7 @@ pub struct Instance {
     /// Monotone token; async merges touch lifecycle-owned fields only when this recent.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub(crate) lifecycle_generation: u64,
+    pub(crate) runner_journal: crate::session::runner_journal::RunnerExecutionJournal,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) prior_tool_session_ids: HashMap<String, PriorToolSession>,
     /// When equal to `agent_session_id`, startup recovery skips automatic resume.
@@ -386,4 +387,6 @@ pub struct Instance {
     pub pane_dead_observed: bool,
     #[serde(skip, default)]
     pub(crate) file_watch: Option<std::sync::Arc<crate::file_watch::FileWatchService>>,
+    #[serde(skip, default)]
+    pub(crate) storage_origin: Option<Arc<crate::session::storage::Storage>>,
 }

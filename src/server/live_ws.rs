@@ -179,21 +179,20 @@ fn paste_payload(text: &str, submit: bool) -> String {
 /// Paste, then Enter after the agent's paste-burst delay when submitting. A live input
 /// channel (tmux 3.8) is the pane's single writer, so the paste and the Enter ride it to
 /// stay ordered with keystrokes; otherwise tmux's paste path takes them.
-fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64) {
+fn deliver_paste(session: &crate::tmux::Session, text: &str, submit: bool, enter_delay_ms: u64) {
     #[cfg(unix)]
-    if crate::tmux::vt::input_mode(tmux_name).is_some()
-        && deliver_paste_via_channel(tmux_name, text, submit, enter_delay_ms)
+    if crate::tmux::vt::input_mode(session).is_some()
+        && deliver_paste_via_channel(session, text, submit, enter_delay_ms)
     {
         return;
     }
-    let session = crate::tmux::Session::from_name(tmux_name);
     let result = if submit {
         session.send_keys_with_delay(text, enter_delay_ms)
     } else {
         session.paste_text(text)
     };
     if let Err(e) = result {
-        warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "paste failed: {}", e);
+        warn!(target: "terminal.ws", tmux = %session.name(), kind = "live", "paste failed: {}", e);
     }
 }
 
@@ -201,7 +200,7 @@ fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64)
 /// anything was written.
 #[cfg(unix)]
 fn deliver_paste_via_channel(
-    tmux_name: &str,
+    session: &crate::tmux::Session,
     text: &str,
     submit: bool,
     enter_delay_ms: u64,
@@ -209,14 +208,14 @@ fn deliver_paste_via_channel(
     use crate::tmux::vt::{try_send_input, try_send_paste};
     use crate::tmux::SubmitText;
     let sent = match (submit, crate::tmux::submit_text(text)) {
-        (true, SubmitText::Literal(payload)) => try_send_input(tmux_name, payload.as_bytes()),
-        _ => try_send_paste(tmux_name, text),
+        (true, SubmitText::Literal(payload)) => try_send_input(session, payload.as_bytes()),
+        _ => try_send_paste(session, text),
     };
     if sent && submit {
         if enter_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
         }
-        try_send_input(tmux_name, b"\r");
+        try_send_input(session, b"\r");
     }
     sent
 }
@@ -300,6 +299,7 @@ fn resize_and_reseed(
     cols: u16,
     rows: u16,
 ) -> bool {
+    let session = ch.map_or(session, |channel| channel.session());
     let in_flight = ch.map(|ch| ch.begin_resize(cols, rows));
     let owned = session.resize_window_if_owner(who, cols, rows);
     match (owned, ch, in_flight) {
@@ -328,7 +328,6 @@ fn grid_transport_eligible(pane_count: Option<u16>, window_lines: usize) -> bool
 /// Resolve a pending resize expectation while the grid is out of service.
 #[cfg(unix)]
 fn retry_pending_resync(
-    name: &str,
     who: &str,
     is_owner: bool,
     ch: Option<&crate::tmux::vt::VtChannel>,
@@ -344,7 +343,7 @@ fn retry_pending_resync(
     let Some((cols, rows)) = ch.pending_resync_target() else {
         return;
     };
-    if !is_owner || !crate::tmux::Session::from_name(name).refresh_size_owner(who) {
+    if !is_owner || !ch.session().refresh_size_owner(who) {
         return;
     }
     ch.set_grid_size_with_deadline(cols, rows, deadline);
@@ -376,8 +375,8 @@ fn translate_cursor_keys(bytes: &[u8], app_cursor: bool) -> std::borrow::Cow<'_,
 
 /// Bytes the pane should receive for `raw` browser input.
 #[cfg(unix)]
-fn pane_input_bytes(tmux_name: &str, raw: Vec<u8>) -> Vec<u8> {
-    match crate::tmux::vt::cursor_mode(tmux_name) {
+fn pane_input_bytes(session: &crate::tmux::Session, raw: Vec<u8>) -> Vec<u8> {
+    match crate::tmux::vt::cursor_mode(session) {
         Some(app_cursor) => translate_cursor_keys(&raw, app_cursor).into_owned(),
         None => raw,
     }
@@ -715,6 +714,18 @@ async fn handle_live_ws_inner(
             return;
         }
     }
+    let actor = Arc::new(crate::tmux::Session::from_name(&tmux_name));
+    let seed = Arc::clone(&actor);
+    let resolved = tokio::task::spawn_blocking(move || {
+        seed.primary_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if !resolved {
+        close_early(&mut socket, CLOSE_CODE_TRY_AGAIN_LATER, "tmux_not_ready").await;
+        return;
+    }
 
     let settings = Arc::new(LiveSettings::new());
     // Identifies this connection in the cross-process size-owner lock (shared
@@ -734,10 +745,10 @@ async fn handle_live_ws_inner(
     // preview shares it).
     #[cfg(unix)]
     let vt = if transport == LiveTransport::Grid && config.tmux.vt_live {
-        let name = tmux_name.clone();
+        let session = actor.clone();
         tokio::task::spawn_blocking(move || {
             let deadline = crate::tmux::TmuxCommandDeadline::new();
-            crate::tmux::vt::VtChannel::acquire_with_deadline(&name, &deadline)
+            crate::tmux::vt::VtChannel::acquire_with_deadline(&session, &deadline)
         })
         .await
         .ok()
@@ -750,11 +761,36 @@ async fn handle_live_ws_inner(
     // Snapshot surfaces keep OSC 52 through a raw observer that builds no grid.
     #[cfg(unix)]
     let osc52 = if clipboard_forward && vt.is_none() {
-        crate::tmux::vt::Osc52Channel::acquire(&tmux_name)
+        let session = actor.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::tmux::vt::Osc52Channel::acquire_with_deadline(
+                &session,
+                &crate::tmux::TmuxCommandDeadline::new(),
+            )
+        })
+        .await
+        .ok()
+        .flatten()
     } else {
         None
     };
 
+    #[cfg(unix)]
+    if vt
+        .as_ref()
+        .is_some_and(|channel| channel.session().captured_primary() != actor.captured_primary())
+        || osc52
+            .as_ref()
+            .is_some_and(|channel| channel.session().captured_primary() != actor.captured_primary())
+    {
+        close_early(
+            &mut socket,
+            CLOSE_CODE_TRY_AGAIN_LATER,
+            "tmux_target_changed",
+        )
+        .await;
+        return;
+    }
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Frames and pings funnel through one channel so the sender task is
@@ -771,6 +807,7 @@ async fn handle_live_ws_inner(
     let capture_osc52 = osc52;
     #[cfg(unix)]
     let capture_vt = vt.clone();
+    let capture_actor = Arc::clone(&actor);
     let capture_task = tokio::spawn(async move {
         #[cfg(unix)]
         let mut osc52_seen = capture_osc52
@@ -806,7 +843,35 @@ async fn handle_live_ws_inner(
         let mut reassert_guard = ReassertGuard::new(STUCK_REASSERT_RETRY);
         let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         let mut last_reclaim = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
+        let mut last_primary_probe = Instant::now();
         loop {
+            if last_primary_probe.elapsed() >= std::time::Duration::from_secs(1)
+                || crate::tmux::primary_changed_in_cache(
+                    &capture_tmux,
+                    capture_actor.captured_primary(),
+                    Some(last_primary_probe),
+                )
+            {
+                let session = Arc::clone(&capture_actor);
+                let current = tokio::task::spawn_blocking(move || {
+                    crate::tmux::utils::primary_matches(
+                        session.name(),
+                        session.captured_primary(),
+                        &crate::tmux::TmuxCommandDeadline::new(),
+                    )
+                })
+                .await;
+                last_primary_probe = Instant::now();
+                if !matches!(current, Ok(Ok(true))) {
+                    let _ = capture_tx
+                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: CLOSE_CODE_TRY_AGAIN_LATER,
+                            reason: "tmux_target_changed_or_unavailable".into(),
+                        })))
+                        .await;
+                    break;
+                }
+            }
             // The grid serves single-pane windows within its scrollback depth;
             // a split window is composited from capture-pane.
             #[cfg(unix)]
@@ -818,13 +883,12 @@ async fn handle_live_ws_inner(
                     .as_ref()
                     .is_some_and(|ch| ch.grid_resync_pending())
             {
-                let name = capture_tmux.clone();
                 let who = capture_owner.clone();
                 let is_owner = capture_settings.is_owner.load(Ordering::Relaxed);
                 let ch = live_grid.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let deadline = crate::tmux::TmuxCommandDeadline::new();
-                    retry_pending_resync(&name, &who, is_owner, ch.as_deref(), &deadline);
+                    retry_pending_resync(&who, is_owner, ch.as_deref(), &deadline);
                 })
                 .await;
                 // Throttle from the end of the attempt.
@@ -844,11 +908,11 @@ async fn handle_live_ws_inner(
             #[cfg(unix)]
             {
                 if live_grid.is_some() && pane_count.1.elapsed() >= PANE_COUNT_PROBE_INTERVAL {
-                    let name = capture_tmux.clone();
+                    let session = Arc::clone(&capture_actor);
                     // Advance the probe clock even on failure, or a tmux that cannot answer
                     // would be re-forked on every capture cycle instead of once a second.
                     let probed =
-                        tokio::task::spawn_blocking(move || window_pane_count(&name)).await;
+                        tokio::task::spawn_blocking(move || window_pane_count(&session)).await;
                     pane_count = (probed.ok().flatten().or(pane_count.0), Instant::now());
                 }
                 outcome = match live_grid {
@@ -868,10 +932,9 @@ async fn handle_live_ws_inner(
                         }
                     }
                     _ => {
-                        let name = capture_tmux.clone();
+                        let session = Arc::clone(&capture_actor);
                         match tokio::task::spawn_blocking(move || {
-                            crate::tmux::Session::from_name(&name)
-                                .capture_window_composited_with_cursor(lines)
+                            session.capture_window_composited_with_cursor(lines)
                         })
                         .await
                         {
@@ -889,10 +952,9 @@ async fn handle_live_ws_inner(
             }
             #[cfg(not(unix))]
             {
-                let name = capture_tmux.clone();
+                let session = Arc::clone(&capture_actor);
                 outcome = match tokio::task::spawn_blocking(move || {
-                    crate::tmux::Session::from_name(&name)
-                        .capture_window_composited_with_cursor(lines)
+                    session.capture_window_composited_with_cursor(lines)
                 })
                 .await
                 {
@@ -951,13 +1013,12 @@ async fn handle_live_ws_inner(
                         && last_heartbeat.elapsed() >= SIZE_OWNER_HEARTBEAT
                     {
                         last_heartbeat = std::time::Instant::now();
-                        let name = capture_tmux.clone();
+                        let session = Arc::clone(&capture_actor);
                         let who = capture_owner.clone();
-                        let still_owner = tokio::task::spawn_blocking(move || {
-                            crate::tmux::Session::from_name(&name).refresh_size_owner(&who)
-                        })
-                        .await
-                        .unwrap_or(false);
+                        let still_owner =
+                            tokio::task::spawn_blocking(move || session.refresh_size_owner(&who))
+                                .await
+                                .unwrap_or(false);
                         if !still_owner {
                             capture_settings.is_owner.store(false, Ordering::Relaxed);
                             let _ = capture_tx
@@ -974,12 +1035,11 @@ async fn handle_live_ws_inner(
                         let rows = capture_settings.screen_rows.load(Ordering::Relaxed) as u16;
                         if cols > 0 && rows > 0 {
                             last_reclaim = std::time::Instant::now();
-                            let name = capture_tmux.clone();
+                            let session = Arc::clone(&capture_actor);
                             let who = capture_owner.clone();
                             #[cfg(unix)]
                             let reclaim_vt = capture_vt.clone();
                             let claimed = tokio::task::spawn_blocking(move || {
-                                let session = crate::tmux::Session::from_name(&name);
                                 if !session.claim_size_owner(&who, SIZE_OWNER_TTL) {
                                     return false;
                                 }
@@ -1043,12 +1103,11 @@ async fn handle_live_ws_inner(
                                     "pane drifted from live owner's grid; re-asserting"
                                 );
                                 // Verified resize.
-                                let name = capture_tmux.clone();
+                                let session = Arc::clone(&capture_actor);
                                 let who = capture_owner.clone();
                                 #[cfg(unix)]
                                 let reassert_vt = capture_vt.clone();
                                 let still_owner = tokio::task::spawn_blocking(move || {
-                                    let session = crate::tmux::Session::from_name(&name);
                                     #[cfg(unix)]
                                     let owned = resize_and_reseed(
                                         &session,
@@ -1342,23 +1401,22 @@ async fn handle_live_ws_inner(
                             continue;
                         }
                         let send_nudge = Arc::clone(&nudge);
-                        let name = tmux_name.clone();
+                        let session = Arc::clone(&actor);
                         let bytes = data.to_vec();
                         // A live VT channel with socket input (ours or another surface's)
                         // is the pane's single input writer; otherwise input goes through
                         // tmux send-keys.
                         let _ = tokio::task::spawn_blocking(move || {
                             #[cfg(unix)]
-                            let bytes = pane_input_bytes(&name, bytes);
+                            let bytes = pane_input_bytes(&session, bytes);
                             #[cfg(unix)]
-                            if crate::tmux::vt::input_mode(&name).is_some()
-                                && crate::tmux::vt::try_send_input(&name, &bytes)
+                            if crate::tmux::vt::input_mode(&session).is_some()
+                                && crate::tmux::vt::try_send_input(&session, &bytes)
                             {
                                 return;
                             }
-                            let session = crate::tmux::Session::from_name(&name);
                             if let Err(e) = session.send_raw_bytes(&bytes) {
-                                warn!(target: "terminal.ws", tmux = %name, kind = "live", "send_raw_bytes failed: {}", e);
+                                warn!(target: "terminal.ws", tmux = %session.name(), kind = "live", "send_raw_bytes failed: {}", e);
                             }
                         })
                         .await;
@@ -1384,12 +1442,11 @@ async fn handle_live_ws_inner(
                                 }
                                 // Claim the cross-process size-owner lock; only the owner
                                 // resizes the shared window.
-                                let name = tmux_name.clone();
+                                let session = Arc::clone(&actor);
                                 let who = owner_id.clone();
                                 #[cfg(unix)]
                                 let resize_vt = vt.clone();
                                 let owned = tokio::task::spawn_blocking(move || {
-                                    let session = crate::tmux::Session::from_name(&name);
                                     if !session.claim_size_owner(&who, SIZE_OWNER_TTL) {
                                         return false;
                                     }
@@ -1431,11 +1488,10 @@ async fn handle_live_ws_inner(
                                 // A keyboard-open mobile pane intentionally postpones its
                                 // first resize so it never sends keyboard-shrunk rows to
                                 // tmux.
-                                let name = tmux_name.clone();
+                                let session = Arc::clone(&actor);
                                 let who = owner_id.clone();
                                 let owned = tokio::task::spawn_blocking(move || {
-                                    crate::tmux::Session::from_name(&name)
-                                        .claim_size_owner(&who, SIZE_OWNER_TTL)
+                                    session.claim_size_owner(&who, SIZE_OWNER_TTL)
                                 })
                                 .await
                                 .unwrap_or(false);
@@ -1447,14 +1503,13 @@ async fn handle_live_ws_inner(
                             }
                             LiveControlMessage::Claim => {
                                 // Explicit take-over.
-                                let name = tmux_name.clone();
+                                let session = Arc::clone(&actor);
                                 let who = owner_id.clone();
                                 let cols = settings.screen_cols.load(Ordering::Relaxed) as u16;
                                 let rows = settings.screen_rows.load(Ordering::Relaxed) as u16;
                                 #[cfg(unix)]
                                 let claim_vt = vt.clone();
                                 let (owned, resized) = tokio::task::spawn_blocking(move || {
-                                    let session = crate::tmux::Session::from_name(&name);
                                     if !session.steal_size_owner(&who) {
                                         return (false, false);
                                     }
@@ -1499,10 +1554,10 @@ async fn handle_live_ws_inner(
                                 if text.is_empty() {
                                     continue;
                                 }
-                                let name = tmux_name.clone();
+                                let session = Arc::clone(&actor);
                                 // Awaited like binary input, so it lands after earlier keystrokes.
                                 let _ = tokio::task::spawn_blocking(move || {
-                                    deliver_paste(&name, &text, submit, enter_delay_ms)
+                                    deliver_paste(&session, &text, submit, enter_delay_ms)
                                 })
                                 .await;
                                 nudge.notify_one();
@@ -1539,10 +1594,9 @@ async fn handle_live_ws_inner(
 
     // Release the size-owner lock if we held it.
     {
-        let name = tmux_name.clone();
         let who = owner_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            crate::tmux::Session::from_name(&name).release_size_owner(&who);
+            actor.release_size_owner(&who);
         })
         .await;
     }
@@ -1564,18 +1618,22 @@ struct LiveStats {
 
 /// Number of panes in the session's first window, or `None` if tmux could not answer.
 #[cfg(unix)]
-fn window_pane_count(tmux_name: &str) -> Option<u16> {
-    let target = format!("{tmux_name}:^");
-    let mut command = crate::tmux::tmux_command();
-    command.args([
-        "display-message",
-        "-p",
-        "-t",
-        &target,
-        "-F",
-        "#{window_panes}",
-    ]);
+fn window_pane_count(session: &crate::tmux::Session) -> Option<u16> {
     let deadline = crate::tmux::TmuxCommandDeadline::new();
+    let target = &session.primary_with_deadline(&deadline).ok()?.window_id;
+    let mut command = session
+        .command_with_deadline(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "-F",
+                "#{window_panes}",
+            ],
+            &deadline,
+        )
+        .ok()?;
     let out = deadline.run(&mut command).ok()?;
     if !out.status.success() {
         return None;
@@ -2052,11 +2110,26 @@ mod tests {
         // literal as the socket.
         let name = format!("aoe_test_ws_cursor_{}", std::process::id());
         let dir = tempfile::tempdir().expect("tempdir");
-        let _channel = crate::tmux::vt::register_live_for_test(&name, dir.path(), false, true);
-        assert_eq!(pane_input_bytes(&name, b"\x1b[A".to_vec()), b"\x1bOA");
+        let session = Arc::new(crate::tmux::Session::with_primary(
+            &name,
+            crate::tmux::PrimaryPane {
+                server_id: "test-server".into(),
+                session_id: "$0".into(),
+                window_id: "@0".into(),
+                pane_id: "%0".into(),
+            },
+        ));
+        let channel = crate::tmux::vt::register_live_for_test(session, dir.path(), false, true);
+        assert_eq!(
+            pane_input_bytes(channel.session(), b"\x1b[A".to_vec()),
+            b"\x1bOA"
+        );
         crate::tmux::vt::unregister_for_test(&name);
         // No live grid: nothing knows the mode, bytes pass through.
-        assert_eq!(pane_input_bytes(&name, b"\x1b[A".to_vec()), b"\x1b[A");
+        assert_eq!(
+            pane_input_bytes(channel.session(), b"\x1b[A".to_vec()),
+            b"\x1b[A"
+        );
 
         let normal = b"\x1b[A\x1b[D";
         assert_eq!(&*translate_cursor_keys(normal, false), normal);
@@ -2123,8 +2196,14 @@ mod tests {
         let target = crate::tmux::test_helpers::only_pane_id(pane.name());
         crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
         let native_dir = tempfile::tempdir().unwrap();
+        let primary = crate::tmux::utils::resolve_primary(
+            pane.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .expect("bind native resize actor");
+        let session = Arc::new(crate::tmux::Session::with_primary(pane.name(), primary));
         let channel =
-            crate::tmux::vt::register_live_for_test(pane.name(), native_dir.path(), false, false);
+            crate::tmux::vt::register_live_for_test(session, native_dir.path(), false, false);
         let mut held = channel.hold_drain_for_test();
         let result =
             channel.set_grid_size_with_deadline(40, 6, &crate::tmux::TmuxCommandDeadline::new());

@@ -1,14 +1,5 @@
-//! A session's provider pick has to reach the adapter process on every
-//! establish path, and it has to win.
-//!
-//! The pick travels as the Claude routing flags `CLAUDE_CODE_USE_BEDROCK` and
-//! `CLAUDE_CODE_USE_VERTEX`. Two layers already claim those names: the host
-//! environment aoe inherits, and trusted `Config.environment`, which
-//! `apply_stdio_env` applies last precisely so it outranks request-sourced
-//! env. A pick carried on either of those loses, so it rides its own
-//! `SpawnConfig::provider_routing` layer applied after both. These tests drive
-//! the real `AcpClient` against the test shim and read back the variables the
-//! shim process actually received.
+//! Claude provider routing must outrank ambient and operator environments
+//! across respawns. The isolated shim records the actual child environment.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,11 +8,11 @@ use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 
-use crate::common::{shim_path, shim_ready, EnvGuard};
+use crate::common::{
+    environment::EnvGuard,
+    shim::{shim_path, shim_ready},
+};
 
-/// The flags `provider_override_env` produces, restated here because the
-/// crate does not export it. Its own table test covers the mapping; what this
-/// file is for is where the pairs land in the env layering.
 fn routing_for(provider: Option<&str>) -> Vec<(String, String)> {
     let (bedrock, vertex) = match provider {
         Some("api") => ("", ""),
@@ -50,10 +41,12 @@ fn spawn_config(
     }
     SpawnConfig {
         wrapper_substitution: None,
+        managed_profile: None,
+        execution_admission: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),

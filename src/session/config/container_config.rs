@@ -4361,8 +4361,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn shared_credential_follows_the_freshest_copy_across_starts() {
-        let (_hook_guard, _, _application) = BaseGuard::ready();
-        let home = TempDir::new().unwrap();
+        let home = IsolatedHome::new();
         let host = home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
         let mount = claude_mount_without_keychain();
@@ -6558,6 +6557,8 @@ trusted_hash = "keep"
     fn test_refresh_agent_configs_uses_profile_status_map_for_codex_hooks() {
         let temp_home = TempDir::new().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        crate::session::create_profile("work").unwrap();
+        crate::session::create_profile("personal").unwrap();
 
         let codex_dir = temp_home.path().join(".codex");
         fs::create_dir_all(&codex_dir).unwrap();

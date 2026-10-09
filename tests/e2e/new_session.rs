@@ -46,8 +46,8 @@ fn submit_new_session_dialog(h: &TuiTestHarness) {
 /// Fill the dialog's Path field with the harness project and submit.
 fn create_session_from_dialog(h: &TuiTestHarness, project: &std::path::Path) {
     h.send_keys("n");
-    h.wait_for("Title");
-    h.send_keys("Tab");
+    h.wait_for(" New Session ");
+    h.send_keys("C-u");
     h.type_text(project.to_str().unwrap());
     submit_new_session_dialog(h);
 }
@@ -78,22 +78,22 @@ fn test_ctrl_p_browse_dir_picker_renders_as_full_overlay() {
     }
 }
 
-/// A session whose on_create hooks are still running shows a Creating stub with
-/// its hook output, blocks a second creation, warns before quitting, and is
-/// removed by Ctrl+C.
+/// Observe the real held hook before testing Creating admission, quit and cancellation.
 #[test]
 #[parallel]
 fn test_creating_stub_lifecycle() {
     require_tmux!();
     let mut h = TuiTestHarness::new("creating_stub");
-    // A slow hook holds the session in the Creating state.
-    h.append_config("[hooks]\non_create = [\"sleep 10\"]");
+    h.append_config(
+        "[hooks]\non_create = [\"printf 'original hook entered\\n'; exec sleep 86400\"]",
+    );
     let project = h.project_path();
     h.spawn_tui();
     h.wait_for(" aoe ");
 
     create_session_from_dialog(&h, &project);
-    h.wait_for_timeout("Creating...", Duration::from_secs(10));
+    h.wait_for_timeout("original hook entered", Duration::from_secs(10));
+    h.assert_screen_contains("Creating...");
     h.assert_screen_contains("Hook Output");
 
     h.send_keys("n");

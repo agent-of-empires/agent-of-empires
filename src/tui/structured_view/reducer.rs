@@ -471,7 +471,8 @@ mod tests {
             Some("claude-opus-5".into()),
         );
         for e in events {
-            s.apply_event(e.clone()).expect("apply ok");
+            s.apply_event(s.last_seq.saturating_add(1), e.clone())
+                .expect("apply ok");
         }
         s
     }

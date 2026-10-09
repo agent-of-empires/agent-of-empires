@@ -52,6 +52,9 @@ pub enum ControlBody {
     Hello {
         control_protocol_version: u32,
         session_id: String,
+        /// Parent-issued execution epoch. Missing legacy tickets are never adopted.
+        #[serde(default)]
+        launch_nonce: Option<uuid::Uuid>,
     },
     /// Runner's answer to [`ControlBody::Initialize`]: the raw ACP
     /// `initialize` result (an `InitializeResponse` serialized to JSON).
@@ -268,6 +271,7 @@ mod tests {
             ControlBody::Hello {
                 control_protocol_version: CONTROL_PROTOCOL_VERSION,
                 session_id: "abc-123".into(),
+                launch_nonce: Some(uuid::Uuid::from_u128(1)),
             },
             ControlBody::Attach {
                 control_protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -382,6 +386,7 @@ mod tests {
         let a = ControlBody::Hello {
             control_protocol_version: CONTROL_PROTOCOL_VERSION,
             session_id: "s".into(),
+            launch_nonce: Some(uuid::Uuid::from_u128(1)),
         };
         let b = ControlBody::PromptCompleted {
             prompt_req_id: 1,

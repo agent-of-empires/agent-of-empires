@@ -86,13 +86,16 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     tmux_session.send_keys_with_delay(&args.message, delay)?;
 
     let id_for_save = session_id.clone();
-    if let Err(err) = storage.update(|instances, _groups| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
-            inst.touch_after_input();
-            inst.status = crate::session::Status::Running;
-        }
-        Ok(())
-    }) {
+    if let Err(err) = storage.update_metadata(
+        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&id_for_save)),
+        |instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
+                inst.touch_after_input();
+                inst.status = crate::session::Status::Running;
+            }
+            Ok(())
+        },
+    ) {
         tracing::warn!(
             ?err,
             "send: failed to persist status remap after successful send"
@@ -152,7 +155,9 @@ mod tests {
             }
             shelve(&mut inst);
             let id = inst.id.clone();
-            Storage::new_unwatched(profile)
+            crate::session::create_profile(profile).unwrap();
+            // Strict: shelving a row must not create the profile it lives in.
+            Storage::open_unwatched(profile)
                 .unwrap()
                 .update(|rows, _| {
                     *rows = vec![inst.clone()];
@@ -188,6 +193,7 @@ mod tests {
             let mut inst = Instance::new("live-archived", "/tmp/x");
             inst.archive();
             let id = inst.id.clone();
+            crate::session::create_profile(profile).unwrap();
             Storage::new_unwatched(profile)
                 .unwrap()
                 .update(|rows, _| {

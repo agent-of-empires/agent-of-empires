@@ -228,7 +228,7 @@ impl Instance {
             profiles.push(current_profile.clone());
         }
         for profile in profiles {
-            let Ok(storage) = crate::session::storage::Storage::new_unwatched(&profile) else {
+            let Ok(storage) = crate::session::storage::Storage::open_unwatched(&profile) else {
                 return false;
             };
             let Ok(instances) = storage.load() else {
@@ -841,18 +841,10 @@ impl Instance {
     /// Join the old poller and persist its final capture as a lifecycle
     /// transition.
     pub(crate) fn stop_and_flush_poller(&mut self) {
-        let profile = self.effective_profile();
-        let storage = match crate::session::storage::Storage::new(
-            &profile,
-            self.resolve_file_watch(),
-        ) {
-            Ok(storage) => storage,
-            Err(error) => {
-                tracing::warn!(target: "session.sync", session = %self.id, "capture storage failed: {error}");
-                self.stop_poller();
-                self.session_id_poller = None;
-                return;
-            }
+        let Ok(storage) = self.original_storage() else {
+            self.stop_poller();
+            self.session_id_poller = None;
+            return;
         };
         let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
             Ok(lock) => lock,
@@ -1210,6 +1202,7 @@ mod tests {
         inst.mark_pi_extension_launched_for_test();
         admit_sandbox_fixture(&inst);
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         let seed = inst.clone();
         storage
             .update(|instances, _| {
@@ -1347,6 +1340,7 @@ mod tests {
         inst.agent_session_id = Some("0199aaaa-0000-7000-8000-000000000000".to_string());
 
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         let seed = inst.clone();
         storage
             .update(|instances, _| {

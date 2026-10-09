@@ -16,7 +16,7 @@ use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::approvals::{ApprovalDecision, ApprovalOption};
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 
-use crate::common::{shim_path, shim_ready};
+use crate::common::shim::{shim_path, shim_ready};
 /// Permission round-trip: shim asks for permission, structured view resolves
 /// allow, agent observes the selected option_id and reports back.
 #[tokio::test]
@@ -30,12 +30,14 @@ async fn shim_agent_round_trips_approval_allow() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -145,13 +147,15 @@ async fn shim_agent_round_trips_a_question_option_list() {
     let shim = shim_path();
 
     let config = SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         generation: 0,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -256,13 +260,15 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
     let shim = shim_path();
 
     let config = SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         generation: 0,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -345,12 +351,14 @@ async fn shim_agent_round_trips_fs() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -434,12 +442,14 @@ async fn shim_agent_round_trips_terminal() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -535,12 +545,14 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -620,12 +632,14 @@ async fn shim_agent_emits_rate_limit_event() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        execution_admission: None,
+        managed_profile: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: crate::common::shim::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),

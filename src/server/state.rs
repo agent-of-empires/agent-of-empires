@@ -194,6 +194,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Retain only the real producer ACK belonging to this original cache projection.
+    pub(crate) fn capture_operation_origin(
+        &self,
+        instance: &crate::session::Instance,
+    ) -> anyhow::Result<Arc<crate::session::LaunchOrigin>> {
+        let cached = crate::session::LaunchOrigin::capture(instance)?;
+        Ok(self
+            .acp_supervisor
+            .running_origin(&instance.id)
+            .filter(|published| published.recognizes_published_snapshot(&cached))
+            .unwrap_or(cached))
+    }
+
     /// Read-through cache over `compute_changed_files`.
     pub fn changed_files_cached(
         &self,

@@ -18,20 +18,24 @@ fn color_to_tmux(color: Color) -> String {
 
 /// Set the `@aoe_*` user options and paint the themed status bar.
 pub fn apply_status_bar(
-    session_name: &str,
+    session: &super::Session,
     title: &str,
     branch: Option<&str>,
     sandbox: Option<&SandboxDisplay>,
     theme: &Theme,
 ) -> Result<()> {
     // A web attach turns the status line off for the session.
-    set_session_option(session_name, "status", "on")?;
-    set_session_option(session_name, "@aoe_title", title)?;
+    set_session_option(session, "status", "on")?;
+    set_session_option(session, "@aoe_title", title)?;
     if let Some(branch_name) = branch {
-        set_session_option(session_name, "@aoe_branch", branch_name)?;
+        set_session_option(session, "@aoe_branch", branch_name)?;
+    } else {
+        set_session_option_unset(session, "@aoe_branch")?;
     }
     if let Some(sandbox_info) = sandbox {
-        set_session_option(session_name, "@aoe_sandbox", &sandbox_info.container_name)?;
+        set_session_option(session, "@aoe_sandbox", &sandbox_info.container_name)?;
+    } else {
+        set_session_option_unset(session, "@aoe_sandbox")?;
     }
 
     let accent = color_to_tmux(theme.accent);
@@ -50,18 +54,18 @@ pub fn apply_status_bar(
           | %H:%M ",
     );
 
-    set_session_option(session_name, "status-right", &status_format)?;
-    set_session_option(session_name, "status-right-length", "80")?;
-    set_session_option(session_name, "status-style", &format!("bg={bg},fg={fg}"))?;
+    set_session_option(session, "status-right", &status_format)?;
+    set_session_option(session, "status-right-length", "80")?;
+    set_session_option(session, "status-style", &format!("bg={bg},fg={fg}"))?;
     let prefix = crate::tmux::utils::tmux_prefix_display();
     set_session_option(
-        session_name,
+        session,
         "status-left",
         &status_left_format(prefix, &accent, &fg, &hint),
     )?;
     // `#S` expands at paint time and a later rename can lengthen it; tmux only
     // trims at this cap, so over-sizing is free.
-    set_session_option(session_name, "status-left-length", "200")?;
+    set_session_option(session, "status-left-length", "200")?;
     Ok(())
 }
 
@@ -78,10 +82,14 @@ fn status_left_format(prefix: &str, accent: &str, fg: &str, hint: &str) -> Strin
 }
 
 /// Remove a session-scoped override so the global value applies.
-fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
-    let output = crate::tmux::tmux_command()
-        .args(["set-option", "-u", "-t", session_name, option])
-        .output()?;
+fn set_session_option_unset(session: &super::Session, option: &str) -> Result<()> {
+    let deadline = super::TmuxCommandDeadline::new();
+    let primary = session.primary_with_deadline(&deadline)?;
+    let mut command = session.command_with_deadline(
+        ["set-option", "-u", "-t", &primary.session_id, option],
+        &deadline,
+    )?;
+    let output = deadline.run(&mut command)?;
     if !output.status.success() {
         anyhow::bail!(
             "tmux set-option -u {} failed: {}",
@@ -93,10 +101,14 @@ fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
 }
 
 /// Deadline-bounded because renames reach it; option errors are non-critical.
-fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<()> {
-    let mut command = crate::tmux::tmux_command();
-    command.args(["set-option", "-t", session_name, option, value]);
-    let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
+fn set_session_option(session: &super::Session, option: &str, value: &str) -> Result<()> {
+    let deadline = super::TmuxCommandDeadline::new();
+    let primary = session.primary_with_deadline(&deadline)?;
+    let mut command = session.command_with_deadline(
+        ["set-option", "-t", &primary.session_id, option, value],
+        &deadline,
+    )?;
+    let output = deadline.run(&mut command)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::debug!(target: "tmux.status", "Failed to set tmux option {}: {}", option, stderr);
@@ -106,18 +118,26 @@ fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<(
 
 /// Refresh `@aoe_title` after a rename. Not gated on the `StatusBar` setting:
 /// `aoe tmux-status` serves it to users painting their own bar.
-pub(crate) fn refresh_session_title(session_name: &str, title: &str) {
-    let _ = set_session_option(session_name, "@aoe_title", title);
+pub(crate) fn refresh_session_title(session: &super::Session, title: &str) {
+    let deadline = crate::tmux::TmuxCommandDeadline::new();
+    if let Ok(primary) = session.primary_with_deadline(&deadline) {
+        if let Ok(mut command) = session.command_with_deadline(
+            ["set-option", "-t", &primary.session_id, "@aoe_title", title],
+            &deadline,
+        ) {
+            let _ = deadline.run(&mut command);
+        }
+    }
 }
 
-pub fn apply_mouse_option(session_name: &str, enabled: bool) -> Result<()> {
+pub fn apply_mouse_option(session: &super::Session, enabled: bool) -> Result<()> {
     let value = if enabled { "on" } else { "off" };
-    set_session_option(session_name, "mouse", value)
+    set_session_option(session, "mouse", value)
 }
 
 /// Apply status bar and mouse settings resolved against `profile`'s config.
 pub fn apply_all_tmux_options(
-    session_name: &str,
+    session: &super::Session,
     title: &str,
     branch: Option<&str>,
     sandbox: Option<&SandboxDisplay>,
@@ -131,7 +151,7 @@ pub fn apply_all_tmux_options(
     if resolve_tmux_setting(TmuxSetting::StatusBar, &config) == TmuxSettingAction::Apply {
         // tmux takes hex colors itself, so palette mode does not apply here.
         let theme = load_theme(&crate::session::config::resolve_theme_name());
-        if let Err(e) = apply_status_bar(session_name, title, branch, sandbox, &theme) {
+        if let Err(e) = apply_status_bar(session, title, branch, sandbox, &theme) {
             tracing::debug!(target: "tmux.status", "Failed to apply tmux status bar: {}", e);
         }
     } else {
@@ -145,21 +165,21 @@ pub fn apply_all_tmux_options(
             "status-right-length",
             "status-style",
         ] {
-            let _ = set_session_option_unset(session_name, option);
+            let _ = set_session_option_unset(session, option);
         }
     }
 
     match resolve_tmux_setting(TmuxSetting::Mouse, &config) {
         action @ (TmuxSettingAction::Apply | TmuxSettingAction::ForceOff) => {
             let enabled = action == TmuxSettingAction::Apply;
-            if let Err(e) = apply_mouse_option(session_name, enabled) {
+            if let Err(e) = apply_mouse_option(session, enabled) {
                 tracing::debug!(target: "tmux.status", "Failed to apply tmux mouse option: {}", e);
             }
         }
         // A session option outranks the global one, so leaving it to the user
         // means clearing any value aoe set earlier.
         TmuxSettingAction::LeaveToUser => {
-            let _ = set_session_option_unset(session_name, "mouse");
+            let _ = set_session_option_unset(session, "mouse");
         }
     }
 }

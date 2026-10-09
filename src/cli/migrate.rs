@@ -99,7 +99,7 @@ pub fn stderr_reporter() -> Reporter {
 }
 
 pub fn run() -> Result<()> {
-    if !crate::migrations::has_pending_migrations() {
+    if !crate::migrations::has_pending_migrations()? {
         eprintln!("{PREFIX}data schema is current; retrying any deferred migration work");
     }
     crate::migrations::run_migrations_announced(Some(stderr_reporter()))?;

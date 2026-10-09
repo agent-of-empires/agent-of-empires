@@ -12,6 +12,9 @@ use crate::tui::styles::Theme;
 pub enum ContextMenuAction {
     Rename,
     Delete,
+    RetryCreationPublication,
+    UndoCreation,
+    AbortIntent,
     /// Archive or unarchive the session (the `'z'` hotkey).
     ToggleArchive,
     /// Snooze or wake the session (the `'h'` hotkey). Snoozing opens the
@@ -128,6 +131,32 @@ impl ContextMenuDialog {
             items.push((ContextMenuAction::SwitchView, label));
         }
         Self::new(anchor, items)
+    }
+
+    pub(crate) fn with_abort_intent(mut self) -> Self {
+        self.items.push((
+            ContextMenuAction::AbortIntent,
+            "Abort metadata; retain resources",
+        ));
+        self
+    }
+
+    /// Recover the retained original Creating transaction, never generic Purge.
+    pub fn for_creating_session(anchor: (u16, u16)) -> Self {
+        Self::new(
+            anchor,
+            vec![
+                (
+                    ContextMenuAction::RetryCreationPublication,
+                    "Retry publication",
+                ),
+                (ContextMenuAction::UndoCreation, "Undo original creation"),
+                (
+                    ContextMenuAction::AbortIntent,
+                    "Abort metadata; retain resources",
+                ),
+            ],
+        )
     }
 
     /// A trashed row can only come back out or be deleted for good.

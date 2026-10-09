@@ -4,6 +4,21 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **session:** Produce Creating checkout/Git-admin roots and public layout before native effects, bind Git and local hooks to their original physical resources and same Create, and withdraw only after actual native retirement plus exact resource Undo. Preserve original body proofs, unrelated Git configuration, and preexisting/dirty/replaced/unacknowledged resources; unresolved module/container and pathname-only domains stay protected.
+- **tui:** Keep lifecycle and metadata persistence off the input thread, order presentation preferences behind durable saves, and cancel quit on failed persistence.
+- **session:** Add explicit metadata-only abort for unresolved Create/Attach intents and legacy unknown runner history without requiring a reboot, retaining exact owners, native history, IDs, physical profiles and resource exclusions durably across build namespaces.
+- **lifecycle:** Retain the actual original Child, prebound observer, launch job and handshake channels through failure. Require durable launch phases and installation ACK from the one installed registry owner; release failed-launch global fences separately from no-target retirement. Preserve the complete producer Armed ACK on both sides before authorization, and commit only the original Create producer’s own record through its durable writer. Complete successful startup preparation only after the genuine Final Installation ACK and durable exact-tuple removal; retain native custody independently so Stop can reach its authenticated protocol. Terminal Stop publishes the actual original source ACK instead of reopening a profile or reloading by ID. Stop fixtures retain their real physical Storage; native replacement coverage uses the original natal constructor, while metadata ACKs and zero jobs remain insufficient retirement proofs.
+- **process:** Classify native Git delegation from matched syscall outcomes independently of diagnostics. Read-only F_GETFD/F_GETFL queries do not delegate work, including on a socket; mutations and unknown commands remain protected. Failed original UNIX-stream connects with ENOENT and pipe terminal queries with ENOTTY do not invent an external domain; successful, unmatched and uncertain effects remain protected. Keep the original macOS kqueue terminal witness shareable across lifecycle jobs.
+- **ci:** Publish original native Creating/Undo proofs before the full Linux/macOS suites. Continue the full suites after a failed proof without hiding either failure.
+- **lifecycle:** Arm natal custody before initialization, bound frames and the original handshake deadline, read authorization without mutating shared socket options, keep descriptor and peer checks in OS modules, drain original registry writers before forced exit, and reject durable release without clearing pending claims or rewriting refused rows.
+- **lifecycle:** Keep original Stop lineage through archive ACKs and runtime state through moves acknowledged by the captured physical target; publish same-generation metadata once and show failed Force results while the original delete remains pending. Keep full Create history, scratch and restore targets in original cache seals and the private natal bootstrap. Publish archive, trash, restore, snooze and purge ACKs off Tokio workers under one cache mutation epoch; never reopen a profile for error recovery or remove a replaced cache and its locks for an absent original.
+- **storage:** Preserve exact raw journals, extensions and unrelated rows in deferred checkpoints; retain every duplicate owner ID in reclaim exclusions, refuse unresolved registries and ambiguous reset fields before effects, and compose resets before reaping. Recheck configured store roots, full sandbox state and generations on the fresh owner before cleanup, publication or content reset.
+- **migrations:** Replace unreleased journal rewrites with one anchored canonical upgrade; preserve non-null partial/native evidence, require explicit journal inventories, refuse invalid schema or lost retention ledgers, and retain exact downgrade backups and every profile durability barrier on retry. Retain original application transition domains before physical profile alias coalescing, order overlapping lock cohorts by their actual lock files, and require the original application directory barrier on current-schema retries. Schema43 conservatively marks complete legacy launch tuples Unresolved with possible authorization; incomplete and ambiguous raw evidence stays untouched.
+
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 
 
@@ -62,6 +77,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - [@alonz](https://github.com/alonz) made their first contribution in [#4314](https://github.com/agent-of-empires/agent-of-empires/pull/4314)
 
 **Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.18.0...v1.19.0
+
 ## [1.18.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.18.0) - 2026-09-30
 
 

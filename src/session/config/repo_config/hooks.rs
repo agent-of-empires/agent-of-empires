@@ -794,6 +794,238 @@ pub fn execute_hooks_in_container_streamed(
     run_hooks_streamed(commands, &target, progress_tx, extra_env)
 }
 
+fn build_owned_hook_command(
+    intent: &crate::session::builder::CreationIntent,
+    cmd: &str,
+    target: &HookTarget,
+    opts: HookSpawnOpts,
+    extra_env: &[(&'static str, String)],
+) -> Result<crate::session::runner_journal::OwnedCreateCommand> {
+    let shell_cmd = if opts.merge_stderr {
+        format!("{cmd} 2>&1")
+    } else {
+        cmd.to_owned()
+    };
+    let command = match target {
+        HookTarget::Local { project_path } => {
+            let mut command = intent
+                .owned_hook_command(crate::session::environment::user_shell(), project_path)?;
+            command.arg("-c").arg(shell_cmd);
+            command.envs(extra_env.iter().map(|(k, v)| (*k, v)));
+            if opts.detach_tty {
+                command.envs(PROMPT_SUPPRESS_ENV.iter().copied());
+            }
+            command
+        }
+        HookTarget::Container {
+            container_name,
+            workdir,
+        } => {
+            let mut command = intent.owned_command(crate::containers::runtime_binary())?;
+            command.args(["exec", "-w", workdir]);
+            for (key, value) in extra_env {
+                command.arg("-e").arg(format!("{key}={value}"));
+            }
+            if opts.detach_tty {
+                for (key, value) in PROMPT_SUPPRESS_ENV {
+                    command.arg("-e").arg(format!("{key}={value}"));
+                }
+            }
+            command
+                .arg(container_name)
+                .args(["bash", "-c"])
+                .arg(shell_cmd);
+            command
+        }
+    };
+    Ok(command)
+}
+
+pub(crate) fn execute_creating_hooks(
+    intent: &crate::session::builder::CreationIntent,
+    commands: &[String],
+    project_path: &Path,
+    progress: Option<&mpsc::Sender<HookProgress>>,
+    extra_env: &[(&'static str, String)],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    run_creating_hooks(
+        intent,
+        commands,
+        &HookTarget::Local { project_path },
+        progress,
+        extra_env,
+        cancel,
+    )
+}
+
+pub(crate) fn execute_creating_hooks_in_container(
+    intent: &crate::session::builder::CreationIntent,
+    instance: &crate::session::Instance,
+    commands: &[String],
+    progress: Option<&mpsc::Sender<HookProgress>>,
+    extra_env: &[(&'static str, String)],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    intent.retain_container_domain(instance)?;
+    let sandbox = instance
+        .sandbox_info
+        .as_ref()
+        .context("Creating hook lacks sandbox plan")?;
+    run_creating_hooks(
+        intent,
+        commands,
+        &HookTarget::Container {
+            container_name: &sandbox.container_name,
+            workdir: &instance.container_workdir(),
+        },
+        progress,
+        extra_env,
+        cancel,
+    )
+}
+
+fn run_creating_hooks(
+    intent: &crate::session::builder::CreationIntent,
+    commands: &[String],
+    target: &HookTarget,
+    progress: Option<&mpsc::Sender<HookProgress>>,
+    extra_env: &[(&'static str, String)],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    for (idx, cmd) in commands.iter().enumerate() {
+        if let Some(progress) = progress {
+            let _ = progress.send(HookProgress::Started(cmd.clone()));
+        }
+        let mut command = build_owned_hook_command(
+            intent,
+            cmd,
+            target,
+            HookSpawnOpts {
+                merge_stderr: progress.is_some(),
+                detach_tty: progress.is_some(),
+            },
+            extra_env,
+        )?;
+        let mut pending = Vec::new();
+        let mut tail = std::collections::VecDeque::new();
+        let mut total_lines = 0usize;
+        let output = match progress {
+            None => intent.run_owned_output(&mut command, cancel)?,
+            Some(progress) => {
+                intent.run_owned_command(&mut command, cancel, |stdout, stderr| {
+                    for chunk in [stdout, stderr] {
+                        pending.extend_from_slice(chunk);
+                        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                            let line = String::from_utf8_lossy(&pending[..end])
+                                .trim_end_matches('\r')
+                                .to_owned();
+                            total_lines += 1;
+                            if tail.len() == 20 {
+                                tail.pop_front();
+                            }
+                            tail.push_back(line.clone());
+                            let _ = progress.send(HookProgress::Output(line));
+                            pending.drain(..=end);
+                        }
+                    }
+                })?
+            }
+        };
+        if let Some(progress) = progress {
+            if !pending.is_empty() {
+                let line = String::from_utf8_lossy(&pending).into_owned();
+                total_lines += 1;
+                if tail.len() == 20 {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
+                let _ = progress.send(HookProgress::Output(line));
+            }
+        }
+        if !output.status.success() {
+            let mut detail = if progress.is_none() {
+                format_hook_error(
+                    cmd,
+                    output.status.code(),
+                    &String::from_utf8_lossy(&output.stderr),
+                    &String::from_utf8_lossy(&output.stdout),
+                    target.in_container(),
+                )
+            } else {
+                let mut detail =
+                    format_hook_error(cmd, output.status.code(), "", "", target.in_container());
+                if !tail.is_empty() {
+                    let label = if total_lines > tail.len() {
+                        format!("output (last {} of {} lines)", tail.len(), total_lines)
+                    } else {
+                        "output".to_owned()
+                    };
+                    detail.push_str(&format!(
+                        "\n{}:\n{}",
+                        label,
+                        tail.into_iter().collect::<Vec<_>>().join("\n")
+                    ));
+                }
+                detail
+            };
+            if commands.len() > 1 {
+                detail.push_str(&format!(
+                    "\n(hook {} of {}{})",
+                    idx + 1,
+                    commands.len(),
+                    if idx + 1 < commands.len() {
+                        "; remaining hooks skipped"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if let Some(progress) = progress {
+                let _ = progress.send(HookProgress::Output(detail.clone()));
+            }
+            anyhow::bail!(detail);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn run_creating_before_start_hooks(
+    intent: &crate::session::builder::CreationIntent,
+    commands: &[String],
+    project_path: &Path,
+    extra_env: &[(&'static str, String)],
+    session_env: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let mut collected = Vec::new();
+    for cmd in commands {
+        let mut command = build_owned_hook_command(
+            intent,
+            cmd,
+            &HookTarget::Local { project_path },
+            HookSpawnOpts {
+                merge_stderr: false,
+                detach_tty: true,
+            },
+            extra_env,
+        )?;
+        command.envs(session_env.iter().map(|(k, v)| (k, v)));
+        let output = intent.run_owned_output(&mut command, None)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "before_start hook failed with exit code {}: {}\nstderr:\n{}",
+            output.status.code().unwrap_or(-1),
+            cmd,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for (key, value) in parse_env_kv_lines(&String::from_utf8_lossy(&output.stdout)) {
+            collected.retain(|(existing, _)| existing != &key);
+            collected.push((key, value));
+        }
+    }
+    Ok(collected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,24 +3,24 @@
 use super::*;
 use crate::migrations::progress::ConsoleProgress;
 use crate::tui::app::Action;
-use crate::tui::store_move_poller::{StoreMoveRequest, StoreMoveResult};
+use crate::tui::store_move_poller::StoreMoveResult;
 
 /// The move in flight. One at a time: the worker is serial and the status
 /// line has one row.
 pub(super) struct StoreMoveInFlight {
     pub(super) title: String,
+    pub(super) origin: RequestOrigin,
     pub(super) console: ConsoleProgress,
     /// The status line as last rendered, so a tick reports a change only
     /// when the line would read differently.
     pub(super) last_line: Option<String>,
 }
 
-/// What a tick found: whether the status line changed, and the action a
-/// finished move hands back.
+/// What a tick found: whether the status line changed. Deferred actions are handed
+/// back separately, only after their original-profile reload is acknowledged.
 #[derive(Default)]
 pub(crate) struct StoreMovePoll {
     pub(crate) changed: bool,
-    pub(crate) resume: Option<Action>,
 }
 
 impl HomeView {
@@ -51,15 +51,38 @@ impl HomeView {
         let Some(instance) = self.get_instance(id).cloned() else {
             return false;
         };
+        let row = match self.capture_transaction_row(id) {
+            Ok(row) => row,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Agent Store Move Failed",
+                    &format!("{error:#}"),
+                ));
+                return false;
+            }
+        };
+        let origin = row.origin.clone();
         self.store_move_in_flight = Some(StoreMoveInFlight {
             title: instance.title.clone(),
+            origin,
             console: ConsoleProgress::default(),
             last_line: None,
         });
         // Anything a previous move left unread belongs to that move.
         while self.store_move_poller.try_recv_progress().is_some() {}
-        self.store_move_poller
-            .request_move(StoreMoveRequest { instance, resume });
+        if let Err(error) =
+            self.request_transaction(persistence_transactions::TransactionRequest::StoreMove {
+                row,
+                resume,
+            })
+        {
+            self.store_move_in_flight = None;
+            self.info_dialog = Some(InfoDialog::new(
+                "Agent Store Move Failed",
+                &format!("{error:#}"),
+            ));
+            return false;
+        }
         true
     }
 
@@ -99,7 +122,11 @@ impl HomeView {
                 return poll;
             }
         };
-        self.store_move_in_flight = None;
+        let original = self
+            .store_move_in_flight
+            .take()
+            .expect("original store move remains in flight")
+            .origin;
         poll.changed = true;
         let StoreMoveResult {
             session_id,
@@ -111,31 +138,27 @@ impl HomeView {
             // launch handed back here may pass the gate: a move started with nothing to
             // resume must not exempt a later launch, by which time the container may have
             // stopped.
-            Ok(false) => {
-                self.store_move_bypass = resume.is_some().then_some(session_id);
-                poll.resume = resume;
-            }
+            Ok(false) => self.request_reload_after(
+                ReloadKind::Full,
+                persistence_lane::ReloadContinuation::StoreMove {
+                    id: session_id,
+                    title,
+                    origin: original,
+                    resume,
+                    container_up: true,
+                },
+            ),
             Ok(true) => {
-                if let Err(error) = self.reload() {
-                    tracing::warn!(
-                        target: "session.store",
-                        %error,
-                        "reload after sandbox store move failed"
-                    );
-                }
-                if self.sandbox_store_move_pending(&session_id) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Agent Store Still Shared",
-                        &format!(
-                            "The agent store of '{title}' did not move: another sandboxed \
-                             session sharing it is running or could not be checked, or \
-                             another aoe process is still moving it. Stop that session and \
-                             open this one again, or run `aoe migrate`."
-                        ),
-                    ));
-                } else {
-                    poll.resume = resume;
-                }
+                self.request_reload_after(
+                    ReloadKind::Full,
+                    persistence_lane::ReloadContinuation::StoreMove {
+                        id: session_id,
+                        title,
+                        origin: original,
+                        resume,
+                        container_up: false,
+                    },
+                );
             }
             Err(error) => {
                 tracing::warn!(

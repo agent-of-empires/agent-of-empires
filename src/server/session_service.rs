@@ -130,6 +130,8 @@ fn queue_drain_batch<'a>(
 pub struct SessionService {
     /// Live in-memory session list, shared with `AppState.instances`.
     pub instances: Arc<RwLock<Vec<Instance>>>,
+    /// Immutable primary profile authority captured at daemon startup, even when it has no rows.
+    pub(super) primary_storage: Arc<crate::session::Storage>,
     /// Per-instance mutation locks, shared with `AppState.instance_locks`.
     pub instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Storage change-notification service, shared with `AppState.file_watch`.
@@ -302,6 +304,7 @@ pub struct AcpDeps {
 impl SessionService {
     pub fn new(
         instances: Arc<RwLock<Vec<Instance>>>,
+        primary_storage: Arc<crate::session::Storage>,
         instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
         file_watch: Arc<crate::file_watch::FileWatchService>,
         telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
@@ -310,6 +313,7 @@ impl SessionService {
     ) -> Self {
         Self {
             instances,
+            primary_storage,
             instance_locks,
             file_watch,
             telemetry_session_creates,
@@ -492,21 +496,26 @@ impl SessionService {
             }
             (inst.source_profile.clone(), wake, was_idle_dormant)
         };
-        if let Ok(storage) = crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        if let Ok(storage) = crate::session::Storage::open(&profile, self.file_watch.clone()) {
             let id_clone = id.to_string();
             let outcome = tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
-                        return Ok(None);
-                    };
-                    // A peer (e.g. the CLI) may have archived or trashed the row since the
-                    // memory check; waking it here would clear that.
-                    if let Err(blocked) = inst.ensure_startable() {
-                        return Ok(Some(blocked));
-                    }
-                    apply_prompt_persist_to_disk(inst, wake);
-                    Ok(None)
-                })
+                storage.update_metadata(
+                    crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                        &id_clone,
+                    )),
+                    |instances, _groups| {
+                        let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                            return Ok(None);
+                        };
+                        // A peer (e.g. the CLI) may have archived or trashed the row since the
+                        // memory check; waking it here would clear that.
+                        if let Err(blocked) = inst.ensure_startable() {
+                            return Ok(Some(blocked));
+                        }
+                        apply_prompt_persist_to_disk(inst, wake);
+                        Ok(None)
+                    },
+                )
             })
             .await;
             match outcome {
@@ -721,16 +730,21 @@ impl SessionService {
                 self.invalidate_disk_snapshots();
             }
         }
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = None;
-                        }
-                        Ok(())
-                    })
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_persist,
+                        )),
+                        |instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                                inst.pending_initial_turn = None;
+                            }
+                            Ok(())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
@@ -776,16 +790,21 @@ impl SessionService {
                 _ => return,
             }
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = Some(turn);
-                        }
-                        Ok(())
-                    })
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_persist,
+                        )),
+                        |instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                                inst.pending_initial_turn = Some(turn);
+                            }
+                            Ok(())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
@@ -820,16 +839,21 @@ impl SessionService {
                 _ => return,
             }
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = None;
-                        }
-                        Ok(())
-                    })
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_persist,
+                        )),
+                        |instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                                inst.pending_initial_turn = None;
+                            }
+                            Ok(())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
@@ -893,22 +917,27 @@ impl SessionService {
                 transaction,
             )
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
                     let _transaction = transaction;
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.queued_prompts = mirrored.queued_prompts;
-                            inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
-                            inst.idle_dormant_since = mirrored.idle_dormant_since;
-                            // Monotone max, never `touch_last_accessed()`.
-                            inst.last_accessed_at =
-                                inst.last_accessed_at.max(mirrored.last_accessed_at);
-                        }
-                        Ok(())
-                    })
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(
+                            &id_persist,
+                        )),
+                        |instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                                inst.queued_prompts = mirrored.queued_prompts;
+                                inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
+                                inst.idle_dormant_since = mirrored.idle_dormant_since;
+                                // Monotone max, never `touch_last_accessed()`.
+                                inst.last_accessed_at =
+                                    inst.last_accessed_at.max(mirrored.last_accessed_at);
+                            }
+                            Ok(())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
@@ -1073,7 +1102,7 @@ impl SessionService {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
                 let mut last_seq = 0;
                 for (seq, event) in store.replay_from(&sid, 0) {
-                    let _ = reduced.apply_event(event);
+                    let _ = reduced.apply_event(seq, event);
                     last_seq = seq;
                 }
                 (reduced, last_seq)
@@ -1985,7 +2014,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_queue_drain_frees_instance_lock_while_it_waits_for_a_resuming_worker() {
-        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use crate::acp::supervisor::ResumeReservationOutcome;
         use std::time::Duration;
 
         let _home = crate::session::test_support::isolate_app_dir();
@@ -2005,12 +2034,17 @@ mod tests {
         // Hold the reservation for the whole probe so no worker can land.
         let reservation = match service
             .acp_supervisor
-            .begin_resume("sess-3621", ResumeKind::Spawn)
+            .begin_resume(
+                "sess-3621",
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                crate::acp::supervisor::test_support::stored_origin("sess-3621"),
+                false,
+            )
             .await
             .expect("begin_resume must not error under capacity")
         {
             ResumeReservationOutcome::Reserved(r) => r,
-            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+            ResumeReservationOutcome::AlreadyPresent(_) => panic!("expected a fresh reservation"),
         };
 
         let mut waits = service.acp_supervisor.watch_worker_waits();

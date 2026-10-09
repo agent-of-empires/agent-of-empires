@@ -120,64 +120,48 @@ fn set_dormant(inst: &mut Instance, dormant: bool) {
     }
 }
 
-/// Returns false when the session is gone.
-async fn set_dormant_in_memory(state: &AppState, id: &str, dormant: bool) -> bool {
-    let mut instances = state.instances.write().await;
-    instances
-        .iter_mut()
-        .find(|i| i.id == id)
-        .map(|inst| set_dormant(inst, dormant))
-        .is_some()
-}
-
-async fn persist_dormant(state: &AppState, profile: &str, id: &str, dormant: bool) -> bool {
-    let Ok(storage) = crate::session::Storage::new(profile, state.file_watch.clone()) else {
-        return false;
-    };
-    let id = id.to_string();
-    tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                set_dormant(inst, dormant);
-            }
-            Ok(())
-        })
-    })
-    .await
-    .is_ok_and(|r| r.is_ok())
-}
-
 /// Shuts down idle workers and marks them dormant so the resume pass skips
 /// them. Dormancy is persisted before shutdown so a persist failure leaves the
 /// worker alive rather than orphaned.
 pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
     // Queued work is not idle: reaping would fight wake-on-drain.
-    let candidates: Vec<(String, String)> = {
+    let candidates: Vec<(String, String, Arc<crate::session::LaunchOrigin>)> = {
         let instances = state.instances.read().await;
         instances
             .iter()
             .filter(|i| is_resumable(i) && i.queued_prompts.is_empty())
-            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .filter_map(|instance| {
+                crate::session::LaunchOrigin::capture(instance)
+                    .ok()
+                    .map(|original| {
+                        (
+                            instance.id.clone(),
+                            instance.source_profile.clone(),
+                            original,
+                        )
+                    })
+            })
             .collect()
     };
     if candidates.is_empty() {
         return;
     }
-    let idle_by_profile = resolve_per_profile(candidates.iter().map(|(_, p)| p.clone()), |c| {
-        c.acp.auto_stop_idle_secs
-    })
+    let idle_by_profile = resolve_per_profile(
+        candidates.iter().map(|(_, profile, _)| profile.clone()),
+        |c| c.acp.auto_stop_idle_secs,
+    )
     .await;
     let mut live = Vec::new();
-    for (id, profile) in candidates {
+    for (id, profile, original) in candidates {
         let idle_secs = idle_by_profile.get(&profile).copied().unwrap_or(0);
         if idle_secs > 0 && state.acp_supervisor.is_running(&id).await {
-            live.push((id, profile, idle_secs));
+            live.push((id, profile, idle_secs, original));
         }
     }
     if live.is_empty() {
         return;
     }
-    let ids: Vec<String> = live.iter().map(|(id, _, _)| id.clone()).collect();
+    let ids: Vec<String> = live.iter().map(|(id, _, _, _)| id.clone()).collect();
     let store = Arc::clone(&state.acp_event_store);
     let latest = match tokio::task::spawn_blocking(move || store.last_event_at_for_sessions(&ids))
         .await
@@ -189,7 +173,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         }
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    for (id, profile, idle_secs) in live {
+    for (id, _profile, idle_secs, original) in live {
         let last_ms = latest.get(&id).copied();
         if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
             continue;
@@ -203,24 +187,71 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         )
         .await
         .unwrap_or(false);
-        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight)
-            || !set_dormant_in_memory(state, &id, true).await
+        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight) {
+            continue;
+        }
+        let stop = match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
+            Ok(stop) => stop,
+            Err(error) => {
+                tracing::debug!(target: "acp.supervisor", %id, %error, "idle worker source changed before retirement");
+                continue;
+            }
+        };
+        let owner = stop.clone();
+        if !matches!(
+            tokio::task::spawn_blocking(move || owner.update_projection(
+                |row| {
+                    set_dormant(row, true);
+                    Ok(())
+                },
+                Ok
+            ))
+            .await,
+            Ok(Ok(()))
+        ) {
+            continue;
+        }
         {
-            continue;
+            let mut instances = state.instances.write().await;
+            if let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| stop.original().matches_instance(instance))
+            {
+                set_dormant(instance, true);
+                instance.lifecycle_generation = stop.generation();
+            }
         }
-        if !persist_dormant(state, &profile, &id, true).await {
-            set_dormant_in_memory(state, &id, false).await;
-            tracing::warn!(target: "acp.supervisor", session = %id, "idle-reap persist failed; leaving worker alive");
-            continue;
-        }
-        match state.acp_supervisor.shutdown_idle(&id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {
+        match state.acp_supervisor.shutdown_idle(stop.clone()).await {
+            Ok(()) => {
+                if let Err(error) = crate::session::runner_journal::release_owned_stop(&stop) {
+                    tracing::warn!(target: "acp.supervisor", %id, %error, "idle claim remains protected");
+                }
                 tracing::info!(target: "acp.supervisor", session = %id, idle_secs, "auto-stopped idle structured view worker");
             }
             Err(e) => {
                 // The worker may still run; clear dormancy so it is not blocked forever.
-                set_dormant_in_memory(state, &id, false).await;
-                persist_dormant(state, &profile, &id, false).await;
+                let owner = stop.clone();
+                let cleared = matches!(
+                    tokio::task::spawn_blocking(move || owner.update_projection(
+                        |row| {
+                            set_dormant(row, false);
+                            Ok(())
+                        },
+                        Ok
+                    ))
+                    .await,
+                    Ok(Ok(()))
+                );
+                if cleared {
+                    let projection = stop.cancellation_origin();
+                    let mut instances = state.instances.write().await;
+                    if let Some(instance) = instances
+                        .iter_mut()
+                        .find(|instance| projection.matches_instance(instance))
+                    {
+                        set_dormant(instance, false);
+                    }
+                }
                 tracing::warn!(target: "acp.supervisor", session = %id, "idle-reap shutdown failed; cleared dormant marker: {e}");
             }
         }

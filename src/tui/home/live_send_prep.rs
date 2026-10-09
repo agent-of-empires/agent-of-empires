@@ -199,33 +199,23 @@ impl HomeView {
                     .to_string()
             }
         };
-        // Switching live mode from one session to another must drop the old worker BEFORE
-        // resetting the old session's window-size, or a `Resize` still queued there can fire
-        // after the reset and flip the old pane back to manual sizing. The thread is not
-        // joined, so dropping its `Sender` is the only way to know its dispatch loop has
-        // finished.
-        let prev_tmux_name = self
-            .live_send
-            .as_ref()
-            .map(|state| state.tmux_name.clone())
-            .filter(|name| name != &tmux_name);
-        if prev_tmux_name.is_some() {
-            // Drop worker first so its queued resizes (if any) drain
-            // against the old session before we reset its sizing.
-            self.live_send_worker = None;
-            // The render reconcile retargets the capture worker, but drop the previous
-            // session's cached previews here so the first frames after the switch don't
-            // paint session A's content under session B's header while B's worker spins up.
-            // All targets are cleared, since a switch can retarget to Terminal or
-            // ContainerTerminal and the view can flip to any of them right after.
-            self.preview_cache = PreviewCache::default();
-            self.terminal_preview_cache = PreviewCache::default();
-            self.container_terminal_preview_cache = PreviewCache::default();
-            self.tool_preview_cache = PreviewCache::default();
-            if let Some(name) = &prev_tmux_name {
-                crate::tmux::Session::from_name(name).reset_size_to_latest_client();
+        self.teardown_live_send();
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let primary = match crate::tmux::utils::resolve_primary(&tmux_name, &deadline) {
+            Ok(primary) => primary,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Live send failed",
+                    &format!("Cannot bind the physical tmux pane: {error}"),
+                ));
+                return Err(());
             }
-        }
+        };
+        let session = std::sync::Arc::new(crate::tmux::Session::with_primary(&tmux_name, primary));
+        self.preview_cache = PreviewCache::default();
+        self.terminal_preview_cache = PreviewCache::default();
+        self.container_terminal_preview_cache = PreviewCache::default();
+        self.tool_preview_cache = PreviewCache::default();
         // Parse the configured exit-chord list now so the per-keystroke path doesn't
         // re-parse on every event. Config cannot be edited during live mode (settings_view
         // participates in has_dialog), so an entry-time snapshot is sufficient.
@@ -267,18 +257,18 @@ impl HomeView {
         if self.preview_capture_worker.is_none() {
             self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
                 self.preview_wake.clone(),
+                self.live_send_effects.clone(),
             ));
         }
-        // Nudge the capture worker after each dispatched batch so typed echo is captured
-        // immediately rather than a full fast-cadence cycle later.
-        let capture_wake = self
+        let capture = self
             .preview_capture_worker
             .as_ref()
-            .map(live_send::LiveCaptureWorker::waker);
-        // Spawn the background worker that dispatches translated keystrokes as one-shot
-        // `tmux send-keys` subprocesses; control-mode was tried (#1485) and proved
-        // unreliable on real tmux setups.
-        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name, capture_wake));
+            .expect("capture worker installed");
+        let admission = capture.begin_live_input(session);
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(
+            admission,
+            Some(capture.waker()),
+        ));
         // Start every live-mode entry, including a switch from another session, with a
         // disarmed leader menu so a half-entered chord can't carry over.
         self.live_send_pending_leader = false;

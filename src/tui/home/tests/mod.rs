@@ -1,6 +1,5 @@
 //! Tests for HomeView
 
-use super::watchers::ConfigWatchKey;
 use super::{ConfigRefreshOrigin, HomeView, PreviewSelection, ViewMode};
 use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
 use crate::session::{
@@ -13,6 +12,59 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
+
+/// Observe actual worker ACKs, including failure, rather than treating enqueue as persistence.
+pub(super) fn drain_persistence(view: &mut HomeView) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !view.persistence_is_idle() {
+        view.apply_persistence_results();
+        anyhow::ensure!(
+            !view.persistence_has_failed(),
+            "Persistence worker failed before acknowledgement"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Persistence acknowledgement timed out"
+        );
+        std::thread::yield_now();
+    }
+    let mut failure = None;
+    while let Some(result) = view.persistence.acknowledgements.pop_front() {
+        if let Err(error) = result {
+            failure = Some(error);
+        }
+    }
+    match failure {
+        Some(error) => Err(anyhow::anyhow!(error)),
+        None => Ok(()),
+    }
+}
+fn await_transaction_result(
+    view: &mut HomeView,
+    submitted: anyhow::Result<super::TransactionDisposition>,
+) -> anyhow::Result<()> {
+    submitted?;
+    drain_persistence(view)
+}
+
+fn remove_test_instance(view: &mut HomeView, id: &str) {
+    if let Some(instance) = view.instances.shift_remove(id) {
+        if let Some(pending) = view.pending_added.get_mut(&instance.source_profile) {
+            pending.remove(id);
+        }
+        let token = view.record_row_edit(&instance.source_profile, id);
+        view.pending_deletions
+            .entry(instance.source_profile)
+            .or_default()
+            .insert(
+                id.to_string(),
+                super::persistence_worker::RowDeletion {
+                    revision: token,
+                    created_at: instance.created_at,
+                },
+            );
+    }
+}
 
 fn observed_fork_parent(agent: &str) -> Instance {
     let mut instance = Instance::new("parent", "/tmp/repo");
@@ -80,8 +132,221 @@ fn setup_test_home(temp: &TempDir) -> AppDirGuard {
 
 struct TestEnv {
     view: HomeView,
+    native_input: Option<NativePreviewInput>,
     _guard: AppDirGuard,
     _temp: TempDir,
+}
+
+struct NativePreviewInput {
+    _guard: crate::tmux::test_helpers::TmuxTestSession,
+    input: std::path::PathBuf,
+    actor: std::sync::Arc<crate::tmux::Session>,
+    effects: std::sync::Arc<std::sync::Mutex<()>>,
+    receipt_offset: std::cell::Cell<usize>,
+    observed: std::cell::RefCell<Vec<u8>>,
+}
+
+fn wait_for_native_fixture<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn finish_runner_settlements(view: &mut HomeView) {
+    wait_for_native_fixture("runner settlement callbacks", || {
+        view.apply_persistence_results();
+        view.apply_settlement_results();
+        (view.settlement_in_flight.is_empty() && view.persistence_is_idle()).then_some(())
+    });
+    while let Some(ack) = view.persistence.acknowledgements.pop_front() {
+        ack.expect("final settlement transaction must acknowledge its durable result");
+    }
+}
+/// State-only fixtures use this without claiming a prepared input transport.
+fn live_state_for_instance(
+    inst: &Instance,
+    target: super::live_send::LiveSendTarget,
+) -> super::live_send::LiveSendState {
+    use super::live_send::{parse_chord_list, LiveSendState, LiveSendTarget, DEFAULT_EXIT_CHORD};
+    let tmux_name = match &target {
+        LiveSendTarget::Agent => crate::tmux::Session::resolve_name(&inst.id, &inst.title),
+        LiveSendTarget::Terminal => {
+            crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
+        }
+        LiveSendTarget::ContainerTerminal => {
+            crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
+        }
+        LiveSendTarget::Tool(name) => crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+            .session_name()
+            .to_owned(),
+    };
+    LiveSendState {
+        session_id: inst.id.clone(),
+        title: inst.title.clone(),
+        tmux_name,
+        target,
+        exit_chords: parse_chord_list(DEFAULT_EXIT_CHORD),
+        leader: None,
+    }
+}
+
+impl TestEnv {
+    /// One raw native receiver, shared by the capture actor and live/passive admission.
+    fn install_native_preview_input(
+        &mut self,
+        id: &str,
+        target: super::live_send::LiveSendTarget,
+        live: bool,
+    ) {
+        use super::live_send::LiveSendWorker;
+        assert!(
+            self.native_input.is_none(),
+            "native receiver already installed"
+        );
+        let inst = self
+            .view
+            .get_instance(id)
+            .expect("native fixture instance")
+            .clone();
+        let state = live_state_for_instance(&inst, target);
+        let guard = crate::tmux::test_helpers::TmuxTestSession::from_name(state.tmux_name.clone());
+        let input = self._temp.path().join("native-preview-input");
+        let receiver = format!(
+            "stty raw -echo; printf 'NATIVE_INPUT_READY'; cat > {}",
+            crate::session::environment::shell_escape_script_word(&input.to_string_lossy()),
+        );
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                &receiver,
+            ])
+            .output()
+            .expect("create native preview receiver");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        crate::tmux::refresh_session_cache();
+        let primary = crate::tmux::utils::resolve_primary(
+            guard.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .expect("bind native preview actor");
+        let session =
+            std::sync::Arc::new(crate::tmux::Session::with_primary(guard.name(), primary));
+        self.view.selected_session = Some(id.to_owned());
+        self.view.live_send = live.then_some(state);
+        self.view.vt_live_enabled = false;
+        self.view.agent_clipboard_forward = false;
+        self.view
+            .sync_preview_capture_worker(Some(session.name().to_owned()));
+        let capture = self
+            .view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker");
+        if live {
+            let admission = capture.begin_live_input(session.clone());
+            self.view.live_send_worker =
+                Some(LiveSendWorker::spawn(admission, Some(capture.waker())));
+        }
+        capture.set_capture_lines(40);
+        let frame = wait_for_native_fixture("current native preview frame", || {
+            capture.take_latest().filter(|frame| {
+                capture.frame_is_current(frame)
+                    && frame.content.contains("NATIVE_INPUT_READY")
+                    && frame
+                        .session
+                        .as_ref()
+                        .is_some_and(|actor| actor.captured_primary() == session.captured_primary())
+            })
+        });
+        self.view
+            .preview_cache
+            .store_capture(frame, id.to_owned(), (80, 24));
+        self.native_input = Some(NativePreviewInput {
+            _guard: guard,
+            input,
+            actor: session,
+            effects: capture.effects_for_test(),
+            receipt_offset: std::cell::Cell::new(0),
+            observed: std::cell::RefCell::new(Vec::new()),
+        });
+        wait_for_native_fixture("raw receiver ready", || {
+            self.native_input
+                .as_ref()
+                .unwrap()
+                .input
+                .exists()
+                .then_some(())
+        });
+    }
+
+    fn assert_native_input(&self, expected: &[u8]) {
+        use super::live_send::{oneshot_idle_for_test, TmuxKey};
+        let native = self
+            .native_input
+            .as_ref()
+            .expect("native receiver installed");
+        wait_for_native_fixture("passive dispatch completion", || {
+            oneshot_idle_for_test().then_some(())
+        });
+        let marker = format!("\x1b[4107;{}~", native.receipt_offset.get());
+        if let Some(worker) = self.view.live_send_worker.as_ref() {
+            assert!(worker.send(TmuxKey::HexBytes(marker.as_bytes().to_vec())));
+        } else {
+            // Cancelled live work and completed passive work precede this native receipt.
+            let _fence = native.effects.lock().unwrap();
+            let deadline = crate::tmux::TmuxCommandDeadline::new();
+            let mut send = native
+                .actor
+                .commands_with_deadline(
+                    [[
+                        "send-keys",
+                        "-t",
+                        native.actor.captured_primary().pane_id.as_str(),
+                        "-l",
+                        marker.as_str(),
+                    ]],
+                    &deadline,
+                )
+                .expect("fenced native receipt");
+            assert!(deadline
+                .run(&mut send)
+                .expect("send native receipt")
+                .status
+                .success());
+        }
+        let bytes = wait_for_native_fixture("ordered native input receipt", || {
+            std::fs::read(&native.input)
+                .ok()
+                .filter(|bytes| bytes.ends_with(marker.as_bytes()))
+        });
+        let mut observed = native.observed.borrow_mut();
+        observed.extend_from_slice(&bytes[native.receipt_offset.get()..bytes.len() - marker.len()]);
+        native.receipt_offset.set(bytes.len());
+        assert_eq!(
+            observed.as_slice(),
+            expected,
+            "complete input before its ordered receipt"
+        );
+    }
 }
 
 /// An isolated app dir for a fixture; the guard must outlive every storage write.
@@ -92,12 +357,14 @@ fn test_home() -> (TempDir, AppDirGuard) {
 }
 
 fn test_view(profile: Option<&str>) -> HomeView {
-    HomeView::new_for_test(
+    let mut view = HomeView::new_for_test(
         profile.map(str::to_string),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
     )
-    .unwrap()
+    .unwrap();
+    drain_persistence(&mut view).unwrap();
+    view
 }
 
 /// Persist `instances` (with derived groups) to `profile`.
@@ -128,6 +395,7 @@ fn seeded_env(
     }
     TestEnv {
         view,
+        native_input: None,
         _guard: guard,
         _temp: temp,
     }
@@ -188,34 +456,16 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
     seeded_env(test_home(), &instances, true)
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[serial]
-async fn config_watch_keys_distinguish_global_from_profile_named_global() {
-    let (_temp, _guard) = test_home();
-    let profile_name = "<global>";
-    // Outside the create grammar, so lay the legacy directory down directly.
-    let profile_dir = crate::session::get_app_dir()
-        .unwrap()
-        .join("profiles")
-        .join(profile_name);
-    std::fs::create_dir_all(&profile_dir).unwrap();
-    let _storage = Storage::open_unwatched(profile_name).unwrap();
-    let view = HomeView::new_for_test(
-        Some(profile_name.to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::new().unwrap(),
-    )
-    .unwrap();
-
-    assert_eq!(view.config_watch.handles.len(), 2);
-    assert!(view
-        .config_watch
-        .handles
-        .contains_key(&ConfigWatchKey::Global));
-    assert!(view
-        .config_watch
-        .handles
-        .contains_key(&ConfigWatchKey::profile(profile_name)));
+pub(super) async fn wait_persistence(view: &mut HomeView) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !view.persistence_is_idle() {
+        view.apply_persistence_results();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "persistence did not acknowledge its work"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Render once off-screen so geometry fields (`list_inner_area`, `shelf_inner_area`) are real.
@@ -393,6 +643,7 @@ fn setup_creation_test_env() -> CreationTestEnv {
             .unwrap();
     }
 
+    let storage = Storage::new_unwatched("default").unwrap();
     let mut view = test_view(Some("default"));
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
@@ -400,7 +651,7 @@ fn setup_creation_test_env() -> CreationTestEnv {
 
     CreationTestEnv {
         view,
-        storage: Storage::new_unwatched("default").unwrap(),
+        storage,
         project_dir,
         _guard: guard,
         _temp: temp,
@@ -436,8 +687,13 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
 fn drain_creation_result(view: &mut HomeView) -> Option<String> {
     let start = std::time::Instant::now();
     loop {
-        if let Some(id) = view.apply_creation_results() {
-            return Some(id);
+        view.apply_persistence_results();
+        if let Some(ack) = view.apply_creation_results() {
+            assert!(
+                ack.matches(view),
+                "creation publication ACK must match its actual original row"
+            );
+            return Some(ack.session_id().to_owned());
         }
         if !view.is_creation_pending() {
             return None;

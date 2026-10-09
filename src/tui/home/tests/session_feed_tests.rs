@@ -14,6 +14,14 @@ fn structured_row(env: &mut TestEnv, status: Status) -> String {
     inst.view = crate::session::View::Structured;
     inst.status = status;
     let id = inst.id.clone();
+    let storage = Storage::new_unwatched("test").unwrap();
+    inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
+    storage
+        .update(|rows, _| {
+            rows.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
     env.view.add_instance(inst);
     id
 }
@@ -323,7 +331,10 @@ fn daemon_status_stopped_leaves_a_stopped_row_alone() {
 fn daemon_status_skips_a_row_mid_restart() {
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Starting);
-    env.view.restart_in_flight.insert(id.clone());
+    env.view.restart_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
 
     env.view
         .apply_daemon_status_update(update(&id, Status::Idle));
@@ -340,7 +351,10 @@ fn daemon_status_skips_a_row_mid_restart() {
 fn daemon_status_skips_a_row_mid_recovery() {
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Starting);
-    env.view.recovery_in_flight.insert(id.clone());
+    env.view.recovery_in_flight.insert(
+        id.clone(),
+        super::super::RequestOrigin::capture(env.view.get_instance(&id).unwrap()).unwrap(),
+    );
 
     env.view
         .apply_daemon_status_update(update(&id, Status::Idle));
@@ -366,7 +380,11 @@ fn daemon_status_does_not_persist_a_structured_row_to_disk() {
     let id = structured_row(&mut env, Status::Idle);
     // `add_instance` only stages the row; flush it to disk as Idle so the
     // passive writer has a durable row to (not) touch.
-    env.view.save().expect("seed the structured row on disk");
+    {
+        env.view.request_save();
+        drain_persistence(&mut env.view)
+    }
+    .expect("seed the structured row on disk");
 
     env.view
         .apply_daemon_status_update(update(&id, Status::Running));
@@ -398,9 +416,11 @@ fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Running);
-    env.view
-        .save()
-        .expect("seed the structured row on disk as read/Running");
+    {
+        env.view.request_save();
+        drain_persistence(&mut env.view)
+    }
+    .expect("seed the structured row on disk as read/Running");
 
     // A finished turn (Running -> Idle).
     env.view

@@ -196,9 +196,7 @@ impl HomeView {
             return;
         }
         self.stamp_last_accessed(session_id);
-        if let Err(e) = self.save() {
-            tracing::error!("Failed to save after send: {}", e);
-        }
+        self.request_save();
         if self.sort_order == crate::session::config::SortOrder::Attention {
             self.select_top_attention(None);
             self.selected_session = None;

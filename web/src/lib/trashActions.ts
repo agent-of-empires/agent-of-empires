@@ -86,10 +86,22 @@ export async function deleteWorkspaceSessions(
   const ids = sessions.map((s) => s.id);
   const activeInWorkspace = activeSessionId != null && ids.includes(activeSessionId);
 
+  // Remember what each row showed before the optimistic overlay: the server
+  // restores the prior status on a 409 and on a retryable partial failure, so a
+  // hardcoded replacement would be wrong for every row but `Stopped`.
+  const priorStatus: Record<string, SessionStatus> = {};
+  for (const session of sessions) priorStatus[session.id] = session.status;
   for (const id of ids) deps.setStatus(id, "Deleting");
 
   const result = await deleteWorkspace(ids, options);
   if (!result.ok) {
+    // A pending teardown kept every row: the server restored their status, so
+    // they are not failures and the user can retry the same delete.
+    if (result.pending) {
+      for (const id of ids) deps.setStatus(id, priorStatus[id] ?? "Stopped");
+      deps.notify?.error?.(result.error || "Sessions are still shutting down, try again in a moment");
+      return;
+    }
     for (const id of ids) deps.setStatus(id, "Error");
     deps.notify?.error?.(result.error || "Failed to delete session");
     return;
@@ -98,9 +110,12 @@ export async function deleteWorkspaceSessions(
   // Ids in neither set (e.g. restored concurrently) are left for the next poll.
   const deleted = new Set(result.deleted ?? []);
   const failed = new Set((result.failed ?? []).map((f) => f.id));
+  const retryable = new Set((result.failed ?? []).filter((f) => f.retryable).map((f) => f.id));
   for (const id of ids) {
     if (deleted.has(id)) {
       deps.purgeLocal(id);
+    } else if (retryable.has(id)) {
+      deps.setStatus(id, priorStatus[id] ?? "Stopped");
     } else if (failed.has(id)) {
       deps.setStatus(id, "Error");
     }

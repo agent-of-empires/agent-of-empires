@@ -1,6 +1,12 @@
 import { useCallback, useState } from "react";
 
-import { setSessionArchive, setSessionPin, setSessionSnooze, setSessionUnread } from "../lib/api";
+import {
+  setSessionArchive,
+  setSessionPin,
+  setSessionSnooze,
+  setSessionUnread,
+  type SessionLifecycleResult,
+} from "../lib/api";
 import { reportError } from "../lib/toastBus";
 import {
   EMPTY_OPTIMISTIC,
@@ -9,19 +15,20 @@ import {
   withOverride,
   type OptimisticTriage,
 } from "../lib/sidebarOptimistic";
-import type { Workspace } from "../lib/types";
+import type { SessionResponse, Workspace } from "../lib/types";
 
 export interface TriageResult {
   workspaceId: string;
   ok: boolean;
   skipped?: boolean;
+  message?: string;
 }
 
 function reportFailure(result: TriageResult, message: string): void {
-  if (!result.ok && !result.skipped) reportError(message);
+  if (!result.ok && !result.skipped) reportError(result.message ?? message);
 }
 
-export function useSidebarTriage(workspaces: readonly Workspace[]) {
+export function useSidebarTriage(workspaces: readonly Workspace[], applySession: (session: SessionResponse) => void) {
   const [overlay, setOverlay] = useState<Map<string, OptimisticTriage>>(() => new Map());
   const [trackedWorkspaces, setTrackedWorkspaces] = useState(workspaces);
   if (workspaces !== trackedWorkspaces) {
@@ -47,20 +54,29 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
       ws: Workspace,
       optimistic: Partial<OptimisticTriage>,
       revert: Partial<OptimisticTriage>,
-      call: (sessionId: string) => Promise<unknown>,
+      call: (sessionId: string) => Promise<SessionLifecycleResult>,
     ): Promise<TriageResult> => {
       const sessionId = ws.sessions[0]?.id;
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
       setOverride(ws.id, optimistic);
-      if (await call(sessionId)) return { workspaceId: ws.id, ok: true };
+      const result = await call(sessionId);
+      if (result.ok) {
+        applySession(result.session);
+        setOverride(ws.id, revert);
+        return { workspaceId: ws.id, ok: true };
+      }
       setOverride(ws.id, revert);
-      return { workspaceId: ws.id, ok: false };
+      return { workspaceId: ws.id, ok: false, message: result.message };
     },
-    [setOverride],
+    [setOverride, applySession],
   );
 
   const pin = useCallback(
-    (ws: Workspace, pinned: boolean) => triage(ws, { pinned }, { pinned: null }, (id) => setSessionPin(id, pinned)),
+    (ws: Workspace, pinned: boolean) =>
+      triage(ws, { pinned }, { pinned: null }, async (id) => {
+        const session = await setSessionPin(id, pinned);
+        return session ? { ok: true, session } : { ok: false, message: "Failed to update session pin" };
+      }),
     [triage],
   );
 
@@ -83,7 +99,10 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const unread = useCallback(
     (ws: Workspace, markUnread: boolean) =>
-      triage(ws, { unread: markUnread }, { unread: null }, (id) => setSessionUnread(id, markUnread)),
+      triage(ws, { unread: markUnread }, { unread: null }, async (id) => {
+        const session = await setSessionUnread(id, markUnread);
+        return session ? { ok: true, session } : { ok: false, message: "Failed to update session unread state" };
+      }),
     [triage],
   );
 

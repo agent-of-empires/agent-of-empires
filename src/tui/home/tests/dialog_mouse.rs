@@ -100,7 +100,11 @@ fn a_clicked_hint_closes_its_dialog_through_the_key_path() {
             env.view.handle_hover(x, y),
             "case {i}: hover lights {target}"
         );
-        assert!(env.view.handle_dialog_click(x, y));
+        assert!({
+            let result = env.view.handle_dialog_click(x, y);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        });
         assert!(!is_open(&env.view), "case {i}: {target} closes its dialog");
     }
 }
@@ -117,7 +121,11 @@ fn the_help_overlay_takes_the_wheel_and_closes_on_click() {
     assert!(env.view.handle_scroll_up(0, 0));
     assert_eq!(env.view.help_scroll, 0);
 
-    assert!(env.view.handle_dialog_click(5, 5));
+    assert!({
+        let result = env.view.handle_dialog_click(5, 5);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    });
     assert!(!env.view.show_help);
 }
 
@@ -139,7 +147,11 @@ fn a_click_in_the_diff_file_list_selects_that_file() {
     env.view.diff_view = Some(diff);
     let buf = render(&mut env);
     let (x, y) = find(&buf, "beta.rs");
-    assert!(env.view.handle_dialog_click(x, y));
+    assert!({
+        let result = env.view.handle_dialog_click(x, y);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    });
     assert_eq!(env.view.diff_view.as_ref().unwrap().selected_file, 1);
 }
 
@@ -156,7 +168,11 @@ fn a_follow_up_dialog_over_new_session_takes_its_own_clicks() {
     ));
     let buf = render(&mut env);
     let (x, y) = find(&buf, "[Cancel (Esc)]");
-    assert!(env.view.handle_dialog_click(x, y));
+    assert!({
+        let result = env.view.handle_dialog_click(x, y);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    });
     assert!(env.view.hooks_install_dialog.is_none());
     assert!(env.view.new_dialog.is_some());
 }

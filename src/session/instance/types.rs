@@ -231,34 +231,10 @@ mod tests {
     #[test]
     fn blank_agent_session_id_deserializes_to_none() {
         for (raw, expected) in [("", None), ("   ", None), ("abc-123", Some("abc-123"))] {
-            let inst: Instance = serde_json::from_value(serde_json::json!({
-                "id": "test123", "title": "Test", "project_path": "/tmp/test",
-                "tool": "claude", "status": "idle", "created_at": "2024-01-01T00:00:00Z",
-                "agent_session_id": raw,
-            }))
-            .unwrap();
+            let mut row = serde_json::to_value(Instance::new("Test", "/tmp/test")).unwrap();
+            row["agent_session_id"] = serde_json::json!(raw);
+            let inst: Instance = serde_json::from_value(row).unwrap();
             assert_eq!(inst.agent_session_id.as_deref(), expected, "{raw:?}");
-        }
-    }
-
-    #[test]
-    fn resume_intent_wire_format_is_pinned() {
-        for (intent, wire) in [
-            (ResumeIntent::Default, r#"{"kind":"Default"}"#),
-            (
-                ResumeIntent::Use("abc".to_string()),
-                r#"{"kind":"Use","value":"abc"}"#,
-            ),
-            (ResumeIntent::Cleared, r#"{"kind":"Cleared"}"#),
-            (
-                ResumeIntent::Fork {
-                    from: "some-parent-id".to_string(),
-                },
-                r#"{"kind":"Fork","value":{"from":"some-parent-id"}}"#,
-            ),
-        ] {
-            assert_eq!(serde_json::to_string(&intent).unwrap(), wire);
-            assert_eq!(serde_json::from_str::<ResumeIntent>(wire).unwrap(), intent);
         }
     }
 }

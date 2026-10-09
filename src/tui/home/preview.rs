@@ -112,6 +112,7 @@ pub(in crate::tui) struct PreviewCache {
     pub(in crate::tui) session_id: Option<String>,
     pub(in crate::tui) capture_target: Option<String>,
     pub(in crate::tui) capture_generation: u64,
+    pub(in crate::tui) capture_session: Option<std::sync::Arc<crate::tmux::Session>>,
     pub(in crate::tui) content: String,
     pub(in crate::tui) dimensions: (u16, u16),
     /// From the same capture frame as `content`; never mix in a newer sample.
@@ -138,7 +139,7 @@ impl PreviewCache {
             return;
         }
         let generation = self
-            .capture_target
+            .capture_session
             .as_deref()
             .map_or(0, crate::tmux::pane_links_generation);
         if self.parsed_text.is_none() {
@@ -158,7 +159,7 @@ impl PreviewCache {
         use crate::tmux::osc8;
 
         let mut links = self
-            .capture_target
+            .capture_session
             .as_deref()
             .map(crate::tmux::pane_links)
             .unwrap_or_default();
@@ -208,21 +209,19 @@ impl PreviewCache {
     /// Store a fresh worker capture, invalidating the parse. Returns the captured line count.
     pub(in crate::tui) fn store_capture(
         &mut self,
-        content: String,
+        frame: super::live_send::CaptureFrame,
         session_id: String,
-        capture_target: String,
-        capture_generation: u64,
         dimensions: (u16, u16),
-        cursor: Option<crate::tmux::PaneCursor>,
     ) -> usize {
-        self.captured_lines = content.lines().count();
-        self.content = content;
+        self.captured_lines = frame.content.lines().count();
+        self.content = frame.content;
         self.parsed_text = None;
         self.session_id = Some(session_id);
-        self.capture_target = Some(capture_target);
-        self.capture_generation = capture_generation;
+        self.capture_target = Some(frame.target);
+        self.capture_generation = frame.generation;
+        self.capture_session = frame.session;
         self.dimensions = dimensions;
-        self.cursor = cursor;
+        self.cursor = frame.cursor;
         self.captured_lines
     }
 }

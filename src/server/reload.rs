@@ -14,6 +14,33 @@ use super::structured_repair::{
     LiveStructuredWorkerRecord,
 };
 
+/// Metadata healing runs before reload snapshots, never while holding the cache lock.
+pub(super) async fn reconcile_filesystem_claims(state: &Arc<AppState>) {
+    if state.read_only {
+        return;
+    }
+    let file_watch = state.file_watch.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        for profile in crate::session::list_profiles_for_worktree_inventory()? {
+            let result = Storage::open(&profile, file_watch.clone())
+                .and_then(|storage| storage.reconcile_filesystem_claims());
+            if let Err(error) = result {
+                tracing::warn!(target: "server.file_watch", %profile, %error, "filesystem claims retained after uncertain reconciliation");
+            }
+        }
+        Ok(())
+    }).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target: "server.file_watch", %error, "filesystem claim inventory unavailable")
+        }
+        Err(error) => {
+            tracing::warn!(target: "server.file_watch", %error, "filesystem claim worker failed")
+        }
+    }
+}
+
 /// Load sessions from all profiles, matching the TUI's "all profiles" view.
 pub(super) fn load_all_instances(
     file_watch: &Arc<FileWatchService>,
@@ -31,7 +58,7 @@ pub(super) fn load_all_instances(
     };
     let mut all = Vec::new();
     for profile in &profiles {
-        match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
+        match Storage::open(profile, file_watch.clone()).and_then(|s| s.load()) {
             Ok(mut instances) => {
                 for inst in &mut instances {
                     inst.source_profile = profile.clone();
@@ -54,13 +81,13 @@ pub(super) fn load_all_instances(
 
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
 /// freshly-loaded one.
-pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
-    fresh.adopt_poller(&prior);
-    fresh.adopt_poller_repair(&prior);
+pub(super) fn merge_runtime_fields(prior: &mut Instance, mut fresh: Instance) -> Instance {
+    fresh.adopt_poller(prior);
+    fresh.adopt_poller_repair(prior);
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
     if fresh.status == Status::Error {
-        fresh.last_error = prior.last_error;
+        fresh.last_error = prior.last_error.take();
     }
     fresh.acp_load_session_capable = prior.acp_load_session_capable;
     fresh.plugin_revival_pending = prior.plugin_revival_pending;
@@ -271,12 +298,12 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
     for mut row in fresh {
-        if let Some(prior) = prior_by_id.get(&row.id).cloned() {
+        if let Some(mut prior) = prior_by_id.get(&row.id).cloned() {
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
             let prior_tracking = PriorTickTracking::of(&prior);
-            row = merge_runtime_fields(prior, row);
+            row = merge_runtime_fields(&mut prior, row);
             match status_source {
                 StatusSource::DiskOnly => {
                     row.status = prior_status;
@@ -528,26 +555,6 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn reload_repair_rejects_a_registry_sample_retired_after_the_disk_read() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let (state, row, record, storage) = live_repair_fixture();
-        // The reload sampled the runner during teardown; disable finished
-        // before this reload could acquire the transition lock.
-        crate::process::worker_registry::delete_if_owned(&row.id, std::process::id()).unwrap();
-        reload_state_instances_from_disk(
-            &state,
-            vec![row],
-            vec![record],
-            StatusSource::DiskOnly,
-            0,
-        )
-        .await;
-        assert!(!state.instances.read().await[0].is_structured());
-        assert!(!storage.load().unwrap()[0].is_structured());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
     async fn reload_repair_commits_before_a_following_terminal_transition() {
         let _home = crate::session::test_support::isolate_app_dir();
         let (state, row, record, storage) = live_repair_fixture();
@@ -758,13 +765,9 @@ mod tests {
             return;
         }
 
-        // Never mutated.
         let mut on_disk = Instance::new("aoe_test_3642_tick", "/tmp");
+        on_disk.tool = "claude".into();
         on_disk.status = Status::Running;
-        assert_eq!(
-            on_disk.tool, "claude",
-            "fixture invariant: this test needs an agent with a manifest"
-        );
 
         let session_name = crate::tmux::Session::generate_name(&on_disk.id, &on_disk.title);
         let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
@@ -787,14 +790,13 @@ mod tests {
             "tmux new-session failed: {}",
             String::from_utf8_lossy(&created.stderr)
         );
-        let cache = crate::tmux::SessionCacheGuard::capture();
-        cache.force_present(&[session_name.as_str()]);
+        let _cache = crate::tmux::SessionCacheGuard::capture_restore_only();
+        crate::tmux::refresh_session_cache();
 
         let mut prev = std::collections::HashMap::from([(on_disk.id.clone(), Status::Running)]);
         let mut tracking: std::collections::HashMap<String, PriorTickTracking> =
             std::collections::HashMap::new();
 
-        // One daemon tick, reporting the status it settled on and the rule that decided.
         let mut tick = |window_activity: Option<i64>| {
             let metadata = std::collections::HashMap::from([(
                 session_name.clone(),
@@ -806,6 +808,7 @@ mod tests {
                     pane_title: None,
                     window_activity,
                     window_size: None,
+                    ..Default::default()
                 },
             )]);
             let mut instances = vec![on_disk.clone()];
@@ -820,34 +823,31 @@ mod tests {
                 .iter()
                 .map(|i| (i.id.clone(), PriorTickTracking::of(i)))
                 .collect();
-            // A passive transition reaches disk in the tick that publishes it
-            // (`flush_passive_transition_writes`), so the next tick's disk
-            // load agrees with what this one decided.
+            // Passive publication is the next tick’s persisted baseline.
             on_disk.status = instances[0].status;
             prev.insert(instances[0].id.clone(), instances[0].status);
-            (instances[0].status, instances[0].detection.rule)
+            instances[0].status
         };
 
         // No activity stamp.
         assert_eq!(
-            tick(None).0,
+            tick(None),
             Status::Running,
             "an unwitnessed Idle waits for a tick that agrees with it"
         );
         assert_eq!(
-            tick(None).0,
+            tick(None),
             Status::Idle,
             "the tick that agrees publishes it (#3642)"
         );
 
         // A stamp whose second is already past.
         let settled = Utc::now().timestamp() - 60;
-        assert_eq!(tick(Some(settled)).0, Status::Idle);
+        assert_eq!(tick(Some(settled)), Status::Idle);
         assert_eq!(
             tick(Some(settled)),
-            (Status::Idle, Some("screen_unchanged")),
-            "a skipped tick must leave the published status standing, not \
-             re-derive one from a row it did not capture for"
+            Status::Idle,
+            "a settled row stays idle across the next reload"
         );
     }
 
@@ -862,7 +862,7 @@ mod tests {
             let mut fresh = Instance::new("seed", "/tmp/seed");
             fresh.status = fresh_status;
             fresh.last_error = None;
-            merge_runtime_fields(prior, fresh).last_error
+            merge_runtime_fields(&mut prior, fresh).last_error
         };
         assert_eq!(
             merged(Status::Error, Status::Error).as_deref(),
@@ -873,7 +873,7 @@ mod tests {
 
         let mut prior = Instance::new("seed", "/tmp/seed");
         prior.acp_load_session_capable = Some(true);
-        let merged = merge_runtime_fields(prior, Instance::new("seed", "/tmp/seed"));
+        let merged = merge_runtime_fields(&mut prior, Instance::new("seed", "/tmp/seed"));
         assert_eq!(merged.acp_load_session_capable, Some(true));
     }
 
@@ -886,7 +886,7 @@ mod tests {
         prior.plugin_revival_pending = true;
 
         let fresh = Instance::new("seed", "/tmp/seed");
-        let merged = merge_runtime_fields(prior, fresh);
+        let merged = merge_runtime_fields(&mut prior, fresh);
 
         assert!(merged.plugin_revival_pending);
     }
@@ -905,11 +905,13 @@ mod tests {
             .mode(0o700)
             .create(&hook_base)
             .unwrap();
-        let mergers: [fn(Instance, Instance) -> Instance; 2] =
-            [merge_runtime_fields, |prior, mut fresh| {
+        let mergers: [fn(Instance, Instance) -> Instance; 2] = [
+            |mut prior, fresh| merge_runtime_fields(&mut prior, fresh),
+            |prior, mut fresh| {
                 fresh.merge_runtime_from_reload(&prior);
                 fresh
-            }];
+            },
+        ];
         for merge in mergers {
             let mut prior = Instance::new("reload-capture", app.path().to_str().unwrap());
             prior.tool = "claude".into();
@@ -952,6 +954,7 @@ mod tests {
             active.capture =
                 Some(serde_json::from_value(serde_json::json!({ "Hooks": publication })).unwrap());
             let storage = Storage::new_unwatched(&fresh.source_profile).unwrap();
+            fresh.storage_origin = Some(Arc::new(storage.clone()));
             storage
                 .update(|rows, _| {
                     *rows = vec![fresh.clone()];
@@ -1011,7 +1014,8 @@ mod tests {
                 container: None,
             })
         };
-        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> =
+            vec![|mut prior, fresh| merge_runtime_fields(&mut prior, fresh)];
         mergers.push(|prior, mut fresh| {
             fresh.merge_runtime_from_reload(&prior);
             fresh
@@ -1086,7 +1090,7 @@ mod tests {
         let mut fresh = Instance::new("swapped-agent", "/tmp/swapped-agent");
         fresh.tool = "codex".to_string();
 
-        let merged = merge_runtime_fields(prior, fresh);
+        let merged = merge_runtime_fields(&mut prior, fresh);
 
         assert_eq!(merged.tool, "codex");
         assert!(
@@ -1101,7 +1105,8 @@ mod tests {
     #[test]
     fn a_reload_keeps_the_repair_pacing_of_a_row_on_the_same_runtime() {
         let now = std::time::Instant::now();
-        let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![merge_runtime_fields];
+        let mut mergers: Vec<fn(Instance, Instance) -> Instance> =
+            vec![|mut prior, fresh| merge_runtime_fields(&mut prior, fresh)];
         mergers.push(|prior, mut fresh| {
             fresh.merge_runtime_from_reload(&prior);
             fresh

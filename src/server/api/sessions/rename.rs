@@ -79,42 +79,65 @@ pub(super) fn apply_session_rename_cache_patch(
     }
 }
 
-/// Quiesce a structured-view worker before its worktree directory moves. A live
-/// ACP worker is pinned to the current cwd, so `git worktree move` crash-loops
-/// it at the stale baked-in cwd until the reconciler parks the session with a
-/// misleading banner (#2260). `blocks_worktree_edit` misses this because a
-/// "stopped" structured session sits at Idle yet still owns a live worker.
-///
-/// `shutdown` is reversible: it keeps the transcript and `acp_session_id`, so
-/// after the move the reconciler fresh-spawns at the new path and resumes via
-/// session/load. Callers hold `instance_lock` across shutdown, move and persist,
-/// and the reconciler re-reads `project_path` under it, so the respawn never
-/// targets the old path. Refuses the move (409) if a live worker cannot be
-/// stopped.
-async fn quiesce_structured_worker_for_worktree_move(
+/// Stop outside filesystem flocks, then reload and prove quiescence under them.
+/// Callers retain submission and instance guards to exclude local respawn.
+async fn reserve_and_settle_worktree_move(
     state: &Arc<AppState>,
-    id: &str,
-    is_structured: bool,
-) -> Result<(), axum::response::Response> {
-    if !is_structured {
-        return Ok(());
-    }
-    match state.acp_supervisor.shutdown(id).await {
-        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
-        Err(e) => {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "could not stop structured-view worker before worktree move: {e}"
-            );
-            Err(api_error(
+    storage: &Storage,
+    expected: &Instance,
+) -> Result<Arc<crate::session::runner_journal::OwnedStop>, axum::response::Response> {
+    let claim_storage = storage.clone();
+    let claim_row = expected.clone();
+    let generation = match tokio::task::spawn_blocking(move || {
+        crate::session::runner_journal::reserve_owned_stop(&claim_storage, &claim_row, true)
+    })
+    .await
+    {
+        Ok(Ok(generation)) => generation,
+        Ok(Err(error)) => {
+            return Err(api_error(
                 StatusCode::CONFLICT,
-                "worker_shutdown_failed",
-                "Could not stop the structured view worker before renaming; retry in a moment",
+                "lifecycle_busy",
+                error.to_string(),
             ))
         }
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    };
+    let settled = match crate::session::runner_journal::settle_if_idle(generation.clone()).await {
+        Ok(()) => state
+            .acp_supervisor
+            .shutdown_and_require_dead(generation.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!(error)),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = settled {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::release_owned_stop(&generation)
+        })
+        .await;
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "runner_not_quiescent",
+            error.to_string(),
+        ));
+    }
+    Ok(generation)
+}
+
+/// The worktree rename hit a live `Attach` reservation. A distinct marker so
+/// the async boundary can map this one expected conflict to a retryable 409 and
+/// leave every other failure a 500.
+#[derive(Debug)]
+struct AttachInProgress;
+
+impl std::fmt::Display for AttachInProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session is attaching a project")
     }
 }
+
+impl std::error::Error for AttachInProgress {}
 
 /// Release a sandboxed session's hold on its worktree mount ahead of a
 /// `git worktree move`, on the blocking pool, and report whether the worktree is
@@ -155,14 +178,20 @@ pub(super) enum RenamePersistOutcome {
 pub(super) fn persist_rename_metadata(
     storage: &Storage,
     id: &str,
+    expected_generation: u64,
+    expected_path: &str,
     title: &str,
     new_path: Option<&str>,
     new_branch: Option<&str>,
 ) -> anyhow::Result<RenamePersistOutcome> {
-    storage.update(|instances, _groups| {
+    storage.update_under_workspace_claim_lock(|instances, _groups| {
         let Some(inst) = instances.iter_mut().find(|instance| instance.id == id) else {
             return Ok(RenamePersistOutcome::Missing);
         };
+        anyhow::ensure!(
+            inst.lifecycle_generation == expected_generation && inst.project_path == expected_path,
+            "rename plan was superseded before commit"
+        );
         let old_title = inst.title.clone();
         if let Some(path) = new_path {
             apply_worktree_name_edit(inst, path, new_branch);
@@ -229,312 +258,364 @@ pub async fn rename_session(
         inst.clone()
     };
     let profile = live.source_profile.clone();
-    // App-wide and per-session flocks may wait on another process, so never
-    // acquire them on a Tokio worker. Identity nests outside session title,
-    // source lifecycle, and profile Storage.
-    // source lifecycle, and profile Storage.
-    let _identity_lock = match tokio::task::spawn_blocking(
-        crate::session::acquire_session_identity_lock,
-    )
-    .await
-    {
-        Ok(Ok(lock)) => lock,
-        Ok(Err(error)) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire session identity lock");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Session identity lock task failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let lock_id = id.clone();
-    let lock_profile = profile.clone();
-    let lock_file_watch = state.file_watch.clone();
-    let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
-        match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let session_title_lock = crate::session::acquire_session_title_lock(&lock_id)?;
-            let storage = Storage::new(&lock_profile, lock_file_watch)?;
-            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
-            let instances = storage.load()?;
-            Ok((session_title_lock, lifecycle_lock, storage, instances))
+    let mut stopped: Option<(Storage, Arc<crate::session::runner_journal::OwnedStop>)> = None;
+    loop {
+        let (_workspace_lock, _identity_lock) = match tokio::task::spawn_blocking(|| {
+            let workspace = crate::session::acquire_session_workspace_claim_lock()?;
+            let identity = crate::session::acquire_session_identity_lock()?;
+            Ok::<_, anyhow::Error>((workspace, identity))
         })
         .await
         {
-            Ok(Ok(locks)) => locks,
+            Ok(Ok(lock)) => lock,
             Ok(Err(error)) => {
-                tracing::error!(target: "http.api.sessions", session = %id, "failed to acquire rename locks or load authoritative state: {error}");
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "title_lock_failed",
-                    "Could not serialize the session rename",
-                );
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire session identity lock");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             Err(error) => {
-                tracing::error!(target: "http.api.sessions", session = %id, "rename lock task failed: {error}");
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "title_lock_failed",
-                    "Could not serialize the session rename",
-                );
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Session identity lock task failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-    let Some(mut fresh) = disk_instances
-        .iter()
-        .find(|instance| instance.id == id)
-        .cloned()
-    else {
-        return session_not_found();
-    };
-    fresh.source_profile.clone_from(&profile);
-    fresh.merge_runtime_from_reload(&live);
-    let current_title = fresh.title.clone();
-    let worktree_info = fresh.worktree_info.clone();
-    let current_path = fresh.project_path.clone();
-    let current_branch = worktree_info
-        .as_ref()
-        .map(|worktree| worktree.branch.clone());
-    let status = fresh.status;
-    let is_sandboxed = fresh.is_sandboxed();
-    let is_structured = fresh.is_structured();
-
-    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
-    // its directory leaf, so title and dir cannot drift.
-    let tied = fresh.tie_workdir_applies(
-        crate::session::config::profile_config::resolve_config_or_warn(&profile)
-            .session
-            .tie_workdir_to_name,
-    );
-    let duplicate_path = if tied {
-        crate::session::worktree_edit::derived_worktree_path(
-            std::path::Path::new(&current_path),
-            &title,
-        )
-    } else {
-        current_path.clone()
-    };
-    let pair_changed = title != current_title
-        || duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/');
-    if pair_changed
-        && is_duplicate_session(disk_instances.iter(), &title, &duplicate_path, Some(&id))
-    {
-        let message = duplicate_session_error(&title).to_string();
-        return api_error(StatusCode::CONFLICT, "duplicate_session", message);
-    }
-
-    // What to write to disk + memory once any git side effect has landed.
-    let mut new_path: Option<String> = None;
-    let mut new_branch: Option<String> = None;
-
-    if tied {
-        // A directory move or branch rename is gated on a quiescent worktree,
-        // like the standalone worktree-name edit. A sandbox session's container
-        // keeps the dir mounted even while Idle, so the helper drops a
-        // merely-stopped container and only reports held for a live one.
-        //
-        // Short-circuited twice, because the helper removes a stopped
-        // container: once on the status check, so a request about to be
-        // rejected never discards, and once on whether the directory actually
-        // moves, so a no-op or branch-only rename does not either.
-        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
-        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
-            std::path::Path::new(&current_path),
-            &leaf,
-        );
-        let renames_branch = worktree_info.as_ref().is_some_and(|wt| {
-            crate::session::worktree_edit::worktree_branch_rename_required(
-                wt,
-                &leaf,
-                body.rename_branch,
-            )
-        });
-        let container_holds = !status.blocks_worktree_edit()
-            && moves_worktree
-            && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
-        if (moves_worktree || renames_branch) && (status.blocks_worktree_edit() || container_holds)
-        {
-            return api_error(StatusCode::CONFLICT, "session_running", "Stop the session before renaming its worktree directory or branch. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session.");
-        }
-
-        // Stop a live structured-view worker only when its cwd will move; a
-        // title-only or branch-only edit leaves the cwd valid.
-        // interrupt the worker.
-        if moves_worktree {
-            if let Err(response) =
-                quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+        let lock_id = id.clone();
+        let lock_profile = profile.clone();
+        let lock_file_watch = state.file_watch.clone();
+        let retained_storage = stopped.as_ref().map(|(storage, _)| storage.clone());
+        let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
+            match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let session_title_lock = crate::session::acquire_session_title_lock(&lock_id)?;
+                let storage = match retained_storage {
+                    Some(storage) => storage,
+                    None => Storage::open(&lock_profile, lock_file_watch)?,
+                };
+                storage.verify_profile_identity()?;
+                let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
+                let instances = storage.load()?;
+                Ok((session_title_lock, lifecycle_lock, storage, instances))
+            })
+            .await
             {
-                return response;
-            }
-        }
-
-        let wt = worktree_info.expect("tied implies worktree_info is Some");
-        let cur = current_path.clone();
-        let rename_branch = body.rename_branch;
-        let edit = tokio::task::spawn_blocking(move || {
-            crate::session::worktree_edit::edit_worktree_workdir(
-                crate::session::worktree_edit::WorktreeEditRequest {
-                    worktree_info: &wt,
-                    current_path: std::path::Path::new(&cur),
-                    new_name: &leaf,
-                    rename_branch,
-                },
-            )
-            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
-        })
-        .await;
-
-        match edit {
-            Ok(Ok((path, branch))) => {
-                // A sandbox container created against the old path is stale
-                // once the dir moved, so drop it to force a fresh create.
-                // Awaited so an immediate restart cannot race the removal.
-                if path != current_path {
-                    let id = id.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::session::worktree_edit::discard_sandbox_container_after_move(
-                            &id,
-                            is_sandboxed,
-                        )
-                    })
-                    .await;
+                Ok(Ok(locks)) => locks,
+                Ok(Err(error)) => {
+                    tracing::error!(target: "http.api.sessions", session = %id, "failed to acquire rename locks or load authoritative state: {error}");
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "title_lock_failed",
+                        "Could not serialize the session rename",
+                    );
                 }
-                new_path = Some(path);
-                new_branch = branch;
-            }
-            // The title slug already maps to the current leaf and no branch
-            // rename was asked for: fall through to a plain title rename.
-            Ok(Err(crate::session::worktree_edit::WorktreeEditError::Unchanged)) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "tied rename worktree edit failed: {e}");
-                let (code, msg) = worktree_edit_error_response(&e);
-                return (code, Json(serde_json::json!({ "message": msg }))).into_response();
-            }
-            Err(e) => {
-                tracing::error!(target: "http.api.sessions", "tied rename worktree edit join failed: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "message": "Worktree edit task failed" })),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // Persist BEFORE mutating in-memory state: once a git move has landed, a
-    // silent persist failure would leave metadata pointing at the old path
-    // after a restart, so it returns 500 rather than a misleading 200.
-    let title_clone = title.clone();
-    let id_clone = id.clone();
-    let new_path_clone = new_path.clone();
-    let new_branch_clone = new_branch.clone();
-    let persisted = tokio::task::spawn_blocking(move || {
-        persist_rename_metadata(
-            &storage,
-            &id_clone,
-            &title_clone,
-            new_path_clone.as_deref(),
-            new_branch_clone.as_deref(),
-        )
-    })
-    .await
-    .map_err(|error| error.to_string())
-    .and_then(|result| result.map_err(|error| error.to_string()));
-    let persisted_old_title = match persisted {
-        Ok(RenamePersistOutcome::Updated { old_title }) => old_title,
-        Ok(RenamePersistOutcome::Missing) => {
-            // AppState can lag an external delete. A missing authoritative row
-            // is not a successful rename and must not trigger tmux/cache work.
-            if let Some(path) = new_path.as_deref() {
-                tracing::warn!(
-                    target: "http.api.sessions",
-                    session = %id,
-                    new_path = %path,
-                    "authoritative row vanished after the worktree move; the moved directory is unreferenced"
-                );
-            }
-            return session_not_found();
-        }
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {error}");
-            // Persist-first: never mutate in-memory state on a failed write, or
-            // the rename silently reverts on restart.
-            let message = if new_path.is_some() {
-                "Worktree was moved on disk, but persisting the new session metadata failed"
-            } else {
-                "Persisting the renamed session failed"
+                Err(error) => {
+                    tracing::error!(target: "http.api.sessions", session = %id, "rename lock task failed: {error}");
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "title_lock_failed",
+                        "Could not serialize the session rename",
+                    );
+                }
             };
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "persist_failed", message);
-        }
-    };
-
-    let published_path = new_path.as_deref().unwrap_or(&current_path);
-    let renamed_path = new_path
-        .as_deref()
-        .filter(|path| *path != current_path.as_str());
-    let published_branch = new_branch.as_deref().or(current_branch.as_deref());
-    let renamed_branch = new_branch
-        .as_deref()
-        .filter(|branch| current_branch.as_deref() != Some(*branch));
-    let initial_branch = live
-        .worktree_info
-        .as_ref()
-        .map(|worktree| worktree.branch.as_str());
-    let mut response = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        let Some(mut fresh) = disk_instances
+            .iter()
+            .find(|instance| instance.id == id)
+            .cloned()
+        else {
             return session_not_found();
         };
-        apply_session_rename_cache_patch(
-            inst,
-            SessionRenameCachePatch {
-                title: &title,
-                initial_path: &live.project_path,
-                initial_branch,
-                authoritative_path: published_path,
-                authoritative_branch: published_branch,
-                renamed_path,
-                renamed_branch,
-            },
-        );
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
-    };
-    // Single-session responses skip list_sessions' overlay, so carry the
-    // resolved tie value here too; otherwise a managed worktree claims it is
-    // untied until the next list refresh (#1927).
-    response.tie_workdir_to_name = tied;
-    drop(_identity_lock);
+        fresh.source_profile.clone_from(&profile);
+        fresh.merge_runtime_from_reload(&live);
+        let current_title = fresh.title.clone();
+        let worktree_info = fresh.worktree_info.clone();
+        let current_path = fresh.project_path.clone();
+        let current_branch = worktree_info
+            .as_ref()
+            .map(|worktree| worktree.branch.clone());
+        let status = fresh.status;
+        let is_sandboxed = fresh.is_sandboxed();
+        let is_structured = fresh.is_structured();
 
-    let tmux_warning = if persisted_old_title != title && !is_structured {
-        let rekey_id = id.clone();
-        let rekey_old_title = persisted_old_title.clone();
-        let rekey_new_title = title.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
-        })
-        .await
+        // Tied mode (#1927): renaming an aoe-managed worktree session also moves
+        // its directory leaf, so title and dir cannot drift.
+        let tied = fresh.tie_workdir_applies(
+            crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                .session
+                .tie_workdir_to_name,
+        );
+        let duplicate_path = if tied {
+            crate::session::worktree_edit::derived_worktree_path(
+                std::path::Path::new(&current_path),
+                &title,
+            )
+        } else {
+            current_path.clone()
+        };
+        let pair_changed = title != current_title
+            || duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/');
+        if pair_changed
+            && is_duplicate_session(disk_instances.iter(), &title, &duplicate_path, Some(&id))
         {
-            Ok(Ok(_)) => None,
-            Ok(Err(error)) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "tmux rename failed after persistence: {error}");
-                Some(format!(
-                    "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
-                ))
+            let message = duplicate_session_error(&title).to_string();
+            return api_error(StatusCode::CONFLICT, "duplicate_session", message);
+        }
+
+        // What to write to disk + memory once any git side effect has landed.
+        let mut new_path: Option<String> = None;
+        let mut new_branch: Option<String> = None;
+
+        if tied {
+            // A directory move or branch rename is gated on a quiescent worktree,
+            // like the standalone worktree-name edit. A sandbox session's container
+            // keeps the dir mounted even while Idle, so the helper drops a
+            // merely-stopped container and only reports held for a live one.
+            //
+            // Short-circuited twice, because the helper removes a stopped
+            // container: once on the status check, so a request about to be
+            // rejected never discards, and once on whether the directory actually
+            // moves, so a no-op or branch-only rename does not either.
+            let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
+            let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+                std::path::Path::new(&current_path),
+                &leaf,
+            );
+            let renames_branch = worktree_info.as_ref().is_some_and(|wt| {
+                crate::session::worktree_edit::worktree_branch_rename_required(
+                    wt,
+                    &leaf,
+                    body.rename_branch,
+                )
+            });
+            let container_holds = !status.blocks_worktree_edit()
+                && moves_worktree
+                && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
+            if (moves_worktree || renames_branch)
+                && (status.blocks_worktree_edit() || container_holds)
+            {
+                return api_error(StatusCode::CONFLICT, "session_running", "Stop the session before renaming its worktree directory or branch. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session.");
             }
-            Err(error) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "tmux rename task failed after persistence: {error}");
-                Some(format!(
-                    "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
-                ))
+
+            if moves_worktree {
+                if stopped.is_none() {
+                    drop(_lifecycle_lock);
+                    drop(_session_title_lock);
+                    drop(_identity_lock);
+                    drop(_workspace_lock);
+                    let generation =
+                        match reserve_and_settle_worktree_move(&state, &storage, &fresh).await {
+                            Ok(generation) => generation,
+                            Err(response) => return response,
+                        };
+                    stopped = Some((storage, generation));
+                    continue;
+                }
+                let stop = stopped
+                    .as_ref()
+                    .expect("checkout stop was claimed")
+                    .1
+                    .clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    crate::session::runner_journal::release_settled_stop_under_locks(&stop)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                {
+                    return api_error(
+                        StatusCode::CONFLICT,
+                        "runner_not_quiescent",
+                        error.to_string(),
+                    );
+                }
+            }
+
+            let wt = worktree_info.expect("tied implies worktree_info is Some");
+            let cur = current_path.clone();
+            let rename_branch = body.rename_branch;
+            let edit_storage = storage.clone();
+            let edit_id = id.clone();
+            let edit = tokio::task::spawn_blocking(move || {
+                edit_storage
+                    .ensure_worktree_edit_unclaimed_under_workspace_lock(
+                        &edit_id,
+                        std::path::Path::new(&cur),
+                        &leaf,
+                    )
+                    .map_err(|error| {
+                        crate::session::worktree_edit::WorktreeEditError::PathClaim(
+                            error.to_string(),
+                        )
+                    })?;
+                crate::session::worktree_edit::edit_worktree_workdir(
+                    crate::session::worktree_edit::WorktreeEditRequest {
+                        worktree_info: &wt,
+                        current_path: std::path::Path::new(&cur),
+                        new_name: &leaf,
+                        rename_branch,
+                    },
+                )
+                .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
+            })
+            .await;
+
+            match edit {
+                Ok(Ok((path, branch))) => {
+                    // A sandbox container created against the old path is stale
+                    // once the dir moved, so drop it to force a fresh create.
+                    // Awaited so an immediate restart cannot race the removal.
+                    if path != current_path {
+                        let id = id.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::session::worktree_edit::discard_sandbox_container_after_move(
+                                &id,
+                                is_sandboxed,
+                            )
+                        })
+                        .await;
+                    }
+                    new_path = Some(path);
+                    new_branch = branch;
+                }
+                // The title slug already maps to the current leaf and no branch
+                // rename was asked for: fall through to a plain title rename.
+                Ok(Err(crate::session::worktree_edit::WorktreeEditError::Unchanged)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(target: "http.api.sessions", session = %id, "tied rename worktree edit failed: {e}");
+                    let (code, msg) = worktree_edit_error_response(&e);
+                    return (code, Json(serde_json::json!({ "message": msg }))).into_response();
+                }
+                Err(e) => {
+                    tracing::error!(target: "http.api.sessions", "tied rename worktree edit join failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+                    )
+                        .into_response();
+                }
             }
         }
-    } else {
-        None
-    };
-    if let Some(warning) = tmux_warning {
-        response.warnings.push(warning);
-    }
 
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+        // Persist BEFORE mutating in-memory state: once a git move has landed, a
+        // silent persist failure would leave metadata pointing at the old path
+        // after a restart, so it returns 500 rather than a misleading 200.
+        let rekey_target = if !is_structured && title != current_title {
+            crate::tmux::capture_rekey_session(&id, &current_title)
+        } else {
+            Ok(None)
+        };
+        let title_clone = title.clone();
+        let id_clone = id.clone();
+        let new_path_clone = new_path.clone();
+        let new_branch_clone = new_branch.clone();
+        let expected_generation = fresh.lifecycle_generation;
+        let expected_path = current_path.clone();
+        let persisted = tokio::task::spawn_blocking(move || {
+            persist_rename_metadata(
+                &storage,
+                &id_clone,
+                expected_generation,
+                &expected_path,
+                &title_clone,
+                new_path_clone.as_deref(),
+                new_branch_clone.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+        let persisted_old_title = match persisted {
+            Ok(RenamePersistOutcome::Updated { old_title }) => old_title,
+            Ok(RenamePersistOutcome::Missing) => {
+                // AppState can lag an external delete. A missing authoritative row
+                // is not a successful rename and must not trigger tmux/cache work.
+                if let Some(path) = new_path.as_deref() {
+                    tracing::warn!(
+                        target: "http.api.sessions",
+                        session = %id,
+                        new_path = %path,
+                        "authoritative row vanished after the worktree move; the moved directory is unreferenced"
+                    );
+                }
+                return session_not_found();
+            }
+            Err(error) => {
+                tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {error}");
+                // Persist-first: never mutate in-memory state on a failed write, or
+                // the rename silently reverts on restart.
+                let message = if new_path.is_some() {
+                    "Worktree was moved on disk, but persisting the new session metadata failed"
+                } else {
+                    "Persisting the renamed session failed"
+                };
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "persist_failed", message);
+            }
+        };
+
+        let published_path = new_path.as_deref().unwrap_or(&current_path);
+        let renamed_path = new_path
+            .as_deref()
+            .filter(|path| *path != current_path.as_str());
+        let published_branch = new_branch.as_deref().or(current_branch.as_deref());
+        let renamed_branch = new_branch
+            .as_deref()
+            .filter(|branch| current_branch.as_deref() != Some(*branch));
+        let initial_branch = live
+            .worktree_info
+            .as_ref()
+            .map(|worktree| worktree.branch.as_str());
+        let mut response = {
+            let mut instances = state.instances.write().await;
+            let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+                return session_not_found();
+            };
+            apply_session_rename_cache_patch(
+                inst,
+                SessionRenameCachePatch {
+                    title: &title,
+                    initial_path: &live.project_path,
+                    initial_branch,
+                    authoritative_path: published_path,
+                    authoritative_branch: published_branch,
+                    renamed_path,
+                    renamed_branch,
+                },
+            );
+            SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
+        };
+        // Single-session responses skip list_sessions' overlay, so carry the
+        // resolved tie value here too; otherwise a managed worktree claims it is
+        // untied until the next list refresh (#1927).
+        response.tie_workdir_to_name = tied;
+
+        let tmux_warning = if persisted_old_title != title && !is_structured {
+            let rekey_id = id.clone();
+
+            let rekey_new_title = title.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::tmux::rekey_session(&rekey_id, &rekey_new_title, rekey_target)
+            })
+            .await
+            {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "http.api.sessions", session = %id, "tmux rename failed after persistence: {error}");
+                    Some(format!(
+                    "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
+                ))
+                }
+                Err(error) => {
+                    tracing::warn!(target: "http.api.sessions", session = %id, "tmux rename task failed after persistence: {error}");
+                    Some(format!(
+                    "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
+                ))
+                }
+            }
+        } else {
+            None
+        };
+        drop(_identity_lock);
+        if let Some(warning) = tmux_warning {
+            response.warnings.push(warning);
+        }
+
+        return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
+    }
 }
 
 // --- Edit worktree workdir name ---
@@ -556,6 +637,7 @@ fn worktree_edit_error_response(
 ) -> (StatusCode, String) {
     use crate::session::worktree_edit::WorktreeEditError as E;
     match e {
+        E::PathClaim(_) => (StatusCode::CONFLICT, "Worktree path ownership is uncertain or reserved".to_owned()),
         E::NotManaged => (
             StatusCode::BAD_REQUEST,
             "This worktree is not managed by aoe; its workdir name cannot be edited".to_string(),
@@ -647,231 +729,301 @@ pub async fn set_worktree_name(
         inst.clone()
     };
     let profile = live.source_profile.clone();
-    let _identity_lock = match tokio::task::spawn_blocking(
-        crate::session::acquire_session_identity_lock,
-    )
-    .await
-    {
-        Ok(Ok(lock)) => lock,
-        Ok(Err(error)) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire worktree identity lock");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree identity lock task failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let lock_id = id.clone();
-    let lock_profile = profile.clone();
-    let lock_file_watch = state.file_watch.clone();
-    let (_lifecycle_lock, storage, authoritative_instances) = match tokio::task::spawn_blocking(
-        move || -> anyhow::Result<_> {
-            let storage = Storage::new(&lock_profile, lock_file_watch)?;
-            let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
-            let instances = storage.load()?;
-            Ok((lifecycle, storage, instances))
-        },
-    )
-    .await
-    {
-        Ok(Ok(locked)) => locked,
-        Ok(Err(error)) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree rename lock task failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let Some(mut fresh) = authoritative_instances
-        .iter()
-        .find(|instance| instance.id == id)
-        .cloned()
-    else {
-        return session_not_found();
-    };
-    fresh.source_profile.clone_from(&profile);
-    fresh.merge_runtime_from_reload(&live);
-    let worktree_info = fresh.worktree_info.clone();
-    let current_path = fresh.project_path.clone();
-    let status = fresh.status;
-    let is_sandboxed = fresh.is_sandboxed();
-    let is_structured = fresh.is_structured();
+    let mut stopped: Option<(Storage, Arc<crate::session::runner_journal::OwnedStop>)> = None;
+    loop {
+        let (_workspace_lock, _identity_lock) = match tokio::task::spawn_blocking(|| {
+            let workspace = crate::session::acquire_session_workspace_claim_lock()?;
+            let identity = crate::session::acquire_session_identity_lock()?;
+            Ok::<_, anyhow::Error>((workspace, identity))
+        })
+        .await
+        {
+            Ok(Ok(lock)) => lock,
+            Ok(Err(error)) => {
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire worktree identity lock");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Err(error) => {
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree identity lock task failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let lock_id = id.clone();
+        let lock_profile = profile.clone();
+        let lock_file_watch = state.file_watch.clone();
+        let retained_storage = stopped.as_ref().map(|(storage, _)| storage.clone());
+        let (_lifecycle_lock, storage, authoritative_instances) = match tokio::task::spawn_blocking(
+            move || -> anyhow::Result<_> {
+                let storage = match retained_storage {
+                    Some(storage) => storage,
+                    None => Storage::open(&lock_profile, lock_file_watch)?,
+                };
+                storage.verify_profile_identity()?;
+                let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
+                let instances = storage.load()?;
+                if instances.iter().any(|instance| {
+                    instance.id == lock_id
+                        && instance
+                            .lifecycle_reservation
+                            .as_ref()
+                            .is_some_and(|reservation| {
+                                reservation.op == crate::session::LifecycleOperation::Attach
+                                    && instance.has_active_lifecycle_reservation(chrono::Utc::now())
+                            })
+                }) {
+                    // An expected lifecycle conflict, not a defect: the caller
+                    // retries once the attach settles.
+                    return Err(AttachInProgress.into());
+                }
+                Ok((lifecycle, storage, instances))
+            },
+        )
+        .await
+        {
+            Ok(Ok(locked)) => locked,
+            Ok(Err(error)) if error.downcast_ref::<AttachInProgress>().is_some() => {
+                tracing::info!(target: "http.api.sessions", session = %id, "worktree rename refused: the session is attaching a project");
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "lifecycle_busy",
+                    "This session is attaching a project; retry once the attach settles.",
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Err(error) => {
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree rename lock task failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let Some(mut fresh) = authoritative_instances
+            .iter()
+            .find(|instance| instance.id == id)
+            .cloned()
+        else {
+            return session_not_found();
+        };
+        fresh.source_profile.clone_from(&profile);
+        fresh.merge_runtime_from_reload(&live);
+        let worktree_info = fresh.worktree_info.clone();
+        let current_path = fresh.project_path.clone();
+        let status = fresh.status;
+        let is_sandboxed = fresh.is_sandboxed();
 
-    let Some(worktree_info) = worktree_info else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": "Session does not use a worktree" })),
+        let Some(worktree_info) = worktree_info else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": "Session does not use a worktree" })),
+            )
+                .into_response();
+        };
+        // When tied (#1927) the directory follows the title, so reject the
+        // standalone edit and point callers at the unified rename.
+        if worktree_info.managed_by_aoe
+            && crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                .session
+                .tie_workdir_to_name
+        {
+            return api_error(StatusCode::CONFLICT, "tied", "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows.");
+        }
+        let duplicate_path = crate::session::worktree_edit::target_worktree_path(
+            std::path::Path::new(&current_path),
+            &name,
         )
-            .into_response();
-    };
-    // When tied (#1927) the directory follows the title, so reject the
-    // standalone edit and point callers at the unified rename.
-    if worktree_info.managed_by_aoe
-        && crate::session::config::profile_config::resolve_config_or_warn(&profile)
-            .session
-            .tie_workdir_to_name
-    {
-        return api_error(StatusCode::CONFLICT, "tied", "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows.");
-    }
-    let duplicate_path = crate::session::worktree_edit::target_worktree_path(
-        std::path::Path::new(&current_path),
-        &name,
-    )
-    .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
-    .to_string_lossy()
-    .into_owned();
-    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &fresh.title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        let message = duplicate_session_error(&fresh.title).to_string();
-        return api_error(StatusCode::CONFLICT, "duplicate_session", message);
-    }
-    // A sandbox container keeps the worktree dir mounted even while Idle, so
-    // the helper drops a merely-stopped container and only reports held for a
-    // live one. Short-circuited twice, because the helper removes a stopped
-    // container: once on the status check, so a request about to be rejected
-    // never discards, and once on whether the directory actually moves.
-    let moves_worktree = crate::session::worktree_edit::worktree_move_required(
-        std::path::Path::new(&current_path),
-        &name,
-    );
-    let container_holds = !status.blocks_worktree_edit()
-        && moves_worktree
-        && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
-    if status.blocks_worktree_edit() || container_holds {
-        return (
+        .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
+        .to_string_lossy()
+        .into_owned();
+        if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
+            && is_duplicate_session(
+                authoritative_instances.iter(),
+                &fresh.title,
+                &duplicate_path,
+                Some(&id),
+            )
+        {
+            let message = duplicate_session_error(&fresh.title).to_string();
+            return api_error(StatusCode::CONFLICT, "duplicate_session", message);
+        }
+        // A sandbox container keeps the worktree dir mounted even while Idle, so
+        // the helper drops a merely-stopped container and only reports held for a
+        // live one. Short-circuited twice, because the helper removes a stopped
+        // container: once on the status check, so a request about to be rejected
+        // never discards, and once on whether the directory actually moves.
+        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+            std::path::Path::new(&current_path),
+            &name,
+        );
+        let container_holds = !status.blocks_worktree_edit()
+            && moves_worktree
+            && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
+        if status.blocks_worktree_edit() || container_holds {
+            return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "message": "Cannot edit the workdir name while the session is active; stop it first"
             })),
         )
             .into_response();
-    }
-
-    // Stop any live structured-view worker before the move so it cannot crash
-    // on the pulled-out cwd and respawn-loop at the stale path (#2260). Gated on
-    // `moves_worktree` for the same reason as the tied rename path: a
-    // branch-only edit leaves the cwd valid.
-    if moves_worktree {
-        if let Err(resp) =
-            quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
-        {
-            return resp;
         }
-    }
 
-    let wt = worktree_info.clone();
-    let cur = current_path.clone();
-    let new_name = name.clone();
-    let rename_branch = body.rename_branch;
-    let edit = tokio::task::spawn_blocking(move || {
-        crate::session::worktree_edit::edit_worktree_workdir(
-            crate::session::worktree_edit::WorktreeEditRequest {
-                worktree_info: &wt,
-                current_path: std::path::Path::new(&cur),
-                new_name: &new_name,
-                rename_branch,
-            },
-        )
-        .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
-    })
-    .await;
-
-    let (new_path, new_branch) = match edit {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "worktree edit failed: {e}");
-            let (code, msg) = worktree_edit_error_response(&e);
-            return (code, Json(serde_json::json!({ "message": msg }))).into_response();
+        if moves_worktree {
+            if stopped.is_none() {
+                drop(_lifecycle_lock);
+                drop(_identity_lock);
+                drop(_workspace_lock);
+                let generation =
+                    match reserve_and_settle_worktree_move(&state, &storage, &fresh).await {
+                        Ok(generation) => generation,
+                        Err(response) => return response,
+                    };
+                stopped = Some((storage, generation));
+                continue;
+            }
+            let stop = stopped
+                .as_ref()
+                .expect("checkout stop was claimed")
+                .1
+                .clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                crate::session::runner_journal::release_settled_stop_under_locks(&stop)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+            {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "runner_not_quiescent",
+                    error.to_string(),
+                );
+            }
         }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "worktree edit join failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+
+        let wt = worktree_info.clone();
+        let cur = current_path.clone();
+        let new_name = name.clone();
+        let rename_branch = body.rename_branch;
+        let edit_storage = storage.clone();
+        let edit_id = id.clone();
+        let edit = tokio::task::spawn_blocking(move || {
+            edit_storage
+                .ensure_worktree_edit_unclaimed_under_workspace_lock(
+                    &edit_id,
+                    std::path::Path::new(&cur),
+                    &new_name,
+                )
+                .map_err(|error| {
+                    crate::session::worktree_edit::WorktreeEditError::PathClaim(error.to_string())
+                })?;
+            crate::session::worktree_edit::edit_worktree_workdir(
+                crate::session::worktree_edit::WorktreeEditRequest {
+                    worktree_info: &wt,
+                    current_path: std::path::Path::new(&cur),
+                    new_name: &new_name,
+                    rename_branch,
+                },
             )
-                .into_response();
-        }
-    };
-
-    // A sandbox container created against the old path is stale once the dir
-    // moved, so drop it to force a fresh create. Awaited so an immediate restart
-    // cannot race the removal.
-    if new_path != current_path {
-        let id_for_discard = id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            crate::session::worktree_edit::discard_sandbox_container_after_move(
-                &id_for_discard,
-                is_sandboxed,
-            )
+            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
         })
         .await;
-    }
 
-    // The git move has already landed, so persist BEFORE mutating in-memory
-    // state; a silent persist failure would leave metadata pointing at the old
-    // path after a restart, so it returns 500 rather than a misleading 200.
-    let persist_failed = || {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "persist_failed",
-            "Worktree was moved on disk, but persisting the new session metadata failed",
-        )
-    };
-
-    let id_clone = id.clone();
-    let new_path_clone = new_path.clone();
-    let new_branch_clone = new_branch.clone();
-    match tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
-            let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
-                return Ok(false);
-            };
-            apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
-            Ok(true)
-        })
-    })
-    .await
-    {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                new_path = %new_path,
-                "authoritative row vanished after the worktree move; the moved directory is unreferenced"
-            );
-            return session_not_found();
-        }
-        Ok(Err(e)) => {
-            tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}");
-            return persist_failed();
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "Worktree edit persist join failed: {e}");
-            return persist_failed();
-        }
-    }
-
-    let response = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            return session_not_found();
+        let (new_path, new_branch) = match edit {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "worktree edit failed: {e}");
+                let (code, msg) = worktree_edit_error_response(&e);
+                return (code, Json(serde_json::json!({ "message": msg }))).into_response();
+            }
+            Err(e) => {
+                tracing::error!(target: "http.api.sessions", "worktree edit join failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+                )
+                    .into_response();
+            }
         };
-        apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
-    };
-    drop(_identity_lock);
 
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+        // A sandbox container created against the old path is stale once the dir
+        // moved, so drop it to force a fresh create. Awaited so an immediate restart
+        // cannot race the removal.
+        if new_path != current_path {
+            let id_for_discard = id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::session::worktree_edit::discard_sandbox_container_after_move(
+                    &id_for_discard,
+                    is_sandboxed,
+                )
+            })
+            .await;
+        }
+
+        // The git move has already landed, so persist BEFORE mutating in-memory
+        // state; a silent persist failure would leave metadata pointing at the old
+        // path after a restart, so it returns 500 rather than a misleading 200.
+        let persist_failed = || {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "persist_failed",
+                "Worktree was moved on disk, but persisting the new session metadata failed",
+            )
+        };
+
+        let expected_generation = fresh.lifecycle_generation;
+        let expected_path = current_path.clone();
+        let id_clone = id.clone();
+        let new_path_clone = new_path.clone();
+        let new_branch_clone = new_branch.clone();
+        match tokio::task::spawn_blocking(move || {
+            storage.update_under_workspace_claim_lock(|instances, _groups| {
+                let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                    return Ok(false);
+                };
+                anyhow::ensure!(
+                    inst.lifecycle_generation == expected_generation
+                        && inst.project_path == expected_path,
+                    "workdir plan was superseded before commit"
+                );
+                apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
+                Ok(true)
+            })
+        })
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    new_path = %new_path,
+                    "authoritative row vanished after the worktree move; the moved directory is unreferenced"
+                );
+                return session_not_found();
+            }
+            Ok(Err(e)) => {
+                tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}");
+                return persist_failed();
+            }
+            Err(e) => {
+                tracing::error!(target: "http.api.sessions", "Worktree edit persist join failed: {e}");
+                return persist_failed();
+            }
+        }
+
+        let response = {
+            let mut instances = state.instances.write().await;
+            let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+                return session_not_found();
+            };
+            apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
+            SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
+        };
+        drop(_identity_lock);
+
+        return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
+    }
 }
 
 // --- Attach a project to an existing session (#3103) ---
@@ -924,12 +1076,16 @@ pub async fn attach_session_project(
             .into_response();
     }
 
-    let profile = {
+    let (profile, original) = {
         let instances = state.instances.read().await;
-        match instances.iter().find(|i| i.id == id) {
-            Some(inst) => inst.source_profile.clone(),
-            None => return session_not_found(),
-        }
+        let Some(instance) = instances.iter().find(|row| row.id == id) else {
+            return session_not_found();
+        };
+        let original = match state.capture_operation_origin(instance) {
+            Ok(original) => original,
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+        };
+        (instance.source_profile.clone(), original)
     };
 
     // A bare name is a registry lookup; anything path-shaped is used as-is, so
@@ -951,7 +1107,8 @@ pub async fn attach_session_project(
         crate::session::attach_project::ExistingBranch::Refuse
     };
 
-    match crate::server::attach_project::attach_project(&state, &id, &repo_path, on_existing).await
+    match crate::server::attach_project::attach_project(&state, original, &repo_path, on_existing)
+        .await
     {
         Ok((outcome, worker)) => {
             use crate::server::attach_project::WorkerOutcome;

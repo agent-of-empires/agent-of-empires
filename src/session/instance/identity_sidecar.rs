@@ -267,13 +267,10 @@ impl Instance {
             return;
         };
         let expected = self.conversation_state();
-        match persist_session_to_storage(
-            &self.effective_profile(),
-            &self.id,
-            &observation,
-            &expected,
-            &self.resolve_file_watch(),
-        ) {
+        let Ok(storage) = self.original_storage() else {
+            return;
+        };
+        match persist_session_to_storage(&storage, &self.id, &observation, &expected) {
             SidWrite::Applied => self.apply_conversation_observation(&observation),
             SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
                 self.reconcile_from_disk();
@@ -341,13 +338,10 @@ impl Instance {
         if !pi_transcript_names(path, &observation.sid) {
             return true;
         }
-        match crate::session::storage::Storage::new(
-            &self.effective_profile(),
-            self.resolve_file_watch(),
-        ) {
-            Ok(storage) => self.persist_pi_transcript_into(&storage, observation, path),
-            Err(_) => false,
-        }
+        let Ok(storage) = self.original_storage() else {
+            return false;
+        };
+        self.persist_pi_transcript_into(&storage, observation, path)
     }
 
     pub(super) fn persist_pi_transcript_into(
@@ -374,26 +368,30 @@ impl Instance {
         observation: &crate::session::poller::SessionIdObservation,
         path: &str,
     ) -> Option<bool> {
-        match storage.update(|instances, _| {
-            #[cfg(test)]
-            anyhow::ensure!(
-                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
-                    && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
-                        let armed = fail.replace(false);
-                        if armed {
-                            FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(true));
-                        }
-                        armed
-                    }),
-                "injected transcript path write failure"
-            );
-            let row = instances
-                .iter_mut()
-                .find(|row| row.id == self.id && row.observation_is_current_pi_path(observation));
-            Ok(row
-                .map(|row| row.pi_session_path = Some(path.to_string()))
-                .is_some())
-        }) {
+        match storage.update_metadata(
+            crate::session::MetadataSelection::Session(self.id.as_str().into()),
+            |instances, _| {
+                #[cfg(test)]
+                anyhow::ensure!(
+                    !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
+                        && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
+                            let armed = fail.replace(false);
+                            if armed {
+                                FAIL_NEXT_PI_PATH_WRITE_CONSUMED
+                                    .with(|consumed| consumed.set(true));
+                            }
+                            armed
+                        }),
+                    "injected transcript path write failure"
+                );
+                let row = instances.iter_mut().find(|row| {
+                    row.id == self.id && row.observation_is_current_pi_path(observation)
+                });
+                Ok(row
+                    .map(|row| row.pi_session_path = Some(path.to_string()))
+                    .is_some())
+            },
+        ) {
             Ok(stored) => Some(stored),
             Err(error) => {
                 tracing::warn!(
@@ -883,6 +881,7 @@ pi = "~/.pi-personal"
         inst.sandbox_info = Some(test_sandbox("aoe-pi-path-retry", None));
         inst.agent_session_id = Some(sid.to_string());
         let mut storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        inst.storage_origin = Some(std::sync::Arc::new(storage.clone()));
         let seed = inst.clone();
         storage
             .update(|instances, _| {

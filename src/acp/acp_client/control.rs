@@ -273,6 +273,7 @@ pub(super) async fn connect_runner_control_v3(
     session_label: String,
     terminal_claim: Arc<TerminalClaim>,
     prompt_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    expected_nonce: uuid::Uuid,
 ) -> anyhow::Result<(Arc<DaemonControlClient>, tokio::io::DuplexStream)> {
     let bound = runner_socket_deadline();
     let dial = async {
@@ -300,14 +301,17 @@ pub(super) async fn connect_runner_control_v3(
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
                 session_id,
+                launch_nonce,
             })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
-                && session_id == session_label => {}
+                && session_id == session_label
+                && launch_nonce == Some(expected_nonce) => {}
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
                 session_id,
+                launch_nonce,
             })) => {
                 return Err(anyhow::anyhow!(
-                    "runner Hello mismatch: expected session {session_label:?} protocol v{}, got session {session_id:?} protocol v{control_protocol_version}",
+                    "runner Hello mismatch: expected session {session_label:?} protocol v{} execution {expected_nonce}, got session {session_id:?} protocol v{control_protocol_version} execution {launch_nonce:?}",
                     control_protocol::CONTROL_PROTOCOL_VERSION
                 ));
             }
@@ -773,6 +777,7 @@ mod tests {
         let hello = ControlBody::Hello {
             control_protocol_version: version,
             session_id: session.into(),
+            launch_nonce: Some(uuid::Uuid::from_u128(1)),
         };
         let _ = control_protocol::write_frame(&mut peer, &hello).await;
         peer
@@ -786,7 +791,15 @@ mod tests {
         in_flight: bool,
     ) -> anyhow::Result<(Arc<DaemonControlClient>, tokio::io::DuplexStream)> {
         let in_flight = Arc::new(AtomicBool::new(in_flight));
-        connect_runner_control_v3(control, event_tx, session.into(), terminal, in_flight).await
+        connect_runner_control_v3(
+            control,
+            event_tx,
+            session.into(),
+            terminal,
+            in_flight,
+            uuid::Uuid::from_u128(1),
+        )
+        .await
     }
 
     struct PromptControlPeer {
@@ -818,6 +831,7 @@ mod tests {
                     "prompt".into(),
                     terminal.clone(),
                     in_flight.clone(),
+                    uuid::Uuid::from_u128(1),
                 ),
                 async {
                     let mut peer = accept_hello(
@@ -1291,6 +1305,7 @@ mod tests {
                     None,
                     "codex".into(),
                     None,
+                    uuid::Uuid::from_u128(1),
                 )
                 .await
                 .unwrap();
@@ -1344,6 +1359,7 @@ mod tests {
                 &ControlBody::Hello {
                     control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
                     session_id: "native-resume".into(),
+                    launch_nonce: Some(uuid::Uuid::from_u128(1)),
                 },
             )
             .await
@@ -1463,6 +1479,7 @@ mod tests {
                 None,
                 "codex".into(),
                 None,
+                uuid::Uuid::from_u128(1),
             )
             .await
             .unwrap();
@@ -1508,6 +1525,7 @@ mod tests {
                 &ControlBody::Hello {
                     control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
                     session_id: "byte-backlog".into(),
+                    launch_nonce: Some(uuid::Uuid::from_u128(1)),
                 },
             )
             .await
@@ -1590,6 +1608,7 @@ mod tests {
                 None,
                 "codex".into(),
                 None,
+                uuid::Uuid::from_u128(1),
             )
             .await
             .expect("producer-admitted backlog must attach");
@@ -1651,6 +1670,7 @@ mod tests {
                 "s".into(),
                 guard.clone(),
                 prompt_in_flight.clone(),
+                uuid::Uuid::from_u128(1),
             )
             .await
             .unwrap();
@@ -1684,33 +1704,63 @@ mod tests {
             "AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS",
             "150",
         )]);
-        let tmp = tempfile::tempdir().unwrap();
-        let (mismatch, listener) = bind(&tmp);
-        let fake = tokio::spawn(async move { accept_hello(&listener, "s", 999).await });
-        let absent =
-            crate::process::worker::control_socket_sibling(&tmp.path().join("absent.sock"));
-        let overlong = tmp.path().join("x".repeat(200));
-        for (path, expected, unexpected) in [
-            (&mismatch, "runner Hello mismatch", None),
-            (&absent, "timed out attaching runner control socket", None),
+        for (session, version, nonce) in [
+            ("s", 999, Some(uuid::Uuid::from_u128(1))),
             (
-                &overlong,
-                "connect runner control socket",
-                Some("timed out attaching"),
+                "other-session",
+                control_protocol::CONTROL_PROTOCOL_VERSION,
+                Some(uuid::Uuid::from_u128(1)),
             ),
+            (
+                "s",
+                control_protocol::CONTROL_PROTOCOL_VERSION,
+                Some(uuid::Uuid::from_u128(2)),
+            ),
+            ("s", control_protocol::CONTROL_PROTOCOL_VERSION, None),
         ] {
-            let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
-            let guard = Arc::new(TerminalClaim::new());
-            let Err(error) = connect(path, "s", event_tx, guard.clone(), false).await else {
-                panic!("attach to {} must fail", path.display());
-            };
-            let message = format!("{error:#}");
-            assert!(message.contains(expected), "{message}");
-            assert!(unexpected.is_none_or(|u| !message.contains(u)), "{message}");
-            assert!(!guard.claimed());
-            assert!(event_rx.try_recv().is_err());
+            let tmp = tempfile::tempdir().unwrap();
+            let (socket, listener) = bind(&tmp);
+            let fake = tokio::spawn(async move {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                control_protocol::write_frame(
+                    &mut peer,
+                    &ControlBody::Hello {
+                        control_protocol_version: version,
+                        session_id: session.into(),
+                        launch_nonce: nonce,
+                    },
+                )
+                .await
+                .unwrap();
+                // No Attach, initialization, native load/resume, or shutdown may reach
+                // a different or legacy execution, even though the session ID matches.
+                assert!(control_protocol::read_frame(&mut peer)
+                    .await
+                    .unwrap()
+                    .is_none());
+            });
+            let (event_tx, mut events) = mpsc::channel::<Event>(8);
+            let terminal = Arc::new(TerminalClaim::new());
+            assert!(connect(&socket, "s", event_tx, terminal.clone(), false)
+                .await
+                .is_err());
+            assert!(!terminal.claimed());
+            assert!(events.try_recv().is_err());
+            fake.await.unwrap();
         }
-        let _ = fake.await;
+        let tmp = tempfile::tempdir().unwrap();
+        for path in [
+            tmp.path().join("absent.sock"),
+            tmp.path().join("x".repeat(200)),
+        ] {
+            let (event_tx, mut events) = mpsc::channel::<Event>(8);
+            let terminal = Arc::new(TerminalClaim::new());
+            assert!(connect(&path, "s", event_tx, terminal.clone(), false)
+                .await
+                .is_err());
+            assert!(!terminal.claimed());
+            assert!(events.try_recv().is_err());
+        }
     }
 
     /// A load must not count as replayed until the crate has applied the replay
@@ -1736,6 +1786,7 @@ mod tests {
                 &ControlBody::Hello {
                     control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
                     session_id: "replayed".into(),
+                    launch_nonce: Some(uuid::Uuid::from_u128(1)),
                 },
             )
             .await
@@ -1805,6 +1856,7 @@ mod tests {
                 "replayed".into(),
                 Arc::new(TerminalClaim::new()),
                 Arc::new(AtomicBool::new(false)),
+                uuid::Uuid::from_u128(1),
             )
             .await
             .unwrap();

@@ -105,6 +105,7 @@ fn spawn_request_for(
     instance: &crate::session::Instance,
     agent: String,
     sandbox_info: Option<crate::session::SandboxInfo>,
+    origin: Arc<crate::session::LaunchOrigin>,
 ) -> SpawnRequest {
     SpawnRequest {
         session_id: instance.id.clone(),
@@ -121,9 +122,7 @@ fn spawn_request_for(
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
-        // Passed even without sandboxing so agent_acp_cmd and worker env
-        // resolve from the session's profile.
-        source_profile: Some(instance.source_profile.clone()),
+        origin: Some(origin),
         yolo_mode: instance.yolo_mode,
         acp_mode_id: instance.acp_mode_id.clone(),
         agent_command_override: crate::server::acp_reconciler::command_override_for_spawn(
@@ -393,8 +392,13 @@ mod tests {
                 }
             };
             tokio::pin!(handler);
-            assert!(futures_util::poll!(&mut handler).is_pending(), "{which}");
-            assert_eq!(claims.try_recv().expect("contender reached claim"), id);
+            let claimed = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    claim = claims.recv() => claim.expect("contender reached claim"),
+                    _ = &mut handler => panic!("{which} completed before the in-flight submission released"),
+                }
+            }).await.expect("contender must reach the claim without blocking the executor");
+            assert_eq!(claimed, id);
 
             drop(delivering);
             tokio::time::timeout(Duration::from_secs(10), handler)
@@ -462,7 +466,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn terminal_handoff_cas_follows_the_adopted_durable_row_through_a_reload() {
-        use std::{future::Future, task::Poll, time::Duration};
+        use std::time::Duration;
 
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -489,6 +493,7 @@ mod tests {
                     durable.view = crate::session::View::Structured;
                     durable.acp_session_id = Some("11111111-1111-4111-8111-111111111111".into());
                     let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+                    durable.storage_origin = Some(Arc::new(storage.clone()));
                     storage
                         .update(|all, _| {
                             *all = vec![durable.clone()];
@@ -505,12 +510,14 @@ mod tests {
                     entered_rx.await.unwrap();
                     let lock = state.instance_lock(&id).await;
                     let mut handler = Box::pin(acp_disable(State(state.clone()), Path(id.clone())));
-                    std::future::poll_fn(|cx| {
-                        assert!(handler.as_mut().poll(cx).is_pending());
-                        Poll::Ready(())
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while lock.try_lock().is_ok() {
+                            assert!(futures_util::poll!(&mut handler).is_pending());
+                            tokio::task::yield_now().await;
+                        }
                     })
-                    .await;
-                    assert!(lock.try_lock().is_err());
+                    .await
+                    .expect("disable must acquire its logical claim while storage is blocked");
                     if let Some(same_identity) = reload {
                         let mut fresh = durable;
                         if !same_identity {
@@ -622,7 +629,6 @@ mod tests {
         })
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
         for (seq, event) in [
             crate::acp::Event::AcpSessionAssigned {
                 acp_session_id: "late".into(),

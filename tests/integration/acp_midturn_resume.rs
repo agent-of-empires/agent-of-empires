@@ -21,10 +21,10 @@
 
 use std::time::{Duration, Instant};
 
-use agent_of_empires::acp::acp_client::AcpClient;
-use agent_of_empires::acp::state::{AcpSessionId, Event};
+use crate::acp::acp_client::AcpClient;
+use crate::acp::state::{AcpSessionId, Event};
 
-use crate::common::{shim_ready, spawn_runner_with_shim};
+use super::{runner_fixture::spawn_runner_with_shim, shim::shim_ready};
 
 async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> Option<String> {
     while Instant::now() < deadline {
@@ -41,13 +41,19 @@ async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> 
 #[tokio::test]
 #[serial_test::serial]
 async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(attach_in_flight_synthesizes_reattach_idle_stopped),
+    ) {
+        return;
+    }
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
 
     // Shorten the watchdog grace and tick from the production defaults.
-    let _env = crate::common::EnvGuard::from_pairs(&[
+    let _env = super::environment::EnvGuard::from_pairs(&[
         ("AOE_RESUME_IDLE_GRACE_MS", "200"),
         ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
     ]);
@@ -67,6 +73,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         None,
         "claude".into(),
         None,
+        _runner.nonce,
     )
     .await
     .expect("attach in_flight=true");
@@ -85,12 +92,18 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
 #[tokio::test]
 #[serial_test::serial]
 async fn attach_idle_session_does_not_synthesize_stopped() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(attach_idle_session_does_not_synthesize_stopped),
+    ) {
+        return;
+    }
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
 
-    let _env = crate::common::EnvGuard::from_pairs(&[
+    let _env = super::environment::EnvGuard::from_pairs(&[
         ("AOE_RESUME_IDLE_GRACE_MS", "200"),
         ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
     ]);
@@ -110,6 +123,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         None,
         "claude".into(),
         None,
+        _runner.nonce,
     )
     .await
     .expect("attach in_flight=false");
@@ -133,13 +147,19 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
 #[tokio::test]
 #[serial_test::serial]
 async fn attach_in_flight_disarms_after_first_inbound_notification() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(attach_in_flight_disarms_after_first_inbound_notification),
+    ) {
+        return;
+    }
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
 
     // Release the notification only after the intended client attaches.
-    let _env = crate::common::EnvGuard::from_pairs(&[
+    let _env = super::environment::EnvGuard::from_pairs(&[
         ("AOE_RESUME_IDLE_GRACE_MS", "800"),
         ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
     ]);
@@ -173,6 +193,7 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         None,
         "claude".into(),
         None,
+        _runner.nonce,
     )
     .await
     .expect("attach in_flight=true");
@@ -196,15 +217,15 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     let _ = client.shutdown().await;
 
     assert!(
-        stopped.is_none(),
-        "watchdog must disarm after the first inbound notification; mid-turn silence is not an orphan; got Stopped reason={stopped:?}"
-    );
+    stopped.is_none(),
+    "watchdog must disarm after the first inbound notification; mid-turn silence is not an orphan; got Stopped reason={stopped:?}"
+);
 }
 
 async fn read_typed_control(
     stream: &mut tokio::net::UnixStream,
-) -> agent_of_empires::acp::control_protocol::ControlBody {
-    use agent_of_empires::acp::control_protocol::{self, ControlBody};
+) -> crate::acp::control_protocol::ControlBody {
+    use crate::acp::control_protocol::{self, ControlBody};
 
     loop {
         let frame = control_protocol::read_frame(stream)
@@ -218,7 +239,7 @@ async fn read_typed_control(
 }
 
 async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool) -> Option<String> {
-    use agent_of_empires::acp::control_protocol::{self, ControlBody};
+    use crate::acp::control_protocol::{self, ControlBody};
 
     let completion_dir = tempfile::tempdir().expect("completion observation directory");
     let completed = completion_dir.path().join("completed");
@@ -237,7 +258,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         ],
     )
     .await;
-    let control_path = agent_of_empires::process::worker::control_socket_sibling(&socket_path);
+    let control_path = crate::process::worker::control_socket_sibling(&socket_path);
     let mut first = tokio::net::UnixStream::connect(&control_path)
         .await
         .expect("connect first daemon");
@@ -324,6 +345,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         None,
         "claude".into(),
         None,
+        _runner.nonce,
     )
     .await
     .expect("resume after detached completion");
@@ -346,6 +368,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         None,
         "claude".into(),
         None,
+        _runner.nonce,
     )
     .await
     .expect("runner accepts a new daemon after clean shutdown");
@@ -356,6 +379,12 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
 #[tokio::test]
 #[serial_test::parallel]
 async fn cached_completion_obeys_durable_in_flight_state_on_attach() {
+    if !super::isolated_case(
+        module_path!(),
+        stringify!(cached_completion_obeys_durable_in_flight_state_on_attach),
+    ) {
+        return;
+    }
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;

@@ -82,7 +82,11 @@ fn buttons_map_clicks_hover_and_yield_to_overlays() {
     );
 
     assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(new_key, None);
+    {
+        let result = env.view.handle_key(new_key, None);
+        drain_persistence(&mut env.view).unwrap();
+        result
+    };
     assert!(
         env.view.new_dialog.is_some(),
         "clicking New opens the new-session dialog"

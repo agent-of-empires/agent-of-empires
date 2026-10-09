@@ -7,6 +7,7 @@ import { test, expect } from "./helpers/mockedTest";
 import { iPhone13 } from "./helpers/viewports";
 import { installSidebarMocks, threeSessionsInOneRepo, type MockSessionInput } from "./helpers/sidebarMocks";
 import { openMobileSidebar } from "./helpers/sidebar";
+import { sessionResponse } from "./helpers/sessions";
 
 const ROW = "[data-testid='sidebar-session-row']";
 const MENU = "[data-testid='sidebar-context-menu']";
@@ -89,10 +90,101 @@ test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
   });
 });
 
+test.describe("Lifecycle refusal preserves the original running workspace", () => {
+  for (const action of ["stop", "archive", "snooze"] as const) {
+    test(`${action} displays refusal guidance without changing the running owner`, async ({ page }) => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const path = `/api/sessions/s-1/${action}`;
+      await page.route(`**${path}`, async (route) => {
+        await held;
+        await route.fulfill({
+          status: 409,
+          json: { error: "original_authority_changed", message: "Original authority changed; reload the session." },
+        });
+      });
+      await openSidebar(page, [{ ...THREE[0]!, fields: { status: "Running" } }]);
+      const row = rows(page).filter({ hasText: "Mongols" });
+      await row.click({ button: "right" });
+      const issued = page.waitForRequest((request) => new URL(request.url()).pathname === path);
+      await menu(page).locator(`[data-testid="sidebar-context-menu-${action}"]`).click();
+      if (action === "stop")
+        await page
+          .locator("[data-testid=stop-session-dialog]")
+          .getByRole("button", { name: /^Stop$/ })
+          .click();
+      if (action === "snooze") await page.locator("[data-testid=snooze-modal-preset-60]").click();
+      await issued;
+      try {
+        if (action === "stop") await expect(row.locator(".text-status-running").first()).toBeVisible();
+      } finally {
+        release();
+      }
+      await expect(page.getByRole("alert").filter({ hasText: "Original authority changed" })).toContainText(
+        "reload the session",
+      );
+      await expect(row).toBeVisible();
+      await expect(row.locator(".text-status-running").first()).toBeVisible();
+      await row.click({ button: "right" });
+      await expect(menu(page).locator("[data-testid=sidebar-context-menu-archive]")).toBeVisible();
+      await expect(menu(page).locator("[data-testid=sidebar-context-menu-snooze]")).toBeVisible();
+    });
+  }
+});
 // #1724, #2312: Cmd/Ctrl+click toggles a row into the selection without
 // navigating, Shift+click extends the range, and bulk triage runs from the
 // right-click menu (the BulkActionBar popup was removed in #2312).
 test.describe("Sidebar multi-select (#1724, #2312)", () => {
+  test("mixed bulk archive retains the refused owner and its guidance", async ({ page }) => {
+    await page.route("**/api/sessions/*/archive", (route) => {
+      const id = new URL(route.request().url()).pathname.split("/").at(-2);
+      if (id === "s-2")
+        return route.fulfill({
+          status: 409,
+          json: { error: "lifecycle_busy", message: "Goths retained: original authority changed." },
+        });
+      const source = THREE.find((session) => session.id === id);
+      if (!source) return route.fulfill({ status: 404 });
+      return route.fulfill({
+        json: sessionResponse({
+          ...source,
+          group_path: source.group,
+          status: "Idle",
+          pinned_at: null,
+          snoozed_until: null,
+          archived_at: "2026-10-08T00:00:00Z",
+        }),
+      });
+    });
+    await openSidebar(
+      page,
+      THREE.map((session) => ({ ...session, fields: { status: "Running", pinned_at: "2026-01-01T00:00:00Z" } })),
+    );
+    await page.route("**/api/sessions", (route) => route.abort());
+    await rows(page)
+      .filter({ hasText: "Mongols" })
+      .click({ modifiers: ["ControlOrMeta"] });
+    await rows(page)
+      .filter({ hasText: "Goths" })
+      .click({ modifiers: ["ControlOrMeta"] });
+    await rows(page).filter({ hasText: "Goths" }).click({ button: "right" });
+    await menu(page).locator("[data-testid=sidebar-context-menu-bulk-archive]").click();
+    await expect(page.getByRole("alert").filter({ hasText: "Goths retained" })).toContainText(
+      "original authority changed",
+    );
+    await expect(rows(page).filter({ hasText: "Goths" })).toBeVisible();
+    await page.getByTestId("sidebar-sunk-toggle").click();
+    await expect(rows(page).filter({ hasText: "Mongols" }).getByLabel("Archived")).toBeVisible();
+    await expect(rows(page).filter({ hasText: "Mongols" }).getByLabel("Pinned")).toHaveCount(0);
+    await expect(rows(page).filter({ hasText: "Mongols" }).locator(".text-status-running")).toHaveCount(0);
+    await expect(rows(page).filter({ hasText: "Goths" }).getByLabel("Pinned")).toBeVisible();
+    await expect(rows(page).filter({ hasText: "Goths" }).locator(".text-status-running")).not.toHaveCount(0);
+    await expect(rows(page).filter({ hasText: "Goths" }).getByLabel("Archived")).toHaveCount(0);
+    await expect(rows(page).filter({ hasText: "Persians" }).getByLabel("Archived")).toHaveCount(0);
+    await expect(rows(page).filter({ hasText: "Persians" })).toBeVisible();
+  });
   test("right-click a selected row bulk-archives the whole selection", async ({ page }) => {
     const archived: Array<{ id: string; body: unknown }> = [];
     await page.route("**/api/sessions/*/archive", (r) => {
@@ -102,7 +194,11 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
           .url()
           .match(/\/api\/sessions\/([^/]+)\/archive$/)?.[1] ?? "?";
       archived.push({ id, body: r.request().postDataJSON() });
-      return r.fulfill({ json: { id, archived_at: "now" } });
+      const source = THREE.find((session) => session.id === id);
+      if (!source) return r.fulfill({ status: 404 });
+      return r.fulfill({
+        json: sessionResponse({ ...source, group_path: source.group, archived_at: "2026-10-08T00:00:00Z" }),
+      });
     });
     await openSidebar(page, THREE);
     await expect(rows(page)).toHaveCount(3);

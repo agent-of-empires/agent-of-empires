@@ -395,48 +395,111 @@ pub(in crate::tui) struct LiveSendWorker {
     /// Set by the worker when resize-window fails or times out. Paint consumes
     /// the flag and schedules a bounded retry for the same geometry.
     resize_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    admission: std::sync::Arc<LiveInputAdmission>,
+    #[cfg(test)]
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+pub(in crate::tui) struct LiveInputAdmission {
+    session: std::sync::Arc<crate::tmux::Session>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    expected_generation: u64,
+    effects: std::sync::Arc<std::sync::Mutex<()>>,
+    cancelled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    effects_waiting: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl LiveInputAdmission {
+    fn new(
+        session: std::sync::Arc<crate::tmux::Session>,
+        generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        expected_generation: u64,
+        effects: std::sync::Arc<std::sync::Mutex<()>>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            session,
+            generation,
+            expected_generation,
+            effects,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            effects_waiting: None,
+        })
+    }
+
+    fn is_current(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        !self.cancelled.load(Ordering::Acquire)
+            && self.generation.load(Ordering::Acquire) == self.expected_generation
+    }
+    fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    fn with_effect<T>(&self, effect: impl FnOnce() -> T) -> Option<T> {
+        #[cfg(not(test))]
+        let _fence = self.effects.lock().ok()?;
+        #[cfg(test)]
+        let _fence = if let Some(waiting) = &self.effects_waiting {
+            crate::session::test_support::lock_reporting_contention(&self.effects, || {
+                let _ = waiting.send(());
+            })
+            .ok()?
+        } else {
+            self.effects.lock().ok()?
+        };
+        self.is_current().then(effect)
+    }
+    #[cfg(test)]
+    pub(super) fn for_test(session: std::sync::Arc<crate::tmux::Session>) -> std::sync::Arc<Self> {
+        assert!(session.cached_primary().is_some());
+        Self::new(session, Default::default(), 0, Default::default())
+    }
+}
+
+impl Drop for LiveSendWorker {
+    fn drop(&mut self) {
+        self.admission.cancel();
+    }
 }
 
 impl LiveSendWorker {
     /// `capture_wake`, when present, nudges the preview capture worker out of its
     /// inter-capture wait after each dispatched batch, so typed echo is captured
     /// immediately rather than a full cadence cycle later.
-    pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
+    pub(super) fn spawn(
+        admission: std::sync::Arc<LiveInputAdmission>,
+        capture_wake: Option<LiveCaptureWake>,
+    ) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         let lock_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_lock_lost = std::sync::Arc::clone(&lock_lost);
         let resize_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_resize_failed = std::sync::Arc::clone(&resize_failed);
-
-        std::thread::spawn(move || {
+        let thread_admission = admission.clone();
+        let _thread = std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
             use std::sync::mpsc::RecvTimeoutError;
 
-            // Entering live mode is an active take-over: it steals the session's size so
-            // the web PTY relay and mobile live view defer to it. Entry is the only steal;
-            // afterwards ownership is merely refreshed, and losing it flips `lock_lost` so
-            // the UI exits instead of fighting. Re-stealing after entry is how a
-            // background TUI used to silently revert a phone takeover on any keystroke or
-            // preview-rect jitter. Released (and `window-size latest` restored) on exit;
-            // after a lost lock the release is a no-op and the new owner's sizing stands.
+            let session = &thread_admission.session;
             let owner_id = format!(
                 "tui-{}-{}",
                 std::process::id(),
                 LIVE_SEND_WORKER_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
-            let session = crate::tmux::Session::from_name(&tmux_name);
-            // Entry is explicit user intent, so it forces the lock even over a live
-            // holder. False means the session is missing or broken at entry, or another
-            // surface won the confirm-read race; the retry on the next resize batch tells
-            // those apart.
-            let mut owned = session.steal_size_owner(&owner_id);
+            let mut owned = thread_admission
+                .with_effect(|| session.steal_size_owner(&owner_id))
+                .unwrap_or(false);
             // Refresh-or-flag: bump the heartbeat only while we still hold the lock; a
             // failed refresh means another surface took over, flagged once and not fought.
             let maintain = |owned: bool| -> bool {
                 if !owned || thread_lock_lost.load(Ordering::Relaxed) {
                     return false;
                 }
-                let still_owner = session.refresh_size_owner(&owner_id);
+                let still_owner = thread_admission
+                    .with_effect(|| session.refresh_size_owner(&owner_id))
+                    .unwrap_or(false);
                 if !still_owner {
                     thread_lock_lost.store(true, Ordering::Relaxed);
                 }
@@ -456,6 +519,9 @@ impl LiveSendWorker {
             loop {
                 match rx.recv_timeout(crate::tmux::SIZE_OWNER_HEARTBEAT) {
                     Ok(first) => {
+                        if !thread_admission.is_current() {
+                            break;
+                        }
                         let mut batch = vec![first];
                         while let Ok(msg) = rx.try_recv() {
                             batch.push(msg);
@@ -471,8 +537,14 @@ impl LiveSendWorker {
                                 // surface won and must not be stomped. Re-forcing would
                                 // fight a takeover the entry race makes indistinguishable
                                 // from a missing pane, and would never flag the loss.
-                                owned = session
-                                    .claim_size_owner(&owner_id, crate::tmux::SIZE_OWNER_TTL);
+                                owned = thread_admission
+                                    .with_effect(|| {
+                                        session.claim_size_owner(
+                                            &owner_id,
+                                            crate::tmux::SIZE_OWNER_TTL,
+                                        )
+                                    })
+                                    .unwrap_or(false);
                                 if !owned {
                                     match session.has_active_size_owner() {
                                         Some(true) => {
@@ -499,7 +571,8 @@ impl LiveSendWorker {
                             }
                         }
                         if !batch.is_empty() {
-                            match dispatch_batch(&tmux_name, &owner_id, batch) {
+                            match dispatch_batch(&thread_admission, &owner_id, batch) {
+                                ResizeDispatchResult::Cancelled => break,
                                 ResizeDispatchResult::Failed => {
                                     owned = false;
                                     thread_resize_failed.store(true, Ordering::Relaxed);
@@ -521,9 +594,9 @@ impl LiveSendWorker {
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        // Idle heartbeat: a failed refresh here is usually the earliest
-                        // takeover signal (the web steals while the desktop sits idle), so
-                        // `maintain` flags it and the UI exits without waiting for input.
+                        if !thread_admission.is_current() {
+                            break;
+                        }
                         if maintain(owned) {
                             last_owner_maintenance = std::time::Instant::now();
                         }
@@ -531,19 +604,39 @@ impl LiveSendWorker {
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
+            let _fence = thread_admission.effects.lock();
             session.release_size_owner(&owner_id);
         });
         Self {
             tx,
             lock_lost,
             resize_failed,
+            admission,
+            #[cfg(test)]
+            thread: Some(_thread),
         }
+    }
+
+    #[cfg(test)]
+    fn stop_join_for_test(&mut self) {
+        self.admission.cancel();
+        let _ = self
+            .tx
+            .send(WorkerMsg::Send(TmuxKey::Literal(String::new())));
+        self.thread
+            .take()
+            .unwrap()
+            .join()
+            .expect("send worker must stop cleanly");
     }
 
     /// True once the worker saw the size-owner lock held elsewhere. Sticky for the
     /// worker's lifetime; the UI loop polls it and exits live mode.
     pub(super) fn lock_lost(&self) -> bool {
         self.lock_lost.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(super) fn target_lost(&self) -> bool {
+        !self.admission.is_current()
     }
 
     /// Consume the sticky resize failure so paint can schedule a bounded
@@ -559,19 +652,25 @@ impl LiveSendWorker {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(super) fn send_to(&self, session: &crate::tmux::Session, key: TmuxKey) -> bool {
+        self.admission.session.cached_primary() == session.cached_primary() && self.send(key)
+    }
+
+    pub(super) fn size_owner(&self) -> Option<(String, u64)> {
+        self.admission.session.size_owner()
+    }
+
     /// Enqueue a translated key. Returns immediately: the fork happens on the worker
     /// thread, so the UI never blocks on tmux latency.
-    pub(super) fn send(&self, key: TmuxKey) {
-        // A send only fails if the worker thread panicked. Drop silently: the user's next
-        // exit clears the dead worker and the next entry spawns a fresh one.
-        let _ = self.tx.send(WorkerMsg::Send(key));
+    pub(super) fn send(&self, key: TmuxKey) -> bool {
+        self.admission.is_current() && self.tx.send(WorkerMsg::Send(key)).is_ok()
     }
 
     /// Enqueue a tmux pane resize, serialized with surrounding keystrokes so keys typed
     /// before it arrive in the old size and keys after in the new one, which matters when
     /// an agent uses cursor-position escapes.
-    pub(super) fn resize(&self, cols: u16, rows: u16) {
-        let _ = self.tx.send(WorkerMsg::Resize { cols, rows });
+    pub(super) fn resize(&self, cols: u16, rows: u16) -> bool {
+        self.admission.is_current() && self.tx.send(WorkerMsg::Resize { cols, rows }).is_ok()
     }
 }
 
@@ -706,9 +805,8 @@ fn channel_arm_due(
         && last_arm.is_none_or(|t| now.duration_since(t) >= VT_REARM_INTERVAL)
 }
 
-/// A channel arm running off the worker thread, so its chain of tmux forks and the
-/// forwarder spawn never delay a frame. The result is tagged with the generation it was
-/// started for; a stale one goes to the caller's teardown sink after the cycle's frame.
+/// Arms share the prepared input target and its effect fence.
+/// A retired generation cannot start an arm or publish its result.
 #[cfg(unix)]
 struct PendingArm<T> {
     generation: u64,
@@ -718,18 +816,22 @@ struct PendingArm<T> {
 #[cfg(unix)]
 impl<T: Send + Sync + 'static> PendingArm<T> {
     fn spawn(
-        name: String,
-        generation: u64,
+        admission: std::sync::Arc<LiveInputAdmission>,
         nudge: CaptureWake,
-        arm: impl FnOnce(&str, &crate::tmux::TmuxCommandDeadline) -> Option<std::sync::Arc<T>>
+        arm: impl FnOnce(
+                &std::sync::Arc<crate::tmux::Session>,
+                &crate::tmux::TmuxCommandDeadline,
+            ) -> Option<std::sync::Arc<T>>
             + Send
             + 'static,
     ) -> Self {
+        let generation = admission.expected_generation;
         let (sender, result) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let deadline = crate::tmux::TmuxCommandDeadline::new();
-            // A send to a stopped worker fails and drops the channel here.
-            let _ = sender.send(arm(&name, &deadline));
+            let armed = admission
+                .with_effect(|| arm(&admission.session, &crate::tmux::TmuxCommandDeadline::new()))
+                .flatten();
+            let _ = sender.send(armed);
             signal_capture_wake(&nudge);
         });
         Self { generation, result }
@@ -812,6 +914,7 @@ pub(in crate::tui) struct CaptureFrame {
     pub(in crate::tui) generation: u64,
     /// Exact tmux target identity captured in this frame.
     pub(in crate::tui) target: String,
+    pub(in crate::tui) session: Option<std::sync::Arc<crate::tmux::Session>>,
     /// The capture_lines budget this capture was produced under.
     pub(in crate::tui) budget: usize,
     pub(in crate::tui) content: String,
@@ -871,6 +974,8 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// and consumers drop mismatches, so bytes captured mid-switch never land under a new
     /// view.
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    admission: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<LiveInputAdmission>>>>,
+    effects: std::sync::Arc<std::sync::Mutex<()>>,
     /// Sleep between captures, in ms. Adaptive: fast under live-send, idle
     /// otherwise. Read by the worker thread each cycle.
     interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -912,6 +1017,7 @@ pub(in crate::tui) struct LiveCaptureWorker {
 
 impl Drop for LiveCaptureWorker {
     fn drop(&mut self) {
+        self.end_live_input();
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         // Wake the worker so it sees `stop` and exits now rather than after
         // its current inter-capture sleep.
@@ -945,28 +1051,27 @@ const PANE_COUNT_PROBE_MS: u64 = 1_000;
 /// A zoomed pane also reports 1: tmux keeps `window_panes` at the real count while
 /// reporting every pane at the window's full rectangle, so the compositor's tiling
 /// assumption breaks and compositing would hide the zoomed pane behind border fill.
-fn probe_pane_count(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> u16 {
-    let mut command = crate::tmux::tmux_command();
-    command.args([
-        "display-message",
-        "-p",
-        "-t",
-        &format!("{name}:^"),
-        "-F",
-        "#{window_panes} #{window_zoomed_flag}",
-    ]);
+fn probe_primary_topology(
+    name: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Option<(crate::tmux::PrimaryPane, u16)> {
+    let mut command = crate::tmux::utils::primary_command(name, "#{@aoe_server_incarnation} #{session_id} #{window_id} #{pane_id} #{window_panes} #{window_zoomed_flag}", true)
+    .ok()?;
     let out = deadline
         .run(&mut command)
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok());
-    let Some(out) = out else { return 1 };
-    let mut fields = out.split_whitespace();
-    let count: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(1);
-    if fields.next().is_some_and(|z| z != "0") {
-        return 1;
-    }
-    count.max(1)
+        .filter(|out| out.status.success())?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut fields = text.split_whitespace();
+    let primary = crate::tmux::PrimaryPane {
+        server_id: fields.next()?.to_owned(),
+        session_id: fields.next()?.to_owned(),
+        window_id: fields.next()?.to_owned(),
+        pane_id: fields.next()?.to_owned(),
+    };
+    let count = fields.next()?.parse::<u16>().ok()?.max(1);
+    let zoomed = fields.next()? != "0";
+    Some((primary, if zoomed { 1 } else { count }))
 }
 
 /// Capture transport for a split window: every pane laid back out on the window grid, plus
@@ -974,12 +1079,14 @@ fn probe_pane_count(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> 
 /// VT channel, where dropping it would cost a split preview its painted cursor and the
 /// alternate-screen and mouse-mode flags the wheel forward reads.
 fn capture_composited(
-    name: &str,
+    session: Option<&crate::tmux::Session>,
     lines: usize,
     forward_empty: bool,
     deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
-    let session = crate::tmux::Session::from_name(name);
+    let Some(session) = session else {
+        return (None, None);
+    };
     match session.capture_window_composited_with_cursor_with_deadline(lines, deadline) {
         Ok((content, cursor)) => (Some(content), cursor),
         Err(_) if forward_empty => (Some(String::new()), None),
@@ -1008,7 +1115,6 @@ struct CompositeCaptureState<'a> {
     last_pane_probe: &'a mut Option<std::time::Instant>,
 }
 fn capture_composited_over_grid(
-    name: &str,
     channel: &crate::tmux::vt::VtChannel,
     state: CompositeCaptureState<'_>,
     pane_count: u16,
@@ -1020,7 +1126,8 @@ fn capture_composited_over_grid(
         at.elapsed() >= std::time::Duration::from_millis(COMPOSITE_LAYOUT_MS)
     });
     if stale {
-        match crate::tmux::Session::from_name(name)
+        match channel
+            .session()
             .capture_window_layout_with_deadline(pane_count, deadline)
         {
             Some(layout) => *state.layout = Some((std::time::Instant::now(), layout)),
@@ -1036,15 +1143,15 @@ fn capture_composited_over_grid(
     }
 
     let Some((_, layout)) = state.layout.as_ref() else {
-        return capture_composited(name, lines, forward_empty, deadline);
+        return capture_composited(Some(channel.session()), lines, forward_empty, deadline);
     };
     let Some(first) = layout.first_pane() else {
-        return capture_composited(name, lines, forward_empty, deadline);
+        return capture_composited(Some(channel.session()), lines, forward_empty, deadline);
     };
     let Some(sample) =
         channel.sample_rows_padded_with_deadline(first.width, first.height, deadline)
     else {
-        return capture_composited(name, lines, forward_empty, deadline);
+        return capture_composited(Some(channel.session()), lines, forward_empty, deadline);
     };
     if sample.incomplete {
         // Pane 0 is mid-repaint. Splicing it beside whole-captured panes tears the
@@ -1072,12 +1179,14 @@ fn capture_composited_over_grid(
 /// The default capture transport: one `capture-pane` fork that folds in the
 /// cursor probe. Shared by the worker's non-VT path on all platforms.
 fn capture_via_tmux(
-    name: &str,
+    session: Option<&crate::tmux::Session>,
     lines: usize,
     forward_empty: bool,
     deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
-    let session = crate::tmux::Session::from_name(name);
+    let Some(session) = session else {
+        return (None, None);
+    };
     match session.capture_pane_with_cursor_with_deadline(lines, deadline) {
         Ok((content, cur)) => (Some(content), cur),
         Err(_) if forward_empty => (Some(String::new()), None),
@@ -1114,14 +1223,23 @@ fn shutdown_osc52_source(
 type TestCapture = Box<dyn FnMut() -> (Option<String>, Option<crate::tmux::PaneCursor>) + Send>;
 
 impl LiveCaptureWorker {
-    pub(in crate::tui) fn spawn(wake: std::sync::Arc<tokio::sync::Notify>) -> Self {
+    pub(in crate::tui) fn spawn(
+        wake: std::sync::Arc<tokio::sync::Notify>,
+        effects: std::sync::Arc<std::sync::Mutex<()>>,
+    ) -> Self {
         Self::spawn_inner(
             wake,
+            effects,
             #[cfg(test)]
             None,
             #[cfg(test)]
             None,
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn effects_for_test(&self) -> std::sync::Arc<std::sync::Mutex<()>> {
+        self.effects.clone()
     }
 
     #[cfg(test)]
@@ -1131,13 +1249,14 @@ impl LiveCaptureWorker {
     ) -> (Self, std::sync::mpsc::Receiver<(u64, usize)>) {
         let (tx, rx) = std::sync::mpsc::channel();
         (
-            Self::spawn_inner(wake, Some(Box::new(capture)), Some(tx)),
+            Self::spawn_inner(wake, Default::default(), Some(Box::new(capture)), Some(tx)),
             rx,
         )
     }
 
     fn spawn_inner(
         wake: std::sync::Arc<tokio::sync::Notify>,
+        effects: std::sync::Arc<std::sync::Mutex<()>>,
         #[cfg(test)] mut test_capture: Option<TestCapture>,
         #[cfg(test)] cycle_done: Option<std::sync::mpsc::Sender<(u64, usize)>>,
     ) -> Self {
@@ -1157,7 +1276,8 @@ impl LiveCaptureWorker {
         let stop = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<ClipboardFrame>>> = Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicU64::new(0));
-        // Spawned enabled; the render reconcile pushes the real `[tmux] vt_live` value
+        let admission = Arc::new(Mutex::new(None::<Arc<LiveInputAdmission>>));
+        // Spawned enabled; the render reconcile pushes the real [tmux] vt_live value
         // right after spawn and on every config refresh, so the worker never reads config.
         let vt_enabled = Arc::new(AtomicBool::new(true));
         // Start disabled until the render reconcile publishes the Clipboard Pass-through
@@ -1175,6 +1295,8 @@ impl LiveCaptureWorker {
         let stop_flag = stop.clone();
         let clipboard_cell = clipboard.clone();
         let generation_cell = generation.clone();
+        let admission_cell = admission.clone();
+        let effects_cell = effects.clone();
         #[cfg(unix)]
         let vt_enabled_cell = vt_enabled.clone();
         #[cfg(unix)]
@@ -1241,6 +1363,7 @@ impl LiveCaptureWorker {
             // the first cycle, so an already-split window composites immediately. Reset on
             // retarget.
             let mut pane_count: u16 = 1;
+            let mut capture_session: Option<std::sync::Arc<crate::tmux::Session>> = None;
             let mut last_pane_probe: Option<std::time::Instant> = None;
             // Window geometry plus every pane's captured rows, reused across frames while
             // pane 0 re-renders from its VT grid. Dropped on retarget and on any pane-count
@@ -1252,21 +1375,19 @@ impl LiveCaptureWorker {
             while !stop_flag.load(Ordering::Relaxed) {
                 cycles_cell.fetch_add(1, Ordering::Relaxed);
                 let lines = lines_cell.load(Ordering::Relaxed);
-                // Read the target without holding the lock across the fork:
-                // `set_target` must never wait on a `capture-pane`.
-                let name = target_cell
-                    .lock()
-                    .ok()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
+                let (name, mut generation_now, active_admission) = {
+                    let target = target_cell.lock().unwrap();
+                    let admission = admission_cell.lock().unwrap();
+                    (
+                        target.clone(),
+                        generation_cell.load(Ordering::Acquire),
+                        admission.clone(),
+                    )
+                };
                 // How long a change deferred this iteration must wait before re-checking
                 // (the sooner of the publish-floor and debounce remainders). `Some` shrinks
                 // the wait below so the held frame goes out as its blockers reopen.
                 let mut defer_wait_ms: Option<u64> = None;
-                // The generation this cycle's frames belong to, read once per cycle so a
-                // mid-fork retarget is caught by the still_current recheck and a frame that
-                // slips past still carries the old generation for the consumer to drop.
-                let generation_now = generation_cell.load(Ordering::Relaxed);
                 let command_deadline = crate::tmux::TmuxCommandDeadline::new();
                 // Channels detached this cycle, shut down after its frame.
                 #[cfg(unix)]
@@ -1276,7 +1397,85 @@ impl LiveCaptureWorker {
                 // A retarget resets the dedup so the new generation's first frame always
                 // publishes, even in an A -> B -> A switch between cycles that leaves the
                 // name unchanged.
-                if capture_target_changed(&last_target, last_generation, &name, generation_now) {
+                let logical_change =
+                    capture_target_changed(&last_target, last_generation, &name, generation_now);
+                if active_admission
+                    .as_ref()
+                    .is_some_and(|admission| !admission.is_current())
+                {
+                    drop(effects_cell.lock());
+                    wait_for_capture_wake(
+                        &nudge_thread,
+                        &mut observed_wake,
+                        std::time::Duration::from_millis(LIVE_CAPTURE_INTERVAL_FAST_MS),
+                    );
+                    continue;
+                }
+                let probe_due = !scripted_capture
+                    && !name.is_empty()
+                    && (logical_change
+                        || last_pane_probe.is_none_or(|at| {
+                            at.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
+                        })
+                        || capture_session
+                            .as_deref()
+                            .and_then(crate::tmux::Session::cached_primary)
+                            .is_some_and(|primary| {
+                                crate::tmux::primary_changed_in_cache(
+                                    &name,
+                                    primary,
+                                    last_pane_probe,
+                                )
+                            }));
+                let topology = probe_due
+                    .then(|| probe_primary_topology(&name, &command_deadline))
+                    .flatten();
+                if let Some(admission) = active_admission.as_ref() {
+                    let replaced = name != admission.session.name()
+                        || topology.as_ref().is_some_and(|(primary, _)| {
+                            primary != admission.session.captured_primary()
+                        });
+                    if replaced && admission.is_current() {
+                        admission.cancel();
+                        let _ = generation_cell.compare_exchange(
+                            generation_now,
+                            generation_now.wrapping_add(1),
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                        *slot.lock().unwrap() = None;
+                        *clipboard_cell.lock().unwrap() = None;
+                        wake.notify_one();
+                    }
+                    if !admission.is_current() {
+                        drop(effects_cell.lock());
+                        wait_for_capture_wake(
+                            &nudge_thread,
+                            &mut observed_wake,
+                            std::time::Duration::from_millis(LIVE_CAPTURE_INTERVAL_FAST_MS),
+                        );
+                        continue;
+                    }
+                }
+                let physical_change = !logical_change
+                    && topology.as_ref().is_some_and(|(primary, _)| {
+                        capture_session
+                            .as_deref()
+                            .and_then(crate::tmux::Session::cached_primary)
+                            .is_some_and(|previous| previous != primary)
+                    });
+                if physical_change {
+                    let next = generation_now.wrapping_add(1);
+                    if generation_cell
+                        .compare_exchange(generation_now, next, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    generation_now = next;
+                }
+                if logical_change || physical_change {
+                    drop(effects_cell.lock());
                     last_target = name.clone();
                     last_generation = generation_now;
                     last_captured = None;
@@ -1303,8 +1502,30 @@ impl LiveCaptureWorker {
                         last_osc52_arm = None;
                     }
                     pane_count = 1;
+                    capture_session = None;
                     last_pane_probe = None;
                     composite_layout = None;
+                }
+                if probe_due {
+                    last_pane_probe = Some(std::time::Instant::now());
+                }
+                if let Some(admission) = active_admission.as_ref() {
+                    capture_session = Some(admission.session.clone());
+                }
+                if let Some((primary, seen)) = topology {
+                    if seen != pane_count {
+                        composite_layout = None;
+                    }
+                    pane_count = seen;
+                    if capture_session
+                        .as_deref()
+                        .and_then(crate::tmux::Session::cached_primary)
+                        != Some(&primary)
+                    {
+                        capture_session = Some(std::sync::Arc::new(
+                            crate::tmux::Session::with_primary(&name, primary),
+                        ));
+                    }
                 }
                 // Adopt finished arms before the enable checks below so a
                 // setting toggled off meanwhile tears the channel down at once.
@@ -1313,19 +1534,33 @@ impl LiveCaptureWorker {
                     PendingArm::take(&mut pending_vt_arm, generation_now, &mut stale_vt)
                 {
                     // Event-driven echo: the channel pokes the nudge condvar on every grid
-                    // change, so the wait below ends as output lands rather than after a
-                    // poll interval.
-                    v.set_change_wakeup(nudge_thread.clone());
-                    next_authoritative_capture =
-                        Some(std::time::Instant::now() + AUTHORITATIVE_CAPTURE_INTERVAL);
-                    vt_source = Some(v);
+                    if capture_session
+                        .as_deref()
+                        .and_then(crate::tmux::Session::cached_primary)
+                        == Some(v.session().captured_primary())
+                    {
+                        v.set_change_wakeup(nudge_thread.clone());
+                        next_authoritative_capture =
+                            Some(std::time::Instant::now() + AUTHORITATIVE_CAPTURE_INTERVAL);
+                        vt_source = Some(v);
+                    } else {
+                        stale_vt.push(v);
+                    }
                 }
                 #[cfg(unix)]
                 if let Some(source) =
                     PendingArm::take(&mut pending_osc52_arm, generation_now, &mut stale_osc52)
                 {
-                    osc52_seen = source.clipboard_sequence();
-                    osc52_source = Some(source);
+                    if capture_session
+                        .as_deref()
+                        .and_then(crate::tmux::Session::cached_primary)
+                        == Some(source.session().captured_primary())
+                    {
+                        osc52_seen = source.clipboard_sequence();
+                        osc52_source = Some(source);
+                    } else {
+                        stale_osc52.push(source);
+                    }
                 }
                 // `[tmux] vt_live`, re-read every cycle. Toggling off tears down an armed
                 // channel, and resetting the arm latch lets a later re-enable arm afresh for
@@ -1350,27 +1585,18 @@ impl LiveCaptureWorker {
                     last_osc52_arm = None;
                 }
                 if lines > 0 && !name.is_empty() {
-                    let forward_empty_policy = forward_empty_cell.load(Ordering::Relaxed);
-                    // Keep a lazy count of the target window's panes so a hand-made split
-                    // stops being invisible: one tiny fork every couple of seconds.
-                    if !scripted_capture
-                        && last_pane_probe.is_none_or(|t| {
-                            t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
+                    #[cfg(unix)]
+                    let arm_admission = |session: &Arc<crate::tmux::Session>| {
+                        active_admission.clone().unwrap_or_else(|| {
+                            LiveInputAdmission::new(
+                                session.clone(),
+                                generation_cell.clone(),
+                                generation_now,
+                                effects_cell.clone(),
+                            )
                         })
-                    {
-                        last_pane_probe = Some(std::time::Instant::now());
-                        let seen = probe_pane_count(&name, &command_deadline);
-                        if seen != pane_count {
-                            // Layout changed under us; the cached rectangles no
-                            // longer describe this window.
-                            composite_layout = None;
-                            pane_count = seen;
-                        }
-                    }
-                    // A split window renders through the compositor in both passive and
-                    // live mode. With a VT channel armed it costs no more per frame than an
-                    // unsplit session: pane 0 still comes from the grid, and only the panes
-                    // beside it are re-captured, on their own cadence.
+                    };
+                    let forward_empty_policy = forward_empty_cell.load(Ordering::Relaxed);
                     let composite = pane_count > 1;
                     // An OSC 52 clipboard write the displayed pane emitted since the last
                     // cycle, published below under the same retarget guard as the cursor.
@@ -1383,18 +1609,18 @@ impl LiveCaptureWorker {
                         last_osc52_arm = None;
                     }
                     #[cfg(unix)]
-                    if observe_osc52
-                        && channel_arm_due(
-                            arm_after,
-                            osc52_source.is_some() || pending_osc52_arm.is_some(),
-                            last_osc52_arm,
-                            std::time::Instant::now(),
-                        )
-                    {
+                    if let Some(session) = capture_session.as_ref().filter(|_| {
+                        observe_osc52
+                            && channel_arm_due(
+                                arm_after,
+                                osc52_source.is_some() || pending_osc52_arm.is_some(),
+                                last_osc52_arm,
+                                std::time::Instant::now(),
+                            )
+                    }) {
                         last_osc52_arm = Some(std::time::Instant::now());
                         pending_osc52_arm = Some(PendingArm::spawn(
-                            name.clone(),
-                            generation_now,
+                            arm_admission(session),
                             nudge_thread.clone(),
                             crate::tmux::vt::Osc52Channel::acquire_with_deadline,
                         ));
@@ -1431,20 +1657,22 @@ impl LiveCaptureWorker {
                         Option<String>,
                         Option<crate::tmux::PaneCursor>,
                     )> = None;
+                    let native_session = capture_session.as_deref();
                     #[cfg(unix)]
                     let (capture, cursor_now) = if let Some(capture) = capture_override {
                         capture
                     } else if vt_enabled {
-                        if channel_arm_due(
-                            arm_after,
-                            vt_source.is_some() || pending_vt_arm.is_some(),
-                            last_vt_arm,
-                            std::time::Instant::now(),
-                        ) {
+                        if let Some(session) = capture_session.as_ref().filter(|_| {
+                            channel_arm_due(
+                                arm_after,
+                                vt_source.is_some() || pending_vt_arm.is_some(),
+                                last_vt_arm,
+                                std::time::Instant::now(),
+                            )
+                        }) {
                             last_vt_arm = Some(std::time::Instant::now());
                             pending_vt_arm = Some(PendingArm::spawn(
-                                name.clone(),
-                                generation_now,
+                                arm_admission(session),
                                 nudge_thread.clone(),
                                 crate::tmux::vt::VtChannel::acquire_with_deadline,
                             ));
@@ -1483,7 +1711,6 @@ impl LiveCaptureWorker {
                                 clipboard_now = v.take_clipboard();
                                 if composite {
                                     capture_composited_over_grid(
-                                        &name,
                                         v,
                                         CompositeCaptureState {
                                             layout: &mut composite_layout,
@@ -1508,25 +1735,31 @@ impl LiveCaptureWorker {
                             }
                             // No grid for pane 0, so every pane comes from the
                             // fork instead.
-                            None if composite => {
-                                capture_composited(&name, lines, forward_empty, &command_deadline)
-                            }
-                            None => {
-                                capture_via_tmux(&name, lines, forward_empty, &command_deadline)
-                            }
+                            None if composite => capture_composited(
+                                native_session,
+                                lines,
+                                forward_empty,
+                                &command_deadline,
+                            ),
+                            None => capture_via_tmux(
+                                native_session,
+                                lines,
+                                forward_empty,
+                                &command_deadline,
+                            ),
                         }
                     } else if composite {
-                        capture_composited(&name, lines, forward_empty, &command_deadline)
+                        capture_composited(native_session, lines, forward_empty, &command_deadline)
                     } else {
-                        capture_via_tmux(&name, lines, forward_empty, &command_deadline)
+                        capture_via_tmux(native_session, lines, forward_empty, &command_deadline)
                     };
                     #[cfg(not(unix))]
                     let (capture, cursor_now) = if let Some(capture) = capture_override {
                         capture
                     } else if composite {
-                        capture_composited(&name, lines, forward_empty, &command_deadline)
+                        capture_composited(native_session, lines, forward_empty, &command_deadline)
                     } else {
-                        capture_via_tmux(&name, lines, forward_empty, &command_deadline)
+                        capture_via_tmux(native_session, lines, forward_empty, &command_deadline)
                     };
                     // Chunk-arrival timing for the repaint-quiescence debounce, only while
                     // sampling a live VT grid; `None` on the capture fallback and non-unix,
@@ -1596,6 +1829,7 @@ impl LiveCaptureWorker {
                                         *guard = Some(CaptureFrame {
                                             generation: generation_now,
                                             target: name.clone(),
+                                            session: capture_session.clone(),
                                             budget: lines,
                                             content: content.clone(),
                                             cursor: cursor_now,
@@ -1724,6 +1958,8 @@ impl LiveCaptureWorker {
             target,
             latest,
             generation,
+            admission,
+            effects,
             interval_ms,
             live,
             forward_empty,
@@ -1772,6 +2008,57 @@ impl LiveCaptureWorker {
         LiveCaptureWake {
             nudge: self.nudge.clone(),
         }
+    }
+
+    pub(super) fn begin_live_input(
+        &self,
+        session: std::sync::Arc<crate::tmux::Session>,
+    ) -> std::sync::Arc<LiveInputAdmission> {
+        use std::sync::atomic::Ordering;
+        self.set_target(session.name().to_owned());
+        let mut current = self.admission.lock().unwrap();
+        if let Some(previous) = current.take() {
+            previous.cancel();
+        }
+        let expected_generation = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let admission = LiveInputAdmission::new(
+            session,
+            self.generation.clone(),
+            expected_generation,
+            self.effects.clone(),
+        );
+        *current = Some(admission.clone());
+        drop(current);
+        self.nudge();
+        admission
+    }
+
+    pub(super) fn end_live_input(&self) {
+        if let Some(admission) = self.admission.lock().unwrap().take() {
+            admission.cancel();
+        }
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.nudge();
+    }
+
+    pub(super) fn preview_input_admission(
+        &self,
+        session: std::sync::Arc<crate::tmux::Session>,
+        generation: u64,
+    ) -> Option<std::sync::Arc<LiveInputAdmission>> {
+        if !self.capture_identity_is_current(session.name(), generation) {
+            return None;
+        }
+        Some(LiveInputAdmission::new(
+            session,
+            self.generation.clone(),
+            generation,
+            self.effects.clone(),
+        ))
     }
 
     /// Choose whether empty captures clear the preview (terminal / container panes) or
@@ -1916,6 +2203,7 @@ impl LiveCaptureWorker {
                     .ok()
                     .map(|value| value.clone())
                     .unwrap_or_default(),
+                session: None,
                 budget,
                 content: content.to_string(),
                 cursor: None,
@@ -1977,6 +2265,7 @@ impl LiveCaptureWorker {
                     .ok()
                     .map(|value| value.clone())
                     .unwrap_or_default(),
+                session: None,
                 budget,
                 content: content.to_string(),
                 cursor,
@@ -1989,12 +2278,13 @@ enum ResizeDispatchResult {
     None,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 /// Walk one drained batch and execute it as one-shot tmux subprocesses: coalescing merges
 /// literal runs into one send-keys call, while named keys and resizes dispatch singly.
 fn dispatch_batch(
-    tmux_name: &str,
+    admission: &LiveInputAdmission,
     resize_owner: &str,
     batch: Vec<WorkerMsg>,
 ) -> ResizeDispatchResult {
@@ -2006,7 +2296,12 @@ fn dispatch_batch(
     let mut resize_result = ResizeDispatchResult::None;
     for action in actions {
         let is_resize = matches!(action, TmuxAction::Resize { .. });
-        match dispatch_via_fork(tmux_name, &action, force_tmux, Some(resize_owner)) {
+        let Some(result) = admission.with_effect(|| {
+            dispatch_via_fork(&admission.session, &action, force_tmux, Some(resize_owner))
+        }) else {
+            return ResizeDispatchResult::Cancelled;
+        };
+        match result {
             Ok(()) if is_resize => resize_result = ResizeDispatchResult::Succeeded,
             Ok(()) => {}
             Err(err) => {
@@ -2028,7 +2323,7 @@ fn dispatch_batch(
 /// Execute one TmuxAction as a one-shot tmux subprocess. A module-level fn rather than a
 /// method, so the spawned thread can call it without holding a worker reference.
 fn dispatch_via_fork(
-    tmux_name: &str,
+    session: &crate::tmux::Session,
     action: &TmuxAction,
     force_tmux: bool,
     resize_owner: Option<&str>,
@@ -2050,13 +2345,13 @@ fn dispatch_via_fork(
     // empty-bytes encoding still drops without forking: nothing proves the writer is dead,
     // so falling back could race a live socket writer.
     #[cfg(unix)]
-    if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name).filter(|_| !force_tmux) {
+    if let Some(app_cursor) = crate::tmux::vt::input_mode(session).filter(|_| !force_tmux) {
         if !matches!(action, TmuxAction::Resize { .. } | TmuxAction::Paste(_)) {
             let bytes = encode_action_bytes(action, app_cursor);
             if bytes.is_empty() {
                 return Ok(());
             }
-            if crate::tmux::vt::try_send_input(tmux_name, &bytes) {
+            if crate::tmux::vt::try_send_input(session, &bytes) {
                 return Ok(());
             }
             tracing::warn!(
@@ -2068,10 +2363,10 @@ fn dispatch_via_fork(
         }
     }
 
-    let target = format!("{}:^.0", tmux_name);
-    let mut cmd = crate::tmux::tmux_command();
-    cmd.stderr(Stdio::null());
-    match action {
+    let target = &session
+        .primary_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?
+        .pane_id;
+    let mut cmd = match action {
         TmuxAction::Literal(s) => {
             // tmux's command parser reads a trailing `;` in a `send-keys -l` payload as a
             // command separator and drops it, even after `--`, so it never reaches the pane
@@ -2080,35 +2375,32 @@ fn dispatch_via_fork(
             let (head, semis) = crate::tmux::peel_trailing_semicolons(s);
             if semis > 0 {
                 if !head.is_empty() {
-                    send_literal(&target, head)?;
+                    send_literal(session, head)?;
                 }
-                return crate::tmux::Session::from_name(tmux_name)
-                    .send_raw_bytes(&vec![0x3b; semis]);
+                return session.send_raw_bytes(&vec![0x3b; semis]);
             }
             // `-l --` mirrors `send_literal_no_enter`: a literal send plus the
             // end-of-options marker, so a payload starting with `-` isn't read as a flag.
-            cmd.args(["send-keys", "-t", &target, "-l", "--", s.as_str()]);
+            session.command(["send-keys", "-t", target, "-l", "--", s.as_str()])?
         }
-        TmuxAction::Named(name) => {
-            cmd.args(["send-keys", "-t", &target, name.as_str()]);
-        }
+        TmuxAction::Named(name) => session.command(["send-keys", "-t", target, name.as_str()])?,
         TmuxAction::NamedRepeat { name, count } => {
             // `-N <count>` repeats the key in one fork. tmux renders each press in the
             // pane's current cursor-key mode, so wheel-forward arrows honor DECCKM.
             let count = count.to_string();
-            cmd.args(["send-keys", "-t", &target, "-N", &count, name.as_str()]);
+            session.command(["send-keys", "-t", target, "-N", &count, name.as_str()])?
         }
         TmuxAction::HexBytes(bytes) => {
             // `-H` sends each arg as the hex value of an ASCII character, used for control
             // bytes (CR, TAB, ESC) and the bracketed-paste markers, none of which ride a
             // `-l` payload safely. ARG_MAX chunking and the hex encoding live in the shared
             // tmux layer, which the web live view's input path also uses.
-            return crate::tmux::Session::from_name(tmux_name).send_raw_bytes(bytes);
+            return session.send_raw_bytes(bytes);
         }
         TmuxAction::Paste(text) => {
             // tmux emits the bracketed-paste markers only when the program set DECSET
             // 2004, so a raw shell gets clean text instead of literal `00~` / `01~`.
-            return crate::tmux::Session::from_name(tmux_name).paste_text(text);
+            return session.paste_text(text);
         }
         TmuxAction::Resize { cols, rows } => {
             // tmux checks ownership in the same command queue as the resize; the worker's
@@ -2116,14 +2408,13 @@ fn dispatch_via_fork(
             // later subprocess.
             let owner = resize_owner
                 .ok_or_else(|| anyhow::anyhow!("live-send resize has no owner token"))?;
-            if !crate::tmux::Session::from_name(tmux_name)
-                .resize_window_if_owner(owner, *cols, *rows)
-            {
+            if !session.resize_window_if_owner(owner, *cols, *rows) {
                 anyhow::bail!("live-send resize lost ownership, failed, or timed out");
             }
             return Ok(());
         }
-    }
+    };
+    cmd.stderr(Stdio::null());
     let status = cmd
         .status()
         .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
@@ -2384,6 +2675,11 @@ mod vt_input_encode_tests {
 const MAX_INFLIGHT_ONESHOT: usize = 8;
 static INFLIGHT_ONESHOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+pub(super) fn oneshot_idle_for_test() -> bool {
+    INFLIGHT_ONESHOT.load(std::sync::atomic::Ordering::Acquire) == 0
+}
+
 /// Releases one `INFLIGHT_ONESHOT` slot on drop, so the count balances even if the fork
 /// thread panics. Constructed inside the spawned closure, so a spawn that never starts must
 /// release its reserved slot itself.
@@ -2400,15 +2696,18 @@ impl Drop for OneshotSlot {
 /// Fire-and-forget: a dropped notch is harmless and a failed fork is logged. Scroll notches
 /// carry no ordering relationship, so racing forks are fine within
 /// `MAX_INFLIGHT_ONESHOT`.
-pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
+pub(super) fn send_key_oneshot(
+    admission: std::sync::Arc<LiveInputAdmission>,
+    key: TmuxKey,
+) -> bool {
     use std::sync::atomic::Ordering;
-    // Reserve a slot first; if we are already at the cap, drop this notch
-    // rather than pile another thread on.
+    if !admission.is_current() {
+        return false;
+    }
     if INFLIGHT_ONESHOT.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_ONESHOT {
         INFLIGHT_ONESHOT.fetch_sub(1, Ordering::AcqRel);
-        return;
+        return false;
     }
-    let tmux_name = tmux_name.to_string();
     let action = match key {
         TmuxKey::Literal(s) => TmuxAction::Literal(s),
         TmuxKey::Named(name) => TmuxAction::Named(name),
@@ -2424,8 +2723,9 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         .name("aoe-wheel-forward".to_string())
         .spawn(move || {
             let _slot = OneshotSlot;
-            // A wheel notch is never a paste, so the vt fast path stays open.
-            if let Err(err) = dispatch_via_fork(&tmux_name, &action, false, None) {
+            if let Some(Err(err)) = admission
+                .with_effect(|| dispatch_via_fork(&admission.session, &action, false, None))
+            {
                 tracing::warn!(
                     target: "tui.live_send",
                     error = %err,
@@ -2441,6 +2741,7 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
             "could not spawn wheel-forward thread; notch dropped",
         );
     }
+    spawned.is_ok()
 }
 
 /// Upper bound on bytes encoded into one `tmux send-keys -H` fork. Each byte becomes a
@@ -2449,11 +2750,13 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
 /// E2BIG. 4 KiB per fork keeps every argv under ~45 KiB while keeping the fork count low.
 /// Send a literal string through one `tmux send-keys -l --` fork, for the head of a payload
 /// whose trailing semicolons were peeled off (see [`dispatch_via_fork`]).
-fn send_literal(target: &str, s: &str) -> anyhow::Result<()> {
+fn send_literal(session: &crate::tmux::Session, s: &str) -> anyhow::Result<()> {
     use std::process::Stdio;
-    let mut cmd = crate::tmux::tmux_command();
+    let target = &session
+        .primary_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?
+        .pane_id;
+    let mut cmd = session.command(["send-keys", "-t", target, "-l", "--", s])?;
     cmd.stderr(Stdio::null());
-    cmd.args(["send-keys", "-t", target, "-l", "--", s]);
     let status = cmd
         .status()
         .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
@@ -3104,7 +3407,10 @@ mod tests {
 
     #[test]
     fn stale_generation_helper_rejects_frame_at_generation_zero() {
-        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let worker = LiveCaptureWorker::spawn(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            Default::default(),
+        );
         assert_eq!(worker.current_generation_for_test(), 0);
 
         worker.inject_stale_generation_frame_for_test(40, "previous pane bytes");
@@ -3148,66 +3454,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn pending_arm_delivers_only_the_current_generation() {
-        let wake: CaptureWake =
-            std::sync::Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
-        let (release, gate) = std::sync::mpsc::channel::<()>();
-        let mut pending = Some(PendingArm::spawn(
-            "pane".into(),
-            7,
-            wake.clone(),
-            move |name, _| {
-                gate.recv().ok()?;
-                Some(std::sync::Arc::new(name.to_string()))
-            },
-        ));
-        let mut stale = Vec::new();
-        assert!(
-            PendingArm::take(&mut pending, 7, &mut stale).is_none() && pending.is_some(),
-            "a running arm stays pending"
-        );
-        release.send(()).unwrap();
-        let mut observed = 0;
-        wait_for_capture_wake(&wake, &mut observed, std::time::Duration::from_secs(5));
-        assert_eq!(
-            PendingArm::take(&mut pending, 7, &mut stale)
-                .as_deref()
-                .map(String::as_str),
-            Some("pane"),
-            "the current generation adopts its channel"
-        );
-        assert!(pending.is_none(), "a delivered arm is no longer pending");
-        assert!(stale.is_empty());
-
-        let (release, gate) = std::sync::mpsc::channel::<()>();
-        let mut pending = Some(PendingArm::spawn(
-            "pane".into(),
-            7,
-            wake.clone(),
-            move |name, _| {
-                gate.recv().ok()?;
-                Some(std::sync::Arc::new(name.to_string()))
-            },
-        ));
-        release.send(()).unwrap();
-        wait_for_capture_wake(&wake, &mut observed, std::time::Duration::from_secs(5));
-        assert!(
-            PendingArm::take(&mut pending, 8, &mut stale).is_none(),
-            "a retarget mid-arm never adopts the stale channel"
-        );
-        assert_eq!(
-            stale.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            ["pane"],
-            "the stale channel goes to the teardown sink"
-        );
-        assert!(
-            pending.is_none(),
-            "a stale arm no longer blocks the next one"
-        );
-    }
-
     #[test]
     fn capture_target_change_detects_aba_generation() {
         assert!(!capture_target_changed("a", 7, "a", 7));
@@ -3246,12 +3492,16 @@ mod tests {
     fn retarget_invalidates_capture_and_clipboard_mailboxes() {
         // Swapping the target must clear any queued capture so the render
         // never applies the previous pane's bytes under the new view.
-        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let worker = LiveCaptureWorker::spawn(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            Default::default(),
+        );
         worker.set_capture_lines(40);
         if let Ok(mut latest) = worker.latest.lock() {
             *latest = Some(CaptureFrame {
                 generation: 0,
                 target: String::new(),
+                session: None,
                 budget: 40,
                 content: "stale previous-pane content".to_string(),
                 cursor: None,
@@ -3468,60 +3718,147 @@ mod tests {
 
     #[test]
     fn live_capture_worker_forwards_empty_when_policy_set() {
-        // Terminal / container panes set `forward_empty`, so a missing or cleared pane must
-        // surface as an empty capture rather than being dropped like the agent kill switch.
-        // Deterministic without tmux: a missing pane reads empty.
-        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        // A successful cleared capture is published under the live forward-empty policy.
+        let (worker, done) = LiveCaptureWorker::spawn_with_capture_for_test(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            || (Some(String::new()), None),
+        );
         worker.set_target("aoe_test_capture_forward_empty".into());
         worker.set_forward_empty(true);
-        // Fast cadence so the worker captures during the polling window.
         worker.set_live(true);
         worker.set_capture_lines(40);
-        assert_eq!(
-            wait_for_latest(&worker, std::time::Duration::from_secs(2)),
-            Some(String::new()),
-            "forward-empty policy must surface empty captures",
+        wait_for_capture_cycle(&worker, &done, 40);
+        let frame = worker
+            .take_latest()
+            .expect("successful empty capture published");
+        assert!(worker.frame_is_current(&frame));
+        assert_eq!(frame.budget, 40);
+        assert!(
+            frame.content.is_empty(),
+            "forward-empty must surface cleared content"
         );
     }
 
     #[test]
+    #[serial_test::serial]
     fn live_capture_worker_publishes_failure_as_empty_outside_live() {
-        // When a displayed agent/tool pane dies its capture fails rather than returning
-        // empty content, and only `forward_empty` panes used to surface that. Outside
-        // live-send a failed capture must publish an empty frame, so the preview shows "No
-        // output available" instead of the dead pane's last bytes. Live mode keeps the
-        // #1501 kill switch.
-        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
-        worker.set_target("aoe_test_capture_dead_agent".into());
+        crate::tmux::test_helpers::require_tmux!();
+        let home = crate::session::test_support::isolate_app_dir();
+        let _socket = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            home.path().join("tmux.sock"),
+        )]);
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_capture_dead_agent");
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "printf 'BEFORE_PANE_DEATH'; exec cat",
+            ])
+            .output()
+            .expect("create native capture pane");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let primary = crate::tmux::utils::resolve_primary(
+            guard.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .expect("bind native pane before failure");
+        let session =
+            std::sync::Arc::new(crate::tmux::Session::with_primary(guard.name(), primary));
+        let worker = LiveCaptureWorker::spawn(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            Default::default(),
+        );
+        worker.set_vt_enabled(false);
+        worker.set_clipboard_capture_enabled(false);
+        worker.set_live(false);
+        worker.set_target(session.name().to_owned());
         worker.set_capture_lines(40);
-        assert_eq!(
-            wait_for_latest(&worker, std::time::Duration::from_secs(2)),
-            Some(String::new()),
-            "a failed capture outside live must surface as an empty frame",
+        wait_until(
+            "bound native capture",
+            std::time::Duration::from_secs(5),
+            || {
+                worker.take_latest().is_some_and(|frame| {
+                    worker.frame_is_current(&frame)
+                        && frame.content.contains("BEFORE_PANE_DEATH")
+                        && frame.session.as_ref().is_some_and(|actor| {
+                            actor.captured_primary() == session.captured_primary()
+                        })
+                })
+            },
+        );
+        let generation = worker.current_generation_for_test();
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let mut kill = session
+            .commands_with_deadline(
+                [[
+                    "kill-pane",
+                    "-t",
+                    session.captured_primary().pane_id.as_str(),
+                ]],
+                &deadline,
+            )
+            .expect("fenced native pane kill");
+        assert!(deadline
+            .run(&mut kill)
+            .expect("kill captured pane")
+            .status
+            .success());
+        wait_until(
+            "native failure published as empty",
+            std::time::Duration::from_secs(5),
+            || {
+                worker.take_latest().is_some_and(|frame| {
+                    worker.frame_is_current(&frame)
+                        && frame.generation == generation
+                        && frame.content.is_empty()
+                        && frame.session.as_ref().is_some_and(|actor| {
+                            actor.captured_primary() == session.captured_primary()
+                        })
+                })
+            },
         );
     }
 
     #[test]
     fn live_capture_worker_republishes_on_budget_change() {
-        // A budget change alone (deeper scroll over a quiet pane) must republish even when
-        // the bytes are identical, or consumers waiting for a deeper capture stall forever.
-        // Deterministic without tmux: forward-empty plus a missing pane is empty at every
-        // budget.
-        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        // Identical successful content must republish when the requested budget deepens.
+        let (worker, done) = LiveCaptureWorker::spawn_with_capture_for_test(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            || (Some("quiet pane".to_owned()), None),
+        );
         worker.set_target("aoe_test_capture_budget_change".into());
-        worker.set_forward_empty(true);
         worker.set_live(true);
         worker.set_capture_lines(40);
-        assert_eq!(
-            wait_for_latest(&worker, std::time::Duration::from_secs(2)),
-            Some(String::new()),
-            "first capture publishes",
-        );
+        wait_for_capture_cycle(&worker, &done, 40);
+        let first = worker.take_latest().expect("first capture published");
+        assert!(worker.frame_is_current(&first));
+        assert_eq!(first.budget, 40);
+        assert_eq!(first.content, "quiet pane");
         worker.set_capture_lines(80);
+        wait_for_capture_cycle(&worker, &done, 80);
+        let mut republished = None;
+        wait_until(
+            "budget-only republish",
+            std::time::Duration::from_secs(5),
+            || {
+                republished = worker.take_latest();
+                republished.is_some()
+            },
+        );
+        let republished = republished.unwrap();
+        assert!(worker.frame_is_current(&republished));
+        assert_eq!(republished.generation, first.generation);
+        assert_eq!(republished.budget, 80);
         assert_eq!(
-            wait_for_latest(&worker, std::time::Duration::from_secs(2)),
-            Some(String::new()),
-            "budget change alone must republish identical bytes",
+            republished.content, first.content,
+            "budget change republishes identical bytes"
         );
     }
 
@@ -3545,15 +3882,36 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn live_send_worker_reports_failed_resize() {
-        let name = "aoe_test_missing_live_resize";
+        if !tmux_available() {
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_missing_live_resize");
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", guard.name(), "sleep 30"])
+            .status()
+            .unwrap()
+            .success());
+        let primary = crate::tmux::utils::resolve_primary(
+            guard.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .unwrap();
+        assert!(crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &primary.session_id])
+            .status()
+            .unwrap()
+            .success());
+        let session =
+            std::sync::Arc::new(crate::tmux::Session::with_primary(guard.name(), primary));
         let action = TmuxAction::Resize { cols: 80, rows: 24 };
         assert!(
-            dispatch_via_fork(name, &action, false, Some("test-owner")).is_err(),
+            dispatch_via_fork(&session, &action, false, Some("test-owner")).is_err(),
             "the bounded resize path must expose failure"
         );
 
-        let worker = LiveSendWorker::spawn(name.to_string(), None);
+        let worker = LiveSendWorker::spawn(LiveInputAdmission::for_test(session), None);
         worker.resize(80, 24);
         wait_until(
             "live resize failure flag",
@@ -3572,12 +3930,15 @@ mod tests {
     }
 
     fn pane_width(name: &str) -> u16 {
+        let primary =
+            crate::tmux::utils::resolve_primary(name, &crate::tmux::TmuxCommandDeadline::new())
+                .unwrap();
         let out = crate::tmux::tmux_command()
             .args([
                 "display-message",
                 "-p",
                 "-t",
-                &format!("{name}:^.0"),
+                &primary.pane_id,
                 "-F",
                 "#{pane_width}",
             ])
@@ -3619,7 +3980,17 @@ mod tests {
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            LiveInputAdmission::for_test(std::sync::Arc::new(crate::tmux::Session::with_primary(
+                guard.name(),
+                crate::tmux::utils::resolve_primary(
+                    guard.name(),
+                    &crate::tmux::TmuxCommandDeadline::new(),
+                )
+                .unwrap(),
+            ))),
+            None,
+        );
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -3691,7 +4062,17 @@ mod tests {
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            LiveInputAdmission::for_test(std::sync::Arc::new(crate::tmux::Session::with_primary(
+                guard.name(),
+                crate::tmux::utils::resolve_primary(
+                    guard.name(),
+                    &crate::tmux::TmuxCommandDeadline::new(),
+                )
+                .unwrap(),
+            ))),
+            None,
+        );
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -3706,128 +4087,257 @@ mod tests {
         assert!(!worker.lock_lost());
     }
 
-    /// The entry steal can come up empty two ways: the pane has not appeared yet, or
-    /// another surface won the confirm-read race. The retry path used to force-steal for
-    /// both, silently stomping a live owner without flagging the loss. Spawning before the
-    /// session exists reproduces `owned == false` deterministically.
     #[test]
     #[serial_test::serial]
-    fn worker_defers_to_live_owner_when_entry_steal_found_no_session() {
+    fn physical_retarget_fences_old_input_and_preview() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
         if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
             return;
         }
-        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
-        // A failed resize acknowledges that the worker observed the absent session.
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
-        worker.resize(60, 20);
-        wait_until(
-            "resize against absent session",
-            std::time::Duration::from_secs(5),
-            || worker.take_resize_failed(),
-        );
-
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        crate::tmux::refresh_session_cache();
-        let session = crate::tmux::Session::from_name(guard.name());
-
-        // The new session has a live owner before the next resize.
-        assert!(session.steal_size_owner("live-test-thief"));
-        assert!(!worker.lock_lost());
-
-        // The retry must claim, not steal: a live holder is a takeover, so the
-        // loss is flagged and the resize dropped.
-        worker.resize(60, 20);
-        wait_until("lock_lost flag", std::time::Duration::from_secs(5), || {
-            worker.lock_lost()
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_admission_retarget");
+        let dir = tempfile::tempdir().unwrap();
+        let input_a = dir.path().join("input-a");
+        let input_b = dir.path().join("input-b");
+        let receiver = |path: &std::path::Path, marker: &str| {
+            format!(
+                "stty raw -echo; printf '{marker}'; cat > {}",
+                crate::session::environment::shell_escape_script_word(&path.to_string_lossy()),
+            )
+        };
+        let run = |args: &[&str]| {
+            let out = crate::tmux::tmux_command().args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        run(&[
+            "new-session",
+            "-d",
+            "-s",
+            guard.name(),
+            "-x",
+            "120",
+            "-y",
+            "40",
+            &receiver(&input_a, "READY_A"),
+        ]);
+        let primary_a = crate::tmux::utils::resolve_primary(
+            guard.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .unwrap();
+        let session_a = Arc::new(crate::tmux::Session::with_primary(guard.name(), primary_a));
+        let effects = Arc::new(Mutex::new(()));
+        let capture =
+            LiveCaptureWorker::spawn(Arc::new(tokio::sync::Notify::new()), effects.clone());
+        capture.set_vt_enabled(false);
+        capture.set_capture_lines(40);
+        capture.set_live(true);
+        let admission = capture.begin_live_input(session_a.clone());
+        let mut worker = LiveSendWorker::spawn(admission, Some(capture.waker()));
+        wait_until("first A preview", Duration::from_secs(5), || {
+            capture.take_latest().is_some_and(|frame| {
+                capture.frame_is_current(&frame) && frame.content.contains("READY_A")
+            })
         });
-        assert_eq!(
-            session.size_owner().map(|(id, _)| id),
-            Some("live-test-thief".to_string()),
-            "unowned retry must not steal from a live owner"
+        assert!(worker.send(TmuxKey::Literal("BEFORE".into())));
+        wait_until("input delivered to A", Duration::from_secs(5), || {
+            std::fs::read(&input_a).is_ok_and(|bytes| bytes == b"BEFORE")
+        });
+        wait_until("entry ownership", Duration::from_secs(5), || {
+            session_a
+                .size_owner()
+                .is_some_and(|(owner, _)| owner.starts_with("tui-"))
+        });
+        let window_b = run(&[
+            "new-window",
+            "-d",
+            "-t",
+            guard.name(),
+            "-P",
+            "-F",
+            "#{window_id}",
+            &receiver(&input_b, "READY_B"),
+        ]);
+        wait_until("B receiver ready", Duration::from_secs(5), || {
+            input_b.exists()
+        });
+        let size_b = run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &window_b,
+            "#{window_width} #{window_height}",
+        ]);
+        let fence = effects.lock().unwrap();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let mut old_arm_admission = LiveInputAdmission::new(
+            session_a.clone(),
+            capture.generation.clone(),
+            capture.current_generation_for_test(),
+            effects.clone(),
         );
-        // Keys queued after the resize are dispatched after its batch, even
-        // when ownership filtering removes the resize itself.
-        worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
-        wait_until(
-            "post-resize input reached the pane",
-            std::time::Duration::from_secs(5),
-            || {
-                let output = crate::tmux::tmux_command()
-                    .args(["capture-pane", "-p", "-t", guard.name()])
-                    .output()
-                    .expect("capture ordered input");
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+        std::sync::Arc::get_mut(&mut old_arm_admission)
+            .unwrap()
+            .effects_waiting = Some(waiting_tx);
+        let old_arm = PendingArm::spawn(
+            old_arm_admission,
+            capture.nudge.clone(),
+            |session, deadline| {
+                session
+                    .claim_vt_owner_with_deadline("OLD_ARM", Duration::from_secs(30), deadline)
+                    .then(|| session.clone())
             },
         );
-        assert_eq!(
-            pane_width(guard.name()),
-            80,
-            "dropped resize must not dispatch"
-        );
-    }
-
-    /// The same retry path must still take a vacant lock, so a genuinely
-    /// slow-to-appear pane gets owned instead of being abandoned.
-    #[test]
-    #[serial_test::serial]
-    fn worker_claims_vacant_lock_when_session_appears_late() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
-        worker.resize(60, 20);
-        wait_until(
-            "resize against absent session",
-            std::time::Duration::from_secs(5),
-            || worker.take_resize_failed(),
-        );
-
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
+        waiting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(worker.send(TmuxKey::Literal("DROP_LITERAL".into())));
+        assert!(worker.send(TmuxKey::Paste("DROP_PASTE".into())));
+        assert!(worker.send(TmuxKey::HexBytes(b"DROP_BYTES".to_vec())));
+        assert!(worker.resize(66, 17));
+        run(&[
+            "swap-window",
+            "-s",
+            &session_a.captured_primary().window_id,
+            "-t",
+            &window_b,
+        ]);
         crate::tmux::refresh_session_cache();
-        let session = crate::tmux::Session::from_name(guard.name());
-
-        worker.resize(60, 20);
+        capture.nudge();
         wait_until(
-            "late resize dispatch",
-            std::time::Duration::from_secs(5),
-            || pane_width(guard.name()) == 60,
+            "cancel before crossing the effect fence",
+            Duration::from_secs(5),
+            || worker.target_lost(),
         );
-        assert!(!worker.lock_lost());
-        assert!(
-            matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
-            "vacant lock must still be claimed on the retry path"
+        let cancellation_cycle = capture.cycles();
+        assert!(!worker.send(TmuxKey::Literal("LATE".into())));
+        assert!(!worker.resize(55, 16));
+        drop(fence);
+        worker.stop_join_for_test();
+        assert!(old_arm
+            .result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_none());
+        for pane in [&session_a.captured_primary().pane_id, &window_b] {
+            assert_eq!(
+                run(&["display-message", "-p", "-t", pane, "#{@aoe_vt_owner}"]),
+                ""
+            );
+        }
+        wait_until(
+            "closed capture admission remains withheld",
+            Duration::from_secs(5),
+            || capture.cycles() >= cancellation_cycle + 2,
         );
+        assert!(capture
+            .take_latest()
+            .is_none_or(|frame| !capture.frame_is_current(&frame)));
+        assert_eq!(std::fs::read(&input_a).unwrap(), b"BEFORE");
+        assert_eq!(std::fs::read(&input_b).unwrap(), b"");
+        assert_eq!(
+            run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &window_b,
+                "#{window_width} #{window_height}"
+            ]),
+            size_b
+        );
+        capture.end_live_input();
+        wait_until(
+            "B preview after UI acknowledgement",
+            Duration::from_secs(5),
+            || {
+                capture.take_latest().is_some_and(|frame| {
+                    capture.frame_is_current(&frame) && frame.content.contains("READY_B")
+                })
+            },
+        );
+
+        let fence = effects.lock().unwrap();
+        let admission = capture.begin_live_input(session_a.clone());
+        let mut old_entry = LiveSendWorker::spawn(admission, Some(capture.waker()));
+        assert!(old_entry.send(TmuxKey::Literal("DROP_FIRST_CAPTURE".into())));
+        capture.nudge();
+        wait_until(
+            "old prepared pane rejected on first live capture",
+            Duration::from_secs(5),
+            || old_entry.target_lost(),
+        );
+        drop(fence);
+        old_entry.stop_join_for_test();
+        assert!(capture
+            .take_latest()
+            .is_none_or(|frame| !capture.frame_is_current(&frame)));
+        capture.end_live_input();
+        let mut current_frame = None;
+        wait_until(
+            "fresh B frame for passive input",
+            Duration::from_secs(5),
+            || {
+                if let Some(frame) = capture.take_latest() {
+                    if capture.frame_is_current(&frame) && frame.content.contains("READY_B") {
+                        current_frame = Some(frame);
+                        return true;
+                    }
+                }
+                false
+            },
+        );
+        let frame = current_frame.unwrap();
+        let session_b = frame.session.unwrap();
+        let admission = capture
+            .preview_input_admission(session_b.clone(), frame.generation)
+            .unwrap();
+        let fresh_arm = PendingArm::spawn(
+            admission.clone(),
+            capture.nudge.clone(),
+            |session, deadline| {
+                session
+                    .claim_vt_owner_with_deadline("FRESH_ARM", Duration::from_secs(30), deadline)
+                    .then(|| session.clone())
+            },
+        );
+        assert!(fresh_arm
+            .result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &session_b.captured_primary().pane_id,
+                "#{@aoe_vt_owner}"
+            ]),
+            "FRESH_ARM"
+        );
+        assert_eq!(
+            run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &session_a.captured_primary().pane_id,
+                "#{@aoe_vt_owner}"
+            ]),
+            ""
+        );
+        session_b.release_vt_owner("FRESH_ARM");
+        assert!(send_key_oneshot(
+            admission,
+            TmuxKey::Literal("AFTER_B".into())
+        ));
+        wait_until(
+            "passive input delivered to displayed B",
+            Duration::from_secs(5),
+            || std::fs::read(&input_b).is_ok_and(|bytes| bytes == b"AFTER_B"),
+        );
+        assert_eq!(std::fs::read(&input_a).unwrap(), b"BEFORE");
     }
 }

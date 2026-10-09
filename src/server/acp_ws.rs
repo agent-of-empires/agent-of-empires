@@ -205,7 +205,7 @@ async fn handle(
                         // the updated snapshot.
                         if frame.seq > last_applied_seq {
                             last_applied_seq = frame.seq;
-                            let _ = reduced.apply_event((*frame.event).clone());
+                            let _ = reduced.apply_event(frame.seq, (*frame.event).clone());
                         }
                         if !send_reduced_state(&mut socket, &session_id, frame.seq, &reduced, &mut cold).await {
                             break;
@@ -252,7 +252,7 @@ async fn handle(
                         .unwrap_or_default();
                         let mut highest = 0;
                         for (seq, event) in entries {
-                            let _ = rebuilt.apply_event(event);
+                            let _ = rebuilt.apply_event(seq, event);
                             highest = seq;
                         }
                         reduced = rebuilt;
@@ -384,7 +384,7 @@ fn fold_connect_history(
 ) -> Vec<(u64, Event)> {
     let mut to_forward = Vec::new();
     for (seq, event) in entries {
-        let _ = folds.reduced.apply_event(event.clone());
+        let _ = folds.reduced.apply_event(seq, event.clone());
         folds.last_applied_seq = seq;
         if seq <= since {
             continue;

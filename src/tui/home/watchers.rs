@@ -25,8 +25,6 @@ impl ConfigWatchKey {
 
 pub(super) const RELOAD_FAILED_TITLE: &str = "Reload Failed";
 
-pub(super) const WATCHER_WARNING_TITLE: &str = "Watcher Warning";
-
 /// Watcher-driven refreshes stay silent; interactive ones may surface dialogs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum ConfigRefreshOrigin {
@@ -373,6 +371,7 @@ pub(in crate::tui) enum WatcherInitErrorKind {
 }
 
 /// Equality is keyed on `(profile, kind)`; `message` is display-only.
+#[derive(Clone)]
 pub(in crate::tui) struct WatcherInitError {
     pub(in crate::tui) profile: Option<String>,
     pub(in crate::tui) kind: WatcherInitErrorKind,

@@ -180,85 +180,77 @@ pub(crate) enum AcpContextUse {
     Attach,
 }
 
-/// Read continuation after sandbox admission, not from a caller's earlier
-/// snapshot. The resolved ACP adapter owns this lane, not the row's TUI tool.
+/// Mutate the already admitted canonical row; the caller owns original storage
+/// and persistence fences. The adapter, not the TUI tool, selects the native lane.
 pub(crate) fn prepare_acp_context(
     profile: &str,
-    id: &str,
+    instance: &mut crate::session::Instance,
     agent: Option<&str>,
     generation: u64,
     usage: AcpContextUse,
     continuation: crate::acp::supervisor::SandboxContinuation,
 ) -> Result<AcpLaunchContext> {
-    let storage = crate::session::Storage::new_unwatched(profile)?;
-    storage.update(|instances, _| {
-        let instance = instances
-            .iter_mut()
-            .find(|instance| instance.id == id)
-            .context("sandbox session disappeared before structured launch")?;
-        if !instance.is_sandboxed() || !instance_ready(instance)? {
-            bail!("sandbox native content is not ready for structured launch");
-        }
-        // An adapter that names no native agent cannot prove which lane it is
-        // about to continue, so it is answered for the whole row: refuse the
-        // attach while any structured lane is pending, and claim them all.
-        let pending = instance.sandbox_content_resets.iter().any(|reset| {
-            reset.tool == instance.tool
-                && agent.is_none_or(|agent| reset.agent == agent)
-                && reset.structured.pending
-                && reset.structured.generation.is_none()
-        });
-        let carried = || {
+    if !instance.is_sandboxed() || !instance_ready(instance)? {
+        bail!("sandbox native content is not ready for structured launch");
+    }
+    // An adapter that names no native agent cannot prove which lane it is
+    // about to continue, so it is answered for the whole row: refuse the
+    // attach while any structured lane is pending, and claim them all.
+    let pending = instance.sandbox_content_resets.iter().any(|reset| {
+        reset.tool == instance.tool
+            && agent.is_none_or(|agent| reset.agent == agent)
+            && reset.structured.pending
+            && reset.structured.generation.is_none()
+    });
+    let carried = || {
+        instance
+            .sandbox_content_resets
+            .iter()
+            .filter(|reset| reset.tool == instance.tool && !reset.structured.pending)
+    };
+    let foreign_adapter =
+        carried().next().is_some() && !carried().any(|reset| agent == Some(reset.agent.as_str()));
+    let unproven_old_id = foreign_adapter
+        && carried().any(|reset| {
             instance
-                .sandbox_content_resets
-                .iter()
-                .filter(|reset| reset.tool == instance.tool && !reset.structured.pending)
-        };
-        let foreign_adapter = carried().next().is_some()
-            && !carried().any(|reset| agent == Some(reset.agent.as_str()));
-        let unproven_old_id = foreign_adapter
-            && carried().any(|reset| {
-                instance
-                    .acp_session_id
-                    .as_ref()
-                    .into_iter()
-                    .chain(instance.fork_pending.as_ref())
-                    .any(|id| reset.retired_structured.contains(id))
-                    || (reset.retired_import && instance.import_pending == Some(true))
-            });
-        if matches!(usage, AcpContextUse::Attach) && (pending || unproven_old_id) {
-            bail!("runner predates its sandbox content reset; a fresh launch is required");
+                .acp_session_id
+                .as_ref()
+                .into_iter()
+                .chain(instance.fork_pending.as_ref())
+                .any(|id| reset.retired_structured.contains(id))
+                || (reset.retired_import && instance.import_pending == Some(true))
+        });
+    if matches!(usage, AcpContextUse::Attach) && (pending || unproven_old_id) {
+        bail!("runner predates its sandbox content reset; a fresh launch is required");
+    }
+    let notice = claim_context_reset(instance, agent, NativeContextView::Structured, generation);
+    let (stored_session_id, fork_from, seed_history_replay) = match continuation {
+        crate::acp::supervisor::SandboxContinuation::Persisted if unproven_old_id => {
+            (None, None, false)
         }
-        let notice =
-            claim_context_reset(instance, agent, NativeContextView::Structured, generation);
-        let (stored_session_id, fork_from, seed_history_replay) = match continuation {
-            crate::acp::supervisor::SandboxContinuation::Persisted if unproven_old_id => {
-                (None, None, false)
-            }
-            crate::acp::supervisor::SandboxContinuation::Persisted => (
-                instance.acp_session_id.clone(),
-                instance.fork_pending.clone(),
-                instance.import_pending == Some(true),
-            ),
-            crate::acp::supervisor::SandboxContinuation::ImportTerminal if notice.is_none() => {
-                let id = instance
-                    .agent_session_id
-                    .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_owned);
-                let replay = id.is_some();
-                (id, None, replay)
-            }
-            crate::acp::supervisor::SandboxContinuation::ImportTerminal
-            | crate::acp::supervisor::SandboxContinuation::Fresh => (None, None, false),
-        };
-        Ok(AcpLaunchContext {
-            profile: storage.profile().to_owned(),
-            stored_session_id,
-            fork_from,
-            seed_history_replay,
-            notice,
-        })
+        crate::acp::supervisor::SandboxContinuation::Persisted => (
+            instance.acp_session_id.clone(),
+            instance.fork_pending.clone(),
+            instance.import_pending == Some(true),
+        ),
+        crate::acp::supervisor::SandboxContinuation::ImportTerminal if notice.is_none() => {
+            let id = instance
+                .agent_session_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned);
+            let replay = id.is_some();
+            (id, None, replay)
+        }
+        crate::acp::supervisor::SandboxContinuation::ImportTerminal
+        | crate::acp::supervisor::SandboxContinuation::Fresh => (None, None, false),
+    };
+    Ok(AcpLaunchContext {
+        profile: profile.to_owned(),
+        stored_session_id,
+        fork_from,
+        seed_history_replay,
+        notice,
     })
 }
 
@@ -274,30 +266,33 @@ pub(crate) fn prepare_terminal_launch_context(
         return Ok(None);
     }
     let generation = instance.lifecycle_generation;
-    let storage = crate::session::Storage::new_unwatched(&instance.source_profile)?;
+    let storage = instance.original_storage()?;
     let (resets, notice, sid, sid_binding, pi_path, intent, resume_binding, floor, omp_generation) =
-        storage.update(|instances, _| {
-            let row = instances
-                .iter_mut()
-                .find(|row| row.id == instance.id)
-                .context("sandbox session disappeared before terminal launch")?;
-            if row.lifecycle_generation != generation || row.tool != instance.tool {
-                bail!("terminal content reset lost its launch scope");
-            }
-            let notice =
-                claim_context_reset(row, Some(agent), NativeContextView::Terminal, generation);
-            Ok((
-                row.sandbox_content_resets.clone(),
-                notice,
-                row.agent_session_id.clone(),
-                row.agent_session_binding.clone(),
-                row.pi_session_path.clone(),
-                row.resume_intent.clone(),
-                row.resume_binding.clone(),
-                row.capture_started_at,
-                row.omp_capture_generation.clone(),
-            ))
-        })?;
+        storage.update_metadata(
+            crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(&instance.id)),
+            |instances, _| {
+                let row = instances
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .context("sandbox session disappeared before terminal launch")?;
+                if row.lifecycle_generation != generation || row.tool != instance.tool {
+                    bail!("terminal content reset lost its launch scope");
+                }
+                let notice =
+                    claim_context_reset(row, Some(agent), NativeContextView::Terminal, generation);
+                Ok((
+                    row.sandbox_content_resets.clone(),
+                    notice,
+                    row.agent_session_id.clone(),
+                    row.agent_session_binding.clone(),
+                    row.pi_session_path.clone(),
+                    row.resume_intent.clone(),
+                    row.resume_binding.clone(),
+                    row.capture_started_at,
+                    row.omp_capture_generation.clone(),
+                ))
+            },
+        )?;
     instance.sandbox_content_resets = resets;
     if notice.is_some() {
         instance.agent_session_id = sid;
@@ -322,38 +317,41 @@ pub(crate) fn acknowledge_context_reset(
     if slots.is_empty() {
         return Ok(());
     }
-    crate::session::Storage::new_unwatched(profile)?.update(|instances, _| {
-        let instance = instances
-            .iter_mut()
-            .find(|instance| instance.id == id)
-            .context("sandbox session disappeared before context-reset acknowledgment")?;
-        if matches!(view, NativeContextView::Terminal)
-            && instance.lifecycle_generation != generation
-        {
-            bail!("sandbox context reset lost its terminal generation");
-        }
-        for slot in slots {
-            let reset = instance
-                .sandbox_content_resets
+    crate::session::Storage::open_unwatched(profile)?.update_metadata(
+        crate::session::MetadataSelection::Session(std::borrow::Cow::Borrowed(id)),
+        |instances, _| {
+            let instance = instances
                 .iter_mut()
-                .find(|reset| &reset.slot == slot)
-                .context("sandbox context-reset slot disappeared")?;
-            if reset.tool != instance.tool {
-                bail!("sandbox context reset lost its literal tool");
+                .find(|instance| instance.id == id)
+                .context("sandbox session disappeared before context-reset acknowledgment")?;
+            if matches!(view, NativeContextView::Terminal)
+                && instance.lifecycle_generation != generation
+            {
+                bail!("sandbox context reset lost its terminal generation");
             }
-            let lane = reset.lane(view);
-            if lane.generation != Some(generation) {
-                bail!("sandbox context reset lost its launch generation");
+            for slot in slots {
+                let reset = instance
+                    .sandbox_content_resets
+                    .iter_mut()
+                    .find(|reset| &reset.slot == slot)
+                    .context("sandbox context-reset slot disappeared")?;
+                if reset.tool != instance.tool {
+                    bail!("sandbox context reset lost its literal tool");
+                }
+                let lane = reset.lane(view);
+                if lane.generation != Some(generation) {
+                    bail!("sandbox context reset lost its launch generation");
+                }
+                lane.pending = false;
             }
-            lane.pending = false;
-        }
-        if matches!(view, NativeContextView::Structured) {
-            if let Some(sid) = assigned_id {
-                instance.acp_session_id = Some(sid.to_owned());
+            if matches!(view, NativeContextView::Structured) {
+                if let Some(sid) = assigned_id {
+                    instance.acp_session_id = Some(sid.to_owned());
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -873,6 +871,8 @@ fn retain_legacy_original_with(
         return Ok(Retained::Absent);
     };
     let app = crate::session::get_app_dir()?;
+    // v027's caller retains the resource workspace fences.
+    layout::ensure_no_retained_owners(&app)?;
     let recovery = recovery_root(host)?;
     if let Some(message) =
         recovery_exposure(&app, &[canonical_expected_path(&recovery)?], exposure)?.refusal(None)
@@ -900,24 +900,236 @@ fn retain_legacy_original_with(
     Ok(Retained::Original(destination))
 }
 
-fn read_registries(app: &Path) -> Result<Vec<(PathBuf, Value)>> {
-    let mut registries = Vec::new();
-    for path in layout::registry_paths(app)? {
-        match serde_json::from_slice(&fs::read(&path)?) {
-            Ok(value) => registries.push((path, value)),
-            // A registry AoE cannot parse is a pre-existing anomaly it cannot
-            // reason about; skipping it with a warning keeps one corrupt file
-            // from bricking every launch and migration, matching the reuse path
-            // that already tolerates a failed reload.
-            Err(error) => tracing::warn!(
-                target: "session.store",
-                registry = %path.display(),
-                error = %error,
-                "skipping unparseable session registry",
-            ),
+struct Registry {
+    raw: crate::session::raw_document::RawDocument,
+    value: Value,
+    owners: std::collections::HashMap<String, crate::session::raw_document::OwnerSlot>,
+    sandbox_rows: Vec<usize>,
+}
+
+impl Registry {
+    fn read(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)?;
+        let raw = crate::session::raw_document::RawDocument::parse(std::str::from_utf8(&bytes)?)?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        let rows = value
+            .as_array()
+            .context("session registry must be an array")?;
+        anyhow::ensure!(
+            rows.len() == raw.rows.len(),
+            "registry projection differs from raw rows"
+        );
+        let owners = raw.owners("id");
+        let mut sandbox_rows = Vec::new();
+        for (index, raw_row) in raw.rows.iter().enumerate() {
+            let object = crate::session::raw_document::RawObject::parse(raw_row)?;
+            if object.sandbox_enabled()? {
+                validate_content_row(&object, &rows[index])?;
+                let id = rows[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("sandbox owner has no id")?;
+                let slot = owners
+                    .get(id)
+                    .context("sandbox owner disappeared from raw inventory")?;
+                anyhow::ensure!(
+                    slot.count == 1 && !slot.ambiguous && slot.index == index,
+                    "ambiguous content owner {id}"
+                );
+                sandbox_rows.push(index);
+            }
+        }
+        Ok(Self {
+            raw,
+            value,
+            owners,
+            sandbox_rows,
+        })
+    }
+
+    fn rows(&self) -> &[Value] {
+        self.value.as_array().expect("validated registry array")
+    }
+
+    fn selected(&self, id: &str) -> Result<Option<usize>> {
+        let Some(slot) = self.owners.get(id) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            slot.count == 1 && !slot.ambiguous,
+            "ambiguous content owner {id}"
+        );
+        if self.sandbox_rows.binary_search(&slot.index).is_err() {
+            let object =
+                crate::session::raw_document::RawObject::parse(&self.raw.rows[slot.index])?;
+            validate_content_row(&object, &self.rows()[slot.index])?;
+        }
+        Ok(Some(slot.index))
+    }
+
+    fn reset(&mut self, index: usize, receipt: &Receipt) -> Result<Option<Vec<u8>>> {
+        let row = &mut self.value.as_array_mut().expect("validated registry array")[index];
+        let before = reset_metadata(row);
+        reset_row(row, receipt)?;
+        let after = reset_metadata(row);
+        if before == after {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.raw.render_value_changes(&[(index, &before, after)])?,
+        ))
+    }
+}
+
+fn reset_metadata(row: &Value) -> Value {
+    Value::Object(
+        [
+            "sandbox_content_policy",
+            "sandbox_content_resets",
+            "agent_session_id",
+            "agent_session_binding",
+            "pi_session_path",
+            "resume_binding",
+            "resume_intent",
+            "capture_started_at",
+            "prior_tool_session_ids",
+            "omp_capture_generation",
+        ]
+        .into_iter()
+        .filter_map(|field| {
+            row.get(field)
+                .map(|value| (field.to_owned(), value.clone()))
+        })
+        .collect(),
+    )
+}
+
+fn validate_content_row(
+    object: &crate::session::raw_document::RawObject<'_>,
+    value: &Value,
+) -> Result<()> {
+    for field in [
+        "id",
+        "tool",
+        "command",
+        "extra_args",
+        "detect_as",
+        "sandbox_info",
+        "sandbox_store_generation",
+        "project_path",
+        "workspace_info",
+        "prior_tool_session_ids",
+        "sandbox_content_resets",
+        "sandbox_content_policy",
+        "agent_session_id",
+        "agent_session_binding",
+        "resume_intent",
+        "resume_binding",
+        "pi_session_path",
+        "acp_session_id",
+        "fork_pending",
+        "import_pending",
+        "capture_started_at",
+        "omp_capture_generation",
+    ] {
+        object.unique(field)?;
+    }
+    let id: String = serde_json::from_str(
+        object
+            .unique("id")?
+            .context("content owner has no id")?
+            .get(),
+    )?;
+    crate::session::validate_instance_id(&id)?;
+    for field in [
+        "tool",
+        "command",
+        "agent_session_id",
+        "pi_session_path",
+        "acp_session_id",
+        "fork_pending",
+    ] {
+        if let Some(value) = object.unique(field)? {
+            let _: Option<String> = serde_json::from_str(value.get())?;
         }
     }
-    Ok(registries)
+    if let Some(sandbox) = object
+        .unique("sandbox_info")?
+        .filter(|value| value.get() != "null")
+    {
+        let sandbox = crate::session::raw_document::RawObject::parse(sandbox)?;
+        sandbox.unique("enabled")?;
+        if let Some(workdir) = sandbox.unique("container_workdir")? {
+            let _: Option<String> = serde_json::from_str(workdir.get())?;
+        }
+    }
+    for field in ["agent_session_binding", "resume_binding"] {
+        if let Some(binding) = object.unique(field)? {
+            let _: Option<crate::session::ConversationBinding> =
+                serde_json::from_str(binding.get())?;
+        }
+    }
+    if let Some(intent) = object
+        .unique("resume_intent")?
+        .filter(|value| value.get() != "null")
+    {
+        let intent_object = crate::session::raw_document::RawObject::parse(intent)?;
+        for field in ["kind", "value", "from"] {
+            intent_object.unique(field)?;
+        }
+        let _: crate::session::ResumeIntent = serde_json::from_str(intent.get())?;
+    }
+    if let Some(workspace) = object.unique("workspace_info")? {
+        let _: Option<crate::session::WorkspaceInfo> = serde_json::from_str(workspace.get())?;
+    }
+    if let Some(prior) = object
+        .unique("prior_tool_session_ids")?
+        .filter(|value| value.get() != "null")
+    {
+        let prior_object = crate::session::raw_document::RawObject::parse(prior)?;
+        let tools = value
+            .get("prior_tool_session_ids")
+            .and_then(Value::as_object)
+            .context("prior tool inventory must be an object")?;
+        for tool in tools.keys() {
+            let slot = crate::session::raw_document::RawObject::parse(
+                prior_object.unique(tool)?.context("missing prior tool")?,
+            )?;
+            for field in ["agent_session_id", "acp_session_id"] {
+                if let Some(value) = slot.unique(field)? {
+                    let _: Option<String> = serde_json::from_str(value.get())?;
+                }
+            }
+            if let Some(binding) = slot.unique("agent_session_binding")? {
+                let _: Option<crate::session::ConversationBinding> =
+                    serde_json::from_str(binding.get())?;
+            }
+        }
+    }
+    if let Some(resets) = object.unique("sandbox_content_resets")? {
+        let resets: Vec<&serde_json::value::RawValue> = serde_json::from_str(resets.get())?;
+        for reset in resets {
+            let reset = crate::session::raw_document::RawObject::parse(reset)?;
+            for field in ["slot", "transaction", "tool"] {
+                if let Some(value) = reset.unique(field)? {
+                    let _: Option<String> = serde_json::from_str(value.get())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_registries(app: &Path) -> Result<Vec<(PathBuf, Registry)>> {
+    layout::registry_paths(app)?
+        .into_iter()
+        .map(|path| {
+            let registry = Registry::read(&path).with_context(|| {
+                format!("cannot inventory content owners in {}", path.display())
+            })?;
+            Ok((path, registry))
+        })
+        .collect()
 }
 
 fn lock_registries(app: &Path) -> Result<Vec<crate::session::StorageFlock>> {
@@ -928,20 +1140,24 @@ fn lock_registries(app: &Path) -> Result<Vec<crate::session::StorageFlock>> {
     layout::lock_registry_dirs(&directories.into_iter().collect::<Vec<_>>())
 }
 
-fn write_registry(path: &Path, value: &Value) -> Result<()> {
-    crate::session::atomic_write(path, &serde_json::to_vec_pretty(value)?)?;
+fn write_registry(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::session::atomic_write(path, bytes)?;
     fs::File::open(path.parent().context("registry has no parent")?)?.sync_all()?;
     Ok(())
 }
 
 fn read_row(path: &Path, id: &str) -> Result<Option<Value>> {
-    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
-    Ok(value
-        .as_array()
-        .context("session registry must be an array")?
-        .iter()
-        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
-        .cloned())
+    let mut registry = Registry::read(path)?;
+    let Some(index) = registry.selected(id)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        registry
+            .value
+            .as_array_mut()
+            .expect("validated registry array")
+            .swap_remove(index),
+    ))
 }
 
 fn row_tools(row: &Value) -> BTreeSet<String> {
@@ -1227,21 +1443,15 @@ fn recovery_exposure(
     targets: &[PathBuf],
     exposure: &ExposureProbe<'_>,
 ) -> Result<Exposure> {
+    // Retained IDs cannot be probed as reconstructed native authorities, nor
+    // treated as absent owners of custom roots or recovery-namespace mounts.
+    layout::ensure_no_retained_owners(app)?;
     let mut found = Exposure::default();
     for (path, registry) in read_registries(app)? {
         let profile = layout::profile_for_registry(app, &path);
         let config = crate::session::config::profile_config::resolve_config(&profile)?;
-        for row in registry
-            .as_array()
-            .context("session registry must be an array")?
-        {
-            if row
-                .pointer("/sandbox_info/enabled")
-                .and_then(Value::as_bool)
-                != Some(true)
-            {
-                continue;
-            }
+        for &index in &registry.sandbox_rows {
+            let row = &registry.rows()[index];
             let id = row
                 .get("id")
                 .and_then(Value::as_str)
@@ -1925,16 +2135,15 @@ fn record_reset_in(
     home: &Path,
     config: &crate::session::Config,
     roots: &[ContentRoot],
-) -> Result<()> {
-    let mut fresh: Value = serde_json::from_slice(&fs::read(registry)?)?;
-    let Some(current) = fresh
-        .as_array_mut()
-        .context("session registry must be an array")?
-        .iter_mut()
-        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
-    else {
-        return Ok(());
+) -> Result<bool> {
+    let mut fresh = Registry::read(registry)?;
+    let Some(index) = fresh.selected(id)? else {
+        return Ok(false);
     };
+    let current = &fresh.rows()[index];
+    if !row_is_sandboxed(current) {
+        return Ok(false);
+    }
     let mut current_roots = row_roots(current, tool, home, config)?;
     container_config::expand_content_roles(&mut current_roots, home, &config.session)?;
     // The reset is per transaction, and `reset_row` already answers for this
@@ -1944,17 +2153,15 @@ fn record_reset_in(
     let resolves_same_store: BTreeSet<_> =
         current_roots.iter().map(|root| root.path.clone()).collect();
     if resolves_same_store != roots.iter().map(|root| root.path.clone()).collect() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(receipt) = retired_receipt(app, id, tool, current, &current_roots)? else {
-        return Ok(());
+        return Ok(true);
     };
-    let before = current.clone();
-    reset_row(current, &receipt)?;
-    if *current != before {
-        write_registry(registry, &fresh)?;
+    if let Some(bytes) = fresh.reset(index, &receipt)? {
+        write_registry(registry, &bytes)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The journal entry that retired this row's context, read from beside the live
@@ -2106,6 +2313,7 @@ fn migration_targets(app: &Path, roots: &[ContentRoot]) -> Result<Vec<PathBuf>> 
     Ok(targets)
 }
 
+#[cfg(test)]
 fn migrate_target(
     app: &Path,
     home: &Path,
@@ -2114,31 +2322,66 @@ fn migrate_target(
     reap: &dyn Fn(&str) -> Result<bool>,
     exposure: &ExposureProbe<'_>,
 ) -> Result<bool> {
+    migrate_target_with_workspace(app, home, target, running, reap, exposure, false)
+}
+
+fn migrate_target_with_workspace(
+    app: &Path,
+    home: &Path,
+    target: (&Path, &str, &str),
+    running: &dyn Fn(&str) -> Result<bool>,
+    reap: &dyn Fn(&str) -> Result<bool>,
+    exposure: &ExposureProbe<'_>,
+    workspace_held: bool,
+) -> Result<bool> {
     let (registry, id, tool) = target;
+    let mut workspace_locks = if workspace_held {
+        None
+    } else {
+        Some(layout::lock_workspace_namespaces(app)?)
+    };
+    layout::ensure_no_retained_owners(app)?;
     let profile = layout::profile_for_registry(app, registry);
     let config = crate::session::config::profile_config::resolve_config(&profile)?;
     let Some(snapshot) = read_row(registry, id)? else {
         return Ok(false);
     };
+    if !row_is_sandboxed(&snapshot) {
+        return Ok(false);
+    }
     let mut roots = row_roots(&snapshot, tool, home, &config)?;
     if roots.is_empty() || roots_ready(app, id, tool, &roots)? {
         // A store another row already moved still has to stop this row from
         // resuming the retired context, and this is the only pass that sees it.
         let registries = lock_registries(app)?;
-        record_reset_in(app, registry, id, tool, home, &config, &roots)?;
+        let admitted = record_reset_in(app, registry, id, tool, home, &config, &roots)?;
         drop(registries);
-        return Ok(true);
+        return Ok(admitted);
     }
     container_config::expand_content_roles(&mut roots, home, &config.session)?;
+    drop(workspace_locks.take());
     let mut cohorts = Vec::with_capacity(roots.len());
     for root in &roots {
-        cohorts.push(layout::acquire_cohort_lock(app, &root.path)?);
+        let lock = if workspace_held {
+            layout::try_lock_cohort_under_workspace(app, &root.path)?
+                .context("sandbox content is moving; release original admission and retry")?
+        } else {
+            layout::acquire_cohort_lock(app, &root.path)?
+        };
+        cohorts.push(lock);
     }
+    if !workspace_held {
+        workspace_locks = Some(layout::lock_workspace_namespaces(app)?);
+    }
+    layout::ensure_no_retained_owners(app)?;
     let mut transition = Some(crate::session::acquire_storage_flock(app, layout::LOCK)?);
     let mut registries = Some(lock_registries(app)?);
     let Some(row) = read_row(registry, id)? else {
         return Ok(false);
     };
+    if !row_is_sandboxed(&row) {
+        return Ok(false);
+    }
     let config = crate::session::config::profile_config::resolve_config(&profile)?;
     let mut locked_roots = row_roots(&row, tool, home, &config)?;
     container_config::expand_content_roles(&mut locked_roots, home, &config.session)?;
@@ -2172,8 +2415,7 @@ fn migrate_target(
         // The row that ran the transaction recorded its own reset. Every other
         // row resolving this store still has to stop resuming the context that
         // transaction retired.
-        record_reset_in(app, registry, id, tool, home, &config, &roots)?;
-        return Ok(true);
+        return record_reset_in(app, registry, id, tool, home, &config, &roots);
     }
     discard_stage(app, &mut receipt, &path)?;
     if receipt.phase == Phase::Planned {
@@ -2182,11 +2424,16 @@ fn migrate_target(
     }
     drop(registries.take());
     drop(transition.take());
+    drop(workspace_locks.take());
     let workspace = Path::new(
         row.get("project_path")
             .and_then(Value::as_str)
             .context("sandbox row has no project path")?,
     );
+    if !workspace_held {
+        workspace_locks = Some(layout::lock_workspace_namespaces(app)?);
+    }
+    layout::ensure_no_retained_owners(app)?;
     stage_receipt(app, &mut receipt, &path, home, &config, workspace)?;
     #[cfg(test)]
     AFTER_STAGE_HOOK.with(|hook| {
@@ -2197,43 +2444,25 @@ fn migrate_target(
     transition = Some(crate::session::acquire_storage_flock(app, layout::LOCK)?);
     registries = Some(lock_registries(app)?);
     let fresh_config = crate::session::config::profile_config::resolve_config(&profile)?;
-    let mut fresh: Value = serde_json::from_slice(&fs::read(registry)?)?;
-    let Some(current) = fresh
-        .as_array_mut()
-        .context("session registry must be an array")?
-        .iter_mut()
-        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
-    else {
+    let mut fresh = Registry::read(registry)?;
+    let Some(index) = fresh.selected(id)? else {
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     };
+    let current = &fresh.rows()[index];
     let mut current_roots = row_roots(current, tool, home, &fresh_config)?;
     container_config::expand_content_roles(&mut current_roots, home, &fresh_config.session)?;
     if current_roots != roots
         || !row_tools(current).contains(tool)
-        || current.get("project_path") != row.get("project_path")
-        || [
-            "tool",
-            "command",
-            "extra_args",
-            "detect_as",
-            "agent_session_id",
-            "agent_session_binding",
-            "resume_intent",
-            "resume_binding",
-            "prior_tool_session_ids",
-        ]
-        .iter()
-        .any(|field| current.get(*field) != row.get(*field))
-        || current.pointer("/sandbox_info/container_workdir")
-            != row.pointer("/sandbox_info/container_workdir")
-        || current.get("workspace_info") != receipt.retired_identity.get("workspace_info")
+        || !content_scope_matches(&row, current, &receipt.retired_identity)
     {
-        // A container could have started after the stage was seeded, so the
-        // seed is dropped with the plan it was made for.
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
+    if receipt.phase == Phase::Staged {
+        record_retirement(&mut receipt, current, home, &fresh_config)?;
+    }
+    let bytes = fresh.reset(index, &receipt)?;
     layout::refresh_liveness();
     if running(id)? || detached_writer_live(app, id)? || !reap(id)? {
         progress::notice(format!(
@@ -2249,13 +2478,14 @@ fn migrate_target(
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
+
     if receipt.phase == Phase::Staged {
-        record_retirement(&mut receipt, current, home, &fresh_config)?;
         write_receipt(&path, &receipt)?;
     }
     publish_receipt(&mut receipt, &path)?;
-    reset_row(current, &receipt)?;
-    write_registry(registry, &fresh)?;
+    if let Some(bytes) = bytes {
+        write_registry(registry, &bytes)?;
+    }
     receipt.phase = Phase::Committed;
     write_receipt(&path, &receipt)?;
     certify_receipt(app, &receipt)?;
@@ -2263,6 +2493,7 @@ fn migrate_target(
     drop(registries);
     drop(transition);
     drop(cohorts);
+    drop(workspace_locks);
     Ok(true)
 }
 
@@ -2275,19 +2506,30 @@ fn reconcile_in(
     reap: &dyn Fn(&str) -> Result<bool>,
     exposure: &ExposureProbe<'_>,
 ) -> Result<()> {
+    reconcile_in_with_workspace(
+        app,
+        home,
+        (only, false),
+        move_stores,
+        running,
+        reap,
+        exposure,
+    )
+}
+
+fn reconcile_in_with_workspace(
+    app: &Path,
+    home: &Path,
+    (only, workspace_held): (Option<&str>, bool),
+    move_stores: bool,
+    running: &dyn Fn(&str) -> Result<bool>,
+    reap: &dyn Fn(&str) -> Result<bool>,
+    exposure: &ExposureProbe<'_>,
+) -> Result<()> {
     let mut targets = BTreeMap::new();
     for (path, registry) in read_registries(app)? {
-        for row in registry
-            .as_array()
-            .context("session registry must be an array")?
-        {
-            if row
-                .pointer("/sandbox_info/enabled")
-                .and_then(Value::as_bool)
-                != Some(true)
-            {
-                continue;
-            }
+        for &index in &registry.sandbox_rows {
+            let row = &registry.rows()[index];
             let id = row
                 .get("id")
                 .and_then(Value::as_str)
@@ -2303,9 +2545,15 @@ fn reconcile_in(
     }
     for ((path, id, tool), ()) in targets {
         if move_stores || only.is_some() {
-            if let Err(error) =
-                migrate_target(app, home, (&path, &id, &tool), running, reap, exposure)
-            {
+            if let Err(error) = migrate_target_with_workspace(
+                app,
+                home,
+                (&path, &id, &tool),
+                running,
+                reap,
+                exposure,
+                workspace_held,
+            ) {
                 if !container_config::source_changed(&error) {
                     return Err(error);
                 }
@@ -2416,6 +2664,20 @@ pub(crate) fn migrate_instance(id: &str) -> Result<()> {
     )
 }
 
+/// Caller retains both namespaces' actual workspace fences; never reacquire them.
+pub(crate) fn migrate_instance_under_workspace_locks(id: &str) -> Result<()> {
+    let app = crate::session::get_app_dir()?;
+    let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
+    reconcile_in_with_workspace(
+        &app,
+        &home,
+        (Some(id), true),
+        true,
+        &layout::batched_running_probe(false),
+        &layout::reap_migrated_container,
+        &live_bind_sources,
+    )
+}
 /// Fresh builders may certify only absent roots or already certified roots.
 /// Existing unproven data requires the stopped, registry-backed migration.
 pub(crate) fn ensure_fresh_content(
@@ -2448,6 +2710,9 @@ fn ensure_fresh_content_with(
     exposure: &ExposureProbe<'_>,
 ) -> Result<crate::session::StorageFlock> {
     crate::session::validate_instance_id(instance)?;
+    // The caller owns workspace admission. This may run under a shared
+    // transition fence; do not reacquire workspace in this helper.
+    layout::ensure_no_retained_owners(app)?;
     if !roots_ready(app, instance, tool, roots)? {
         // Never wait for a cohort held by a migrator while already holding the
         // transition lock. Callers initialize fresh stores before launch admission.
@@ -2568,6 +2833,9 @@ pub(crate) fn guard_preparation(
         .context("sandbox path has no instance id")?;
     crate::session::validate_instance_id(instance)?;
     let app = crate::session::get_app_dir()?;
+    // Nested fresh-store preparation already holds transition and its original
+    // workspace admission. Read only; transition -> workspace would invert.
+    layout::ensure_no_retained_owners(&app)?;
     let transition = crate::session::acquire_storage_shared_flock(&app, layout::LOCK)?;
     let root = ContentRoot {
         path: canonical_expected_path(sandbox)?,
@@ -2580,9 +2848,157 @@ pub(crate) fn guard_preparation(
     Ok(transition)
 }
 
+fn row_is_sandboxed(row: &Value) -> bool {
+    row.pointer("/sandbox_info/enabled")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn content_scope_matches(planned: &Value, current: &Value, retired_identity: &Value) -> bool {
+    [
+        "project_path",
+        "tool",
+        "command",
+        "extra_args",
+        "detect_as",
+        "agent_session_id",
+        "agent_session_binding",
+        "resume_intent",
+        "resume_binding",
+        "prior_tool_session_ids",
+        "sandbox_info",
+        "sandbox_store_generation",
+    ]
+    .iter()
+    .all(|field| current.get(*field) == planned.get(*field))
+        && row_is_sandboxed(planned)
+        && row_is_sandboxed(current)
+        && current.get("workspace_info") == retired_identity.get("workspace_info")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_content_refuses_disabled_or_legacy_fresh_scope() {
+        let planned = serde_json::json!({
+            "tool":"gemini", "project_path":"/project", "sandbox_store_generation":2,
+            "sandbox_info":{"enabled":true,"container_workdir":"/work"},
+        });
+        let identity = serde_json::json!({});
+        assert!(content_scope_matches(&planned, &planned, &identity));
+        for changed in 0..2 {
+            let mut fresh = planned.clone();
+            match changed {
+                0 => fresh["sandbox_info"]["enabled"] = serde_json::json!(false),
+                _ => fresh["sandbox_store_generation"] = serde_json::json!(1),
+            }
+            assert!(!content_scope_matches(&planned, &fresh, &identity));
+        }
+        let mut disabled = planned.clone();
+        disabled["sandbox_info"]["enabled"] = serde_json::json!(false);
+        assert!(!content_scope_matches(&disabled, &disabled, &identity));
+    }
+
+    #[test]
+    fn content_metadata_checkpoint_preserves_raw_owners() -> Result<()> {
+        use crate::session::raw_document::{RawDocument, RawObject};
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("sessions.json");
+        let journal = r#"{"coverage":"unknown","launches":[{"partial_native":{"same":1,"same":2,"number":1.2300e+02,"escaped":"\u0061"}}]}"#;
+        let owner = format!(
+            r#"{{"id":"e17a000000000041","tool":"gemini","sandbox_content_policy":0,"runner_journal":{journal},"extension":{{"x":1,"x":2,"number":1e400}}}}"#
+        );
+        let peer = format!(r#"{{"id":"e17a000000000042","runner_journal":{journal}}}"#);
+        let frozen = r#"{"id":"frozen-left","id":"frozen-right","sandbox_info":{"enabled":false},"opaque":{"x":1,"x":2,"number":-0}}"#;
+        fs::write(&path, format!("[{owner},{peer},{frozen}]"))?;
+        let receipt = Receipt {
+            policy: CONTENT_POLICY,
+            instance: "e17a000000000041".into(),
+            tool: "gemini".into(),
+            transaction: "metadata-only".into(),
+            roots: Vec::new(),
+            phase: Phase::Committed,
+            retired_identity: Value::Null,
+            retired_tools: BTreeMap::new(),
+        };
+        let mut fresh = Registry::read(&path)?;
+        let index = fresh.selected(&receipt.instance)?.unwrap();
+        let bytes = fresh.reset(index, &receipt)?.unwrap();
+        write_registry(&path, &bytes)?;
+        let mut unchanged = Registry::read(&path)?;
+        let index = unchanged.selected(&receipt.instance)?.unwrap();
+        assert!(unchanged.reset(index, &receipt)?.is_none());
+        assert_eq!(fs::read(&path)?, bytes);
+        let bytes = fs::read(&path)?;
+        let document = RawDocument::parse(std::str::from_utf8(&bytes)?)?;
+        let selected = RawObject::parse(&document.rows[0])?;
+        assert_eq!(selected.unique("runner_journal")?.unwrap().get(), journal);
+        assert_eq!(
+            selected.unique("extension")?.unwrap().get(),
+            r#"{"x":1,"x":2,"number":1e400}"#
+        );
+        assert_eq!(document.rows[1].get(), peer);
+        assert_eq!(document.rows[2].get(), frozen);
+        assert_eq!(
+            serde_json::from_str::<u8>(selected.unique("sandbox_content_policy")?.unwrap().get())?,
+            CONTENT_POLICY
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_content_claims_refuse_without_checkpoint() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("sessions.json");
+        let id = "e17a000000000061";
+        for rows in [
+            format!(r#"[{{"id":"{id}","id":"e17a000000000062"}}]"#),
+            format!(r#"[{{"id":"{id}"}},{{"id":"{id}"}}]"#),
+            format!(r#"[{{"id":"{id}","sandbox_info":{{"enabled":true,"enabled":false}}}}]"#),
+            format!(
+                r#"[{{"id":"{id}","prior_tool_session_ids":{{"gemini":{{}},"gemini":{{}}}}}}]"#
+            ),
+            format!(r#"[{{"id":"{id}","sandbox_content_resets":[{{"slot":"a","slot":"b"}}]}}]"#),
+            format!(
+                r#"[{{"id":"{id}","resume_intent":{{"kind":"Use","value":"left","value":"right"}}}}]"#
+            ),
+            format!(
+                r#"[{{"id":"{id}","resume_intent":{{"kind":"Cleared","from":"left","from":"right"}}}}]"#
+            ),
+        ] {
+            fs::write(&path, &rows)?;
+            let admitted = Registry::read(&path).and_then(|registry| registry.selected(id));
+            assert!(admitted.is_err());
+            assert_eq!(fs::read(&path)?, rows.as_bytes());
+        }
+        Ok(())
+    }
+
+    fn prepare_context_in_store(
+        storage: &crate::session::Storage,
+        id: &str,
+        agent: Option<&str>,
+        generation: u64,
+        usage: AcpContextUse,
+        continuation: crate::acp::supervisor::SandboxContinuation,
+    ) -> Result<AcpLaunchContext> {
+        storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == id)
+                .context("fixture native context owner disappeared")?;
+            super::prepare_acp_context(
+                storage.profile(),
+                row,
+                agent,
+                generation,
+                usage,
+                continuation,
+            )
+        })
+    }
 
     fn mutate_workspace_after_stage(registry: &Path, id: &str) {
         let mut rows: Vec<Value> = serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
@@ -2590,7 +3006,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
             .unwrap();
-        row["workspace_info"]["repos"] = serde_json::json!([{"main_repo_path": "/new/repo"}]);
+        row["workspace_info"]["workspace_dir"] = serde_json::json!("/new/workspace");
         fs::write(registry, serde_json::to_vec(&rows).unwrap()).unwrap();
     }
 
@@ -2625,6 +3041,7 @@ mod tests {
             "container_name": "aoe-sandbox-fixture",
         });
         row["workspace_info"] = serde_json::json!({
+            "name": "fixture",
             "branch": "main",
             "workspace_dir": project.to_string_lossy(),
             "repos": [],
@@ -3861,8 +4278,9 @@ mod tests {
             "a carried resume must keep its session id: {}",
             rows[0]
         );
-        let continuation = prepare_acp_context(
-            "default",
+        let storage = crate::session::Storage::open_unwatched("default").unwrap();
+        let continuation = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             1,
@@ -3876,8 +4294,8 @@ mod tests {
             "the native-backed ACP adapter must load its carried conversation"
         );
         for other_agent in [None, Some("external-acp")] {
-            let outside = prepare_acp_context(
-                "default",
+            let outside = prepare_context_in_store(
+                &storage,
                 &instance.id,
                 other_agent,
                 2,
@@ -3890,8 +4308,8 @@ mod tests {
                 "an unproven adapter cannot load the retired ACP ID"
             );
         }
-        let native_again = prepare_acp_context(
-            "default",
+        let native_again = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             3,
@@ -4265,8 +4683,9 @@ mod tests {
                 stored["agent_session_id"], "own-context",
                 "{tool} lost native resume"
             );
-            let continuation = prepare_acp_context(
-                "default",
+            let storage = crate::session::Storage::open_unwatched("default").unwrap();
+            let continuation = prepare_context_in_store(
+                &storage,
                 &instance.id,
                 Some(tool),
                 1,
@@ -4422,8 +4841,9 @@ mod tests {
                 stored.get("agent_session_id").is_none(),
                 "{tool} retained an unproven ID"
             );
-            let context = prepare_acp_context(
-                "default",
+            let storage = crate::session::Storage::open_unwatched("default").unwrap();
+            let context = prepare_context_in_store(
+                &storage,
                 &instance.id,
                 Some(tool),
                 1,
@@ -4588,8 +5008,8 @@ mod tests {
             })
             .unwrap();
 
-        let imported = prepare_acp_context(
-            "default",
+        let imported = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             7,
@@ -4604,8 +5024,8 @@ mod tests {
         assert!(imported.fork_from.is_none());
         assert!(imported.seed_history_replay);
 
-        let fresh = prepare_acp_context(
-            "default",
+        let fresh = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             8,
@@ -4647,8 +5067,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let reset_import = prepare_acp_context(
-            "default",
+        let reset_import = prepare_context_in_store(
+            &storage,
             &instance.id,
             Some("claude"),
             9,
@@ -4713,9 +5133,10 @@ mod tests {
         fs::create_dir_all(registry.parent().unwrap()).unwrap();
         fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
 
+        let storage = crate::session::Storage::open_unwatched("default").unwrap();
         assert!(
-            prepare_acp_context(
-                "default",
+            prepare_context_in_store(
+                &storage,
                 &instance.id,
                 None,
                 1,
@@ -4725,8 +5146,8 @@ mod tests {
             .is_err(),
             "an adapter that names no native agent cannot attach to a moved lane"
         );
-        let context = prepare_acp_context(
-            "default",
+        let context = prepare_context_in_store(
+            &storage,
             &instance.id,
             None,
             1,

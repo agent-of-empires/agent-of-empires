@@ -46,8 +46,6 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         conversation_carry,
     } = request;
 
-    let title = instance.title.clone();
-    let tool = instance.tool.clone();
     let before = instance.clone();
 
     // With `bound_hooks`, honor the on_launch / before_start hook timeout the startup-recovery
@@ -60,12 +58,16 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
             )
         });
         instance
-            .restart_discarding_sandbox_container(
-                size,
-                skip_on_launch,
-                discard_sandbox_container,
-                conversation_carry,
-            )
+            .original_storage()
+            .and_then(|storage| {
+                storage.verify_profile_identity()?;
+                instance.restart_discarding_sandbox_container(
+                    size,
+                    skip_on_launch,
+                    discard_sandbox_container,
+                    conversation_carry,
+                )
+            })
             .map_err(|e| e.to_string())
     };
 
@@ -74,7 +76,9 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     // pane-readiness probe.
     let should_wake = launched_agent(&outcome);
     if should_wake && !wake_message.is_empty() {
-        spawn_wake_worker(session_id.clone(), title, tool, wake_message);
+        if let Err(error) = spawn_wake_worker(&instance, wake_message) {
+            tracing::warn!(target: "session.restart", %error, "failed to capture restart wake-up worker");
+        }
     }
 
     RestartResult {
@@ -97,14 +101,28 @@ pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
 
 /// Wait for the restarted pane to become live and past its boot shell, then send the wake-up
 /// message.
-fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_message: String) {
+fn spawn_wake_worker(instance: &Instance, wake_message: String) -> anyhow::Result<()> {
+    let storage = instance.original_storage()?;
+    let session_id = instance.id.clone();
+    let generation = instance.lifecycle_generation;
+    let execution = instance.active_execution.clone();
+    let tool = instance.tool.clone();
+    let tmux_session = super::runner_journal::with_current_execution_row(
+        &storage,
+        &session_id,
+        generation,
+        execution.as_ref(),
+        |current| {
+            anyhow::ensure!(current.tool == tool, "restart wake-up inputs changed");
+            let session = crate::tmux::Session::new(&session_id, &current.title)?;
+            session.primary_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+            Ok(session)
+        },
+    )?;
     let spawn_result = std::thread::Builder::new()
         .name(format!("aoe-restart-wake/{}", session_id))
         .stack_size(128 * 1024)
         .spawn(move || {
-            let Ok(tmux_session) = crate::tmux::Session::new(&session_id, &title) else {
-                return;
-            };
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
             loop {
                 if !tmux_session.exists() {
@@ -116,22 +134,22 @@ fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_messa
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
-                    break;
+                    return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
-            if !tmux_session.exists() {
-                return;
-            }
-            let delay = crate::agents::send_keys_enter_delay(&tool);
-            if let Err(e) = tmux_session.send_keys_with_delay(&wake_message, delay) {
-                tracing::warn!(target: "session.restart", "failed to send wake-up message after restart: {}", e);
+            if let Err(error) = super::runner_journal::with_current_execution_row(
+                &storage, &session_id, generation, execution.as_ref(), |current| {
+                    anyhow::ensure!(current.tool == tool, "restart wake-up inputs changed");
+                    let delay = crate::agents::send_keys_enter_delay(&tool);
+                    tmux_session.send_keys_with_delay(&wake_message, delay)
+                }) {
+                tracing::warn!(target: "session.restart", %error, "restart wake-up was not delivered");
             }
         });
-    if let Err(err) = spawn_result {
-        tracing::warn!(target: "session.restart", ?err, "failed to spawn restart wake-up worker");
-    }
+    spawn_result?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -175,6 +193,7 @@ mod tests {
         for (peer_reserved, expected_removals) in [(true, 0), (false, 1)] {
             let mut instance = test_instance();
             instance.source_profile = profile.to_string();
+            instance.storage_origin = Some(std::sync::Arc::new(storage.clone()));
             instance.tool = "codex".to_string();
             instance.sandbox_info = Some(SandboxInfo {
                 provider: None,
@@ -193,6 +212,8 @@ mod tests {
                     op: LifecycleOperation::Launch,
                     generation: 1,
                     at: chrono::Utc::now(),
+                    path_claims: crate::session::WorktreePathClaims::None,
+                    custodian: None,
                 });
             }
             storage

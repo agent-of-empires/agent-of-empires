@@ -70,10 +70,21 @@ pub(super) async fn flush_passive_transition_writes(
         let unread_ids_for_local = unread_ids.clone();
         let patch_count = patches.len();
         let unread_count = unread_ids.len();
+        let selected_ids: Vec<String> = patches
+            .keys()
+            .cloned()
+            .chain(
+                unread_ids
+                    .iter()
+                    .filter(|id| !patches.contains_key(*id))
+                    .cloned(),
+            )
+            .collect();
         let persisted = api::persist_session_update(
             profile.clone(),
             "passive-status",
             file_watch.clone(),
+            crate::session::MetadataSelection::Sessions(selected_ids.into()),
             move |insts| {
                 for inst in insts.iter_mut() {
                     if let Some((id, patch)) = patches.get_key_value(&inst.id) {
@@ -129,7 +140,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    let mut acp_reap_cadence = acp_reconciler::ReapCadence::default();
+    let mut acp_reap_cadence = acp_reconciler::ReconcilerState::default();
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
     // Loop-local, single-owner sleep-inhibit assertion (single global toggle, so one slot
     // for the whole daemon).
@@ -143,7 +154,10 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
     let mut acp_capacity_deferred: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = state.shutdown.cancelled() => return,
+            _ = interval.tick() => {},
+        }
 
         let prev: std::collections::HashMap<String, crate::session::Status> = {
             let instances = state.instances.read().await;
@@ -184,6 +198,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
         // fall back to comparing against its own possibly-stale disk-loaded `status`.
         let prev_for_poll = prev.clone();
         let snapshot_guard = state.session_service.disk_reload_guard().await;
+        super::reload::reconcile_filesystem_claims(&state).await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -256,6 +271,9 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
 
             drain_session_id_updates_in_state(&state).await;
 
+            if state.shutdown.is_cancelled() {
+                return;
+            }
             acp_reconciler::reconcile_acp_workers(
                 &state,
                 &mut attempted_acp_spawns,

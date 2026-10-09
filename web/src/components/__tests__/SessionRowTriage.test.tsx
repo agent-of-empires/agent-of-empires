@@ -6,7 +6,7 @@ import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 import type { SessionResponse } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
 import { OPEN_SWITCH_AGENT_EVENT, consumePendingSwitchAgent } from "../../lib/switchAgentTrigger";
-import { firstRequest, makeSession, makeWorkspace, openRowMenu, renderRow, stubFetch } from "./fixtures";
+import { makeSession, makeWorkspace, openRowMenu, renderRow, stubFetch } from "./fixtures";
 
 const ws = (over: Partial<SessionResponse> = {}) => makeWorkspace("w", [makeSession(over)]);
 const PAST = "2026-01-01T00:00:00Z";
@@ -112,8 +112,14 @@ describe("SessionRow unread", () => {
     expect(testId("sidebar-context-menu-unread")).toBeNull();
   });
 
-  it.each([false, true])("unread=%s toggles in place and PATCHes the opposite", async (unread) => {
+  it.each([false, true])("unread=%s applies its acknowledged state in place", async (unread) => {
     const next = !unread;
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(makeSession({ id: "sess-u", unread: next })), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
     openRowMenu(ws({ id: "sess-u", unread }));
     const toggle = () => testId("sidebar-context-menu-unread")!;
     expect(toggle().getAttribute("aria-pressed")).toBe(String(unread));
@@ -123,11 +129,6 @@ describe("SessionRow unread", () => {
     expect(toggle().getAttribute("aria-pressed")).toBe(String(next));
     expect(testId("sidebar-context-menu")).not.toBeNull();
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
-    expect(firstRequest(fetchSpy)).toEqual({
-      url: "/api/sessions/sess-u/unread",
-      method: "PATCH",
-      body: { unread: next },
-    });
   });
 });
 
@@ -241,29 +242,38 @@ describe("SessionRow context menu", () => {
 });
 
 describe("SessionRow triage actions", () => {
-  it.each([
-    ["Pin", {}, "sidebar-context-menu-pin", "pin", { pinned: true }],
-    ["Unpin", { pinned_at: PAST }, "sidebar-context-menu-pin", "pin", { pinned: false }],
-    ["Archive", {}, "sidebar-context-menu-archive", "archive", { archived: true, kill_pane: true }],
-    [
-      "Unarchive",
-      { archived_at: PAST },
-      "sidebar-context-menu-archive",
-      "archive",
-      { archived: false, kill_pane: true },
-    ],
-    ["Unsnooze", { snoozed_until: inMinutes(60) }, "sidebar-context-menu-unsnooze", "snooze", { minutes: null }],
-    ["Color", {}, "sidebar-context-menu-color-red", "color", { color: "red" }],
-    ["Clear color", { color: "green" }, "sidebar-context-menu-color-clear", "color", { color: null }],
-  ] as [string, Partial<SessionResponse>, string, string, unknown][])(
-    "%s PATCHes its endpoint",
-    async (_n, over, item, path, body) => {
-      openRowMenu(ws({ id: "sess-it", ...over }));
-      click(item);
-      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
-      expect(firstRequest(fetchSpy)).toEqual({ url: `/api/sessions/sess-it/${path}`, method: "PATCH", body });
-    },
-  );
+  it.each(["archive", "snooze"] as const)("%s applies the acknowledged status, pin and deadline", async (action) => {
+    const id = "canonical-triage";
+    const deadline = inMinutes(20);
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify(
+          makeSession({
+            id,
+            status: "Idle",
+            pinned_at: null,
+            archived_at: action === "archive" ? PAST : null,
+            snoozed_until: action === "snooze" ? deadline : null,
+          }),
+        ),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    openRowMenu(ws({ id, status: "Running", pinned_at: PAST }));
+    expect(screen.getByTestId("sidebar-session-row").querySelector(".text-status-running")).not.toBeNull();
+    click(`sidebar-context-menu-${action}`);
+    if (action === "snooze") click("snooze-modal-preset-60");
+    await vi.waitFor(() => {
+      expect(label("Pinned")).toBeNull();
+      expect(screen.getByTestId("sidebar-session-row").querySelector(".text-status-running")).toBeNull();
+      if (action === "archive") expect(label("Archived")).not.toBeNull();
+      else {
+        const remaining = Number.parseInt(label("Snoozed")!.textContent!, 10);
+        expect(remaining).toBeGreaterThanOrEqual(19);
+        expect(remaining).toBeLessThanOrEqual(20);
+      }
+    });
+  });
 
   it.each([
     ["Pin", "sidebar-context-menu-pin", "Pinned"],

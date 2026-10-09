@@ -7,7 +7,7 @@
 
 import * as acp from "@agentclientprotocol/sdk";
 import net from "node:net";
-import { appendFile, access, writeFile } from "node:fs/promises";
+import { appendFile, access, readFile, writeFile } from "node:fs/promises";
 import { Duplex, Readable, Writable } from "node:stream";
 
 // One shim process serves one ACP connection, so module state is per connection.
@@ -38,6 +38,15 @@ async function waitForFile(path) {
 async function record(envVar, line) {
   const file = process.env[envVar];
   if (file) await appendFile(file, line);
+}
+
+async function resumeCursor(path) {
+  try {
+    return Number.parseInt(await readFile(path, "utf8"), 10);
+  } catch (error) {
+    if (error.code === "ENOENT") return 0;
+    throw error;
+  }
 }
 
 // SHIM_ENV_RECORD_FILE: the Claude routing variables as the adapter process
@@ -99,7 +108,12 @@ function emitUnsolicitedNotifIfRequested(client) {
   );
 }
 
-function handleInitialize(params) {
+async function handleInitialize(params) {
+  const state = process.env.SHIM_RATE_LIMIT_RESUME_STATE;
+  if (state && (await resumeCursor(state)) === 1) {
+    await writeFile(`${state}.initialize.entered`, JSON.stringify({ pid: process.pid, turnCursor: 1 }));
+    await waitForFile(`${state}.initialize.release`);
+  }
   // SHIM_LOAD_SESSION=1 advertises loadSession.
   const agentCapabilities = { loadSession: process.env.SHIM_LOAD_SESSION === "1" };
   // SHIM_DELETE_CAPABILITY=1 advertises session/delete.
@@ -305,6 +319,21 @@ async function handlePrompt(params, client) {
   const chunk = (text) =>
     notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
 
+  const state = process.env.SHIM_RATE_LIMIT_RESUME_STATE;
+  if (state) {
+    const cursor = await resumeCursor(state);
+    await writeFile(state, String(cursor + 1));
+    await record("SHIM_RATE_LIMIT_RESUME_PROMPTS", JSON.stringify({ pid: process.pid, text: userText }) + "\n");
+    if (cursor === 0) {
+      await notify({
+        sessionUpdate: "usage_update", used: 1234, size: 200000,
+        _meta: { "_claude/rateLimit": { status: "rejected", resetsAt: Math.floor(Date.now() / 1000) + 10 } },
+      });
+      throw acp.RequestError.internalError({ errorKind: "rate_limit" }, "usage limit reached");
+    }
+    await chunk(`sdk resumed: ${userText}`);
+    return { stopReason: "end_turn" };
+  }
   // Checked in this order, as the scenarios' keywords are distinct.
   for (const keyword of ["COST_THEN_SILENCE", "SILENCE_NO_COST", "ASYNC_AGENT_ORPHAN"]) {
     if (userText.includes(keyword)) {

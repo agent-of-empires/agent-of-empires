@@ -65,10 +65,6 @@ impl HomeView {
         }
     }
 
-    pub fn sort_order(&self) -> SortOrder {
-        self.sort_order
-    }
-
     /// Move the cursor to the first session row, skipping `returning_id` unless it is the only one.
     pub fn select_top_attention(&mut self, returning_id: Option<&str>) {
         let mut sessions =
@@ -117,6 +113,7 @@ impl HomeView {
                     if let Some(tree) = self.group_trees.get_mut(&target_profile) {
                         tree.set_collapsed(&gpath, false);
                     }
+                    self.record_group_edit(&target_profile);
                 }
             }
             self.rebuild_flat_items();

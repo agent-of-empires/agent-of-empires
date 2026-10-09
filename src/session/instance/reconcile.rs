@@ -5,7 +5,7 @@ use super::*;
 impl Instance {
     /// Reload this instance from disk before a launch that would re-persist peer-writable fields.
     pub(super) fn reconcile_from_disk(&mut self) {
-        if let Err(error) = self.try_reconcile_from_disk() {
+        if let Err(error) = self.try_reconcile_from_disk(false) {
             tracing::warn!(target: "session.store",
                 session = %self.id,
                 error = %format_args!("{error:#}"),
@@ -15,12 +15,8 @@ impl Instance {
 
     /// [`Self::reconcile_from_disk`] that reports a storage failure. `Ok(false)`
     /// means the row is gone from disk and `self` is unchanged.
-    pub(super) fn try_reconcile_from_disk(&mut self) -> Result<bool> {
-        let storage = crate::session::storage::Storage::new(
-            &self.effective_profile(),
-            self.resolve_file_watch(),
-        )
-        .context("failed to open storage")?;
+    pub(super) fn try_reconcile_from_disk(&mut self, launch_baseline: bool) -> Result<bool> {
+        let storage = self.original_storage()?;
         let Some(mut disk) = storage
             .load()
             .context("failed to load sessions")?
@@ -29,6 +25,38 @@ impl Instance {
         else {
             return Ok(false);
         };
+
+        if launch_baseline {
+            disk.ensure_startable()?;
+            anyhow::ensure!(
+                disk.created_at == self.created_at
+                    && disk.lifecycle_generation == self.lifecycle_generation
+                    && disk.active_execution == self.active_execution
+                    && disk.project_path == self.project_path
+                    && disk.title == self.title
+                    && disk.first_launch_names_agent == self.first_launch_names_agent
+                    && disk.agent_provider == self.agent_provider
+                    && disk.tool == self.tool
+                    && disk.command == self.command
+                    && disk.extra_args == self.extra_args
+                    && disk.detect_as == self.detect_as
+                    && disk.yolo_mode == self.yolo_mode
+                    && disk.worktree_info == self.worktree_info
+                    && crate::session::runner_journal::sandbox_geometry_matches(
+                        disk.sandbox_info.as_ref(),
+                        self.sandbox_info.as_ref()
+                    )
+                    && match (&disk.workspace_info, &self.workspace_info) {
+                        (None, None) => true,
+                        (Some(disk), Some(expected)) =>
+                            disk.workspace_dir == expected.workspace_dir
+                                && disk.branch == expected.branch
+                                && disk.repos == expected.repos,
+                        _ => false,
+                    },
+                "native launch snapshot was superseded"
+            );
+        }
 
         // Carry runtime-only fields (`#[serde(skip)]`) and locally-mutated launch-time state from
         // `self` onto the disk snapshot.
@@ -89,15 +117,11 @@ impl Instance {
         if self.is_capture_excluded(fresh, observation.source()) {
             return;
         }
-        let profile = self.effective_profile();
+        let Ok(storage) = self.original_storage() else {
+            return;
+        };
         let baseline = self.conversation_state();
-        match persist_session_to_storage(
-            &profile,
-            &self.id,
-            &observation,
-            &baseline,
-            &self.resolve_file_watch(),
-        ) {
+        match persist_session_to_storage(&storage, &self.id, &observation, &baseline) {
             SidWrite::Applied => {
                 self.set_agent_conversation(Some(observation.sid), binding, None);
             }
@@ -120,7 +144,7 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
-    fn seeded(profile: &str, inst: &Instance) -> crate::session::storage::Storage {
+    fn seeded(profile: &str, inst: &mut Instance) -> crate::session::storage::Storage {
         seed_disk_for_sidecar_test(profile, inst);
         crate::session::storage::Storage::new_unwatched(profile).unwrap()
     }
@@ -132,6 +156,29 @@ mod tests {
             .into_iter()
             .find(|row| row.id == id)
             .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn native_launch_refuses_a_reused_id_with_the_same_plan_and_counter() {
+        let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let mut original = Instance::new("same-plan", "/tmp/reused-launch-origin");
+        let created_at = original.created_at;
+        let storage = seeded("reused-launch-origin", &mut original);
+        storage
+            .update(|rows, _| {
+                let replacement = rows.iter_mut().find(|row| row.id == original.id).unwrap();
+                replacement.created_at = created_at + chrono::Duration::seconds(1);
+                Ok(())
+            })
+            .unwrap();
+        assert!(original.try_reconcile_from_disk(true).is_err());
+        assert_eq!(
+            original.created_at, created_at,
+            "a queued launch cannot adopt a replacement DOB"
+        );
+        assert_ne!(disk_row(&storage, &original.id).created_at, created_at);
     }
 
     #[test]
@@ -167,7 +214,7 @@ mod tests {
             let mut inst = Instance::new(label, "/tmp/x");
             inst.source_profile = profile.to_string();
             inst.agent_session_id = Some("old-sid".to_string());
-            let storage = seeded(profile, &inst);
+            let storage = seeded(profile, &mut inst);
             storage
                 .update(|rows, _| {
                     peer_write(&mut rows[0]);
@@ -192,7 +239,7 @@ mod tests {
         let mut inst = Instance::new("runtime state", "/tmp/x");
         inst.source_profile = profile.to_string();
         inst.sandbox_info = Some(test_sandbox("ctr", None));
-        seeded(profile, &inst);
+        seeded(profile, &mut inst);
 
         let now = std::time::Instant::now();
         inst.poller_repair.defer(now);
@@ -300,7 +347,7 @@ mod tests {
                 inst.retroactive_capture_excludes
                     .insert(ConversationBinding::unknown(SIDECAR_TEST_FRESH_UUID));
             }
-            let storage = seeded(profile, &inst);
+            let storage = seeded(profile, &mut inst);
             if let Some(peer) = c.peer_sid {
                 storage
                     .update(|rows, _| {

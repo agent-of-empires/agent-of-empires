@@ -9,7 +9,7 @@ use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 use agent_of_empires::session::import::Owned;
 
-use crate::common::{shim_node, shim_path, shim_ready};
+use crate::common::shim::{shim_node, shim_path, shim_ready};
 
 fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
@@ -42,6 +42,8 @@ fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
+        managed_profile: None,
+        execution_admission: None,
         mcp_servers: Vec::new(),
         claude_store_pin: None,
         base_host_environment: vec![],

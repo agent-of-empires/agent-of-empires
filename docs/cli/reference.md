@@ -17,6 +17,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe status`↴](#aoe-status)
 * [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
+* [`aoe session abort-intent`↴](#aoe-session-abort-intent)
 * [`aoe session start`↴](#aoe-session-start)
 * [`aoe session stop`↴](#aoe-session-stop)
 * [`aoe session restart`↴](#aoe-session-restart)
@@ -392,6 +393,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 
 ###### **Subcommands:**
 
+* `abort-intent` — Remove unresolved intent or legacy session metadata; retain resources and exclusions
 * `start` — Start a session's tmux process
 * `stop` — Stop session process
 * `restart` — Restart session (or all sessions with `--all`)
@@ -415,6 +417,18 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `import` — Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
 * `list-trash` — List the sessions currently in the trash
 * `empty-trash` — Permanently purge every trashed session in the profile (irreversible)
+
+
+
+## `aoe session abort-intent`
+
+Remove unresolved intent or legacy session metadata; retain resources and exclusions
+
+**Usage:** `aoe session abort-intent <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Exact full ID of an unfinished create/attach intent or session with unknown runner history
 
 
 
@@ -1658,7 +1672,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
-* `stop` — Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
+* `stop` — Authentically stop a session's managed executions and prove their groups quiescent. Unverified legacy history remains protected
 * `kill` — SIGKILL a worker immediately (use when `stop` doesn't take)
 * `logs` — Tail the runner's log file for an agent session
 * `restart` — Restart a wedged agent worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
@@ -1702,7 +1716,7 @@ List configured agents (claude-code, aoe-agent, etc.)
 
 ## `aoe acp stop`
 
-Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
+Authentically stop a session's managed executions and prove their groups quiescent. Unverified legacy history remains protected
 
 **Usage:** `aoe acp stop [OPTIONS] [SESSION]`
 
@@ -1713,7 +1727,7 @@ Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). 
 ###### **Options:**
 
 * `--all` — Stop every running agent worker
-* `--timeout-secs <TIMEOUT_SECS>` — Seconds to wait after SIGTERM before escalating to SIGKILL
+* `--timeout-secs <TIMEOUT_SECS>` — Maximum seconds to wait for authenticated stop and quiescence proof
 
   Default value: `5`
 

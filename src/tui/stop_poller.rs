@@ -4,7 +4,9 @@
 //! the UI event loop (issue #1496), so stops run on a worker thread and the
 //! main loop drains results each frame.
 
+use crate::session::runner_journal::OwnedStop;
 use std::sync::mpsc::TryRecvError;
+use std::sync::Arc;
 
 use crate::session::stop::perform_stop;
 pub use crate::session::stop::{StopRequest, StopResult};
@@ -48,6 +50,208 @@ impl Default for StopPoller {
     }
 }
 
+pub(crate) enum SettlementAction {
+    Workdir {
+        name: String,
+        rename_branch: bool,
+    },
+    Rename {
+        title: String,
+        group: Option<String>,
+        profile: Option<String>,
+        rename_branch: bool,
+    },
+    Archive {
+        reveal: bool,
+    },
+}
+
+pub(crate) struct SettlementRequest {
+    pub session_id: String,
+    pub storage: crate::session::Storage,
+    pub instance: crate::session::Instance,
+    pub action: SettlementAction,
+}
+
+pub(crate) struct SettlementResult {
+    pub request: SettlementRequest,
+    pub generation: anyhow::Result<StopCustody>,
+}
+
+impl SessionScoped for SettlementResult {
+    fn session_id(&self) -> &str {
+        &self.request.session_id
+    }
+}
+
+pub(crate) struct StopCustody {
+    pub stop: Arc<OwnedStop>,
+    completion: Option<std::sync::mpsc::Sender<Arc<OwnedStop>>>,
+}
+
+impl StopCustody {
+    pub fn disarm(&mut self) {
+        self.completion = None;
+    }
+}
+
+impl Drop for StopCustody {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            if completion.send(self.stop.clone()).is_err() {
+                tracing::error!(target: "session.store", "Stop retirement worker disappeared; reservation remains fenced");
+            }
+        }
+    }
+}
+
+pub(crate) struct SettlementShutdown {
+    worker: TrackedWorker<SettlementRequest, SettlementResult>,
+    completion: std::sync::mpsc::Sender<Arc<OwnedStop>>,
+    retirement_worker: std::thread::JoinHandle<anyhow::Result<()>>,
+}
+
+impl SettlementShutdown {
+    pub fn finish(self) -> anyhow::Result<()> {
+        let result = self
+            .worker
+            .finish()
+            .map_err(|_| anyhow::anyhow!("settlement worker panicked"));
+        drop(self.completion);
+        let retired = self
+            .retirement_worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Stop retirement worker panicked"))?;
+        result.and(retired)
+    }
+}
+
+pub(crate) struct SettlementPoller {
+    worker: Option<TrackedWorker<SettlementRequest, SettlementResult>>,
+    completion: Option<std::sync::mpsc::Sender<Arc<OwnedStop>>>,
+    retirement_worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl SettlementPoller {
+    pub fn new() -> anyhow::Result<Self> {
+        let (completion, retired) = std::sync::mpsc::channel::<Arc<OwnedStop>>();
+        let retirement_worker = std::thread::Builder::new()
+            .name("aoe-stop-retirement".into())
+            .spawn(move || {
+                let mut failure = None;
+                while let Ok(retirement) = retired.recv() {
+                    if let Err(error) =
+                        crate::session::runner_journal::release_owned_stop(&retirement)
+                    {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                    }
+                }
+                match failure {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            })?;
+        let worker_completion = completion.clone();
+        Ok(Self {
+            completion: Some(completion),
+            retirement_worker: Some(retirement_worker),
+            worker: Some(TrackedWorker::spawn(
+                "aoe-settlement-poller",
+                move |request: SettlementRequest| {
+                    let generation = (|| -> anyhow::Result<StopCustody> {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        let stop = crate::session::runner_journal::reserve_owned_stop(
+                            &request.storage,
+                            &request.instance,
+                            !matches!(request.action, SettlementAction::Archive { .. }),
+                        )?;
+                        let custody = StopCustody {
+                            stop: stop.clone(),
+                            completion: Some(worker_completion.clone()),
+                        };
+                        runtime.block_on(async {
+                            if matches!(request.action, SettlementAction::Archive { .. }) {
+                                crate::session::runner_journal::settle(stop.clone()).await
+                            } else {
+                                crate::session::runner_journal::settle_if_idle(stop.clone()).await
+                            }
+                        })?;
+                        Ok(custody)
+                    })();
+                    SettlementResult {
+                        request,
+                        generation,
+                    }
+                },
+            )),
+        })
+    }
+
+    pub fn request(&mut self, request: SettlementRequest) {
+        if let Some(worker) = self.worker.as_mut() {
+            worker.request(request.session_id.clone(), request);
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<SettlementResult, TryRecvError> {
+        self.worker
+            .as_mut()
+            .ok_or(TryRecvError::Disconnected)?
+            .try_recv()
+    }
+
+    pub fn take_pending(&mut self) -> Vec<String> {
+        self.worker
+            .as_mut()
+            .map(TrackedWorker::take_pending)
+            .unwrap_or_default()
+    }
+
+    pub fn take_shutdown(&mut self) -> Option<SettlementShutdown> {
+        self.worker.take().map(|worker| SettlementShutdown {
+            worker,
+            completion: self
+                .completion
+                .take()
+                .expect("live settlement retirement sender"),
+            retirement_worker: self
+                .retirement_worker
+                .take()
+                .expect("live settlement retirement worker"),
+        })
+    }
+}
+
+pub(crate) struct SettledEdit {
+    pub storage: crate::session::Storage,
+    pub custody: StopCustody,
+}
+
+impl SettledEdit {
+    pub fn consume_under_locks(
+        mut self,
+        current: &crate::session::Instance,
+    ) -> anyhow::Result<u64> {
+        self.storage.verify_profile_identity()?;
+        let stop = &self.custody.stop;
+        let generation = stop.generation();
+        stop.original().validate_baseline_at(current, generation)?;
+        anyhow::ensure!(
+            current.lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Stop,
+                generation
+            ),
+            "session changed during runner settlement"
+        );
+        crate::session::runner_journal::release_settled_stop_under_locks(stop)?;
+        self.custody.disarm();
+        Ok(generation)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,12 +263,11 @@ mod tests {
     impl Drop for TestPoller {
         fn drop(&mut self) {
             if let Some(poller) = self.0.take() {
-                let _ = poller.worker.finish_for_test();
+                let _ = poller.worker.finish();
             }
         }
     }
 
-    /// A stored, isolated session plus a live poller to stop it with.
     fn fixture(profile: &str) -> (crate::session::Storage, TestPoller, Instance) {
         let storage = crate::session::Storage::new_unwatched(profile).unwrap();
         let mut instance = Instance::new("Test Session", "/tmp/test-project");
@@ -74,6 +277,12 @@ mod tests {
                 instances.push(instance.clone());
                 Ok(())
             })
+            .unwrap();
+        let instance = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == instance.id)
             .unwrap();
         (storage, TestPoller(Some(StopPoller::new())), instance)
     }
@@ -89,8 +298,6 @@ mod tests {
         panic!("timed out waiting for stop result");
     }
 
-    /// A request is in flight until its result lands, and stopping writes the
-    /// durable `Stopped` status.
     #[test]
     #[serial_test::serial]
     fn stop_tracks_its_request_and_persists_the_status() {

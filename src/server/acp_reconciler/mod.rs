@@ -85,8 +85,9 @@ fn park_message(project_path: &str) -> String {
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
-    /// The orphan registry entry was swept; retry next tick unless parked.
-    RetryAfterAttachTimeout,
+    AttachFallbackPending {
+        lease: crate::acp::runner_lifecycle::Lease,
+    },
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
     SpawnFinished,
@@ -97,12 +98,14 @@ enum ResumeOutcome {
     },
 }
 
-/// When each cadence-gated pass last ran.
+/// Per-process reconciliation state across ticks.
 #[derive(Default)]
-pub struct ReapCadence {
+pub struct ReconcilerState {
     pub idle: Option<Instant>,
     pub rate_limit: Option<Instant>,
     pub terminal_repair: Option<Instant>,
+    attach_fallbacks: HashMap<String, (crate::acp::runner_lifecycle::Lease, ResumeTarget)>,
+    orphan_jobs: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 fn due(last: &mut Option<Instant>, interval: Duration) -> bool {
@@ -120,7 +123,10 @@ fn is_untriaged_structured(i: &Instance) -> bool {
 
 /// Eligible for a reconciler-driven worker.
 fn is_resumable(i: &Instance) -> bool {
-    is_untriaged_structured(i) && !i.is_idle_dormant()
+    // A purge that settled its runner from the registry left no in-memory lease
+    // to skip on, so the durable reservation is what keeps the next tick from
+    // respawning what the purge just killed.
+    is_untriaged_structured(i) && !i.is_idle_dormant() && !i.is_purge_reserved(chrono::Utc::now())
 }
 
 /// Runs a blocking event-store query for `id` off the runtime; `None` (logged) if the task panicked.
@@ -164,13 +170,30 @@ async fn resolve_per_profile<T: Send + 'static>(
 pub async fn reconcile_acp_workers(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
-    cadence: &mut ReapCadence,
+    cadence: &mut ReconcilerState,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
     capacity_deferred: &mut HashSet<String>,
 ) {
     let supervisor = &state.acp_supervisor;
-    supervisor.retry_pending_teardowns().await;
+    let mut retired_fallbacks = Vec::new();
+    supervisor
+        .retry_pending_teardowns(|lease| {
+            let id = lease.session_id();
+            if cadence
+                .attach_fallbacks
+                .get(id)
+                .is_some_and(|(pending, _)| pending == lease)
+            {
+                if let Some((_, target)) = cadence.attach_fallbacks.remove(id) {
+                    if !parked.contains(id) {
+                        attempted.remove(id);
+                        retired_fallbacks.push(target);
+                    }
+                }
+            }
+        })
+        .await;
 
     // Before the reaper, so this tick's reaper tears down the drained handle.
     resume::respawn_drained_stale_workers(state).await;
@@ -212,7 +235,7 @@ pub async fn reconcile_acp_workers(
     };
 
     // Triaged sessions are excluded so an archive/snooze teardown is not undone (#1581).
-    let (targets, with_queued_prompts): (Vec<ResumeTarget>, HashSet<String>) = {
+    let (mut targets, with_queued_prompts): (Vec<ResumeTarget>, HashSet<String>) = {
         let instances = state.instances.read().await;
         (
             instances
@@ -227,15 +250,18 @@ pub async fn reconcile_acp_workers(
                 .collect(),
         )
     };
+    for target in retired_fallbacks {
+        targets.retain(|current| current.id != target.id);
+        targets.push(target);
+    }
     let live: HashSet<&String> = targets.iter().map(|t| &t.id).collect();
     attempted.retain(|id| live.contains(id));
     parked.retain(|id| live.contains(id));
     respawn_history.retain(|id, _| live.contains(id));
     capacity_deferred.retain(|id| live.contains(id));
+    cadence.attach_fallbacks.retain(|id, _| live.contains(id));
 
-    // Must precede scheduling: capacity counts registry entries, so dead
-    // entries would block legitimate spawns.
-    sweep_orphan_workers(state, &live).await;
+    sweep_orphan_workers(state, &mut cadence.orphan_jobs).await;
     readopt_orphan_runners(state, attempted).await;
     drain_pending_initial_turns(state).await;
     drain_queued_prompts(state).await;
@@ -323,27 +349,23 @@ pub async fn reconcile_acp_workers(
         .min(cfg.acp.max_concurrent_workers)
         .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
-    let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
-    for target in tasks {
+    let mut set: JoinSet<(String, ResumeOutcome, ResumeTarget)> = JoinSet::new();
+    for mut target in tasks {
         let state = Arc::clone(state);
         let sem = Arc::clone(&semaphore);
         set.spawn(async move {
-            let Ok(_permit) = sem.acquire().await else {
-                return (target.id, ResumeOutcome::SpawnFinished);
-            };
             let id = target.id.clone();
-            (id, resume_one(state, target).await)
+            let outcome = resume_one(state, &mut target, sem).await;
+            (id, outcome, target)
         });
     }
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((id, ResumeOutcome::RetryAfterAttachTimeout)) => {
-                if !parked.contains(&id) {
-                    attempted.remove(&id);
-                }
+            Ok((id, ResumeOutcome::AttachFallbackPending { lease }, target)) => {
+                cadence.attach_fallbacks.insert(id, (lease, target));
             }
-            Ok((id, ResumeOutcome::CapacityDeferred { message })) => {
+            Ok((id, ResumeOutcome::CapacityDeferred { message }, _)) => {
                 // Refund only this tick's budget entry so prior crash history survives.
                 if let Some(entries) = respawn_history.get_mut(&id) {
                     entries.pop();
@@ -358,7 +380,7 @@ pub async fn reconcile_acp_workers(
                     supervisor.publish_startup_error(&id, message);
                 }
             }
-            Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished)) => {
+            Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished, _)) => {
                 capacity_deferred.remove(&id);
             }
             Err(e) => {
@@ -445,30 +467,56 @@ async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<S
     }
 }
 
-/// Reaps registry entries whose session no longer exists.
-async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
-    let Ok(records) = crate::process::worker_registry::list() else {
-        return;
+async fn sweep_orphan_workers(
+    state: &Arc<AppState>,
+    jobs: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    jobs.retain(|_, job| !job.is_finished());
+    let inventory = tokio::task::spawn_blocking(|| {
+        anyhow::Ok((
+            crate::session::runner_journal::stored_session_ids()?,
+            crate::process::worker_registry::list()?,
+        ))
+    })
+    .await;
+    let (stored, records) = match inventory {
+        Ok(Ok(inventory)) => inventory,
+        error => {
+            tracing::warn!(
+                target: "acp.supervisor",
+                ?error,
+                "orphan inventory unavailable; no execution signalled"
+            );
+            return;
+        }
     };
     for record in records {
-        if live.contains(&record.session_id)
+        if stored.binary_search(&record.session_id).is_ok()
+            || jobs.contains_key(&record.session_id)
             || state.acp_supervisor.is_owned(&record.session_id).await
         {
             continue;
         }
-        tracing::info!(
-            target: "acp.supervisor",
-            session = %record.session_id,
-            pid = record.pid,
-            "sweeping orphan worker (no matching session on disk)"
+        let id = record.session_id;
+        let identity = crate::acp::runner_lifecycle::RunnerIdentity {
+            pid: record.pid,
+            generation: record.generation,
+            launch_nonce: record.launch_nonce,
+            incarnation: None,
+            profile_identity: None,
+            boot: None,
+        };
+        jobs.insert(
+            id.clone(),
+            tokio::spawn(async move {
+                if let Err(error) =
+                    crate::session::runner_journal::settle_captured_ticket(&id, identity, false)
+                        .await
+                {
+                    tracing::warn!(target: "acp.supervisor", session = %id, %error, "orphan execution remains protected");
+                }
+            }),
         );
-        // Group kill with escalation, detached so one stubborn orphan cannot stall the sweep (#1921).
-        #[cfg(unix)]
-        tokio::spawn(crate::process::worker::reap_group_escalating(
-            record.pid,
-            Duration::from_secs(2),
-        ));
-        crate::process::worker_registry::delete(&record.session_id).ok();
     }
 }
 

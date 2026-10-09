@@ -5,7 +5,7 @@
 //! `Worker`: requests go to a dedicated named thread, results come back
 //! over a channel the main loop drains each frame.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -75,10 +75,14 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         }
     }
 
+    pub(crate) fn try_request(&self, req: Req) -> Result<(), mpsc::SendError<Req>> {
+        self.request_tx.send(req)
+    }
+
     /// Enqueue a request. A send failure means the worker thread is gone, so
     /// log it rather than dropping silently.
     pub fn request(&self, req: Req) {
-        if let Err(e) = self.request_tx.send(req) {
+        if let Err(e) = self.try_request(req) {
             tracing::warn!(
                 target: "tui.worker",
                 worker = %self.name,
@@ -94,8 +98,7 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         self.result_rx.try_recv()
     }
 
-    #[cfg(test)]
-    pub(crate) fn finish_for_test(self) -> thread::Result<()> {
+    pub(crate) fn finish(self) -> thread::Result<()> {
         let Self {
             request_tx,
             result_rx,
@@ -136,48 +139,51 @@ pub trait SessionScoped {
     fn session_id(&self) -> &str;
 }
 
-/// A [`Worker`] that remembers the session ids of in-flight requests. Rows are
-/// marked optimistically at request time, so their status alone cannot say
-/// which requests a dead worker lost; this set can.
+/// A [`Worker`] that counts in-flight requests per session. Completing an older
+/// request cannot hide a newer queued request from dead-worker recovery.
 pub struct TrackedWorker<Req, Res> {
     worker: Worker<Req, Res>,
-    pending: HashSet<String>,
+    pending: HashMap<String, usize>,
 }
 
 impl<Req: Send + 'static, Res: SessionScoped + Send + 'static> TrackedWorker<Req, Res> {
     pub fn spawn(thread_name: &str, handler: impl FnMut(Req) -> Res + Send + 'static) -> Self {
         Self {
             worker: Worker::spawn(thread_name, handler),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
         }
     }
 
     pub fn request(&mut self, session_id: String, request: Req) {
-        self.pending.insert(session_id);
+        *self.pending.entry(session_id).or_default() += 1;
         self.worker.request(request);
     }
 
     pub fn try_recv(&mut self) -> Result<Res, mpsc::TryRecvError> {
         let result = self.worker.try_recv();
         if let Ok(ref done) = result {
-            self.pending.remove(done.session_id());
+            if let Some(count) = self.pending.get_mut(done.session_id()) {
+                *count -= 1;
+                if *count == 0 {
+                    self.pending.remove(done.session_id());
+                }
+            }
         }
         result
     }
 
     /// Drain the in-flight set, for once the worker is known dead.
     pub fn take_pending(&mut self) -> Vec<String> {
-        self.pending.drain().collect()
+        self.pending.drain().map(|(id, _)| id).collect()
     }
 
     #[cfg(test)]
     pub(crate) fn is_pending(&self, id: &str) -> bool {
-        self.pending.contains(id)
+        self.pending.contains_key(id)
     }
 
-    #[cfg(test)]
-    pub(crate) fn finish_for_test(self) -> thread::Result<()> {
-        self.worker.finish_for_test()
+    pub(crate) fn finish(self) -> thread::Result<()> {
+        self.worker.finish()
     }
 }
 

@@ -1,8 +1,326 @@
 //! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+
+pub(super) fn receive_natal_authorization_byte(
+    channel: &std::os::unix::net::UnixStream,
+) -> std::io::Result<Option<u8>> {
+    use std::os::fd::AsRawFd;
+    let mut byte = [0u8];
+    // SAFETY: the original socket remains owned and byte is writable for one byte.
+    let received = unsafe {
+        libc::recv(
+            channel.as_raw_fd(),
+            byte.as_mut_ptr().cast(),
+            byte.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if received < 0 {
+        Err(std::io::Error::last_os_error())
+    } else if received == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(byte[0]))
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+pub(super) fn ignore_child_reaping_for_hosted_probe() -> std::io::Result<()> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = libc::SIG_IGN;
+    let result = unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(super) struct OriginalRootDeathObservation {
+    fd: std::os::fd::OwnedFd,
+    pid: u32,
+    observed: std::sync::atomic::AtomicBool,
+}
+
+impl OriginalRootDeathObservation {
+    pub(super) fn bind(birth: super::ProcessIncarnation) -> anyhow::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::kqueue() };
+        anyhow::ensure!(
+            fd >= 0,
+            "cannot bind original kqueue: {}",
+            std::io::Error::last_os_error()
+        );
+        // kqueue returned one newly owned descriptor.
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+        change.ident = birth.pid as libc::uintptr_t;
+        change.filter = libc::EVFILT_PROC;
+        change.flags = libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT;
+        change.fflags = libc::NOTE_EXIT;
+        let result =
+            unsafe { libc::kevent(fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        anyhow::ensure!(
+            result == 0,
+            "cannot subscribe to original root death: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(Self {
+            fd: owned,
+            pid: birth.pid,
+            observed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub(super) fn exited(&self) -> anyhow::Result<bool> {
+        use std::os::fd::AsRawFd;
+        if self.observed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        let immediate = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let result = unsafe {
+            libc::kevent(
+                self.fd.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                &immediate,
+            )
+        };
+        anyhow::ensure!(
+            result >= 0,
+            "original kqueue observation failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if result == 1 {
+            anyhow::ensure!(
+                event.flags & libc::EV_ERROR == 0
+                    && event.ident == self.pid as libc::uintptr_t
+                    && event.filter == libc::EVFILT_PROC
+                    && event.fflags & libc::NOTE_EXIT != 0,
+                "event is not the bound original root death"
+            );
+            self.observed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(self.observed.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+pub(super) fn peer_pid_from_connected_socket(stream: &impl std::os::fd::AsFd) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+    let pid = getsockopt(stream, LocalPeerPid).ok()?;
+    (pid > 0).then_some(pid as u32)
+}
 use std::collections::HashMap;
 use std::process::Command;
+// Darwin retains the real original Child/group, but does not claim exhaustive
+// descendant containment from a host CLI's exit or from a process-table guess.
+pub(super) struct OwnedCreateRoot {
+    birth: super::ProcessIncarnation,
+}
+impl OwnedCreateRoot {
+    pub(super) fn prepare(birth: super::ProcessIncarnation) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            super::process_incarnation(birth.pid)? == Some(birth),
+            "original held Darwin bootstrap birth changed"
+        );
+        anyhow::ensure!(
+            birth.pid == birth.group,
+            "original Darwin bootstrap is not its new group root"
+        );
+        Ok(Self { birth })
+    }
+    pub(super) fn release(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            super::process_incarnation(self.birth.pid)? == Some(self.birth),
+            "held Darwin original changed before its private gate release"
+        );
+        Ok(())
+    }
+    pub(super) fn retire(
+        &mut self,
+        child: &mut std::process::Child,
+        cancel: &tokio_util::sync::CancellationToken,
+        _admit: impl FnMut(super::CreateObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<super::CreateRetirement> {
+        use std::os::unix::process::ExitStatusExt;
+        anyhow::ensure!(
+            child.id() == self.birth.pid,
+            "Darwin original Child was replaced"
+        );
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if cancel.is_cancelled() {
+                anyhow::ensure!(
+                    super::process_incarnation(child.id())? == Some(self.birth),
+                    "Darwin cancellation lost its original kernel birth"
+                );
+                child.kill()?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        while process_group_has_live_members(self.birth.group)? {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(super::CreateRetirement {
+            raw_status: status.clone().into_raw(),
+            status,
+            descendants_retired: false,
+            group_retired: true,
+            external_domain: false,
+        })
+    }
+}
+pub(super) fn hold_owned_create_bootstrap() -> anyhow::Result<()> {
+    // The real private-channel read in the producer bootstrap is Darwin's gate.
+    // Confirm the actual root/group before entering that held state.
+    use anyhow::Context;
+    let birth = super::process_incarnation(std::process::id())?
+        .context("original Darwin bootstrap birth unavailable")?;
+    anyhow::ensure!(
+        birth.pid == birth.group,
+        "Darwin native bootstrap changed its original group"
+    );
+    Ok(())
+}
+pub(super) fn exec_owned_create(
+    program: &std::ffi::CString,
+    executable: &std::fs::File,
+    directory: &std::fs::File,
+    argv: &[std::ffi::CString],
+    env: &[std::ffi::CString],
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    // XNU has no fexecve. Retain and validate the real executable pin, execute
+    // the sealed resolved pathname, and never turn this into containment proof.
+    let metadata = std::fs::metadata(std::path::Path::new(std::ffi::OsStr::from_bytes(
+        program.as_bytes(),
+    )))?;
+    anyhow::ensure!(
+        crate::session::DirectoryIdentity::from_metadata(&metadata)
+            == crate::session::DirectoryIdentity::from_metadata(&executable.metadata()?),
+        "Darwin resolved executable changed before native exec"
+    );
+    let mut argvp: Vec<_> = argv.iter().map(|v| v.as_ptr()).collect();
+    argvp.push(std::ptr::null());
+    let mut envp: Vec<_> = env.iter().map(|v| v.as_ptr()).collect();
+    envp.push(std::ptr::null());
+    let input = std::fs::File::open("/dev/null")?;
+    unsafe {
+        if libc::fchdir(directory.as_raw_fd()) != 0
+            || libc::dup2(input.as_raw_fd(), libc::STDIN_FILENO) == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        libc::execve(program.as_ptr(), argvp.as_ptr(), envp.as_ptr());
+    }
+    Err(std::io::Error::last_os_error().into())
+}
+
+pub(super) fn owned_create_descendant_traceable() -> bool {
+    false
+}
+pub(super) fn owned_create_anchor_path(
+    file: &std::fs::File,
+    _: u32,
+) -> anyhow::Result<(std::ffi::OsString, bool)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    let mut path = [0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let length = path
+        .iter()
+        .position(|&v| v == 0)
+        .ok_or_else(|| anyhow::anyhow!("original Darwin FD path was not terminated"))?;
+    let path = std::ffi::OsString::from_vec(path[..length].to_vec());
+    anyhow::ensure!(
+        crate::session::DirectoryIdentity::from_metadata(&std::fs::metadata(
+            std::path::Path::new(&path)
+        )?) == crate::session::DirectoryIdentity::from_metadata(&file.metadata()?),
+        "Darwin F_GETPATH replaced its original role birth"
+    );
+    // XNU /dev/fd is dupfdopen, not a traversable directory capability; /.vol
+    // also rebuilds a pathname. This is explicitly PathOnly, NEVER strong effect proof.
+    Ok((path, true))
+}
+pub(super) fn install_owned_create_anchors(
+    files: &[std::fs::File],
+    slots: &[u32],
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    for (file, &slot) in files.iter().zip(slots) {
+        if unsafe { libc::dup2(file.as_raw_fd(), slot as i32) } == -1
+            || unsafe { libc::fcntl(slot as i32, libc::F_SETFD, 0) } == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn is_process_group_alive(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    if super::worker::is_pid_alive_and_ours(pgid) && !is_terminated(pgid) {
+        return true;
+    }
+    process_group_has_live_members(pgid).unwrap_or(true)
+}
+
+/// # Safety
+/// `message` must point to live writable data and control buffers.
+pub(super) unsafe fn receive_bootstrap_rights(
+    channel: &std::os::unix::net::UnixStream,
+    message: &mut libc::msghdr,
+) -> std::io::Result<isize> {
+    use std::os::fd::AsRawFd;
+
+    let capacity = message.msg_controllen;
+    loop {
+        message.msg_controllen = capacity;
+        // XNU peeks without creating FDs, but externalizes all rights before copyout.
+        let received = unsafe { libc::recvmsg(channel.as_raw_fd(), message, libc::MSG_PEEK) };
+        if received >= 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    let truncated = message.msg_flags & libc::MSG_CTRUNC != 0 || message.msg_controllen > capacity;
+    message.msg_controllen = capacity;
+    message.msg_flags = 0;
+    if truncated {
+        channel.shutdown(std::net::Shutdown::Read)?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "original descriptor transfer was truncated",
+        ));
+    }
+    loop {
+        let received = unsafe { libc::recvmsg(channel.as_raw_fd(), message, 0) };
+        if received >= 0 {
+            return Ok(received);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
 
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
@@ -359,9 +677,60 @@ Pages wired down:                        300000.
     }
 }
 
-/// `kern.boottime` shifts on clock steps; the session UUID does not.
+// A hidden or unreadable process is not absent. Signal zero has no process effect.
+pub(super) fn custodian_process_absent(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+pub(super) fn process_incarnation(pid: u32) -> std::io::Result<Option<super::ProcessIncarnation>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if written == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    if written != size as i32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete process incarnation",
+        ));
+    }
+    // PROC_PIDTBSDINFO returned the complete fixed-size structure.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process identity differs",
+        ));
+    }
+    Ok(Some(super::ProcessIncarnation {
+        pid,
+        group: info.pbi_pgid,
+        start: [info.pbi_start_tvsec, info.pbi_start_tvusec],
+        namespace: [0, 0],
+    }))
+}
+
+pub(super) fn process_namespace() -> std::io::Result<[u64; 2]> {
+    Ok([0, 0])
+}
+
+/// The session UUID is independent of clock steps.
 pub(super) fn boot_id() -> Option<String> {
-    let out = Command::new("sysctl")
+    let out = Command::new("/usr/sbin/sysctl")
         .args(["-n", "kern.bootsessionuuid"])
         .output()
         .ok()?;
@@ -369,13 +738,184 @@ pub(super) fn boot_id() -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
+    (!s.is_empty()).then_some(s)
+}
+
+/// Report non-zombie group members. Probe failures do not prove absence.
+pub(super) fn process_group_has_live_members(pgrp: u32) -> std::io::Result<bool> {
+    use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+
+    match killpg(Pid::from_raw(pgrp as i32), None) {
+        // Darwin excludes zombies from its permission check.
+        Ok(()) | Err(Errno::EPERM) => {}
+        Err(Errno::ESRCH) => return Ok(false),
+        Err(error) => return Err(std::io::Error::from_raw_os_error(error as i32)),
+    }
+    // Match the explicit group column, not BSD ps -g.
+    let output = Command::new("/bin/ps")
+        .args(["-o", "pid=,pgid=,state=", "-A"])
+        .output()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "ps exited with {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _pid = fields.next()?;
+            let group = fields.next()?;
+            let state = fields.next()?;
+            (group.parse::<u32>() == Ok(pgrp)).then_some(state)
+        })
+        // BSD state suffixes do not change the leading zombie state.
+        .any(|state| !state.starts_with('Z')))
+}
+
+/// Darwin cannot reap an unrelated process, so query its state instead.
+pub(super) fn is_terminated(pid: u32) -> bool {
+    match process_state(pid) {
+        Ok(state) => state.starts_with('Z'),
+        // Neither query failure nor an absent row proves termination.
+        _ => false,
     }
 }
 
+/// The BSD state field of one process. BSD `ps` prints the state letter
+/// followed by its flags, so a zombie reads `ZN` rather than `Z`.
+fn process_state(pid: u32) -> Result<String, std::io::Error> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "ps -p {pid} exited with {}",
+            output.status
+        )));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| std::io::Error::other(format!("ps -p {pid} printed no state")))
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        unsafe {
+            (
+                OwnedFd::from_raw_fd(descriptors[0]),
+                OwnedFd::from_raw_fd(descriptors[1]),
+            )
+        }
+    }
+
+    struct ZombieParent {
+        pid: libc::pid_t,
+        release: Option<OwnedFd>,
+    }
+
+    impl Drop for ZombieParent {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            while unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) } < 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_zombie_observed_by_another_parent_is_terminated() {
+        use std::io::Read;
+
+        let (ready_read, ready_write) = pipe();
+        let (release_read, release_write) = pipe();
+        let parent_pid = unsafe { libc::fork() };
+        assert!(parent_pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if parent_pid == 0 {
+            // Only async-signal-safe syscalls run in either post-fork child.
+            unsafe {
+                libc::close(ready_read.as_raw_fd());
+                libc::close(release_write.as_raw_fd());
+                let zombie_pid = libc::fork();
+                if zombie_pid < 0 {
+                    libc::_exit(2);
+                }
+                if zombie_pid == 0 {
+                    libc::_exit(0);
+                }
+                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+                while libc::waitid(
+                    libc::P_PID,
+                    zombie_pid as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                ) < 0
+                {
+                    if *libc::__error() != libc::EINTR {
+                        libc::_exit(3);
+                    }
+                }
+                let bytes = zombie_pid.to_ne_bytes();
+                if libc::write(ready_write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                    != bytes.len() as libc::ssize_t
+                {
+                    libc::_exit(4);
+                }
+                let mut byte = 0_u8;
+                while libc::read(release_read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) < 0 {
+                    if *libc::__error() != libc::EINTR {
+                        break;
+                    }
+                }
+                while libc::waitpid(zombie_pid, std::ptr::null_mut(), 0) < 0 {
+                    if *libc::__error() != libc::EINTR {
+                        libc::_exit(5);
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+        let _parent = ZombieParent {
+            pid: parent_pid,
+            release: Some(release_write),
+        };
+        drop(ready_write);
+        drop(release_read);
+        let mut ready = libc::pollfd {
+            fd: ready_read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut ready, 1, 5_000) }, 1);
+        let mut bytes = [0; std::mem::size_of::<libc::pid_t>()];
+        std::fs::File::from(ready_read)
+            .read_exact(&mut bytes)
+            .unwrap();
+        let zombie_pid = libc::pid_t::from_ne_bytes(bytes);
+        assert_eq!(
+            unsafe { libc::waitpid(zombie_pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(super::is_terminated(zombie_pid as u32));
+    }
+}
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
         .args(["-o", "ppid=,args=", "-p", &pid.to_string()])

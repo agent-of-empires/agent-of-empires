@@ -137,28 +137,39 @@ pub(super) fn persist_structured_row_repairs(
                     .map(|repair| repair.session_id.clone())
                     .collect();
                 let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let storage = crate::session::Storage::new(&profile, file_watch)?;
-                    storage.update(|all, _groups| {
-                        for repair in repairs {
-                            if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
-                                inst.view = crate::session::View::Structured;
-                                if inst.agent_name.is_none() {
-                                    inst.agent_name = repair.agent_name;
+                    let storage = crate::session::Storage::open(&profile, file_watch)?;
+                    let repair_ids: Vec<String> = repairs
+                        .iter()
+                        .map(|repair| repair.session_id.clone())
+                        .collect();
+                    storage.update_metadata(
+                        crate::session::MetadataSelection::Sessions(std::borrow::Cow::Borrowed(
+                            &repair_ids,
+                        )),
+                        |all, _groups| {
+                            for repair in repairs {
+                                if let Some(inst) =
+                                    all.iter_mut().find(|i| i.id == repair.session_id)
+                                {
+                                    inst.view = crate::session::View::Structured;
+                                    if inst.agent_name.is_none() {
+                                        inst.agent_name = repair.agent_name;
+                                    }
+                                    if inst.agent_model.is_none() {
+                                        inst.agent_model = repair.agent_model;
+                                    }
+                                    inst.acp_session_id = Some(repair.acp_session_id);
+                                } else {
+                                    tracing::debug!(
+                                        target: "server.file_watch",
+                                        session = %repair.session_id,
+                                        "repair target not found on disk; skipping"
+                                    );
                                 }
-                                if inst.agent_model.is_none() {
-                                    inst.agent_model = repair.agent_model;
-                                }
-                                inst.acp_session_id = Some(repair.acp_session_id);
-                            } else {
-                                tracing::debug!(
-                                    target: "server.file_watch",
-                                    session = %repair.session_id,
-                                    "repair target not found on disk; skipping"
-                                );
                             }
-                        }
-                        Ok(())
-                    })?;
+                            Ok(())
+                        },
+                    )?;
                     Ok(())
                 })
                 .await;

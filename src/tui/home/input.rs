@@ -7,14 +7,14 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{
-    live_send, DragKind, HomeView, PermissionResponseTarget, PreviewSelection, TerminalMode,
-    ViewMode,
+    live_send, persistence_transactions, DragKind, HomeView, PermissionResponseTarget,
+    PreviewSelection, TerminalMode, ViewMode,
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
 };
-use crate::session::{list_profiles_for_display, Item, Status};
+use crate::session::{list_profiles_for_display, Item, Status, Storage};
 use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
@@ -1005,7 +1005,15 @@ impl HomeView {
     /// actions run inline and return `None`. Shared by the keyboard Enter path and the
     /// mouse-click path so both produce the same end state.
     pub(super) fn dispatch_confirm_submit(&mut self, action: &str) -> Option<Action> {
+        if action != "creation_recovery" {
+            self.pending_creation_confirmation = None;
+            self.pending_claim_abort_confirmation = None;
+        }
         match action {
+            "creation_recovery" => {
+                self.submit_creation_confirmation();
+                None
+            }
             "delete_group" => {
                 if let Err(e) = self.delete_selected_group() {
                     tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
@@ -1036,9 +1044,11 @@ impl HomeView {
                 None
             }
             "force_remove_session" => {
-                if let Some(session_id) = self.pending_force_remove_session.take() {
-                    if let Err(e) = self.force_remove_session(&session_id) {
+                if let Some(target) = self.pending_force_remove_session.take() {
+                    if let Err(e) = self.force_remove_session(target) {
                         tracing::error!(target: "tui.input", "Failed to force remove session: {}", e);
+                        self.info_dialog =
+                            Some(InfoDialog::new("Force Remove Refused", &format!("{e:#}")));
                     }
                 }
                 None
@@ -1373,6 +1383,8 @@ impl HomeView {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
+                        self.pending_creation_confirmation = None;
+                        self.pending_claim_abort_confirmation = None;
                         self.pending_stop_session = None;
                         self.pending_stop_terminal = None;
                         self.pending_stop_tool = None;
@@ -2164,6 +2176,8 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
+                    self.pending_creation_confirmation = None;
+                    self.pending_claim_abort_confirmation = None;
                     self.pending_stop_session = None;
                     self.pending_stop_terminal = None;
                     self.pending_stop_tool = None;
@@ -2421,33 +2435,35 @@ impl HomeView {
                     }
                     ProfilePickerAction::Created(name) => {
                         self.profile_picker_dialog = None;
-                        match crate::session::create_profile(&name) {
-                            Ok(()) => {
-                                if let Err(e) = self.switch_profile(Some(name)) {
-                                    tracing::error!(target: "tui.input", "Failed to switch to new profile: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Error",
-                                    &format!("Failed to create profile: {}", e),
-                                ));
-                            }
+                        if let Err(error) = self.request_transaction(
+                            persistence_transactions::TransactionRequest::CreateProfile(name),
+                        ) {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Profile creation failed",
+                                &format!("{error:#}"),
+                            ));
                         }
                     }
                     ProfilePickerAction::Deleted(name) => {
-                        match crate::session::delete_profile(&name) {
-                            Ok(()) => {
-                                self.rewire_after_profile_delete(&name);
-                                self.show_profile_picker();
-                            }
-                            Err(e) => {
-                                self.profile_picker_dialog = None;
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Error",
-                                    &format!("Failed to delete profile: {}", e),
-                                ));
-                            }
+                        let result = self
+                            .storages
+                            .get(&name)
+                            .cloned()
+                            .map(Ok)
+                            .unwrap_or_else(|| Storage::open(&name, self.file_watch.clone()))
+                            .and_then(|storage| {
+                                self.request_transaction(
+                                    persistence_transactions::TransactionRequest::DeleteProfile(
+                                        storage,
+                                    ),
+                                )
+                            });
+                        self.profile_picker_dialog = None;
+                        if let Err(error) = result {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Profile deletion failed",
+                                &format!("{error:#}"),
+                            ));
                         }
                     }
                 },
@@ -3138,8 +3154,8 @@ impl HomeView {
     /// view opens through this: both modes route keystrokes away from the home view and
     /// paint the preview pane, so they cannot coexist.
     pub(in crate::tui) fn exit_live_send_if_active(&mut self) {
-        if let Some(state) = self.live_send.clone() {
-            self.exit_live_send_and_restore_sizing(&state);
+        if self.live_send.is_some() {
+            self.teardown_live_send();
         }
     }
 
@@ -3444,7 +3460,7 @@ impl HomeView {
             }
         }
         crate::tmux::refresh_session_cache();
-        self.reload()?;
+        self.request_reload(super::ReloadKind::Full);
         Ok(())
     }
 
@@ -3486,7 +3502,7 @@ impl HomeView {
             }
         }
         crate::tmux::refresh_session_cache();
-        self.reload()?;
+        self.request_reload(super::ReloadKind::Full);
         Ok(())
     }
 
@@ -3860,8 +3876,8 @@ impl HomeView {
         // target `live_send`. Committing one while still live would desync the two, so
         // leave live mode first. Cancelling never reaches here, so Esc still returns to
         // live mode.
-        if let Some(state) = self.live_send.clone() {
-            self.exit_live_send_and_restore_sizing(&state);
+        if self.live_send.is_some() {
+            self.teardown_live_send();
         }
         match action {
             PaletteAction::Invoke(id) => {
@@ -4253,6 +4269,17 @@ impl HomeView {
     }
 
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
+        if self
+            .enqueue_transaction(
+                persistence_transactions::TransactionRequest::SetSortOrder(new_order),
+                super::persistence_worker::SaveSnapshot {
+                    profiles: Vec::new(),
+                },
+            )
+            .is_err()
+        {
+            return;
+        }
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
             self.refresh_flat_items();
@@ -4261,24 +4288,25 @@ impl HomeView {
             self.rebuild_flat_items();
             self.reseat_cursor_after_rebuild();
         }
-        let sort_order = self.sort_order;
-        if let Err(e) = update_app_state(|state| {
-            state.sort_order = Some(sort_order);
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
-        }
+        // Keep the desired presentation on ACK failure; the lane displays the
+        // unsaved-preference error without rolling back newer input.
     }
 
     pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
+        if self
+            .enqueue_transaction(
+                persistence_transactions::TransactionRequest::SetGroupBy(new_mode),
+                super::persistence_worker::SaveSnapshot {
+                    profiles: Vec::new(),
+                },
+            )
+            .is_err()
+        {
+            return;
+        }
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
-        let group_by = self.group_by;
-        if let Err(e) = update_app_state(|state| {
-            state.group_by = Some(group_by);
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to save group_by mode: {}", e);
-        }
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header derived automatically
@@ -4336,11 +4364,10 @@ impl HomeView {
             if let Some(tree) = self.group_trees.get_mut(&profile) {
                 tree.toggle_collapsed(path);
             }
+            self.record_group_edit(&profile);
         }
         self.rebuild_flat_items();
-        if let Err(e) = self.save() {
-            tracing::error!(target: "tui.input", "Failed to save group state: {}", e);
-        }
+        self.request_save();
     }
 
     /// Forward one wheel notch to the previewed full-screen pane so it scrolls its own
@@ -4390,17 +4417,30 @@ impl HomeView {
     /// the live-send target, so it stays in sequence with typed keystrokes; otherwise a
     /// one-shot send is forked. True when something was dispatched.
     fn send_to_preview_pane(&self, key: live_send::TmuxKey) -> bool {
-        let Some(target) = self.preview_capture_target.as_deref() else {
+        let cache = self.active_preview_cache();
+        let Some(target) = cache.capture_target.as_deref() else {
+            return false;
+        };
+        if self.preview_capture_target.as_deref() != Some(target) {
+            return false;
+        }
+        let Some(session) = cache.capture_session.as_ref() else {
+            return false;
+        };
+        let Some(capture) = self.preview_capture_worker.as_ref() else {
+            return false;
+        };
+        let Some(admission) =
+            capture.preview_input_admission(session.clone(), cache.capture_generation)
+        else {
             return false;
         };
         if let (Some(worker), Some(live)) = (&self.live_send_worker, &self.live_send) {
             if live.tmux_name.as_str() == target {
-                worker.send(key);
-                return true;
+                return worker.send_to(session, key);
             }
         }
-        live_send::send_key_oneshot(target, key);
-        true
+        live_send::send_key_oneshot(admission, key)
     }
 
     /// The previewed agent's cursor when a mouse button event over the preview should go
@@ -4730,6 +4770,13 @@ impl HomeView {
                 }
             }
             if let super::Item::Session { id, .. } = &self.flat_items[idx] {
+                if self
+                    .get_instance(id)
+                    .is_some_and(|inst| inst.status == Status::Creating)
+                {
+                    self.context_menu = Some(ContextMenuDialog::for_creating_session(anchor));
+                    return true;
+                }
                 if self.get_instance(id).is_some_and(|inst| inst.is_trashed()) {
                     self.context_menu = Some(ContextMenuDialog::for_trashed_session(anchor));
                     return true;
@@ -4776,14 +4823,23 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
                 };
-                ContextMenuDialog::for_session(
+                let mut menu = ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
-                )
+                );
+                if let super::Item::Session { id, .. } = &self.flat_items[idx] {
+                    if self
+                        .get_instance(id)
+                        .is_some_and(crate::session::retained_intents::can_abort_metadata)
+                    {
+                        menu = menu.with_abort_intent();
+                    }
+                }
+                menu
             });
             return true;
         }
@@ -4843,6 +4899,12 @@ impl HomeView {
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
         match action {
+            ContextMenuAction::RetryCreationPublication => self.prompt_creation_recovery(
+                persistence_transactions::CreationRecoveryAction::RetryPublication,
+            ),
+            ContextMenuAction::UndoCreation => self
+                .prompt_creation_recovery(persistence_transactions::CreationRecoveryAction::Undo),
+            ContextMenuAction::AbortIntent => self.prompt_claim_abort(),
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
             ContextMenuAction::ToggleArchive => {
@@ -5099,8 +5161,8 @@ impl HomeView {
             // A real row resolved here; the regular click path owns it.
             return false;
         }
-        if let Some(state) = self.live_send.clone() {
-            self.exit_live_send_and_restore_sizing(&state);
+        if self.live_send.is_some() {
+            self.teardown_live_send();
             return true;
         }
         false
@@ -5261,15 +5323,29 @@ impl HomeView {
         if let Some(session_id) = &self.selected_session {
             if let Some(inst) = self.get_instance(session_id) {
                 if inst.status == Status::Creating {
+                    self.prompt_creation_recovery(
+                        persistence_transactions::CreationRecoveryAction::Undo,
+                    );
                     return;
                 }
                 if inst.status == Status::Deleting {
+                    let target = match self.prepare_force_removal(inst) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Force Remove Refused",
+                                &format!("{error:#}"),
+                            ));
+                            return;
+                        }
+                    };
                     let message = format!(
-                        "'{}' is stuck deleting. Force remove it from the session list? \
-                         (the sandbox container is torn down; worktrees and branches will not be cleaned up)",
+                        "Force removal of '{}'? The original deletion is escalated when it is still pending. \
+                         Worktrees, branches and scratch files are kept. Agent teardown must still be proven, \
+                         and hooks or commit already started cannot be bypassed.",
                         inst.title
                     );
-                    self.pending_force_remove_session = Some(session_id.clone());
+                    self.pending_force_remove_session = Some(target);
                     self.confirm_dialog = Some(ConfirmDialog::new(
                         "Force Remove",
                         &message,
@@ -5479,8 +5555,8 @@ impl HomeView {
                     // old session) and for the row already live: a single click is a "stop
                     // touching that" gesture. In `LiveSend` mode the `start_live_send`
                     // branch below retargets instead.
-                    if let Some(state) = self.live_send.clone() {
-                        self.exit_live_send_and_restore_sizing(&state);
+                    if self.live_send.is_some() {
+                        self.teardown_live_send();
                     }
                     None
                 } else {
@@ -5830,12 +5906,18 @@ impl HomeView {
         self.clear_preview_selection();
         if !self.has_non_live_send_overlay() {
             if let Some(state) = self.live_send.clone() {
+                if self.end_live_send_on_drift(&state) {
+                    return;
+                }
+                let mut accepted = false;
                 if let Some(worker) = &self.live_send_worker {
                     for key in split_paste_for_live_send(text) {
-                        worker.send(key);
+                        accepted |= worker.send(key);
                     }
                 }
-                self.stamp_last_accessed(&state.session_id);
+                if accepted {
+                    self.stamp_last_accessed(&state.session_id);
+                }
                 return;
             }
         }
@@ -6004,7 +6086,14 @@ impl HomeView {
         let Some(state) = self.live_send.clone() else {
             return;
         };
+        if live_send::chord_list_matches(&state.exit_chords, key) {
+            self.teardown_live_send();
+            return;
+        }
 
+        if self.end_live_send_on_drift(&state) {
+            return;
+        }
         // Leader menu: a prior keystroke matched the configured leader
         // (tmux-style prefix, default Ctrl+B), so this key picks a
         // live-send command instead of being forwarded. Always disarm
@@ -6034,9 +6123,7 @@ impl HomeView {
             match key.code {
                 KeyCode::Char('k') | KeyCode::Char('K') if plain => self.open_command_palette(),
                 KeyCode::Char('b') | KeyCode::Char('B') if plain => self.toggle_sidebar_collapsed(),
-                KeyCode::Char('q') | KeyCode::Char('Q') if plain => {
-                    self.exit_live_send_and_restore_sizing(&state)
-                }
+                KeyCode::Char('q') | KeyCode::Char('Q') if plain => self.teardown_live_send(),
                 // Esc, or any unbound or modified key, cancels the menu without
                 // forwarding: the leader already swallowed the keystroke, as tmux's
                 // prefix does for unknown keys.
@@ -6072,12 +6159,6 @@ impl HomeView {
             }
         }
 
-        // The exit chord is checked before drift: exiting is always safe, and a user
-        // escaping a stuck live mode shouldn't hit a "session ended" dialog on the way.
-        if live_send::chord_list_matches(&state.exit_chords, key) {
-            self.exit_live_send_and_restore_sizing(&state);
-            return;
-        }
         // Leader press: arm the live-send command menu and swallow the keystroke; the
         // next key goes to the pending-leader branch at the top. Checked after the exit
         // chord so a leader misconfigured as the exit chord still exits.
@@ -6087,9 +6168,6 @@ impl HomeView {
                 return;
             }
         }
-        if self.end_live_send_on_drift(&state) {
-            return;
-        }
         // Ctrl+C here is forwarded to the agent rather than quitting aoe (the app-level
         // handler defers to live-send via `is_live_send_capturing`). Flash the footer so
         // the user learns the keystroke landed on the agent; re-armed per press (#2894).
@@ -6098,8 +6176,12 @@ impl HomeView {
         match live_send::translate(key) {
             live_send::LiveDispatch::Ignore => {}
             live_send::LiveDispatch::Send(tmux_key) => {
-                if let Some(worker) = &self.live_send_worker {
-                    worker.send(tmux_key);
+                if !self
+                    .live_send_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.send(tmux_key))
+                {
+                    return;
                 }
                 if is_ctrl_c {
                     self.flash_ctrl_c_hint();
@@ -6116,8 +6198,8 @@ impl HomeView {
     /// inherits the preview-pinned window size, and detaching drops the user back into
     /// live mode rather than the home list (#2290). No-op when not live-sending.
     fn exit_live_send_before_attach(&mut self) {
-        if let Some(state) = self.live_send.clone() {
-            self.exit_live_send_and_restore_sizing(&state);
+        if self.live_send.is_some() {
+            self.teardown_live_send();
         }
     }
 
@@ -6126,7 +6208,7 @@ impl HomeView {
     /// can outlive its agent, and keys must not reach a pane the list no longer shows. The
     /// selection is left for the caller's rebuild to settle.
     pub(super) fn end_live_send_if_hidden(&mut self) {
-        let Some(state) = self.live_send.clone() else {
+        let Some(state) = self.live_send.as_ref() else {
             return;
         };
         if !self
@@ -6141,7 +6223,7 @@ impl HomeView {
             self.selected_group.clone(),
             self.selected_group_profile.clone(),
         );
-        self.exit_live_send_and_restore_sizing(&state);
+        self.teardown_live_send();
         (
             self.cursor,
             self.selected_session,
@@ -6151,23 +6233,12 @@ impl HomeView {
         self.flash_status("Live send ended: its session is hidden (y to show)");
     }
 
-    /// Tear down live-send state and restore the tmux window's automatic sizing:
-    /// live-send's resize loop forces manual sizing, which would leave the next attach
-    /// from a full-size terminal cramped at the preview dimensions. Re-setting
-    /// `window-size latest` is best-effort, so a stuck pane never blocks the exit.
-    fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
-        let session = crate::tmux::Session::from_name(&state.tmux_name);
-        session.reset_size_to_latest_client();
-        self.teardown_live_send();
-    }
-
-    /// Shared live-send teardown that touches no tmux sizing. Normal exits come through
-    /// `exit_live_send_and_restore_sizing`; the lost-lock exit calls this directly,
-    /// because the surface that took over has already sized the window and re-asserting
-    /// `window-size latest` would stomp it.
-    fn teardown_live_send(&mut self) {
+    pub(super) fn teardown_live_send(&mut self) {
         let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
+        if let Some(capture) = self.preview_capture_worker.as_ref() {
+            capture.end_live_input();
+        }
         // Leave the capture worker running: the same pane is still previewed, just at the
         // idle cadence, which the render reconcile retunes.
         self.live_send_last_resize = None;
@@ -6201,6 +6272,13 @@ impl HomeView {
     ///
     /// The caller shows the message verbatim, so phrase it as a user-facing sentence.
     fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
+        if self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(|worker| worker.target_lost())
+        {
+            return Some("The physical tmux pane changed while live mode was active.");
+        }
         let Some(inst) = self.get_instance(&state.session_id) else {
             return Some("Session was deleted while live mode was active.");
         };
@@ -6233,7 +6311,7 @@ impl HomeView {
         let Some(reason) = self.live_send_drift_reason(state) else {
             return false;
         };
-        self.exit_live_send_and_restore_sizing(state);
+        self.teardown_live_send();
         self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
         true
     }
@@ -6246,6 +6324,19 @@ impl HomeView {
     /// Deliberately does not restore the window's sizing: the new owner already resized
     /// the window, and `window-size latest` would stomp it.
     pub(in crate::tui) fn poll_live_send_takeover(&mut self) -> bool {
+        let Some(state) = self.live_send.clone() else {
+            if self.live_send_worker.is_some() {
+                self.teardown_live_send();
+            }
+            return false;
+        };
+        if self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(live_send::LiveSendWorker::target_lost)
+        {
+            return self.end_live_send_on_drift(&state);
+        }
         if !self
             .live_send_worker
             .as_ref()
@@ -6253,12 +6344,6 @@ impl HomeView {
         {
             return false;
         }
-        let Some(state) = self.live_send.clone() else {
-            // Worker outlived the live-send state (already torn down some
-            // other way); just drop it.
-            self.live_send_worker = None;
-            return false;
-        };
         // A dead or renamed session also fails the worker's ownership refresh, so prefer
         // the accurate drift message over blaming a takeover that never happened.
         if self.end_live_send_on_drift(&state) {
@@ -6266,7 +6351,11 @@ impl HomeView {
         }
         // Name the thief where the owner id is unambiguous: the web dashboard's live
         // viewers register as `live-*` (src/server/live_ws.rs), other TUIs as `tui-*`.
-        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
+        let message = match self
+            .live_send_worker
+            .as_ref()
+            .and_then(live_send::LiveSendWorker::size_owner)
+        {
             Some((id, _)) if id.starts_with("live-") => {
                 "The web dashboard took over this session's live view."
             }
@@ -6732,37 +6821,14 @@ impl HomeView {
         None
     }
 
-    /// Create a session with optional hooks, delegating to the background
-    /// `CreationPoller` when hooks are present, the session is sandboxed, or a worktree
-    /// branch is requested, so a slow `post-checkout` can't freeze the TUI.
+    /// Every creation uses the native builder worker and the durable publication lane.
     pub(super) fn create_session_with_hooks(
         &mut self,
         data: NewSessionData,
         hooks: Option<repo_config::ResolvedHooks>,
     ) -> Option<Action> {
-        let has_hooks = hooks
-            .as_ref()
-            .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());
-        let has_worktree = data.worktree_enabled;
-
-        if data.sandbox || has_hooks || has_worktree {
-            self.request_creation(data, hooks);
-            return None;
-        }
-
-        match self.create_session(data) {
-            Ok(session_id) => {
-                self.new_dialog = None;
-                Some(Action::AttachAfterCreate(session_id))
-            }
-            Err(e) => {
-                tracing::error!(target: "tui.input", "Failed to create session: {}", e);
-                if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_error(e.to_string());
-                }
-                None
-            }
-        }
+        self.request_creation(data, hooks);
+        None
     }
 }
 

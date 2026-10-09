@@ -4,31 +4,12 @@
 use super::*;
 
 impl HomeView {
-    /// Reload the merged project registry into `registered_projects`, on every storage
-    /// reload and after a pin toggle, so empty headers and pin indicators track the disk
-    /// registry.
-    ///
-    /// In all-profiles mode `build_flat_items_by_project` merges sessions from every loaded
-    /// profile, so the registry must too, or a profile-scoped pin loses its header once its
-    /// sessions are gone. Deduped by canonical path, since each `load_merged` repeats the
-    /// global entries.
     pub(in crate::tui) fn refresh_registered_projects(&mut self) {
-        use crate::session::projects::{canonical_key, load_merged};
-        if self.active_profile.is_some() {
-            self.registered_projects = load_merged(&self.config_profile()).unwrap_or_default();
-            return;
-        }
-        let profiles: Vec<String> = self.storages.keys().cloned().collect();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut merged = Vec::new();
-        for profile in &profiles {
-            for p in load_merged(profile).unwrap_or_default() {
-                if seen.insert(canonical_key(&p.path)) {
-                    merged.push(p);
-                }
-            }
-        }
-        self.registered_projects = merged;
+        self.registered_projects = super::persistence_worker::load_projects(
+            self.active_profile.as_deref(),
+            &self.config_profile(),
+            &self.storages,
+        );
     }
 
     /// The canonical repo path of the first live (non-archived) session under project

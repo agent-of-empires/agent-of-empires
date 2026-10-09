@@ -17,6 +17,69 @@ use crate::acp::runner_lifecycle::WorkerPhase;
 use crate::acp::state::Event;
 
 impl<S: BroadcastSink> Supervisor<S> {
+    pub(crate) async fn wait_for_present_resume(
+        &self,
+        present: &super::PresentResume,
+    ) -> Result<Arc<crate::session::LaunchOrigin>, SupervisorError> {
+        let id = present.lease.session_id();
+        let deadline = tokio::time::Instant::now() + WORKER_READY_TIMEOUT;
+        loop {
+            let notified = self.worker_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            present
+                .issued
+                .check_active()
+                .map_err(super::launch::launch_origin_error)?;
+            let ready = {
+                let workers = self.workers.lock().await;
+                let table = lock_recover(&self.lifecycle);
+                let current = table
+                    .present_admission(id)
+                    .filter(|(lease, _)| *lease == present.lease)
+                    .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
+                if !current
+                    .1
+                    .original_baseline()
+                    .is_some_and(|baseline| Arc::ptr_eq(&baseline, &present.baseline))
+                {
+                    return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+                }
+                table
+                    .running(id)
+                    .is_some_and(|(lease, _)| lease == present.lease)
+                    && workers
+                        .get(id)
+                        .is_some_and(|handle| handle.lease == present.lease)
+                    && !lock_recover(&self.pending_context_resets).contains(id)
+            };
+            if ready {
+                super::launch::validate_launch_origin(&present.issued).await?;
+                let workers = self.workers.lock().await;
+                let table = lock_recover(&self.lifecycle);
+                if table
+                    .running(id)
+                    .is_some_and(|(lease, _)| lease == present.lease)
+                    && workers
+                        .get(id)
+                        .is_some_and(|handle| handle.lease == present.lease)
+                    && !lock_recover(&self.pending_context_resets).contains(id)
+                    && present.issued.check_active().is_ok()
+                {
+                    return present
+                        .issued
+                        .origin()
+                        .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()));
+                }
+                return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Err(SupervisorError::Acp(AcpError::Spawn(
+                    "original worker readiness timed out".into(),
+                )));
+            }
+        }
+    }
     /// Wait until the session's worker is installed; false once no resume is
     /// pending or `deadline` elapses.
     pub(super) async fn wait_for_worker(&self, session_id: &str, deadline: Duration) -> bool {
@@ -243,24 +306,116 @@ mod tests {
     use crate::acp::state::AcpSessionId;
     use crate::daemon::AcpWorkerState;
 
+    #[test]
+    fn runtime_shutdown_retains_issued_custody_until_last_job() {
+        const CHILD: &str = "AOE_TEST_RESERVATION_RUNTIME_SHUTDOWN";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("acp::supervisor::requests::tests::runtime_shutdown_retains_issued_custody_until_last_job")
+                .arg("--nocapture").env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (_home, _temporary) = isolate_home();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sup = Arc::new(Supervisor::new(VecSink::new()));
+        let reservation = runtime.block_on(async {
+            reserve(
+                crate::acp::supervisor::test_support::memory_resume(
+                    &sup,
+                    "runtime-custody",
+                    ResumeKind::Attach,
+                )
+                .await,
+            )
+        });
+        let admission = reservation.execution_admission();
+        let first = admission.begin_job();
+        let last = admission.begin_job();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        runtime.spawn(async move {
+            let _reservation = reservation;
+            entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        runtime.block_on(ready).unwrap();
+        runtime.shutdown_timeout(Duration::ZERO);
+        assert_eq!(
+            sup.lifecycle.lock().unwrap().phase("runtime-custody"),
+            crate::acp::runner_lifecycle::WorkerPhase::Resuming
+        );
+        drop(first);
+        assert_eq!(
+            sup.lifecycle.lock().unwrap().phase("runtime-custody"),
+            crate::acp::runner_lifecycle::WorkerPhase::Resuming
+        );
+        drop(last);
+        assert_eq!(
+            sup.lifecycle.lock().unwrap().phase("runtime-custody"),
+            crate::acp::runner_lifecycle::WorkerPhase::Absent
+        );
+    }
+
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
     async fn wait_for_worker_blocks_on_a_reservation_until_it_drops() {
+        let (_home, _temporary) = isolate_home();
         let sup = Arc::new(Supervisor::new(VecSink::new()));
         assert!(
             !sup.wait_for_worker("s-1748", Duration::from_secs(60)).await,
             "with no reservation, wait_for_worker fails fast"
         );
 
-        let reservation = reserve(sup.begin_resume("s-1748", ResumeKind::Spawn).await);
+        let reservation = reserve(
+            sup.begin_resume(
+                "s-1748",
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                crate::acp::supervisor::test_support::stored_origin("s-1748"),
+                false,
+            )
+            .await,
+        );
         assert!(
             sup.is_running("s-1748").await,
             "a reservation counts as running so the reconciler skips it"
         );
         assert_eq!(sup.worker_state("s-1748").await, AcpWorkerState::Resuming);
-        assert!(matches!(
-            sup.begin_resume("s-1748", ResumeKind::Spawn).await.unwrap(),
-            ResumeReservationOutcome::AlreadyPresent
-        ));
+        let original = stored_origin("s-1748");
+        let present = match sup
+            .begin_resume(
+                "s-1748",
+                crate::acp::runner_lifecycle::NativeResume::Spawn,
+                original.clone(),
+                false,
+            )
+            .await
+            .unwrap()
+        {
+            ResumeReservationOutcome::AlreadyPresent(present) => present,
+            ResumeReservationOutcome::Reserved(_) => {
+                panic!("must observe the existing reservation")
+            }
+        };
+        assert!(original.same_scope(&stored_origin("s-1748")));
+        {
+            let mut readiness = std::pin::pin!(sup.wait_for_present_resume(&present));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(readiness.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(present);
+        assert_eq!(sup.worker_state("s-1748").await, AcpWorkerState::Resuming);
 
         let mut entered = sup.watch_worker_waits();
         let waiter = {
@@ -287,7 +442,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
     async fn wait_for_worker_blocks_until_native_context_is_durable() {
+        let (_home, _temporary) = isolate_home();
         let sup = Arc::new(Supervisor::new(VecSink::new()));
         sup.test_install_handle(
             "s-isolated",
@@ -319,7 +476,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn requests_racing_a_force_stop_teardown_are_not_faults() {
+        let (_home, _temporary) = isolate_home();
         let sup = Supervisor::new(VecSink::new());
         sup.test_install_handle(
             "s-3401",
@@ -343,7 +502,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_session_context_resets_then_reasserts_mode_without_clearing_on_failure() {
+        let (_home, _temporary) = isolate_home();
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
         let cmds = sup.test_insert_worker_cmd_recording("s-reset").await;

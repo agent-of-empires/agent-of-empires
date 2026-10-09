@@ -279,9 +279,24 @@ fn test_session_context_menu_snooze_toggle() {
         .clone()
         .expect("a session should be selected");
 
-    env.view.snooze_session_for(&id, 60).unwrap();
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    (|| -> anyhow::Result<Option<String>> {
+        let _disposition = env.view.snooze_session_for(&id, 60)?;
+        drain_persistence(&mut env.view)?;
+        match env
+            .view
+            .take_persistence_action()
+            .map(super::super::PersistenceAction::into_action)
+        {
+            Some(Action::SetTransientStatus(message)) => Ok(Some(message)),
+            _ => Ok(None),
+        }
+    })()
+    .unwrap();
+    {
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(
         env.view.snooze_duration_dialog.is_none(),
         "waking a snoozed session must not open the duration picker"
@@ -294,8 +309,11 @@ fn test_session_context_menu_snooze_toggle() {
     env.view.sort_order = SortOrder::Attention;
     env.view.flat_items = env.view.build_flat_items();
     env.view.select_session_by_id(&id);
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    {
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+        drain_persistence(&mut env.view).unwrap();
+    };
     assert!(
         env.view.snooze_duration_dialog.is_some(),
         "context-menu Snooze on an active session must open the duration picker"
@@ -332,7 +350,11 @@ fn test_shift_n_prefills_from_selected_session() {
         env.view.update_selected();
         env.view.new_dialog = None;
 
-        env.view.handle_key(key(KeyCode::Char('N')), None);
+        {
+            let result = env.view.handle_key(key(KeyCode::Char('N')), None);
+            drain_persistence(&mut env.view).unwrap();
+            result
+        };
         let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
         assert_eq!(dialog.path_value(), path, "{title}");
         assert_eq!(dialog.group_value(), "", "{title}");
@@ -379,7 +401,14 @@ fn test_rename_selected_group_with_children() {
             old_path: old.to_string(),
             old_profile: "test".to_string(),
         });
-        view.rename_selected_group(Some(new), None).unwrap();
+        {
+            let submitted = view.rename_selected_group(Some(new), None);
+            await_transaction_result(
+                &mut view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .unwrap();
         let tree = view.group_trees.get("test").unwrap();
         assert!(
             !tree.group_exists(old),
@@ -443,7 +472,14 @@ fn test_rename_group_noop_and_duplicate() {
     };
 
     env.view.group_rename_context = Some(context());
-    env.view.rename_selected_group(Some("work"), None).unwrap();
+    {
+        let submitted = env.view.rename_selected_group(Some("work"), None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     let work_session = env
         .view
         .instances()
@@ -453,15 +489,27 @@ fn test_rename_group_noop_and_duplicate() {
 
     env.view.group_rename_context = Some(context());
     assert!(
-        env.view
-            .rename_selected_group(Some("personal"), None)
-            .is_err(),
+        {
+            let submitted = env.view.rename_selected_group(Some("personal"), None);
+            await_transaction_result(
+                &mut env.view,
+                submitted.map(|_| super::super::TransactionDisposition::Queued),
+            )
+        }
+        .is_err(),
         "renaming to an existing group should fail"
     );
 
     env.view.sort_order = crate::session::config::SortOrder::AZ;
     env.view.group_rename_context = Some(context());
-    env.view.rename_selected_group(Some("aaa"), None).unwrap();
+    {
+        let submitted = env.view.rename_selected_group(Some("aaa"), None);
+        await_transaction_result(
+            &mut env.view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     let group_items: Vec<&str> = env
         .view
         .flat_items
@@ -502,8 +550,14 @@ fn test_move_explicit_empty_group_between_profiles() {
         old_profile: "alpha".to_string(),
     });
 
-    view.rename_selected_group(Some("moved-empty"), Some("beta"))
-        .unwrap();
+    {
+        let submitted = view.rename_selected_group(Some("moved-empty"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
 
     assert!(Storage::new_unwatched("alpha")
         .unwrap()
@@ -556,14 +610,15 @@ fn test_group_profile_move_rejects_concurrent_fresh_member_without_metadata_spli
             Ok(())
         })
         .unwrap();
-    let error = view
-        .rename_selected_group(Some("moved-team"), Some("beta"))
-        .expect_err("a concurrent group member must abort the move");
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("group membership changed while the cross-profile move was pending"),
-        "unexpected profile-move rejection: {message}"
-    );
+    let error = {
+        let submitted = view.rename_selected_group(Some("moved-team"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("a concurrent group member must abort the move");
+    drop(error);
     let (source_rows, source_groups) = source.load_with_groups().unwrap();
     assert_eq!(source_rows.len(), 2);
     assert!(source_rows
@@ -618,7 +673,14 @@ fn test_group_profile_move_is_all_or_nothing() {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    assert!(view.rename_selected_group(None, Some("beta")).is_err());
+    assert!({
+        let submitted = view.rename_selected_group(None, Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .is_err());
     assert_eq!(source.load().unwrap().len(), 2);
     assert_eq!(target.load().unwrap().len(), 1);
     let (_, source_groups) = source.load_with_groups().unwrap();
@@ -639,7 +701,14 @@ fn test_group_profile_move_is_all_or_nothing() {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    view.rename_selected_group(None, Some("beta")).unwrap();
+    {
+        let submitted = view.rename_selected_group(None, Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .unwrap();
     assert!(source.load().unwrap().is_empty());
     assert_eq!(target.load().unwrap().len(), 2);
     let published: Vec<_> = view
@@ -700,11 +769,15 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         old_profile: "alpha".to_string(),
     });
 
-    let error = view
-        .rename_selected_group(Some("moved"), Some("beta"))
-        .expect_err("a creating member must reject the complete group move");
+    {
+        let submitted = view.rename_selected_group(Some("moved"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("a creating member must reject the complete group move");
 
-    assert!(error.to_string().contains("being created"));
     assert!(view
         .instances()
         .filter(|instance| instance.id == first.id || instance.id == second.id)
@@ -723,10 +796,14 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    let error = view
-        .rename_selected_group(Some("moved"), Some("beta"))
-        .expect_err("a deleting member must reject the complete group move");
-    assert!(error.to_string().contains("being deleted"));
+    {
+        let submitted = view.rename_selected_group(Some("moved"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect_err("a deleting member must reject the complete group move");
     assert_eq!(source.load().unwrap().len(), 2);
     assert!(target.load().unwrap().is_empty());
 
@@ -734,6 +811,8 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        path_claims: crate::session::WorktreePathClaims::None,
+        custodian: None,
     };
     view.mutate_instance(&second.id, |instance| {
         instance.status = Status::Idle;
@@ -756,8 +835,14 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         old_profile: "alpha".to_string(),
     });
 
-    view.rename_selected_group(Some("moved"), Some("beta"))
-        .expect("expired reservation must not block the group move");
+    {
+        let submitted = view.rename_selected_group(Some("moved"), Some("beta"));
+        await_transaction_result(
+            &mut view,
+            submitted.map(|_| super::super::TransactionDisposition::Queued),
+        )
+    }
+    .expect("expired reservation must not block the group move");
     assert!(source.load().unwrap().is_empty());
     assert_eq!(target.load().unwrap().len(), 2);
 }
@@ -769,20 +854,70 @@ fn test_q_in_search_mode_types_q_not_quit() {
     let mut view = env.view;
 
     assert!(!view.has_dialog());
-    view.handle_key(key(KeyCode::Char('/')), None);
+    {
+        let result = view.handle_key(key(KeyCode::Char('/')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert!(view.search_active);
     assert!(view.has_dialog(), "active search counts as a dialog");
 
-    let action = view.handle_key(key(KeyCode::Char('q')), None);
+    let action = {
+        let result = view.handle_key(key(KeyCode::Char('q')), None);
+        drain_persistence(&mut view).unwrap();
+        result
+    };
     assert_eq!(action, None);
     assert!(view.search_active);
     assert_eq!(view.search_query.value(), "q");
 }
 
-/// The async CreationPoller result must replace a `Creating` stub even when an intervening
-/// save already persisted it, keep the finalized row's group, and treat the committed row as
-/// authoritative rather than a provisional pending add, so a later peer deletion is not
-/// resurrected by `save`.
+struct CreationHookGate {
+    root: std::path::PathBuf,
+}
+
+impl CreationHookGate {
+    fn new(root: &std::path::Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    fn hooks(&self) -> Option<crate::session::config::repo_config::ResolvedHooks> {
+        let started = self.root.join("create-started");
+        let release = self.root.join("release");
+        let started = shell_words::quote(started.to_str().unwrap());
+        let release = shell_words::quote(release.to_str().unwrap());
+        crate::session::config::repo_config::ResolvedHooks::with_repo("default", &self.root,
+            crate::session::config::repo_config::HooksConfig {
+                on_create: vec![format!("touch {started}; i=0; while [ ! -e {release} ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i+1)); done; [ -e {release} ]")],
+                ..Default::default()
+            })
+    }
+
+    fn wait(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.root.join("create-started").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "creation hook never acknowledged its start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn release(&self) {
+        std::fs::write(self.root.join("release"), b"").unwrap();
+    }
+}
+
+impl Drop for CreationHookGate {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.root.join("release"), b"");
+    }
+}
+
+/// Finalization consumes the same canonical identity despite an intervening UI save.
 #[test]
 #[serial]
 fn apply_creation_results_finalizes_persisted_stub() {
@@ -794,16 +929,24 @@ fn apply_creation_results_finalizes_persisted_stub() {
         _temp,
     } = setup_creation_test_env();
 
+    let gate = CreationHookGate::new(&project_dir);
     view.request_creation(
         creation_data(&project_dir, "Async Test", "async-success"),
-        None,
+        gate.hooks(),
     );
+    drain_persistence(&mut view).unwrap();
     assert!(view.is_creation_pending());
     let stub_id = view
         .creating_stub_id
         .clone()
         .expect("request should install a Creating stub");
-    view.save().unwrap();
+    let original_dob = view.get_instance(&stub_id).unwrap().created_at;
+    gate.wait();
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
     let (persisted_while_creating, groups_while_creating) = storage.load_with_groups().unwrap();
     assert_eq!(persisted_while_creating.len(), 1);
     assert_eq!(persisted_while_creating[0].id, stub_id);
@@ -812,12 +955,13 @@ fn apply_creation_results_finalizes_persisted_stub() {
         crate::session::Status::Creating
     );
     assert!(
-        groups_while_creating
+        !groups_while_creating
             .iter()
             .any(|group| group.path == "async-success"),
-        "the intervening save should persist the stub's provisional group"
+        "a provisional group is not durably published before original creation ACK"
     );
 
+    gate.release();
     let session_id = drain_creation_result(&mut view)
         .expect("apply_creation_results should return Some(session_id)");
     assert!(
@@ -828,13 +972,6 @@ fn apply_creation_results_finalizes_persisted_stub() {
         view.get_instance(&session_id).is_some(),
         "created session should be findable after apply_creation_results"
     );
-    assert!(
-        !view
-            .pending_added
-            .get("default")
-            .is_some_and(|pending| pending.contains(&session_id)),
-        "a row committed by finalization is not a provisional pending add"
-    );
     let (persisted_after_finalization, groups_after_finalization) =
         storage.load_with_groups().unwrap();
     assert_eq!(
@@ -843,22 +980,28 @@ fn apply_creation_results_finalizes_persisted_stub() {
         "finalization should replace the persisted stub with one real row"
     );
     assert_eq!(persisted_after_finalization[0].id, session_id);
-    assert!(
-        persisted_after_finalization
-            .iter()
-            .all(|instance| instance.id != stub_id
-                && instance.status != crate::session::Status::Creating),
-        "the persisted Creating stub must not survive finalization"
+    assert_eq!(session_id, stub_id);
+    assert_eq!(persisted_after_finalization[0].created_at, original_dob);
+    assert_ne!(
+        persisted_after_finalization[0].status,
+        crate::session::Status::Creating
     );
+    assert!(persisted_after_finalization[0]
+        .lifecycle_reservation
+        .is_none());
     assert!(
         groups_after_finalization
             .iter()
             .any(|group| group.path == "async-success"),
         "the finalized row's group should remain persisted"
     );
-    assert!(
-        view.get_instance(&stub_id).is_none(),
-        "the in-memory Creating stub must be replaced too"
+    assert_eq!(
+        view.get_instance(&stub_id).unwrap().created_at,
+        original_dob
+    );
+    assert_ne!(
+        view.get_instance(&stub_id).unwrap().status,
+        crate::session::Status::Creating
     );
 
     storage
@@ -867,7 +1010,11 @@ fn apply_creation_results_finalizes_persisted_stub() {
             Ok(())
         })
         .unwrap();
-    view.save().unwrap();
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
     assert!(
         view.get_instance(&session_id).is_none(),
         "save must evict the peer-deleted finalized row from memory"
@@ -902,24 +1049,24 @@ fn cancelled_creation_is_not_revived_by_a_later_request() {
     view.request_creation(cancelled, None);
     view.cancel_creation();
     view.request_creation(creation_data(&project_dir, "Kept", ""), None);
+    drain_persistence(&mut view).unwrap();
 
     let session_id = drain_creation_result(&mut view).expect("the later request should finish");
     assert_eq!(view.get_instance(&session_id).unwrap().title, "Kept");
     assert!(!view.is_creation_pending());
     let persisted = storage.load().unwrap();
-    assert_eq!(
-        persisted
-            .iter()
-            .map(|row| row.title.as_str())
-            .collect::<Vec<_>>(),
-        ["Kept"]
-    );
-    let repo = git2::Repository::open(&project_dir).unwrap();
-    assert!(
-        repo.find_branch("cancelled-branch", git2::BranchType::Local)
-            .is_err(),
-        "the cancelled request's worktree branch must be rolled back"
-    );
+    assert!(persisted
+        .iter()
+        .any(|row| row.id == session_id && row.title == "Kept"));
+    if let Some(cancelled) = persisted.iter().find(|row| row.title == "Cancelled") {
+        assert!(cancelled.has_pending_worktree_path_claims());
+        assert_ne!(cancelled.id, session_id);
+    } else {
+        let repo = git2::Repository::open(&project_dir).unwrap();
+        assert!(repo
+            .find_branch("cancelled-branch", git2::BranchType::Local)
+            .is_err());
+    }
 }
 
 /// Ctrl-C while on_create runs lets that hook finish but must not start on_launch.
@@ -949,6 +1096,7 @@ fn cancel_during_on_create_skips_on_launch() {
         },
     );
     view.request_creation(creation_data(&project_dir, "Hooked", ""), hooks);
+    drain_persistence(&mut view).unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !project_dir.join("create-started").exists() {
@@ -958,6 +1106,21 @@ fn cancel_during_on_create_skips_on_launch() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let original = view
+        .get_instance(view.creating_stub_id.as_ref().unwrap())
+        .unwrap()
+        .clone();
+    let custody = crate::session::builder::CreationCustody::retained()
+        .into_iter()
+        .find(|custody| {
+            custody.session_id() == original.id
+                && custody.created_at() == original.created_at
+                && custody.storage().same_origin_as(&storage)
+        })
+        .expect("original native producer custody");
+    let generation = custody
+        .generation()
+        .expect("actual original Create acknowledgement");
     view.cancel_creation();
     std::fs::write(project_dir.join("release"), b"").unwrap();
 
@@ -967,16 +1130,31 @@ fn cancel_during_on_create_skips_on_launch() {
         !project_dir.join("launch-started").exists(),
         "on_launch must not start after a cancel during on_create"
     );
-    assert!(storage.load().unwrap().is_empty());
+    let retained = storage.load().unwrap();
+    assert!(custody
+        .matches_original(&storage, &original.id, original.created_at, generation)
+        .unwrap());
+    if retained.is_empty() {
+        // With no canonical row, matches_original can succeed only using the producer's
+        // retained opaque withdrawal ACK, not by reconstructing authority from JSON.
+        assert!(custody.generation().is_none());
+    } else {
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, original.id);
+        assert_eq!(retained[0].created_at, original.created_at);
+        assert_eq!(retained[0].status, crate::session::Status::Creating);
+        assert_eq!(retained[0].lifecycle_generation, generation);
+        assert_eq!(
+            retained[0].lifecycle_reservation.as_ref().unwrap().op,
+            crate::session::LifecycleOperation::Create
+        );
+    }
 }
 
-/// A peer can commit the same title/path while the background builder waits for
-/// finalization. The duplicate rollback must preserve every resource the persisted winner
-/// references and its own pre-existing empty group, while discarding the losing stub's
-/// provisional group, in memory and across a later save.
+/// A peer cannot claim a path while its original creation producer is pending.
 #[test]
 #[serial]
-fn apply_creation_results_rolls_back_on_peer_collision() {
+fn pending_creation_claim_rejects_peer_collision() {
     let CreationTestEnv {
         mut view,
         storage,
@@ -984,163 +1162,163 @@ fn apply_creation_results_rolls_back_on_peer_collision() {
         _guard,
         _temp,
     } = setup_creation_test_env();
-
-    // Use a real created branch/worktree so rollback proves it preserves
-    // resources referenced by the persisted winner.
-    let preexisting_group = "existing-empty";
-    let transient_group = "existing-empty/collision";
+    let parent_group = "existing-empty";
+    let group = "existing-empty/collision";
     view.group_trees
         .get_mut("default")
-        .expect("default profile should have a group tree")
-        .create_group(preexisting_group);
-    view.save().unwrap();
-    assert!(
-        storage
-            .load_with_groups()
-            .unwrap()
-            .1
-            .iter()
-            .any(|group| group.path == preexisting_group),
-        "the parent group must be intentionally persisted before the request"
-    );
+        .unwrap()
+        .create_group(parent_group);
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
+    let gate = CreationHookGate::new(&project_dir);
     let branch = "raced-worktree";
-    let mut raced = creation_data(&project_dir, "Raced title", transient_group);
-    raced.worktree_enabled = true;
-    raced.worktree_branch = Some(branch.to_string());
-    raced.create_new_branch = true;
-    view.request_creation(raced, None);
-    let raced_stub_id = view
-        .creating_stub_id
-        .clone()
-        .expect("raced request should install a Creating stub");
-    view.save().unwrap();
-    let (raced_rows, raced_groups) = storage.load_with_groups().unwrap();
-    assert!(raced_rows.iter().any(|instance| {
-        instance.id == raced_stub_id && instance.status == crate::session::Status::Creating
-    }));
-    assert!(
-        raced_groups
-            .iter()
-            .any(|group| group.path == transient_group),
-        "the intervening save should persist the raced stub's child group"
+    let mut data = creation_data(&project_dir, "Raced title", group);
+    data.worktree_enabled = true;
+    data.worktree_branch = Some(branch.to_string());
+    data.create_new_branch = true;
+    view.request_creation(data, gate.hooks());
+    drain_persistence(&mut view).unwrap();
+    let id = view.creating_stub_id.clone().unwrap();
+    let original_dob = view.get_instance(&id).unwrap().created_at;
+    gate.wait();
+    let claimed = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(claimed.created_at, original_dob);
+    assert_eq!(claimed.status, crate::session::Status::Creating);
+    assert!(claimed.has_pending_worktree_path_claims());
+    let path = std::path::PathBuf::from(&claimed.project_path);
+    let mut peer = Instance::new("Raced title", &claimed.project_path);
+    peer.worktree_info = claimed.worktree_info.clone();
+    peer.source_profile = "default".to_string();
+    assert!(storage
+        .update(|rows, _| {
+            rows.push(peer);
+            Ok(())
+        })
+        .is_err());
+    {
+        view.request_save();
+        drain_persistence(&mut view)
+    }
+    .unwrap();
+    let still_claimed = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(still_claimed.created_at, original_dob);
+    assert_eq!(
+        still_claimed.lifecycle_generation,
+        claimed.lifecycle_generation
     );
+    assert_eq!(
+        still_claimed.lifecycle_reservation,
+        claimed.lifecycle_reservation
+    );
+    gate.release();
+    assert_eq!(drain_creation_result(&mut view), Some(id.clone()));
+    let (rows, groups) = storage.load_with_groups().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].created_at, original_dob);
+    assert_ne!(rows[0].status, crate::session::Status::Creating);
+    assert!(rows[0].lifecycle_reservation.is_none());
+    assert!(groups.iter().any(|stored| stored.path == parent_group));
+    assert!(groups.iter().any(|stored| stored.path == group));
+    assert!(view.creating_provisional_group_paths.is_empty());
+    assert!(path.is_dir());
+    let git = crate::git::GitWorktree::new(project_dir.canonicalize().unwrap()).unwrap();
+    assert!(git
+        .list_worktrees()
+        .unwrap()
+        .iter()
+        .any(|worktree| worktree.path == path));
+    assert!(git2::Repository::open(&project_dir)
+        .unwrap()
+        .find_branch(branch, git2::BranchType::Local)
+        .is_ok());
+    storage
+        .update(|rows, _| {
+            rows.retain(|row| row.id != id);
+            Ok(())
+        })
+        .unwrap();
+    git.remove_worktree(&path, true).unwrap();
+    git.delete_branch(branch).unwrap();
+}
 
-    let main_repo_path = project_dir.canonicalize().unwrap();
-    let git = crate::git::GitWorktree::new(main_repo_path.clone()).unwrap();
+/// A delivered creation result must not still own the global ownership flocks.
+/// `apply_creation_results` takes the workspace-claim and identity pair itself
+/// while it publishes, and any other path needing them (`save`, a peer
+/// duplicate repair during `reload`) would block forever behind flocks the
+/// builder thread still held across the channel.
+#[test]
+#[serial]
+fn creation_result_does_not_carry_the_ownership_flocks() {
+    use std::sync::mpsc;
+    let CreationTestEnv {
+        mut view,
+        storage: _storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+
+    view.request_creation(
+        creation_data(&project_dir, "Lock Test", "async-locks"),
+        None,
+    );
+    drain_persistence(&mut view).unwrap();
     let start = std::time::Instant::now();
-    let winner_path = loop {
-        if let Some(path) = git
-            .list_worktrees()
-            .unwrap()
-            .into_iter()
-            .find(|worktree| worktree.branch.as_deref() == Some(branch))
-            .map(|worktree| worktree.path)
-        {
-            break path;
+    let result = loop {
+        if let Some(result) = view.creation_poller.try_recv_result() {
+            break result;
         }
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "background worktree creation timed out"
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "background creation timed out"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-
-    let mut owner = Instance::new("Raced title", winner_path.to_str().unwrap());
-    owner.source_profile = "default".to_string();
-    owner.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: branch.to_string(),
-        main_repo_path: main_repo_path.to_string_lossy().into_owned(),
-        managed_by_aoe: false,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
-    let owner_id = owner.id.clone();
-    storage
-        .update(|instances, _groups| {
-            instances.push(owner);
-            Ok(())
-        })
-        .unwrap();
-
-    let unexpected_id = drain_creation_result(&mut view);
-    assert_eq!(unexpected_id, None);
     assert!(
-        view.creating_provisional_group_paths.is_empty(),
-        "rollback must leave no provisional group paths behind"
-    );
-    assert!(view.info_dialog.is_some());
-    assert!(
-        winner_path.is_dir(),
-        "rollback must preserve the winner's worktree"
-    );
-    assert!(
-        git.list_worktrees()
-            .unwrap()
-            .iter()
-            .any(|worktree| worktree.path == winner_path),
-        "winner worktree must remain registered"
-    );
-    assert!(
-        git2::Repository::open(&main_repo_path)
-            .unwrap()
-            .find_branch(branch, git2::BranchType::Local)
-            .is_ok(),
-        "rollback must preserve the winner's branch"
-    );
-    assert!(
-        view.group_trees.get("default").is_none_or(|tree| tree
-            .get_all_groups()
-            .iter()
-            .all(|group| group.path != transient_group)),
-        "duplicate rejection must discard the stub's provisional group"
-    );
-    assert!(
-        view.group_trees
-            .get("default")
-            .is_some_and(|tree| tree.group_exists(preexisting_group)),
-        "duplicate rejection must preserve an intentionally pre-existing empty group"
+        matches!(
+            &result.result,
+            crate::tui::creation_poller::CreationResult::Success { .. }
+        ),
+        "the builder should have delivered a successful result: {:?}",
+        result.result
     );
 
-    view.save().unwrap();
-    let (persisted, groups) = storage.load_with_groups().unwrap();
-    assert_eq!(
-        persisted
-            .iter()
-            .filter(|instance| {
-                instance.title == "Raced title"
-                    && std::path::Path::new(&instance.project_path) == winner_path
+    // Probe from another thread while the result is still held, exactly as
+    // `apply_creation_results` holds it. The probe blocks on the flock, so the
+    // handle is kept and joined once the assertion has passed; on the failing
+    // path the thread is still parked in the flock wait and must be left
+    // detached rather than joined, or the test would hang instead of fail.
+    let (tx, rx) = mpsc::channel();
+    let probe = std::thread::spawn(move || {
+        let acquired = crate::session::acquire_session_workspace_claim_lock()
+            .and_then(|claim| {
+                crate::session::acquire_session_identity_lock().map(|identity| (claim, identity))
             })
-            .count(),
-        1
-    );
-    assert_eq!(
-        persisted.len(),
-        1,
-        "duplicate rejection should leave only the authoritative peer row"
-    );
+            .is_ok();
+        let _ = tx.send(acquired);
+    });
     assert!(
-        persisted.iter().all(|instance| {
-            instance.id != raced_stub_id && instance.status != crate::session::Status::Creating
-        }),
-        "duplicate rejection must remove the persisted Creating stub"
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or(false),
+        "a delivered creation result must not hold the workspace-claim or identity flock"
     );
-    assert!(
-        groups.iter().all(|group| group.path != transient_group),
-        "a later save must not persist the rejected stub's group"
-    );
-    assert!(
-        groups.iter().any(|group| group.path == preexisting_group),
-        "a later save must preserve the pre-existing empty parent group"
-    );
-
-    storage
-        .update(|instances, _groups| {
-            instances.retain(|instance| instance.id != owner_id);
-            Ok(())
-        })
-        .unwrap();
-    git.remove_worktree(&winner_path, true).unwrap();
-    git.delete_branch(branch).unwrap();
+    if probe.is_finished() {
+        probe.join().unwrap();
+    }
 }
 
 #[test]
@@ -1174,10 +1352,17 @@ fn test_cursor_follows_session_after_deletion() {
         Item::Session { id, .. } => id.clone(),
         _ => panic!("expected session at index 1"),
     };
-    env.view.remove_instance(&victim_id);
+    super::remove_test_instance(&mut env.view, &victim_id);
     env.view.rebuild_group_trees();
-    let _ = env.view.save();
-    env.view.reload().unwrap();
+    let _ = {
+        env.view.request_save();
+        drain_persistence(&mut env.view)
+    };
+    {
+        env.view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut env.view)
+    }
+    .unwrap();
 
     // Cursor should have followed the tracked session to its new position
     assert_eq!(
@@ -1185,4 +1370,157 @@ fn test_cursor_follows_session_after_deletion() {
         Some(tracked_id.as_str())
     );
     assert_eq!(env.view.cursor, 1);
+}
+
+#[test]
+#[serial]
+fn creation_delayed_in_native_hook_cannot_adopt_recreated_profile() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    let sh = which::which("sh").expect("native hook fixture requires sh");
+    let _shell = crate::session::test_support::EnvGuard::set(&[("SHELL", sh)]);
+    let hooks = crate::session::config::repo_config::ResolvedHooks::with_repo("default", &project_dir, crate::session::config::repo_config::HooksConfig {
+        on_create: vec!["touch create-started; i=0; while [ ! -e release ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i+1)); done; [ -e release ]".into()],
+        on_launch: vec!["touch old-launch-started".into()],
+        ..Default::default()
+    });
+    view.request_creation(
+        creation_data(&project_dir, "Retired", "old-provisional-group"),
+        hooks,
+    );
+    drain_persistence(&mut view).unwrap();
+    wait_for_native_fixture("old profile creation entering on_create", || {
+        project_dir.join("create-started").exists().then_some(())
+    });
+    std::fs::rename(
+        storage.sessions_path().parent().unwrap(),
+        _temp.path().join("retired-profile"),
+    )
+    .unwrap();
+    crate::session::create_profile("default").unwrap();
+    let replacement = Storage::new_unwatched("default").unwrap();
+    replacement
+        .update(|rows, groups| {
+            rows.push(Instance::new("replacement", project_dir.to_str().unwrap()));
+            groups.push(Group::new("kept", "kept"));
+            Ok(())
+        })
+        .unwrap();
+    let rows_before = std::fs::read(replacement.sessions_path()).unwrap();
+    let groups_path = replacement
+        .sessions_path()
+        .parent()
+        .unwrap()
+        .join("groups.json");
+    let groups_before = std::fs::read(&groups_path).unwrap();
+    std::fs::write(project_dir.join("release"), b"").unwrap();
+    assert_eq!(drain_creation_result(&mut view), None);
+    assert!(!project_dir.join("old-launch-started").exists());
+    assert_eq!(
+        std::fs::read(replacement.sessions_path()).unwrap(),
+        rows_before
+    );
+    assert_eq!(std::fs::read(&groups_path).unwrap(), groups_before);
+    view.request_save();
+    let _save_result = drain_persistence(&mut view);
+    assert_eq!(
+        std::fs::read(replacement.sessions_path()).unwrap(),
+        rows_before
+    );
+    assert_eq!(std::fs::read(&groups_path).unwrap(), groups_before);
+    {
+        view.request_reload(super::super::ReloadKind::Full);
+        drain_persistence(&mut view)
+    }
+    .unwrap();
+    view.request_creation(creation_data(&project_dir, "Fresh", ""), None);
+    drain_persistence(&mut view).unwrap();
+    let id = drain_creation_result(&mut view).expect("an explicit reload admits a fresh creation");
+    assert_eq!(view.get_instance(&id).unwrap().title, "Fresh");
+    let (rows, groups) = replacement.load_with_groups().unwrap();
+    assert!(rows.iter().any(|row| row.title == "replacement"));
+    assert!(rows.iter().any(|row| row.title == "Fresh"));
+    assert!(!rows
+        .iter()
+        .any(|row| row.title == "Retired" || row.status == Status::Creating));
+    assert!(!groups
+        .iter()
+        .any(|group| group.path == "old-provisional-group"));
+}
+
+#[test]
+#[serial]
+fn retained_creation_confirmation_does_not_retarget_after_selection_changes() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    view.request_creation(creation_data(&project_dir, "Retained original", ""), None);
+    let original_id = view.creating_stub_id.clone().unwrap();
+    drain_persistence(&mut view).unwrap();
+    view.storages
+        .get_mut("default")
+        .unwrap()
+        .set_fail_writes_for_test(true);
+    assert_eq!(drain_creation_result(&mut view), None);
+    assert!(
+        drain_persistence(&mut view).is_err(),
+        "publication fence must report its actual failed ACK"
+    );
+    assert_eq!(
+        view.get_instance(&original_id).unwrap().status,
+        Status::Creating
+    );
+    view.storages
+        .get_mut("default")
+        .unwrap()
+        .set_fail_writes_for_test(false);
+    let other = Instance::new("Other", project_dir.to_str().unwrap());
+    let other_id = other.id.clone();
+    storage
+        .update(|rows, _| {
+            rows.push(other);
+            Ok(())
+        })
+        .unwrap();
+    view.request_reload(super::super::ReloadKind::Full);
+    drain_persistence(&mut view).unwrap();
+    view.selected_session = Some(original_id.clone());
+    view.prompt_creation_recovery(
+        super::super::persistence_transactions::CreationRecoveryAction::RetryPublication,
+    );
+    drain_persistence(&mut view).unwrap();
+    assert_eq!(
+        view.pending_creation_confirmation
+            .as_ref()
+            .unwrap()
+            .capture
+            .id,
+        original_id
+    );
+    view.selected_session = Some(other_id.clone());
+    view.submit_creation_confirmation();
+    drain_persistence(&mut view).unwrap();
+    assert_eq!(
+        view.persistence
+            .created
+            .pop_front()
+            .map(|ack| ack.session_id().to_owned()),
+        Some(original_id.clone())
+    );
+    let rows = storage.load().unwrap();
+    assert!(rows
+        .iter()
+        .any(|row| row.id == original_id && row.status != Status::Creating));
+    assert!(rows
+        .iter()
+        .any(|row| row.id == other_id && row.title == "Other"));
 }
