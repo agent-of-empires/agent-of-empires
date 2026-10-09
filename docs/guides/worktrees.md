@@ -84,7 +84,7 @@ Creation and attach reserve the complete future path set durably before Git, wor
 
 ### Abandoning unresolved intent metadata
 
-When original creation or attach custody is lost, or a pre-upgrade session has unknown runner history, `aoe -p PROFILE session abort-intent FULL_ID` removes only that exact metadata row. In the TUI, right-click the session and choose **Abort metadata; retain resources**, then confirm. This workflow needs no reboot. Cancelling the confirmation leaves the row unchanged.
+When original creation or attach custody is lost, or a pre-upgrade session has unknown runner history, `aoe -p PROFILE session abort-intent FULL_ID` removes only that exact eligible metadata row. For a decodable row, the TUI offers **Abort metadata; retain resources** in its context menu, then confirmation. If an eligible partial journal prevents the row from appearing in the TUI, use the exact-ID CLI command. This workflow needs no reboot. Cancelling confirmation leaves the row unchanged.
 
 This does not stop a process, run destroy hooks, undo creation or purge anything. Before removing the row, aoe durably retains its exact owner, native history and path inventory in `retained-intents.json` outside the profiles. Its ID remains reserved; cleanup continues to exclude its resources in both build namespaces even when no live row owns them. A failed source write keeps both copies until retry.
 
@@ -96,13 +96,9 @@ An externally placed `git worktree lock` is not a deletion guard: aoe locks ever
 
 ### Legacy execution coverage after an upgrade
 
-Sessions whose old build did not record execution history remain protected in the same boot. To remove their metadata without rebooting, use [metadata-only retirement](#abandoning-unresolved-intent-metadata); resources and unknown native exclusions remain protected. Existing complete journals are preserved. To establish different-boot execution coverage:
+An upgrade adds an explicit unknown journal only when the old journal is absent or null. Existing non-null journals and native history are preserved, including partial evidence that the current decoder cannot accept. The migration does not invent missing births or seed an observed boot baseline. Use [metadata-only retirement](#abandoning-unresolved-intent-metadata) for eligible unknown or unresolved owners; their resources and exclusions remain protected.
 
-1. Stop the old TUI, CLI writers and `aoe serve` processes before upgrading. Open the upgraded build so its migrations durably record the actually observed boot for legacy journals. Keep the migration backups.
-2. Reboot the actual host or VM. Restarting aoe, its daemon or a container does not establish a different host boot.
-3. Reopen the upgraded build and retry the requested operation. It must observe both the stored baseline and a different real boot; if boot identity is unavailable, cleanup remains refused.
-
-This procedure establishes execution coverage only. It does not reconstruct original endpoint custody or clear Pending/Unknown filesystem intents. Those independent ownership guards may still retain the checkout and row.
+A different host boot can establish runner execution coverage only when a real observed baseline was already durably recorded. With no baseline, restarting or rebooting does not establish that proof. Execution coverage never reconstructs original endpoint custody, retires an unknown Create domain, or clears Pending/Unknown filesystem intents.
 
 ## Warnings during create
 

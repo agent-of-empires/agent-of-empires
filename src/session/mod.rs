@@ -105,7 +105,9 @@ pub use runner_journal::{LaunchOrigin, OwnedCreateCommand};
 pub(crate) use storage::observe_lock_contention_for_test;
 pub use storage::DirectoryIdentity;
 pub(crate) use storage::{
-    acquire_profile_namespace_lock, acquire_session_identity_lock, sync_parent_directory,
+    acquire_session_identity_lock, acquire_storage_flock_cohort, sync_parent_directory,
+    OpenStorageLock, MIGRATION_BACKUP_MARKER, PROFILE_NAMESPACE_LOCK_FILENAME,
+    SESSION_IDENTITY_LOCK_FILENAME, SESSION_WORKSPACE_CLAIM_LOCK_FILENAME,
 };
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport, MetadataSelection};
 
@@ -192,11 +194,10 @@ pub use scope::SessionScope;
 #[cfg(test)]
 pub(crate) use storage::migration_backups;
 pub(crate) use storage::{
-    acquire_session_title_lock, acquire_session_workspace_claim_lock,
-    acquire_session_workspace_claim_lock_in, acquire_storage_flock, acquire_storage_shared_flock,
-    atomic_write, backup_before_migration, read_file_no_follow, replace_file_no_follow,
-    resolve_symlink_chain, same_filesystem_identity, try_acquire_storage_flock, GroupMovePlan,
-    StorageFlock, STORAGE_LOCK_FILENAME,
+    acquire_session_title_lock, acquire_session_workspace_claim_lock, acquire_storage_flock,
+    acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
+    replace_file_no_follow, resolve_symlink_chain, same_filesystem_identity,
+    try_acquire_storage_flock, GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

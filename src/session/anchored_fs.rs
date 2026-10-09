@@ -105,6 +105,20 @@ impl AnchoredDir {
         })
     }
 
+    pub(crate) fn child_following_alias(&self, leaf: &Path) -> Result<Self> {
+        let components = normal_components(leaf)?;
+        anyhow::ensure!(components.len() == 1, "profile alias needs one component");
+        Ok(Self {
+            root: self.root.join(leaf),
+            fd: openat(
+                &self.fd,
+                leaf,
+                OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                Mode::empty(),
+            )?,
+        })
+    }
+
     pub(crate) fn create_child(&self, relative: &Path) -> Result<Self> {
         Ok(Self {
             root: self.root.join(relative),
@@ -281,6 +295,25 @@ impl AnchoredDir {
             return Ok(None);
         }
         Ok(Some(bytes))
+    }
+
+    pub(crate) fn open_lock_file(&self, relative: &Path) -> Result<File> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        let file = File::from(openat(
+            &parent,
+            leaf.as_os_str(),
+            OFlag::O_RDWR
+                | OFlag::O_CREAT
+                | OFlag::O_CLOEXEC
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_NONBLOCK,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )?);
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "original lock is not a regular file"
+        );
+        Ok(file)
     }
 
     /// Create `relative` for writing, or `None` when an entry is already

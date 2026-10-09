@@ -258,18 +258,17 @@ fn guard(app_dir: &Path) -> Result<Vec<crate::session::StorageFlock>> {
         fs::create_dir_all(&*namespace)?;
         *namespace = fs::canonicalize(&*namespace)?;
     }
-    namespaces.sort();
-    namespaces.dedup();
+    locks.extend(crate::session::storage::acquire_storage_flock_cohort(
+        namespaces.iter().map(PathBuf::as_path),
+        crate::session::SESSION_WORKSPACE_CLAIM_LOCK_FILENAME,
+        false,
+    )?);
+    locks.extend(crate::session::storage::acquire_storage_flock_cohort(
+        namespaces.iter().map(PathBuf::as_path),
+        v027::LOCK,
+        true,
+    )?);
     for namespace in &namespaces {
-        locks.push(crate::session::acquire_session_workspace_claim_lock_in(
-            namespace,
-        )?);
-    }
-    for namespace in &namespaces {
-        locks.push(crate::session::acquire_storage_shared_flock(
-            namespace,
-            v027::LOCK,
-        )?);
         if v027::transition_in_flight(namespace)? {
             bail!(
                 "the sandbox store migration is still moving stores; run `aoe migrate` and try again"
@@ -727,7 +726,8 @@ mod tests {
         .unwrap();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let mut row = crate::session::Instance::new("retained", "/retained-original");
-        row.runner_journal = Default::default();
+        row.runner_journal =
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
         row.status = crate::session::Status::Creating;
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Create,

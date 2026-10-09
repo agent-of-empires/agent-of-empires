@@ -3,6 +3,7 @@
 
 mod config_file;
 pub mod progress;
+pub(crate) mod schema;
 mod sessions_file;
 mod store_fs;
 #[cfg(test)]
@@ -42,12 +43,7 @@ mod v032_bound_capture_exclusions;
 pub(crate) mod v033_isolate_sandbox_content;
 mod v034_trash_retention_minutes;
 mod v035_custom_sort_order;
-mod v036_runner_execution_journal;
-mod v037_runner_preparation_custody;
-mod v038_worktree_path_claims;
-mod v039_owned_create_native_custody;
-mod v040_filesystem_claim_custodian;
-pub(crate) mod v041_retained_intents;
+mod v042_canonical_execution_journal;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -90,161 +86,197 @@ mod hook_fixtures {
 }
 
 use anyhow::Result;
+#[cfg(test)]
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 41;
+const CURRENT_VERSION: u32 = 42;
 const VERSION_FILE: &str = ".schema_version";
 
-/// Version, log name, and the one-time transformation to run.
-type Migration = (u32, &'static str, fn() -> Result<()>);
+enum MigrationAction {
+    Legacy(fn() -> Result<()>),
+    Anchored(fn(&crate::session::AnchoredDir, u32) -> Result<()>),
+}
+
+type Migration = (u32, &'static str, MigrationAction);
 
 const MIGRATIONS: &[Migration] = &[
-    (1, "xdg_linux", v001_xdg_linux::run),
+    (1, "xdg_linux", MigrationAction::Legacy(v001_xdg_linux::run)),
     (
         2,
         "seed_sandbox_from_volumes",
-        v002_seed_sandbox_from_volumes::run,
+        MigrationAction::Legacy(v002_seed_sandbox_from_volumes::run),
     ),
-    (3, "yolo_mode_config", v003_yolo_mode_config::run),
-    (4, "unified_environment", v004_unified_environment::run),
-    (5, "acp_defaults", v005_cockpit_defaults::run),
+    (
+        3,
+        "yolo_mode_config",
+        MigrationAction::Legacy(v003_yolo_mode_config::run),
+    ),
+    (
+        4,
+        "unified_environment",
+        MigrationAction::Legacy(v004_unified_environment::run),
+    ),
+    (
+        5,
+        "acp_defaults",
+        MigrationAction::Legacy(v005_cockpit_defaults::run),
+    ),
     (
         6,
         "unlimited_cockpit_history",
-        v006_unlimited_cockpit_history::run,
+        MigrationAction::Legacy(v006_unlimited_cockpit_history::run),
     ),
-    (7, "serve_log_to_legacy", v007_serve_log_to_legacy::run),
+    (
+        7,
+        "serve_log_to_legacy",
+        MigrationAction::Legacy(v007_serve_log_to_legacy::run),
+    ),
     (
         8,
         "lock_in_default_profile",
-        v008_lock_in_default_profile::run,
+        MigrationAction::Legacy(v008_lock_in_default_profile::run),
     ),
-    (9, "update_check_mode", v009_update_check_mode::run),
+    (
+        9,
+        "update_check_mode",
+        MigrationAction::Legacy(v009_update_check_mode::run),
+    ),
     (
         10,
         "drop_legacy_live_send_exit_chord",
-        v010_drop_legacy_live_send_exit_chord::run,
+        MigrationAction::Legacy(v010_drop_legacy_live_send_exit_chord::run),
     ),
     (
         11,
         "relocate_sandbox_image",
-        v011_relocate_sandbox_image::run,
+        MigrationAction::Legacy(v011_relocate_sandbox_image::run),
     ),
-    (12, "acp_rename", v012_acp_rename::run),
-    (13, "strip_profile_theme", v013_strip_profile_theme::run),
-    (14, "rename_default_theme", v014_rename_default_theme::run),
-    (15, "rewrite_hook_strings", v015_rewrite_hook_strings::run),
+    (
+        12,
+        "acp_rename",
+        MigrationAction::Legacy(v012_acp_rename::run),
+    ),
+    (
+        13,
+        "strip_profile_theme",
+        MigrationAction::Legacy(v013_strip_profile_theme::run),
+    ),
+    (
+        14,
+        "rename_default_theme",
+        MigrationAction::Legacy(v014_rename_default_theme::run),
+    ),
+    (
+        15,
+        "rewrite_hook_strings",
+        MigrationAction::Legacy(v015_rewrite_hook_strings::run),
+    ),
     (
         16,
         "clear_archived_tmux_gone_error",
-        v016_clear_archived_tmux_gone_error::run,
+        MigrationAction::Legacy(v016_clear_archived_tmux_gone_error::run),
     ),
     (
         17,
         "rewrite_hook_strings_for_per_user_base",
-        v017_rewrite_hook_strings_for_per_user_base::run,
+        MigrationAction::Legacy(v017_rewrite_hook_strings_for_per_user_base::run),
     ),
     (
         18,
         "strip_codex_config_toml_hooks",
-        v018_strip_codex_config_toml_hooks::run,
+        MigrationAction::Legacy(v018_strip_codex_config_toml_hooks::run),
     ),
     (
         19,
         "move_acp_defaults_to_acp",
-        v019_move_acp_defaults_to_acp::run,
+        MigrationAction::Legacy(v019_move_acp_defaults_to_acp::run),
     ),
     (
         20,
         "move_tui_branch_suffix_to_row_tag",
-        v020_move_tui_branch_suffix_to_row_tag::run,
+        MigrationAction::Legacy(v020_move_tui_branch_suffix_to_row_tag::run),
     ),
     (
         21,
         "split_app_state_to_state_toml",
-        v021_split_app_state_to_state_toml::run,
+        MigrationAction::Legacy(v021_split_app_state_to_state_toml::run),
     ),
-    (22, "prune_tuning_settings", v022_prune_tuning_settings::run),
+    (
+        22,
+        "prune_tuning_settings",
+        MigrationAction::Legacy(v022_prune_tuning_settings::run),
+    ),
     (
         23,
         "clear_structured_container_error",
-        v023_clear_structured_container_error::run,
+        MigrationAction::Legacy(v023_clear_structured_container_error::run),
     ),
-    (24, "backfill_detect_as", v024_backfill_detect_as::run),
+    (
+        24,
+        "backfill_detect_as",
+        MigrationAction::Legacy(v024_backfill_detect_as::run),
+    ),
     (
         25,
         "reenable_confirm_delete",
-        v025_reenable_confirm_delete::run,
+        MigrationAction::Legacy(v025_reenable_confirm_delete::run),
     ),
     (
         26,
         "repoint_acp_default_agent",
-        v026_repoint_acp_default_agent::run,
+        MigrationAction::Legacy(v026_repoint_acp_default_agent::run),
     ),
     (
         27,
         "isolate_sandbox_stores",
-        v027_isolate_sandbox_stores::run,
+        MigrationAction::Legacy(v027_isolate_sandbox_stores::run),
     ),
     (
         28,
         "clear_archived_live_status",
-        v028_clear_archived_live_status::run,
+        MigrationAction::Legacy(v028_clear_archived_live_status::run),
     ),
     (
         29,
         "fold_pending_initial_turn",
-        v029_fold_pending_initial_turn::run,
+        MigrationAction::Legacy(v029_fold_pending_initial_turn::run),
     ),
     (
         30,
         "global_only_profile_settings",
-        v030_global_only_profile_settings::run,
+        MigrationAction::Legacy(v030_global_only_profile_settings::run),
     ),
     (
         31,
         "conversation_provenance",
-        v031_conversation_provenance::run,
+        MigrationAction::Legacy(v031_conversation_provenance::run),
     ),
     (
         32,
         "bound_capture_exclusions",
-        v032_bound_capture_exclusions::run,
+        MigrationAction::Legacy(v032_bound_capture_exclusions::run),
     ),
     (
         33,
         "isolate_sandbox_content",
-        v033_isolate_sandbox_content::run,
+        MigrationAction::Legacy(v033_isolate_sandbox_content::run),
     ),
     (
         34,
         "trash_retention_minutes",
-        v034_trash_retention_minutes::run,
-    ),
-    (35, "custom_sort_order", v035_custom_sort_order::run),
-    (
-        36,
-        "runner_execution_journal",
-        v036_runner_execution_journal::run,
+        MigrationAction::Legacy(v034_trash_retention_minutes::run),
     ),
     (
-        37,
-        "runner_preparation_custody",
-        v037_runner_preparation_custody::run,
-    ),
-    (38, "worktree_path_claims", v038_worktree_path_claims::run),
-    (
-        39,
-        "owned_create_native_custody",
-        v039_owned_create_native_custody::run,
+        35,
+        "custom_sort_order",
+        MigrationAction::Legacy(v035_custom_sort_order::run),
     ),
     (
-        40,
-        "filesystem_claim_custodian",
-        v040_filesystem_claim_custodian::run,
+        42,
+        "canonical_execution_journal",
+        MigrationAction::Anchored(v042_canonical_execution_journal::run),
     ),
-    (41, "retained_intents", v041_retained_intents::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -256,8 +288,8 @@ pub fn current_schema_version() -> u32 {
 }
 
 /// Check whether there are any pending migrations to run.
-pub fn has_pending_migrations() -> bool {
-    get_current_version() < CURRENT_VERSION
+pub fn has_pending_migrations() -> Result<bool> {
+    Ok(get_current_version()? < CURRENT_VERSION)
 }
 
 /// Move this session's sandbox store into the private layout, if it is still
@@ -275,7 +307,7 @@ pub fn migrate_sandbox_store_for_with(
     id: &str,
     reporter: Option<progress::Reporter>,
 ) -> Result<()> {
-    if get_current_version() < 27 {
+    if get_current_version()? < 27 {
         return Ok(());
     }
     let _installed = progress::install(reporter);
@@ -287,7 +319,7 @@ pub(crate) fn migrate_sandbox_store_under_workspace_locks(
     id: &str,
     reporter: Option<progress::Reporter>,
 ) -> Result<()> {
-    if get_current_version() < 27 {
+    if get_current_version()? < 27 {
         return Ok(());
     }
     let _installed = progress::install(reporter);
@@ -332,7 +364,17 @@ pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<
 fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) -> Result<()> {
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
-    let current = get_current_version();
+    let app = crate::session::AnchoredDir::open(&crate::session::get_app_dir()?)?;
+    let original_app = app.birth_identity()?;
+    let validate_app = || {
+        anyhow::ensure!(
+            crate::session::AnchoredDir::open(app.path())?.birth_identity()? == original_app,
+            "original migration app directory changed"
+        );
+        Ok(())
+    };
+    let current = schema::read_at(&app)?;
+    crate::session::retained_intents::validate_at(&app)?;
     debug!("Current schema version: {}", current);
 
     if current > CURRENT_VERSION {
@@ -341,7 +383,17 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
         );
     }
     if current == CURRENT_VERSION {
-        crate::session::retained_intents::validate_current_app()?;
+        validate_app()?;
+        anyhow::ensure!(
+            schema::read_at(&app)? == current,
+            "migration schema changed"
+        );
+        app.sync()?;
+        validate_app()?;
+        anyhow::ensure!(
+            schema::read_at(&app)? == current,
+            "migration schema changed"
+        );
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         return v033_isolate_sandbox_content::reconcile_pending(announce);
     }
@@ -359,8 +411,13 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
             position: index + 1,
             total: pending.len(),
         });
-        run()?;
-        set_version(*version)?;
+        match run {
+            MigrationAction::Legacy(run) => {
+                run()?;
+                set_version_at(&app, *version, Some(&validate_app))?;
+            }
+            MigrationAction::Anchored(run) => run(&app, *version)?,
+        }
         progress::report(progress::Event::Finished {
             version: *version,
             elapsed: start.elapsed(),
@@ -377,21 +434,30 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
     Ok(())
 }
 
-/// Get the schema version from the selected app directory.
-fn get_current_version() -> u32 {
-    crate::session::get_app_dir()
-        .ok()
-        .and_then(|dir| fs::read_to_string(dir.join(VERSION_FILE)).ok())
-        .and_then(|content| content.trim().parse::<u32>().ok())
-        .unwrap_or(0)
+fn get_current_version() -> Result<u32> {
+    schema::read_at(&crate::session::AnchoredDir::open(
+        &crate::session::get_app_dir()?,
+    )?)
 }
 
-/// Write the version to the current app directory.
-fn set_version(version: u32) -> Result<()> {
-    let dir = crate::session::get_app_dir()?;
-    let version_file = dir.join(VERSION_FILE);
-    crate::session::atomic_write(&version_file, version.to_string().as_bytes())?;
-    debug!("Updated schema version to {}", version);
+fn set_version_at(
+    app: &crate::session::AnchoredDir,
+    version: u32,
+    validate: Option<&dyn Fn() -> Result<()>>,
+) -> Result<()> {
+    let bytes = version.to_string();
+    app.publish_file(
+        std::path::Path::new(VERSION_FILE),
+        &mut bytes.as_bytes(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        true,
+        validate.map(|validate| crate::session::anchored_fs::FilePublication {
+            staging: app,
+            validate,
+        }),
+    )?;
+    app.sync()?;
+    debug!(version, "updated schema version");
     Ok(())
 }
 
@@ -400,12 +466,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_migrations_are_sequential() {
-        let mut prev = 0;
-        for (version, ..) in MIGRATIONS {
-            assert!(*version > prev, "migration {version} should be > {prev}");
-            prev = *version;
+    #[serial_test::serial]
+    fn current_schema_retry_requires_original_directory_durability() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let _environment = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let root = crate::session::get_app_dir()?;
+        crate::session::retained_intents::initialize_legacy_in(&root)?;
+        let marker = CURRENT_VERSION.to_string();
+        let rows = br#"[{"id":"retry-owner","opaque":1e400}]"#;
+        fs::write(root.join(VERSION_FILE), &marker)?;
+        fs::write(root.join("sessions.json"), rows)?;
+        let ledger = fs::read(root.join("retained-intents.json"))?;
+        let original = crate::session::AnchoredDir::open(&root)?;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::session::anchored_fs::FAIL_SYNC_IDENTITY_ONCE.set(None);
+            }
         }
+        let _reset = Reset;
+        crate::session::anchored_fs::FAIL_SYNC_IDENTITY_ONCE.set(Some(original.identity()?));
+        assert!(run_migrations().is_err());
+        assert_eq!(fs::read(root.join(VERSION_FILE))?, marker.as_bytes());
+        assert_eq!(fs::read(root.join("sessions.json"))?, rows);
+        assert_eq!(fs::read(root.join("retained-intents.json"))?, ledger);
+        run_migrations_announced(None)?;
+        assert_eq!(fs::read(root.join(VERSION_FILE))?, marker.as_bytes());
+        assert_eq!(fs::read(root.join("sessions.json"))?, rows);
+        assert_eq!(fs::read(root.join("retained-intents.json"))?, ledger);
+        assert!(crate::session::migration_backups(&root.join("sessions.json"))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn corrupt_schema_or_retained_ledger_refuses_before_legacy_row_mutation() -> Result<()> {
+        for (marker, ledger) in [
+            (&b"not-a-version"[..], None),
+            (&b"\xff"[..], None),
+            (&b"4294967296"[..], None),
+            (&b"41"[..], None),
+            (&b"22"[..], Some(&b"null"[..])),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let _environment = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let root = crate::session::get_app_dir()?;
+            let original = br#"[{"id":"retained-original","archived":true,"status":"Waiting","opaque":1e400}]"#;
+            fs::write(root.join(VERSION_FILE), marker)?;
+            fs::write(root.join("sessions.json"), original)?;
+            if let Some(ledger) = ledger {
+                fs::write(root.join("retained-intents.json"), ledger)?;
+            }
+            assert!(run_migrations().is_err());
+            assert_eq!(fs::read(root.join(VERSION_FILE))?, marker);
+            assert_eq!(fs::read(root.join("sessions.json"))?, original);
+            assert!(crate::session::migration_backups(&root.join("sessions.json"))?.is_empty());
+        }
+        Ok(())
     }
 
     #[test]
@@ -415,11 +532,13 @@ mod tests {
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
         fs::create_dir_all(&app).unwrap();
-        fs::write(app.join(VERSION_FILE), (CURRENT_VERSION + 1).to_string()).unwrap();
-
-        let error = run_migrations().unwrap_err().to_string();
-
-        assert!(error.contains("refusing to downgrade"));
+        let marker = (CURRENT_VERSION + 1).to_string();
+        fs::write(app.join(VERSION_FILE), &marker).unwrap();
+        let rows = b"[{\"id\":\"future-owner\",\"runner_journal\":{\"future-evidence\":true}}]";
+        fs::write(app.join("sessions.json"), rows).unwrap();
+        assert!(run_migrations().is_err());
+        assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker.as_bytes());
+        assert_eq!(fs::read(app.join("sessions.json")).unwrap(), rows);
     }
 
     /// v035 is a schema step and nothing more: an install on the previous version with a
@@ -444,7 +563,7 @@ mod tests {
         );
 
         run_migrations().unwrap();
-        let advanced = get_current_version();
+        let advanced = get_current_version().unwrap();
         assert!(advanced > 34, "the version advances past 34, to {advanced}");
         assert_eq!(advanced, CURRENT_VERSION);
         assert_eq!(
@@ -454,7 +573,11 @@ mod tests {
         );
 
         run_migrations().unwrap();
-        assert_eq!(get_current_version(), advanced, "a second run stays put");
+        assert_eq!(
+            get_current_version().unwrap(),
+            advanced,
+            "a second run stays put"
+        );
         assert_eq!(
             fs::read_to_string(app.join("state.toml")).unwrap(),
             state,
@@ -488,7 +611,7 @@ mod tests {
             rows[0]["retroactive_capture_excludes"][0]["session_id"],
             "old"
         );
-        assert_eq!(get_current_version(), CURRENT_VERSION);
+        assert_eq!(get_current_version().unwrap(), CURRENT_VERSION);
     }
 
     #[test]

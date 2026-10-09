@@ -356,7 +356,6 @@ pub(super) struct CreateExecution {
     external_domain: bool,
     scope_unproven: bool,
     effect_acknowledged: bool,
-    #[serde(default)]
     no_target_approved: bool,
 }
 impl CreateExecution {

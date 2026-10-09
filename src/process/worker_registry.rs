@@ -529,50 +529,6 @@ fn read_record(path: &Path) -> Result<Option<WorkerRecord>> {
     Ok(Some(record))
 }
 
-/// One-time schema normalization preserves weak birth data without discovering new authority.
-pub(crate) fn migrate_birth_stamps(
-    transform: impl Fn(&mut serde_json::Value) -> bool,
-) -> Result<()> {
-    let directory = crate::session::get_app_dir()?.join("acp-workers");
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if validate_session_id(id).is_err() {
-            continue;
-        }
-        with_registry_lock(id, || {
-            let Some((mut value, pin)) = read_discovered_record::<serde_json::Value>(&path)? else {
-                return Ok(());
-            };
-            anyhow::ensure!(
-                value.get("session_id").and_then(|value| value.as_str()) == Some(id),
-                "registry migration discovered a different session identity"
-            );
-            if transform(&mut value) {
-                let current = std::fs::symlink_metadata(&path)?;
-                anyhow::ensure!(
-                    crate::session::DirectoryIdentity::from_metadata(&current) == pin.identity,
-                    "registry file changed before birth normalization"
-                );
-                let bytes = serde_json::to_vec_pretty(&value)?;
-                write_record_bytes_unlocked(id, &bytes)?;
-            }
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
 pub fn list() -> Result<Vec<WorkerRecord>> {
     let dir = workers_dir()?;
     let mut out = Vec::new();

@@ -39,6 +39,7 @@ struct RunnerLaunch {
     nonce: [u8; 16],
     boot: BootToken,
     generation: u64,
+    #[serde(deserialize_with = "Option::deserialize")]
     incarnation: Option<crate::process::ProcessIncarnation>,
     profile_identity: Option<super::storage::DirectoryIdentity>,
     stop_endpoint: Option<SocketEndpointIdentity>,
@@ -186,15 +187,14 @@ impl PreparationCustody {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CreationCoverage {
-    #[default]
     Unknown,
     Owned,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunnerExecutionJournal {
     #[serde(flatten)]
     coverage: Coverage,
@@ -202,49 +202,6 @@ pub(crate) struct RunnerExecutionJournal {
     preparations: Vec<RunnerPreparation>,
     creations: Vec<native_create::CreateExecution>,
     create_coverage: CreationCoverage,
-}
-
-impl<'de> Deserialize<'de> for RunnerExecutionJournal {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Document {
-            #[serde(flatten)]
-            coverage: Coverage,
-            launches: Vec<RunnerLaunch>,
-            preparations: Vec<RunnerPreparation>,
-            creations: Option<Vec<native_create::CreateExecution>>,
-            #[serde(default)]
-            create_coverage: CreationCoverage,
-        }
-        let document = Document::deserialize(deserializer)?;
-        if document.create_coverage == CreationCoverage::Owned && document.creations.is_none() {
-            return Err(serde::de::Error::custom(
-                "owned Create coverage has no explicit producer ledger",
-            ));
-        }
-        Ok(Self {
-            coverage: document.coverage,
-            launches: document.launches,
-            preparations: document.preparations,
-            creations: document.creations.unwrap_or_default(),
-            create_coverage: document.create_coverage,
-        })
-    }
-}
-impl Default for RunnerExecutionJournal {
-    fn default() -> Self {
-        Self {
-            coverage: Coverage::Unknown {
-                boot: current_boot(),
-            },
-            launches: Vec::new(),
-            preparations: Vec::new(),
-            creations: Vec::new(),
-            create_coverage: CreationCoverage::Unknown,
-        }
-    }
 }
 
 impl RunnerExecutionJournal {
@@ -255,6 +212,16 @@ impl RunnerExecutionJournal {
             preparations: Vec::new(),
             creations: Vec::new(),
             create_coverage: CreationCoverage::Owned,
+        }
+    }
+
+    pub(crate) fn legacy_unknown() -> Self {
+        Self {
+            coverage: Coverage::Unknown { boot: None },
+            launches: Vec::new(),
+            preparations: Vec::new(),
+            creations: Vec::new(),
+            create_coverage: CreationCoverage::Unknown,
         }
     }
 
@@ -2943,6 +2910,38 @@ mod tests {
     use std::os::unix::process::CommandExt;
 
     #[test]
+    fn journal_rejects_missing_native_evidence_instead_of_assuming_quiescence() {
+        let current = serde_json::to_value(RunnerExecutionJournal::new()).unwrap();
+        for field in ["launches", "preparations", "creations", "create_coverage"] {
+            for omitted in [true, false] {
+                let mut partial = current.clone();
+                if omitted {
+                    partial.as_object_mut().unwrap().remove(field);
+                } else {
+                    partial[field] = serde_json::Value::Null;
+                }
+                assert!(
+                    serde_json::from_value::<RunnerExecutionJournal>(partial).is_err(),
+                    "{field}, omitted={omitted}"
+                );
+            }
+        }
+        let mut pending = current;
+        let nonce = [1; 16];
+        let boot = [2; 16];
+        pending["launches"] = serde_json::json!([{
+            "nonce": nonce, "boot": boot, "generation": 0, "incarnation": null
+        }]);
+        let explicit: RunnerExecutionJournal = serde_json::from_value(pending.clone()).unwrap();
+        assert!(explicit.launches[0].is_quiescent([2; 16]));
+        pending["launches"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("incarnation");
+        assert!(serde_json::from_value::<RunnerExecutionJournal>(pending).is_err());
+    }
+
+    #[test]
     #[serial_test::serial]
     fn retained_intent_refuses_original_scope_even_with_its_source_row() {
         let temporary = tempfile::tempdir().unwrap();
@@ -2951,7 +2950,7 @@ mod tests {
             .unwrap();
         let storage = Storage::new_unwatched("default").unwrap();
         let mut row = Instance::new("retained", temporary.path().to_str().unwrap());
-        row.runner_journal = RunnerExecutionJournal::default();
+        row.runner_journal = RunnerExecutionJournal::legacy_unknown();
         row.status = super::super::Status::Creating;
         row.try_acquire_lifecycle_reservation(
             LifecycleOperation::Create,

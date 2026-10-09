@@ -163,17 +163,23 @@ fn eligible(raw: &RawValue) -> Result<()> {
 }
 
 fn read_at(app: &AnchoredDir) -> Result<Ledger> {
-    let Some(bytes) = app.read_regular(Path::new(FILE), usize::MAX)? else {
-        let schema = app.read_regular(Path::new(".schema_version"), usize::MAX)?;
-        anyhow::ensure!(
-            crate::migrations::v041_retained_intents::is_legacy_schema(schema.as_deref())?,
-            "mandatory retained intent ledger is missing; refusing ownership admission"
-        );
-        return Ok(Ledger {
-            version: VERSION,
-            records: Vec::new(),
-        });
-    };
+    match app.regular_lookup(Path::new(FILE))? {
+        None => {
+            anyhow::ensure!(
+                crate::migrations::schema::read_at(app)? < 41,
+                "mandatory retained intent ledger is missing; refusing ownership admission"
+            );
+            return Ok(Ledger {
+                version: VERSION,
+                records: Vec::new(),
+            });
+        }
+        Some(false) => anyhow::bail!("retained intent ledger is not a regular file"),
+        Some(true) => {}
+    }
+    let bytes = app
+        .read_regular(Path::new(FILE), usize::MAX)?
+        .context("retained intent ledger disappeared while reading")?;
     let ledger: Ledger =
         serde_json::from_slice(&bytes).context("unreadable retained intent ledger")?;
     anyhow::ensure!(
@@ -187,15 +193,14 @@ fn read_at(app: &AnchoredDir) -> Result<Ledger> {
     Ok(ledger)
 }
 
-pub(crate) fn initialize_legacy_in(app_dir: &Path) -> Result<()> {
-    let app = AnchoredDir::create(app_dir)?;
+pub(crate) fn initialize_legacy_at(app: &AnchoredDir) -> Result<()> {
     if app.regular_lookup(Path::new(FILE))?.is_some() {
-        read_at(&app)?;
+        read_at(app)?;
+        app.sync()?;
         return Ok(());
     }
-    let schema = app.read_regular(Path::new(".schema_version"), usize::MAX)?;
     anyhow::ensure!(
-        crate::migrations::v041_retained_intents::is_legacy_schema(schema.as_deref())?,
+        crate::migrations::schema::read_at(app)? < 41,
         "mandatory retained intent ledger is missing"
     );
     let bytes = serde_json::to_vec(&Ledger {
@@ -209,12 +214,18 @@ pub(crate) fn initialize_legacy_in(app_dir: &Path) -> Result<()> {
         false,
         None,
     )?;
-    read_at(&app)?;
+    read_at(app)?;
+    app.sync()?;
     Ok(())
 }
 
-pub(crate) fn validate_current_app() -> Result<()> {
-    read_at(&AnchoredDir::open(&super::get_app_dir()?)?).map(|_| ())
+#[cfg(test)]
+pub(crate) fn initialize_legacy_in(app_dir: &Path) -> Result<()> {
+    initialize_legacy_at(&AnchoredDir::create(app_dir)?)
+}
+
+pub(crate) fn validate_at(app: &AnchoredDir) -> Result<()> {
+    read_at(app).map(|_| ())
 }
 
 pub(crate) fn retained_raw_owners_in(app_dir: &Path) -> Result<Vec<Box<RawValue>>> {

@@ -3606,7 +3606,8 @@ mod tests {
             storage
                 .update(|instances, _| {
                     instances[0].trash();
-                    instances[0].runner_journal = Default::default();
+                    instances[0].runner_journal =
+                        crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
                     Ok(())
                 })
                 .unwrap();
@@ -4821,7 +4822,7 @@ mod tests {
             })
             .unwrap();
         for journal in [
-            crate::session::runner_journal::RunnerExecutionJournal::default(),
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown(),
             live,
         ] {
             instance.runner_journal = journal.clone();

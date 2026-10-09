@@ -1298,7 +1298,8 @@ mod tests {
             instance.id = id.into();
             instance.source_profile = "hooked".into();
             instance.view = view;
-            instance.runner_journal = Default::default();
+            instance.runner_journal =
+                crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
             storage
                 .update(|rows, _| {
                     rows.push(instance.clone());

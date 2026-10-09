@@ -1742,7 +1742,8 @@ async fn terminal_worktree_edits_refuse_unproven_history() {
         inst.source_profile = "default".into();
         inst.status = Status::Idle;
         inst.view = crate::session::View::Terminal;
-        inst.runner_journal = crate::session::runner_journal::RunnerExecutionJournal::default();
+        inst.runner_journal =
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
         inst.worktree_info = Some(worktree(
             "original",
             paths

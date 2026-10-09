@@ -14,6 +14,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **lifecycle:** Arm natal custody before initialization, bound frames and the original handshake deadline, read authorization without mutating shared socket options, keep descriptor and peer checks in OS modules, drain original registry writers before forced exit, and reject durable release without clearing pending claims or rewriting refused rows.
 - **tui:** Keep original Stop lineage through archive ACKs and runtime state through moves acknowledged by the captured physical target; publish same-generation metadata once and show failed Force results while the original delete remains pending.
 - **storage:** Replace execution-store path arrays atomically while preserving opaque evidence and requiring complete immutable identities for native and sandbox reset arrays.
+- **migrations:** Replace unreleased journal rewrites with one anchored canonical upgrade; preserve non-null partial/native evidence, require explicit journal inventories, refuse invalid schema or lost retention ledgers, and retain exact downgrade backups and every profile durability barrier on retry. Order overlapping lock cohorts by their actual physical lock files and require the original application directory barrier on current-schema retries.
 
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 

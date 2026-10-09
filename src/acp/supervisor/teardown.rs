@@ -951,7 +951,8 @@ mod tests {
                 rows.iter_mut()
                     .find(|row| row.id == "s-unknown")
                     .unwrap()
-                    .runner_journal = Default::default();
+                    .runner_journal =
+                    crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
                 Ok(())
             })
             .unwrap();

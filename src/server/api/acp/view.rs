@@ -892,7 +892,8 @@ mod tests {
         instance.source_profile = "disable-history".into();
         instance.view = View::Terminal;
         instance.tool = "shell".into();
-        instance.runner_journal = Default::default();
+        instance.runner_journal =
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
         let id = instance.id.clone();
         let storage = crate::session::Storage::new_unwatched("disable-history").unwrap();
         storage

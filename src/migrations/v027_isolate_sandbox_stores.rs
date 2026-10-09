@@ -1466,12 +1466,11 @@ pub(super) fn lock_workspace_namespaces(
         fs::create_dir_all(&*namespace)?;
         *namespace = fs::canonicalize(&*namespace)?;
     }
-    namespaces.sort();
-    namespaces.dedup();
-    namespaces
-        .iter()
-        .map(|namespace| crate::session::acquire_session_workspace_claim_lock_in(namespace))
-        .collect()
+    crate::session::acquire_storage_flock_cohort(
+        namespaces.iter().map(PathBuf::as_path),
+        crate::session::SESSION_WORKSPACE_CLAIM_LOCK_FILENAME,
+        false,
+    )
 }
 
 /// A caller borrowing workspace must never wait for a cohort held by a mover
@@ -1509,11 +1508,11 @@ fn registry_dirs_of(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 pub(super) fn lock_registry_dirs(dirs: &[PathBuf]) -> Result<Vec<crate::session::StorageFlock>> {
-    dirs.iter()
-        .map(|dir| {
-            crate::session::acquire_storage_flock(dir, crate::session::STORAGE_LOCK_FILENAME)
-        })
-        .collect()
+    crate::session::acquire_storage_flock_cohort(
+        dirs.iter().map(PathBuf::as_path),
+        crate::session::STORAGE_LOCK_FILENAME,
+        false,
+    )
 }
 
 /// Every legacy source each sandboxed row reads, by canonical root. The plan
@@ -2443,7 +2442,8 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let mut owner = crate::session::Instance::new("retained", "/original");
-        owner.runner_journal = Default::default();
+        owner.runner_journal =
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
         owner.status = crate::session::Status::Creating;
         owner
             .try_acquire_lifecycle_reservation(
@@ -2860,7 +2860,7 @@ mod tests {
                 .trim(),
             super::super::CURRENT_VERSION.to_string()
         );
-        assert!(!super::super::has_pending_migrations());
+        assert!(!super::super::has_pending_migrations().unwrap());
         assert!(transition_may_be_pending(&app, false).unwrap());
         assert!(home.join(".gemini/sandbox").is_dir());
         assert!(!home.join(".gemini/sandbox-v2").exists());
