@@ -409,6 +409,7 @@ pub(super) async fn run_execution_fixture_child() -> bool {
     let Ok(encoded) = std::env::var("AOE_TEST_NATIVE_ISSUER") else {
         return false;
     };
+    let natal = crate::session::runner_journal::RunnerNatalGuard::from_inherited_channel().unwrap();
     let (profile, id, nonce, generation, release, ready, hold_stop): (
         String,
         String,
@@ -418,9 +419,10 @@ pub(super) async fn run_execution_fixture_child() -> bool {
         PathBuf,
         bool,
     ) = serde_json::from_str(&encoded).unwrap();
-    let mut bootstrap =
-        crate::session::runner_journal::LaunchBootstrap::receive(&profile, &id, nonce, generation)
-            .unwrap();
+    let mut bootstrap = crate::session::runner_journal::LaunchBootstrap::receive(
+        &profile, &id, nonce, generation, natal,
+    )
+    .unwrap();
     let born = bootstrap.identity();
     let stop_path = crate::session::runner_journal::stop_socket(&id, born.pid).unwrap();
     let stop_endpoint = worker_registry::BoundEndpoint::bind(&id, &stop_path).unwrap();
@@ -456,105 +458,118 @@ pub(super) async fn run_execution_fixture_child() -> bool {
     }
     true
 }
-pub(crate) fn published_execution(
+pub(crate) async fn published_execution(
     id: &str,
     profile: &str,
     admission: Option<&ExecutionAdmission>,
     hold_stop: bool,
 ) -> PublishedExecution {
-    let storage = crate::session::Storage::new_unwatched(profile).unwrap();
-    storage
-        .update(|rows, _| {
-            if !rows.iter().any(|row| row.id == id) {
-                let mut row = crate::session::Instance::new(id, "/tmp");
-                row.id = id.to_owned();
-                row.source_profile = profile.to_owned();
-                row.view = crate::session::View::Structured;
-                rows.push(row);
-            }
-            Ok(())
-        })
-        .unwrap();
-    let standalone = if admission.is_none() {
-        let original = crate::session::runner_journal::capture_unique_origin(id).unwrap();
-        let table = std::sync::Mutex::new(crate::acp::runner_lifecycle::LifecycleTable::new(1));
-        let lease = table.lock().unwrap().admit(id, ResumeKind::Spawn).unwrap();
-        let issued = table.lock().unwrap().execution_admission(&lease);
-        issued.set_origin(original.clone()).unwrap();
-        let (prepared, custody) = original
-            .prepare(
-                &crate::acp::runner_lifecycle::NativeResume::Spawn,
-                &issued,
-                |commit| {
-                    crate::acp::runner_lifecycle::PreparationAuthorization::acquire(
-                        table.lock().unwrap(),
-                        &lease,
-                        &original,
-                        false,
-                        commit,
-                    )
-                },
-            )
+    let runtime = tokio::runtime::Handle::current();
+    let id = id.to_owned();
+    let profile = profile.to_owned();
+    let admission = admission.cloned();
+    let queued_custody = admission.as_ref().map(ExecutionAdmission::begin_job);
+    tokio::task::spawn_blocking(move || {
+        let id = id.as_str();
+        let profile = profile.as_str();
+        let admission = admission.as_ref();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                if !rows.iter().any(|row| row.id == id) {
+                    let mut row = crate::session::Instance::new(id, "/tmp");
+                    row.id = id.to_owned();
+                    row.source_profile = profile.to_owned();
+                    row.view = crate::session::View::Structured;
+                    rows.push(row);
+                }
+                Ok(())
+            })
             .unwrap();
-        issued.set_prepared_origin(prepared, custody).unwrap();
-        Some(issued)
-    } else {
-        None
-    };
-    let admission = admission.or(standalone.as_ref()).unwrap();
-    let _custody = admission.begin_job();
-    let generation = admission.origin().unwrap().generation();
-    let directory = tempfile::TempDir::new().unwrap();
-    let release = directory.path().join("stop");
-    let ready = directory.path().join("ready");
+        let standalone = if admission.is_none() {
+            let original = crate::session::runner_journal::capture_unique_origin(id).unwrap();
+            let table = std::sync::Mutex::new(crate::acp::runner_lifecycle::LifecycleTable::new(1));
+            let lease = table.lock().unwrap().admit(id, ResumeKind::Spawn).unwrap();
+            let issued = table.lock().unwrap().execution_admission(&lease);
+            issued.set_origin(original.clone()).unwrap();
+            let (prepared, custody) = original
+                .prepare(
+                    &crate::acp::runner_lifecycle::NativeResume::Spawn,
+                    &issued,
+                    |commit| {
+                        crate::acp::runner_lifecycle::PreparationAuthorization::acquire(
+                            table.lock().unwrap(),
+                            &lease,
+                            &original,
+                            false,
+                            commit,
+                        )
+                    },
+                )
+                .unwrap();
+            issued.set_prepared_origin(prepared, custody).unwrap();
+            Some(issued)
+        } else {
+            None
+        };
+        let admission = admission.or(standalone.as_ref()).unwrap();
+        let _custody = queued_custody.unwrap_or_else(|| admission.begin_job());
+        let generation = admission.origin().unwrap().generation();
+        let directory = tempfile::TempDir::new().unwrap();
+        let release = directory.path().join("stop");
+        let ready = directory.path().join("ready");
 
-    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-    command.args(["--exact", "acp::supervisor::drain::tests::drain_retires_attached_crash_without_trusting_registry_presence", "--nocapture"]);
-    unsafe {
-        command.pre_exec(|| {
-            nix::unistd::setsid().map_err(std::io::Error::other)?;
-            Ok(())
-        });
-    }
-    let launch = crate::session::runner_journal::ManagedLaunch::new(
-        crate::session::deletion::SessionPathOwner {
-            profile,
-            session_id: id,
-        },
-        generation,
-    )
-    .unwrap();
-    let nonce = launch.nonce();
-    command.env(
-        "AOE_TEST_NATIVE_ISSUER",
-        serde_json::to_string(&(profile, id, nonce, generation, &release, &ready, hold_stop))
-            .unwrap(),
-    );
-    let mut born = None;
-    let pid = launch
-        .spawn(&storage, &mut command, Some(admission), |identity| {
-            born = Some(identity);
-        })
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "acp::supervisor::drain::tests::drain_retires_attached_crash_without_trusting_registry_presence", "--nocapture"]);
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+        let launch = crate::session::runner_journal::ManagedLaunch::new(
+            crate::session::deletion::SessionPathOwner {
+                profile,
+                session_id: id,
+            },
+            generation,
+        )
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() {
-        assert!(
-            crate::process::worker::is_process_group_alive(pid),
-            "actual fixture child exited before native publication"
+        let nonce = launch.nonce();
+        command.env(
+            "AOE_TEST_NATIVE_ISSUER",
+            serde_json::to_string(&(profile, id, nonce, generation, &release, &ready, hold_stop))
+                .unwrap(),
         );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "actual fixture child did not publish endpoints before deadline"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    PublishedExecution {
-        pid,
-        identity: born.expect("real fixture launch captures its authenticated kernel birth"),
-        requested: release.with_file_name("requested"),
-        release,
-        _directory: directory,
-    }
+        let mut born = None;
+        let _entered = runtime.enter();
+        let pid = launch
+            .spawn(&storage, &mut command, Some(admission), |identity| {
+                born = Some(identity);
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                crate::process::worker::is_process_group_alive(pid),
+                "actual fixture child exited before native publication"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual fixture child did not publish endpoints before deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        PublishedExecution {
+            pid,
+            identity: born.expect("real fixture launch captures its authenticated kernel birth"),
+            requested: release.with_file_name("requested"),
+            release,
+            _directory: directory,
+        }
+    })
+    .await
+    .expect("original published-execution launch task")
 }
 
 /// Holds a gated launch until the test opens it.
@@ -586,7 +601,8 @@ pub(super) fn gated_launcher(gate: &Gate) -> Launcher {
                 profile,
                 config.execution_admission.as_ref(),
                 false,
-            );
+            )
+            .await;
             let identity = execution.identity;
             executions.lock().unwrap().push(execution);
             entered.notify_one();

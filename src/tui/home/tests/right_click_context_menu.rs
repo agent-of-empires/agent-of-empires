@@ -244,17 +244,17 @@ fn right_click_fork_requires_provenance_not_a_tool_label() {
         .iter()
         .any(|(action, _)| *action == ContextMenuAction::Fork));
     env.view.context_menu = None;
-    {
-        let submitted = env.view.apply_user_action(&id, |instance| {
+    Storage::open_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            let instance = rows.iter_mut().find(|row| row.id == id).unwrap();
             instance.agent_session_binding = binding;
             instance.tool = "status-alias".into();
-        });
-        await_transaction_result(
-            &mut env.view,
-            submitted.map(|_| super::super::TransactionDisposition::Queued),
-        )
-    }
-    .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    env.view.request_reload(super::super::ReloadKind::Full);
+    drain_persistence(&mut env.view).unwrap();
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
         .view

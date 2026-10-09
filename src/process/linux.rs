@@ -21,6 +21,44 @@ pub(super) unsafe fn receive_bootstrap_rights(
     }
 }
 
+#[cfg(all(test, debug_assertions))]
+pub(super) struct OriginalRootDeathObservation(std::os::fd::OwnedFd);
+
+#[cfg(all(test, debug_assertions))]
+impl OriginalRootDeathObservation {
+    pub(super) fn bind(birth: super::ProcessIncarnation) -> anyhow::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, birth.pid, 0) as i32 };
+        anyhow::ensure!(
+            fd >= 0,
+            "cannot bind original pidfd: {}",
+            std::io::Error::last_os_error()
+        );
+        // pidfd_open returned one newly owned descriptor.
+        Ok(Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    pub(super) fn exited(&self) -> anyhow::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut event = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut event, 1, 0) };
+        anyhow::ensure!(
+            result >= 0,
+            "original pidfd poll failed: {}",
+            std::io::Error::last_os_error()
+        );
+        anyhow::ensure!(
+            event.revents & (libc::POLLERR | libc::POLLNVAL) == 0,
+            "original pidfd observation failed"
+        );
+        Ok(result == 1 && event.revents & libc::POLLIN != 0)
+    }
+}
+
 pub(super) fn peer_pid_from_connected_socket(stream: &impl std::os::fd::AsFd) -> Option<u32> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     let pid = getsockopt(stream, PeerCredentials).ok()?.pid();
@@ -34,7 +72,9 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 // Owned Create uses a genuinely held bootstrap and follows all native descendants.
 pub(super) struct OwnedCreateRoot {
     pid: u32,
-    handles: std::collections::BTreeMap<u32, Option<std::os::fd::OwnedFd>>,
+    birth: super::ProcessIncarnation,
+    diagnostics: bool,
+    handles: std::collections::BTreeMap<u32, CreateTraceActor>,
 }
 impl OwnedCreateRoot {
     pub(super) fn prepare(birth: super::ProcessIncarnation) -> anyhow::Result<Self> {
@@ -50,7 +90,18 @@ impl OwnedCreateRoot {
         );
         Ok(Self {
             pid,
-            handles: std::collections::BTreeMap::from([(pid, create_pidfd(pid)?)]),
+            birth,
+            diagnostics: std::env::var_os("AOE_CREATE_SYSCALL_DIAGNOSTICS").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
+            handles: std::collections::BTreeMap::from([(
+                pid,
+                CreateTraceActor {
+                    trace_pid: pid,
+                    fd: create_pidfd(pid)?,
+                    birth: Some(birth),
+                    pending: None,
+                },
+            )]),
         })
     }
     pub(super) fn release(&mut self) -> anyhow::Result<()> {
@@ -69,13 +120,19 @@ impl OwnedCreateRoot {
         anyhow::ensure!(child.id() == self.pid, "original Create root was replaced");
         let mut live = BTreeSet::from([self.pid]);
         let handles = &mut self.handles;
+        let mut diagnostics = CreateTraceDiagnostics {
+            root: self.birth,
+            enabled: self.diagnostics,
+            remaining: 64,
+            truncated: false,
+        };
         let mut observed = Vec::new();
         let mut root_status = None;
         let mut external = false;
         let mut scope_unproven = false;
         while !live.is_empty() {
             if cancel.is_cancelled() {
-                for fd in handles.values().flatten() {
+                for fd in handles.values().filter_map(|actor| actor.fd.as_ref()) {
                     let result = unsafe {
                         libc::syscall(
                             libc::SYS_pidfd_send_signal,
@@ -107,6 +164,9 @@ impl OwnedCreateRoot {
                 }
                 made_progress = true;
                 if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                    if let Some(actor) = handles.get_mut(&pid) {
+                        actor.missing_exit(&diagnostics, "actor_retired");
+                    }
                     live.remove(&pid);
                     if pid != self.pid {
                         handles.remove(&pid);
@@ -134,7 +194,15 @@ impl OwnedCreateRoot {
                     let birth = super::process_incarnation(born)?
                         .context("held descendant lacks actual kernel birth")?;
                     live.insert(born);
-                    handles.insert(born, create_pidfd(born)?);
+                    handles.insert(
+                        born,
+                        CreateTraceActor {
+                            trace_pid: born,
+                            fd: create_pidfd(born)?,
+                            birth: Some(birth),
+                            pending: None,
+                        },
+                    );
                     admit(super::CreateObservation::Birth(birth))?;
                 } else if event == libc::PTRACE_EVENT_EXEC {
                     let mut former: libc::c_ulong = 0;
@@ -146,6 +214,13 @@ impl OwnedCreateRoot {
                     )?;
                     if former != 0 && former != pid as libc::c_ulong {
                         // Thread-group exec changes PID projection; never promote a fresh alias.
+                        if let Some(actor) = handles.get_mut(&(former as u32)) {
+                            actor.missing_exit(&diagnostics, "exec_pid_projection_changed");
+                        }
+                        if let Some(actor) = handles.get_mut(&pid) {
+                            actor.missing_exit(&diagnostics, "exec_pid_projection_changed");
+                            actor.birth = None;
+                        }
                         live.remove(&(former as u32));
                         handles.remove(&(former as u32));
                         if !scope_unproven {
@@ -154,7 +229,10 @@ impl OwnedCreateRoot {
                         }
                     }
                 } else if signal == (libc::SIGTRAP | 0x80) {
-                    let audit = create_audit_syscall(pid)?;
+                    let actor = handles
+                        .get_mut(&pid)
+                        .context("held syscall actor lacks original trace state")?;
+                    let audit = create_audit_syscall(pid, actor, &mut diagnostics)?;
                     if audit.external && !external {
                         admit(super::CreateObservation::ExternalDomain)?;
                         external = true;
@@ -264,22 +342,109 @@ fn create_pidfd(pid: u32) -> anyhow::Result<Option<std::os::fd::OwnedFd>> {
     }
     Err(error.into())
 }
+// Evidence only: no diagnostic event grants retirement or clears a refusal.
+struct CreateTraceActor {
+    trace_pid: u32,
+    fd: Option<std::os::fd::OwnedFd>,
+    birth: Option<super::ProcessIncarnation>,
+    pending: Option<(u8, i64)>,
+}
+struct CreateTraceDiagnostics {
+    root: super::ProcessIncarnation,
+    enabled: bool,
+    remaining: u8,
+    truncated: bool,
+}
+fn create_trace_diagnostic(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    // A broken diagnostic sink must not change native admission or retirement.
+    let _ = writeln!(std::io::stderr().lock(), "owned-create-syscall {message}");
+}
+impl CreateTraceActor {
+    fn missing_exit(&mut self, diagnostics: &CreateTraceDiagnostics, reason: &str) {
+        if let Some((sequence, nr)) = self.pending.take() {
+            create_trace_diagnostic(format_args!(
+                "root={:?} actor={:?} actor_pid={} sequence={sequence} nr={nr} phase=missing_exit reason={reason}",
+                diagnostics.root, self.birth, self.trace_pid,
+            ));
+        }
+    }
+}
+impl CreateTraceDiagnostics {
+    #[cfg(target_arch = "x86_64")]
+    fn entry(
+        &mut self,
+        actor: &mut CreateTraceActor,
+        nr: i64,
+        argument: impl Fn(usize) -> u64,
+        audit: &CreateSyscallAudit,
+    ) {
+        if !self.enabled || !(audit.external || audit.unproven) {
+            return;
+        }
+        if self.remaining == 0 {
+            if !self.truncated {
+                create_trace_diagnostic(format_args!(
+                    "root={:?} phase=truncated pair_limit=64 coverage=not_complete",
+                    self.root,
+                ));
+                self.truncated = true;
+            }
+            return;
+        }
+        let sequence = 65 - self.remaining;
+        self.remaining -= 1;
+        actor.pending = Some((sequence, nr));
+        // Scalars only: never dereference mutable tracee payloads or print secrets/pointers.
+        let socket = (nr == libc::SYS_socket).then(|| [argument(0), argument(1), argument(2)]);
+        let descriptor = [
+            libc::SYS_connect,
+            libc::SYS_sendmsg,
+            libc::SYS_sendto,
+            libc::SYS_ioctl,
+            libc::SYS_pidfd_getfd,
+        ]
+        .contains(&nr)
+        .then(|| argument(0));
+        let request = (nr == libc::SYS_ioctl).then(|| argument(1));
+        create_trace_diagnostic(format_args!(
+            "root={:?} actor={:?} actor_pid={} sequence={sequence} nr={nr} phase=held_entry external={} unproven={} socket={socket:?} descriptor={descriptor:?} ioctl_request={request:?}",
+            self.root, actor.birth, actor.trace_pid, audit.external, audit.unproven,
+        ));
+    }
+}
 struct CreateSyscallAudit {
     external: bool,
     unproven: bool,
 }
 #[cfg(target_arch = "x86_64")]
-fn create_audit_syscall(pid: u32) -> anyhow::Result<CreateSyscallAudit> {
+fn create_audit_syscall(
+    pid: u32,
+    actor: &mut CreateTraceActor,
+    diagnostics: &mut CreateTraceDiagnostics,
+) -> anyhow::Result<CreateSyscallAudit> {
     let mut info = [0u8; 128];
     let length = create_ptrace(0x420e, pid, info.len(), info.as_mut_ptr() as usize)? as usize;
     anyhow::ensure!(length >= 8, "native syscall ABI observation was incomplete");
+    let arch = u32::from_ne_bytes(info[4..8].try_into().unwrap());
+    if info[0] == 2 && arch == 0xc000003e && length >= 33 && info[32] <= 1 {
+        if let Some((sequence, nr)) = actor.pending.take() {
+            let result = i64::from_ne_bytes(info[24..32].try_into().unwrap());
+            let is_error = info[32] != 0;
+            create_trace_diagnostic(format_args!(
+                "root={:?} actor={:?} actor_pid={} sequence={sequence} nr={nr} phase=held_exit result={result} kernel_is_error={is_error}",
+                diagnostics.root, actor.birth, actor.trace_pid,
+            ));
+        }
+    } else {
+        actor.missing_exit(diagnostics, "next_entry_or_unpaired_abi_phase");
+    }
     if info[0] != 1 {
         return Ok(CreateSyscallAudit {
             external: false,
             unproven: false,
         });
     }
-    let arch = u32::from_ne_bytes(info[4..8].try_into().unwrap());
     if arch != 0xc000003e || length < 80 {
         return Ok(CreateSyscallAudit {
             external: false,
@@ -319,14 +484,20 @@ fn create_audit_syscall(pid: u32) -> anyhow::Result<CreateSyscallAudit> {
         || (nr == libc::SYS_ioctl
             && ![libc::TCGETS, libc::TIOCGWINSZ, libc::FIONREAD].contains(&argument(1)));
     // clone3's shared userspace arguments can change after a peek; no fake complete coverage.
-    Ok(CreateSyscallAudit {
+    let audit = CreateSyscallAudit {
         external,
         unproven: nr == libc::SYS_clone3
             || (nr == libc::SYS_clone && argument(0) & libc::CLONE_UNTRACED as u64 != 0),
-    })
+    };
+    diagnostics.entry(actor, nr, argument, &audit);
+    Ok(audit)
 }
 #[cfg(not(target_arch = "x86_64"))]
-fn create_audit_syscall(_: u32) -> anyhow::Result<CreateSyscallAudit> {
+fn create_audit_syscall(
+    _: u32,
+    _: &mut CreateTraceActor,
+    _: &mut CreateTraceDiagnostics,
+) -> anyhow::Result<CreateSyscallAudit> {
     Ok(CreateSyscallAudit {
         external: false,
         unproven: true,

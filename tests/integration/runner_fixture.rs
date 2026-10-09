@@ -11,19 +11,19 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub(super) struct RunnerLaunchFixture {
+pub(crate) struct RunnerLaunchFixture {
     storage: Storage,
     admission: ExecutionAdmission,
     job: RefCell<Option<ExecutionJob>>,
     launch: RefCell<Option<ManagedLaunch>>,
     retired: tokio::sync::watch::Receiver<Option<bool>>,
     generation: u64,
-    pub(super) nonce: uuid::Uuid,
+    pub(crate) nonce: uuid::Uuid,
     _env: EnvGuard,
 }
 
 impl RunnerLaunchFixture {
-    pub(super) fn new(home: &Path, xdg: &Path, profile: &str, id: &str) -> Self {
+    pub(crate) fn new(home: &Path, xdg: &Path, profile: &str, id: &str) -> Self {
         assert!(
             std::env::var_os("AOE_ISOLATED_RUNNER_TEST").is_some(),
             "native fixture needs an isolated scenario process"
@@ -95,11 +95,11 @@ impl RunnerLaunchFixture {
         }
     }
 
-    pub(super) fn original_storage(&self) -> &Storage {
+    pub(crate) fn original_storage(&self) -> &Storage {
         &self.storage
     }
 
-    pub(super) fn command(&self) -> Command {
+    pub(crate) fn command(&self) -> Command {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new(super::aoe_binary());
         command.arg("__acp-runner").process_group(0);
@@ -112,7 +112,7 @@ impl RunnerLaunchFixture {
         command
     }
 
-    pub(super) fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
+    pub(crate) fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
         let launch = self
             .launch
             .borrow_mut()
@@ -136,6 +136,12 @@ impl RunnerLaunchFixture {
             ));
         }
         Ok(child)
+    }
+
+    pub(crate) fn produced_origin(
+        &self,
+    ) -> std::sync::Arc<crate::session::runner_journal::LaunchOrigin> {
+        self.admission.origin().expect("original producer output")
     }
 }
 

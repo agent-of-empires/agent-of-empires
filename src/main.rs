@@ -4,7 +4,7 @@ use agent_of_empires::cli::{self, Cli, Commands};
 use agent_of_empires::logging::{self, LogConfig, ProcessContext, SubscriberTarget};
 use agent_of_empires::migrations;
 use agent_of_empires::tui;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use clap_complete::generate;
 
@@ -41,16 +41,47 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
     })
 }
 
+// Skip global option values before any runtime or CLI initialization.
+fn managed_runner_requested(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        let bytes = argument.as_bytes();
+        if matches!(bytes, b"-p" | b"--profile" | b"--daemon-url") {
+            if args.next().is_none() {
+                return false;
+            }
+        } else if bytes.starts_with(b"--profile=")
+            || bytes.starts_with(b"--daemon-url=")
+            || (bytes.starts_with(b"-p") && bytes.len() > 2)
+        {
+            continue;
+        } else {
+            return bytes == b"__acp-runner";
+        }
+    }
+    false
+}
+
 fn main() -> Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__owned-create-native"))
     {
         return agent_of_empires::session::builder::run_owned_create_bootstrap();
     }
-    application_main()
+    // Start before Tokio, clap, global logging, and migrations: fd0 may already
+    // hold queued SCM_RIGHTS references to the issuer's locked OFDs.
+    let natal = if managed_runner_requested(std::env::args_os().skip(1)) {
+        Some(agent_of_empires::process::runner::RunnerNatalGuard::from_inherited_channel()?)
+    } else {
+        None
+    };
+    application_main(natal)
 }
 
 #[tokio::main]
-async fn application_main() -> Result<()> {
+async fn application_main(
+    natal: Option<agent_of_empires::process::runner::RunnerNatalGuard>,
+) -> Result<()> {
     // Hidden helper for the VT live preview, handled before clap so it stays off the CLI surface.
     {
         let mut a = std::env::args();
@@ -137,6 +168,10 @@ async fn application_main() -> Result<()> {
         ProcessContext::Tui | ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild
     ) || env_filter.is_some();
 
+    #[cfg(debug_assertions)]
+    if let Some(natal) = natal.as_ref() {
+        natal.hold_for_hosted_proof("main-logging")?;
+    }
     let (init, log_path_for_msg) = if should_init {
         let filter = env_filter
             .clone()
@@ -227,6 +262,7 @@ async fn application_main() -> Result<()> {
         should_init,
         debug_namespace_drift,
         debug_log_warning,
+        natal,
     )
     .await
     {
@@ -246,6 +282,7 @@ async fn run(
     should_init: bool,
     debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
     debug_log_warning: Option<String>,
+    natal: Option<agent_of_empires::process::runner::RunnerNatalGuard>,
 ) -> Result<()> {
     if cli.command.is_some() {
         if let Some((release, dev)) = debug_namespace_drift.as_ref() {
@@ -317,6 +354,10 @@ async fn run(
             .and_then(cli::command_name)
             .is_some()
             .then(cli::migrate::stderr_reporter);
+        #[cfg(debug_assertions)]
+        if let Some(natal) = natal.as_ref() {
+            natal.hold_for_hosted_proof("transition")?;
+        }
         migrations::run_migrations_with(reporter)?;
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
@@ -365,7 +406,13 @@ async fn run(
         // config.toml without copying it, dropping every other key.
         Some(Commands::Hooks { command }) => cli::hooks::run(&profile, command),
         Some(Commands::Acp { command }) => cli::acp::run(command).await,
-        Some(Commands::AcpRunner(args)) => agent_of_empires::process::runner::run(*args).await,
+        Some(Commands::AcpRunner(args)) => {
+            agent_of_empires::process::runner::run(
+                *args,
+                natal.context("managed runner has no early inherited watchdog")?,
+            )
+            .await
+        }
         None => {
             let drift_msg = debug_namespace_drift.as_ref().map(|(release, dev)| {
                 agent_of_empires::session::format_debug_namespace_warning(release, dev)
@@ -382,4 +429,37 @@ async fn run(
     };
 
     result
+}
+
+#[cfg(test)]
+mod natal_entry_tests {
+    use super::managed_runner_requested;
+
+    #[test]
+    fn command_scan_skips_global_option_values_without_late_parsing() {
+        for (args, expected) in [
+            (vec!["__acp-runner"], true),
+            (vec!["--profile", "default", "__acp-runner"], true),
+            (vec!["-pdefault", "__acp-runner"], true),
+            (
+                vec![
+                    "--profile=default",
+                    "--daemon-url=http://host",
+                    "__acp-runner",
+                ],
+                true,
+            ),
+            (vec!["--profile", "__acp-runner", "list"], false),
+            (vec!["--daemon-url", "__acp-runner", "list"], false),
+            (vec!["--profile=__acp-runner", "list"], false),
+            (vec!["list", "__acp-runner"], false),
+            (vec!["--", "__acp-runner"], false),
+            (vec!["--profile"], false),
+        ] {
+            assert_eq!(
+                managed_runner_requested(args.into_iter().map(std::ffi::OsString::from)),
+                expected
+            );
+        }
+    }
 }

@@ -51,6 +51,7 @@ struct TransactionRowGuard {
     storage: std::sync::Arc<Storage>,
     generation: u64,
     revision: u64,
+    settled_stop: Option<std::sync::Arc<crate::session::runner_journal::OwnedStop>>,
 }
 pub(super) struct TransactionEnvelope {
     request: Box<persistence_transactions::TransactionRequest>,
@@ -376,6 +377,13 @@ impl HomeView {
             }
             Ok(())
         })?;
+        let archive_stop = match &request {
+            persistence_transactions::TransactionRequest::Archive {
+                settled: Some(settled),
+                ..
+            } => Some(&settled.custody.stop),
+            _ => None,
+        };
         let mut rows = Vec::new();
         request.try_for_each_captured_row(|row| {
             rows.push(TransactionRowGuard {
@@ -383,6 +391,7 @@ impl HomeView {
                 created_at: row.before.created_at,
                 storage: row.origin.storage.clone(),
                 generation: row.origin.generation,
+                settled_stop: archive_stop.cloned(),
                 revision: self
                     .persistence
                     .row_edits
@@ -470,7 +479,12 @@ impl HomeView {
         rows.iter().all(|guard| {
             self.instances.get(&guard.id).is_some_and(|current| {
                 current.created_at == guard.created_at
-                    && current.lifecycle_generation == guard.generation
+                    && (current.lifecycle_generation == guard.generation
+                        || guard.settled_stop.as_ref().is_some_and(|stop| {
+                            // Only this original Stop may advance the final Archive guard.
+                            stop.acknowledges_original_epoch(current, guard.generation)
+                                && stop.storage().same_origin_as(&guard.storage)
+                        }))
                     && current
                         .storage_origin
                         .as_ref()
@@ -752,7 +766,33 @@ impl HomeView {
                                 }
                                 self.clear_profile_projection_state();
                             }
-                            if let Some(snapshot) = done.snapshot {
+                            if let Some(mut snapshot) = done.snapshot {
+                                if let persistence_transactions::TransactionEffect::Edited {
+                                    rows,
+                                    ..
+                                } = &done.effect
+                                {
+                                    // Carry runtime only across this guarded, committed Move ACK.
+                                    for profile in &mut snapshot.profiles {
+                                        for row in &mut profile.rows {
+                                            if rows.iter().any(|ack| {
+                                                ack.id == row.id
+                                                    && ack.created_at == row.created_at
+                                                    && ack.lifecycle_generation
+                                                        == row.lifecycle_generation
+                                                    && ack.storage_origin.as_ref().is_some_and(
+                                                        |origin| {
+                                                            profile.storage.same_origin_as(origin)
+                                                        },
+                                                    )
+                                            }) {
+                                                if let Some(source) = self.instances.get(&row.id) {
+                                                    row.merge_runtime_for_profile_move(source);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 self.apply_reload_snapshot(snapshot, &active.revisions);
                             }
                             self.apply_transaction_effect(done.effect);

@@ -1122,8 +1122,14 @@ impl CreationUndo {
         plan.admin_uncertainty =
             Some("original Git bootstrap has not acknowledged all layout file effects".into());
         let admin = plan.admin.as_mut().unwrap();
-        let admin_path = admin.pin.directory.path();
-        let relative = crate::git::GitWorktree::diff_paths(admin_path, path)
+        let admin_path = admin.pin.directory.path().canonicalize()?;
+        let root_path = root.directory.path().canonicalize()?;
+        anyhow::ensure!(
+            DirectoryIdentity::from_metadata(&std::fs::metadata(&admin_path)?) == admin.pin.birth
+                && DirectoryIdentity::from_metadata(&std::fs::metadata(&root_path)?) == root.birth,
+            "Git layout pathname projection changed its original role birth"
+        );
+        let relative = crate::git::GitWorktree::diff_paths(&admin_path, &root_path)
             .context("Git layout roots have no relative path")?;
         use std::os::unix::ffi::OsStrExt;
         let mut pointer = b"gitdir: ".to_vec();
@@ -1136,7 +1142,7 @@ impl CreationUndo {
             format!("ref: refs/heads/{branch}\n").as_bytes(),
         )?;
         Self::allocate_git_file(&admin.pin.directory, Path::new("commondir"), b"../..\n")?;
-        let mut backlink = path.join(".git").as_os_str().as_bytes().to_vec();
+        let mut backlink = root_path.join(".git").as_os_str().as_bytes().to_vec();
         backlink.push(b'\n');
         Self::allocate_git_file(&admin.pin.directory, Path::new("gitdir"), &backlink)?;
         Self::allocate_git_file(

@@ -195,30 +195,13 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     }
 }
 
-/// An archived row has no pane (#1868) and the poller never revisits it
-/// (#2206), so a persisted `waiting` used to stand forever and `aoe ps` kept
-/// listing a pending-permission row nothing could clear. Both layers settle it:
-/// the archived poll guard on read, and migration v028 once for older installs.
-/// A resting `error` row is the control neither layer may touch.
+/// Legacy archived rows migrate before current-schema reads. The persisted-session
+/// listing, unlike the worker/process listing, includes rows with no native pane.
 #[test]
-#[parallel]
+#[serial_test::serial]
 fn test_archived_waiting_row_reads_idle_and_migrates_once() {
-    require_tmux!();
     let h = TuiTestHarness::new("archive_waiting_zombie");
     let version_path = app_dir_in(h.home_path()).join(".schema_version");
-
-    // First boot stamps the build's schema version, so the read below
-    // exercises the in-process guard alone rather than the migration.
-    h.run_cli_ok(&["ps", "--json"]);
-    let stamped: u32 = std::fs::read_to_string(&version_path)
-        .expect("first boot stamps .schema_version")
-        .trim()
-        .parse()
-        .expect("schema version is a number");
-    assert!(stamped >= 28, "build must carry v028, stamped {stamped}");
-
-    // `aoe ps` joins rows to instances by the 8-char id suffix of the tmux
-    // name, so the ids must be underscore-free like real session ids.
     let project = h.project_path();
     let project = project.to_str().unwrap();
     let row = |id: &str, title: &str, status: &str| {
@@ -231,58 +214,63 @@ fn test_archived_waiting_row_reads_idle_and_migrates_once() {
         row("frozen0waiting01", "Frozen", "waiting"),
         row("resting0error001", "Resting", "error")
     );
-    std::fs::write(h.sessions_path(), &frozen).expect("write sessions.json");
-
-    // No pane exists for either row: the guard settles the frozen Waiting on
-    // read and leaves the resting Error alone.
-    let rows: Value = serde_json::from_str(&h.run_cli_ok(&["ps", "--json", "--dead"]))
-        .expect("aoe ps emits JSON");
-    let state_of = |id: &str| {
-        rows.as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["session"] == id)
-            .unwrap_or_else(|| panic!("{id} missing from aoe ps --json: {rows}"))["state"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    assert_eq!(
-        state_of("frozen0waiting01"),
-        "idle",
-        "an archived row must never read as a pending-permission row"
-    );
-    assert_eq!(state_of("resting0error001"), "dead");
-
-    // An install predating v028 boots on the same stored rows.
-    std::fs::write(h.sessions_path(), &frozen).expect("rewrite sessions.json");
-    std::fs::write(&version_path, "27").expect("rewind .schema_version");
-    h.run_cli_ok(&["ps", "--json"]);
-
-    let stored = h.read_sessions();
-    let stored_row = |id: &str| {
-        stored
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["id"] == id)
-            .unwrap_or_else(|| panic!("{id} missing from sessions.json: {stored}"))
-            .clone()
-    };
-    let healed = stored_row("frozen0waiting01");
-    assert_eq!(healed["status"], "idle", "v028 settles the stored row");
-    assert_eq!(
-        healed["archived_at"], "2026-07-13T22:17:21Z",
-        "the archive itself survives the settle"
-    );
-    assert_eq!(stored_row("resting0error001")["status"], "error");
-    let after: u32 = std::fs::read_to_string(&version_path)
-        .unwrap()
-        .trim()
-        .parse()
+    std::fs::write(h.sessions_path(), &frozen).expect("seed legacy sessions");
+    std::fs::write(&version_path, "27").expect("seed actual pre-v028 schema");
+    let listed: Value = serde_json::from_str(&h.run_cli_ok(&["list", "--json"]))
+        .expect("persisted session listing");
+    for id in ["frozen0waiting01", "resting0error001"] {
+        assert!(listed.as_array().unwrap().iter().any(|row| row["id"] == id));
+    }
+    let mut stored = h.read_sessions();
+    let rows = stored.as_array_mut().unwrap();
+    let healed = rows
+        .iter_mut()
+        .find(|row| row["id"] == "frozen0waiting01")
         .unwrap();
+    assert_eq!(healed["status"], "idle");
+    assert_eq!(healed["archived_at"], "2026-07-13T22:17:21Z");
+    // The schema migration, not a fixture-created birth or None journal, supplies
+    // the legacy journal. Only the transient status is edited for the read guard.
+    assert_eq!(healed["runner_journal"]["coverage"], "unknown");
+    healed["status"] = serde_json::json!("waiting");
     assert_eq!(
-        after, stamped,
-        "the rewound install converges on the build's version"
+        rows.iter()
+            .find(|row| row["id"] == "resting0error001")
+            .unwrap()["status"],
+        "error"
+    );
+    std::fs::write(h.sessions_path(), serde_json::to_vec(&stored).unwrap()).unwrap();
+    let stamped = std::fs::read_to_string(&version_path).unwrap();
+    assert_eq!(
+        stamped.trim().parse::<u32>().unwrap(),
+        agent_of_empires::migrations::current_schema_version()
+    );
+    {
+        let _home = crate::harness::HomeGuard::new(h.home_path());
+        let rows = agent_of_empires::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "frozen0waiting01")
+                .unwrap()
+                .status,
+            agent_of_empires::session::Status::Idle
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "resting0error001")
+                .unwrap()
+                .status,
+            agent_of_empires::session::Status::Error
+        );
+    }
+    h.run_cli_ok(&["list", "--json"]);
+    assert_eq!(std::fs::read_to_string(&version_path).unwrap(), stamped);
+    assert_eq!(
+        h.read_sessions(),
+        stored,
+        "read guard must not rerun the migration"
     );
 }

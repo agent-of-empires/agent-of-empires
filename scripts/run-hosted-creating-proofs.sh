@@ -16,6 +16,7 @@ esac
 
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export AOE_CREATE_SYSCALL_DIAGNOSTICS=1
 export HOME="$RUNNER_TEMP/aoe-hosted-creating-home"
 export XDG_CONFIG_HOME="$HOME/.config"
 mkdir -p "$XDG_CONFIG_HOME"
@@ -37,6 +38,8 @@ test_binary="$(printf '%s\n' "$artifacts" | jq -r '
 [[ -n "$test_binary" && "$test_binary" != *$'\n'* ]]
 test -x "$test_binary"
 cases=(
+  session::runner_journal::bootstrap::tests::hosted_managed_launch_parent_loss_before_ack_releases_only_after_original_death
+  tui::home::pollers::hosted_tests::hosted_force_refusal_dialog_keeps_original_purge_pending
   session::runner_journal::native_create::tests::hosted_create_original_native_same_g_and_changed_profile_refusal
   session::runner_journal::native_create::tests::hosted_create_pre_target_cancel_original_retirement_and_same_g_undo
   session::runner_journal::native_create::tests::hosted_create_changed_goal_refuses_target_before_effect

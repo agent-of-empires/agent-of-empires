@@ -4386,6 +4386,111 @@ mod tests {
 
     #[test]
     #[serial]
+    fn execution_store_replacement_and_reset_ack_keep_opaque_evidence() -> Result<()> {
+        use super::super::raw_document::{RawDocument, RawObject};
+        use crate::migrations::v033_isolate_sandbox_content::{
+            acknowledge_context_reset, NativeContextView,
+        };
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("canonical-context-update")?;
+        let mut row = Instance::new("context-update", "/tmp/context-update");
+        row.lifecycle_generation = 7;
+        row.active_execution = Some(super::super::instance::ActiveExecution {
+            launch_id: "original-execution".into(),
+            binding: super::super::ExecutionBinding {
+                agent: "pi".into(),
+                stores: vec!["/tmp/original-store".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp/context-update".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        });
+        let opaque = r#"{"same":1,"same":2,"float":1e400,"escaped":"\u0061"}"#;
+        let reset = format!(
+            r#"{{"slot":"original-slot","transaction":"original-transaction","tool":"{}","agent":"claude","roots":["/tmp/native-root"],"recovery":["/tmp/original-recovery"],"terminal":{{"pending":true,"generation":null}},"structured":{{"pending":true,"generation":7}},"retired_terminal":"terminal-context","retired_structured":["old-acp-context"],"retired_import":true,"extension":{opaque}}}"#,
+            row.tool,
+        );
+        row.sandbox_content_resets
+            .push(serde_json::from_str(&reset)?);
+        let typed_reset = serde_json::to_string(&row.sandbox_content_resets[0])?;
+        let binding = serde_json::to_string(&row.active_execution.as_ref().unwrap().binding)?;
+        let raw_binding = format!("{},\"extension\":{opaque}}}", &binding[..binding.len() - 1]);
+        let original = serde_json::to_string(&row)?
+            .replace(&typed_reset, &reset)
+            .replace(&binding, &raw_binding);
+        fs::write(&storage.sessions_path, format!("[{original}]"))?;
+
+        storage.update_metadata(
+            MetadataSelection::Session(row.id.as_str().into()),
+            |rows, _| {
+                let execution = rows[0].active_execution.as_mut().unwrap();
+                execution.launch_id = "next-execution".into();
+                execution.binding.stores = vec!["/tmp/replacement-store".into()];
+                Ok(())
+            },
+        )?;
+        acknowledge_context_reset(
+            storage.profile(),
+            &row.id,
+            NativeContextView::Structured,
+            7,
+            &["original-slot".into()],
+            Some("fresh-acp-context"),
+        )?;
+        let bytes = fs::read(&storage.sessions_path)?;
+        let document = RawDocument::parse(std::str::from_utf8(&bytes)?)?;
+        let object = RawObject::parse(&document.rows[0])?;
+        let execution = RawObject::parse(object.unique("active_execution")?.unwrap())?;
+        let binding = RawObject::parse(execution.unique("binding")?.unwrap())?;
+        assert_eq!(binding.unique("extension")?.unwrap().get(), opaque);
+        let resets: Vec<&serde_json::value::RawValue> =
+            serde_json::from_str(object.unique("sandbox_content_resets")?.unwrap().get())?;
+        assert_eq!(
+            RawObject::parse(resets[0])?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            opaque
+        );
+        let stored = storage.load()?.remove(0);
+        assert_eq!(stored.acp_session_id.as_deref(), Some("fresh-acp-context"));
+        assert_eq!(
+            stored.active_execution.unwrap().binding.stores,
+            vec![PathBuf::from("/tmp/replacement-store")]
+        );
+        let reset_value = serde_json::to_value(&stored.sandbox_content_resets[0])?;
+        assert_eq!(reset_value["structured"]["pending"], false);
+        assert_eq!(reset_value["terminal"]["pending"], true);
+        assert_eq!(
+            reset_value["recovery"],
+            serde_json::json!(["/tmp/original-recovery"])
+        );
+
+        // A shared immutable tuple must not choose which literal original survives.
+        let duplicate_reset = reset.replace(opaque, r#"{"same":3,"same":4,"float":1e400}"#);
+        let ambiguous = original.replace(&reset, &format!("{reset},{duplicate_reset}"));
+        let ambiguous = format!("[{ambiguous}]");
+        fs::write(&storage.sessions_path, &ambiguous)?;
+        assert!(acknowledge_context_reset(
+            storage.profile(),
+            &row.id,
+            NativeContextView::Structured,
+            7,
+            &["original-slot".into()],
+            Some("must-not-publish"),
+        )
+        .is_err());
+        assert_eq!(fs::read(&storage.sessions_path)?, ambiguous.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
     fn open_unwatched_requires_existing_profile() {
         let temp = tempdir().unwrap();
         let guard = setup_test_home(temp.path());

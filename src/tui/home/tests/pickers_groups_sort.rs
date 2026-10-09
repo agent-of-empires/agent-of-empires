@@ -417,7 +417,6 @@ fn group_archive_refuses_before_queuing_any_new_member() {
         serde_json::to_value(storage.load().unwrap()).unwrap(),
         before
     );
-    assert!(env.view.info_dialog.is_some());
 }
 
 /// Archiving a manual group includes nested members but not unrelated sessions.

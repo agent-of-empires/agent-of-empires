@@ -2774,7 +2774,7 @@ async fn a_trash_stop_does_not_hold_the_identity_lock() {
             Ok(())
         })
         .unwrap();
-    let execution = published_execution(&id, profile, None, true);
+    let execution = published_execution(&id, profile, None, true).await;
     let pid = execution.pid;
     let original = storage
         .load()

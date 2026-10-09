@@ -803,6 +803,7 @@ fn manual_unread_hold_lasts_one_visit() {
         env.view.tick_unread_dwell(t1 + past_dwell),
         "revisiting and dwelling should clear the mark"
     );
+    drain_persistence(&mut env.view).unwrap();
     assert!(!env.view.get_instance(&a).unwrap().is_unread());
 
     // Engaging clears the mark and ends the hold without leaving the row, so a later auto
@@ -824,7 +825,8 @@ fn manual_unread_hold_lasts_one_visit() {
         "engaging with the row must release the manual hold"
     );
     assert!(!env.view.get_instance(&a).unwrap().is_unread());
-    env.view.mutate_instance(&a, |inst| inst.mark_unread());
+    let submitted = env.view.apply_user_action(&a, |inst| inst.mark_unread());
+    await_transaction_result(&mut env.view, submitted).unwrap();
     assert!(env.view.tick_unread_dwell(t1 + past_dwell * 2));
     drain_persistence(&mut env.view).unwrap();
     assert!(!env.view.get_instance(&a).unwrap().is_unread());

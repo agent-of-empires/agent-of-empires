@@ -11,8 +11,9 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **session:** Produce Creating checkout/Git-admin roots and public layout before native effects, bind Git and local hooks to their original physical resources and same Create, and withdraw only after actual native retirement plus exact resource Undo. Preserve original body proofs, unrelated Git configuration, and preexisting/dirty/replaced/unacknowledged resources; unresolved module/container and pathname-only domains stay protected.
 - **tui:** Keep lifecycle and metadata persistence off the input thread, order presentation preferences behind durable saves, and cancel quit on failed persistence.
 - **session:** Add explicit metadata-only abort for unresolved Create/Attach intents and legacy unknown runner history without requiring a reboot, retaining exact owners, native history, IDs, physical profiles and resource exclusions durably across build namespaces.
-- **lifecycle:** Bound natal frames and handshake lifetime, keep descriptor and peer checks in OS modules, drain original registry writers before forced exit, and reject durable release without clearing pending claims or rewriting refused rows.
-- **tui:** Publish acknowledged same-generation metadata without losing runtime state and show failed Force results while the original delete remains pending.
+- **lifecycle:** Arm natal custody before initialization, bound frames and the original handshake deadline, keep descriptor and peer checks in OS modules, drain original registry writers before forced exit, and reject durable release without clearing pending claims or rewriting refused rows.
+- **tui:** Keep original Stop lineage through archive ACKs and runtime state through acknowledged moves; publish same-generation metadata and show failed Force results while the original delete remains pending.
+- **storage:** Replace execution-store path arrays atomically while preserving opaque evidence and requiring complete immutable identities for native and sandbox reset arrays.
 
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 

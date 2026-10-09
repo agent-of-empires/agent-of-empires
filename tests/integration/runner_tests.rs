@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 #[path = "common/environment.rs"]
-mod environment;
-mod runner_fixture;
+pub(crate) mod environment;
+pub(crate) mod runner_fixture;
 #[cfg(debug_assertions)]
 #[path = "common/shim.rs"]
-mod shim;
+pub(crate) mod shim;
 
 #[cfg(debug_assertions)]
 #[path = "acp_runner_control.rs"]
@@ -47,7 +47,7 @@ impl environment::EnvGuard {
     }
 }
 
-fn isolated_case(module: &str, name: &str) -> bool {
+pub(crate) fn isolated_case(module: &str, name: &str) -> bool {
     let module = module.split_once("::").expect("test module path").1;
     let case = format!("{module}::{name}");
     if std::env::var("AOE_ISOLATED_RUNNER_TEST").ok().as_deref() == Some(&case) {
@@ -60,7 +60,7 @@ fn isolated_case(module: &str, name: &str) -> bool {
     let acknowledgement = root.path().join("entered");
     let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
     command
-        .args(["--exact", &case, "--nocapture"])
+        .args(["--exact", &case, "--nocapture", "--include-ignored"])
         .env("AOE_ISOLATED_RUNNER_TEST", &case)
         .env("AOE_ISOLATED_CASE_ACK", &acknowledgement)
         .env("HOME", root.path())

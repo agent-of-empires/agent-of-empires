@@ -2620,8 +2620,8 @@ mod tests {
     #[serial_test::serial]
     async fn hosted_creating_checkout_publication_and_managed_launch_preserve_receipts() {
         crate::session::test_support::require_hosted_creating_native();
-        let home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
         let storage = std::sync::Arc::new(super::super::Storage::new_unwatched("default").unwrap());
         let (_parent, build) = hosted_git_creation(&storage, None);
         let mut prepared = build.instance;
@@ -2668,7 +2668,8 @@ mod tests {
             "default",
             None,
             false,
-        );
+        )
+        .await;
         assert!(execution.identity.birth_is_complete());
         assert_eq!(execution.identity.generation, generation + 1);
         let launched = storage.load().unwrap().pop().unwrap();
@@ -2677,7 +2678,7 @@ mod tests {
         assert_eq!(journal["create_coverage"], receipts["create_coverage"]);
         assert_eq!(launched.lifecycle_generation, generation + 1);
         assert!(!launched.runner_journal.proves_quiescent());
-        assert!(custody
+        assert!(!custody
             .matches_original(&storage, &published.id, published.created_at, generation)
             .unwrap());
         assert_eq!(
@@ -2947,6 +2948,7 @@ mod tests {
         let mut params = custom_agent_params(&repo, "claude");
         params.worktree_enabled = true;
         params.worktree_branch = Some("hosted-native".into());
+        params.title = "preexisting checkout consumer".into();
         let second = build_instance(params, &[], &[], &storage).unwrap();
         assert!(
             !second

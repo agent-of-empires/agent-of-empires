@@ -2038,8 +2038,10 @@ fn w_skips_unread_trashed_session() {
     // row carries an unread flag, as it would after being trashed while unread.
     env.view
         .mutate_instance(&active, |inst| inst.status = Status::Idle);
-    env.view
-        .mutate_instance(&trashed, |inst| inst.mark_unread());
+    let submitted = env
+        .view
+        .apply_user_action(&trashed, |inst| inst.mark_unread());
+    await_transaction_result(&mut env.view, submitted).unwrap();
     {
         env.view.trash_session_by_id(&trashed);
         drain_persistence(&mut env.view).unwrap();

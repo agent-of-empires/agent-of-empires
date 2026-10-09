@@ -107,6 +107,17 @@ impl Drop for PurgeOwner {
 }
 
 impl PurgeControl {
+    #[cfg(test)]
+    pub(crate) fn receipt_for_test(
+        &self,
+    ) -> Option<std::sync::Arc<crate::session::runner_journal::OwnedStop>> {
+        self.shared
+            .phase
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .receipt
+            .clone()
+    }
     pub(crate) fn request_force(&self) -> ForceIntent {
         let mut progress = self
             .shared
@@ -2727,10 +2738,12 @@ mod tests {
         )?;
         row.lifecycle_reservation.as_mut().unwrap().path_claims =
             crate::session::WorktreePathClaims::Unknown(Some(vec![first.clone(), second.clone()]));
-        std::fs::write(
-            peer.sessions_path(),
-            serde_json::to_vec(&vec![row.clone()])?,
-        )?;
+        let mut legacy = serde_json::to_value(&row)?;
+        legacy.as_object_mut().unwrap().remove("runner_journal");
+        std::fs::write(peer.sessions_path(), serde_json::to_vec(&vec![legacy])?)?;
+        std::fs::write(crate::session::get_app_dir()?.join(".schema_version"), "35")?;
+        crate::migrations::run_migrations()?;
+        row = peer.load()?.remove(0);
         let claims = PathClaimIndex::load_for_writer(std::slice::from_ref(&target))?;
         let profile = claims.writer_profile(&target)?;
         claims.ensure_unclaimed(profile, "new-owner", std::slice::from_ref(&unrelated))?;
@@ -2747,10 +2760,7 @@ mod tests {
             crate::session::WorktreePathClaims::Unknown(None);
         std::fs::write(peer.sessions_path(), serde_json::to_vec(&vec![row])?)?;
         let claims = PathClaimIndex::load_for_writer(std::slice::from_ref(&target))?;
-        let profile = claims.writer_profile(&target)?;
-        assert!(claims
-            .ensure_unclaimed(profile, "new-owner", &[unrelated])
-            .is_err());
+        assert!(claims.writer_profile(&target).is_err());
         assert!(matches!(paths_in_use_except(&[]), PathsInUse::Unknown(_)));
         Ok(())
     }

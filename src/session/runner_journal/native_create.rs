@@ -388,6 +388,7 @@ impl std::fmt::Debug for CreateNativeCustody {
 struct CreateReceipt {
     state: Mutex<CreateExecution>,
     cancel: CancellationToken,
+    completed_output: std::sync::atomic::AtomicBool,
     pins: [File; 2],
     spec: NativeSpec,
     root: Mutex<Option<crate::process::OwnedCreateRoot>>,
@@ -413,7 +414,8 @@ impl CreateNativeCustody {
         anyhow::ensure!(receipts.iter().all(|r| {
             let state = r.state.lock().unwrap_or_else(|e| e.into_inner());
             state.root_status.is_some() && state.effect_acknowledged && state.group_retired
-                && !state.births.is_empty() && !state.no_target_approved && !r.cancel.is_cancelled()
+                && !state.births.is_empty() && !state.no_target_approved
+                && r.completed_output.load(std::sync::atomic::Ordering::Acquire)
         }), "native producer has not acknowledged its actual root output and original group retirement");
         owner.with_scope(|row| {
             anyhow::ensure!(
@@ -620,6 +622,7 @@ impl CreationIntent {
         };
         let receipt = Arc::new(CreateReceipt {
             state: Mutex::new(record.clone()),
+            completed_output: std::sync::atomic::AtomicBool::new(false),
             cancel: cancel
                 .map(CancellationToken::child_token)
                 .unwrap_or_default(),
@@ -1033,6 +1036,19 @@ fn drive(
         *receipt.state.lock().unwrap_or_else(|e| e.into_inner()) = record.clone();
         canonical_natal_ack = true;
         *native_root = Some(crate::process::OwnedCreateRoot::prepare(birth)?);
+        if std::env::var_os("AOE_CREATE_SYSCALL_DIAGNOSTICS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            use std::io::Write;
+            let kind = match receipt.spec.kind {
+                CreateCommandKind::Ordinary => "ordinary",
+                CreateCommandKind::Undo => "undo",
+            };
+            let _ = writeln!(std::io::stderr().lock(),
+                "owned-create-receipt nonce={} generation={} root={birth:?} category={kind} commitment={:?} durable_goal={:?}",
+                record.nonce, record.generation, record.commitment, receipt.spec.durable_goal,
+            );
+        }
         #[cfg(test)]
         if receipt.cancel_at_admission {
             receipt.cancel.cancel();
@@ -1154,6 +1170,9 @@ fn drive(
         !receipt.cancel.is_cancelled(),
         "original Create cancelled during target execution"
     );
+    receipt
+        .completed_output
+        .store(true, std::sync::atomic::Ordering::Release);
     Ok(Output {
         status,
         stdout,
@@ -1499,8 +1518,7 @@ mod tests {
         cancel.cancel();
         #[cfg(target_os = "linux")]
         {
-            let result = driver.join().unwrap().unwrap();
-            assert!(!result.status.success());
+            driver.join().unwrap().unwrap_err();
             intent.retire_owned_commands().unwrap();
         }
     }

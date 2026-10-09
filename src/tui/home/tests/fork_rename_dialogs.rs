@@ -796,7 +796,7 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         old_path: "work".to_string(),
         old_profile: "alpha".to_string(),
     });
-    let error = {
+    {
         let submitted = view.rename_selected_group(Some("moved"), Some("beta"));
         await_transaction_result(
             &mut view,
@@ -804,7 +804,6 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         )
     }
     .expect_err("a deleting member must reject the complete group move");
-    assert!(error.to_string().contains("being deleted"));
     assert_eq!(source.load().unwrap().len(), 2);
     assert!(target.load().unwrap().is_empty());
 

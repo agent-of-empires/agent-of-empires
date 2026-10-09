@@ -89,6 +89,11 @@ fn spawn_worker(name: &str) -> Worker<DeletionJob, DeletionDone> {
 }
 
 impl DeletionPoller {
+    #[cfg(test)]
+    pub(crate) fn request_counter_for_test(&self) -> u64 {
+        self.next_request
+    }
+
     pub fn new() -> Self {
         Self {
             worker: spawn_worker("aoe-deletion-poller"),

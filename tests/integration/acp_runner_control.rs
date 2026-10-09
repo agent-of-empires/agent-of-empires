@@ -2128,12 +2128,8 @@ async fn original_purge_force_reuses_the_acknowledged_stream_and_keeps_paths() {
         let _env = super::environment::EnvGuard::new(&["HOME", "XDG_CONFIG_HOME"])
             .and_set("HOME", &home)
             .and_set("XDG_CONFIG_HOME", &xdg);
-        let app = crate::session::get_app_dir().unwrap();
-        std::fs::write(
-            app.join(".schema_version"),
-            crate::migrations::current_schema_version().to_string(),
-        )
-        .unwrap();
+        crate::migrations::run_migrations()
+            .expect("initialize mandatory schema before native effects");
         let id = "original-force";
         let checkout = crate::session::scratch::provision_scratch_dir(id).unwrap();
         let repo = temp.path().join("repo");

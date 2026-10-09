@@ -858,3 +858,482 @@ impl HomeView {
             })
     }
 }
+
+#[cfg(all(test, debug_assertions, unix))]
+mod hosted_tests {
+    use super::*;
+    use crate::acp::control_protocol::{self, ControlBody};
+    use crate::runner_tests::{environment::EnvGuard, runner_fixture::RunnerLaunchFixture, shim};
+    use crate::session::{LifecycleOperation, View, WorktreeInfo};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    struct RunnerChild(std::process::Child);
+    impl Drop for RunnerChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().is_ok_and(|status| status.is_none()) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> std::process::Output {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn screen(view: &mut HomeView) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                view.render(
+                    frame,
+                    frame.area(),
+                    &crate::tui::styles::Theme::default(),
+                    None,
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    #[ignore = "disposable hosted native producer proof only"]
+    async fn hosted_force_refusal_dialog_keeps_original_purge_pending() {
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        assert_eq!(
+            std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+            Ok("github-hosted")
+        );
+        assert!(matches!(
+            std::env::var("RUNNER_OS").as_deref(),
+            Ok("Linux" | "macOS")
+        ));
+        if !crate::runner_tests::isolated_case(
+            module_path!(),
+            stringify!(hosted_force_refusal_dialog_keeps_original_purge_pending),
+        ) {
+            return;
+        }
+        shim::shim_ready().expect("hosted SDK shim prerequisites");
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let home = root.path().join("home");
+        let xdg = root.path().join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let _env = EnvGuard::new(&["HOME", "XDG_CONFIG_HOME"])
+            .and_set("HOME", &home)
+            .and_set("XDG_CONFIG_HOME", &xdg);
+        crate::session::get_app_dir().unwrap();
+        crate::migrations::run_migrations().unwrap();
+        let id = "pending-force-ui";
+        let checkout = crate::session::scratch::provision_scratch_dir(id).unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "--initial-branch=main"]);
+        std::fs::write(repo.join("owned-file"), "original resource").unwrap();
+        git(&repo, &["add", "owned-file"]);
+        git(&repo, &["commit", "-m", "seed"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "original",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let sentinel = checkout.join("owned-file");
+
+        let hook_socket = root.path().join("hook.sock");
+        let hook_done = root.path().join("hook.done");
+        let hook_script = root.path().join("destroy.cjs");
+        let release = uuid::Uuid::new_v4().to_string();
+        let listener = UnixListener::bind(&hook_socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::write(
+            &hook_script,
+            format!(
+                r#"
+const net = require('node:net');
+const fs = require('node:fs');
+const socket = net.connect({socket});
+socket.on('error', error => {{ throw error; }});
+socket.on('connect', () => socket.write(JSON.stringify({{
+  id: process.env.AOE_SESSION_ID, cwd: process.env.AOE_PROJECT_PATH, pid: process.pid
+}}) + '\n'));
+let received = '';
+socket.on('data', bytes => {{
+  received += bytes.toString();
+  if (received === {release} + '\n') {{
+    fs.appendFileSync({done}, process.env.AOE_SESSION_ID + '\n');
+    socket.end();
+  }}
+}});
+"#,
+                socket = serde_json::to_string(&hook_socket).unwrap(),
+                release = serde_json::to_string(&release).unwrap(),
+                done = serde_json::to_string(&hook_done).unwrap(),
+            ),
+        )
+        .unwrap();
+        let hook_command = format!(
+            "'{}' '{}'",
+            shim::shim_node().unwrap().display(),
+            hook_script.display()
+        );
+        crate::session::config::update_config(|config| {
+            config.hooks.on_destroy = vec![hook_command];
+        })
+        .unwrap();
+        let mut row = Instance::new("pending original", checkout.to_str().unwrap());
+        row.id = id.into();
+        row.source_profile = "main".into();
+        row.view = View::Structured;
+        row.scratch = true;
+        row.worktree_info = Some(WorktreeInfo {
+            branch: "original".into(),
+            main_repo_path: repo.to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: Some("main".into()),
+        });
+        Storage::new_unwatched("main")
+            .unwrap()
+            .update(|rows, _| {
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+        let fixture = RunnerLaunchFixture::new(&home, &xdg, "main", id);
+        let socket = root.path().join("runner.sock");
+        let control_socket = socket.with_extension("control.sock");
+        let retire_gate = root.path().join("retire.release");
+        let entered = retire_gate.with_extension("entered");
+        let counter = root.path().join("native-starts");
+        let mut command = fixture.command();
+        command
+            .args([
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                id,
+                "--agent-name",
+                "shim",
+                "--cwd",
+                checkout.to_str().unwrap(),
+                "--",
+                shim::shim_node().unwrap().to_str().unwrap(),
+                shim::shim_path().to_str().unwrap(),
+            ])
+            .env("AOE_TEST_STOP_RETIRE_GATE", &retire_gate)
+            .env("SHIM_ENV_RECORD_FILE", &counter);
+        let mut child = RunnerChild(
+            fixture
+                .spawn(&mut command)
+                .expect("original managed SDK bootstrap"),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !control_socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut attachment = tokio::net::UnixStream::connect(&control_socket)
+                .await
+                .unwrap();
+            assert!(matches!(
+                control_protocol::read_frame(&mut attachment).await.unwrap(),
+                Some(ControlBody::Hello { .. })
+            ));
+            control_protocol::write_frame(
+                &mut attachment,
+                &ControlBody::Attach {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                },
+            )
+            .await
+            .unwrap();
+            control_protocol::write_frame(
+                &mut attachment,
+                &ControlBody::Initialize {
+                    request: serde_json::json!({"protocolVersion": 1}),
+                },
+            )
+            .await
+            .unwrap();
+            loop {
+                match control_protocol::read_frame(&mut attachment).await.unwrap() {
+                    Some(ControlBody::Initialized { .. }) => break,
+                    Some(ControlBody::Notify { .. }) => {}
+                    frame => panic!("initialize failed: {frame:?}"),
+                }
+            }
+            control_protocol::write_frame(
+                &mut attachment,
+                &ControlBody::EstablishSession {
+                    method: "session/new".into(),
+                    request: serde_json::json!({"cwd": checkout, "mcpServers": []}),
+                },
+            )
+            .await
+            .unwrap();
+            loop {
+                match control_protocol::read_frame(&mut attachment).await.unwrap() {
+                    Some(ControlBody::SessionReady { .. }) => break,
+                    Some(ControlBody::Notify { .. }) => {}
+                    frame => panic!("session establishment failed: {frame:?}"),
+                }
+            }
+        })
+        .await
+        .expect("actual SDK establishment");
+        let storage = fixture.original_storage();
+        let original = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert!(!original.runner_journal.proves_runner_quiescent());
+        let starts = std::fs::read(&counter).unwrap();
+        assert_eq!(starts.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let original_profile = storage.original_profile_identity().unwrap();
+        let produced = fixture.produced_origin();
+        let record = crate::process::worker_registry::load_strict(id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.pid, child.0.id());
+        assert_eq!(record.launch_nonce, Some(fixture.nonce));
+        produced.validate_record_birth(&record).unwrap();
+        produced
+            .validate_baseline_at(&original, original.lifecycle_generation)
+            .unwrap();
+        assert!(original_profile.is_durable());
+        let mut view = HomeView::new(
+            Some("main".into()),
+            AvailableTools::detect(),
+            crate::file_watch::FileWatchService::new().unwrap(),
+        )
+        .unwrap();
+        view.view_mode = ViewMode::Structured;
+        view.selected_session = Some(id.into());
+        view.delete_selected(&crate::tui::dialogs::DeleteOptions {
+            delete_worktree: true,
+            force_delete: false,
+            delete_branch: true,
+            delete_sandbox: false,
+            keep_scratch: false,
+        })
+        .unwrap();
+        assert_eq!(view.deletes_in_flight.len(), 1);
+        let original_request = *view.deletes_in_flight.keys().next().unwrap();
+        let control = view.deletes_in_flight[&original_request].control.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let marker = loop {
+            if let Ok(bytes) = std::fs::read(&entered) {
+                if let Ok(marker) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    break marker;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual original Stop did not acknowledge retirement"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(marker["pid"], child.0.id());
+        assert_eq!(marker["nonce"], fixture.nonce.to_string());
+        assert_eq!(marker["mode"], 0);
+        let receipt = control.receipt_for_test().expect("original bound receipt");
+        assert_eq!(receipt.generation(), original.lifecycle_generation + 1);
+        assert_eq!(receipt.session_id(), id);
+        std::fs::write(&retire_gate, "release original graceful Stop").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut hook, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("hook accept: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "original deletion did not enter its real destroy hook"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        hook.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut announcement = String::new();
+        BufReader::new(hook.try_clone().unwrap())
+            .read_line(&mut announcement)
+            .unwrap();
+        let announcement: serde_json::Value = serde_json::from_str(&announcement).unwrap();
+        assert_eq!(announcement["id"], id);
+        assert_eq!(announcement["cwd"], checkout.to_str().unwrap());
+        let reserved = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(reserved.lifecycle_generation, receipt.generation());
+        assert_eq!(
+            reserved.lifecycle_reservation.as_ref().unwrap().op,
+            LifecycleOperation::Purge
+        );
+        assert!(
+            reserved.runner_journal.proves_quiescent(),
+            "hook gate must be after canonical native retirement"
+        );
+        receipt
+            .current_projection()
+            .validate_baseline_at(&reserved, receipt.generation())
+            .unwrap();
+        assert!(control.matches(&reserved));
+        let visible_before = serde_json::to_value(view.get_instance(id).unwrap()).unwrap();
+        let durable_before = serde_json::to_value(&reserved).unwrap();
+        let counter_before = view.deletion_poller.request_counter_for_test();
+        assert!(
+            !view.apply_deletion_results(),
+            "original cannot complete while its hook is held"
+        );
+        view.open_delete_for_selected();
+        assert!(view.confirm_dialog.is_some());
+        assert!(
+            matches!(&view.pending_force_remove_session, Some(PendingForceRemoval::Existing { request_id, .. }) if *request_id == original_request)
+        );
+        view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), None);
+        let dialog = screen(&mut view);
+        assert!(dialog.contains("Force Remove Refused"), "{dialog}");
+        assert!(
+            ["already", "started", "commit", "cleanup"]
+                .iter()
+                .all(|word| dialog.contains(word)),
+            "actual TooLate reason: {dialog}"
+        );
+        assert!(view.confirm_dialog.is_none());
+        assert!(view.pending_force_remove_session.is_none());
+        assert_eq!(
+            view.deletion_poller.request_counter_for_test(),
+            counter_before
+        );
+        assert!(!control.force_requested());
+        assert_eq!(view.deletes_in_flight.len(), 1);
+        assert!(view.deletes_in_flight.contains_key(&original_request));
+        assert!(!view.deletes_in_flight[&original_request].attempt.forced);
+        assert_eq!(
+            serde_json::to_value(view.get_instance(id).unwrap()).unwrap(),
+            visible_before
+        );
+        let durable_after = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&durable_after).unwrap(),
+            durable_before
+        );
+        assert_eq!(
+            storage.original_profile_identity().unwrap(),
+            original_profile
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &receipt,
+            &view.deletes_in_flight[&original_request]
+                .control
+                .receipt_for_test()
+                .unwrap()
+        ));
+        assert!(!view.failed_deletes.contains_key(id));
+        assert!(!hook_done.exists());
+        assert_eq!(std::fs::read(&counter).unwrap(), starts);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "original resource"
+        );
+        git(&repo, &["show-ref", "--verify", "refs/heads/original"]);
+        assert!(!view.apply_deletion_results());
+        assert!(child.0.try_wait().unwrap().is_some());
+        assert!(!crate::process::worker::is_process_group_alive(
+            child.0.id()
+        ));
+
+        view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(view.info_dialog.is_none());
+        assert!(!screen(&mut view).contains("Force Remove Refused"));
+
+        hook.write_all(format!("{release}\n").as_bytes()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !view.apply_deletion_results() {
+            assert!(
+                Instant::now() < deadline,
+                "original delete did not finish after its own hook release"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(view.deletes_in_flight.is_empty());
+        assert!(
+            view.get_instance(id).is_none(),
+            "real Removed/AlreadyGone application"
+        );
+        assert!(!storage.load().unwrap().iter().any(|row| row.id == id));
+        assert_eq!(
+            std::fs::read_to_string(&hook_done).unwrap(),
+            format!("{id}\n")
+        );
+        assert!(
+            !checkout.exists(),
+            "TooLate must not change original cleanup to keep paths"
+        );
+        let refs = git(
+            &repo,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/original"],
+        );
+        assert!(refs.stdout.is_empty());
+        assert!(!socket.exists());
+        assert!(!control_socket.exists());
+        assert!(
+            !crate::session::runner_journal::stop_socket(id, child.0.id())
+                .unwrap()
+                .exists()
+        );
+        assert!(crate::process::worker_registry::load_strict(id)
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(&counter).unwrap(), starts);
+        assert_eq!(
+            view.deletion_poller.request_counter_for_test(),
+            counter_before
+        );
+        eprintln!("HOSTED_FORCE_PENDING_UI_ACK: actual TooLate UI rendered; one original request/receipt/lease/row and native counter retained; original hook completed once; original cleanup completed");
+    }
+}

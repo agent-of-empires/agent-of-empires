@@ -105,7 +105,9 @@ pub struct AcpRunnerArgs {
     pub agent_argv: Vec<String>,
 }
 
-pub async fn run(args: AcpRunnerArgs) -> Result<()> {
+pub use crate::session::runner_journal::RunnerNatalGuard;
+
+pub async fn run(args: AcpRunnerArgs, natal: RunnerNatalGuard) -> Result<()> {
     // Paths are derived from the session id; reject traversal before touching the filesystem.
     worker_registry::validate_session_id(&args.session_id).context("invalid --session-id")?;
     let mut bootstrap = crate::session::runner_journal::LaunchBootstrap::receive(
@@ -113,8 +115,11 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         &args.session_id,
         args.launch_nonce,
         args.generation,
+        natal,
     )?;
     let born_identity = bootstrap.identity();
+    #[cfg(debug_assertions)]
+    crate::session::runner_journal::hold_for_hosted_proof("runner-logging")?;
     init_runner_logging(&args.session_id)?;
 
     if let Ok(app_dir) = crate::session::get_app_dir() {

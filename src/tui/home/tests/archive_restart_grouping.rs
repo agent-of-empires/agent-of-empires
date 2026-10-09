@@ -1252,11 +1252,17 @@ fn delete_selected_refused_during_restart() {
         let storage = env.view.storages.get("test").unwrap();
         storage
             .update(|instances, _groups| {
-                instances
+                let row = instances
                     .iter_mut()
                     .find(|instance| instance.id == id)
-                    .unwrap()
-                    .status = crate::session::Status::Creating;
+                    .unwrap();
+                row.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Create,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .map_err(anyhow::Error::new)?;
+                row.status = crate::session::Status::Creating;
                 Ok(())
             })
             .unwrap();

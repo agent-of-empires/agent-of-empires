@@ -14,6 +14,30 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::unistd::Pid;
 
+/// Test-only original-root death observation; never group retirement authority.
+#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct OriginalRootDeathObservation(platform::OriginalRootDeathObservation);
+
+#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+impl OriginalRootDeathObservation {
+    pub(crate) fn bind(birth: ProcessIncarnation) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            process_incarnation(birth.pid)? == Some(birth),
+            "original root changed before death observation binding"
+        );
+        let observation = platform::OriginalRootDeathObservation::bind(birth)?;
+        anyhow::ensure!(
+            process_incarnation(birth.pid)? == Some(birth),
+            "original root changed during death observation binding"
+        );
+        Ok(Self(observation))
+    }
+
+    pub(crate) fn exited(&self) -> anyhow::Result<bool> {
+        self.0.exited()
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 

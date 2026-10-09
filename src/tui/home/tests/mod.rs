@@ -166,6 +166,9 @@ fn finish_runner_settlements(view: &mut HomeView) {
         view.apply_settlement_results();
         (view.settlement_in_flight.is_empty() && view.persistence_is_idle()).then_some(())
     });
+    while let Some(ack) = view.persistence.acknowledgements.pop_front() {
+        ack.expect("final settlement transaction must acknowledge its durable result");
+    }
 }
 /// State-only fixtures use this without claiming a prepared input transport.
 fn live_state_for_instance(

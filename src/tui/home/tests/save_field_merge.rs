@@ -1309,6 +1309,7 @@ fn stamp_last_accessed_on_archived_row_unsinks_persistently() {
     .expect("seed snooze must persist");
     assert!(view.get_instance(&id).unwrap().is_snoozed());
     view.stamp_last_accessed(&id);
+    drain_persistence(&mut view).unwrap();
     assert!(!view.get_instance(&id).unwrap().is_snoozed());
     let disk_row = Storage::new_unwatched("test")
         .unwrap()
@@ -1687,7 +1688,7 @@ fn cached_save_cannot_adopt_recreated_profile_or_replay_pending_metadata() {
     replacement
         .update(|rows, groups| {
             rows.push(row);
-            groups.push(Group::new("shared", "replacement-group"));
+            groups.push(Group::new("replacement-group", "shared"));
             Ok(())
         })
         .unwrap();

@@ -65,25 +65,31 @@ fn dynamic_profile_add_and_remove_keeps_subscriptions_in_sync() {
         "TUI should not have crashed after profile dir removal"
     );
 
-    // The active-profile filter is not auto-reset when its dir vanishes,
-    // so the list header still reads `aoe [scratch]`. Switch back to
-    // all-profiles mode first: with the active profile gone from the
-    // list, the picker opens with "all" highlighted at the top
-    // (ProfilePickerDialog::new falls back to index 0), so Enter selects
-    // it and the header drops the profile tag.
+    // The vanished active filter may still be named in the header. Verify
+    // picker rows, not the whole screen, without requesting a switch whose
+    // save fence still owns the removed physical profile.
     h.send_keys("P");
     h.wait_for("Profiles");
-    h.send_keys("Enter");
-    h.wait_for_absent("Profiles", Duration::from_secs(5));
-
-    // Now in all-profiles mode the header carries no profile tag, so a
-    // lingering "scratch" can only be a stale picker row. Reopen the
-    // picker and assert the removed profile is gone. Substring "scratch"
-    // rather than "scratch  0 sessions" so a stale row with any session
-    // count still trips the assertion.
-    h.send_keys("P");
-    h.wait_for("Profiles");
-    h.wait_for_absent("scratch", Duration::from_secs(5));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = h.capture_screen();
+        let stale_row = screen.lines().any(|line| {
+            line.split('│').any(|cell| {
+                cell.trim()
+                    .trim_start_matches('>')
+                    .trim()
+                    .starts_with("scratch ")
+            })
+        });
+        if !stale_row {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "removed profile still in picker: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     h.send_keys("Escape");
     h.wait_for_absent("Profiles", Duration::from_secs(5));
 }

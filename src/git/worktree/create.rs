@@ -722,8 +722,9 @@ impl GitWorktree {
                     String::from_utf8_lossy(&output.stderr)
                 ));
                 warnings.push(format!(
-                    "post-checkout hook failed for {} (worktree created, hook output below):\n{}",
+                    "post-checkout hook failed for {} ({}, worktree created, hook output below):\n{}",
                     path.display(),
+                    output.status,
                     detail.trim()
                 ));
             }

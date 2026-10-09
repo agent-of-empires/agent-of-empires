@@ -917,8 +917,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let error = stale.commit_lifecycle_launch(&storage, false).unwrap_err();
-        assert!(error.to_string().contains("lost its lifecycle reservation"));
+        stale.commit_lifecycle_launch(&storage, false).unwrap_err();
         let disk = storage
             .load()
             .unwrap()

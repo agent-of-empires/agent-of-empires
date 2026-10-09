@@ -17,7 +17,10 @@ use super::{Instance, LifecycleOperation, Storage};
 
 mod bootstrap;
 pub(crate) mod native_create;
+#[cfg(debug_assertions)]
+pub(crate) use bootstrap::hold_for_hosted_proof;
 pub(crate) use bootstrap::LaunchBootstrap;
+pub use bootstrap::RunnerNatalGuard;
 pub use native_create::OwnedCreateCommand;
 
 pub(crate) type BootToken = [u8; 16];
@@ -1298,6 +1301,24 @@ impl OwnedStop {
     }
     pub(crate) fn original(&self) -> &LaunchOrigin {
         &self.original
+    }
+
+    // Metadata ACK matching only; native effects still require the original scope.
+    pub(crate) fn acknowledges_original_epoch(
+        &self,
+        row: &Instance,
+        original_generation: u64,
+    ) -> bool {
+        self.original.generation() == original_generation
+            && original_generation.checked_add(1) == Some(self.generation)
+            && row.id == self.session_id()
+            && row.created_at == self.original.plan.created_at
+            && row.lifecycle_generation == self.generation
+            && row
+                .storage_origin
+                .as_ref()
+                .is_some_and(|origin| self.storage().same_origin_as(origin))
+            && self.original.validate_native_history(row).is_ok()
     }
 
     pub(crate) fn cancellation_origin(&self) -> std::sync::Arc<LaunchOrigin> {

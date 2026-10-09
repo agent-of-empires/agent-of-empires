@@ -170,6 +170,10 @@ fn patch_member<'a>(
                 originals.len() == before.len(),
                 "canonical array differs from its typed projection"
             );
+            // Execution stores are atomic paths, not extension-bearing records.
+            if array_field == Some("stores") && before.iter().chain(after).all(Value::is_string) {
+                return Ok(Emission::Changed(serde_json::value::to_raw_value(after)?));
+            }
             let mut consumed = vec![false; before.len()];
             let mut matched = 0;
             let mut inserted = false;
@@ -210,6 +214,19 @@ fn same_identity(before: &Value, after: &Value, array_field: Option<&str>) -> bo
     let keys: &[&str] = match array_field {
         // A repository's checkout path and branch are mutable transaction output.
         Some("repos") => &["name", "source_path", "main_repo_path"],
+        // Lane acknowledgements change without replacing retirement evidence.
+        Some("sandbox_content_resets") => &[
+            "slot",
+            "transaction",
+            "tool",
+            "agent",
+            "roots",
+            "recovery",
+            "retired_terminal",
+            "retired_terminal_binding",
+            "retired_structured",
+            "retired_import",
+        ],
         Some("launches") => &[
             "nonce",
             "boot",
@@ -247,6 +264,10 @@ fn same_identity(before: &Value, after: &Value, array_field: Option<&str>) -> bo
         }
     };
     keys.iter().all(|key| {
+        if array_field == Some("sandbox_content_resets") && *key == "retired_terminal_binding" {
+            // This optional evidence is omitted by the typed projection when absent.
+            return before.get(*key) == after.get(*key);
+        }
         if array_field == Some("repos") {
             return before.get(*key).is_some_and(|prior| {
                 prior.as_str().is_some_and(|value| !value.is_empty())
@@ -599,6 +620,118 @@ mod tests {
             &serde_json::json!([{"id":"shared","name":"a","value":1},{"id":"shared","name":"b","value":2}]),
             &serde_json::json!([{"id":"shared","name":"unknown","value":3}]),
         ).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn field_specific_arrays_keep_native_and_reset_correspondence_closed() -> Result<()> {
+        let opaque = r#"{"same":1,"same":2,"float":1e400,"escaped":"\u0061"}"#;
+        let raw = format!(r#"{{"stores":["/old"],"boot":[1,2],"extension":{opaque}}}"#);
+        let before = serde_json::json!({"stores":["/old"],"boot":[1,2]});
+        let after = serde_json::json!({"stores":["/new"],"boot":[1,2]});
+        let raw: Box<RawValue> = serde_json::from_str(&raw)?;
+        let output = serde_json::to_string(&patch(&raw, &before, &after)?)?;
+        let output: Box<RawValue> = serde_json::from_str(&output)?;
+        assert_eq!(
+            RawObject::parse(&output)?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            opaque
+        );
+        assert!(patch(
+            &raw,
+            &before,
+            &serde_json::json!({"stores":["/new"],"boot":[3,4]})
+        )
+        .is_err());
+        for field in ["unknown", "nonce", "commitment", "start", "namespace"] {
+            let before = serde_json::json!({(field):["old"]});
+            assert!(patch(
+                &serde_json::value::to_raw_value(&before)?,
+                &before,
+                &serde_json::json!({(field):["new"]}),
+            )
+            .is_err());
+        }
+        let before = serde_json::json!({"stores":[{"value":1}]});
+        assert!(patch(
+            &serde_json::value::to_raw_value(&before)?,
+            &before,
+            &serde_json::json!({"stores":[{"value":2}]}),
+        )
+        .is_err());
+
+        let reset_raw = format!(
+            r#"{{"slot":"original","transaction":"transaction","tool":"claude","agent":"claude","roots":["/native"],"recovery":["/recovery"],"terminal":{{"pending":true,"generation":null}},"structured":{{"pending":true,"generation":null}},"retired_terminal":"old-terminal","retired_structured":["old-acp"],"retired_import":true,"extension":{opaque}}}"#
+        );
+        let reset: crate::migrations::v033_isolate_sandbox_content::SandboxContentReset =
+            serde_json::from_str(&reset_raw)?;
+        let reset = serde_json::to_value(reset)?;
+        let before = serde_json::json!({"sandbox_content_resets":[reset]});
+        let raw: Box<RawValue> =
+            serde_json::from_str(&format!(r#"{{"sandbox_content_resets":[{reset_raw}]}}"#))?;
+        let mut claimed = reset.clone();
+        claimed["structured"]["generation"] = serde_json::json!(7);
+        claimed["structured"]["pending"] = serde_json::json!(false);
+        let output = serde_json::to_string(&patch(
+            &raw,
+            &before,
+            &serde_json::json!({"sandbox_content_resets":[claimed]}),
+        )?)?;
+        let output: Box<RawValue> = serde_json::from_str(&output)?;
+        let resets: Vec<&RawValue> = serde_json::from_str(
+            RawObject::parse(&output)?
+                .unique("sandbox_content_resets")?
+                .unwrap()
+                .get(),
+        )?;
+        assert_eq!(
+            RawObject::parse(resets[0])?
+                .unique("extension")?
+                .unwrap()
+                .get(),
+            opaque
+        );
+        for component in [
+            "slot",
+            "transaction",
+            "tool",
+            "agent",
+            "roots",
+            "recovery",
+            "retired_terminal",
+            "retired_terminal_binding",
+            "retired_structured",
+            "retired_import",
+        ] {
+            let mut foreign = claimed.clone();
+            foreign[component] = serde_json::json!("foreign");
+            assert!(
+                patch(
+                    &raw,
+                    &before,
+                    &serde_json::json!({"sandbox_content_resets":[foreign]})
+                )
+                .is_err(),
+                "{component}"
+            );
+        }
+        let duplicate_raw: Box<RawValue> = serde_json::from_str(&format!(
+            r#"{{"sandbox_content_resets":[{reset_raw},{reset_raw}]}}"#
+        ))?;
+        assert!(patch(
+            &duplicate_raw,
+            &serde_json::json!({"sandbox_content_resets":[reset,reset]}),
+            &serde_json::json!({"sandbox_content_resets":[claimed]}),
+        )
+        .is_err());
+        assert!(patch(
+            &raw,
+            &before,
+            &serde_json::json!({"sandbox_content_resets":[claimed,claimed]})
+        )
+        .is_err());
         Ok(())
     }
 

@@ -821,7 +821,7 @@ mod tests {
                 .unwrap()
                 .profile()
                 .to_owned();
-            let execution = published_execution(id, &profile, None, false);
+            let execution = published_execution(id, &profile, None, false).await;
             let identity = execution.identity;
             if !registry_saved {
                 let record = worker_registry::load_strict(id).unwrap().unwrap();
@@ -952,7 +952,7 @@ mod tests {
                 .unwrap()
                 .profile()
                 .to_owned();
-            let execution = published_execution(id, &profile, None, false);
+            let execution = published_execution(id, &profile, None, false).await;
             let identity = execution.identity;
             let (mut client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
                 crate::acp::state::AcpSessionId(id.into()),
@@ -1267,7 +1267,8 @@ mod tests {
                     profile,
                     config.execution_admission.as_ref(),
                     false,
-                );
+                )
+                .await;
                 let identity = execution.identity;
                 executions.lock().unwrap().push(execution);
                 config_tx.send(config).unwrap();
@@ -1282,7 +1283,7 @@ mod tests {
             .unwrap()
             .profile()
             .to_owned();
-        let previous = published_execution("s-store", &profile, None, false);
+        let previous = published_execution("s-store", &profile, None, false).await;
         let socket = worker_registry::socket_path_for("s-store").unwrap();
         let mut config = runner_config(socket);
         config.managed_profile = Some(profile.clone());

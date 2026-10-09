@@ -2,6 +2,83 @@
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 
+#[cfg(all(test, debug_assertions))]
+pub(super) struct OriginalRootDeathObservation {
+    fd: std::os::fd::OwnedFd,
+    pid: u32,
+    observed: std::cell::Cell<bool>,
+}
+
+#[cfg(all(test, debug_assertions))]
+impl OriginalRootDeathObservation {
+    pub(super) fn bind(birth: super::ProcessIncarnation) -> anyhow::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::kqueue() };
+        anyhow::ensure!(
+            fd >= 0,
+            "cannot bind original kqueue: {}",
+            std::io::Error::last_os_error()
+        );
+        // kqueue returned one newly owned descriptor.
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+        change.ident = birth.pid as libc::uintptr_t;
+        change.filter = libc::EVFILT_PROC;
+        change.flags = libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT;
+        change.fflags = libc::NOTE_EXIT;
+        let result =
+            unsafe { libc::kevent(fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        anyhow::ensure!(
+            result == 0,
+            "cannot subscribe to original root death: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(Self {
+            fd: owned,
+            pid: birth.pid,
+            observed: std::cell::Cell::new(false),
+        })
+    }
+
+    pub(super) fn exited(&self) -> anyhow::Result<bool> {
+        use std::os::fd::AsRawFd;
+        if self.observed.get() {
+            return Ok(true);
+        }
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        let immediate = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let result = unsafe {
+            libc::kevent(
+                self.fd.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                &immediate,
+            )
+        };
+        anyhow::ensure!(
+            result >= 0,
+            "original kqueue observation failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if result == 1 {
+            anyhow::ensure!(
+                event.flags & libc::EV_ERROR == 0
+                    && event.ident == self.pid as libc::uintptr_t
+                    && event.filter == libc::EVFILT_PROC
+                    && event.fflags & libc::NOTE_EXIT != 0,
+                "event is not the bound original root death"
+            );
+            self.observed.set(true);
+        }
+        Ok(self.observed.get())
+    }
+}
+
 pub(super) fn peer_pid_from_connected_socket(stream: &impl std::os::fd::AsFd) -> Option<u32> {
     use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
     let pid = getsockopt(stream, LocalPeerPid).ok()?;
