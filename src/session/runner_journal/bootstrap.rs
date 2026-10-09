@@ -85,10 +85,11 @@ struct InstallationAck {
     published: super::RunnerLaunch,
 }
 
-fn canonical_published(
+fn canonical_publication(
     original: &LaunchOrigin,
     born: RunnerIdentity,
     publication: &NatalPublication,
+    phase: super::NativeLaunchPhase,
 ) -> Result<super::RunnerLaunch> {
     anyhow::ensure!(
         publication.born == born,
@@ -116,11 +117,12 @@ fn canonical_published(
         matches.next().is_none(),
         "installation original birth is duplicated"
     );
+    super::validate_launch_snapshots(std::slice::from_ref(launch))?;
     anyhow::ensure!(
-        launch.phase == super::NativeLaunchPhase::Published
+        launch.phase == phase
             && launch.stop_endpoint == Some(publication.endpoint)
             && launch.registry.as_ref() == Some(&publication.registry),
-        "installation differs from canonical Published original"
+        "producer receipt differs from canonical {phase:?} original"
     );
     Ok(launch.clone())
 }
@@ -137,7 +139,12 @@ pub(super) fn commit_original(
         ack.original == commit,
         "installation ACK changed complete original"
     );
-    let published = canonical_published(issued, identity, &ack.publication)?;
+    let published = canonical_publication(
+        issued,
+        identity,
+        &ack.publication,
+        super::NativeLaunchPhase::Published,
+    )?;
     anyhow::ensure!(
         published == ack.published,
         "installation ACK changed durable Published snapshot"
@@ -213,7 +220,7 @@ pub(super) fn publish_original(
     original: &LaunchOrigin,
     born: RunnerIdentity,
     fences: [&StorageFlock; 3],
-) -> Result<()> {
+) -> Result<Arc<LaunchOrigin>> {
     send_descriptors(
         channel,
         [
@@ -253,27 +260,13 @@ pub(super) fn publish_original(
         publication.born == born,
         "natal ACK replaced the issued birth"
     );
-    original.storage().verify_profile_identity()?;
-    let row = original
-        .storage()
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == original.session_id())
-        .context("natal ACK's original session disappeared")?;
-    original.validate_row(&row)?;
-    anyhow::ensure!(
-        row.runner_journal.launches().iter().any(|launch| {
-            Some(Uuid::from_bytes(launch.nonce)) == born.launch_nonce
-                && Some(launch.boot) == born.boot
-                && launch.generation == born.generation
-                && launch.incarnation == born.incarnation
-                && launch.profile_identity == born.profile_identity
-                && launch.stop_endpoint == Some(publication.endpoint)
-                && launch.registry.as_ref() == Some(&publication.registry)
-        }),
-        "producer ACK differs from its canonical natal publication"
-    );
-    Ok(())
+    let armed = canonical_publication(
+        original,
+        born,
+        &publication,
+        super::NativeLaunchPhase::Armed,
+    )?;
+    original.with_launch_snapshot(armed)
 }
 
 impl LaunchBootstrap {
@@ -393,7 +386,7 @@ impl LaunchBootstrap {
                 super::publish_registry_under_original_fences(&self.origin, record, |record| {
                     worker_registry::publish_control_listener(record, control_path)
                 })?;
-            self.publication = Some(NatalPublication {
+            let publication = NatalPublication {
                 born: self.born,
                 endpoint,
                 registry: RegistryWitness {
@@ -403,7 +396,15 @@ impl LaunchBootstrap {
                     control_file_identity: control.identity(),
                     socket_path: record.socket_path.clone(),
                 },
-            });
+            };
+            let armed = canonical_publication(
+                &self.origin,
+                self.born,
+                &publication,
+                super::NativeLaunchPhase::Armed,
+            )?;
+            self.origin = self.origin.with_launch_snapshot(armed)?;
+            self.publication = Some(publication);
             Ok(control)
         })();
         if let Err(error) = &result {
@@ -446,7 +447,12 @@ impl LaunchBootstrap {
             publication.registry.matches_record(&installed_record),
             "installation substituted registry owner"
         );
-        let published = canonical_published(&self.origin, self.born, publication)?;
+        let published = canonical_publication(
+            &self.origin,
+            self.born,
+            publication,
+            super::NativeLaunchPhase::Published,
+        )?;
         write_frame_until(
             &mut self.channel,
             &InstallationAck {

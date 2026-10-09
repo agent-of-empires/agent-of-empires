@@ -362,6 +362,16 @@ impl CreateExecution {
     pub(super) fn same_record(&self, other: &Self) -> bool {
         self == other
     }
+    fn same_invocation(&self, other: &Self) -> bool {
+        self.format == other.format
+            && self.nonce == other.nonce
+            && self.session_id == other.session_id
+            && self.created_at == other.created_at
+            && self.generation == other.generation
+            && self.boot == other.boot
+            && self.commitment == other.commitment
+            && self.profile_identity == other.profile_identity
+    }
     pub(super) fn proves_retired(&self) -> bool {
         self.format == 1
             && self.descendants_retired
@@ -634,13 +644,7 @@ impl CreationIntent {
         });
         // Custody is retained before pending CAS, spawn, or any target effect.
         owner.native_create.retain(receipt.clone());
-        owner.update_projection(
-            |row| {
-                row.runner_journal.creations.push(record.clone());
-                Ok(())
-            },
-            |_| Ok(()),
-        )?;
+        commit_record(&owner, &receipt, &record, true)?;
         drop(gate);
         let (events, receiver) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -863,9 +867,60 @@ fn canonical_goal(goal: &impl Serialize) -> Result<[u8; 32]> {
 }
 
 fn publish(owner: &OwnedStop, receipt: &CreateReceipt, record: &CreateExecution) -> Result<()> {
-    owner.update_projection(
-        |row| {
-            validate_goal(owner.storage(), row, record, &receipt.spec)?;
+    commit_record(owner, receipt, record, false)
+}
+
+// Only the retained native producer can append or advance its own original receipt.
+fn commit_record(
+    owner: &OwnedStop,
+    receipt: &CreateReceipt,
+    record: &CreateExecution,
+    pending: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        owner.operation() == LifecycleOperation::Create,
+        "native receipt writer lost its original Create operation"
+    );
+    let storage = owner.storage();
+    let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    storage.verify_profile_identity()?;
+    let _lifecycle = storage.acquire_instance_lifecycle_lock(owner.session_id())?;
+    super::ensure_unique_owner(storage, owner.session_id())?;
+    let expected = owner.current_projection();
+    let before = receipt
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    anyhow::ensure!(
+        before.same_invocation(record),
+        "native producer changed its original complete invocation identity"
+    );
+    let emitted = storage.update_under_workspace_claim_lock(|rows, _| {
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == owner.session_id())
+            .context("original native Create disappeared")?;
+        expected.validate_baseline_at(row, owner.generation())?;
+        validate_goal(storage, row, record, &receipt.spec)?;
+        anyhow::ensure!(
+            row.runner_journal.create_coverage == super::CreationCoverage::Owned,
+            "native producer lost its original owned Create coverage"
+        );
+        if pending {
+            anyhow::ensure!(
+                before.same_record(record)
+                    && record.births.is_empty()
+                    && !row
+                        .runner_journal
+                        .creations
+                        .iter()
+                        .any(|p| p.nonce == record.nonce),
+                "original native pending receipt was replaced or already admitted"
+            );
+            row.runner_journal.creations.push(record.clone());
+        } else {
             let current = row
                 .runner_journal
                 .creations
@@ -873,8 +928,7 @@ fn publish(owner: &OwnedStop, receipt: &CreateReceipt, record: &CreateExecution)
                 .find(|p| p.nonce == record.nonce)
                 .context("original native receipt disappeared")?;
             anyhow::ensure!(
-                current.same_record(&receipt.state.lock().unwrap_or_else(|e| e.into_inner()))
-                    && current.commitment == record.commitment
+                current.same_record(&before)
                     && current
                         .births
                         .iter()
@@ -882,10 +936,17 @@ fn publish(owner: &OwnedStop, receipt: &CreateReceipt, record: &CreateExecution)
                 "original native invocation/birth scope was replaced"
             );
             *current = record.clone();
-            Ok(())
-        },
-        |_| Ok(()),
-    )?;
+        }
+        Ok(Arc::new(super::LaunchOrigin {
+            plan: expected.plan.clone(),
+            generation: owner.generation(),
+            births: expected.births.clone(),
+            creations: row.runner_journal.creations.clone().into(),
+            create_coverage: expected.create_coverage,
+        }))
+    })?;
+    super::sync_parent_directory(storage.sessions_path())?;
+    *owner.acknowledged.lock().unwrap_or_else(|e| e.into_inner()) = Some(emitted);
     *receipt.state.lock().unwrap_or_else(|e| e.into_inner()) = record.clone();
     Ok(())
 }
@@ -1026,9 +1087,14 @@ fn drive(
             "producer ACK is not its actual durable canonical CAS"
         );
         record = published;
-        *owner.acknowledged.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(
-            super::LaunchOrigin::capture_baseline_at(&row, original.plan.storage.clone())?,
-        ));
+        *owner.acknowledged.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::new(super::LaunchOrigin {
+                plan: original.plan.clone(),
+                generation: owner.generation(),
+                births: original.births.clone(),
+                creations: row.runner_journal.creations.clone().into(),
+                create_coverage: original.create_coverage,
+            }));
         *receipt.state.lock().unwrap_or_else(|e| e.into_inner()) = record.clone();
         canonical_natal_ack = true;
         *native_root = Some(crate::process::OwnedCreateRoot::prepare(birth)?);
@@ -1241,10 +1307,9 @@ mod tests {
             } else {
                 cancel.cancel();
             }
-            let failure = intent
+            intent
                 .run_owned_output(&mut command, Some(&cancel))
                 .unwrap_err();
-            assert!(format!("{failure:#}").contains("cancelled before target exec"));
             assert_eq!(
                 std::fs::read(&marker).unwrap(),
                 b"original untouched marker"

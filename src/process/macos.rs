@@ -39,7 +39,7 @@ pub(super) fn ignore_child_reaping_for_hosted_probe() -> std::io::Result<()> {
 pub(super) struct OriginalRootDeathObservation {
     fd: std::os::fd::OwnedFd,
     pid: u32,
-    observed: std::cell::Cell<bool>,
+    observed: std::sync::atomic::AtomicBool,
 }
 
 impl OriginalRootDeathObservation {
@@ -68,13 +68,13 @@ impl OriginalRootDeathObservation {
         Ok(Self {
             fd: owned,
             pid: birth.pid,
-            observed: std::cell::Cell::new(false),
+            observed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub(super) fn exited(&self) -> anyhow::Result<bool> {
         use std::os::fd::AsRawFd;
-        if self.observed.get() {
+        if self.observed.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(true);
         }
         let mut event: libc::kevent = unsafe { std::mem::zeroed() };
@@ -105,9 +105,10 @@ impl OriginalRootDeathObservation {
                     && event.fflags & libc::NOTE_EXIT != 0,
                 "event is not the bound original root death"
             );
-            self.observed.set(true);
+            self.observed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(self.observed.get())
+        Ok(self.observed.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 

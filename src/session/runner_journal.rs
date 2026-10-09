@@ -2302,12 +2302,13 @@ impl ManagedLaunch {
             admission.record_produced_origin(&pending, issued.clone(), Some(identity))?;
             custody.lock().original = issued.clone();
             capture(identity);
-            {
+            let armed = {
                 let mut state = custody.lock();
                 let custody::LaunchState {
                     channel,
                     fences,
                     authorization_attempted,
+                    original: custody_original,
                     ..
                 } = &mut *state;
                 let channel = channel
@@ -2316,23 +2317,26 @@ impl ManagedLaunch {
                 let fences = fences
                     .as_ref()
                     .context("original constructor fences are absent")?;
-                bootstrap::publish_original(
+                let armed = bootstrap::publish_original(
                     channel,
                     &issued,
                     identity,
                     [&fences[0], &fences[1], &fences[2]],
                 )?;
+                admission.record_produced_origin(&issued, armed.clone(), Some(identity))?;
+                *custody_original = armed.clone();
                 admission.authorize(identity, || {
                     *authorization_attempted = true;
                     channel.write_all(&[1])
                 })?;
-            }
+                armed
+            };
             storage.update_under_workspace_claim_lock(|rows, _| {
                 let row = rows
                     .iter_mut()
                     .find(|row| row.id == self.session_id)
                     .context("Published original session disappeared")?;
-                issued.validate_row(row)?;
+                armed.validate_row(row)?;
                 let mut slots = row
                     .runner_journal
                     .launches_mut()
@@ -2365,9 +2369,9 @@ impl ManagedLaunch {
                     .channel
                     .as_mut()
                     .context("original commit channel is absent")?;
-                bootstrap::commit_original(channel, &issued, identity)?
+                bootstrap::commit_original(channel, &armed, identity)?
             };
-            admission.record_produced_origin(&issued, committed.clone(), Some(identity))?;
+            admission.record_produced_origin(&armed, committed.clone(), Some(identity))?;
             {
                 let mut state = custody.lock();
                 state.original = committed;
@@ -2641,7 +2645,7 @@ fn publish_registry_under_original_fences<T>(
                 control_file_identity,
                 socket_path: record.socket_path.clone(),
             });
-            launch.phase = NativeLaunchPhase::Published;
+
             Ok(published)
         })
         .and_then(|published| {
