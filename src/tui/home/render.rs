@@ -928,24 +928,41 @@ impl HomeView {
             return;
         }
 
-        // Layout: main area + status bar + optional update bar. The update bar carries
-        // both persistent banners and transient toasts, so it needs a row whenever either
-        // is present, or a toast fired without a pending update would never show.
+        // Scrape the last prompt for the footer (throttled; a no-op unless the
+        // Ctrl+L toggle is on and a session is selected). The owned line is shown
+        // just above the status bar.
+        self.refresh_last_prompt();
+        let last_prompt = self.last_prompt_footer_line();
+
+        // Layout: main area + optional last-prompt footer + status bar + optional
+        // update bar. The update bar carries both persistent banners and transient
+        // toasts, so it needs a row whenever either is present, or a toast fired
+        // without a pending update would never show.
         let has_update_bar =
             update_info.is_some() || update_status.is_some() || image_update.is_some();
-        let constraints = if has_update_bar {
-            vec![
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ]
-        } else {
-            vec![Constraint::Min(0), Constraint::Length(1)]
-        };
+        let mut constraints = vec![Constraint::Min(0)];
+        if last_prompt.is_some() {
+            constraints.push(Constraint::Length(1)); // last-prompt footer
+        }
+        constraints.push(Constraint::Length(1)); // status bar
+        if has_update_bar {
+            constraints.push(Constraint::Length(1)); // update bar
+        }
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
+
+        // Row indices shift when the footer row is present; resolve them once.
+        let mut next_row = 1;
+        let last_prompt_idx = last_prompt.as_ref().map(|_| {
+            let i = next_row;
+            next_row += 1;
+            i
+        });
+        let status_idx = next_row;
+        next_row += 1;
+        let update_bar_idx = has_update_bar.then_some(next_row);
 
         // The diagnostics strip docks under the session-list column (see
         // `diagnostics_dock`) so it stays narrow and the preview keeps its height.
@@ -1012,12 +1029,15 @@ impl HomeView {
             self.render_list(frame, list_rect, theme, layout);
             self.render_preview(frame, preview_area, theme);
         }
-        self.render_status_bar(frame, main_chunks[1], theme);
+        if let (Some(idx), Some(text)) = (last_prompt_idx, last_prompt.as_deref()) {
+            self.render_last_prompt_footer(frame, main_chunks[idx], theme, text);
+        }
+        self.render_status_bar(frame, main_chunks[status_idx], theme);
 
-        if has_update_bar {
+        if let Some(idx) = update_bar_idx {
             self.render_update_bar(
                 frame,
-                main_chunks[2],
+                main_chunks[idx],
                 theme,
                 update_info,
                 update_status,
@@ -3612,6 +3632,22 @@ impl HomeView {
                 wrap: false,
             },
         );
+    }
+
+    /// Show the first line of the last submitted prompt as a clipped footer.
+    fn render_last_prompt_footer(&self, frame: &mut Frame, area: Rect, theme: &Theme, text: &str) {
+        // `text` is the scrape's first prompt line, already whitespace-collapsed
+        // and length-capped; the paragraph clips whatever still overruns the row.
+        let spans = vec![
+            Span::styled(
+                " ↑ last prompt: ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text.to_string(), Style::default().fg(theme.dimmed)),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
