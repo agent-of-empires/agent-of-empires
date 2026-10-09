@@ -631,8 +631,13 @@ mod tests {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             crate::process::configure_process_group(&mut command);
+            let hard_wait = std::env::var("AOE_HOSTED_NATAL_HARD_WAIT").as_deref() == Ok("1");
+            if hard_wait {
+                crate::process::ignore_child_reaping_for_hosted_probe()?;
+            }
+            let mut observation = None;
             let mut evidence = UnixStream::connect(directory.join("issuer.sock"))?;
-            let (_, _, published) = launch.spawn_child(
+            let launched = launch.spawn_child(
                 &storage,
                 Some(&admission),
                 |input| {
@@ -647,14 +652,32 @@ mod tests {
                         || directory.join("retire-release").exists(),
                         Duration::from_secs(10),
                     )?;
-                    if child.try_wait()?.is_none() {
-                        child.kill()?;
+                    let waited = (|| -> std::io::Result<_> {
+                        if child.try_wait()?.is_none() {
+                            child.kill()?;
+                        }
+                        child.wait()
+                    })();
+                    if hard_wait {
+                        let error = waited.as_ref().expect_err(
+                            "SIGCHLD ignore must cause a real original Child wait error",
+                        );
+                        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+                        std::fs::write(directory.join("root-wait-error"), format!("{error:?}"))?;
                     }
-                    let status = child.wait()?;
+                    let status = waited?;
                     std::fs::write(directory.join("root-reaped"), format!("{status:?}"))?;
                     Ok(())
                 },
                 |born| {
+                    if hard_wait {
+                        observation = Some(
+                            crate::process::OriginalRootDeathObservation::bind(
+                                born.incarnation.unwrap(),
+                            )
+                            .unwrap(),
+                        );
+                    }
                     let issued = admission.origin().unwrap();
                     write_frame(
                         &mut evidence,
@@ -668,7 +691,35 @@ mod tests {
                     )
                     .unwrap();
                 },
-            )?;
+            );
+            if hard_wait {
+                let error = match launched {
+                    Err(error) => error,
+                    Ok(_) => {
+                        anyhow::bail!("original hard wait error unexpectedly returned a child")
+                    }
+                };
+                assert!(error.chain().any(|cause| cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::ECHILD))));
+                let observation =
+                    observation.context("original observer was not bound before publication")?;
+                hosted_wait_until(|| observation.exited().unwrap(), Duration::from_secs(5))?;
+                std::fs::write(
+                    directory.join("hard-wait-returned"),
+                    format!(
+                        "{error:#}
+{admission:?}"
+                    ),
+                )?;
+                hosted_wait_until(
+                    || directory.join("issuer-release").exists(),
+                    Duration::from_secs(10),
+                )?;
+                drop(job);
+                return Ok(());
+            }
+            let (_, _, published) = launched?;
             assert!(
                 published.is_err(),
                 "a stalled pre-ACK child cannot receive target approval"
@@ -677,12 +728,13 @@ mod tests {
             return Ok(());
         }
 
-        for (stages, kill_issuer) in [
-            ("pre-receive,runner-logging", true),
-            ("main-logging", true),
-            ("transition", true),
-            ("storage", true),
-            ("pre-receive", false),
+        for (stages, kill_issuer, hard_wait) in [
+            ("pre-receive,runner-logging", true, false),
+            ("main-logging", true, false),
+            ("transition", true, false),
+            ("storage", true, false),
+            ("pre-receive", false, false),
+            ("pre-receive", false, true),
         ] {
             let home = tempfile::tempdir_in("/tmp")?;
             let _home = crate::session::test_support::isolate_home(home.path());
@@ -736,6 +788,10 @@ mod tests {
                 .env("AOE_HOSTED_NATAL_PRODUCER", home.path())
                 .env("AOE_HOSTED_NATAL_ID", &row.id)
                 .env("AOE_HOSTED_NATAL_STAGE", stages)
+                .env(
+                    "AOE_HOSTED_NATAL_HARD_WAIT",
+                    if hard_wait { "1" } else { "0" },
+                )
                 .env(
                     "AOE_HOSTED_NATAL_TRANSFERRED",
                     home.path().join("transferred"),
@@ -818,10 +874,29 @@ mod tests {
                     home.path().join("retire-release"),
                     b"retire actual original Child",
                 )?;
-                hosted_wait_until(
-                    || home.path().join("root-reaped").exists(),
-                    Duration::from_secs(5),
-                )?;
+                if hard_wait {
+                    hosted_wait_until(
+                        || home.path().join("hard-wait-returned").exists(),
+                        Duration::from_secs(5),
+                    )?;
+                    hosted_wait_until(|| death.exited().unwrap(), Duration::from_secs(5))?;
+                    assert!(
+                        issuer.0.try_wait()?.is_none(),
+                        "issuer observation window must remain live"
+                    );
+                    assert_eq!(hosted_fence_state(&storage, &row.id)?, [true; 3], "C2 before: actual ECHILD loses reachable fence custody after original root terminal");
+                    assert!(!home.path().join("target-executed").exists());
+                    println!("C2 BEFORE actual original ECHILD; root terminal observed by same prebound pidfd/kqueue; all original fences remain stuck; original ID={} DOB={} g={} PFD={original_profile:?} goal={execution:?}; {}", row.id, row.created_at, born.generation, std::fs::read_to_string(home.path().join("hard-wait-returned"))?);
+                    std::fs::write(
+                        home.path().join("issuer-release"),
+                        b"end original observation window",
+                    )?;
+                } else {
+                    hosted_wait_until(
+                        || home.path().join("root-reaped").exists(),
+                        Duration::from_secs(5),
+                    )?;
+                }
                 assert!(issuer.0.wait()?.success());
             }
             hosted_wait_until(|| death.exited().unwrap(), Duration::from_secs(35))?;

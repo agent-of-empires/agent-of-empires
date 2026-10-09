@@ -26,6 +26,17 @@ pub(super) fn receive_natal_authorization_byte(
 }
 
 #[cfg(all(test, debug_assertions))]
+pub(super) fn ignore_child_reaping_for_hosted_probe() -> std::io::Result<()> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = libc::SIG_IGN;
+    let result = unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, debug_assertions))]
 pub(super) struct OriginalRootDeathObservation {
     fd: std::os::fd::OwnedFd,
     pid: u32,

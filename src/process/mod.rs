@@ -19,6 +19,11 @@ use nix::unistd::Pid;
 pub(crate) struct OriginalRootDeathObservation(platform::OriginalRootDeathObservation);
 
 #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn ignore_child_reaping_for_hosted_probe() -> std::io::Result<()> {
+    platform::ignore_child_reaping_for_hosted_probe()
+}
+
+#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
 impl OriginalRootDeathObservation {
     pub(crate) fn bind(birth: ProcessIncarnation) -> anyhow::Result<Self> {
         anyhow::ensure!(
