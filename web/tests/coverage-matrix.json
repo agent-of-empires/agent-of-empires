@@ -482,6 +482,13 @@
       ]
     },
     {
+      "id": "settings.list-field",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/settings-list-field.spec.ts", "src/components/settings/__tests__/StructuredWidgets.test.tsx"],
+      "components": ["web/src/components/settings/FormFields.tsx", "web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
       "id": "settings.mobile-header",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -787,6 +794,19 @@
         "web/src/App.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/lib/repinOnResize.ts"
+      ]
+    },
+    {
+      "id": "sidebar.terminal-focus-handoff",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/terminal-focus-shortcut.spec.ts", "src/hooks/useKeyboardShortcuts.test.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/shortcuts.ts"
       ]
     },
     {
@@ -1952,6 +1972,14 @@
       "notes": "The shared Dialog links its body as the accessible description; bodies with controls point it at their prompt, and ScratchOverridesModal opts out."
     },
     {
+      "id": "acp.compaction-summary",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/ThreadMessages.test.tsx"],
+      "components": ["web/src/components/acp/activityMessages.ts", "web/src/components/acp/ThreadMessages.tsx"],
+      "notes": "The summary an agent retains on /compact renders as a collapsed card under the compaction divider; replacement and clearing are server-side row patches covered by Rust tests."
+    },
+    {
       "id": "acp.tool-group-chunking",
       "kind": "vitest",
       "risk": "medium",
@@ -2521,6 +2549,9 @@
       ],
       "components": [
         "web/src/components/acp/Composer.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/shortcuts.ts",
         "web/src/components/acp/recallNav.ts",
         "web/src/components/acp/ComposerControls.tsx"
       ]
@@ -2866,6 +2897,22 @@
       "risk": "medium",
       "specs": ["src/components/acp/WrapToggle.test.tsx", "tests/acp-tool-output-wrap.spec.ts"],
       "components": ["web/src/components/acp/WrapToggle.tsx"]
+    },
+    {
+      "id": "acp.tool-run-folding",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-structured-view.spec.ts",
+        "src/components/acp/ToolExpansion.test.tsx",
+        "src/components/acp/activityMessages.test.ts",
+        "src/lib/toolAnchor.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/ToolExpansion.tsx",
+        "web/src/components/acp/GroupToolCards.tsx",
+        "web/src/lib/toolAnchor.ts"
+      ]
     },
     {
       "id": "acp.queued-prompt-expand-bounds",
@@ -4261,9 +4308,10 @@
         "web/src/components/plugin/PluginSlots.tsx",
         "web/src/components/plugin/PluginPane.tsx",
         "web/src/components/plugin/SlotChrome.tsx",
-        "web/src/components/plugin/paneBlocks.tsx"
+        "web/src/components/plugin/paneBlocks.tsx",
+        "web/src/components/plugin/BlockMarkdown.tsx"
       ],
-      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer. api_version 13 adds the sparkline block (per-sample band coloring) and the global home-pane slot (PluginHomePanes), covered by the sparkline and home-pane cases in PluginSlots.test.tsx."
+      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer. api_version 13 adds the sparkline block (per-sample band coloring) and the global home-pane slot (PluginHomePanes), covered by the sparkline and home-pane cases in PluginSlots.test.tsx. api_version 15 adds the sanitised markdown block (BlockMarkdown: no raw HTML, no remote images, href-policy links), covered by the markdown block cases there."
     },
     {
       "id": "plugins.composer-actions",

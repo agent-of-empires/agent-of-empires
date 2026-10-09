@@ -1406,6 +1406,14 @@ fn transcript_lines(
                 }
                 out.push(Line::default());
             }
+            // Empty until the summary arrives; the row only anchors its position.
+            TranscriptRowKind::CompactionSummary => {
+                if !row.text.is_empty() {
+                    out.push(note_line(NoteKind::Info, "Compaction summary"));
+                    out.extend(agent_message_lines(&row.text, theme));
+                    out.push(Line::default());
+                }
+            }
             TranscriptRowKind::EmptyOutput
             | TranscriptRowKind::ContextReset
             | TranscriptRowKind::SessionCleared
@@ -1920,6 +1928,7 @@ mod tests {
                 severity: "warning".into(),
                 title: "Model fallback".into(),
                 description: Some("Switched to Sonnet.".into()),
+                key: None,
             }]));
 
         // One strip row per undismissed notice, each with its own close target.
@@ -2326,9 +2335,24 @@ mod tests {
                 outcome: ElicitationOutcome::Accepted,
                 answers: vec![answer("Proceed?", "Yes"), answer("Mode", "Fast")],
             },
+            Event::ConversationCompactionSummary {
+                compaction_id: "c-1".into(),
+                text: "kept the codeword".into(),
+            },
+            Event::ConversationCompactionSummary {
+                compaction_id: "c-2".into(),
+                text: String::new(),
+            },
         ]);
         let out = joined(&transcript_lines(&t, &Theme::default(), None));
-        for want in ["working on it", "› Proceed?: Yes", "› Mode: Fast"] {
+        assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
+        for want in [
+            "working on it",
+            "› Proceed?: Yes",
+            "› Mode: Fast",
+            "· Compaction summary",
+            "kept the codeword",
+        ] {
             assert!(out.contains(want), "{out:?}");
         }
         assert!(

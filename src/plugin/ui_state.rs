@@ -616,6 +616,22 @@ fn check_block_depth(blocks: Option<&[Value]>) -> Result<(), String> {
     }
 }
 
+/// Blocks are otherwise opaque; `markdown` is the one kind rejected up front
+/// when malformed. Run after `check_block_depth`, which bounds the recursion.
+fn check_markdown_blocks(blocks: &[Value]) -> Result<(), String> {
+    for block in blocks {
+        if block.get("kind").and_then(Value::as_str) == Some("markdown")
+            && !block.get("text").is_some_and(Value::is_string)
+        {
+            return Err("markdown block requires a string text".into());
+        }
+        if let Some(children) = block.get("children").and_then(Value::as_array) {
+            check_markdown_blocks(children)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_badge_groups(items: &[BadgeItem]) -> Result<(), String> {
     if items.iter().any(|i| i.group.as_deref() == Some("")) {
         return Err("badge item group must not be empty".into());
@@ -652,6 +668,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             let parsed: PanePayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
             check_block_depth(parsed.blocks.as_deref())?;
+            check_markdown_blocks(parsed.blocks.as_deref().unwrap_or_default())?;
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
         UiSlot::ComposerAction => {
@@ -1020,6 +1037,34 @@ mod tests {
                 Some("s1"),
                 json!({"blocks": [{"kind": "some-future-kind", "payload": inert}]}),
                 true,
+            ),
+            (
+                "markdown block accepts string text",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "markdown", "text": "# hi\n- [x] done", "tone": "info"}]}),
+                true,
+            ),
+            (
+                "markdown block without text rejected",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "markdown"}]}),
+                false,
+            ),
+            (
+                "markdown block with non-string text rejected",
+                UiSlot::HomePane,
+                None,
+                json!({"blocks": [{"kind": "markdown", "text": 5}]}),
+                false,
+            ),
+            (
+                "markdown block nested in a section is checked too",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "section", "children": [{"kind": "markdown"}]}]}),
+                false,
             ),
             (
                 "pane payload cap is larger than other slots",

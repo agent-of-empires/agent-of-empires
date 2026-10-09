@@ -161,14 +161,17 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         ? "text-text-primary"
         : "text-text-secondary";
   const navigationSessionId = navigationSession?.id ?? null;
+  const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
 
   return (
     <>
       <a
         ref={rowRef}
-        href={navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/"}
+        href={sessionPath}
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
+        aria-current={isActive && sessionPath === window.location.pathname ? "page" : undefined}
+        data-active-session-row={isActive || undefined}
         data-testid="sidebar-session-row"
         title={model.needsAttention ? `${label} · ${model.attentionHint}` : label}
         draggable={false}
@@ -188,7 +191,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-6 pr-3" : "px-3"
-        } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
+        } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500`}
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">

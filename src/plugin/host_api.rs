@@ -14,7 +14,7 @@ use crate::plugin::ui_state::{Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
 
 const CAP_WORKER: &str = "runtime.worker";
-const CAP_SESSION_READ: &str = "session.read";
+pub(crate) const CAP_SESSION_READ: &str = "session.read";
 const CAP_SESSION_WRITE: &str = "session.write";
 const CAP_NOTIFICATIONS: &str = "notifications";
 const CAP_COMPOSER_WRITE: &str = "composer.write";
@@ -63,6 +63,10 @@ impl HostApiState {
 
     fn storage(&self) -> anyhow::Result<Storage> {
         Storage::new_unwatched(&self.profile)
+    }
+
+    pub(crate) fn profile(&self) -> &str {
+        &self.profile
     }
 
     pub fn bump_settings_revision(&self) -> u64 {
