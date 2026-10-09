@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `14`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `15`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `14`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `15`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -313,6 +313,7 @@ The payload is capped at 64 KiB. Everything but `blocks` is validated strictly; 
 |---|---|---|
 | `heading` | `text` | |
 | `note` | `text` | `tone` |
+| `markdown` | `text` | `tone` (requires `api_version >= 15`) |
 | `divider` | | |
 | `row` | one of `label` / `value` / `prefix` / `icon` / `avatar` | `sublabel`, `tone`, `value_tone`, `color`, `href`, `tooltip`, `mono`, `selected`, `badges`, `method`, `params` |
 | `section` | | `title`, `children`, `value`, `value_tone`, `badges`, `icon`, `tone`, `boxed`, `scroll`, `collapsible`, `collapsed` |
@@ -334,6 +335,8 @@ An `href` renders as a link only when it is an `http(s)` URL or a path starting 
 **`callout`** is a tone-bordered verdict card: glyph, `title`, `detail` paragraph, and full-width `actions`. Use it for the one thing the pane is telling the user, and a `section` for a list.
 
 **`bar`** stacks `segments` (`{ value, tone?, color?, label? }`) proportionally; segments without a positive `value` are dropped and a bar left with nothing renders nothing. **`sparkline`** plots `values` (oldest first) as a history line, with `max` fixing the top of the scale so a series does not auto-scale each refresh and `bands` (`{ at, tone }` thresholds) recoloring each sample by the highest band it reaches. Both take a `caption` beneath.
+
+**`markdown`** renders `text` as GitHub-flavoured markdown: headings, emphasis, inline and fenced code, lists including task lists, blockquotes, links and tables. `text` must be a string, or the host rejects the push; it has no cap of its own beyond the pane payload cap. Plugin text is untrusted, so the web dashboard sanitises it: raw HTML, HTML comments and `<details>` tags are dropped (markdown inside them still renders when set off by blank lines, as on GitHub; without them the whole HTML block is dropped), an image shows its alt text and never loads its URL, and a link follows the `href` policy above (a link that fails it shows as plain text). The TUI cannot render rich markdown and shows `text` as plain lines with the markers kept.
 
 **`columns`** lays its `children` out in equal fractions, and a single child spans the full width, so eliding one card collapses the row cleanly.
 
