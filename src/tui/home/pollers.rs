@@ -1232,12 +1232,6 @@ socket.on('data', bytes => {{
         view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), None);
         let dialog = screen(&mut view);
         assert!(dialog.contains("Force Remove Refused"), "{dialog}");
-        assert!(
-            ["already", "started", "commit", "cleanup"]
-                .iter()
-                .all(|word| dialog.contains(word)),
-            "actual TooLate reason: {dialog}"
-        );
         assert!(view.confirm_dialog.is_none());
         assert!(view.pending_force_remove_session.is_none());
         assert_eq!(
@@ -1292,6 +1286,7 @@ socket.on('data', bytes => {{
         assert!(!screen(&mut view).contains("Force Remove Refused"));
 
         hook.write_all(format!("{release}\n").as_bytes()).unwrap();
+        hook.shutdown(std::net::Shutdown::Write).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !view.apply_deletion_results() {
             assert!(

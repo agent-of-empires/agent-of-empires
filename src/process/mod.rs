@@ -46,6 +46,17 @@ mod macos;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::receive_natal_authorization_until;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn receive_natal_authorization_until(
+    _: &std::os::unix::net::UnixStream,
+    _: std::time::Instant,
+    _: impl FnMut() -> bool,
+) -> std::io::Result<Option<u8>> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]

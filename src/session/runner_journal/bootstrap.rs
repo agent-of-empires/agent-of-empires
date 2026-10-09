@@ -461,7 +461,7 @@ struct ChildNatalGuard {
 
 impl ChildNatalGuard {
     fn start(channel: &UnixStream, deadline: Instant) -> Result<Self> {
-        let mut reader = channel.try_clone()?;
+        let reader = channel.try_clone()?;
         let channel = channel.try_clone()?;
         let state = Arc::new((Mutex::new(ChildNatalState::default()), Condvar::new()));
         let watched = state.clone();
@@ -486,37 +486,28 @@ impl ChildNatalGuard {
                 }
                 drop(state);
                 let authorized = (|| -> Result<()> {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    anyhow::ensure!(!remaining.is_zero(), "natal authorization deadline expired");
-                    reader.set_read_timeout(Some(Duration::from_millis(25)))?;
-                    loop {
-                        anyhow::ensure!(
-                            !deadline.saturating_duration_since(Instant::now()).is_zero(),
-                            "natal authorization deadline expired"
-                        );
-                        if lock
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .released
-                        {
-                            anyhow::bail!("natal bootstrap was released");
+                    let byte = crate::process::receive_natal_authorization_until(
+                        &reader,
+                        deadline,
+                        || {
+                            lock.lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .released
+                        },
+                    )
+                    .map_err(|error| match error.kind() {
+                        std::io::ErrorKind::TimedOut => {
+                            anyhow::anyhow!("natal authorization deadline expired")
                         }
-                        let mut byte = [0];
-                        match reader.read(&mut byte) {
-                            Ok(1) if byte == [1] => return Ok(()),
-                            Ok(0) => anyhow::bail!("execution authorization closed"),
-                            Ok(_) => anyhow::bail!("execution authorization was refused"),
-                            Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::Interrupted
-                                        | std::io::ErrorKind::WouldBlock
-                                        | std::io::ErrorKind::TimedOut
-                                ) => {}
-                            Err(error) => {
-                                return Err(error).context("execution authorization closed")
-                            }
+                        std::io::ErrorKind::Interrupted => {
+                            anyhow::anyhow!("natal bootstrap was released")
                         }
+                        _ => anyhow::Error::new(error).context("reading execution authorization"),
+                    })?;
+                    match byte {
+                        Some(1) => Ok(()),
+                        None => anyhow::bail!("execution authorization closed"),
+                        Some(_) => anyhow::bail!("execution authorization was refused"),
                     }
                 })();
                 let _ = send.send(authorized);
@@ -888,7 +879,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match listener.accept() {
-                Ok((stream, _)) => return Ok(stream),
+                Ok((stream, _)) => {
+                    // Darwin inherits the listener's nonblocking mode.
+                    stream.set_nonblocking(false)?;
+                    return Ok(stream);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     anyhow::ensure!(
                         Instant::now() < deadline,
@@ -1052,6 +1047,50 @@ mod tests {
                 "reading authorization must not disarm the fence watchdog"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn expired_or_released_authorization_keeps_queued_byte_unconsumed() -> Result<()> {
+        for released in [false, true] {
+            let (mut sender, mut receiver) = UnixStream::pair()?;
+            sender.write_all(&[1])?;
+            let deadline = if released {
+                Instant::now() + NATAL_LIFETIME
+            } else {
+                Instant::now()
+            };
+            let error =
+                crate::process::receive_natal_authorization_until(&receiver, deadline, || released)
+                    .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if released {
+                    std::io::ErrorKind::Interrupted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                }
+            );
+            let mut byte = [0];
+            receiver.read_exact(&mut byte)?;
+            assert_eq!(byte, [1]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn child_disarm_wakes_original_channel_before_its_deadline() -> Result<()> {
+        let (_sender, receiver) = UnixStream::pair()?;
+        let mut guard =
+            ChildNatalGuard::start(&receiver, Instant::now() + Duration::from_secs(30))?;
+        guard.frame_consumed();
+        let (done, completed) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            guard.disarm();
+            done.send(()).unwrap();
+        });
+        completed.recv_timeout(Duration::from_secs(5))?;
+        thread.join().unwrap();
         Ok(())
     }
 

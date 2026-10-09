@@ -2615,6 +2615,10 @@ impl Storage {
             self.file_watch.notify_local_change(&source_groups_path);
         }
         self.file_watch.notify_local_change(&self.sessions_path);
+        let origin = Arc::new(target.clone());
+        for row in &mut moved {
+            row.storage_origin = Some(origin.clone());
+        }
         Ok(moved)
     }
 }

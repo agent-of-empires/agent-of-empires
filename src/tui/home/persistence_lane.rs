@@ -766,6 +766,7 @@ impl HomeView {
                                 }
                                 self.clear_profile_projection_state();
                             }
+                            let snapshot_published = done.snapshot.is_some();
                             if let Some(mut snapshot) = done.snapshot {
                                 if let persistence_transactions::TransactionEffect::Edited {
                                     rows,
@@ -795,7 +796,7 @@ impl HomeView {
                                 }
                                 self.apply_reload_snapshot(snapshot, &active.revisions);
                             }
-                            self.apply_transaction_effect(done.effect);
+                            self.apply_transaction_effect(done.effect, snapshot_published);
                         } else {
                             self.apply_transaction_native_effect(done.effect);
                         }
@@ -1109,7 +1110,11 @@ impl HomeView {
             _ => {}
         }
     }
-    fn apply_transaction_effect(&mut self, effect: persistence_transactions::TransactionEffect) {
+    fn apply_transaction_effect(
+        &mut self,
+        effect: persistence_transactions::TransactionEffect,
+        snapshot_published: bool,
+    ) {
         use persistence_transactions::TransactionEffect;
         match effect {
             TransactionEffect::Ordered {
@@ -1132,7 +1137,9 @@ impl HomeView {
                 }
             }
             TransactionEffect::Edited { rows, warning } => {
-                self.project_transaction_rows(rows);
+                if !snapshot_published {
+                    self.project_transaction_rows(rows);
+                }
                 if let Some(warning) = warning {
                     self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
                 }
@@ -1447,7 +1454,11 @@ impl HomeView {
                             row.command.clone_from(&current.command);
                             row.extra_args.clone_from(&current.extra_args);
                         }
-                        row.merge_runtime_from_reload(current);
+                        if current.lifecycle_generation == row.lifecycle_generation {
+                            row.merge_runtime_for_profile_move(current);
+                        } else {
+                            row.merge_runtime_from_reload(current);
+                        }
                     }
                 }
                 if dirty || newer {

@@ -2,6 +2,29 @@
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 
+pub(super) fn receive_natal_authorization_byte(
+    channel: &std::os::unix::net::UnixStream,
+) -> std::io::Result<Option<u8>> {
+    use std::os::fd::AsRawFd;
+    let mut byte = [0u8];
+    // SAFETY: the original socket remains owned and byte is writable for one byte.
+    let received = unsafe {
+        libc::recv(
+            channel.as_raw_fd(),
+            byte.as_mut_ptr().cast(),
+            byte.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if received < 0 {
+        Err(std::io::Error::last_os_error())
+    } else if received == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(byte[0]))
+    }
+}
+
 #[cfg(all(test, debug_assertions))]
 pub(super) struct OriginalRootDeathObservation {
     fd: std::os::fd::OwnedFd,

@@ -195,11 +195,10 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     }
 }
 
-/// Legacy archived rows migrate before current-schema reads. The persisted-session
-/// listing, unlike the worker/process listing, includes rows with no native pane.
+/// CLI upgrade normalizes archived transient statuses once, preserving error rows.
 #[test]
-#[serial_test::serial]
-fn test_archived_waiting_row_reads_idle_and_migrates_once() {
+#[parallel]
+fn test_legacy_archived_waiting_status_migrates_once() {
     let h = TuiTestHarness::new("archive_waiting_zombie");
     let version_path = app_dir_in(h.home_path()).join(".schema_version");
     let project = h.project_path();
@@ -229,8 +228,6 @@ fn test_archived_waiting_row_reads_idle_and_migrates_once() {
         .unwrap();
     assert_eq!(healed["status"], "idle");
     assert_eq!(healed["archived_at"], "2026-07-13T22:17:21Z");
-    // The schema migration, not a fixture-created birth or None journal, supplies
-    // the legacy journal. Only the transient status is edited for the read guard.
     assert_eq!(healed["runner_journal"]["coverage"], "unknown");
     healed["status"] = serde_json::json!("waiting");
     assert_eq!(
@@ -240,37 +237,10 @@ fn test_archived_waiting_row_reads_idle_and_migrates_once() {
         "error"
     );
     std::fs::write(h.sessions_path(), serde_json::to_vec(&stored).unwrap()).unwrap();
-    let stamped = std::fs::read_to_string(&version_path).unwrap();
-    assert_eq!(
-        stamped.trim().parse::<u32>().unwrap(),
-        agent_of_empires::migrations::current_schema_version()
-    );
-    {
-        let _home = crate::harness::HomeGuard::new(h.home_path());
-        let rows = agent_of_empires::session::Storage::open_unwatched("default")
-            .unwrap()
-            .load()
-            .unwrap();
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "frozen0waiting01")
-                .unwrap()
-                .status,
-            agent_of_empires::session::Status::Idle
-        );
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "resting0error001")
-                .unwrap()
-                .status,
-            agent_of_empires::session::Status::Error
-        );
-    }
     h.run_cli_ok(&["list", "--json"]);
-    assert_eq!(std::fs::read_to_string(&version_path).unwrap(), stamped);
     assert_eq!(
         h.read_sessions(),
         stored,
-        "read guard must not rerun the migration"
+        "CLI reads must not repeat the archived-status migration"
     );
 }

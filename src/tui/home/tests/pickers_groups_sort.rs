@@ -577,7 +577,7 @@ fn test_prompt_archive_selected_group() {
 
 #[test]
 #[serial]
-fn test_delete_group_with_sessions_updates_groups_field() {
+fn busy_hidden_member_refuses_group_delete_without_any_metadata_write() {
     use crate::tui::dialogs::GroupDeleteOptions;
 
     let temp = TempDir::new().unwrap();
@@ -648,6 +648,8 @@ fn test_delete_group_with_sessions_updates_groups_field() {
     assert_eq!(view.selected_group.as_deref(), Some("work"));
     assert_eq!(view.selected_group_profile.as_deref(), Some("test"));
 
+    let before = std::fs::read(storage.sessions_path()).unwrap();
+    let other_before = std::fs::read(other_storage.sessions_path()).unwrap();
     let options = GroupDeleteOptions {
         delete_sessions: true,
         delete_worktrees: false,
@@ -668,92 +670,17 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         drain_persistence(&mut view)
     }
     .unwrap();
-    let during_delete = storage.load().unwrap();
-    assert_eq!(during_delete.len(), 1);
-    assert_ne!(
-        during_delete[0].status,
-        Status::Deleting,
-        "save persisted the transient Deleting status"
-    );
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !view.apply_deletion_results() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        view.info_dialog.is_some(),
-        "busy purge result was not delivered"
-    );
-
-    let persisted = storage.load().unwrap();
-    assert_eq!(persisted.len(), 1);
-    assert!(persisted[0].group_path.is_empty());
-    assert_ne!(persisted[0].status, Status::Deleting);
-    storage
-        .update(|instances, _| {
-            instances.clear();
-            Ok(())
-        })
-        .unwrap();
-
-    {
-        view.request_reload(super::super::ReloadKind::Full);
-        drain_persistence(&mut view)
-    }
-    .unwrap();
-    let tree = view.group_trees.get("test").unwrap();
-    assert!(!tree.group_exists("work"));
-    assert!(!tree.group_exists("work/projects"));
-    assert!(tree.group_exists("workbench"), "near-prefix group removed");
-
-    let (_, groups) = storage.load_with_groups().unwrap();
-    assert!(!groups
-        .iter()
-        .any(|group| group.path == "work" || group.path.starts_with("work/")));
-    assert!(groups.iter().any(|group| group.path == "workbench"));
-    let (_, other_groups) = other_storage.load_with_groups().unwrap();
-    assert!(other_groups.iter().any(|group| group.path == "work"));
-    assert!(other_groups
-        .iter()
-        .any(|group| group.path == "work/projects"));
-    let mut creating = Instance::new("creating-member", "/tmp/creating");
-    creating.source_profile = "test".to_string();
-    creating.group_path = "creating".to_string();
-    creating.status = Status::Creating;
-    let creating_id = creating.id.clone();
-    view.add_instance(creating);
-    view.rebuild_group_trees();
-    view.selected_group = Some("creating".to_string());
-    view.selected_group_profile = Some("test".to_string());
-    view.info_dialog = None;
-
-    {
-        let submitted = view.delete_group_with_sessions(&options);
-        await_transaction_result(
-            &mut view,
-            submitted.map(|_| super::super::TransactionDisposition::Queued),
-        )
-    }
-    .unwrap();
-    assert_eq!(view.selected_group.as_deref(), Some("creating"));
+    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
     assert_eq!(
-        view.info_dialog.as_ref().map(InfoDialog::title),
-        Some("Creation in progress")
+        std::fs::read(other_storage.sessions_path()).unwrap(),
+        other_before
     );
-
-    view.mutate_instance(&creating_id, |instance| {
-        instance.status = Status::Deleting;
-    });
-    {
-        view.request_save();
-        drain_persistence(&mut view)
-    }
-    .unwrap();
-    assert!(!storage
-        .load()
-        .unwrap()
-        .iter()
-        .any(|instance| instance.id == creating_id));
+    let persisted = storage.load().unwrap();
+    assert_eq!(persisted[0].group_path, "work/projects");
+    assert_eq!(persisted[0].lifecycle_generation, 1);
+    assert!(view.group_trees["test"].group_exists("work"));
+    assert!(view.group_trees["test"].group_exists("work/projects"));
+    assert!(view.group_trees["test"].group_exists("workbench"));
 }
 
 #[test]

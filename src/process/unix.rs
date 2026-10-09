@@ -25,6 +25,80 @@ use anyhow::Result;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
+// Cancellation sets released permanently and wakes this original socket with shutdown(Read).
+pub(crate) fn receive_natal_authorization_until(
+    channel: &UnixStream,
+    deadline: std::time::Instant,
+    mut released: impl FnMut() -> bool,
+) -> std::io::Result<Option<u8>> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    use std::time::Instant;
+
+    let mut terminal_readiness = false;
+    loop {
+        if released() {
+            return Err(ErrorKind::Interrupted.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        match super::platform::receive_natal_authorization_byte(channel) {
+            Ok(byte) => {
+                if released() {
+                    return Err(ErrorKind::Interrupted.into());
+                }
+                if Instant::now() >= deadline {
+                    return Err(ErrorKind::TimedOut.into());
+                }
+                return Ok(byte);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if terminal_readiness {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        if released() {
+            return Err(ErrorKind::Interrupted.into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        // Round poll up to milliseconds; the Instant still bounds authorization.
+        let milliseconds =
+            remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
+        let timeout = milliseconds.min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut event = libc::pollfd {
+            fd: channel.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: event remains writable and channel keeps the descriptor owned.
+        let ready = unsafe { libc::poll(&mut event, 1, timeout) };
+        if ready < 0 {
+            let error = Error::last_os_error();
+            if error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        if event.revents & libc::POLLNVAL != 0 {
+            return Err(Error::from_raw_os_error(libc::EBADF));
+        }
+        if event.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+            return Err(ErrorKind::Other.into());
+        }
+        terminal_readiness = event.revents & (libc::POLLHUP | libc::POLLERR) != 0;
+    }
+}
+
 pub(crate) fn receive_bootstrap_descriptors<const N: usize>(
     channel: &UnixStream,
 ) -> Result<[OwnedFd; N]> {

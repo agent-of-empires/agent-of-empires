@@ -33,7 +33,6 @@ mod storage_concurrency;
 mod terminal_smart_rename;
 mod tmux_reachability;
 mod tmux_send_keys;
-mod tui_attach_detach;
 mod update_command;
 mod worktree_integration;
 
