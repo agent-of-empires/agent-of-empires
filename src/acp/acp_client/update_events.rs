@@ -8,8 +8,8 @@ use crate::acp::state::{
     ToolCall, UsageCost,
 };
 use agent_client_protocol::schema::v1::{
-    CompactionId, CompactionStatus, ContentBlock, MessageId, NoticeSeverity, SessionUpdate,
-    TextContent,
+    CompactionId, CompactionStatus, ContentBlock, MessageId, NoticeSeverity, SessionId,
+    SessionUpdate, TextContent,
 };
 use agent_client_protocol::schema::MaybeUndefined;
 use tracing::debug;
@@ -96,6 +96,17 @@ fn compaction_failed_notice(id: &CompactionId, error: Option<String>) -> Event {
         description: error,
         key: Some(format!("compaction-{id}")),
     }
+}
+
+/// ACP ids are unique only per session, while an agent switch keeps the
+/// transcript; qualifying them keeps each session's rows and notices apart.
+pub(super) fn qualify_compaction_id(session: &SessionId, update: &mut SessionUpdate) {
+    let id = match update {
+        SessionUpdate::CompactionUpdate(u) => &mut u.compaction_id,
+        SessionUpdate::CompactionSummaryChunk(c) => &mut c.compaction_id,
+        _ => return,
+    };
+    *id = CompactionId::new(format!("{}/{}", session.0, id.0));
 }
 
 pub(super) enum CompactionFold {
@@ -952,6 +963,88 @@ mod tests {
                     Some("out of tokens".into()),
                     key
                 ),
+            ]
+        );
+    }
+
+    /// An agent switch opens a new native session that may reuse a compaction
+    /// id; its rows must not patch the earlier session's.
+    #[test]
+    fn compaction_ids_are_scoped_to_their_session() {
+        use crate::acp::transcript::TranscriptModel;
+        let summary = |text: &str| serde_json::json!({"summary": [{"type": "text", "text": text}]});
+        let error = |text: &str| serde_json::json!({"error": text});
+        let mut model = TranscriptModel::new();
+        let mut seq = 0;
+        let mut feed = |tracker: &mut CompactionTracker, session: &str, mut u: SessionUpdate| {
+            qualify_compaction_id(&SessionId::new(session), &mut u);
+            let events = match tracker.observe(&mut u) {
+                CompactionFold::Pass => claude(u),
+                CompactionFold::Skip => Vec::new(),
+                CompactionFold::Patch(e) => vec![*e],
+            };
+            for event in events {
+                seq += 1;
+                model.apply_event(seq, &event);
+            }
+        };
+        let (mut one, mut two) = (CompactionTracker::default(), CompactionTracker::default());
+        feed(
+            &mut one,
+            "s1",
+            compaction_update("a", "completed", summary("first")),
+        );
+        feed(
+            &mut one,
+            "s1",
+            compaction_update("b", "failed", error("e1")),
+        );
+        feed(
+            &mut two,
+            "s2",
+            compaction_update("a", "completed", summary("second")),
+        );
+        feed(
+            &mut two,
+            "s2",
+            compaction_update("b", "failed", error("e2")),
+        );
+        feed(
+            &mut two,
+            "s2",
+            compaction_update("a", "completed", summary("patched")),
+        );
+        feed(
+            &mut two,
+            "s2",
+            compaction_update("b", "failed", error("e3")),
+        );
+        let rows: Vec<(&str, &str)> = model
+            .rows()
+            .iter()
+            .map(|r| (r.id.as_str(), r.text.as_str()))
+            .filter(|(id, _)| !id.starts_with("compacted-"))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("compaction-summary-s1/a", "first"),
+                ("notice-compaction-s1/b", "error: Compaction failed: e1"),
+                ("compaction-summary-s2/a", "patched"),
+                ("notice-compaction-s2/b", "error: Compaction failed: e3"),
+            ]
+        );
+        let kinds: Vec<_> = model.rows().iter().map(|r| r.kind).collect();
+        use crate::acp::transcript::TranscriptRowKind::{Advisory, Compacted, CompactionSummary};
+        assert_eq!(
+            kinds,
+            [
+                Compacted,
+                CompactionSummary,
+                Advisory,
+                Compacted,
+                CompactionSummary,
+                Advisory
             ]
         );
     }

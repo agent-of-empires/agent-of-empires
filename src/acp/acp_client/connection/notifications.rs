@@ -23,7 +23,8 @@ use crate::acp::acp_client::tool_context::{
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
-    map_update_to_events, AgentMessageDedup, CompactionFold, CompactionTracker,
+    map_update_to_events, qualify_compaction_id, AgentMessageDedup, CompactionFold,
+    CompactionTracker,
 };
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 
@@ -194,6 +195,7 @@ impl Shared {
         }
         // Replayed compactions carry fresh ids and are dropped as transcript.
         if !suppressing {
+            qualify_compaction_id(&notification.session_id, &mut notification.update);
             let fold = self
                 .compaction
                 .lock()
