@@ -221,37 +221,47 @@ pub async fn update_session_color(
 }
 
 pub(super) async fn publish_archive_update(
-    state: &AppState,
+    state: &Arc<AppState>,
     original: &crate::session::LaunchOrigin,
     issued: Option<&crate::session::LaunchOrigin>,
     generation: u64,
     acknowledged: &crate::session::LaunchOrigin,
     authoritative: Instance,
-) -> Option<SessionResponse> {
-    if !original.storage().same_origin_as(acknowledged.storage()) {
-        return None;
-    }
-    let mut instances = state.instances.write().await;
-    let row = instances.iter_mut().find(|row| {
-        original.matches_instance(row)
-            || issued.is_some_and(|scope| scope.matches_instance(row))
-            || acknowledged.matches_instance(row)
-            || (row
-                .storage_origin
-                .as_ref()
-                .is_some_and(|storage| original.storage().same_origin_as(storage))
-                && original.validate_baseline_at(row, generation).is_ok())
-    })?;
-    let old_status = row.status;
-    *row = crate::server::reload::merge_runtime_fields(row, authoritative);
-    state
-        .mutation_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    publish_status_change(&state.status_tx, row, old_status);
-    Some(SessionResponse::from_instance(
-        row,
-        crate::claude_settings::read_tui_fullscreen(),
-    ))
+) -> Result<Option<SessionResponse>, String> {
+    let state = Arc::clone(state);
+    let original = original.clone();
+    let issued = issued.cloned();
+    let acknowledged = acknowledged.clone();
+    tokio::task::spawn_blocking(move || {
+        if !original.storage().same_origin_as(acknowledged.storage()) {
+            return None;
+        }
+        let mut instances = state.instances.blocking_write();
+        let row = instances.iter_mut().find(|row| {
+            original.matches_instance(row)
+                || issued
+                    .as_ref()
+                    .is_some_and(|scope| scope.matches_instance(row))
+                || acknowledged.matches_instance(row)
+                || (row
+                    .storage_origin
+                    .as_ref()
+                    .is_some_and(|storage| original.storage().same_origin_as(storage))
+                    && original.validate_baseline_at(row, generation).is_ok())
+        })?;
+        let old_status = row.status;
+        *row = crate::server::reload::merge_runtime_fields(row, authoritative);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        publish_status_change(&state.status_tx, row, old_status);
+        Some(SessionResponse::from_instance(
+            row,
+            crate::claude_settings::read_tui_fullscreen(),
+        ))
+    })
+    .await
+    .map_err(|error| format!("Archive cache publication task failed: {error}"))
 }
 
 pub async fn update_session_archive(
@@ -314,11 +324,14 @@ pub async fn update_session_archive(
             }
             Err(_) => return persist_failed_response(),
         };
-        let Some(response) =
-            publish_archive_update(&state, &original, None, generation, &acknowledged, row).await
-        else {
-            return crate::server::api::session_gone_after_persist();
-        };
+        let response =
+            match publish_archive_update(&state, &original, None, generation, &acknowledged, row)
+                .await
+            {
+                Ok(Some(response)) => response,
+                Ok(None) => return crate::server::api::session_gone_after_persist(),
+                Err(_) => return persist_failed_response(),
+            };
         return (StatusCode::OK, Json(response)).into_response();
     }
 
@@ -391,7 +404,7 @@ pub async fn update_session_archive(
         }
         Err(_) => return persist_failed_response(),
     };
-    let Some(response) = publish_archive_update(
+    let response = match publish_archive_update(
         &state,
         &original,
         Some(&issued),
@@ -400,8 +413,10 @@ pub async fn update_session_archive(
         authoritative,
     )
     .await
-    else {
-        return crate::server::api::session_gone_after_persist();
+    {
+        Ok(Some(response)) => response,
+        Ok(None) => return crate::server::api::session_gone_after_persist(),
+        Err(_) => return persist_failed_response(),
     };
     (StatusCode::OK, Json(response)).into_response()
 }

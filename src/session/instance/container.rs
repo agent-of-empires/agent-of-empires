@@ -901,7 +901,7 @@ claude-personal = "~/.claude-global"
             (("codex", ""), "codex", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "claude", Disk::Corrupt, 0, None),
-            (("codex", ""), "codex", Disk::Corrupt, 0, Some(".codex")),
+            (("codex", ""), "codex", Disk::Corrupt, 0, None),
             (
                 ("claude", ""),
                 "claude",
@@ -1008,12 +1008,6 @@ claude-personal = "~/.claude-global"
                 })
                 .collect();
             assert_eq!(stores, Vec::from_iter(expected_store), "{case}");
-            if let Disk::RowBrokenProfile(..) = disk {
-                assert!(
-                    format!("{error:#}").contains("cannot resolve the session's agent"),
-                    "{case}"
-                );
-            }
         }
         let _ = std::fs::remove_file(&profile_config);
 

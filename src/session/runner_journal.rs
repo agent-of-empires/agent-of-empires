@@ -608,6 +608,7 @@ impl std::ops::Deref for LaunchPlan {
 }
 
 /// One sealed original-profile authority epoch. A derivative cannot promote an old observer.
+#[derive(Clone)]
 pub struct LaunchOrigin {
     plan: std::sync::Arc<LaunchPlan>,
     generation: u64,
@@ -779,6 +780,7 @@ impl LaunchOrigin {
     /// birth must still match; this does not authorize discovering new history.
     pub(crate) fn recognizes_published_snapshot(&self, cached: &Self) -> bool {
         self.same_projection_at(cached, self.generation)
+            && self.same_creation_scope(cached.create_coverage, &cached.creations)
             && cached
                 .births
                 .iter()
@@ -791,6 +793,10 @@ impl LaunchOrigin {
             .as_ref()
             .is_some_and(|storage| storage.same_origin_as(&self.plan.storage))
             && self.plan_matches_at(cached, self.generation, self.plan.trashed)
+            && self.same_creation_scope(
+                cached.runner_journal.create_coverage,
+                &cached.runner_journal.creations,
+            )
             && cached
                 .runner_journal
                 .launches()
@@ -798,15 +804,22 @@ impl LaunchOrigin {
                 .all(|birth| self.births.contains(&birth.birth_key()))
     }
 
-    fn same_birth_scope(&self, other: &Self) -> bool {
-        if self.create_coverage != other.create_coverage
-            || self.creations.len() != other.creations.len()
-            || !self
+    fn same_creation_scope(
+        &self,
+        coverage: CreationCoverage,
+        records: &[native_create::CreateExecution],
+    ) -> bool {
+        self.create_coverage == coverage
+            && self.creations.len() == records.len()
+            && self
                 .creations
                 .iter()
-                .zip(other.creations.iter())
+                .zip(records)
                 .all(|(a, b)| a.same_record(b))
-        {
+    }
+
+    fn same_birth_scope(&self, other: &Self) -> bool {
+        if !self.same_creation_scope(other.create_coverage, &other.creations) {
             return false;
         }
         if self.births == other.births {
@@ -928,13 +941,10 @@ impl LaunchOrigin {
 
     pub(super) fn validate_native_history(&self, row: &Instance) -> Result<()> {
         anyhow::ensure!(
-            self.create_coverage == row.runner_journal.create_coverage
-                && self.creations.len() == row.runner_journal.creations.len()
-                && self
-                    .creations
-                    .iter()
-                    .zip(row.runner_journal.creations.iter())
-                    .all(|(a, b)| a.same_record(b)),
+            self.same_creation_scope(
+                row.runner_journal.create_coverage,
+                &row.runner_journal.creations
+            ),
             "original Create native scope changed without its producer ACK"
         );
         anyhow::ensure!(
@@ -2908,6 +2918,31 @@ async fn settle_selected_owned(
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    #[serial_test::serial]
+    fn published_cache_rejects_changed_create_coverage() -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("create-cache")?;
+        let storage = Storage::new_unwatched("create-cache")?;
+        let mut row = Instance::new("original", "/metadata-only");
+        row.source_profile = "create-cache".into();
+        row.runner_journal = RunnerExecutionJournal::legacy_unknown();
+        storage.update(|rows, _| {
+            rows.push(row);
+            Ok(())
+        })?;
+        let mut cached = storage.load()?.remove(0);
+        let original = LaunchOrigin::capture_baseline(&cached)?;
+        assert!(original.recognizes_published_instance(&cached));
+        let snapshot = LaunchOrigin::capture_baseline(&cached)?;
+        assert!(original.recognizes_published_snapshot(&snapshot));
+        cached.runner_journal.create_coverage = CreationCoverage::Owned;
+        assert!(!original.recognizes_published_instance(&cached));
+        let changed = LaunchOrigin::capture_baseline(&cached)?;
+        assert!(!original.recognizes_published_snapshot(&changed));
+        Ok(())
+    }
 
     #[test]
     fn journal_rejects_missing_native_evidence_instead_of_assuming_quiescence() {

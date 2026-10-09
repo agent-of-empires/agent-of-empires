@@ -776,10 +776,11 @@ fn run_pass_with_workspace(
     let mut cleanup_roots = BTreeSet::new();
     let mut needs_registry_write = false;
     let mut defer_source_retirement = false;
-    let row_ids_by_root = collect_row_ids_by_root(&registries, app_dir, home)?;
+    let configs = registry_configs(&registries, app_dir)?;
+    let row_ids_by_root = collect_row_ids_by_root(&registries, &configs, home)?;
 
     for (registry_index, registry) in registries.iter_mut().enumerate() {
-        let profile = profile_for_registry(app_dir, &registry.path);
+        let config = &configs[registry_index];
         let Some(rows) = registry.value.as_array_mut() else {
             continue;
         };
@@ -819,61 +820,24 @@ fn run_pass_with_workspace(
             // refuses to retire under. The pass-wide flag would block every
             // unrelated root on a machine with one archived session.
             let parked = row_is_parked(row) && only != Some(id.as_str());
-            let Some(tool) = row.get("tool").and_then(Value::as_str) else {
-                defer_source_retirement = true;
-                continue;
-            };
-            let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-            let detect_as = row
-                .get("detect_as")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
-            let Some(agent) = crate::agents::get_agent(tool)
-                .or_else(|| detect_as.and_then(crate::agents::get_agent))
+            let stored_plans = transition_paths(row)
+                .with_context(|| format!("validating v027 transition plan for {id}"))?;
+            let Some(StorePlan {
+                old_private,
+                paths: fresh_plans,
+            }) = configured_store_plan(row, config, home, stored_plans.as_deref())?
             else {
                 defer_source_retirement = true;
                 continue;
             };
-            let declared = config.session.agent_config_dir_for(tool, home);
-            let mut fresh_plans =
-                crate::session::config::container_config::sandbox_store_migration_paths(
-                    agent.name,
-                    home,
-                    declared.as_deref(),
-                    &id,
-                )?;
-            let stored_plans = transition_paths(row)
-                .with_context(|| format!("validating v027 transition plan for {id}"))?;
-            let stored_private = stored_plans.as_ref().is_some_and(|plans| {
-                plans.iter().all(|(source, _)| {
-                    source.file_name().is_some_and(|name| name == id.as_str())
-                        && source
-                            .parent()
-                            .and_then(Path::file_name)
-                            .is_some_and(|name| name == "sandbox")
-                })
-            });
-            let old_private = agent.name == "codex" || stored_private;
-            if old_private {
-                for (shared, _) in &mut fresh_plans {
-                    *shared = shared.join(&id);
-                }
-            }
-            let mut plans = if let Some(stored) = stored_plans.as_ref() {
-                if stored.len() != fresh_plans.len()
-                    || stored.iter().zip(&fresh_plans).any(
-                        |((source, destination), (fresh_source, fresh_destination))| {
-                            !same_authorized_path(destination, fresh_destination)
-                                || !same_authorized_path(source, fresh_source)
-                        },
-                    )
-                {
+            let has_stored_plans = stored_plans.is_some();
+            let mut plans = if let Some(stored) = stored_plans {
+                if !same_store_paths(&stored, &fresh_plans) {
                     bail!(
                         "v027 checkpointed transition plan is outside the expected sandbox roots for {id}; restore the previous session.agent_config_dir before retrying"
                     );
                 }
-                stored.clone()
+                stored
             } else {
                 fresh_plans
             };
@@ -886,7 +850,7 @@ fn run_pass_with_workspace(
                                 shared.display()
                             );
                         }
-                        if stored_plans.is_none() {
+                        if !has_stored_plans {
                             *shared = fs::canonicalize(&*shared)?;
                         }
                     }
@@ -896,7 +860,7 @@ fn run_pass_with_workspace(
                             .with_context(|| format!("inspecting {}", shared.display()))
                     }
                 }
-                if stored_plans.is_none() {
+                if !has_stored_plans {
                     *destination = resolve_existing_ancestor(destination)
                         .unwrap_or_else(|| destination.clone());
                 }
@@ -911,7 +875,7 @@ fn run_pass_with_workspace(
             // A parked row is carried only as a cohort member; it publishes
             // nothing this pass, so it gets neither the drift checkpoint nor
             // the pending stamp.
-            if stored_plans.is_none() && !parked {
+            if !has_stored_plans && !parked {
                 registry
                     .before
                     .entry(row_index)
@@ -1367,7 +1331,8 @@ fn run_pass_with_workspace(
     );
     refresh_liveness();
     let mut fresh = load_registries(app_dir)?;
-    let fresh_ids_by_root = collect_row_ids_by_root(&fresh, app_dir, home)?;
+    let fresh_configs = registry_configs(&fresh, app_dir)?;
+    let fresh_ids_by_root = collect_row_ids_by_root(&fresh, &fresh_configs, home)?;
     for root in &cleanup_roots {
         let planned = row_ids_by_root.get(root);
         let arrived = fresh_ids_by_root
@@ -1385,7 +1350,19 @@ fn run_pass_with_workspace(
     }
     let mut published_rows: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
     for key in std::mem::take(&mut ready_rows) {
-        match locate_planned_row(&registries, &fresh, key) {
+        let fresh_key = match locate_planned_row(&registries, &fresh, key) {
+            Some(fresh_key)
+                if checkpoint_matches_config(
+                    &fresh[fresh_key.0].value[fresh_key.1],
+                    &fresh_configs[fresh_key.0],
+                    home,
+                )? =>
+            {
+                Some(fresh_key)
+            }
+            _ => None,
+        };
+        match fresh_key {
             Some(fresh_key) => {
                 published_rows.insert(key, fresh_key);
                 ready_rows.insert(key);
@@ -1653,21 +1630,104 @@ pub(super) fn lock_registry_dirs(dirs: &[PathBuf]) -> Result<Vec<crate::session:
     )
 }
 
-/// Every legacy source each sandboxed row reads, by canonical root. The plan
-/// is made from one snapshot and publication checks another: a root that
-/// gained a reader in between is not retired.
+struct StorePlan {
+    old_private: bool,
+    paths: Vec<(PathBuf, PathBuf)>,
+}
+
+fn registry_configs(registries: &[Registry], app: &Path) -> Result<Vec<crate::session::Config>> {
+    registries
+        .iter()
+        .map(|registry| {
+            crate::session::config::profile_config::resolve_config(&profile_for_registry(
+                app,
+                &registry.path,
+            ))
+        })
+        .collect()
+}
+
+fn configured_store_plan(
+    row: &Value,
+    config: &crate::session::Config,
+    home: &Path,
+    stored: Option<&[(PathBuf, PathBuf)]>,
+) -> Result<Option<StorePlan>> {
+    let (Some(id), Some(tool)) = (
+        row.get("id").and_then(Value::as_str),
+        row.get("tool").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let detect_as = row
+        .get("detect_as")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
+    let Some(agent) =
+        crate::agents::get_agent(tool).or_else(|| detect_as.and_then(crate::agents::get_agent))
+    else {
+        return Ok(None);
+    };
+    let declared = config.session.agent_config_dir_for(tool, home);
+    let mut paths = crate::session::config::container_config::sandbox_store_migration_paths(
+        agent.name,
+        home,
+        declared.as_deref(),
+        id,
+    )?;
+    let old_private = agent.name == "codex"
+        || stored.is_some_and(|paths| {
+            paths.iter().all(|(source, _)| {
+                source.file_name().is_some_and(|name| name == id)
+                    && source
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "sandbox")
+            })
+        });
+    if old_private {
+        for (source, _) in &mut paths {
+            *source = source.join(id);
+        }
+    }
+    Ok(Some(StorePlan { old_private, paths }))
+}
+
+fn same_store_paths(stored: &[(PathBuf, PathBuf)], expected: &[(PathBuf, PathBuf)]) -> bool {
+    stored.len() == expected.len()
+        && stored.iter().zip(expected).all(
+            |((source, destination), (fresh_source, fresh_destination))| {
+                same_authorized_path(source, fresh_source)
+                    && same_authorized_path(destination, fresh_destination)
+            },
+        )
+}
+
+fn checkpoint_matches_config(
+    row: &Value,
+    config: &crate::session::Config,
+    home: &Path,
+) -> Result<bool> {
+    let stored = transition_paths(row)?;
+    let Some(plan) = configured_store_plan(row, config, home, stored.as_deref())? else {
+        return Ok(false);
+    };
+    Ok(stored
+        .as_ref()
+        .is_some_and(|stored| same_store_paths(stored, &plan.paths)))
+}
+
 fn collect_row_ids_by_root(
     registries: &[Registry],
-    app_dir: &Path,
+    configs: &[crate::session::Config],
     home: &Path,
 ) -> Result<BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>>> {
     let mut row_ids_by_root: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> = BTreeMap::new();
-    for registry in registries {
-        let profile = profile_for_registry(app_dir, &registry.path);
+    for (registry, config) in registries.iter().zip(configs) {
         let Some(rows) = registry.value.as_array() else {
             continue;
         };
-        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         for row in rows {
             if !row
                 .pointer("/sandbox_info/enabled")
@@ -1676,34 +1736,20 @@ fn collect_row_ids_by_root(
             {
                 continue;
             }
-            let (Some(id), Some(tool)) = (
-                row.get("id").and_then(Value::as_str),
-                row.get("tool").and_then(Value::as_str),
-            ) else {
+            let Some(id) = row.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            if crate::session::validate_instance_id(id).is_err() {
-                continue;
-            }
-            let detect_as = row
-                .get("detect_as")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
-            let Some(agent) = crate::agents::get_agent(tool)
-                .or_else(|| detect_as.and_then(crate::agents::get_agent))
-            else {
+            crate::session::validate_instance_id(id)?;
+            let stored = transition_paths(row)?;
+            let Some(plan) = configured_store_plan(row, config, home, stored.as_deref())? else {
                 continue;
             };
-            let declared = config.session.agent_config_dir_for(tool, home);
-            for (source, _) in
-                crate::session::config::container_config::sandbox_store_migration_paths(
-                    agent.name,
-                    home,
-                    declared.as_deref(),
-                    id,
-                )?
-            {
+            for (source, _) in plan.paths {
+                let source = if plan.old_private {
+                    source.parent().unwrap_or(&source).to_path_buf()
+                } else {
+                    source
+                };
                 let root = fs::canonicalize(&source).unwrap_or(source);
                 row_ids_by_root
                     .entry(root)
@@ -2616,6 +2662,24 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
     #[test]
+    fn copied_layout_checkpoint_refuses_fresh_configured_root() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let home = temporary.path();
+        let mut config = serde_json::to_value(crate::session::Config::default())?;
+        config["session"]["agent_config_dir"]["gemini"] = serde_json::json!(home.join("source-a"));
+        let original: crate::session::Config = serde_json::from_value(config.clone())?;
+        let mut row = serde_json::json!({"id":"e17a000000000099","tool":"gemini","sandbox_info":{"enabled":true}});
+        let plan = configured_store_plan(&row, &original, home, None)?.unwrap();
+        set_transition_paths(&mut row, &plan.paths);
+        assert!(checkpoint_matches_config(&row, &original, home)?);
+        config["session"]["agent_config_dir"]["gemini"] = serde_json::json!(home.join("source-b"));
+        let changed: crate::session::Config = serde_json::from_value(config)?;
+        assert!(!checkpoint_matches_config(&row, &changed, home)?);
+
+        Ok(())
+    }
+
+    #[test]
     #[serial_test::serial]
     fn deferred_layout_checkpoints_preserve_raw_owners_and_unrelated_registries() -> Result<()> {
         use crate::session::raw_document::{RawDocument, RawObject};
@@ -2681,6 +2745,8 @@ mod tests {
             format!("[{{{base}}},{{{base}}}]"),
             format!(r#"[{{{base},"sandbox_store_generation":2}}]"#),
             r#"[{"id":"e17a000000000051","sandbox_info":{"enabled":true,"enabled":false}}]"#.into(),
+            r#"[{"tool":"gemini","sandbox_info":{"enabled":true},"sandbox_store_generation":1}]"#
+                .into(),
         ] {
             fs::write(&path, &rows)?;
             assert!(super::run_in(
@@ -4134,7 +4200,7 @@ gemini = "{}"
         fs::write(legacy.join("data"), b"data").unwrap();
         let rows = serde_json::json!([
             {"id":"1111111111111111","tool":"missing-agent","sandbox_info":{"enabled":true}},
-            {"tool":"missing-agent","sandbox_info":{"enabled":true}},
+
             {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true}}
         ]);
         fs::write(
@@ -4147,7 +4213,7 @@ gemini = "{}"
 
         let rows: Value = read_rows(&app);
         assert!(rows[0].get("sandbox_store_generation").is_none());
-        assert_eq!(rows[2]["sandbox_store_generation"], 2);
+        assert_eq!(rows[1]["sandbox_store_generation"], 2);
         assert_eq!(
             fs::read(home.join(".gemini/sandbox-v2/2222222222222222/data")).unwrap(),
             b"data"
@@ -4160,7 +4226,7 @@ gemini = "{}"
         let repaired = serde_json::json!([
             {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
             {"id":"3333333333333333","tool":"gemini","sandbox_info":{"enabled":true}},
-            rows[2].clone()
+            rows[1].clone()
         ]);
         fs::write(
             app.join("sessions.json"),

@@ -2135,12 +2135,15 @@ fn record_reset_in(
     home: &Path,
     config: &crate::session::Config,
     roots: &[ContentRoot],
-) -> Result<()> {
+) -> Result<bool> {
     let mut fresh = Registry::read(registry)?;
     let Some(index) = fresh.selected(id)? else {
-        return Ok(());
+        return Ok(false);
     };
     let current = &fresh.rows()[index];
+    if !row_is_sandboxed(current) {
+        return Ok(false);
+    }
     let mut current_roots = row_roots(current, tool, home, config)?;
     container_config::expand_content_roles(&mut current_roots, home, &config.session)?;
     // The reset is per transaction, and `reset_row` already answers for this
@@ -2150,15 +2153,15 @@ fn record_reset_in(
     let resolves_same_store: BTreeSet<_> =
         current_roots.iter().map(|root| root.path.clone()).collect();
     if resolves_same_store != roots.iter().map(|root| root.path.clone()).collect() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(receipt) = retired_receipt(app, id, tool, current, &current_roots)? else {
-        return Ok(());
+        return Ok(true);
     };
     if let Some(bytes) = fresh.reset(index, &receipt)? {
         write_registry(registry, &bytes)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The journal entry that retired this row's context, read from beside the live
@@ -2343,14 +2346,17 @@ fn migrate_target_with_workspace(
     let Some(snapshot) = read_row(registry, id)? else {
         return Ok(false);
     };
+    if !row_is_sandboxed(&snapshot) {
+        return Ok(false);
+    }
     let mut roots = row_roots(&snapshot, tool, home, &config)?;
     if roots.is_empty() || roots_ready(app, id, tool, &roots)? {
         // A store another row already moved still has to stop this row from
         // resuming the retired context, and this is the only pass that sees it.
         let registries = lock_registries(app)?;
-        record_reset_in(app, registry, id, tool, home, &config, &roots)?;
+        let admitted = record_reset_in(app, registry, id, tool, home, &config, &roots)?;
         drop(registries);
-        return Ok(true);
+        return Ok(admitted);
     }
     container_config::expand_content_roles(&mut roots, home, &config.session)?;
     drop(workspace_locks.take());
@@ -2373,6 +2379,9 @@ fn migrate_target_with_workspace(
     let Some(row) = read_row(registry, id)? else {
         return Ok(false);
     };
+    if !row_is_sandboxed(&row) {
+        return Ok(false);
+    }
     let config = crate::session::config::profile_config::resolve_config(&profile)?;
     let mut locked_roots = row_roots(&row, tool, home, &config)?;
     container_config::expand_content_roles(&mut locked_roots, home, &config.session)?;
@@ -2406,8 +2415,7 @@ fn migrate_target_with_workspace(
         // The row that ran the transaction recorded its own reset. Every other
         // row resolving this store still has to stop resuming the context that
         // transaction retired.
-        record_reset_in(app, registry, id, tool, home, &config, &roots)?;
-        return Ok(true);
+        return record_reset_in(app, registry, id, tool, home, &config, &roots);
     }
     discard_stage(app, &mut receipt, &path)?;
     if receipt.phase == Phase::Planned {
@@ -2446,26 +2454,8 @@ fn migrate_target_with_workspace(
     container_config::expand_content_roles(&mut current_roots, home, &fresh_config.session)?;
     if current_roots != roots
         || !row_tools(current).contains(tool)
-        || current.get("project_path") != row.get("project_path")
-        || [
-            "tool",
-            "command",
-            "extra_args",
-            "detect_as",
-            "agent_session_id",
-            "agent_session_binding",
-            "resume_intent",
-            "resume_binding",
-            "prior_tool_session_ids",
-        ]
-        .iter()
-        .any(|field| current.get(*field) != row.get(*field))
-        || current.pointer("/sandbox_info/container_workdir")
-            != row.pointer("/sandbox_info/container_workdir")
-        || current.get("workspace_info") != receipt.retired_identity.get("workspace_info")
+        || !content_scope_matches(&row, current, &receipt.retired_identity)
     {
-        // A container could have started after the stage was seeded, so the
-        // seed is dropped with the plan it was made for.
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
@@ -2858,9 +2848,58 @@ pub(crate) fn guard_preparation(
     Ok(transition)
 }
 
+fn row_is_sandboxed(row: &Value) -> bool {
+    row.pointer("/sandbox_info/enabled")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn content_scope_matches(planned: &Value, current: &Value, retired_identity: &Value) -> bool {
+    [
+        "project_path",
+        "tool",
+        "command",
+        "extra_args",
+        "detect_as",
+        "agent_session_id",
+        "agent_session_binding",
+        "resume_intent",
+        "resume_binding",
+        "prior_tool_session_ids",
+        "sandbox_info",
+        "sandbox_store_generation",
+    ]
+    .iter()
+    .all(|field| current.get(*field) == planned.get(*field))
+        && row_is_sandboxed(planned)
+        && row_is_sandboxed(current)
+        && current.get("workspace_info") == retired_identity.get("workspace_info")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_content_refuses_disabled_or_legacy_fresh_scope() {
+        let planned = serde_json::json!({
+            "tool":"gemini", "project_path":"/project", "sandbox_store_generation":2,
+            "sandbox_info":{"enabled":true,"container_workdir":"/work"},
+        });
+        let identity = serde_json::json!({});
+        assert!(content_scope_matches(&planned, &planned, &identity));
+        for changed in 0..2 {
+            let mut fresh = planned.clone();
+            match changed {
+                0 => fresh["sandbox_info"]["enabled"] = serde_json::json!(false),
+                _ => fresh["sandbox_store_generation"] = serde_json::json!(1),
+            }
+            assert!(!content_scope_matches(&planned, &fresh, &identity));
+        }
+        let mut disabled = planned.clone();
+        disabled["sandbox_info"]["enabled"] = serde_json::json!(false);
+        assert!(!content_scope_matches(&disabled, &disabled, &identity));
+    }
+
     #[test]
     fn content_metadata_checkpoint_preserves_raw_owners() -> Result<()> {
         use crate::session::raw_document::{RawDocument, RawObject};
@@ -2967,7 +3006,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
             .unwrap();
-        row["workspace_info"]["repos"] = serde_json::json!([{"main_repo_path": "/new/repo"}]);
+        row["workspace_info"]["workspace_dir"] = serde_json::json!("/new/workspace");
         fs::write(registry, serde_json::to_vec(&rows).unwrap()).unwrap();
     }
 
@@ -3002,6 +3041,7 @@ mod tests {
             "container_name": "aoe-sandbox-fixture",
         });
         row["workspace_info"] = serde_json::json!({
+            "name": "fixture",
             "branch": "main",
             "workspace_dir": project.to_string_lossy(),
             "repos": [],

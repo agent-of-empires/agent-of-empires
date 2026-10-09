@@ -2866,6 +2866,7 @@ async fn archive_metadata_ack_preserves_idle_and_rejects_replaced_cache() {
         emitted.clone(),
     )
     .await
+    .unwrap()
     .unwrap();
     let cached = state.instances.read().await[0].clone();
     assert_eq!(cached.status, Status::Idle);
@@ -2896,6 +2897,7 @@ async fn archive_metadata_ack_preserves_idle_and_rejects_replaced_cache() {
             emitted.clone()
         )
         .await
+        .unwrap()
         .is_none());
         let kept = state.instances.read().await[0].clone();
         assert_eq!(kept.created_at, replacement.created_at);
@@ -3032,7 +3034,9 @@ async fn failed_delete_notifies_plugins_of_the_error() {
 
     let original =
         crate::session::LaunchOrigin::capture_baseline(&state.instances.read().await[0]).unwrap();
-    super::delete::mark_delete_error(&state, &original, None, "boom".to_string()).await;
+    super::delete::mark_delete_error(&state, &original, None, "boom".to_string())
+        .await
+        .unwrap();
 
     assert_eq!(feed.next().await, ("Deleting".into(), "Error".into()));
 }

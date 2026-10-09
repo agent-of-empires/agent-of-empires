@@ -22,60 +22,111 @@ pub struct DeleteSessionBody {
 
 /// Publish a failed purge without leaving its polling overlay active.
 pub(super) async fn mark_delete_error(
-    state: &AppState,
+    state: &Arc<AppState>,
     original: &crate::session::LaunchOrigin,
     issued: Option<&crate::session::LaunchOrigin>,
     message: String,
-) {
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|instance| {
-        original.matches_instance(instance)
-            || issued.is_some_and(|scope| scope.matches_instance(instance))
-    }) {
-        let old_status = inst.status;
-        inst.status = Status::Error;
-        inst.last_error = Some(message);
+) -> Result<(), String> {
+    let state = Arc::clone(state);
+    let original = original.clone();
+    let issued = issued.cloned();
+    tokio::task::spawn_blocking(move || {
+        let mut instances = state.instances.blocking_write();
+        if let Some(inst) = instances.iter_mut().find(|instance| {
+            original.matches_instance(instance)
+                || issued
+                    .as_ref()
+                    .is_some_and(|scope| scope.matches_instance(instance))
+        }) {
+            let old_status = inst.status;
+            inst.status = Status::Error;
+            inst.last_error = Some(message);
+            state
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            publish_status_change(&state.status_tx, inst, old_status);
+        }
+    })
+    .await
+    .map_err(|error| format!("Purge error publication task failed: {error}"))
+}
+
+async fn mark_delete_in_progress(
+    state: &Arc<AppState>,
+    original: &crate::session::LaunchOrigin,
+) -> Result<Option<Status>, String> {
+    let state = Arc::clone(state);
+    let original = original.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut instances = state.instances.blocking_write();
+        let inst = instances
+            .iter_mut()
+            .find(|instance| original.matches_instance(instance))?;
+        let old_status = std::mem::replace(&mut inst.status, Status::Deleting);
         state
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         publish_status_change(&state.status_tx, inst, old_status);
-    }
-}
-
-/// Publish a temporary overlay owned by the admitted original.
-async fn mark_delete_in_progress(
-    state: &AppState,
-    original: &crate::session::LaunchOrigin,
-) -> Option<Status> {
-    let mut instances = state.instances.write().await;
-    let inst = instances
-        .iter_mut()
-        .find(|instance| original.matches_instance(instance))?;
-    let old_status = std::mem::replace(&mut inst.status, Status::Deleting);
-    state
-        .mutation_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    publish_status_change(&state.status_tx, inst, old_status);
-    Some(old_status)
+        Some(old_status)
+    })
+    .await
+    .map_err(|error| format!("Purge overlay publication task failed: {error}"))
 }
 
 async fn restore_delete_status(
-    state: &AppState,
+    state: &Arc<AppState>,
     original: &crate::session::LaunchOrigin,
     issued: Option<&crate::session::LaunchOrigin>,
     status: Status,
-) {
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|instance| {
-        original.matches_instance(instance)
-            || issued.is_some_and(|scope| scope.matches_instance(instance))
-    }) {
-        let old_status = std::mem::replace(&mut inst.status, status);
-        state
-            .mutation_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        publish_status_change(&state.status_tx, inst, old_status);
-    }
+) -> Result<(), String> {
+    let state = Arc::clone(state);
+    let original = original.clone();
+    let issued = issued.cloned();
+    tokio::task::spawn_blocking(move || {
+        let mut instances = state.instances.blocking_write();
+        if let Some(inst) = instances.iter_mut().find(|instance| {
+            original.matches_instance(instance)
+                || issued
+                    .as_ref()
+                    .is_some_and(|scope| scope.matches_instance(instance))
+        }) {
+            let old_status = std::mem::replace(&mut inst.status, status);
+            state
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            publish_status_change(&state.status_tx, inst, old_status);
+        }
+    })
+    .await
+    .map_err(|error| format!("Purge overlay restoration task failed: {error}"))
+}
+
+async fn remove_original_from_cache(
+    state: &Arc<AppState>,
+    original: &crate::session::LaunchOrigin,
+    issued: Option<&crate::session::LaunchOrigin>,
+) -> Result<bool, String> {
+    let state = Arc::clone(state);
+    let original = original.clone();
+    let issued = issued.cloned();
+    tokio::task::spawn_blocking(move || {
+        let id = original.session_id();
+        let mut instances = state.instances.blocking_write();
+        if instances.iter().filter(|row| row.id == id).any(|row| {
+            !original.matches_instance(row)
+                && !issued
+                    .as_ref()
+                    .is_some_and(|scope| scope.matches_instance(row))
+        }) {
+            return false;
+        }
+        remove_instance(&mut instances, id, &state.mutation_epoch);
+        state.instance_locks.blocking_write().remove(id);
+        tokio::runtime::Handle::current().block_on(state.session_service.forget_prompt_lock(id));
+        true
+    })
+    .await
+    .map_err(|error| format!("Purge cache retirement task failed: {error}"))
 }
 
 /// Why a purge could not complete. `Retryable` is a transient conflict the
@@ -123,20 +174,32 @@ fn purge_session_artifacts(
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
 ) -> impl std::future::Future<Output = Result<(bool, Vec<String>), PurgeRefusal>> + Send + 'static {
-    let original = crate::session::LaunchOrigin::capture_baseline(&instance);
     let state = Arc::clone(state);
     let id = id.to_owned();
     let body = body.clone();
     let driver = tokio::spawn(async move {
-        let original = original.map_err(|error| PurgeRefusal::Fatal(error.to_string()))?;
-        let previous_status = mark_delete_in_progress(&state, &original).await;
+        let (original, instance) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let original = crate::session::LaunchOrigin::capture_baseline(&instance)
+                .map_err(|error| error.to_string())?;
+            Ok((original, instance))
+        })
+        .await
+        .map_err(|error| format!("Purge original capture task failed: {error}"))??;
+        let previous_status = mark_delete_in_progress(&state, &original).await?;
         let mut issued = None;
-        let outcome =
-            purge_session_artifacts_inner(&state, &id, instance, &body, recent_entry, &mut issued)
-                .await;
+        let outcome = purge_session_artifacts_inner(
+            &state,
+            &id,
+            instance,
+            &body,
+            recent_entry,
+            &mut issued,
+            &original,
+        )
+        .await;
         if !matches!(outcome, Ok((true, _))) {
             if let Some(status) = previous_status {
-                restore_delete_status(&state, &original, issued.as_deref(), status).await;
+                restore_delete_status(&state, &original, issued.as_deref(), status).await?;
             }
         }
         if let Err(refusal) = &outcome {
@@ -147,7 +210,7 @@ fn purge_session_artifacts(
                     issued.as_deref(),
                     refusal.message().to_owned(),
                 )
-                .await;
+                .await?;
             }
         }
         outcome
@@ -168,6 +231,7 @@ async fn purge_session_artifacts_inner(
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
     issued: &mut Option<Arc<crate::session::LaunchOrigin>>,
+    original: &crate::session::LaunchOrigin,
 ) -> Result<(bool, Vec<String>), PurgeRefusal> {
     let profile = instance.source_profile.clone();
     if profile.is_empty() {
@@ -218,14 +282,8 @@ async fn purge_session_artifacts_inner(
         crate::session::deletion::PurgeReservation::Rejected(result) => {
             return match result.disposition {
                 crate::session::deletion::DeletionDisposition::AlreadyGone => {
-                    remove_instance(
-                        &mut *state.instances.write().await,
-                        id,
-                        &state.mutation_epoch,
-                    );
-                    state.instance_locks.write().await.remove(id);
-                    state.session_service.forget_prompt_lock(id).await;
-                    Ok((true, result.messages))
+                    let removed = remove_original_from_cache(state, original, None).await?;
+                    Ok((removed, result.messages))
                 }
                 crate::session::deletion::DeletionDisposition::KeptRestored => {
                     Err(PurgeRefusal::Fatal(
@@ -376,23 +434,12 @@ async fn purge_session_artifacts_inner(
         ));
     }
 
-    {
-        // The row is gone from disk and memory, so a reloader carrying an older
-        // `sessions.json` snapshot must drop it rather than fold the row back
-        // in. `remove_instance` bumps while holding the `instances` write lock
-        // and the reloader checks under that same lock, so no reload can slip
-        // between removal and bump. See invariant 8 on
-        // `reload_state_instances_from_disk`.
-        let mut instances = state.instances.write().await;
-        if instances.iter().any(|instance| {
-            scope.original().matches_instance(instance)
-                || scope.cancellation_origin().matches_instance(instance)
-        }) {
-            remove_instance(&mut instances, id, &state.mutation_epoch);
-        }
-    }
-    state.instance_locks.write().await.remove(id);
-    state.session_service.forget_prompt_lock(id).await;
+    let removed = remove_original_from_cache(
+        state,
+        scope.original(),
+        Some(scope.cancellation_origin().as_ref()),
+    )
+    .await?;
     if let Some(entry) = recent_entry {
         if let Err(e) = crate::session::record_recent_project(entry) {
             tracing::warn!(target: "http.api.sessions",
@@ -411,7 +458,7 @@ async fn purge_session_artifacts_inner(
             "Session removed, but its ACP transcript was not purged: {error}"
         ));
     }
-    Ok((true, messages))
+    Ok((removed, messages))
 }
 
 /// Heal managed worktree sessions whose recorded `project_path` no longer
@@ -1177,6 +1224,93 @@ mod tests {
     use crate::server::test_support::build_test_app_state;
     #[tokio::test]
     #[serial_test::serial]
+    async fn absent_original_does_not_remove_replaced_cache_or_locks() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut row = Instance::new("original", "/metadata-only-original");
+        row.source_profile = "default".into();
+        row.runner_journal =
+            crate::session::runner_journal::RunnerExecutionJournal::legacy_unknown();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row]);
+        let storage = Storage::open_unwatched("default").unwrap();
+        let row = storage.load().unwrap().remove(0);
+        let original = crate::session::LaunchOrigin::capture_baseline(&row).unwrap();
+        let state = build_test_app_state(vec![row.clone()]);
+        storage
+            .update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .unwrap();
+        crate::session::create_profile("replacement").unwrap();
+        let foreign = Arc::new(Storage::open_unwatched("replacement").unwrap());
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        state
+            .instance_locks
+            .write()
+            .await
+            .insert(row.id.clone(), Arc::clone(&lock));
+        let _submission = state.session_service.prompt_submission(&row.id).await;
+        let epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        for changed in 0..4 {
+            let mut replacement = row.clone();
+            match changed {
+                0 => replacement.created_at += chrono::Duration::seconds(1),
+                1 => replacement.lifecycle_generation += 1,
+                2 => replacement.project_path = "/metadata-only-replacement".into(),
+                _ => replacement.storage_origin = Some(Arc::clone(&foreign)),
+            }
+            state.instances.write().await[0] = replacement.clone();
+            assert!(!remove_original_from_cache(&state, &original, None)
+                .await
+                .unwrap());
+            let cached = state.instances.read().await[0].clone();
+            assert_eq!(cached.created_at, replacement.created_at);
+            assert_eq!(
+                cached.lifecycle_generation,
+                replacement.lifecycle_generation
+            );
+            assert_eq!(cached.project_path, replacement.project_path);
+            assert!(cached
+                .storage_origin
+                .as_ref()
+                .unwrap()
+                .same_origin_as(replacement.storage_origin.as_ref().unwrap()));
+            assert!(Arc::ptr_eq(
+                state.instance_locks.read().await.get(&row.id).unwrap(),
+                &lock
+            ));
+            assert_eq!(state.session_service.prompt_locks_len().await, 1);
+            assert_eq!(
+                state
+                    .mutation_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                epoch
+            );
+        }
+        state.instances.write().await[0] = row.clone();
+        assert!(remove_original_from_cache(&state, &original, None)
+            .await
+            .unwrap());
+        assert!(state
+            .instances
+            .read()
+            .await
+            .iter()
+            .all(|cached| cached.id != row.id));
+        assert!(!state.instance_locks.read().await.contains_key(&row.id));
+        assert_eq!(state.session_service.prompt_locks_len().await, 0);
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            epoch + 1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn purge_overlay_publishes_its_restoration_without_cleanup() {
         let _home = crate::session::test_support::isolate_app_dir();
         let mut row = Instance::new("overlay", "/original-metadata-only");
@@ -1194,14 +1328,19 @@ mod tests {
         let epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
-        let previous = mark_delete_in_progress(&state, &original).await.unwrap();
+        let previous = mark_delete_in_progress(&state, &original)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(status_of(&state, &row.id).await, Some(Status::Deleting));
         let applied = updates.try_recv().expect("admitted overlay was published");
         assert_eq!(
             (applied.instance_id.as_str(), applied.old, applied.new),
             (row.id.as_str(), Status::Waiting, Status::Deleting)
         );
-        restore_delete_status(&state, &original, None, previous).await;
+        restore_delete_status(&state, &original, None, previous)
+            .await
+            .unwrap();
         assert_eq!(status_of(&state, &row.id).await, Some(Status::Waiting));
         let restored = updates
             .try_recv()
@@ -1216,7 +1355,9 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             epoch + 2
         );
-        mark_delete_error(&state, &original, None, "original failure".into()).await;
+        mark_delete_error(&state, &original, None, "original failure".into())
+            .await
+            .unwrap();
         assert_eq!(status_of(&state, &row.id).await, Some(Status::Error));
         let failed = updates.try_recv().unwrap();
         assert_eq!((failed.old, failed.new), (Status::Waiting, Status::Error));
@@ -1228,7 +1369,9 @@ mod tests {
                 _ => replacement.project_path = "/replacement".into(),
             }
             state.instances.write().await[0] = replacement;
-            mark_delete_error(&state, &original, None, "must not reach replacement".into()).await;
+            mark_delete_error(&state, &original, None, "must not reach replacement".into())
+                .await
+                .unwrap();
             assert_eq!(status_of(&state, &row.id).await, Some(Status::Waiting));
             assert!(matches!(
                 updates.try_recv(),

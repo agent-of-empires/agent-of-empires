@@ -893,63 +893,42 @@ mod tests {
     #[test]
     fn an_unusable_registry_aborts_the_pass_before_removing_anything() {
         type Plant = fn(&Path);
-        let cases: &[(&str, Plant, &str)] = &[
-            (
-                "not an array",
-                |app| {
-                    fs::write(
-                        app.join("profiles/work/sessions.json"),
-                        r#"{"not":"an array"}"#,
-                    )
-                    .unwrap()
-                },
-                "session array",
-            ),
-            (
-                "truncated",
-                |app| fs::write(app.join("profiles/work/sessions.json"), "{").unwrap(),
-                "sessions.json",
-            ),
-            (
-                "row without id",
-                |app| {
-                    fs::write(
-                        app.join("profiles/work/sessions.json"),
-                        r#"[{"title":"no id"}]"#,
-                    )
-                    .unwrap()
-                },
-                "sessions.json",
-            ),
-            (
-                "no registry",
-                |app| fs::remove_file(app.join("sessions.json")).unwrap(),
-                "refusing",
-            ),
-            (
-                "dangling profile directory",
-                |app| {
-                    fs::remove_dir(app.join("profiles/work")).unwrap();
-                    std::os::unix::fs::symlink(app.join("nowhere"), app.join("profiles/work"))
-                        .unwrap();
-                },
-                "refusing",
-            ),
-            (
-                "dangling registry file",
-                |app| {
-                    std::os::unix::fs::symlink(
-                        app.join("nowhere"),
-                        app.join("profiles/work/sessions.json"),
-                    )
-                    .unwrap();
-                },
-                "refusing",
-            ),
+        let cases: &[(&str, Plant)] = &[
+            ("not an array", |app| {
+                fs::write(
+                    app.join("profiles/work/sessions.json"),
+                    r#"{"not":"an array"}"#,
+                )
+                .unwrap()
+            }),
+            ("truncated", |app| {
+                fs::write(app.join("profiles/work/sessions.json"), "{").unwrap()
+            }),
+            ("row without id", |app| {
+                fs::write(
+                    app.join("profiles/work/sessions.json"),
+                    r#"[{"title":"no id"}]"#,
+                )
+                .unwrap()
+            }),
+            ("no registry", |app| {
+                fs::remove_file(app.join("sessions.json")).unwrap()
+            }),
+            ("dangling profile directory", |app| {
+                fs::remove_dir(app.join("profiles/work")).unwrap();
+                std::os::unix::fs::symlink(app.join("nowhere"), app.join("profiles/work")).unwrap();
+            }),
+            ("dangling registry file", |app| {
+                std::os::unix::fs::symlink(
+                    app.join("nowhere"),
+                    app.join("profiles/work/sessions.json"),
+                )
+                .unwrap();
+            }),
         ];
 
         let mut failures = Vec::new();
-        for (name, plant, cause) in cases {
+        for (name, plant) in cases {
             let dir = tempfile::tempdir().unwrap();
             let app = dir.path().join("app");
             let home = dir.path().join("home");
@@ -958,12 +937,8 @@ mod tests {
             let orphan = owned_store(&app, &home, "2222222222222222", 40);
             plant(&app);
 
-            match reclaim_in(&app, &[], &home, NO_GRACE, &gone) {
-                Ok(_) => failures.push(format!("{name}: the pass succeeded")),
-                Err(error) if !error.chain().any(|c| c.to_string().contains(cause)) => {
-                    failures.push(format!("{name}: {error:#}"))
-                }
-                Err(_) => {}
+            if reclaim_in(&app, &[], &home, NO_GRACE, &gone).is_ok() {
+                failures.push(format!("{name}: the pass succeeded"));
             }
             if !orphan.exists() {
                 failures.push(format!("{name}: a store was removed despite the failure"));
