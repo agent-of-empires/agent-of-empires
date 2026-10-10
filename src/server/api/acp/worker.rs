@@ -848,6 +848,7 @@ mod tests {
                     text: "still working".to_string(),
                     attachments: Vec::new(),
                     synthesized: false,
+                    origin_plugin: None,
                 };
                 state
                     .acp_event_store

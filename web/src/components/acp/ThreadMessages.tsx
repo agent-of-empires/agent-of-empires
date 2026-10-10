@@ -16,8 +16,16 @@ import { TodoGroupCard } from "./TodoCards";
 import { ToolCard } from "./ToolCards";
 
 export function UserMessage() {
+  const originPlugin = useAuiState(
+    (s) => (s.message.metadata?.custom as { originPlugin?: unknown } | undefined)?.originPlugin,
+  );
   return (
     <MessagePrimitive.Root className="group mt-4 flex flex-col items-end gap-1">
+      {typeof originPlugin === "string" && (
+        <div data-testid="user-message-origin" className="text-xs text-text-dim">
+          Sent by plugin {originPlugin}
+        </div>
+      )}
       <MessagePrimitive.Parts components={{ Text: UserText, Image: UserImage }} />
     </MessagePrimitive.Root>
   );

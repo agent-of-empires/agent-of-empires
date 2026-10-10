@@ -23,6 +23,20 @@ fn prompt_req(text: &str) -> Result<Json<PromptRequest>, axum::extract::rejectio
         attachments: Vec::new(),
         prompt_id: None,
         no_revive: false,
+        queued_prompt_id: None,
+    }))
+}
+
+fn send_now_req(
+    text: &str,
+    queued_prompt_id: &str,
+) -> Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection> {
+    Ok(Json(PromptRequest {
+        text: text.to_string(),
+        attachments: Vec::new(),
+        prompt_id: None,
+        no_revive: false,
+        queued_prompt_id: Some(queued_prompt_id.to_string()),
     }))
 }
 
@@ -34,6 +48,7 @@ fn no_revive_prompt_req(
         attachments: Vec::new(),
         prompt_id: None,
         no_revive: true,
+        queued_prompt_id: None,
     }))
 }
 
@@ -588,7 +603,14 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
         .await;
     state
         .session_service
-        .enqueue_prompt(&id, "q1".into(), "queued follow-up".into(), vec![], None)
+        .enqueue_prompt(
+            &id,
+            "q1".into(),
+            "queued follow-up".into(),
+            vec![],
+            None,
+            None,
+        )
         .await
         .expect("session exists");
 
@@ -655,7 +677,14 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
 
     state
         .acp_supervisor
-        .publish_user_prompt_with_attachments(&id, "the winning turn".into(), &[], None, false)
+        .publish_user_prompt_with_attachments(
+            &id,
+            "the winning turn".into(),
+            &[],
+            None,
+            false,
+            None,
+        )
         .await;
     drop(winner);
 
@@ -685,6 +714,7 @@ fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
             attachments: Vec::new(),
             prompt_id: None,
             synthesized: false,
+            origin_plugin: None,
         },
         Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
@@ -883,4 +913,316 @@ fn prompt_persist_tiers() {
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, true);
     assert!(disk.snoozed_until.is_none());
     assert!(disk.last_accessed_at.is_some());
+}
+
+/// Send now on a queued plugin message keeps the sender the server stored, and the
+/// row is consumed exactly once.
+#[tokio::test]
+async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now";
+    let state = structured_state(id, true);
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    state
+        .session_service
+        .enqueue_prompt(
+            id,
+            "q1".into(),
+            "PR #7 was merged".into(),
+            vec![],
+            None,
+            Some("cron".into()),
+        )
+        .await
+        .expect("session exists");
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        send_now_req("PR #7 was merged", "q1"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { origin_plugin: Some(p), .. } if p == "cron"
+    )));
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(id)
+        .await
+        .is_empty());
+
+    let again = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        send_now_req("PR #7 was merged", "q1"),
+    )
+    .await
+    .into_response();
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+}
+
+async fn state_with_queued_plugin_row(id: &str, idle: bool) -> Arc<AppState> {
+    let state = structured_state(id, idle);
+    state
+        .session_service
+        .enqueue_prompt(
+            id,
+            "q1".into(),
+            "PR #7 was merged".into(),
+            vec![],
+            None,
+            Some("cron".into()),
+        )
+        .await
+        .expect("session exists");
+    state
+}
+
+/// Different text must not be published under the plugin's name.
+#[tokio::test]
+async fn send_now_refuses_text_that_differs_from_the_stored_plugin_row() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-spoof";
+    let state = state_with_queued_plugin_row(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        send_now_req("something the plugin never said", "q1"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(!published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { .. }
+    )));
+    assert_eq!(
+        state
+            .session_service
+            .queued_prompts_snapshot(id)
+            .await
+            .len(),
+        1
+    );
+}
+
+/// A send naming a row must carry that row's text, so a 202 never covers text the daemon
+/// does not hold (a queue edit racing Send now).
+#[tokio::test]
+async fn send_now_refuses_text_that_differs_from_a_user_row_too() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-stale";
+    let state = structured_state(id, true);
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    state
+        .session_service
+        .enqueue_prompt(id, "q1".into(), "stored".into(), vec![], None, None)
+        .await
+        .expect("session exists");
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        send_now_req("edited elsewhere", "q1"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(!published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { .. }
+    )));
+    let queue = state.session_service.queued_prompts_snapshot(id).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].text, "stored");
+}
+
+fn shot_ref() -> crate::daemon::PromptAttachmentRef {
+    crate::daemon::PromptAttachmentRef {
+        id: "att-1".into(),
+        kind: crate::daemon::PromptAttachmentKind::Image,
+        mime_type: "image/png".into(),
+        name: Some("shot.png".into()),
+        size: 6,
+    }
+}
+
+async fn state_with_attachment_row(id: &str, store_bytes: bool) -> Arc<AppState> {
+    let state = structured_state(id, true);
+    state
+        .session_service
+        .enqueue_prompt(
+            id,
+            "q1".into(),
+            "caption".into(),
+            vec![shot_ref()],
+            None,
+            None,
+        )
+        .await
+        .expect("session exists");
+    if store_bytes {
+        assert!(state.acp_event_store.record_pending_attachment(
+            id,
+            "q1",
+            &crate::acp::event_store::AttachmentBlob {
+                id: "att-1".into(),
+                kind: crate::daemon::PromptAttachmentKind::Image,
+                mime_type: "image/png".into(),
+                name: Some("shot.png".into()),
+                data: b"stored".to_vec(),
+            },
+        ));
+    }
+    state
+}
+
+/// Send now delivers the bytes the daemon stored for the row. Request attachments, even a
+/// valid different one of the same count, never replace them.
+#[tokio::test]
+async fn send_now_delivers_the_rows_stored_attachments_not_the_requests() {
+    use base64::Engine;
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-attachments";
+    let state = state_with_attachment_row(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        Ok(Json(PromptRequest {
+            text: "caption".into(),
+            attachments: vec![crate::acp::protocol::PromptAttachmentUpload {
+                kind: crate::daemon::PromptAttachmentKind::Image,
+                mime_type: "image/png".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(b"swapped-bytes"),
+                name: Some("other.png".into()),
+            }],
+            prompt_id: None,
+            no_revive: false,
+            queued_prompt_id: Some("q1".into()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let sent = state
+        .acp_event_store
+        .replay_from(id, 0)
+        .into_iter()
+        .find_map(|(_, e)| match e {
+            Event::UserPromptSent { attachments, .. } => Some(attachments),
+            _ => None,
+        })
+        .expect("prompt published");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].name.as_deref(), Some("shot.png"));
+    assert_eq!(sent[0].size, 6);
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(id)
+        .await
+        .is_empty());
+}
+
+/// A row whose bytes are gone cannot be sent as if it never had attachments.
+#[tokio::test]
+async fn send_now_keeps_a_row_whose_attachment_bytes_are_gone() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-expired";
+    let state = state_with_attachment_row(id, false).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        send_now_req("caption", "q1"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(!published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { .. }
+    )));
+    assert_eq!(
+        state.session_service.queued_prompts_snapshot(id).await[0]
+            .attachments
+            .len(),
+        1
+    );
+}
+
+/// A refused send leaves the row for a retry instead of losing it.
+#[tokio::test]
+async fn a_refused_send_now_keeps_the_queued_row() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-refused";
+    let state = state_with_queued_plugin_row(id, false).await;
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        Ok(Json(PromptRequest {
+            text: "PR #7 was merged".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            no_revive: true,
+            queued_prompt_id: Some("q1".into()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let queue = state.session_service.queued_prompts_snapshot(id).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
+}
+
+/// A busy agent parks the send again: the same row stays, with its sender, and no copy is made.
+#[tokio::test]
+async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-busy";
+    let state = state_with_queued_plugin_row(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    state
+        .acp_supervisor
+        .publish_user_prompt_with_attachments(id, "the user's turn".into(), &[], None, false, None)
+        .await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        send_now_req("PR #7 was merged", "q1"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let queue = state.session_service.queued_prompts_snapshot(id).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].id, "q1");
+    assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
 }

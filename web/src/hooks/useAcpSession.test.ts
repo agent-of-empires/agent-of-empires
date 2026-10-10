@@ -422,6 +422,7 @@ describe("sendPrompt outcomes", () => {
 describe("server queue", () => {
   let serverQueue: Map<string, ServerQueuedPrompt>;
   let serverBusy: boolean;
+  let workerDown: boolean;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -433,6 +434,7 @@ describe("server queue", () => {
   beforeEach(() => {
     serverQueue = new Map();
     serverBusy = false;
+    workerDown = false;
     vi.mocked(reportAcpInteraction).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
       if (url.includes("/queue")) {
@@ -448,6 +450,12 @@ describe("server queue", () => {
         }
         if (method === "DELETE" && !item) serverQueue.clear();
         return new Response(null, { status: 204 });
+      }
+      if (url.includes("/acp/prompt") && workerDown) return new Response("worker_not_ready", { status: 503 });
+      if (url.includes("/acp/prompt") && body && JSON.parse(body).queued_prompt_id) {
+        // The daemon consumes the named row, or reports it already delivered.
+        const consumed = serverQueue.delete(JSON.parse(body).queued_prompt_id);
+        return consumed ? json({ disposition: "sent" }, 202) : new Response("queued_prompt_gone", { status: 409 });
       }
       if (url.includes("/acp/prompt") && serverBusy) {
         const parsed = JSON.parse(body!) as { prompt_id: string; text: string };
@@ -520,11 +528,13 @@ describe("server queue", () => {
     }
     const deletes = () => calls.filter((c) => c.method === "DELETE");
 
-    it("removes a row server-side, then sends it", async () => {
+    it("names the row in the send so the daemon consumes it and keeps its sender", async () => {
       serverQueue.set("t1", row("t1", "text only"));
       await sendNow("t1");
-      expect(deletes()).toHaveLength(1);
-      expect(posts("/acp/prompt")).toHaveLength(1);
+      expect(deletes()).toHaveLength(0);
+      const sent = posts("/acp/prompt");
+      expect(sent).toHaveLength(1);
+      expect(JSON.parse(sent[0]!.body!)).toMatchObject({ text: "text only", queued_prompt_id: "t1" });
       expect(serverQueue.has("t1")).toBe(false);
     });
 
@@ -536,10 +546,20 @@ describe("server queue", () => {
       expect(result.current.state.queuedPrompts.map((q) => q.id)).toContain("img");
     });
 
-    it("sends nothing when the drain claimed the row first", async () => {
+    it("keeps the one server row when the send is refused, instead of queueing a copy", async () => {
+      serverQueue.set("w1", row("w1", "waiting"));
+      const result = await sendNow("w1", () => (workerDown = true));
+      expect(posts("/queue")).toHaveLength(0);
+      expect(serverQueue.has("w1")).toBe(true);
+      expect(result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["w1"]);
+    });
+
+    it("drops the row quietly when the drain claimed it first", async () => {
       serverQueue.set("r1", row("r1", "raced"));
-      await sendNow("r1", () => serverQueue.delete("r1"));
-      expect(posts("/acp/prompt")).toHaveLength(0);
+      const result = await sendNow("r1", () => serverQueue.delete("r1"));
+      expect(posts("/queue")).toHaveLength(0);
+      expect(result.current.state.queuedPrompts.map((q) => q.id)).not.toContain("r1");
+      expect(result.current.state.lastError).toBeNull();
     });
   });
 });

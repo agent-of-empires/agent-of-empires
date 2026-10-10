@@ -67,7 +67,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 | `session.create` | Creating a host-owned structured session via `sessions.create` (`api_version >= 9`). |
 | `session.prompt` | Delivering a turn to a session the plugin created via `sessions.turn.send`, and the initial turn on `sessions.create` (`api_version >= 9`). |
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
-| `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. It is the plugin equivalent of the user typing into the session, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
+| `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -244,11 +244,11 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 
 ## Messaging any session
 
-`sessions.message.send` takes `{ session_id, message }` and delivers `message` to the session as if the user had typed it. It is for pings such as a PR notification, not for driving a session: it cannot create sessions or read their output, and there is no idempotency key.
+`sessions.message.send` takes `{ session_id, message }` and delivers `message` to the session. For a structured session the message is marked as sent by the plugin, never as typed by the user: the transcript row and a queued message carry the plugin id, and the web and TUI show it. A terminal session receives the message as plain terminal input, with no attribution. It is for pings such as a PR notification, not for driving a session: it cannot create sessions or read their output, and there is no idempotency key.
 
 **Result.** `{ disposition, revived }`. `disposition` is `sent`, `steered` or `queued`. A structured session takes the same path as the web composer: a running agent that accepts steering takes the message mid-turn (`steered`), one that does not has it parked on the session's queue until the turn ends (`queued`), and an idle one starts a turn (`sent`). A busy agent is never refused. A terminal session always reports `sent`. `revived` is `true` when the host had to start something to take the message. For a structured session that is a stopped, dormant or snoozed worker, which is resumed and given the message immediately rather than queued. For a terminal session it is a stopped or dead pane that was started or respawned. A snoozed terminal keeps its live pane, so it reports `revived: false`; the message still clears the snooze.
 
-**Targets.** Any session, with no ownership check: the `session.message` grant is the gate. A woken session does not count toward the plugin's active-session limit, which only covers sessions the plugin created. Terminal (tmux) sessions are supported and a dead pane is revived first. In CityHall mode (`AOE_CITYHALL_MODE`) terminal sessions refuse plugin input with `terminal_unavailable`; this deliberately differs from `aoe send`, which does not check CityHall.
+**Targets.** Any session, with no ownership check: the `session.message` grant is the gate. A structured session still runs the message under its persisted permission mode, as it does for turns from the plugin that created it. A woken session does not count toward the plugin's active-session limit, which only covers sessions the plugin created. Terminal (tmux) sessions are supported and a dead pane is revived first. In CityHall mode (`AOE_CITYHALL_MODE`) terminal sessions refuse plugin input with `terminal_unavailable`; this deliberately differs from `aoe send`, which does not check CityHall.
 
 **Validation.** An empty or whitespace-only message is `invalid_params` (`message_empty`); one over 64 KiB is `invalid_params` (`message_too_long`).
 

@@ -730,6 +730,7 @@ mod tests {
             attachments: Vec::new(),
             prompt_id: None,
             synthesized: false,
+            origin_plugin: None,
         };
         state.acp_event_store.record(id, 1, &prompt).unwrap();
         state.acp_supervisor.hydrate_seqs([(id.to_string(), 1)]);
