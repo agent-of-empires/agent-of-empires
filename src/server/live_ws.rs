@@ -165,11 +165,27 @@ enum LiveControlMessage {
     },
 }
 
-/// ESC is removed so pasted text cannot end the bracketed paste early.
+/// Bracketed-paste delimiters and remaining ESC bytes are removed before terminal input.
 pub(crate) fn strip_paste_escapes(text: &mut String) {
-    text.retain(|ch| ch != '\x1b');
+    // SAFETY: We only omit ASCII delimiters or ESC, so retained UTF-8 bytes stay in order.
+    let bytes = unsafe { text.as_mut_vec() };
+    let (mut read, mut write) = (0, 0);
+    while read < bytes.len() {
+        if bytes[read] == 0x1b {
+            let remaining = &bytes[read..];
+            if remaining.starts_with(b"\x1b[200~") || remaining.starts_with(b"\x1b[201~") {
+                read += 6;
+            } else {
+                read += 1;
+            }
+        } else {
+            bytes[write] = bytes[read];
+            read += 1;
+            write += 1;
+        }
+    }
+    bytes.truncate(write);
 }
-
 /// A submit drops trailing line breaks, since Enter follows.
 fn paste_payload(mut text: String, submit: bool) -> String {
     if submit {
@@ -1733,7 +1749,13 @@ mod tests {
                 r#"{"type":"paste","text":"x\u001b[201~y\n","submit":true}"#,
                 "x\x1b[201~y\n",
                 true,
-                "x[201~y",
+                "xy",
+            ),
+            (
+                r#"{"type":"paste","text":"\u001b[200~pasted\u001b[201~","submit":false}"#,
+                "\x1b[200~pasted\x1b[201~",
+                false,
+                "pasted",
             ),
             (
                 r#"{"type":"paste","text":"line\r\n\n","submit":false}"#,

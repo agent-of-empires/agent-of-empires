@@ -3674,13 +3674,13 @@ async fn send_strips_bracketed_paste_escape_from_captured_snippet() {
         State(state),
         Path(id),
         Ok(Json(SendMessageRequest {
-            message: "Captured snippet: prefix\x1b[201~following text".to_string(),
+            message: "Captured snippet: prefix\x1b[200~code 雪\x1b[201~following text".to_string(),
             revive: false,
         })),
     )
     .await
     .into_response();
-    let expected = "Captured snippet: prefix[201~following text";
+    let expected = "Captured snippet: prefixcode 雪following text";
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let captured = loop {
         let output = crate::tmux::tmux_command()
