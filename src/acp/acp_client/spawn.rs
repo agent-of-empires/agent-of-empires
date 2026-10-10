@@ -123,22 +123,6 @@ pub(super) fn scrub_stderr_secrets(line: &str) -> std::borrow::Cow<'_, str> {
     re.replace_all(line, "<redacted-secret>")
 }
 
-/// Forwarded to every host-side agent on both spawn paths. Provider
-/// credentials come only from the adapter allowlist or session config.
-pub(super) const ALWAYS_FORWARD_ENV: &[&str] = &[
-    "PATH",
-    "HOME",
-    // Drives `get_app_dir()` on Linux; a mismatch puts the runner's registry
-    // record where the daemon never looks (#1383).
-    "XDG_CONFIG_HOME",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "USER",
-    // Lets the agent's git authenticate over SSH (#2691).
-    "SSH_AUTH_SOCK",
-];
-
 /// The inherited host environment (desktop vars etc., #3262), applied first so
 /// every later layer wins on a shared key. Sandboxed agents get none.
 pub(super) fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
@@ -206,7 +190,7 @@ pub(super) fn apply_env_filter(
         cmd.env(&key, value);
         keys.inherited.push(key);
     }
-    for &name in ALWAYS_FORWARD_ENV {
+    for &name in crate::session::environment::HOST_BASE_ENV_KEYS {
         let Ok(mut value) = std::env::var(name) else {
             continue;
         };
@@ -540,8 +524,6 @@ mod tests {
             );
         }
         assert!(host_environment_denyreason(crate::process::runner::ACP_AGENT_ENV).is_some());
-        // #2691: both spawn paths read this one list.
-        assert!(ALWAYS_FORWARD_ENV.contains(&"SSH_AUTH_SOCK"));
     }
 
     /// #3262: structured-view agents get the desktop env; sandboxed ones

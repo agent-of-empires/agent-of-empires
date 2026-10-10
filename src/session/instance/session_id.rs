@@ -38,13 +38,13 @@ pub(super) fn read_session_settings(
 }
 
 impl Instance {
-    /// Returns `(session_id, is_existing)`. Explicit intents win; default intent
-    /// keeps a stored id unless the pane's own backend proves it rotated, and
-    /// otherwise captures only from a live pane through the declared backend.
+    /// Explicit intents win; default intent keeps a stored id unless its backend rotated.
+    /// Returns the id, resume status and whether the native API created a fresh id.
     fn acquire_session_id(
         &mut self,
         execution: Option<&super::execution::NativeExecution>,
-    ) -> (Option<String>, bool) {
+        launch_context: super::execution::AgentLaunchContext<'_>,
+    ) -> (Option<String>, bool, bool) {
         let backend = execution.map_or_else(
             || self.default_selector_backend(),
             |execution| {
@@ -65,8 +65,7 @@ impl Instance {
             || self.pi_session_id_pinnable(),
             |execution| execution.pi_pinnable,
         );
-        let environment =
-            (preassign && execution.is_none()).then(|| self.resolved_host_environment());
+
         let native_created = std::cell::Cell::new(false);
         let result = self.acquire_session_id_with(execution, &|path| {
             if pin_pi {
@@ -75,28 +74,20 @@ impl Instance {
             if !preassign {
                 return None;
             }
-            let mut command = std::process::Command::new(
-                execution.map_or(std::path::Path::new("opencode"), |execution| {
-                    execution.program.as_path()
-                }),
+            let snapshot = launch_context.host_command?;
+            let mut command = std::process::Command::new(snapshot.get_program());
+            command.env_clear().envs(
+                snapshot
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
             );
-            let cwd = if let Some(execution) = execution {
-                command.env_clear().envs(&execution.inputs.environment);
-                for (key, value) in &execution.routing {
-                    if let Some(value) = value {
-                        command.env(key, value);
-                    } else {
-                        command.env_remove(key);
-                    }
-                }
-                execution.inputs.cwd.to_str()?
-            } else {
-                command.envs(crate::session::environment::resolve_host_environment_pairs(
-                    environment.as_deref()?,
-                ));
-                path
-            };
-            let sid = crate::session::capture::preassign_opencode_session_id(cwd, command);
+            command.current_dir(snapshot.get_current_dir()?);
+            let cwd = execution.map_or(Some(path), |execution| execution.inputs.cwd.to_str())?;
+            let sid = crate::session::capture::preassign_opencode_session_id(
+                cwd,
+                command,
+                launch_context.generation,
+            );
             native_created.set(sid.is_some());
             sid
         });
@@ -114,7 +105,7 @@ impl Instance {
                 );
             }
         }
-        result
+        (result.0, result.1, native_created.get())
     }
 
     /// Session-id acquisition with the pre-mint step injected as a seam, so
@@ -301,6 +292,98 @@ impl Instance {
         self.resolved_agent().is_some_and(|agent| {
             agent.name == "opencode" && self.launch_invokes_resolved_agent_directly(agent)
         })
+    }
+
+    /// Attest the store-minted child after the server is reaped, before adoption.
+    pub(super) fn fork_session_in_store(
+        &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+        parent_id: &str,
+        expected: &mut ConversationState,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.opencode_store_fork_available(execution),
+            "a fork through the agent's store needs a host launch of opencode itself"
+        );
+        let execution =
+            execution.context("OpenCode store fork requires a prepared native execution")?;
+        anyhow::ensure!(
+            execution.opencode_schema.is_some(),
+            "OpenCode store fork requires a prepared active schema"
+        );
+        let command = execution.host_command();
+        let cwd = execution
+            .inputs
+            .cwd
+            .to_str()
+            .context("fork working directory is not UTF-8")?;
+
+        let child = crate::session::capture::fork_opencode_session_id(cwd, command, parent_id)
+            .context("the store returned no child for this fork")?;
+        anyhow::ensure!(
+            child != parent_id,
+            "OpenCode fork returned its parent instead of a child"
+        );
+        execution
+            .validate_opencode_session_target(&child)
+            .context("the returned OpenCode fork child is not valid in the pinned store")?;
+        self.set_agent_conversation(
+            Some(child.clone()),
+            Some(crate::session::ConversationBinding {
+                session_id: child.clone(),
+                execution: Some(execution.binding.clone()),
+                provenance: crate::session::ConversationProvenance::Observed,
+                transcript_path: None,
+            }),
+            None,
+        );
+        // Keep Fork as the in-memory validation target until launch finalization.
+        if let SidPersistOutcome::Skip =
+            self.persist_fork_adoption(&self.effective_profile(), expected)
+        {
+            tracing::warn!(target: "session.store", instance = %self.id,
+                "the adopted fork child could not be written to the durable row; \
+                 a retry before the launch publishes may fork the conversation again");
+        }
+        Ok(child)
+    }
+
+    /// The child a store fork already adopted for THIS launch. Returns `None`
+    /// until one is, so the first pass asks the store and a later one reuses it.
+    ///
+    /// An `Observed` binding outlives the launch, being the row's native
+    /// identity, so a child counts as this launch's only while the conversation
+    /// was branched from a different id. Otherwise forking an already-forked
+    /// session would hand back the first fork's child instead of branching.
+    pub(super) fn stored_fork_child(&self) -> Option<String> {
+        let binding = self.agent_session_binding.as_ref()?;
+        (binding.provenance == crate::session::ConversationProvenance::Observed
+            && Some(binding.session_id.as_str()) == self.agent_session_id.as_deref()
+            && matches!(&self.resume_intent, ResumeIntent::Fork { .. })
+            && self
+                .resume_binding
+                .as_ref()
+                .is_some_and(|parent| parent.session_id != binding.session_id))
+        .then(|| binding.session_id.clone())
+    }
+    /// A store fork runs `opencode serve` against the launch's own store, so it
+    /// needs a host launch that invokes the resolved binary directly and shares
+    /// no container store with it. "Directly" is the launch's own command
+    /// against the resolved binary: a wrapper would have the fork spawn
+    /// something other than the agent it forks. It is not a question about
+    /// AoE's own `PATH`, which the server does not inherit.
+    fn opencode_store_fork_available(
+        &self,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> bool {
+        match execution {
+            Some(execution) => {
+                execution.agent.name == "opencode"
+                    && execution.inputs.container.is_none()
+                    && self.launch_invokes_resolved_agent_directly(execution.agent)
+            }
+            None => false,
+        }
     }
 
     fn self_heal_row_is_eligible(&self, contended: &HashSet<(String, String)>) -> bool {
@@ -557,6 +640,8 @@ impl Instance {
         context: &str,
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
+        launch_context: super::execution::AgentLaunchContext<'_>,
+        expected: &mut ConversationState,
     ) -> Result<bool> {
         let agent = execution
             .map(|execution| execution.agent)
@@ -602,11 +687,57 @@ impl Instance {
         }
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let agent = agent.context("fork execution adapter is unavailable")?;
+            anyhow::ensure!(
+                !(self.is_sandboxed() && agent.spans_agent_generations),
+                "OpenCode forks require a host launch; sandbox forks are unsupported"
+            );
+            let generation = launch_context.generation;
+            if generation == crate::agents::AgentGeneration::Unknown {
+                anyhow::bail!(
+                    "{} --help did not answer, so it is unknown whether this build forks \
+                     through its store or its root flag; the fork was refused rather than \
+                     started with a mechanism that may not exist",
+                    agent.name
+                );
+            }
+            let fork_strategy = agent
+                .fork_strategy
+                .resolve(generation)
+                .expect("the unknown generation bailed above");
+            if matches!(fork_strategy, crate::agents::ForkStrategy::ServeFork) {
+                // A restart prepares the command twice, and asking the store
+                // again would leave a second conversation behind in the user's
+                // history, so an adopted child is reused. The intent stays a
+                // fork: `refresh_prepared_prime_launch_after_pane_stop` resets
+                // the conversation to the pre-fork seed, and promoting it here
+                // would send that reset straight to the command line.
+                let child_id = match self.stored_fork_child() {
+                    Some(adopted) => adopted,
+                    None => self
+                        .fork_session_in_store(execution, &from, expected)
+                        .with_context(|| {
+                            format!(
+                                "{} could not fork this conversation, so the fork was \
+                                 refused rather than started as a fresh session",
+                                agent.name
+                            )
+                        })?,
+                };
+                append_resume_flags(
+                    agent.name,
+                    Some(child_id.as_str()),
+                    false,
+                    cmd,
+                    parsed_command.executable_end,
+                    "host fork",
+                );
+                return Ok(false);
+            }
             let child_id = self
                 .agent_session_id
                 .as_deref()
                 .context("fork child seed is missing")?;
-            let fork_part = build_fork_flags(agent.name, &from, child_id);
+            let fork_part = build_fork_flags(agent.name, &from, child_id, generation);
             anyhow::ensure!(
                 !fork_part.is_empty(),
                 "native agent cannot execute this fork"
@@ -628,8 +759,7 @@ impl Instance {
             } else {
                 fork_part
             };
-            let is_subcommand =
-                matches!(agent.fork_strategy, crate::agents::ForkStrategy::CodexFork);
+            let is_subcommand = matches!(fork_strategy, crate::agents::ForkStrategy::CodexFork);
             splice_subcommand_or_append(
                 cmd,
                 &fork_part,
@@ -638,7 +768,9 @@ impl Instance {
             return Ok(false);
         }
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
-        let (mut session_id, is_existing) = self.acquire_session_id(execution);
+        let (mut session_id, is_existing, native_created) =
+            self.acquire_session_id(execution, launch_context);
+
         if let Some(path) = execution.and_then(|execution| execution.pi_transcript_path.as_ref()) {
             self.set_agent_conversation(
                 session_id.clone(),
@@ -715,6 +847,26 @@ impl Instance {
             parsed_command.executable_end,
             context,
         );
+        if emitted
+            && execution.is_none()
+            && agent.is_some_and(|agent| {
+                agent.name == "opencode" && self.managed_user_argv(agent).is_ok()
+            })
+            && (native_created || matches!(self.resume_intent, ResumeIntent::Default))
+        {
+            let generation = if native_created {
+                crate::agents::AgentGeneration::Current
+            } else {
+                launch_context.generation
+            };
+            match generation {
+                crate::agents::AgentGeneration::Current => cmd.push_str(" --standalone"),
+                crate::agents::AgentGeneration::Legacy => {},
+                crate::agents::AgentGeneration::Unknown => anyhow::bail!(
+                    "OpenCode --help did not establish a generation; the stored conversation cannot be safely resumed, so the launch was refused"
+                ),
+            }
+        }
         anyhow::ensure!(
             !matches!(self.resume_intent, ResumeIntent::Use(_)) || emitted,
             "explicit resume did not produce a native resume selector"
@@ -800,6 +952,68 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn default_opencode_resume_keeps_its_private_route_without_overriding_user_routes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let agent = crate::agents::get_agent("opencode").unwrap();
+        for (index, (help, args, private, refused)) in [
+            ("--auto", "", true, false),
+            ("--fork", "", false, false),
+            ("", "", false, true),
+            ("--auto", "--server http://127.0.0.1:1234", false, false),
+            ("", "--server http://127.0.0.1:1234", false, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bin = root.path().join(format!("bin-{index}"));
+            std::fs::create_dir(&bin).unwrap();
+            let program = bin.join("opencode");
+            std::fs::write(&program, format!("#!/bin/sh\nprintf '%s\n' '{help}'\n")).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _path = EnvGuard::set(&[("PATH", bin.to_str().unwrap())]);
+            let mut inst = tool_instance("opencode", root.path().to_str().unwrap());
+            inst.extra_args = args.into();
+            inst.agent_session_id = Some("ses_saved_default_conversation".into());
+            let mut cmd = format!("opencode {args}");
+            let result = inst.apply_session_flags(
+                &mut cmd,
+                "test",
+                Some(agent),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    Some(agent),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+                &mut inst.conversation_state(),
+            );
+            if refused {
+                assert!(result.unwrap_err().to_string().contains("safely resumed"));
+                assert!(!cmd.contains("--standalone"));
+                continue;
+            }
+            result.unwrap();
+            assert_eq!(
+                cmd.contains("--standalone"),
+                private,
+                "help={help:?}, args={args:?}: {cmd}"
+            );
+            assert!(
+                cmd.contains("--session ses_saved_default_conversation"),
+                "{cmd}"
+            );
+            if !args.is_empty() {
+                assert!(cmd.contains(args), "{cmd}");
+            }
+        }
+    }
+
     #[test]
     fn acquire_reuses_stored_and_pinned_ids_unless_cleared() {
         // (tool, stored, intent, reused id, or whether a cleared launch mints a fresh one)
@@ -850,7 +1064,15 @@ mod tests {
             let mut inst = tool_instance(tool, "/tmp/x");
             inst.agent_session_id = stored.map(str::to_string);
             inst.resume_intent = intent;
-            let (sid, existing) = inst.acquire_session_id(None);
+            let (sid, existing, _) = inst.acquire_session_id(
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+            );
             match reused {
                 Some(id) => assert_eq!((sid.as_deref(), existing), (Some(id), true), "{tool}"),
                 None if mints => {
@@ -876,7 +1098,19 @@ mod tests {
         };
         let mut cmd = "claude".to_string();
         assert!(!inst
-            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("claude"), None,)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                crate::agents::get_agent("claude"),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         assert_eq!(
             cmd,
@@ -888,21 +1122,64 @@ mod tests {
     #[test]
     fn fresh_claude_launch_mints_a_stable_pinned_id() {
         let mut inst = tool_instance("claude", "/tmp/test");
-        let (first, first_existing) = inst.acquire_session_id(None);
+        let (first, first_existing, _) = inst.acquire_session_id(
+            None,
+            super::execution::AgentLaunchContext::host(
+                inst.default_selector_agent(),
+                inst.default_selector_agent()
+                    .and_then(|agent| inst.host_agent_command(agent, None))
+                    .as_ref(),
+            ),
+        );
         assert!(first.is_some() && !first_existing);
         assert_eq!(inst.agent_session_id, first);
         // With no transcript on disk the same id stays fresh-pinned.
-        assert_eq!(inst.acquire_session_id(None), (first, false));
+        let (sid, existing, _) = inst.acquire_session_id(
+            None,
+            super::execution::AgentLaunchContext::host(
+                inst.default_selector_agent(),
+                inst.default_selector_agent()
+                    .and_then(|agent| inst.host_agent_command(agent, None))
+                    .as_ref(),
+            ),
+        );
+        assert_eq!((sid, existing), (first, false));
 
         let mut fresh = tool_instance("claude", "/tmp/test");
         let mut cmd = String::from("claude");
         assert!(!fresh
-            .apply_session_flags(&mut cmd, "test", None, None)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    fresh.default_selector_agent(),
+                    fresh
+                        .default_selector_agent()
+                        .and_then(|agent| fresh.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut fresh.conversation_state()
+            )
             .unwrap());
         fresh.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".into());
         let mut cmd = String::from("claude");
         assert!(fresh
-            .apply_session_flags(&mut cmd, "test", None, None)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    fresh.default_selector_agent(),
+                    fresh
+                        .default_selector_agent()
+                        .and_then(|agent| fresh.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut fresh.conversation_state()
+            )
             .unwrap());
     }
 
@@ -931,7 +1208,19 @@ mod tests {
         assert!(inst.execution_agent().is_err());
         let mut first = inst.command.clone();
         assert!(!inst
-            .apply_session_flags(&mut first, "test", None, None)
+            .apply_session_flags(
+                &mut first,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         let sid = inst.agent_session_id.clone().expect("fresh Claude pin");
         assert_eq!(first, format!("work-claude --session-id {sid}"));
@@ -945,7 +1234,19 @@ mod tests {
         std::fs::write(project.join(format!("{sid}.jsonl")), "{}\n").unwrap();
         let mut resumed = inst.command.clone();
         assert!(inst
-            .apply_session_flags(&mut resumed, "test", None, None)
+            .apply_session_flags(
+                &mut resumed,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         assert_eq!(resumed, format!("work-claude --resume {sid}"));
         for intent in [
@@ -955,7 +1256,19 @@ mod tests {
             inst.resume_intent = intent;
             let mut command = inst.command.clone();
             assert!(inst
-                .apply_session_flags(&mut command, "test", None, None)
+                .apply_session_flags(
+                    &mut command,
+                    "test",
+                    None,
+                    None,
+                    super::execution::AgentLaunchContext::host(
+                        inst.default_selector_agent(),
+                        inst.default_selector_agent()
+                            .and_then(|agent| inst.host_agent_command(agent, None))
+                            .as_ref()
+                    ),
+                    &mut inst.conversation_state()
+                )
                 .is_err());
             assert_eq!(command, "work-claude");
         }
@@ -970,7 +1283,19 @@ mod tests {
             assert!(!inst.supports_native_resume(), "{unsafe_command}");
             let mut command = unsafe_command.to_string();
             assert!(!inst
-                .apply_session_flags(&mut command, "test", None, None)
+                .apply_session_flags(
+                    &mut command,
+                    "test",
+                    None,
+                    None,
+                    super::execution::AgentLaunchContext::host(
+                        inst.default_selector_agent(),
+                        inst.default_selector_agent()
+                            .and_then(|agent| inst.host_agent_command(agent, None))
+                            .as_ref()
+                    ),
+                    &mut inst.conversation_state()
+                )
                 .unwrap());
             assert_eq!(command, unsafe_command);
         }
@@ -980,7 +1305,19 @@ mod tests {
         inst.extra_args = "--resume external".into();
         let mut conflict = "work-claude --resume external".to_string();
         assert!(inst
-            .apply_session_flags(&mut conflict, "test", None, None)
+            .apply_session_flags(
+                &mut conflict,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .is_err());
         let mut launched = tool_instance("work-claude", root.path().to_str().unwrap());
         launched.source_profile = PROFILE.into();
@@ -1054,16 +1391,33 @@ work-opencode = "opencode"
                 std::fs::write(sidecar.join("session_path"), pi_path.to_str().unwrap()).unwrap();
             }
             assert!(inst.supports_session_poller(), "{tool} lost its publisher");
-            assert_eq!(
-                inst.acquire_session_id(None),
-                (Some(SID.into()), true),
-                "{tool}"
+            let (sid, existing, _) = inst.acquire_session_id(
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
             );
+            assert_eq!((sid, existing), (Some(SID.into()), true), "{tool}");
             assert_eq!(inst.agent_session_id.as_deref(), Some(SID), "{tool}");
             if tool == "work-claude" {
                 let mut command = tool.to_string();
                 assert!(inst
-                    .apply_session_flags(&mut command, "test", None, None)
+                    .apply_session_flags(
+                        &mut command,
+                        "test",
+                        None,
+                        None,
+                        super::execution::AgentLaunchContext::host(
+                            inst.default_selector_agent(),
+                            inst.default_selector_agent()
+                                .and_then(|agent| inst.host_agent_command(agent, None))
+                                .as_ref()
+                        ),
+                        &mut inst.conversation_state()
+                    )
                     .unwrap());
                 assert_eq!(command, format!("{tool} --resume {SID}"));
             }
@@ -1073,7 +1427,20 @@ work-opencode = "opencode"
                 fresh.command = tool.into();
                 let mut command = tool.to_string();
                 assert!(!fresh
-                    .apply_session_flags(&mut command, "test", None, None)
+                    .apply_session_flags(
+                        &mut command,
+                        "test",
+                        None,
+                        None,
+                        super::execution::AgentLaunchContext::host(
+                            fresh.default_selector_agent(),
+                            fresh
+                                .default_selector_agent()
+                                .and_then(|agent| fresh.host_agent_command(agent, None))
+                                .as_ref()
+                        ),
+                        &mut fresh.conversation_state()
+                    )
                     .unwrap());
                 assert!(
                     command.starts_with(&format!("{tool} --session-id ")),
@@ -1151,6 +1518,217 @@ work-opencode = "opencode"
         assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
     }
 
+    /// A restart prepares the launch twice and resets the conversation to the
+    /// pre-fork seed on the way. The store must be asked once, and the adopted
+    /// child must survive that reset rather than the pane opening a seed id no
+    /// server ever created.
+    #[test]
+    fn a_store_fork_reuses_the_child_it_already_adopted() {
+        let seed = "ses_child000000000000000000000000";
+        let child = "ses_ef71c5686ffedIqGGjtFGLwW1r";
+        let parent = "ses_parent00000000000000000000000";
+        let adopt = |inst: &mut Instance, id: &str, provenance| {
+            inst.agent_session_id = Some(id.to_string());
+            inst.agent_session_binding = Some(crate::session::ConversationBinding {
+                session_id: id.to_string(),
+                execution: None,
+                provenance,
+                transcript_path: None,
+            });
+        };
+        let fork_intent = |inst: &mut Instance| {
+            inst.resume_intent = ResumeIntent::Fork {
+                from: parent.to_string(),
+            };
+        };
+
+        let mut inst = tool_instance("opencode", "/tmp/test");
+        fork_intent(&mut inst);
+        adopt(
+            &mut inst,
+            seed,
+            crate::session::ConversationProvenance::Preallocated,
+        );
+        assert_eq!(inst.stored_fork_child(), None, "the seed is not a child");
+
+        // The fork arm adopts what the store minted, branching from the parent.
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: parent.to_string(),
+            execution: None,
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        adopt(
+            &mut inst,
+            child,
+            crate::session::ConversationProvenance::Observed,
+        );
+        assert_eq!(
+            inst.stored_fork_child().as_deref(),
+            Some(child),
+            "a second pass must open the adopted child, not mint another"
+        );
+
+        // Forking the adopted child again must mint a new child.
+        inst.resume_intent = ResumeIntent::Fork {
+            from: child.to_string(),
+        };
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: child.to_string(),
+            execution: None,
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        assert_eq!(
+            inst.stored_fork_child(),
+            None,
+            "a second fork of that child must ask the store again"
+        );
+
+        // Outside a fork nothing is reused either.
+        inst.resume_intent = ResumeIntent::Default;
+        assert_eq!(inst.stored_fork_child(), None);
+    }
+
+    /// A sandbox fork is refused independently of either installed generation.
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_opencode_fork_refuses_with_a_legacy_host() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let agent = crate::agents::get_agent("opencode").expect("opencode is a builtin agent");
+
+        // Establish a legacy host so choosing its fork arm would succeed.
+        crate::agents::forget_agent_help_for_test();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("opencode");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' '  --fork  fork a session'\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", bin.as_os_str())]);
+
+        let host = tool_instance("opencode", project.to_str().unwrap());
+        assert_eq!(
+            super::execution::AgentLaunchContext::host(
+                Some(agent),
+                host.host_agent_command(agent, None).as_ref()
+            )
+            .generation,
+            crate::agents::AgentGeneration::Legacy,
+            "the host launch reads the stub's own answer"
+        );
+
+        let mut sandboxed = tool_instance("opencode", project.to_str().unwrap());
+        sandboxed.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "sandbox-generation",
+            None,
+        ));
+        sandboxed.resume_intent = ResumeIntent::Fork {
+            from: "ses_1111111111111111111111111111aaaa".to_string(),
+        };
+        sandboxed.agent_session_id = Some("ses_2222222222222222222222222222bbbb".to_string());
+        let mut command = "opencode".to_string();
+        for generation in [
+            crate::agents::AgentGeneration::Legacy,
+            crate::agents::AgentGeneration::Current,
+            crate::agents::AgentGeneration::Unknown,
+        ] {
+            let error = sandboxed
+                .apply_session_flags(
+                    &mut command,
+                    "sandbox fork",
+                    Some(agent),
+                    None,
+                    super::execution::AgentLaunchContext {
+                        generation,
+                        host_command: None,
+                    },
+                    &mut sandboxed.conversation_state(),
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .root_cause()
+                    .to_string()
+                    .contains("sandbox forks are unsupported"),
+                "{error:#}"
+            );
+            assert_eq!(command, "opencode", "a refused fork must not alter argv");
+        }
+    }
+
+    /// An attested host launch forks whatever binary it resolved, even when the
+    /// profile points `PATH` somewhere else, because the server is spawned from
+    /// that resolved path with the launch's own environment.
+    #[test]
+    #[serial_test::serial]
+    fn an_attested_host_launch_may_fork_through_a_profile_path() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let inst = tool_instance("opencode", project.to_str().unwrap());
+        // A profile `PATH` that does not name the resolved program.
+        let profile_bin = home.path().join("elsewhere");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let agent = crate::session::instance::execution::NativeLaunchInputs {
+            raw_environment: Vec::new(),
+            launch_id: "test".to_string(),
+            environment: [(
+                "PATH".to_string(),
+                profile_bin.to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            cwd: project.clone(),
+            profile: "default".to_string(),
+            container: None,
+            docker_env: None,
+            pane_env: Vec::new(),
+            identity_extension: None,
+        };
+        let execution = super::execution::NativeExecution {
+            agent: crate::agents::get_agent("opencode").unwrap(),
+            binding: crate::session::ExecutionBinding {
+                agent: "opencode".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                exported_default_store: None,
+                cwd: project,
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            },
+            routing: Vec::new(),
+            case_insensitive_routing: &[],
+            namespace_arguments: Vec::new(),
+            omp: None,
+            inputs: agent,
+            program: profile_bin.join("opencode"),
+            capture: None,
+            pi_transcript_path: None,
+            pi_pinnable: false,
+            target_session_id: None,
+            resolved_target_session_id: None,
+            opencode_preassign: false,
+            opencode_schema: None,
+            store_override: None,
+        };
+        assert!(
+            inst.opencode_store_fork_available(Some(&execution)),
+            "the resolved program is spawned directly, so a profile PATH does not bar it"
+        );
+    }
+
     #[test]
     fn self_heal_eligibility_rejects_owned_and_inactive_rows() {
         let base = Instance::new("self-heal", "/tmp/self-heal");
@@ -1213,7 +1791,16 @@ work-opencode = "opencode"
         let json = serde_json::to_string(&inst).unwrap();
         let mut reloaded: Instance = serde_json::from_str(&json).unwrap();
 
-        let (session_id, is_existing) = reloaded.acquire_session_id(None);
+        let (session_id, is_existing, _) = reloaded.acquire_session_id(
+            None,
+            super::execution::AgentLaunchContext::host(
+                reloaded.default_selector_agent(),
+                reloaded
+                    .default_selector_agent()
+                    .and_then(|agent| reloaded.host_agent_command(agent, None))
+                    .as_ref(),
+            ),
+        );
         assert_eq!(session_id.as_deref(), Some(native_id));
         assert!(is_existing);
         assert_eq!(
@@ -1241,8 +1828,20 @@ work-opencode = "opencode"
             inst.sandbox_info = Some(test_sandbox("test", None));
             let mut cmd = tool.to_string();
             assert_eq!(
-                inst.apply_session_flags(&mut cmd, "test", crate::agents::get_agent(tool), None,)
-                    .unwrap(),
+                inst.apply_session_flags(
+                    &mut cmd,
+                    "test",
+                    crate::agents::get_agent(tool),
+                    None,
+                    super::execution::AgentLaunchContext::host(
+                        inst.default_selector_agent(),
+                        inst.default_selector_agent()
+                            .and_then(|agent| inst.host_agent_command(agent, None))
+                            .as_ref()
+                    ),
+                    &mut inst.conversation_state()
+                )
+                .unwrap(),
                 resumed,
                 "{tool}"
             );
@@ -1255,7 +1854,20 @@ work-opencode = "opencode"
         automatic_copilot.sandbox_info = Some(test_sandbox("test", None));
         let mut automatic_cmd = "copilot".to_string();
         assert!(!automatic_copilot
-            .apply_session_flags(&mut automatic_cmd, "test", None, None)
+            .apply_session_flags(
+                &mut automatic_cmd,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    automatic_copilot.default_selector_agent(),
+                    automatic_copilot
+                        .default_selector_agent()
+                        .and_then(|agent| automatic_copilot.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut automatic_copilot.conversation_state()
+            )
             .unwrap());
         assert_eq!(automatic_cmd, "copilot");
 
@@ -1264,7 +1876,20 @@ work-opencode = "opencode"
         host_prime.resume_intent = ResumeIntent::Use(sid.to_string());
         let mut cmd = "prime-agent".to_string();
         assert!(host_prime
-            .apply_session_flags(&mut cmd, "test", None, None)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    host_prime.default_selector_agent(),
+                    host_prime
+                        .default_selector_agent()
+                        .and_then(|agent| host_prime.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut host_prime.conversation_state()
+            )
             .unwrap());
         assert_eq!(cmd, format!("prime-agent --resume {sid}"));
     }
@@ -1327,7 +1952,20 @@ work-opencode = "opencode"
         );
         let mut cmd = wrapped.command.clone();
         assert!(wrapped
-            .apply_session_flags(&mut cmd, "test", wrapped.resolved_agent(), None)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                wrapped.resolved_agent(),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    wrapped.default_selector_agent(),
+                    wrapped
+                        .default_selector_agent()
+                        .and_then(|agent| wrapped.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut wrapped.conversation_state()
+            )
             .is_err());
         assert_eq!(
             cmd, "ssh -t lenovo codex",
@@ -1347,7 +1985,20 @@ work-opencode = "opencode"
         );
         let mut direct_cmd = direct.command.clone();
         assert!(direct
-            .apply_session_flags(&mut direct_cmd, "test", direct.resolved_agent(), None)
+            .apply_session_flags(
+                &mut direct_cmd,
+                "test",
+                direct.resolved_agent(),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    direct.default_selector_agent(),
+                    direct
+                        .default_selector_agent()
+                        .and_then(|agent| direct.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut direct.conversation_state()
+            )
             .unwrap());
         assert_eq!(direct_cmd, format!("codex resume {sid} --model o3"));
 
@@ -1363,7 +2014,20 @@ work-opencode = "opencode"
         );
         let mut qualified_cmd = qualified.command.clone();
         assert!(qualified
-            .apply_session_flags(&mut qualified_cmd, "test", qualified.resolved_agent(), None)
+            .apply_session_flags(
+                &mut qualified_cmd,
+                "test",
+                qualified.resolved_agent(),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    qualified.default_selector_agent(),
+                    qualified
+                        .default_selector_agent()
+                        .and_then(|agent| qualified.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut qualified.conversation_state()
+            )
             .is_err());
         assert_eq!(qualified_cmd, "/opt/bin/mycodex");
 
@@ -1381,8 +2045,20 @@ work-opencode = "opencode"
             );
             let mut bare_cmd = bare.command.clone();
             assert!(
-                bare.apply_session_flags(&mut bare_cmd, "test", bare.resolved_agent(), None)
-                    .unwrap(),
+                bare.apply_session_flags(
+                    &mut bare_cmd,
+                    "test",
+                    bare.resolved_agent(),
+                    None,
+                    super::execution::AgentLaunchContext::host(
+                        bare.default_selector_agent(),
+                        bare.default_selector_agent()
+                            .and_then(|agent| bare.host_agent_command(agent, None))
+                            .as_ref()
+                    ),
+                    &mut bare.conversation_state()
+                )
+                .unwrap(),
                 "{command}"
             );
             assert_eq!(bare_cmd, format!("{command} resume {sid}"));
@@ -1396,7 +2072,19 @@ work-opencode = "opencode"
         assert_eq!(inst.agent_session_id, None);
         let mut cmd = String::from("gemini");
         assert!(!inst
-            .apply_session_flags(&mut cmd, "test", None, None)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         assert_eq!(cmd, "gemini");
         inst.capture_started_at = Some(std::time::SystemTime::now());
@@ -1425,7 +2113,19 @@ work-opencode = "opencode"
             let mut inst = tool_instance("claude", "/tmp/x");
             let mut actual = command.to_string();
             assert!(!inst
-                .apply_session_flags(&mut actual, "test", None, None)
+                .apply_session_flags(
+                    &mut actual,
+                    "test",
+                    None,
+                    None,
+                    super::execution::AgentLaunchContext::host(
+                        inst.default_selector_agent(),
+                        inst.default_selector_agent()
+                            .and_then(|agent| inst.host_agent_command(agent, None))
+                            .as_ref()
+                    ),
+                    &mut inst.conversation_state()
+                )
                 .unwrap());
             assert_eq!(actual, command);
             assert!(inst.agent_session_id.is_none());
@@ -1443,7 +2143,20 @@ work-opencode = "opencode"
                 managed.agent_session_id = stored;
                 managed.resume_intent = intent;
                 let error = managed
-                    .apply_session_flags(&mut command.to_string(), "test", None, None)
+                    .apply_session_flags(
+                        &mut command.to_string(),
+                        "test",
+                        None,
+                        None,
+                        super::execution::AgentLaunchContext::host(
+                            None,
+                            managed
+                                .default_selector_agent()
+                                .and_then(|agent| managed.host_agent_command(agent, None))
+                                .as_ref(),
+                        ),
+                        &mut managed.conversation_state(),
+                    )
                     .unwrap_err()
                     .to_string();
                 assert!(
@@ -1460,7 +2173,20 @@ work-opencode = "opencode"
         let mut external = tool_instance("codex", "/tmp/x");
         let mut command = "codex resume external".to_string();
         assert!(!external
-            .apply_session_flags(&mut command, "test", None, None)
+            .apply_session_flags(
+                &mut command,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    external.default_selector_agent(),
+                    external
+                        .default_selector_agent()
+                        .and_then(|agent| external.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut external.conversation_state()
+            )
             .unwrap());
         assert_eq!(command, "codex resume external");
 
@@ -1469,7 +2195,20 @@ work-opencode = "opencode"
         value_token.resume_intent = ResumeIntent::Use(sid.to_string());
         let mut command = "codex --model resume".to_string();
         assert!(value_token
-            .apply_session_flags(&mut command, "test", value_token.resolved_agent(), None)
+            .apply_session_flags(
+                &mut command,
+                "test",
+                value_token.resolved_agent(),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    value_token.default_selector_agent(),
+                    value_token
+                        .default_selector_agent()
+                        .and_then(|agent| value_token.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut value_token.conversation_state()
+            )
             .unwrap());
         assert_eq!(command, format!("codex resume {sid} --model resume"));
 
@@ -1481,7 +2220,20 @@ work-opencode = "opencode"
         alias.command = "claude --resume external".to_string();
         let mut command = alias.command.clone();
         assert!(!alias
-            .apply_session_flags(&mut command, "test", alias.resolved_agent(), None)
+            .apply_session_flags(
+                &mut command,
+                "test",
+                alias.resolved_agent(),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    alias.default_selector_agent(),
+                    alias
+                        .default_selector_agent()
+                        .and_then(|agent| alias.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut alias.conversation_state()
+            )
             .unwrap());
         assert!(alias.agent_session_id.is_none());
     }
@@ -1535,7 +2287,19 @@ work-opencode = "opencode"
         );
         let mut command = "claude".to_string();
         assert!(inst
-            .apply_session_flags(&mut command, "test", inst.resolved_agent(), None)
+            .apply_session_flags(
+                &mut command,
+                "test",
+                inst.resolved_agent(),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .is_err());
         assert_eq!(command, "claude");
         inst.resume_intent = ResumeIntent::Cleared;
@@ -1576,7 +2340,19 @@ work-opencode = "opencode"
         );
         let mut pinned = "copilot".to_string();
         assert!(inst
-            .apply_session_flags(&mut pinned, "test", None, None)
+            .apply_session_flags(
+                &mut pinned,
+                "test",
+                None,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         assert_eq!(pinned, format!("copilot --session-id {sid}"));
 
@@ -1733,12 +2509,20 @@ work-opencode = "opencode"
                     inst.sandbox_info = Some(test_sandbox("verify-sandbox", None));
                 }
                 let dir = sidecar.map(|sid| write_sidecar(&inst.id, sid));
-                let acquired = inst.acquire_session_id(None);
+                let acquired = inst.acquire_session_id(
+                    None,
+                    super::execution::AgentLaunchContext::host(
+                        inst.default_selector_agent(),
+                        inst.default_selector_agent()
+                            .and_then(|agent| inst.host_agent_command(agent, None))
+                            .as_ref(),
+                    ),
+                );
                 if let Some(dir) = dir {
                     fs::remove_dir_all(dir).ok();
                 }
                 assert_eq!(
-                    acquired,
+                    (acquired.0, acquired.1),
                     (Some(want_sid.to_string()), want_existing),
                     "{label}"
                 );
@@ -1811,7 +2595,16 @@ work-opencode = "opencode"
                         )]
                     })
                     .unwrap_or_default();
-                inst.acquire_session_id(None)
+                let (sid, existing, _) = inst.acquire_session_id(
+                    None,
+                    super::execution::AgentLaunchContext::host(
+                        inst.default_selector_agent(),
+                        inst.default_selector_agent()
+                            .and_then(|agent| inst.host_agent_command(agent, None))
+                            .as_ref(),
+                    ),
+                );
+                (sid, existing)
             };
             for (profile, sid) in cases {
                 assert_eq!(

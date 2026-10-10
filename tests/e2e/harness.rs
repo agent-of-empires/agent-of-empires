@@ -111,6 +111,22 @@ macro_rules! require_node {
 }
 pub(crate) use require_node;
 
+/// The fake OpenCode store server is a small Python program, so the tests that
+/// need one skip where Python is absent rather than failing.
+pub fn python_available() -> bool {
+    which::which("python3").is_ok()
+}
+
+macro_rules! require_python3 {
+    () => {
+        if !$crate::harness::python_available() {
+            eprintln!("Skipping test: python3 not available");
+            return;
+        }
+    };
+}
+pub(crate) use require_python3;
+
 /// Ephemeral port not yet issued to another test in this process. The
 /// bind-then-drop TOCTOU window remains for unrelated processes.
 pub fn pick_free_port() -> u16 {
@@ -275,8 +291,7 @@ pub struct TuiTestHarness {
     recording: bool,
     cast_path: Option<PathBuf>,
     /// Exported on every spawned process (tmux session and `run_cli`).
-    extra_env: Vec<(String, String)>,
-    /// Removed from commands built by `isolated()` after `extra_env` is applied.
+    extra_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     extra_env_remove: Vec<String>,
     /// Prepended to PATH ahead of the `claude` stub.
     extra_path_dirs: Vec<PathBuf>,
@@ -362,7 +377,7 @@ last_seen_version = "{}"
             recording,
             cast_path: None,
             // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
-            extra_env: vec![("AOE_TMUX_SOCKET".to_string(), tmux_socket_env)],
+            extra_env: vec![("AOE_TMUX_SOCKET".into(), tmux_socket_env.into())],
             extra_env_remove: Vec::new(),
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
@@ -398,7 +413,7 @@ last_seen_version = "{}"
         for key in remove {
             cmd.env_remove(key);
         }
-        cmd.envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        cmd.envs(self.extra_env.iter().map(|(key, value)| (key, value)));
         for key in &self.extra_env_remove {
             cmd.env_remove(key);
         }
@@ -441,13 +456,21 @@ last_seen_version = "{}"
         let _ = self.tmux().args(["kill-session", "-t", name]).output();
     }
 
-    pub fn set_env(&mut self, key: &str, value: &str) {
-        self.extra_env_remove.retain(|removed| removed != key);
-        self.extra_env.push((key.to_string(), value.to_string()));
+    pub fn set_env(
+        &mut self,
+        key: impl AsRef<std::ffi::OsStr>,
+        value: impl AsRef<std::ffi::OsStr>,
+    ) {
+        let key = key.as_ref();
+        self.extra_env_remove
+            .retain(|removed| std::ffi::OsStr::new(removed) != key);
+        self.extra_env
+            .push((key.to_owned(), value.as_ref().to_owned()));
     }
 
     pub fn remove_env(&mut self, key: &str) {
-        self.extra_env.retain(|(existing, _)| existing != key);
+        self.extra_env
+            .retain(|(existing, _)| existing.as_os_str() != std::ffi::OsStr::new(key));
         if !self.extra_env_remove.iter().any(|removed| removed == key) {
             self.extra_env_remove.push(key.to_string());
         }
@@ -513,7 +536,7 @@ last_seen_version = "{}"
             write_executable(&bin.join(name), &script);
         }
         self.extra_path_dirs.push(bin);
-        self.set_env("FAKE_ACP_DEBUG_LOG", &debug_log.display().to_string());
+        self.set_env("FAKE_ACP_DEBUG_LOG", debug_log.as_os_str());
         self.set_env("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS", "60000");
     }
 

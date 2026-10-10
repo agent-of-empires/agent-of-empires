@@ -4,6 +4,18 @@ use super::config::SandboxConfig;
 use super::instance::SandboxInfo;
 use crate::containers::container_interface::EnvEntry;
 
+/// Process essentials shared by host agent launchers.
+pub(crate) const HOST_BASE_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "USER",
+    "SSH_AUTH_SOCK",
+];
+
 /// Terminal environment variables that are always passed through for proper UI/theming
 pub(crate) const DEFAULT_TERMINAL_ENV_VARS: &[&str] =
     &["TERM", "COLORTERM", "FORCE_COLOR", "NO_COLOR"];
@@ -76,17 +88,32 @@ const FORWARDED_DESKTOP_VARS: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
+pub(crate) fn host_env_key_inherited(key: &std::ffi::OsStr, passthrough: bool) -> bool {
+    let bytes = key.as_encoded_bytes();
+    if bytes.starts_with(b"AOE_")
+        || bytes.starts_with(b"AGENT_OF_EMPIRES_")
+        || key == std::ffi::OsStr::new("TERM")
+    {
+        return false;
+    }
+    passthrough
+        || key
+            .to_str()
+            .is_some_and(|key| key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key))
+}
+
 /// Why the wholesale passthrough ([`inherited_host_env`] with `session.inherit_host_environment`
 /// on) refuses a key, or `None` when it may be forwarded.
 fn passthrough_denyreason(key: &str) -> Option<&'static str> {
     if !is_valid_env_key(key) {
         return Some("not a valid environment variable name");
     }
-    if key.starts_with("AOE_") || key.starts_with("AGENT_OF_EMPIRES_") {
-        return Some("aoe-internal wiring or credential");
-    }
-    if key == "TERM" {
-        return Some("terminal type is owned by tmux and the spawn allowlists");
+    if !host_env_key_inherited(std::ffi::OsStr::new(key), true) {
+        return Some(if key == "TERM" {
+            "terminal type is owned by tmux and the spawn allowlists"
+        } else {
+            "aoe-internal wiring or credential"
+        });
     }
     None
 }
@@ -113,7 +140,7 @@ where
         if passthrough {
             passthrough_denyreason(key).is_none()
         } else {
-            key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key)
+            host_env_key_inherited(std::ffi::OsStr::new(key), false)
         }
     };
     let mut pairs: Vec<(String, String)> = vars
@@ -578,6 +605,36 @@ pub(crate) struct DockerExecEnv {
 
 pub(crate) const CONTAINER_EXEC_ENV_FD: u8 = 9;
 pub(crate) const CONTAINER_EXEC_ENV_PATH: &str = "/dev/fd/9";
+
+pub(crate) fn container_env_file<'a>(
+    environment: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> anyhow::Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix("aoe-container-env-")
+        .tempfile()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    for (key, value) in environment {
+        anyhow::ensure!(
+            is_valid_env_key(key),
+            "invalid container environment key {key:?}"
+        );
+        anyhow::ensure!(
+            !value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')),
+            "container environment value for {key} cannot be represented in an env-file"
+        );
+        writeln!(file, "{key}={value}")?;
+    }
+    file.flush()?;
+    Ok(file)
+}
 
 /// Build docker exec environment transport from config and optional
 /// per-session extra entries.

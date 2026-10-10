@@ -41,7 +41,19 @@ fn send_keys_keeps_a_trailing_semicolon() {
     let status = Command::new("tmux")
         .arg("-S")
         .arg(&socket)
-        .args(["new-session", "-d", "-s", &name, "cat -v"])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "cat -v",
+            ";",
+            "set-window-option",
+            "-t",
+            &name,
+            "pane-base-index",
+            "0",
+        ])
         .status()
         .expect("tmux new-session");
     assert!(status.success(), "tmux new-session failed");

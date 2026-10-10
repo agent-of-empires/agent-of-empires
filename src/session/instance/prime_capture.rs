@@ -749,7 +749,19 @@ mod tests {
         let mut command = "prime-agent".to_string();
         let agent = inst.resolved_agent();
         assert!(!inst
-            .apply_session_flags(&mut command, "test", agent, None)
+            .apply_session_flags(
+                &mut command,
+                "test",
+                agent,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         assert_eq!(command, "prime-agent");
         assert_eq!(inst.agent_session_id, None);
@@ -757,7 +769,20 @@ mod tests {
         let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
         let mut command = "prime-agent".to_string();
         assert!(!restarted
-            .apply_session_flags(&mut command, "test", agent, None)
+            .apply_session_flags(
+                &mut command,
+                "test",
+                agent,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    restarted.default_selector_agent(),
+                    restarted
+                        .default_selector_agent()
+                        .and_then(|agent| restarted.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut restarted.conversation_state()
+            )
             .unwrap());
         assert_eq!(command, "prime-agent");
 
@@ -766,7 +791,20 @@ mod tests {
         let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
         let mut command = "prime-agent".to_string();
         assert!(restarted
-            .apply_session_flags(&mut command, "test", agent, None)
+            .apply_session_flags(
+                &mut command,
+                "test",
+                agent,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    restarted.default_selector_agent(),
+                    restarted
+                        .default_selector_agent()
+                        .and_then(|agent| restarted.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut restarted.conversation_state()
+            )
             .unwrap());
         assert_eq!(command, format!("prime-agent --resume {new}"));
     }
@@ -889,7 +927,19 @@ mod tests {
         let mut command = "prime-agent".to_string();
         let agent = inst.resolved_agent();
         assert!(inst
-            .apply_session_flags(&mut command, "test", agent, None)
+            .apply_session_flags(
+                &mut command,
+                "test",
+                agent,
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         assert_eq!(command, format!("prime-agent --resume {parent}"));
     }
@@ -904,6 +954,8 @@ mod tests {
         inst.source_profile = "prime-resident-root-refresh".into();
         inst.sandbox_info = Some(test_sandbox("prime-resident", Some("/workspace/project")));
         admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config().unwrap();
+        let _transport = install_container_transport(tmp.path(), "prime-resident", &config.volumes);
         let plan = inst
             .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
             .unwrap();

@@ -33,6 +33,96 @@ mod platform {
     pub(super) fn kill_process_group(_: &std::process::Child) {}
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
+    pub(super) fn restore_environment_value(
+        _: super::FrozenEnvironmentValue<String, Vec<u8>>,
+    ) -> std::io::Result<std::ffi::OsString> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frozen environments require Linux or macOS",
+        ))
+    }
+    pub(super) fn close_frozen_payload() -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frozen environments require Linux or macOS",
+        ))
+    }
+    pub(super) fn exec_command(_: &mut std::process::Command) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process replacement requires Linux or macOS",
+        )
+    }
+}
+
+pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FrozenEnvironment<T, E> {
+    pub(crate) argv: Vec<String>,
+    pub(crate) cwd: T,
+    pub(crate) environment: Vec<(E, E)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum FrozenEnvironmentValue<T, B> {
+    Text(T),
+    Bytes(B),
+}
+
+pub(crate) fn frozen_environment_value(
+    value: &std::ffi::OsStr,
+) -> FrozenEnvironmentValue<&str, &[u8]> {
+    match value.to_str() {
+        Some(value) => FrozenEnvironmentValue::Text(value),
+        None => FrozenEnvironmentValue::Bytes(value.as_encoded_bytes()),
+    }
+}
+
+pub(crate) fn executable_for_native_launch() -> std::io::Result<std::path::PathBuf> {
+    let executable = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    return linux::launch_executable(executable);
+    #[cfg(not(target_os = "linux"))]
+    Ok(executable)
+}
+
+#[doc(hidden)]
+pub fn exec_frozen_environment() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let file = std::fs::File::open("/dev/fd/4").context("opening frozen environment descriptor")?;
+    let payload = serde_json::from_reader::<
+        _,
+        FrozenEnvironment<String, FrozenEnvironmentValue<String, Vec<u8>>>,
+    >(file);
+    platform::close_frozen_payload().context("closing frozen environment descriptor")?;
+    let payload = payload.context("reading frozen environment descriptor")?;
+    let program = payload
+        .argv
+        .iter()
+        .find(|word| !word.contains('='))
+        .context("frozen launch program is missing")?;
+    anyhow::ensure!(!program.is_empty(), "frozen launch program is empty");
+    let mut command = Command::new("/usr/bin/env");
+    command
+        .arg("--")
+        .args(&payload.argv)
+        .current_dir(payload.cwd)
+        .env_clear();
+    for (key, value) in payload.environment {
+        command.env(
+            platform::restore_environment_value(key)?,
+            platform::restore_environment_value(value)?,
+        );
+    }
+    for key in LIVE_PANE_ENV_KEYS {
+        command.env_remove(key);
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    Err(platform::exec_command(&mut command).into())
 }
 
 /// Lower the child's scheduling and I/O priority where the OS supports it.

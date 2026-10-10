@@ -217,7 +217,7 @@ pub(super) fn dotenv_locations(
     ])
 }
 
-pub(crate) fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
+fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
     let mut values = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect::<HashMap<_, _>>();

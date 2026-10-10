@@ -40,6 +40,41 @@ pub enum YoloMode {
     CliFlag(&'static str),
     EnvVar(&'static str, &'static str),
     AlwaysYolo,
+    /// Two generations, one contract: an agent spanning the rename declares
+    /// both and `resolve` picks the one the installed build understands.
+    EitherGeneration {
+        legacy: &'static YoloMode,
+        current: &'static YoloMode,
+    },
+}
+
+/// Which generation of an agent's interface a launch resolves against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentGeneration {
+    /// The interface the agent shipped before its 2.x rename.
+    Legacy,
+    /// The interface 2.x and later expose.
+    Current,
+    /// The build's help never answered, so nothing distinguishes the two. A
+    /// launch that depends on the answer refuses rather than guess.
+    Unknown,
+}
+
+impl YoloMode {
+    /// The mechanism the installed build understands. A mode that spans two
+    /// generations resolves to the matching arm; any other mode is itself.
+    /// `None` means the generation is unknown, so neither arm can be claimed
+    /// and the caller has to refuse rather than pick one for the user.
+    pub fn resolve(&'static self, generation: AgentGeneration) -> Option<&'static YoloMode> {
+        match self {
+            YoloMode::EitherGeneration { legacy, current } => match generation {
+                AgentGeneration::Legacy => Some(legacy),
+                AgentGeneration::Current => Some(current),
+                AgentGeneration::Unknown => None,
+            },
+            mode => Some(mode),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,19 +155,46 @@ pub struct SessionSupport {
     pub resume: ResumeStrategy,
     pub capture: Option<SessionCaptureSpec>,
 }
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkStrategy {
     ClaudeFork,
     CodexFork,
     PiFork,
     Flag(&'static str),
+    /// The agent's store mints the child over its own API before the launch, so
+    /// the session that follows is still the interactive one.
+    ServeFork,
+    /// Two generations, one contract: no single spelling serves both, so an
+    /// agent spanning the rename declares both and `resolve` picks the one the
+    /// installed build accepts.
+    EitherGeneration {
+        legacy: &'static ForkStrategy,
+        current: &'static ForkStrategy,
+    },
     Unsupported,
 }
 
 impl ForkStrategy {
-    /// Other strategies mint a child id that capture must discover after launch.
-    pub fn preassigns_child_id(&self) -> bool {
-        matches!(self, Self::ClaudeFork | Self::PiFork)
+    /// Whether the launch itself produces the child id, which makes the id AoE
+    /// pre-pinned for the fork a placeholder to drop. A root fork flag never
+    /// carries that id, so the agent mints one of its own.
+    pub(crate) const fn mints_child(self) -> bool {
+        matches!(self, Self::CodexFork | Self::Flag(_))
+    }
+
+    /// The mechanism the installed build understands. A strategy that spans two
+    /// generations resolves to the matching arm; any other is itself. `None`
+    /// means the generation is unknown, so the caller has to refuse rather than
+    /// pick one for the user.
+    pub fn resolve(&'static self, generation: AgentGeneration) -> Option<&'static ForkStrategy> {
+        match self {
+            ForkStrategy::EitherGeneration { legacy, current } => match generation {
+                AgentGeneration::Legacy => Some(legacy),
+                AgentGeneration::Current => Some(current),
+                AgentGeneration::Unknown => None,
+            },
+            strategy => Some(strategy),
+        }
     }
 }
 
@@ -287,6 +349,10 @@ pub struct AgentDef {
     pub aliases: &'static [&'static str],
     pub detection: DetectionMethod,
     pub yolo: Option<YoloMode>,
+    /// Set when this agent's `yolo` and `fork_strategy` each declare a legacy
+    /// and a current arm, so a launch resolves both against the installed
+    /// binary. Declaring it once keeps the two from disagreeing.
+    pub spans_agent_generations: bool,
     pub instruction_flag: Option<&'static str>,
     /// One argv token placed before the prompt; never contains a `{}` placeholder.
     pub oneshot_flag: Option<&'static str>,
@@ -498,6 +564,7 @@ const fn agent(name: &'static str, binary: &'static str, install_hint: &'static 
         aliases: &[],
         detection: DetectionMethod::Which(binary),
         yolo: None,
+        spans_agent_generations: false,
         instruction_flag: None,
         oneshot_flag: None,
         set_default_command: false,
@@ -555,7 +622,14 @@ pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         oneshot_flag: Some("run"),
         aliases: &["open-code"],
-        yolo: Some(YoloMode::EnvVar("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)),
+        // 2.x dropped the inlined permission object and the root fork flag, and
+        // serves the fork endpoint under `/api` where 1.x used no prefix, so
+        // both generations are declared and the launch resolves against the one
+        // the installed build speaks.
+        yolo: Some(YoloMode::EitherGeneration {
+            legacy: &YoloMode::EnvVar("OPENCODE_PERMISSION", r#"{"*":"allow"}"#),
+            current: &YoloMode::CliFlag("--auto"),
+        }),
         set_default_command: true,
         detect_status: status_detection::detect_opencode_status,
         session_support: session_support(
@@ -564,7 +638,11 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Preassigned,
             SessionCaptureContext::Unsupported,
         ),
-        fork_strategy: ForkStrategy::Flag("--fork"),
+        fork_strategy: ForkStrategy::EitherGeneration {
+            legacy: &ForkStrategy::Flag("--fork"),
+            current: &ForkStrategy::ServeFork,
+        },
+        spans_agent_generations: true,
         ready_marker: Some("ask anything"),
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
@@ -873,7 +951,7 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
-        // `--fork` needs the parent id as its value, which `ForkStrategy::Flag` does not emit.
+        // Prime exposes no fork surface, so the parent id has nothing to carry.
         fork_strategy: ForkStrategy::Unsupported,
         ..agent(
             "prime-agent",
@@ -941,13 +1019,13 @@ impl AgentDef {
         }
     }
 
-    /// The session-name flag, if the `--help` of `program`, the executable the launch runs, lists it.
+    /// The launch's help must advertise a session-name flag before injection.
     pub(crate) fn supported_session_name_flag(
         &self,
-        program: &std::path::Path,
+        command: &std::process::Command,
     ) -> Option<&'static str> {
         let flag = self.session_name_flag()?;
-        agent_help_advertises(program, flag).then_some(flag)
+        agent_help_advertises(command, flag).then_some(flag)
     }
 
     pub fn launch_base_command(&self) -> String {
@@ -955,6 +1033,97 @@ impl AgentDef {
             Some(sub) => format!("{} {}", self.binary, sub),
             None => self.binary.to_string(),
         }
+    }
+}
+
+/// Resolve generations from help using the launch's explicit, complete environment.
+pub fn agent_generation_for(agent: &AgentDef, command: &std::process::Command) -> AgentGeneration {
+    if !agent.spans_agent_generations {
+        return AgentGeneration::Current;
+    }
+    with_agent_help(command, false, agent_generation_from_help)
+}
+
+pub(crate) fn agent_generation_from_help(help: &str) -> AgentGeneration {
+    // Late 1.x builds also advertise --auto; only --fork distinguishes them.
+    if help_advertises_flag(help, LEGACY_GENERATION_MARKER) {
+        return AgentGeneration::Legacy;
+    }
+    if help.trim().is_empty() {
+        tracing::warn!(target: "session.create",
+            "agent --help did not answer, so its generation cannot be established; \
+             launch features that depend on it are refused");
+        return AgentGeneration::Unknown;
+    }
+    AgentGeneration::Current
+}
+
+/// Inspect help under the executable's lock without copying its text.
+fn with_agent_help<R>(
+    command: &std::process::Command,
+    cache_success: bool,
+    inspect: impl FnOnce(&str) -> R,
+) -> R {
+    let Ok(program) = std::fs::canonicalize(command.get_program()) else {
+        return inspect("");
+    };
+    let Ok(metadata) = std::fs::metadata(&program) else {
+        return inspect("");
+    };
+    let key = (program, metadata.modified().ok(), metadata.len());
+    let cache = HELP_PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key)
+        .or_default()
+        .clone();
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let probe_cwd = command.get_current_dir().is_none().then(std::env::temp_dir);
+    let launch_cwd = match command.get_current_dir() {
+        Some(cwd) if cwd.is_absolute() => std::borrow::Cow::Borrowed(cwd),
+        cwd => {
+            let Ok(current) = std::env::current_dir() else {
+                return inspect("");
+            };
+            std::borrow::Cow::Owned(match cwd {
+                Some(cwd) => current.join(cwd),
+                None => current,
+            })
+        }
+    };
+    cache.with_help(
+        HelpContext {
+            command,
+            launch_cwd: &launch_cwd,
+            probe_cwd: probe_cwd.as_deref(),
+        },
+        cache_success,
+        std::time::Instant::now,
+        |timeout| {
+            run_agent_help(
+                command,
+                &launch_cwd,
+                probe_cwd.as_deref().unwrap_or(&launch_cwd),
+                timeout,
+            )
+        },
+        inspect,
+    )
+}
+
+/// A flag the older generation's help lists and the current one's does not.
+const LEGACY_GENERATION_MARKER: &str = "--fork";
+
+impl AgentDef {
+    /// Probe the executable and environment AoE itself would launch.
+    pub fn detected_generation(&self) -> AgentGeneration {
+        if !self.spans_agent_generations {
+            return AgentGeneration::Current;
+        }
+        let program = which::which(self.binary).unwrap_or_else(|_| self.binary.into());
+        agent_generation_for(self, &ambient_help_command(&program))
     }
 }
 
@@ -967,54 +1136,174 @@ fn help_advertises_flag(help: &str, flag: &str) -> bool {
     })
 }
 
-/// An agent's `--help`, cached once it succeeds. A timeout or failure reports no flags for now
-/// and is retried after a cooldown with a longer deadline, since a cold start with many
-/// extensions can outlast the first one.
-#[derive(Default)]
-struct HelpProbe {
-    help: Option<String>,
-    retry_at: Option<std::time::Instant>,
+fn ambient_help_command(program: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env_clear().envs(std::env::vars_os());
+    command
 }
 
-impl HelpProbe {
-    fn help(
-        &mut self,
-        clock: impl Fn() -> std::time::Instant,
-        probe: impl FnOnce(std::time::Duration) -> Option<String>,
-    ) -> &str {
-        if self.help.is_none() && self.retry_at.is_none_or(|at| clock() >= at) {
-            let timeout = if self.retry_at.is_some() {
-                HELP_RETRY_TIMEOUT
-            } else {
-                HELP_PROBE_TIMEOUT
-            };
-            self.help = probe(timeout);
-            if self.help.is_none() {
-                tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
-                    "agent --help did not answer; launching without the flags it gates until a retry succeeds");
-                // Timed from the answer, so a probe that ran to its deadline still cools down.
-                self.retry_at = Some(clock() + HELP_RETRY_COOLDOWN);
-            }
+fn help_environment(
+    command: &std::process::Command,
+) -> impl Iterator<Item = (&std::ffi::OsStr, &std::ffi::OsStr)> {
+    command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+}
+
+fn run_agent_help(
+    command: &std::process::Command,
+    launch_cwd: &std::path::Path,
+    cwd: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let mut cmd = std::process::Command::new(command.get_program());
+    cmd.arg("--help")
+        .env_clear()
+        .envs(help_environment(command));
+    if command.get_current_dir().is_none() {
+        if let Some((_, path)) = help_environment(command).find(|(key, path)| {
+            *key == "PATH" && std::env::split_paths(path).any(|entry| entry.is_relative())
+        }) {
+            let resolved = std::env::join_paths(std::env::split_paths(path).map(|entry| {
+                if entry.is_absolute() {
+                    entry
+                } else {
+                    launch_cwd.join(entry)
+                }
+            }))
+            .ok()?;
+            cmd.env("PATH", resolved);
         }
-        self.help.as_deref().unwrap_or_default()
     }
-}
-
-fn run_agent_help(program: &std::path::Path, timeout: std::time::Duration) -> Option<String> {
-    let mut cmd = std::process::Command::new(program);
-    cmd.arg("--help");
-    // An agent that reads stdin would hold the pipe until the deadline, and one that writes a
-    // file would drop it wherever the caller happened to be.
-    cmd.stdin(std::process::Stdio::null());
-    cmd.current_dir(std::env::temp_dir());
+    cmd.stdin(std::process::Stdio::null()).current_dir(cwd);
     crate::process::run_with_timeout(&mut cmd, timeout)
         .ok()
         .flatten()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .map(|output| {
+            let bytes = if output.stdout.is_empty() {
+                output.stderr
+            } else if output.stderr.is_empty() {
+                output.stdout
+            } else {
+                let mut bytes = output.stdout;
+                bytes.reserve(output.stderr.len() + 1);
+                bytes.push(b'\n');
+                bytes.extend(output.stderr);
+                bytes
+            };
+            String::from_utf8(bytes)
+                .unwrap_or_else(|error| String::from_utf8_lossy(&error.into_bytes()).into_owned())
+        })
 }
 
-type SharedHelpProbe = std::sync::Arc<std::sync::Mutex<HelpProbe>>;
+#[derive(Clone, Copy)]
+struct HelpContext<'a> {
+    command: &'a std::process::Command,
+    launch_cwd: &'a std::path::Path,
+    probe_cwd: Option<&'a std::path::Path>,
+}
+
+struct CachedHelp {
+    program: std::ffi::OsString,
+    launch_cwd: std::path::PathBuf,
+    // Unbound probes relocate to temp; explicit probes use launch_cwd.
+    probe_cwd: Option<std::path::PathBuf>,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    answer: HelpAnswer,
+}
+
+enum HelpAnswer {
+    Available(String),
+    RetryAt(std::time::Instant),
+}
+
+#[derive(Default)]
+struct ProgramHelpCache {
+    retry_timeout_escalated: bool,
+    contexts: Vec<CachedHelp>,
+}
+
+impl ProgramHelpCache {
+    fn with_help<R>(
+        &mut self,
+        context: HelpContext<'_>,
+        cache_success: bool,
+        clock: impl Fn() -> std::time::Instant,
+        probe: impl FnOnce(std::time::Duration) -> Option<String>,
+        inspect: impl FnOnce(&str) -> R,
+    ) -> R {
+        let HelpContext {
+            command,
+            launch_cwd,
+            probe_cwd,
+        } = context;
+        let now = clock();
+        self.contexts
+            .retain(|cached| !matches!(cached.answer, HelpAnswer::RetryAt(at) if now >= at));
+        let index = self.contexts.iter().position(|cached| {
+            cached.program == command.get_program()
+                && cached.launch_cwd == launch_cwd
+                && cached.probe_cwd.as_deref() == probe_cwd
+                && cached
+                    .environment
+                    .iter()
+                    .map(|(key, value)| (key.as_os_str(), value.as_os_str()))
+                    .eq(help_environment(command))
+        });
+        if let Some(index) = index {
+            match &self.contexts[index].answer {
+                HelpAnswer::Available(help) if cache_success => return inspect(help),
+                HelpAnswer::RetryAt(_) => return inspect(""),
+                HelpAnswer::Available(_) => {}
+            }
+        }
+        let timeout = if self.retry_timeout_escalated {
+            HELP_RETRY_TIMEOUT
+        } else {
+            HELP_PROBE_TIMEOUT
+        };
+        let help = probe(timeout).filter(|help| !help.trim().is_empty());
+        if !cache_success {
+            if let Some(help) = &help {
+                if let Some(index) = index {
+                    self.contexts.swap_remove(index);
+                }
+                return inspect(help);
+            }
+        }
+        let answer = match help {
+            Some(help) => HelpAnswer::Available(help),
+            None => {
+                self.retry_timeout_escalated = true;
+                tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
+                    "agent --help did not answer; this launch context cools down before retrying");
+                HelpAnswer::RetryAt(clock() + HELP_RETRY_COOLDOWN)
+            }
+        };
+        let index = if let Some(index) = index {
+            self.contexts[index].answer = answer;
+            index
+        } else {
+            self.contexts.push(CachedHelp {
+                program: command.get_program().to_owned(),
+                launch_cwd: launch_cwd.to_owned(),
+                probe_cwd: probe_cwd.map(std::path::Path::to_owned),
+                environment: help_environment(command)
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    .collect(),
+                answer,
+            });
+            self.contexts.len() - 1
+        };
+        match &self.contexts[index].answer {
+            HelpAnswer::Available(help) => inspect(help),
+            HelpAnswer::RetryAt(_) => inspect(""),
+        }
+    }
+}
+
+type SharedHelpProbe = std::sync::Arc<std::sync::Mutex<ProgramHelpCache>>;
 
 /// The resolved executable plus its modification time and size, so an update that swaps the
 /// binary behind a path, or a symlink to it, is probed afresh.
@@ -1023,34 +1312,9 @@ type HelpProbeKey = (std::path::PathBuf, Option<std::time::SystemTime>, u64);
 static HELP_PROBES: std::sync::Mutex<BTreeMap<HelpProbeKey, SharedHelpProbe>> =
     std::sync::Mutex::new(BTreeMap::new());
 
-/// Whether `program --help` advertises `flag`, for a flag an older install would reject outright.
-/// The probe and its cached answer are bound to the resolved executable, so neither the probe's
-/// own working directory nor another install found on `PATH` can stand in for it.
-fn agent_help_advertises(program: &std::path::Path, flag: &str) -> bool {
-    let Ok(program) = std::fs::canonicalize(program) else {
-        return false;
-    };
-    let Ok(metadata) = std::fs::metadata(&program) else {
-        return false;
-    };
-    let key = (program.clone(), metadata.modified().ok(), metadata.len());
-    let probe = HELP_PROBES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(key)
-        .or_default()
-        .clone();
-    // Held across the probe: launches of this binary racing it wait for the answer instead of
-    // starting without the flag.
-    let mut probe = probe
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    help_advertises_flag(
-        probe.help(std::time::Instant::now, |timeout| {
-            run_agent_help(&program, timeout)
-        }),
-        flag,
-    )
+/// The explicit launch environment is part of every cached answer.
+fn agent_help_advertises(command: &std::process::Command, flag: &str) -> bool {
+    with_agent_help(command, true, |help| help_advertises_flag(help, flag))
 }
 
 #[cfg(test)]
@@ -1066,7 +1330,7 @@ pub(crate) fn forget_agent_help_for_test() {
 fn pi_help_advertises(flag: &str) -> bool {
     get_agent("pi")
         .and_then(|agent| which::which(agent.binary).ok())
-        .is_some_and(|program| agent_help_advertises(&program, flag))
+        .is_some_and(|program| agent_help_advertises(&ambient_help_command(&program), flag))
 }
 
 pub(crate) fn pi_supports_extension_flag() -> bool {
@@ -1440,7 +1704,9 @@ mod tests {
         forget_agent_help_for_test();
 
         let claude_program = temp.path().join("bin/claude");
-        let claude = std::thread::spawn(move || agent_help_advertises(&claude_program, "--name"));
+        let claude = std::thread::spawn(move || {
+            agent_help_advertises(&ambient_help_command(&claude_program), "--name")
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !started.exists() {
             assert!(
@@ -1486,18 +1752,202 @@ mod tests {
         forget_agent_help_for_test();
 
         assert!(
-            agent_help_advertises(&current, "--name"),
+            agent_help_advertises(&ambient_help_command(&current), "--name"),
             "the probe ran another claude than the one given"
         );
         assert!(
-            !agent_help_advertises(&older, "--name"),
+            !agent_help_advertises(&ambient_help_command(&older), "--name"),
             "an answer cached for one install was reused for another"
         );
         forget_agent_help_for_test();
     }
 
-    /// An update replaces the executable behind the same path, in place or by moving a symlink to
-    /// a new version, and the new one is probed rather than answered from the old one's help.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn wrapper_generation_tracks_the_complete_launch_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let install = |directory: &str, flag: &str| {
+            let directory = temp.path().join(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let program = directory.join("opencode");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  {flag} enabled'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            program
+        };
+        let legacy = install("legacy", "--fork");
+        let current = install("current", "--auto");
+        let wrapper = temp.path().join("wrapper");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nexec \"${NATIVE_AGENT:-opencode}\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        forget_agent_help_for_test();
+        let agent = get_agent("opencode").unwrap();
+        for (path, override_program, expected) in [
+            (legacy.parent().unwrap(), None, AgentGeneration::Legacy),
+            (current.parent().unwrap(), None, AgentGeneration::Current),
+            (
+                legacy.parent().unwrap(),
+                Some(current.as_path()),
+                AgentGeneration::Current,
+            ),
+            (
+                current.parent().unwrap(),
+                Some(legacy.as_path()),
+                AgentGeneration::Legacy,
+            ),
+            (legacy.parent().unwrap(), None, AgentGeneration::Legacy),
+        ] {
+            let mut command = std::process::Command::new(&wrapper);
+            command.env_clear().env("PATH", path);
+            if let Some(program) = override_program {
+                command.env("NATIVE_AGENT", program);
+            }
+            assert_eq!(
+                agent_generation_for(agent, &command),
+                expected,
+                "PATH={path:?}, override={override_program:?}"
+            );
+        }
+        for cwd in [current.parent().unwrap(), legacy.parent().unwrap()] {
+            let mut command = std::process::Command::new(&wrapper);
+            command.env_clear().env("PATH", ".").current_dir(cwd);
+            let expected = if cwd == current.parent().unwrap() {
+                AgentGeneration::Current
+            } else {
+                AgentGeneration::Legacy
+            };
+            assert_eq!(
+                agent_generation_for(agent, &command),
+                expected,
+                "cwd={cwd:?}"
+            );
+        }
+        forget_agent_help_for_test();
+    }
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn explicit_help_cwd_preserves_shim_dispatch_and_literal_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        let current = root.path().join("current");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(legacy.join(".use-legacy"), "").unwrap();
+        let log = root.path().join("probes");
+        let wrapper = root.path().join("opencode");
+        std::fs::write(&wrapper, r#"#!/bin/sh
+printf '%s|%s\n' "$PWD" "$PATH" >> "$PROBE_LOG"
+if [ -f .use-legacy ]; then printf '%s\n' '  --fork branch'; else printf '%s\n' '  --auto approvals'; fi
+"#).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        forget_agent_help_for_test();
+        let agent = get_agent("opencode").unwrap();
+        let command = |cwd: &std::path::Path| {
+            let mut command = std::process::Command::new(&wrapper);
+            command
+                .env_clear()
+                .env("PATH", ".")
+                .env("PROBE_LOG", &log)
+                .current_dir(cwd);
+            command
+        };
+        for (cwd, expected) in [
+            (legacy.as_path(), AgentGeneration::Legacy),
+            (current.as_path(), AgentGeneration::Current),
+        ] {
+            assert_eq!(agent_generation_for(agent, &command(cwd)), expected);
+        }
+        let expected_log = format!(
+            "{}|.\n{}|.\n",
+            std::fs::canonicalize(&legacy).unwrap().display(),
+            std::fs::canonicalize(&current).unwrap().display()
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), expected_log);
+
+        std::fs::remove_file(legacy.join(".use-legacy")).unwrap();
+        assert_eq!(
+            agent_generation_for(agent, &command(&legacy)),
+            AgentGeneration::Current,
+            "a new launch must observe a changed selector in the same cwd"
+        );
+        std::fs::write(legacy.join(".use-legacy"), "").unwrap();
+        assert_eq!(
+            agent_generation_for(agent, &command(&legacy)),
+            AgentGeneration::Legacy
+        );
+        let before_missing = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            agent_generation_for(agent, &command(&root.path().join("missing"))),
+            AgentGeneration::Unknown
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before_missing,
+            "a missing explicit cwd must not fall back to a different directory"
+        );
+        forget_agent_help_for_test();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn failed_help_cools_down_only_the_exact_launch_context() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("opencode");
+        let log = temp.path().join("probes");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+printf '%s:%s\n' "$AOE_SESSION_SOURCE" "$PROBE_MODE" >> "$PROBE_LOG"
+if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; else exit 1; fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = get_agent("opencode").unwrap();
+        forget_agent_help_for_test();
+        for (source, mode, expected) in [
+            ("first", "fail", AgentGeneration::Unknown),
+            ("first", "fail", AgentGeneration::Unknown),
+            ("second", "legacy", AgentGeneration::Legacy),
+            ("first", "fail", AgentGeneration::Unknown),
+            ("first", "legacy", AgentGeneration::Legacy),
+            ("third", "fail", AgentGeneration::Unknown),
+            ("third", "fail", AgentGeneration::Unknown),
+        ] {
+            let mut command = std::process::Command::new(&program);
+            command
+                .env_clear()
+                .env("AOE_SESSION_SOURCE", source)
+                .env("PROBE_MODE", mode)
+                .env("PROBE_LOG", &log)
+                .current_dir(temp.path());
+            assert_eq!(
+                agent_generation_for(agent, &command),
+                expected,
+                "{source}:{mode}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "first:fail\nsecond:legacy\nfirst:legacy\nthird:fail\n"
+        );
+        forget_agent_help_for_test();
+    }
+
+    /// Replacing an executable or symlink invalidates its help.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -1512,10 +1962,13 @@ mod tests {
 
         let in_place = temp.path().join("claude");
         write(&in_place, "  -r, --resume [value]");
-        assert!(!agent_help_advertises(&in_place, "--name"));
+        assert!(!agent_help_advertises(
+            &ambient_help_command(&in_place),
+            "--name"
+        ));
         write(&in_place, "  -n, --name <name>  Set a display name");
         assert!(
-            agent_help_advertises(&in_place, "--name"),
+            agent_help_advertises(&ambient_help_command(&in_place), "--name"),
             "an executable replaced in place kept its old answer"
         );
 
@@ -1539,54 +1992,92 @@ mod tests {
         );
         let link = temp.path().join("current");
         std::os::unix::fs::symlink(&old, &link).unwrap();
-        assert!(!agent_help_advertises(&link, "--name"));
+        assert!(!agent_help_advertises(
+            &ambient_help_command(&link),
+            "--name"
+        ));
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&new, &link).unwrap();
         assert!(
-            agent_help_advertises(&link, "--name"),
+            agent_help_advertises(&ambient_help_command(&link), "--name"),
             "a symlink moved to a new version kept the old version's answer"
         );
         forget_agent_help_for_test();
     }
 
     #[test]
-    fn help_probe_retries_an_inconclusive_answer_and_keeps_a_confirmed_one() {
-        let help = "  --session-id <id>\n  --extension, -e <path>\n";
-        let start = std::time::Instant::now();
-        let now = std::cell::Cell::new(start);
-        let mut probe = HelpProbe::default();
+    fn help_cooldown_starts_after_the_answer_and_retries_with_the_longer_timeout() {
+        let help = "--fork fork session";
+        let now = std::cell::Cell::new(std::time::Instant::now());
+        let mut cache = ProgramHelpCache::default();
         let mut timeouts = Vec::new();
-
-        // The first probe runs to its deadline before failing.
-        let first = probe.help(
-            || now.get(),
-            |timeout| {
+        let cwd = std::env::temp_dir();
+        let mut failed = std::process::Command::new("opencode");
+        failed.env_clear().env("MODE", "failed").current_dir(&cwd);
+        let mut healthy = std::process::Command::new("opencode");
+        healthy.env_clear().env("MODE", "healthy").current_dir(&cwd);
+        macro_rules! answer {
+            ($command:expr, $cached:expr, $probe:expr) => {
+                cache.with_help(
+                    HelpContext {
+                        command: $command,
+                        launch_cwd: &cwd,
+                        probe_cwd: None,
+                    },
+                    $cached,
+                    || now.get(),
+                    $probe,
+                    str::to_owned,
+                )
+            };
+        }
+        assert_eq!(
+            answer!(&failed, true, |timeout| {
                 timeouts.push(timeout);
                 now.set(now.get() + timeout);
                 None
-            },
+            }),
+            ""
         );
-        assert_eq!(first, "", "a timed-out probe advertises nothing");
         let failed_at = now.get();
         now.set(failed_at + HELP_RETRY_COOLDOWN - std::time::Duration::from_millis(1));
         assert_eq!(
-            probe.help(|| now.get(), |_| unreachable!("cooling down")),
-            "",
-            "the cooldown runs from the failed answer, not from when the probe began"
-        );
-
-        now.set(failed_at + HELP_RETRY_COOLDOWN);
-        let retried = probe.help(
-            || now.get(),
-            |timeout| {
+            answer!(&healthy, false, |timeout| {
                 timeouts.push(timeout);
-                Some(help.to_string())
-            },
+                Some(help.into())
+            }),
+            help
         );
-        assert_eq!(retried, help, "the process is not stuck on the failure");
+        assert_eq!(
+            answer!(&failed, true, |_| unreachable!("same-context cooldown")),
+            ""
+        );
+        now.set(failed_at + HELP_RETRY_COOLDOWN);
+        assert_eq!(
+            answer!(&failed, true, |timeout| {
+                timeouts.push(timeout);
+                Some(help.into())
+            }),
+            help
+        );
+        assert_eq!(
+            answer!(&failed, true, |_| unreachable!("positive flag cache")),
+            help
+        );
+        assert_eq!(answer!(&failed, false, |_| None), "");
+        assert_eq!(
+            answer!(&failed, true, |_| unreachable!("stale positive help")),
+            ""
+        );
         now.set(now.get() + HELP_RETRY_COOLDOWN);
-        assert_eq!(probe.help(|| now.get(), |_| unreachable!("cached")), help);
-        assert_eq!(timeouts, [HELP_PROBE_TIMEOUT, HELP_RETRY_TIMEOUT]);
+        assert_eq!(
+            answer!(&failed, false, |_| Some("--auto approvals".into())),
+            "--auto approvals"
+        );
+        assert_eq!(
+            timeouts,
+            [HELP_PROBE_TIMEOUT, HELP_RETRY_TIMEOUT, HELP_RETRY_TIMEOUT]
+        );
     }
 
     #[test]

@@ -16,6 +16,14 @@ The binary is `target/{profile}/aoe`. Web commands and test selection live in `w
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
 
+## Test isolation
+
+Git fixtures must ignore inherited global/system configuration and config-injection environment variables in their child processes, and assert every setup command's exit status. Do not change the developer's Git configuration to make a fixture pass.
+
+An isolated tmux socket still loads user tmux configuration. Raw fixtures addressing `^.0` must reuse managed pane-index setup. Input-delivery assertions need a ready consumer and its acknowledgment, not terminal echo.
+
+Sandbox unit tests that prepare launch commands must install the shared isolated container transport fixture rather than depend on an installed host runtime.
+
 ## Running and logs
 
 ```sh

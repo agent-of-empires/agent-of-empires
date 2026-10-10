@@ -703,7 +703,20 @@ pi = "~/.pi-personal"
 
         let mut cmd = String::from("pi");
         declared
-            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                crate::agents::get_agent("pi"),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    crate::agents::get_agent("pi"),
+                    declared
+                        .default_selector_agent()
+                        .and_then(|agent| declared.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+                &mut declared.conversation_state(),
+            )
             .unwrap();
         assert!(
             !cmd.contains(STALE_ID) && !cmd.contains("--session"),
@@ -852,7 +865,19 @@ pi = "~/.pi-personal"
 
         let mut cmd = "pi".to_string();
         let resumed = inst
-            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                crate::agents::get_agent("pi"),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    crate::agents::get_agent("pi"),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+                &mut inst.conversation_state(),
+            )
             .unwrap();
         assert_eq!(cmd, "pi", "no selector may be handed to a doomed resume");
         assert!(!resumed, "nothing was resumed");
@@ -865,7 +890,19 @@ pi = "~/.pi-personal"
         std::fs::write(&transcript, "{}\n").unwrap();
         let mut cmd = "pi".to_string();
         assert!(inst
-            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                crate::agents::get_agent("pi"),
+                None,
+                super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         assert_eq!(cmd, format!("pi --session '{}'", transcript.display()));
     }

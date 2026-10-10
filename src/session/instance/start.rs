@@ -349,11 +349,8 @@ impl Instance {
                     .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
             });
-            let native_mints_child = matches!(
-                prepared.expected_conversation.intent,
-                ResumeIntent::Fork { .. }
-            ) && !execution.agent.fork_strategy.preassigns_child_id();
-            if native_mints_child {
+
+            if prepared.fork_mints_child {
                 self.set_agent_conversation(None, None, None);
             } else if let Some(sid) = self.agent_session_id.clone() {
                 let existing = self.agent_session_binding.as_ref().filter(|binding| {
@@ -876,6 +873,7 @@ mod tests {
             case_insensitive_routing: &[],
             omp: None,
             inputs: NativeLaunchInputs {
+                raw_environment: Vec::new(),
                 launch_id: "launch-attested-route".into(),
                 environment: Default::default(),
                 cwd: temp.path().to_path_buf(),
@@ -893,6 +891,7 @@ mod tests {
             resolved_target_session_id: None,
             pi_pinnable: false,
             opencode_preassign: false,
+            opencode_schema: None,
             store_override: None,
         };
 

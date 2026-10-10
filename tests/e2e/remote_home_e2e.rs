@@ -51,7 +51,7 @@ async fn remote_home_accepts_old_daemon_rows_and_keeps_structured_title_order() 
     });
 
     let mut harness = TuiTestHarness::new("remote_home_old_daemon");
-    harness.set_env("AOE_DAEMON_URL", &format!("http://127.0.0.1:{port}"));
+    harness.set_env("AOE_DAEMON_URL", format!("http://127.0.0.1:{port}"));
     harness.spawn_tui();
     harness.wait_for("Alpha review");
     harness.wait_for("Beta review");
