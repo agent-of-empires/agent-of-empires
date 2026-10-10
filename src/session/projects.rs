@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::warn;
 
-use super::{get_app_dir, get_profile_dir_path};
+use super::{get_app_dir_path, get_profile_dir_path};
 
 /// Distinct failure modes for registry mutations.
 #[derive(Debug, Error)]
@@ -149,7 +149,7 @@ impl Project {
 }
 
 fn global_path() -> Result<PathBuf> {
-    Ok(get_app_dir()?.join("projects.json"))
+    Ok(get_app_dir_path()?.join("projects.json"))
 }
 
 fn profile_path(profile: &str) -> Result<PathBuf> {
@@ -174,10 +174,11 @@ fn parse_projects(content: &str, scope: ProjectScope) -> Result<Vec<Project>> {
 }
 
 fn read_file(path: &Path, scope: ProjectScope) -> Result<Vec<Project>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(path)?;
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -539,11 +540,66 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[serial]
+    fn readonly_registries_do_not_create_paths_but_mutation_does() {
+        let home = tempdir().unwrap();
+        let _guard = isolate_app_dir_at(home.path());
+        let app = super::super::get_profile_dir_path("explicit")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(load_global().unwrap().is_empty());
+        assert!(load_profile("explicit").unwrap().is_empty());
+        assert!(!app.exists());
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for scope in [ProjectScope::Global, ProjectScope::Profile] {
+            add(
+                "explicit",
+                scope,
+                Project::new(scope.as_str(), repo.to_string_lossy(), scope),
+                true,
+            )
+            .unwrap();
+        }
+        assert_eq!(load_global().unwrap()[0].name, "global");
+        assert_eq!(load_profile("explicit").unwrap()[0].name, "profile");
+    }
+
+    #[test]
     fn repo_label_uses_basename_with_root_fallbacks() {
         assert_eq!(repo_label("/home/me/myrepo"), "myrepo");
         assert_eq!(repo_label("/home/me/myrepo/"), "myrepo");
         assert_eq!(repo_label("/"), "(root)");
         assert_eq!(repo_label(""), "(root)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn unreadable_project_registries_are_not_successful_empty_results() {
+        let home = tempdir().unwrap();
+        let _guard = isolate_app_dir_at(home.path());
+        for scope in [ProjectScope::Global, ProjectScope::Profile] {
+            let path = registry_path("explicit", scope).unwrap();
+            assert!(read_file(&path, scope).unwrap().is_empty());
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "[]").unwrap();
+            assert!(read_file(&path, scope).unwrap().is_empty());
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(path.file_name().unwrap(), &path).unwrap();
+            let error = read_file(&path, scope).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::ELOOP)
+            );
+        }
     }
 
     #[test]

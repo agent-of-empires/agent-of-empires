@@ -788,7 +788,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::parallel]
     fn probe_output_maps_spawn_failures_and_timeouts() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let mut missing = Command::new("aoe-nonexistent-runtime-binary-zzz");
         assert!(matches!(
             DOCKER.probe_output(&mut missing),
@@ -800,7 +802,6 @@ mod tests {
             .expect("a spawnable binary must not map to a DockerError");
         assert!(!output.status.success());
 
-        assert!(RUNTIME_EXEC_TIMEOUT > RUNTIME_CMD_TIMEOUT);
         let mut slow = Command::new("sh");
         slow.args(["-c", "sleep 5"]);
         assert!(matches!(

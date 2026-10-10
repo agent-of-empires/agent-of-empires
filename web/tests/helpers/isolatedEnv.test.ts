@@ -41,6 +41,8 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_E2E_STORAGE_LOCK_CONTENDED: `${HOST}/lock-contended`,
   AOE_TUI_TEST_CHILD: "host-test-child",
   AOE_TUI_TEST_ENTERED: `${HOST}/test-entered`,
+  AOE_UDS_UMASK_TEST_CHILD: "1",
+  AOE_UDS_UMASK_TEST_ENTERED: `${HOST}/umask-test-entered`,
   AOE_GITHUB_CLONE_BASE: `file://${HOST}/plugins`,
   AOE_AGENT_BIN: "host-session",
   AOE_AGENT_PID: "host-session",
@@ -61,6 +63,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   GIT_CONFIG_SYSTEM: `${HOST}/etc/gitconfig`,
   GIT_SSH_COMMAND: `ssh -i ${HOST}/.ssh/id_ed25519`,
   GIT_WORK_TREE: `${HOST}/repo`,
+  NOTIFY_SOCKET: `${HOST}/systemd-notify.sock`,
   TMUX: "/tmp/tmux-1000/default,4242,0",
   TMUX_PANE: "%7",
 };

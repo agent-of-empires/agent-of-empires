@@ -156,7 +156,7 @@ pub struct SessionService {
     /// Per-session persist locks for `mutate_instance_persisted`, held across snapshot AND
     /// disk write so the two cannot be reordered.
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Shared by queue transactions, exclusive for disk sampling and reload application.
+    /// Shared by mirrored mutations, exclusive for disk sampling and reload application.
     reload_gate: Arc<RwLock<()>>,
     /// Per-session prompt-submission locks.
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -857,6 +857,11 @@ impl SessionService {
     /// Hold through epoch sampling and disk load, or through reload application.
     pub(super) async fn disk_reload_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.reload_gate).write_owned().await
+    }
+
+    /// Exclude disk sampling and reload application through a mirrored mutation.
+    pub(super) async fn disk_mutation_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.reload_gate).read_owned().await
     }
 
     /// Apply `mutate` to a session's in-memory `Instance`, then mirror the resulting state
@@ -2418,7 +2423,7 @@ mod tests {
                         std::fs::rename(&saved_path, storage.sessions_path()).unwrap();
                     }
                     crate::server::reload::reload_state_instances_from_disk(
-                        &state, stale, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
+                        &state, stale.into(), vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
                     ).await;
                     assert_eq!(ids(&service.queued_prompts_snapshot(&id).await), ["A"], "stale reload, cancel={cancel}");
                     let b = match successor.take() {
@@ -2432,7 +2437,7 @@ mod tests {
                     assert_eq!(ids(&fresh[0].queued_prompts), ["A", "B"]);
                     drop(guard);
                     crate::server::reload::reload_state_instances_from_disk(
-                        &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, epoch,
+                        &state, fresh.into(), vec![], crate::server::state::StatusSource::DiskOnly, epoch,
                     ).await;
                     let memory = state.instances.read().await;
                     assert_eq!(ids(&memory[0].queued_prompts), ["A", "B"]);
@@ -2447,7 +2452,6 @@ mod tests {
     fn reload_during_queue_persistence_keeps_acknowledged_prompts() {
         use std::{future::Future, task::Poll, time::Duration};
 
-        let _app_dir = crate::session::test_support::isolate_app_dir();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -2459,6 +2463,7 @@ mod tests {
                 };
                 let mut outcomes = Vec::new();
                 for apply_before_completion in [true, false] {
+                    let _app_dir = crate::session::test_support::isolate_app_dir();
                     let mut inst = Instance::new("reload-queue", "/tmp/aoe-reload-queue");
                     inst.source_profile = "default".into();
                     inst.view = crate::session::View::Structured;
@@ -2468,7 +2473,24 @@ mod tests {
                         *rows = vec![inst.clone()];
                         Ok(())
                     }).unwrap();
+                    let outside = tempfile::tempdir().unwrap();
+                    let root = crate::session::get_profile_dir_path("default").unwrap()
+                        .parent().unwrap().to_path_buf();
+                    std::os::unix::fs::symlink(outside.path(), root.join("external-old")).unwrap();
+                    let alias_path = outside.path().join("sessions.json");
+                    let mut alias = Instance::new("alias accepted", "/tmp/aoe-reload-alias");
+                    std::fs::write(&alias_path, serde_json::to_vec(std::slice::from_ref(&alias)).unwrap()).unwrap();
                     let state = crate::server::test_support::build_test_app_state(vec![inst]);
+                    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+                    storage.update(|rows, _| {
+                        rows[0].title = "canonical sampled".into();
+                        Ok(())
+                    }).unwrap();
+                    alias.title = "alias sampled".into();
+                    std::fs::write(&alias_path, serde_json::to_vec(std::slice::from_ref(&alias)).unwrap()).unwrap();
+                    std::fs::rename(root.join("external-old"), root.join("external-new")).unwrap();
+                    let unreadable = crate::session::get_profile_dir("unreadable").unwrap();
+                    std::fs::write(unreadable.join("sessions.json"), b"[").unwrap();
                     let service = &state.session_service;
                     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -2485,9 +2507,14 @@ mod tests {
                         Poll::Ready(())
                     }).await;
                     let read_epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
-                    let fresh = storage.load().unwrap();
+                    let fresh = crate::server::reload::load_all_instances(&state.file_watch);
                     assert_eq!(contents(&service.queued_prompts_snapshot(&id).await), [("A".into(), 0)]);
-                    assert!(fresh[0].queued_prompts.is_empty());
+                    assert!(fresh.instances[0].queued_prompts.is_empty());
+                    assert_eq!(fresh.instances[0].title, "canonical sampled");
+                    assert_eq!(fresh.cache.alias_only_instances[0].title, "alias sampled");
+                    assert_eq!(fresh.cache.alias_only_instances[0].source_profile, "external-new");
+                    assert!(fresh.cache.health.unreadable_profiles.contains("unreadable"));
+                    assert_eq!(fresh.cache.inventory.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(), ["default", "external-new", "unreadable"]);
                     let mut reload = Box::pin(crate::server::reload::reload_state_instances_from_disk(
                         &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
                     ));
@@ -2506,8 +2533,36 @@ mod tests {
                     if !applied {
                         tokio::time::timeout(Duration::from_secs(10), reload).await.unwrap();
                     }
+                    {
+                        let rows = state.instances.read().await;
+                        let cache = state.runtime_read_cache.read().unwrap();
+                        assert_eq!(rows[0].title, "reload-queue", "stale canonical row must not publish");
+                        assert_eq!(contents(&rows[0].queued_prompts), [("A".into(), 0)]);
+                        assert_eq!(cache.alias_only_instances[0].title, "alias accepted");
+                        assert_eq!(cache.alias_only_instances[0].source_profile, "external-old");
+                        assert!(!cache.health.enumeration_failed);
+                        assert!(cache.health.unreadable_profiles.is_empty());
+                        assert_eq!(cache.inventory.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(), ["default", "external-old"]);
+                    }
                     let _submission = service.prompt_submission(&id).await;
                     service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None).await.unwrap();
+                    let snapshot_guard = service.disk_reload_guard().await;
+                    let epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    let fresh = crate::server::reload::load_all_instances(&state.file_watch);
+                    drop(snapshot_guard);
+                    crate::server::reload::reload_state_instances_from_disk(
+                        &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, epoch,
+                    ).await;
+                    {
+                        let rows = state.instances.read().await;
+                        let cache = state.runtime_read_cache.read().unwrap();
+                        assert_eq!(rows[0].title, "canonical sampled", "following reload must publish");
+                        assert_eq!(cache.alias_only_instances[0].title, "alias sampled");
+                        assert_eq!(cache.alias_only_instances[0].source_profile, "external-new");
+                        assert!(!cache.health.enumeration_failed);
+                        assert_eq!(cache.health.unreadable_profiles, std::collections::HashSet::from(["unreadable".to_owned()]));
+                        assert_eq!(cache.inventory.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(), ["default", "external-new", "unreadable"]);
+                    }
                     let memory = contents(&service.queued_prompts_snapshot(&id).await);
                     let disk = contents(&storage.load().unwrap()[0].queued_prompts);
                     eprintln!("apply_before_completion={apply_before_completion}, captured_epoch={read_epoch}, during={during:?}, memory={memory:?}, disk={disk:?}");
@@ -2591,7 +2646,7 @@ mod tests {
             mutate(Arc::clone(&state.session_service)).await;
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
-                vec![inst],
+                vec![inst].into(),
                 vec![],
                 crate::server::state::StatusSource::DiskOnly,
                 read_epoch,

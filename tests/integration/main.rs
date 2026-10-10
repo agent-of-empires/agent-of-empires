@@ -14,6 +14,14 @@
 //! Modules behind `#[cfg(debug_assertions)]` use test hooks and helpers that
 //! only debug builds compile, so release test builds (the Nix checks) skip them.
 
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod cli_read_parity;
+#[cfg(debug_assertions)]
+mod cli_read_record;
+#[cfg(debug_assertions)]
+mod cli_read_server;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod cli_read_uds;
 mod common;
 mod home_isolation;
 
@@ -24,6 +32,7 @@ mod hooks_cli;
 mod hooks_config;
 mod migration_pipeline;
 mod profile_management;
+mod profile_selection_scope;
 mod recovery_hook_timeout;
 mod repo_config;
 mod session_id_acquisition;

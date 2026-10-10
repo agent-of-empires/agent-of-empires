@@ -34,6 +34,16 @@ mod platform {
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn effective_uid() -> u32 {
+    platform::effective_uid()
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    platform::metadata_identity(metadata)
+}
+#[cfg(target_os = "linux")]
+pub(crate) use linux::runtime_io;
 
 /// Lower the child's scheduling and I/O priority where the OS supports it.
 pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
@@ -80,6 +90,21 @@ pub(crate) fn rename_exclusive(
             "exclusive directory publication is unsupported on this platform",
         ))
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn notify_systemd(message: &[u8]) -> std::io::Result<()> {
+    let Some(destination) = std::env::var_os("NOTIFY_SOCKET").filter(|path| !path.is_empty())
+    else {
+        return Ok(());
+    };
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket.set_nonblocking(true)?;
+    #[cfg(target_os = "linux")]
+    platform::connect_systemd_socket(&socket, &destination)?;
+    #[cfg(not(target_os = "linux"))]
+    socket.connect(&destination)?;
+    socket.send(message).map(|_| ())
 }
 
 /// Only use this when output is not piped: a full pipe can wedge the child. Prefer

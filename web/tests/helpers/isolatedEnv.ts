@@ -1,6 +1,4 @@
-// The live daemon inherits process.env, so any variable naming config, data, or credentials would point it at
-// real agent state. Path-shaped names are dropped wholesale, a few needed ones are kept, and host state under
-// unsuffixed names is dropped or pinned by name (#3657). isolatedEnv.test.ts enforces the contract against src/.
+// Keep daemon subprocesses and private test controls inside the fixture namespace.
 
 import { join } from "node:path";
 
@@ -45,6 +43,8 @@ export const HOST_STATE_VARS = new Set([
   "AOE_E2E_STORAGE_LOCK_CONTENDED",
   "AOE_TUI_TEST_CHILD",
   "AOE_TUI_TEST_ENTERED",
+  "AOE_UDS_UMASK_TEST_CHILD",
+  "AOE_UDS_UMASK_TEST_ENTERED",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one
@@ -68,6 +68,7 @@ export const HOST_STATE_VARS = new Set([
   "AOE_OMP_LAUNCH_ID",
   "TMUX",
   "TMUX_PANE",
+  "NOTIFY_SOCKET", // the host service manager's notification endpoint
   // Re-pinned to the private socket by spawnAoeServe.
   "AOE_TMUX_SOCKET",
 ]);

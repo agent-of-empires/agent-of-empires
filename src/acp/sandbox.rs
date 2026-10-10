@@ -239,7 +239,7 @@ mod tests {
         let reload = |snapshot: &Instance, read_epoch| {
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
-                vec![snapshot.clone()],
+                vec![snapshot.clone()].into(),
                 Vec::new(),
                 crate::server::state::StatusSource::DiskOnly,
                 read_epoch,

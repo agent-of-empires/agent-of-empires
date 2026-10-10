@@ -52,18 +52,37 @@ pub struct Cli {
     /// consume or create profile state require an existing profile: an unknown
     /// name is refused, not created (make one with `aoe profile create`).
     /// Profile-independent commands such as `list --all` and `serve --stop`
-    /// ignore it
-    #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
+    /// ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit
+    /// `-p` wins over it.
+    // No `env` attribute here on purpose. clap would fold the variable into
+    // `cli.profile` itself, and the two are not the same field: `explicit_profile`
+    // and `env_profile` are read separately, and which of them wins is the
+    // documented precedence. An `env` attribute would erase that distinction
+    // behind what looks like a help-text fix.
+    #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
-    /// Attach to a remote agent daemon instead of using the local
-    /// session list. Equivalent to setting `AOE_DAEMON_URL`; pair with
-    /// `AOE_DAEMON_TOKEN` for the bearer token. The session list goes
-    /// through a bearer-only client, so `AOE_DAEMON_PASSPHRASE` does not
-    /// work here yet; it works for `aoe acp <verb>` against the same
-    /// `AOE_DAEMON_URL`. Only meaningful at the no-subcommand `aoe`
-    /// invocation (the TUI dashboard); ignored otherwise.
-    #[arg(long, global = true, env = "AOE_DAEMON_URL")]
+    /// Use the daemon for `list`, `status`, `session show`, `session list-trash`,
+    /// `group list`, `profile`, and `project list`, or attach the TUI to it.
+    /// For these read-only CLI commands, `--daemon-url` requires a served answer
+    /// and never falls back.
+    /// `AOE_DAEMON_URL` selects the same endpoint, but an absent peer falls back
+    /// to the local store with a notice on stderr after at most one second of
+    /// TCP discovery. Once connected, authentication and exchange failures
+    /// never fall back. The whole served exchange has a 15-second deadline.
+    /// Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; an
+    /// unauthenticated daemon needs neither. Passphrase sessions are cached
+    /// using the same login and device binding as the ACP client. Loopback
+    /// login bypasses environment proxies. Plaintext URLs must name a loopback
+    /// literal or localhost, which is pinned to loopback addresses without DNS.
+    /// Use HTTPS for other hosts.
+    /// Without an HTTP endpoint, Linux uses an admitted local daemon socket
+    /// when published, otherwise the local store. Other platforms use the
+    /// local store. A served view can omit an unknown agent_session_id.
+    /// TUI session-list authentication supports bearer tokens only; an unauthenticated
+    /// daemon needs no credential. Ancillary plugin UI requests can use ACP passphrase auth.
+    // Keep the explicit flag separate from the optional environment endpoint.
+    #[arg(long, global = true)]
     pub daemon_url: Option<String>,
 
     #[command(subcommand)]
@@ -106,6 +125,9 @@ pub enum Commands {
     Send(SendArgs),
 
     /// Show session status summary
+    ///
+    /// `--verbose`, `--quiet` and `--json` each replace the default summary
+    /// instead of composing with it, so they exclude one another.
     Status(StatusArgs),
 
     /// Force-stop everything aoe is running: the serve daemon, all agent

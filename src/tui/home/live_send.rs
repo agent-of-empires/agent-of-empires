@@ -3589,10 +3589,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// The worker never steals the size-owner lock back after entry: an external steal
-    /// flips its sticky `lock_lost` flag, the thief keeps the lock, and a queued resize is
-    /// dropped instead of stomping the new owner's grid. Fixes the tug-of-war where a
-    /// background TUI's next keystroke reverted a phone takeover.
+    /// An external size-owner takeover drops later resizes without dropping keys.
     #[test]
     #[serial_test::serial]
     fn worker_flags_lock_loss_and_drops_resize_after_external_steal() {
@@ -3601,18 +3598,23 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_steal");
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            guard.name(),
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep 30",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, guard.name());
         let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
+            .args(&args)
             .output()
             .expect("tmux new-session");
         assert!(out.status.success());
@@ -3706,10 +3708,7 @@ mod tests {
         assert!(!worker.lock_lost());
     }
 
-    /// The entry steal can come up empty two ways: the pane has not appeared yet, or
-    /// another surface won the confirm-read race. The retry path used to force-steal for
-    /// both, silently stomping a live owner without flagging the loss. Spawning before the
-    /// session exists reproduces `owned == false` deterministically.
+    /// A failed entry steal must not turn a later live-owner claim into a steal.
     #[test]
     #[serial_test::serial]
     fn worker_defers_to_live_owner_when_entry_steal_found_no_session() {
@@ -3727,18 +3726,23 @@ mod tests {
             || worker.take_resize_failed(),
         );
 
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            guard.name(),
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep 30",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, guard.name());
         let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
+            .args(&args)
             .output()
             .expect("tmux new-session");
         assert!(out.status.success());

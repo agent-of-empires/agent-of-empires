@@ -176,8 +176,8 @@ Run without arguments to launch the TUI dashboard.
 
 ###### **Options:**
 
-* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it
-* `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. The session list goes through a bearer-only client, so `AOE_DAEMON_PASSPHRASE` does not work here yet; it works for `aoe acp <verb>` against the same `AOE_DAEMON_URL`. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
+* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
+* `--daemon-url <DAEMON_URL>` — Use the daemon for `list`, `status`, `session show`, `session list-trash`, `group list`, `profile`, and `project list`, or attach the TUI to it. For these read-only CLI commands, `--daemon-url` requires a served answer and never falls back. `AOE_DAEMON_URL` selects the same endpoint, but an absent peer falls back to the local store with a notice on stderr after at most one second of TCP discovery. Once connected, authentication and exchange failures never fall back. The whole served exchange has a 15-second deadline. Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; an unauthenticated daemon needs neither. Passphrase sessions are cached using the same login and device binding as the ACP client. Loopback login bypasses environment proxies. Plaintext URLs must name a loopback literal or localhost, which is pinned to loopback addresses without DNS. Use HTTPS for other hosts. Without an HTTP endpoint, Linux uses an admitted local daemon socket when published, otherwise the local store. Other platforms use the local store. A served view can omit an unknown agent_session_id. TUI session-list authentication supports bearer tokens only; an unauthenticated daemon needs no credential. Ancillary plugin UI requests can use ACP passphrase auth
 
 
 
@@ -358,6 +358,8 @@ Send a message to a running agent session
 ## `aoe status`
 
 Show session status summary
+
+`--verbose`, `--quiet` and `--json` each replace the default summary instead of composing with it, so they exclude one another.
 
 **Usage:** `aoe status [OPTIONS]`
 
