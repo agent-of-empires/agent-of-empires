@@ -188,11 +188,11 @@ pub(crate) fn strip_paste_escapes(text: &mut String) {
 }
 /// A submit drops trailing line breaks, since Enter follows.
 fn paste_payload(mut text: String, submit: bool) -> String {
+    strip_paste_escapes(&mut text);
     if submit {
         let len = text.trim_end_matches(['\r', '\n']).len();
         text.truncate(len);
     }
-    strip_paste_escapes(&mut text);
     text
 }
 
@@ -1750,6 +1750,12 @@ mod tests {
                 "x\x1b[201~y\n",
                 true,
                 "xy",
+            ),
+            (
+                r#"{"type":"paste","text":"text\n\u001b[201~","submit":true}"#,
+                "text\n\x1b[201~",
+                true,
+                "text",
             ),
             (
                 r#"{"type":"paste","text":"\u001b[200~pasted\u001b[201~","submit":false}"#,
