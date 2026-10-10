@@ -2967,6 +2967,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "acp.typing-keeps-transcript-pinned",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-typing-keeps-pin.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/composerInput.ts"]
+    },
+    {
       "id": "acp.mobile-jump-to-bottom",
       "kind": "mocked-playwright",
       "risk": "medium",
