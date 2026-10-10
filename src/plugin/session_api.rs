@@ -632,7 +632,7 @@ async fn sessions_turn_send(
         };
         let dispatch = deps
             .session_service
-            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant, false)
+            .prompt_dispatch_under_submission(&req.session_id, &req.text, woke_idle_dormant, false)
             .await;
         if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
             if !matches!(reason, crate::acp::dispatch::QueueReason::WorkerDown) {
@@ -823,7 +823,7 @@ async fn deliver_structured(
         .map_err(blocked_error)?;
     let was_running = service.acp_supervisor.is_running(id).await;
     let dispatch = service
-        .prompt_dispatch_under_submission(id, woke_idle_dormant, false)
+        .prompt_dispatch_under_submission(id, &req.message, woke_idle_dormant, false)
         .await;
     // A stopped worker is resumed by `send_turn` below, not queued behind a drain nothing starts.
     if let PromptDispatch::Queued { reason } = dispatch {

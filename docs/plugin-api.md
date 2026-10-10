@@ -232,7 +232,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 
 **Ownership.** `sessions.turn.send` reaches only a session the calling plugin created. To reach any other session, use `sessions.message.send`.
 
-**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`.
+**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. So is a `/compact` or `/clear` aimed at any running turn, steerable or not, since such a command runs on its own turn. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`.
 
 **Idempotency.** `sessions.create` takes a plugin-scoped `idempotency_key`: retrying with the same key and payload returns the existing session (`created: false`), while a different payload under that key is a conflict.
 
