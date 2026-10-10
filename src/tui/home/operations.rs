@@ -309,6 +309,7 @@ impl HomeView {
         }
         drop(ownership);
 
+        crate::tips::record_session_creations(1);
         self.reload()?;
         // reload()'s selection fallback lands on the nearest index, often the new
         // session's group folder, so pin the selection the caller attaches to. Same as

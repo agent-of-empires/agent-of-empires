@@ -81,6 +81,10 @@ row_tag = "branch"        # none | auto | profile | sandbox | branch
 sidebar_position = "left" # left | right; TUI session list
 ```
 
+After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
+It waits until the home screen is free, respects **Show tips**, and never changes the setting.
+You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `default_tool` | (auto-detect) | Default agent for new sessions, including a custom agent name. Falls back to the first available tool. |
@@ -92,6 +96,7 @@ sidebar_position = "left" # left | right; TUI session list
 | `row_tag` | `"branch"` | Metadata next to a TUI session title: `none`, `auto` (profile code in all-profiles view), `profile`, `sandbox`, or `branch`. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
 | `sidebar_position` | `"left"` | TUI session sidebar position: `left` or `right`. Global only. Narrow terminals keep the stacked layout. |
+| `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view; shortcuts, `?` help, dialog controls, and temporary notifications still work. |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `pre_trust_agent_folders` | `false` | Pre-trust each host session's worktree in the agent's own config (Claude Code, Codex, Gemini) so it does not open on a folder-trust prompt. Config-dir overrides are honored, and an `agent_config_dir` entry wins over them. Trust also activates the repo's `.claude/settings.json`, hooks included, so enable it only for directories you would have trusted by hand. Sandboxed sessions always pre-trust their own staged config. |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config; see [Agent hook approval](#agent-hook-approval) for the approval that gates it and [Adding a New Agent](../development/adding-agents.md#hook-format-reference) for the formats. Disabling it leaves status to pane reading but keeps identity hooks used for native resume. |

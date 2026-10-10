@@ -207,6 +207,10 @@ pub struct ModeInfo {
     pub description: Option<String>,
 }
 
+/// Title of the tool call the adapter opens for `/compact`; newer adapters emit
+/// it instead of the `Compacting...` text chunk.
+const COMPACT_TOOL_NAME: &str = "Compact conversation";
+
 /// Agent-to-client notification carrying the agent's own auth identity.
 pub const AUTH_STATUS_UPDATE_METHOD: &str = "_auth/status_update";
 
@@ -800,12 +804,9 @@ impl AcpState {
             Event::TodoListUpdated { todos } => self.todos = todos,
             Event::ToolCallStarted { tool_call } => self.start_tool_call(tool_call),
             Event::ToolCallCompleted { tool_call_id, .. } => {
-                if self
-                    .in_flight_tool
-                    .as_ref()
-                    .is_some_and(|t| t.id == tool_call_id)
-                {
-                    self.in_flight_tool = None;
+                let finished = self.in_flight_tool.take_if(|t| t.id == tool_call_id);
+                if finished.is_some_and(|t| t.name == COMPACT_TOOL_NAME) {
+                    self.compacting = false;
                 }
             }
             Event::ToolCallUpdated {
@@ -1049,6 +1050,9 @@ impl AcpState {
     }
 
     fn start_tool_call(&mut self, tool_call: ToolCall) {
+        if tool_call.name == COMPACT_TOOL_NAME {
+            self.compacting = true;
+        }
         match self.in_flight_tool.as_mut() {
             // A repeated start frame for the same call keeps diffs an update already attached.
             Some(existing) if existing.id == tool_call.id => {
@@ -1460,6 +1464,32 @@ mod tests {
         assert!(
             !applied([Event::ConversationCompactionStarted, stopped("end_turn")]).compacting,
             "Stopped self-heals a stuck compaction"
+        );
+
+        let compact_tool = || {
+            let mut tc = tool_call("tc-compact");
+            tc.name = COMPACT_TOOL_NAME.into();
+            Event::ToolCallStarted { tool_call: tc }
+        };
+        let tool_done = |id: &str, is_error: bool| Event::ToolCallCompleted {
+            tool_call_id: id.into(),
+            is_error,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: Utc::now(),
+            async_subagent: false,
+        };
+        assert!(
+            applied([compact_tool()]).compacting,
+            "the adapter's compact tool call marks compaction"
+        );
+        assert!(
+            !applied([compact_tool(), tool_done("tc-compact", true)]).compacting,
+            "a failed compaction clears the flag"
+        );
+        assert!(
+            applied([compact_tool(), tool_done("other", false)]).compacting,
+            "another tool's completion leaves it set"
         );
 
         let mut s = fresh_state();

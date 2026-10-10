@@ -960,7 +960,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         },
     );
     match persist_result {
-        Ok(true) => {}
+        Ok(true) => crate::tips::record_session_creations(1),
         Ok(false) => {
             drop(_identity_lock);
             drop(ownership.take());

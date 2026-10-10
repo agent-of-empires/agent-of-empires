@@ -287,6 +287,12 @@ fn test_create_session_in_all_mode_is_findable() {
     };
 
     let session_id = view.create_session(data).unwrap();
+    assert_eq!(
+        crate::session::config::AppStateConfig::load()
+            .unwrap()
+            .sessions_created,
+        1
+    );
 
     // In unified view, the session IS findable (fixes #419)
     assert!(

@@ -937,6 +937,12 @@ fn apply_creation_results_finalizes_persisted_stub() {
         .expect("request should install a Creating stub");
     view.save().unwrap();
     let (persisted_while_creating, groups_while_creating) = storage.load_with_groups().unwrap();
+    assert_eq!(
+        crate::session::config::AppStateConfig::load()
+            .unwrap()
+            .sessions_created,
+        0
+    );
     assert_eq!(persisted_while_creating.len(), 1);
     assert_eq!(persisted_while_creating[0].id, stub_id);
     assert_eq!(
@@ -952,6 +958,19 @@ fn apply_creation_results_finalizes_persisted_stub() {
 
     let session_id = drain_creation_result(&mut view)
         .expect("apply_creation_results should return Some(session_id)");
+    assert_eq!(
+        crate::session::config::AppStateConfig::load()
+            .unwrap()
+            .sessions_created,
+        1
+    );
+    view.save().unwrap();
+    assert_eq!(
+        crate::session::config::AppStateConfig::load()
+            .unwrap()
+            .sessions_created,
+        1
+    );
     assert!(
         view.creating_provisional_group_paths.is_empty(),
         "finalization must leave no provisional group paths behind"
@@ -1094,6 +1113,12 @@ fn cancel_during_on_create_skips_on_launch() {
     std::fs::write(project_dir.join("release"), b"").unwrap();
 
     assert_eq!(drain_creation_result(&mut view), None);
+    assert_eq!(
+        crate::session::config::AppStateConfig::load()
+            .unwrap()
+            .sessions_created,
+        0
+    );
     assert!(!view.is_creation_pending());
     assert!(
         !project_dir.join("launch-started").exists(),

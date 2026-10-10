@@ -275,6 +275,7 @@ pub struct HomeView {
     pub(super) pending_status_refresh: bool,
 
     pub(super) show_diagnostics: bool,
+    pub(super) show_shortcut_bar: bool,
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,

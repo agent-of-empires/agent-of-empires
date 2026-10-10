@@ -378,6 +378,11 @@ impl Instance {
                         provenance: ConversationProvenance::Preallocated,
                         transcript_path: None,
                     });
+                if matches!(prepared.expected_conversation.intent, ResumeIntent::Default)
+                    && super::execution::transcript_confirms_reserved_claude_conversation(&binding)
+                {
+                    binding.provenance = ConversationProvenance::Observed;
+                }
                 // #4127: a legacy binding adopts the route this launch
                 // attested, so the marker stops being derived from the
                 // configuration as it stands the moment a launch settles it.
