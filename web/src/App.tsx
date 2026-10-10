@@ -322,6 +322,7 @@ function isInsideEditable(target: EventTarget | null): boolean {
   return false;
 }
 
+/** Composes the authenticated dashboard and synchronizes its user-scoped UI state. */
 function AppContent({
   loginRequired,
   onLogout,

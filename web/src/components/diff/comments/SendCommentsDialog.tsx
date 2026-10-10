@@ -64,6 +64,7 @@ export function SendCommentsDialog({
         ? "Sending your comments to the agent..."
         : "Send comments to agent";
 
+  /** Sends the assembled prompt through the selected session transport; failures keep the draft editable. */
   const send = useCallback(async () => {
     if (busy || comments.length === 0 || !sendEnabled) return;
     setBusy(true);
