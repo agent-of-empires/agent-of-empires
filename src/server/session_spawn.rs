@@ -374,26 +374,42 @@ pub(crate) async fn spawn_structured_session(
             return Err(error);
         }
         drop(ownership.take());
-        if !instance.is_structured() {
+        let startup_error = if !instance.is_structured() {
+            let birth = (instance.created_at, instance.lifecycle_generation);
             if let Err(error) = instance.start() {
-                return Err(error.context("Session metadata was persisted; created resources were retained after startup failed"));
+                if let Err(settlement) = record_created_start_failure(
+                    &storage, &witness, &mut instance, birth, &error,
+                ) {
+                    return Err(error.context(format!("Could not record retained startup failure: {settlement:#}")));
+                }
+                Some(error.context("Session metadata was persisted; created resources were retained after startup failed"))
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        crate::tips::record_session_creations(1);
+        if startup_error.is_none() {
+            crate::tips::record_session_creations(1);
+        }
         Ok::<_, anyhow::Error>((
             instance,
             build_warnings,
             agent_effort,
             storage,
             witness,
+            startup_error,
         ))
     })
     .await;
 
     match result {
-        Ok(Ok((instance, warnings, agent_effort, storage, witness))) => {
+        Ok(Ok((instance, warnings, agent_effort, storage, witness, startup_error))) => {
             let instance = publish_created_instance(service, instance, storage, witness).await?;
+            if let Some(error) = startup_error {
+                return Err(error);
+            }
             let response_instance = instance.clone();
             let acp_spawn_target = if instance.is_structured() {
                 Some((
@@ -557,6 +573,54 @@ pub(crate) async fn spawn_structured_session(
     }
 }
 
+fn record_created_start_failure(
+    storage: &crate::session::Storage,
+    witness: &crate::session::builder::CreationWitness,
+    instance: &mut Instance,
+    birth: (chrono::DateTime<chrono::Utc>, u64),
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let original_path = witness.original_project_path();
+    anyhow::ensure!(
+        instance.created_at == birth.0
+            && std::path::Path::new(&instance.project_path) == original_path,
+        "Created session changed during startup"
+    );
+    let ownership = crate::session::storage::acquire_ownership_read()?;
+    storage.verify_profile_identity()?;
+    let _lifecycle =
+        storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &instance.id)?;
+    let matches = |row: &Instance| {
+        row.id == instance.id
+            && row.created_at == birth.0
+            && std::path::Path::new(&row.project_path) == original_path
+            && row.lifecycle_generation == instance.lifecycle_generation
+            && row.lifecycle_reservation.is_none()
+            && (row.lifecycle_generation == birth.1 || row.status == crate::session::Status::Error)
+    };
+    let rows = storage.load_strict_for_worktree_ownership()?;
+    let current = rows.iter().find(|row| matches(row)).ok_or_else(|| {
+        anyhow::anyhow!("Created session was removed or superseded during startup")
+    })?;
+    witness.validate(current)?;
+    let needs_commit = current.status != crate::session::Status::Error;
+    drop(rows);
+    if needs_commit {
+        storage.update_with_ownership(&ownership, |rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| matches(row))
+                .ok_or_else(|| anyhow::anyhow!("Created session changed before failure commit"))?;
+            row.status = crate::session::Status::Error;
+            row.idle_entered_at = None;
+            Ok(())
+        })?;
+    }
+    instance.status = crate::session::Status::Error;
+    instance.idle_entered_at = None;
+    instance.last_error = Some(format!("{error:#}"));
+    Ok(())
+}
 async fn publish_created_instance(
     service: &Arc<SessionService>,
     instance: Instance,
@@ -594,13 +658,15 @@ async fn publish_created_instance(
                 "Created session changed before live publication"
             );
             witness.validate(&authoritative)?;
-            // Preserve only the non-serialized startup environment, never stale
-            // durable fields from the worker snapshot.
+            // Only startup-only fields may come from the worker snapshot.
             if let (Some(current), Some(started)) = (
                 authoritative.sandbox_info.as_mut(),
                 expected.sandbox_info.as_ref(),
             ) {
                 current.before_start_env = started.before_start_env.clone();
+            }
+            if authoritative.status == crate::session::Status::Error {
+                authoritative.last_error = expected.last_error.clone();
             }
             let response = authoritative.clone();
             crate::server::api::sessions::upsert_instance(&mut instances, authoritative);
@@ -633,6 +699,160 @@ async fn publish_created_instance(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn startup_failure_never_overwrites_superseded_or_unknown_ownership() {
+        for change in [
+            "generation",
+            "birth",
+            "path",
+            "reservation",
+            "reconciled-generation",
+            "reconciled-reservation",
+            "purge",
+            "corrupt",
+            "profile",
+            "checkout",
+            "worker-birth",
+            "worker-path",
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let fixture = tempfile::tempdir().unwrap();
+            let project = fixture.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let storage = crate::session::Storage::new_unwatched("test").unwrap();
+            let mut instance =
+                crate::session::Instance::new("original", &project.to_string_lossy());
+            instance.source_profile = "test".into();
+            let witness = crate::session::builder::CreationWitness::capture(&instance).unwrap();
+            let birth = (instance.created_at, instance.lifecycle_generation);
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            match change {
+                "corrupt" => {
+                    std::fs::write(storage.sessions_path(), b"unreadable inventory").unwrap()
+                }
+                "profile" => {
+                    let profile = storage.sessions_path().parent().unwrap();
+                    std::fs::rename(profile, profile.with_file_name("retired-test")).unwrap();
+                    std::fs::create_dir_all(profile).unwrap();
+                    std::fs::write(storage.sessions_path(), b"[]").unwrap();
+                }
+                "checkout" => {
+                    std::fs::rename(&project, fixture.path().join("retired")).unwrap();
+                    std::fs::create_dir(&project).unwrap();
+                }
+                "worker-birth" => instance.created_at += chrono::Duration::seconds(1),
+                "worker-path" => instance.project_path.push_str("/changed"),
+                _ => storage
+                    .update(|rows, _| {
+                        match change {
+                            "generation" | "reconciled-generation" => {
+                                rows[0].lifecycle_generation += 1
+                            }
+                            "birth" => rows[0].created_at += chrono::Duration::seconds(1),
+                            "path" => rows[0].project_path.push_str("/changed"),
+                            "reservation" | "reconciled-reservation" => {
+                                rows[0]
+                                    .try_acquire_lifecycle_reservation(
+                                        crate::session::LifecycleOperation::Launch,
+                                        chrono::Duration::minutes(10),
+                                        chrono::Utc::now(),
+                                    )
+                                    .unwrap();
+                            }
+                            "purge" => rows.clear(),
+                            _ => unreachable!(),
+                        }
+                        Ok(())
+                    })
+                    .unwrap(),
+            }
+            if change.starts_with("reconciled-") {
+                instance = storage.load().unwrap().remove(0);
+            }
+            let before = std::fs::read(storage.sessions_path()).unwrap();
+            let result = super::record_created_start_failure(
+                &storage,
+                &witness,
+                &mut instance,
+                birth,
+                &anyhow::anyhow!("startup failed"),
+            );
+            assert!(result.is_err(), "{change}");
+            assert_eq!(
+                std::fs::read(storage.sessions_path()).unwrap(),
+                before,
+                "{change}"
+            );
+        }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_terminal_creation_publishes_the_retained_error_row() {
+        use crate::session::Status;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let app_dir = crate::session::get_app_dir().unwrap();
+        crate::session::config::update_config(|config| {
+            config.hooks.on_create = vec![format!(
+                "mkdir '{}/.session-title-'\"$AOE_SESSION_ID\"'.lock'",
+                app_dir.display()
+            )];
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let body = serde_json::from_value(serde_json::json!({
+            "title": "retained-start-failure", "path": "", "tool": "claude",
+            "scratch": true, "view": "terminal", "profile": "test",
+            "command_override": "true",
+        }))
+        .unwrap();
+        let response = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let row = crate::server::test_support::load_instances_from_disk_for_test("test")
+            .into_iter()
+            .find(|row| row.title == "retained-start-failure")
+            .unwrap();
+        assert_eq!(row.status, Status::Error);
+        assert!(row.lifecycle_reservation.is_none());
+        assert!(std::path::Path::new(&row.project_path).is_dir());
+        let instances = state.instances.read().await;
+        let live = instances.iter().find(|live| live.id == row.id).unwrap();
+        assert_eq!(live.status, Status::Error);
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            state
+                .telemetry_session_creates
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sessions_created,
+            0
+        );
+    }
     #[tokio::test]
     async fn the_create_bumps_the_mutation_epoch_under_the_instances_lock() {
         use axum::extract::{Query, State};

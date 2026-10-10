@@ -8,7 +8,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Bug Fixes
 
-- **worktree:** Serialize cross-profile ownership transitions through Git effects and durable publication. Preserve referenced worktrees and branches during purge, trash/restore, orphan cleanup, attachment, creation, reconciliation and rename, including external profile aliases and unreadable inventories. Release abandoned lifecycle reservations only for their original owner, and keep creation prompts and sandbox pulls outside ownership leases (#4107).
+- **worktree:** Serialize cross-profile ownership transitions through Git effects and durable publication. Preserve referenced worktrees and branches during purge, trash/restore, orphan cleanup, attachment, creation, reconciliation and rename, including external profile aliases and unreadable inventories. Release abandoned lifecycle reservations only for their original owner, keep creation prompts and sandbox pulls outside ownership leases, and publish retained startup failures as errors without deleting their resources (#4107).
 
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 

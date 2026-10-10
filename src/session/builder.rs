@@ -219,6 +219,10 @@ impl CreationWitness {
         Ok(witness)
     }
 
+    pub(crate) fn original_project_path(&self) -> &Path {
+        &self.directories[0].path
+    }
+
     pub(crate) fn validate(&self, instance: &Instance) -> Result<()> {
         for directory in &self.directories {
             directory.verify()?;
