@@ -57,6 +57,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "session.create",
     "session.prompt",
     "session.unattended",
+    "session.message",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

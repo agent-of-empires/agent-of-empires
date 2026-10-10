@@ -5,6 +5,7 @@
 //! or websocket attach.
 
 use super::*;
+use crate::server::session_service::SessionService;
 
 #[derive(Deserialize)]
 pub struct SendMessageRequest {
@@ -19,7 +20,10 @@ fn default_revive() -> bool {
     true
 }
 
-enum SendKeysError {
+/// Why a terminal send failed; the HTTP handler and the plugin RPC each map it to their own
+/// wire shape.
+pub(crate) enum SendKeysError {
+    NotFound,
     NotRunning,
     ResumeFailed(String),
     Transient(Status),
@@ -27,55 +31,44 @@ enum SendKeysError {
     Blocked(crate::session::StartBlocked),
     Gone,
     Tmux(anyhow::Error),
+    Internal,
 }
 
 type SendKeysResult =
     Result<(EnsureReadyOutcome, Instance), Box<(Instance, EnsureReadyOutcome, SendKeysError)>>;
 
-pub async fn send_message(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    req: Result<Json<SendMessageRequest>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if state.read_only {
-        return crate::server::api::read_only_response();
-    }
-    // Terminal keystroke injection: CityHall sessions are structured-view only,
-    // so close this explicitly rather than leaning on the downstream error.
-    if let Some(resp) = crate::server::api::cityhall_block(&state) {
-        return resp;
-    }
-    let Json(req) = match req {
-        Ok(j) => j,
-        Err(rej) => return rej.into_response(),
-    };
-
-    if req.message.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "message_empty"})),
-        )
-            .into_response();
-    }
-
+/// Type `message` into the session's tmux pane. Returns whether a stopped or dead pane was
+/// revived first. Serializes with every other send to the same session.
+pub(crate) async fn send_terminal_message(
+    service: &SessionService,
+    status_tx: &tokio::sync::broadcast::Sender<crate::server::push::StatusChange>,
+    id: &str,
+    message: String,
+    revive: bool,
+) -> Result<bool, SendKeysError> {
     // Serialize concurrent sends (and other tmux mutations) for this id, or two
     // racing POSTs interleave their bytes inside the pane.
-    let inst_lock = state.instance_lock(&id).await;
+    let inst_lock = service.instance_lock(id).await;
     let _guard = inst_lock.lock().await;
 
-    let Some(instance) = find_instance(&state, &id).await else {
-        return bare_not_found();
+    let Some(instance) = service
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .cloned()
+    else {
+        return Err(SendKeysError::NotFound);
     };
 
     // Covers `revive: false` and a live pane too; an archived session takes no input.
     if let Err(blocked) = instance.ensure_startable() {
-        return crate::server::api::start_blocked_response(blocked);
+        return Err(SendKeysError::Blocked(blocked));
     }
 
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
-    let message = req.message;
-    let revive = req.revive;
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
         // Revive the pane before sending, unless the caller opted out: a send
         // to a dead pane silently writes keystrokes to a corpse.
@@ -149,37 +142,31 @@ pub async fn send_message(
 
     match send_result {
         Ok(Ok((outcome, started))) => {
-            let body = serde_json::json!({"sent": true});
             // ensure_pane_ready mutated `started` on the clone, so sync it back
             // or a rapid follow-up generates a fresh `agent_session_id` and
             // orphans the prior Claude conversation. See `apply_post_restart_sync`.
             // Also stamps last_accessed_at for the activity column.
-            let mut instances = state.instances.write().await;
+            let mut instances = service.instances.write().await;
+            let revived = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             let profile = if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                if !matches!(outcome, EnsureReadyOutcome::AlreadyAlive) {
-                    sync_live_after_restart(&state.status_tx, i, &sync_base, &started);
+                if revived {
+                    sync_live_after_restart(status_tx, i, &sync_base, &started);
                 }
                 i.touch_after_input();
                 i.source_profile.clone()
             } else {
                 // Deleted between the send and the stamp; nothing to persist.
-                return (StatusCode::OK, Json(body)).into_response();
+                return Ok(revived);
             };
             drop(instances);
-            let id_for_save = id.clone();
-            let sync_base_for_save = sync_base.clone();
-            let started_for_save = started.clone();
-            let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
+            let id_for_save = id.to_string();
+            let file_watch = service.file_watch.clone();
             tokio::task::spawn_blocking(move || {
-                if let Ok(storage) = Storage::new(&profile, state.file_watch.clone()) {
+                if let Ok(storage) = Storage::new(&profile, file_watch) {
                     if let Err(e) = storage.update(|all, _groups| {
                         if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
-                            if !outcome_already_alive {
-                                apply_post_restart_sync(
-                                    disk_inst,
-                                    &sync_base_for_save,
-                                    &started_for_save,
-                                );
+                            if revived {
+                                apply_post_restart_sync(disk_inst, &sync_base, &started);
                             }
                             disk_inst.touch_after_input();
                         }
@@ -189,7 +176,7 @@ pub async fn send_message(
                     }
                 }
             });
-            (StatusCode::OK, Json(body)).into_response()
+            Ok(revived)
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;
@@ -197,98 +184,136 @@ pub async fn send_message(
             // fields the live entry needs (fresh sid, last_start_time), so sync
             // only when work happened.
             let did_work = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
-            match send_err {
-                SendKeysError::NotRunning => {
-                    // An external kill or a remain-on-exit-off crash can race
-                    // ensure_pane_ready's Alive decision. Use the narrow sync
-                    // helper so status and last_error stay untouched: NotRunning
-                    // is recoverable, and `Starting` from finalize_launch would
-                    // briefly mis-paint a broken pane.
+            match &send_err {
+                // An external kill or a remain-on-exit-off crash can race
+                // ensure_pane_ready's Alive decision. Use the narrow sync
+                // helper so status and last_error stay untouched: NotRunning
+                // is recoverable, and `Starting` from finalize_launch would
+                // briefly mis-paint a broken pane. A peer that shelved the row
+                // after a revive launched also keeps the launch identity.
+                SendKeysError::NotRunning | SendKeysError::Blocked(_) => {
                     if did_work {
-                        let mut instances = state.instances.write().await;
+                        let mut instances = service.instances.write().await;
                         if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                             apply_cascade_state_sync(i, &sync_base, &started);
                         }
                     }
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({"error": "session_not_running"})),
-                    )
-                        .into_response()
                 }
-                SendKeysError::ResumeFailed(sid) => {
-                    let mut instances = state.instances.write().await;
+                SendKeysError::ResumeFailed(_) => {
+                    let mut instances = service.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        sync_live_after_restart(&state.status_tx, i, &sync_base, &started);
+                        sync_live_after_restart(status_tx, i, &sync_base, &started);
                     }
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({
-                            "error": "resume_failed",
-                            "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
-                            "resume_session_id": sid,
-                        })),
-                    )
-                        .into_response()
                 }
-                SendKeysError::Transient(status) => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "session_transient",
-                        "status": format!("{status:?}"),
-                    })),
-                )
-                    .into_response(),
-                SendKeysError::StructuredView => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "acp_mode_unsupported"})),
-                )
-                    .into_response(),
-                SendKeysError::Blocked(blocked) => {
-                    // A peer shelved the row after a revive launched: keep the launch identity.
-                    if did_work {
-                        let mut instances = state.instances.write().await;
-                        if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                            apply_cascade_state_sync(i, &sync_base, &started);
-                        }
-                    }
-                    crate::server::api::start_blocked_response(blocked)
-                }
-                SendKeysError::Gone => bare_not_found(),
+                // Mirror `ensure_session`'s Err arm: full sync, then
+                // override `status` and `last_error` so observers do not see
+                // `Status::Starting` on a broken session. Tmux Err is the
+                // catch-all for both an unmutated pre-cascade failure and a
+                // post-resume-path one whose durable state must be copied
+                // back from the clone.
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();
-                    // Mirror `ensure_session`'s Err arm: full sync, then
-                    // override `status` and `last_error` so observers do not see
-                    // `Status::Starting` on a broken session. Tmux Err is the
-                    // catch-all for both an unmutated pre-cascade failure and a
-                    // post-resume-path one whose durable state must be copied
-                    // back from the clone.
-                    let mut instances = state.instances.write().await;
+                    let mut instances = service.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        if sync_live_after_restart(&state.status_tx, i, &sync_base, &started) {
+                        if sync_live_after_restart(status_tx, i, &sync_base, &started) {
                             let synced_status = i.status;
                             i.status = crate::session::Status::Error;
                             i.last_error = Some(msg);
-                            publish_status_change(&state.status_tx, i, synced_status);
+                            publish_status_change(status_tx, i, synced_status);
                         }
                     }
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "tmux_error"})),
-                    )
-                        .into_response()
                 }
+                SendKeysError::NotFound
+                | SendKeysError::Transient(_)
+                | SendKeysError::StructuredView
+                | SendKeysError::Gone
+                | SendKeysError::Internal => {}
             }
+            Err(send_err)
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "send_message: blocking task panicked for {id}: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response()
+            Err(SendKeysError::Internal)
         }
+    }
+}
+
+pub async fn send_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<SendMessageRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    // Terminal keystroke injection: CityHall sessions are structured-view only,
+    // so close this explicitly rather than leaning on the downstream error.
+    if let Some(resp) = crate::server::api::cityhall_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+
+    if req.message.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "message_empty"})),
+        )
+            .into_response();
+    }
+
+    match send_terminal_message(
+        &state.session_service,
+        &state.status_tx,
+        &id,
+        req.message,
+        req.revive,
+    )
+    .await
+    {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response(),
+        Err(SendKeysError::NotFound | SendKeysError::Gone) => bare_not_found(),
+        Err(SendKeysError::NotRunning) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "session_not_running"})),
+        )
+            .into_response(),
+        Err(SendKeysError::ResumeFailed(sid)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "resume_failed",
+                "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                "resume_session_id": sid,
+            })),
+        )
+            .into_response(),
+        Err(SendKeysError::Transient(status)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "session_transient",
+                "status": format!("{status:?}"),
+            })),
+        )
+            .into_response(),
+        Err(SendKeysError::StructuredView) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "acp_mode_unsupported"})),
+        )
+            .into_response(),
+        Err(SendKeysError::Blocked(blocked)) => crate::server::api::start_blocked_response(blocked),
+        Err(SendKeysError::Tmux(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "tmux_error"})),
+        )
+            .into_response(),
+        Err(SendKeysError::Internal) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal"})),
+        )
+            .into_response(),
     }
 }
 

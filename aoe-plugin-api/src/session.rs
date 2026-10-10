@@ -1,4 +1,4 @@
-//! Session create / turn-delivery DTOs for the `sessions.create` and
+//! DTOs for the `sessions.create`, `sessions.turn.send` and `sessions.message.send` RPCs.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,34 @@ pub struct TurnSendRequest {
     pub text: String,
 }
 
+/// Request of `sessions.message.send`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageSendRequest {
+    pub session_id: String,
+    pub message: String,
+}
+
+/// How the host handled a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDisposition {
+    /// Typed into a terminal pane, or started as a new agent turn.
+    Sent,
+    /// Folded into the agent's running turn.
+    Steered,
+    /// Parked on the session's queue behind a running turn.
+    Queued,
+}
+
+/// Response of `sessions.message.send`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSendResponse {
+    pub disposition: MessageDisposition,
+    /// A stopped or dormant session was woken to take the message.
+    pub revived: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +124,25 @@ mod tests {
         }))
         .expect_err("unknown fields must be rejected");
         assert!(err.to_string().contains("allow_untrusted"));
+    }
+
+    #[test]
+    fn message_send_wire_shapes_are_stable() {
+        let response = MessageSendResponse {
+            disposition: MessageDisposition::Steered,
+            revived: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&response).expect("serialize"),
+            serde_json::json!({"disposition": "steered", "revived": true})
+        );
+        let err = serde_json::from_value::<MessageSendRequest>(serde_json::json!({
+            "session_id": "s",
+            "message": "hi",
+            "text": "x"
+        }))
+        .expect_err("unknown fields must be rejected");
+        assert!(err.to_string().contains("text"));
     }
 
     #[test]

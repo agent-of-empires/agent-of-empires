@@ -1001,6 +1001,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         Ok(ids)
     })?;
 
+    crate::tips::record_session_creations(created_ids.len());
     println!("✓ Imported {} session(s).", created_ids.len());
 
     if structured {
@@ -3391,6 +3392,61 @@ mod session_mutation_tests {
 mod import_tests {
     use super::*;
     use crate::session::claude_import::ClaudeSessionSummary;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn import_counts_only_new_committed_sessions_across_profiles() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let store = home.path().join(".claude/projects/import-count");
+        std::fs::create_dir_all(&store).unwrap();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        for id in ["import-one", "import-two"] {
+            let row = serde_json::json!({
+                "cwd": home.path(), "type": "user", "message": {"content": id}
+            });
+            std::fs::write(store.join(format!("{id}.jsonl")), row.to_string()).unwrap();
+        }
+        let count = || {
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sessions_created
+        };
+        for (profile, dry_run, expected) in [
+            ("test", true, 0),
+            ("test", false, 2),
+            ("test", false, 2),
+            ("other", false, 4),
+        ] {
+            Storage::new_unwatched(profile).unwrap();
+            import_sessions(
+                profile,
+                ImportArgs {
+                    paths: vec![],
+                    all: true,
+                    structured: false,
+                    group: None,
+                    launch: false,
+                    dry_run,
+                    yes: true,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(count(), expected);
+        }
+        Storage::open_unwatched("test")
+            .unwrap()
+            .update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            count(),
+            4,
+            "deleting sessions does not lower the lifetime count"
+        );
+    }
 
     fn summary(id: &str, cwd: &str, title: Option<&str>) -> ClaudeSessionSummary {
         ClaudeSessionSummary {

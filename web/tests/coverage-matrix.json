@@ -623,6 +623,13 @@
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
     },
     {
+      "id": "settings.tui-shortcut-bar",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
       "id": "settings.tmux-persistence",
       "kind": "vitest",
       "risk": "medium",
@@ -738,7 +745,7 @@
     {
       "id": "notifications.push-subscription",
       "kind": "vitest",
-      "risk": "medium",
+      "risk": "high",
       "specs": ["src/hooks/usePushSubscription.test.ts", "src/lib/pushHealth.test.ts"],
       "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"]
     },
@@ -2816,8 +2823,8 @@
       "id": "acp.ws-reconnect-liveness",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useAcpSession.test.ts"],
-      "components": ["web/src/hooks/useAcpSession.ts"]
+      "specs": ["src/hooks/useAcpSession.test.ts", "tests/acp-reconnect-hung-dial.spec.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/useAcpConnection.ts"]
     },
     {
       "id": "acp.args",
@@ -2965,6 +2972,13 @@
       "risk": "medium",
       "specs": ["tests/acp-submit-repin.spec.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "acp.typing-keeps-transcript-pinned",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-typing-keeps-pin.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/composerInput.ts"]
     },
     {
       "id": "acp.mobile-jump-to-bottom",

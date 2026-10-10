@@ -351,6 +351,7 @@ impl HomeView {
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
             show_diagnostics: resolved.session.show_diagnostics_pane,
+            show_shortcut_bar: resolved.session.show_shortcut_bar,
             metrics_poller: crate::tui::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
             metrics: crate::process::metrics::MetricsSnapshot::default(),
@@ -606,6 +607,7 @@ impl HomeView {
             }
         };
         view.rewire_config_subscriptions(&initial_config_profiles);
+        view.refresh_shortcut_bar_tip();
         Ok(view)
     }
 
@@ -616,6 +618,7 @@ impl HomeView {
     /// `refresh_from_config`.
     pub fn reload(&mut self) -> anyhow::Result<()> {
         self.refresh_status_hook_config_cache();
+        self.refresh_shortcut_bar_tip();
         self.reload_storage_only()
     }
 
