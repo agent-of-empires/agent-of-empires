@@ -9,8 +9,8 @@ use crate::containers;
 use crate::session::builder;
 use crate::session::config::repo_config;
 use crate::session::{
-    acquire_session_identity_lock, civilizations, duplicate_session_error, is_duplicate_session,
-    GroupTree, Instance, SandboxInfo, Storage,
+    civilizations, duplicate_session_error, is_duplicate_session, GroupTree, Instance, SandboxInfo,
+    Storage,
 };
 
 fn parse_repo_base(raw: &str) -> Result<(String, String), String> {
@@ -237,6 +237,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut workspace_info_opt = None;
 
     let storage = Storage::new_unwatched(profile)?;
+    let mut ownership = Some(crate::session::storage::acquire_ownership_read()?);
     let (instances, _groups) = storage.load_with_groups()?;
     let final_title = resolve_session_title(&args, &instances)?;
 
@@ -341,13 +342,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 })
                 .collect();
 
-            let ws_result = builder::create_workspace(
+            let ws_result = builder::create_workspace_with_ownership(
                 &primary,
                 &extra_repos,
                 branch,
                 args.create_branch,
                 &config.worktree.workspace_path_template,
                 init_submodules,
+                &mut ownership,
             )?;
 
             for repo in &ws_result.workspace_info.repos {
@@ -746,6 +748,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
+    drop(ownership.take());
     let hook_result: Result<()> = (|| {
         let resolved_hooks: Option<repo_config::ResolvedHooks> = if args.scratch {
             repo_config::ResolvedHooks::global(profile)
@@ -884,9 +887,30 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         return Err(e);
     }
 
-    let _identity_lock = match acquire_session_identity_lock() {
+    ownership = Some(crate::session::storage::acquire_ownership_read()?);
+    if let Err(error) = storage
+        .verify_profile_identity()
+        .and_then(|_| builder::validate_creation_paths(&instance))
+    {
+        drop(ownership.take());
+        cleanup_partial_session(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            instance
+                .scratch
+                .then_some(std::path::Path::new(&instance.project_path)),
+            instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+        );
+        return Err(error);
+    }
+    let _identity_lock = match crate::session::storage::acquire_session_identity_lock_with_ownership(
+        ownership.as_ref().expect("creation ownership reacquired"),
+    ) {
         Ok(lock) => lock,
         Err(error) => {
+            drop(ownership.take());
             cleanup_partial_session(
                 &path,
                 instance.worktree_info.as_ref(),
@@ -923,6 +947,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     match persist_result {
         Ok(true) => {}
         Ok(false) => {
+            drop(_identity_lock);
+            drop(ownership.take());
             cleanup_partial_session(
                 &path,
                 instance.worktree_info.as_ref(),
@@ -938,6 +964,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Err(duplicate_session_error(&instance.title));
         }
         Err(e) => {
+            drop(_identity_lock);
+            drop(ownership.take());
             cleanup_partial_session(
                 &path,
                 instance.worktree_info.as_ref(),
@@ -954,6 +982,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
     drop(_identity_lock);
+    drop(ownership.take());
 
     println!("✓ Added session: {}", final_title);
     println!("  Profile: {}", storage.profile());
@@ -1128,43 +1157,37 @@ fn cleanup_partial_session(
 ) {
     if let Some(session_id) = container_session_id {
         let container = crate::containers::DockerContainer::from_session_id(session_id);
-        if let crate::containers::Teardown::Failed(e) = container.teardown(session_id) {
-            tracing::warn!(
-                target: "cli.add",
-                "failed to remove sandbox container during partial cleanup for {}: {}",
-                session_id,
-                e
-            );
+        if let crate::containers::Teardown::Failed(error) = container.teardown(session_id) {
+            tracing::warn!(target: "cli.add", "failed to remove sandbox container during partial cleanup: {error}");
         }
     }
-    if let Some(wt) = worktree_info {
-        if wt.managed_by_aoe {
-            if let Ok(git_wt) = crate::git::GitWorktree::new(PathBuf::from(&wt.main_repo_path)) {
-                let _ = git_wt.remove_worktree(path, false);
-                if created_branch {
-                    let _ = git_wt.delete_branch(&wt.branch);
-                }
-            }
-        }
-    }
-    if let Some(ws) = workspace_info {
-        for repo in &ws.repos {
-            if repo.managed_by_aoe {
-                if let Ok(git_wt) =
-                    crate::git::GitWorktree::new(PathBuf::from(&repo.main_repo_path))
-                {
-                    let _ =
-                        git_wt.remove_worktree(std::path::Path::new(&repo.worktree_path), false);
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&ws.workspace_dir);
-    }
-    if let Some(scratch) = scratch_dir {
-        if crate::session::scratch::is_scratch_path(scratch) {
-            let _ = std::fs::remove_dir_all(scratch);
-        }
-    }
+    let mut instance = Instance::new("", &path.to_string_lossy());
+    instance.worktree_info = worktree_info.cloned();
+    instance.workspace_info = workspace_info.cloned();
+    instance.scratch = scratch_dir.is_some();
+    let created_worktree = worktree_info
+        .filter(|info| info.managed_by_aoe)
+        .map(|info| builder::CreatedWorktree {
+            path: path.to_path_buf(),
+            main_repo_path: PathBuf::from(&info.main_repo_path),
+            owned_branch: created_branch.then(|| info.branch.clone()),
+        });
+    let created_workspace_worktrees: Vec<_> = workspace_info
+        .into_iter()
+        .flat_map(|workspace| &workspace.repos)
+        .filter(|repo| repo.managed_by_aoe)
+        .map(|repo| builder::CreatedWorktree {
+            path: PathBuf::from(&repo.worktree_path),
+            main_repo_path: PathBuf::from(&repo.main_repo_path),
+            owned_branch: created_branch.then(|| repo.branch.clone()),
+        })
+        .collect();
+    builder::cleanup_instance(
+        &instance,
+        created_worktree.as_ref(),
+        &created_workspace_worktrees,
+        None,
+    );
 }
 
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {

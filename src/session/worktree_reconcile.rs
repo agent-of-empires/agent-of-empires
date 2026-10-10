@@ -85,6 +85,16 @@ pub fn reconcile_and_persist(
     inst: &mut Instance,
     cache: &mut ReconcileCache,
 ) -> anyhow::Result<WorktreePathResolution> {
+    let ownership = super::storage::acquire_ownership_read()?;
+    reconcile_and_persist_with_ownership(storage, &ownership, inst, cache)
+}
+
+pub(crate) fn reconcile_and_persist_with_ownership(
+    storage: &Storage,
+    ownership: &super::storage::OwnershipGuard,
+    inst: &mut Instance,
+    cache: &mut ReconcileCache,
+) -> anyhow::Result<WorktreePathResolution> {
     let Some(info) = inst.worktree_info.clone() else {
         return Ok(WorktreePathResolution::Current);
     };
@@ -108,7 +118,7 @@ pub fn reconcile_and_persist(
             // Both guards below need the storage lock the git lookup ran
             // without, so they live inside the update rather than beside it.
             let mut claimed_by: Option<String> = None;
-            let applied = storage.update(|instances, _groups| {
+            let applied = storage.update_with_ownership(ownership, |instances, _groups| {
                 // Never adopt a checkout another session already records.
                 if let Some(owner) = instances.iter().find(|c| {
                     c.id != id

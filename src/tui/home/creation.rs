@@ -34,6 +34,7 @@ pub(super) enum CreationCommit {
 pub(in crate::tui) struct SessionMutationGuards {
     pub(super) _session_title: crate::session::StorageFlock,
     pub(super) _lifecycle: crate::session::StorageFlock,
+    pub(super) _ownership: Option<crate::session::storage::OwnershipGuard>,
 }
 
 impl HomeView {
@@ -209,7 +210,7 @@ impl HomeView {
         use crate::tui::creation_poller::CreationResult;
 
         let outcome = self.creation_poller.try_recv_result()?;
-        let result = outcome.result;
+        let mut result = outcome.result;
 
         // A cancelled request's stub is already gone; the fields below may belong to a
         // newer request, so leave them alone.
@@ -218,9 +219,11 @@ impl HomeView {
                 ref instance,
                 ref created_worktree,
                 ref created_workspace_worktrees,
+                ref mut ownership,
                 ..
             } = result
             {
+                drop(ownership.take());
                 cleanup_creation_resources(
                     instance,
                     created_worktree.as_ref(),
@@ -249,6 +252,7 @@ impl HomeView {
                 created_workspace_worktrees,
                 on_launch_hooks_ran,
                 mut warnings,
+                mut ownership,
             } => {
                 // Remove the stub instance
                 if let Some(id) = &stub_id {
@@ -269,6 +273,7 @@ impl HomeView {
                             self.storages.insert(target_profile.clone(), storage);
                         }
                         Err(error) => {
+                            drop(ownership.take());
                             cleanup_creation_resources(
                                 &instance,
                                 created_worktree.as_ref(),
@@ -329,6 +334,7 @@ impl HomeView {
                 match persist_result {
                     Ok(CreationCommit::Inserted) => {}
                     Ok(CreationCommit::Duplicate(owner)) => {
+                        drop(ownership.take());
                         cleanup_creation_resources(
                             &instance,
                             created_worktree.as_ref(),
@@ -362,6 +368,7 @@ impl HomeView {
                                 None,
                             )
                             .cloned();
+                            drop(ownership.take());
                             cleanup_creation_resources(
                                 &instance,
                                 created_worktree.as_ref(),
@@ -572,9 +579,11 @@ impl HomeView {
                 ref instance,
                 ref created_worktree,
                 ref created_workspace_worktrees,
+                mut ownership,
                 ..
             } = outcome.result
             {
+                drop(ownership.take());
                 cleanup_creation_resources(
                     instance,
                     created_worktree.as_ref(),

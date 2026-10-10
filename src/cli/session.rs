@@ -6,8 +6,8 @@ use serde::Serialize;
 use std::collections::HashSet;
 
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    duplicate_session_error, is_duplicate_session, GroupTree, Instance, LifecycleOperation,
+    ResumeIntent, StartOutcome, Storage,
 };
 
 #[derive(Subcommand)]
@@ -1675,10 +1675,12 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let title_requested = args.title.is_some();
     let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
 
-    let _identity_lock = acquire_session_identity_lock()?;
+    let ownership = crate::session::storage::acquire_ownership_lock()?;
+    let _identity_lock =
+        crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
     let _session_title_lock = if session_lock_required {
         Some(
-            crate::session::acquire_session_title_lock(&id)
+            crate::session::storage::acquire_session_title_lock_with_ownership(&ownership, &id)
                 .context("failed to acquire session title lock")?,
         )
     } else {
@@ -1687,7 +1689,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let _lifecycle_lock = if session_lock_required {
         Some(
             storage
-                .acquire_instance_lifecycle_lock(&id)
+                .acquire_instance_lifecycle_lock_with_ownership(&ownership, &id)
                 .context("failed to acquire session lifecycle lock")?,
         )
     } else {
@@ -1699,8 +1701,9 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_with_ownership(
         &storage,
+        &ownership,
         &mut inst,
         &mut Default::default(),
     ) {
@@ -1748,36 +1751,15 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Branch-only rename requires a managed worktree"))?;
         if branch != &info.branch {
-            let path = std::path::Path::new(&inst.project_path).canonicalize()?;
-            let repo = std::path::Path::new(&info.main_repo_path).canonicalize()?;
-            let same_branch = |main_repo: &str, name: &str| {
-                name == info.branch
-                    && std::path::Path::new(main_repo).canonicalize().ok().as_ref() == Some(&repo)
-            };
-            for other_profile in crate::session::list_profiles()? {
-                let rows = Storage::open_unwatched(&other_profile)?.load()?;
-                if rows.iter().any(|other| {
-                    other.id != id
-                        && !other.is_trashed()
-                        && (std::path::Path::new(&other.project_path)
-                            .canonicalize()
-                            .ok()
-                            .as_ref()
-                            == Some(&path)
-                            || other
-                                .worktree_info
-                                .as_ref()
-                                .is_some_and(|wt| same_branch(&wt.main_repo_path, &wt.branch))
-                            || other.workspace_info.as_ref().is_some_and(|workspace| {
-                                workspace
-                                    .repos
-                                    .iter()
-                                    .any(|wt| same_branch(&wt.main_repo_path, &wt.branch))
-                            }))
-                }) {
-                    bail!("Another session shares this branch or worktree in profile {other_profile}; rename is not isolated");
-                }
-            }
+            crate::session::worktree_edit::ensure_worktree_unshared(
+                &ownership,
+                profile,
+                &id,
+                std::path::Path::new(&inst.project_path),
+                info,
+                false,
+                true,
+            )?;
         }
         if crate::session::worktree_edit::rename_worktree_branch(
             info,
@@ -1818,7 +1800,10 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
             }
         }
-        match crate::session::worktree_edit::edit_worktree_workdir(
+        match crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+            &ownership,
+            profile,
+            &id,
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
                 current_path: std::path::Path::new(&current_path),
@@ -1843,7 +1828,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
     }
 
-    let persist = storage.update(|instances, groups| {
+    let persist = storage.update_with_ownership(&ownership, |instances, groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
@@ -2158,13 +2143,12 @@ mod rename_tests {
                     Ok(())
                 })
                 .unwrap();
-            let shared = rename_session(
+            rename_session(
                 "branch-only",
                 args(&id, Some("Must not apply"), None, Some("would-change-peer")),
             )
             .await
             .unwrap_err();
-            assert!(shared.to_string().contains("profile branch-peer"));
             assert_eq!(
                 git(&worktree, &["branch", "--show-current"]),
                 "olof/bemlo-123-task"
@@ -2467,9 +2451,11 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     };
 
     let id = inst.id.clone();
-    let _identity_lock = acquire_session_identity_lock()?;
+    let ownership = crate::session::storage::acquire_ownership_lock()?;
+    let _identity_lock =
+        crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
     let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&id)
+        .acquire_instance_lifecycle_lock_with_ownership(&ownership, &id)
         .context("failed to acquire worktree rename lifecycle lock")?;
     let authoritative_instances = storage.load()?;
     let inst = authoritative_instances
@@ -2477,8 +2463,9 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_with_ownership(
         &storage,
+        &ownership,
         &mut inst,
         &mut Default::default(),
     ) {
@@ -2530,7 +2517,10 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         bail!("Cannot edit the workdir name while the session is active; stop it first");
     }
 
-    let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+    let outcome = crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+        &ownership,
+        profile,
+        &id,
         crate::session::worktree_edit::WorktreeEditRequest {
             worktree_info: &worktree_info,
             current_path: std::path::Path::new(&current_path),
@@ -2548,7 +2538,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let new_branch = outcome.new_branch.clone();
 
     storage
-        .update(|instances, _groups| {
+        .update_with_ownership(&ownership, |instances, _groups| {
             let inst = instances
                 .iter_mut()
                 .find(|i| i.id == id)

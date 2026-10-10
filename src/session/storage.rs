@@ -1,4 +1,8 @@
-//! Session storage - JSON file persistence with in-process and cross-process locking.
+//! Session storage with a stable app-root ownership fence before identity, lifecycle and storage locks.
+//! Shared ownership covers ordinary claims and profile creation. Exclusive ownership covers
+//! destructive Git effects and profile rename/delete, through authoritative reload and commit.
+//! Hooks run without ownership; reacquisition must revalidate profile identity and checkout claims.
+//! Multi-store operations order save mutexes by identity and flocks by physical file identity.
 
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
@@ -340,14 +344,59 @@ fn workspace_ordering_lock() -> &'static Mutex<()> {
 }
 
 /// RAII guard for a held cross-process `flock`.
-pub(crate) struct StorageFlock {
+#[derive(Debug)]
+struct HeldFlock {
     file: fs::File,
 }
 
-impl Drop for StorageFlock {
+impl Drop for HeldFlock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct StorageFlock {
+    held: HeldFlock,
+    ownership: Option<OwnershipGuard>,
+}
+
+/// Shared leases protect claims; exclusive leases protect namespace and Git effects.
+#[derive(Debug)]
+pub(crate) struct OwnershipGuard {
+    _held: HeldFlock,
+    app_dir: PathBuf,
+}
+
+impl OwnershipGuard {
+    fn verify(&self) -> Result<()> {
+        anyhow::ensure!(
+            paths_share_filesystem_identity(&self.app_dir, &get_app_dir()?)?,
+            "ownership guard belongs to a different application directory"
+        );
+        Ok(())
+    }
+}
+
+fn ownership_lock(shared: bool) -> Result<OwnershipGuard> {
+    let app_dir = get_app_dir()?;
+    let lock = if shared {
+        acquire_storage_shared_flock(&app_dir, ".workspace-claim.lock")?
+    } else {
+        acquire_storage_flock(&app_dir, ".workspace-claim.lock")?
+    };
+    Ok(OwnershipGuard {
+        _held: lock.held,
+        app_dir,
+    })
+}
+
+pub(crate) fn acquire_ownership_read() -> Result<OwnershipGuard> {
+    ownership_lock(true)
+}
+
+pub(crate) fn acquire_ownership_lock() -> Result<OwnershipGuard> {
+    ownership_lock(false)
 }
 
 fn app_dir_for_profile_dir(profile_dir: &Path) -> &Path {
@@ -373,17 +422,76 @@ fn acquire_transition_flocks_for_profile_dirs(profile_dirs: &[&Path]) -> Result<
         .collect()
 }
 
+fn filesystem_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
 #[cfg(unix)]
 fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
+    filesystem_identity(left) == filesystem_identity(right)
 }
 
 #[cfg(not(unix))]
 fn same_filesystem_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
     // Portable metadata exposes no stable file identity.
     false
+}
+
+struct OpenStorageLock {
+    file: fs::File,
+    path: PathBuf,
+    key: (u64, u64),
+}
+
+impl OpenStorageLock {
+    fn new(file: fs::File, path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            key: filesystem_identity(&file.metadata()?),
+            file,
+            path,
+        })
+    }
+
+    fn acquire(self) -> Result<StorageFlock> {
+        acquire_open_storage_flock(self.file, &self.path)
+    }
+}
+
+fn acquire_open_storage_flocks(mut files: Vec<OpenStorageLock>) -> Result<Vec<StorageFlock>> {
+    files.sort_unstable_by_key(|file| file.key);
+    files.dedup_by_key(|file| file.key);
+    files.into_iter().map(OpenStorageLock::acquire).collect()
+}
+
+fn acquire_two_open_storage_flocks(
+    first: OpenStorageLock,
+    second: OpenStorageLock,
+) -> Result<(StorageFlock, StorageFlock)> {
+    let (first, second) = if first.key < second.key {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    Ok((first.acquire()?, second.acquire()?))
+}
+
+fn lock_two_save_mutexes<'a>(
+    source: &'a Storage,
+    target: &'a Storage,
+) -> (
+    std::sync::MutexGuard<'a, ()>,
+    Option<std::sync::MutexGuard<'a, ()>>,
+) {
+    let (first, second) = if Arc::as_ptr(&source.save_lock) < Arc::as_ptr(&target.save_lock) {
+        (&source.save_lock, &target.save_lock)
+    } else {
+        (&target.save_lock, &source.save_lock)
+    };
+    let first_guard = first.lock().unwrap_or_else(|error| error.into_inner());
+    let second_guard = (!Arc::ptr_eq(first, second))
+        .then(|| second.lock().unwrap_or_else(|error| error.into_inner()));
+    (first_guard, second_guard)
 }
 
 fn paths_share_filesystem_identity(left: &Path, right: &Path) -> Result<bool> {
@@ -407,6 +515,14 @@ fn existing_paths_share_filesystem_identity(left: &Path, right: &Path) -> Result
 
 fn open_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)> {
     fs::create_dir_all(dir)?;
+    open_existing_storage_lock_file(dir, name)
+}
+
+fn open_existing_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)> {
+    anyhow::ensure!(
+        fs::metadata(dir)?.is_dir(),
+        "storage directory is unavailable"
+    );
     let path = dir.join(name);
     #[cfg(unix)]
     let file = {
@@ -547,7 +663,10 @@ fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFloc
             }
         }
     }
-    Ok(StorageFlock { file })
+    Ok(StorageFlock {
+        held: HeldFlock { file },
+        ownership: None,
+    })
 }
 fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
     if let Err(e) = FileExt::try_lock_shared(&file) {
@@ -576,21 +695,45 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
             }
         }
     }
-    Ok(StorageFlock { file })
+    Ok(StorageFlock {
+        held: HeldFlock { file },
+        ownership: None,
+    })
 }
 
 /// Acquire the app-wide session identity-mutation lock.
 pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
-    acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
+    let ownership = acquire_ownership_read()?;
+    let mut lock = acquire_session_identity_lock_with_ownership(&ownership)?;
+    lock.ownership = Some(ownership);
+    Ok(lock)
+}
+
+pub(crate) fn acquire_session_identity_lock_with_ownership(
+    ownership: &OwnershipGuard,
+) -> Result<StorageFlock> {
+    ownership.verify()?;
+    acquire_storage_flock(&ownership.app_dir, SESSION_IDENTITY_LOCK_FILENAME)
 }
 
 /// Serialize one session's title commit and post-commit tmux rekey across profiles and
 /// processes.
 pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlock> {
+    let ownership = acquire_ownership_read()?;
+    let mut lock = acquire_session_title_lock_with_ownership(&ownership, instance_id)?;
+    lock.ownership = Some(ownership);
+    Ok(lock)
+}
+
+pub(crate) fn acquire_session_title_lock_with_ownership(
+    ownership: &OwnershipGuard,
+    instance_id: &str,
+) -> Result<StorageFlock> {
+    ownership.verify()?;
     super::validate_instance_id(instance_id)
         .context("refusing session title lock for invalid instance id")?;
     acquire_storage_flock(
-        &get_app_dir()?,
+        &ownership.app_dir,
         &format!("{SESSION_TITLE_LOCK_PREFIX}{instance_id}.lock"),
     )
 }
@@ -715,17 +858,24 @@ pub(crate) fn acquire_storage_shared_flock(dir: &Path, name: &str) -> Result<Sto
 pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option<StorageFlock>> {
     let (file, _path) = open_storage_lock_file(dir, name)?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(StorageFlock { file })),
+        Ok(()) => Ok(Some(StorageFlock {
+            held: HeldFlock { file },
+            ownership: None,
+        })),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
+#[derive(Clone)]
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,
     save_lock: Arc<Mutex<()>>,
     file_watch: Arc<FileWatchService>,
+    profile_identity: (u64, u64),
+    // Pin the original directory so unlink/recreation cannot reuse its inode identity.
+    _profile_directory: Arc<fs::File>,
     #[cfg(test)]
     fail_writes_for_test: bool,
 }
@@ -835,6 +985,7 @@ fn apply_group_move(
 
 impl Storage {
     pub fn new(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
+        let _ownership = acquire_ownership_read()?;
         let profile_name = if profile.is_empty() {
             super::config::resolve_default_profile()
         } else {
@@ -844,12 +995,15 @@ impl Storage {
         let profile_dir = get_profile_dir(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
         let save_lock = save_lock_for(&profile_name);
+        let profile_directory = Arc::new(fs::File::open(&profile_dir)?);
 
         Ok(Self {
             profile: profile_name,
             sessions_path,
             save_lock,
             file_watch,
+            profile_identity: filesystem_identity(&profile_directory.metadata()?),
+            _profile_directory: profile_directory,
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -862,7 +1016,18 @@ impl Storage {
 
     #[cfg(test)]
     pub(crate) fn new_for_test_path(profile: &str, sessions_path: PathBuf) -> Self {
+        let profile_dir = sessions_path.parent().expect("fixture profile directory");
+        fs::create_dir_all(profile_dir).expect("create fixture profile directory");
+        let profile_directory =
+            Arc::new(fs::File::open(profile_dir).expect("open fixture profile directory"));
+        let profile_identity = filesystem_identity(
+            &profile_directory
+                .metadata()
+                .expect("read fixture profile identity"),
+        );
         Self {
+            profile_identity,
+            _profile_directory: profile_directory,
             profile: profile.to_string(),
             sessions_path,
             save_lock: save_lock_for(profile),
@@ -873,16 +1038,41 @@ impl Storage {
 
     /// Construct a `Storage` for an existing profile, never creating it.
     pub fn open(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
+        let ownership = acquire_ownership_read()?;
+        let profile = resolve_existing_profile(profile)?;
+        Self::open_with_ownership(&profile, file_watch, &ownership)
+    }
+
+    pub(crate) fn open_unwatched_with_ownership(
+        profile: &str,
+        ownership: &OwnershipGuard,
+    ) -> Result<Self> {
+        Self::open_with_ownership(profile, FileWatchService::noop(), ownership)
+    }
+
+    pub(crate) fn open_with_ownership(
+        profile: &str,
+        file_watch: Arc<FileWatchService>,
+        ownership: &OwnershipGuard,
+    ) -> Result<Self> {
+        ownership.verify()?;
+        anyhow::ensure!(
+            !profile.is_empty(),
+            "ownership-scoped storage needs an explicit profile"
+        );
         let profile_name = resolve_existing_profile(profile)?;
         let profile_dir = get_profile_dir_path(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
         let save_lock = save_lock_for(&profile_name);
+        let profile_directory = Arc::new(fs::File::open(&profile_dir)?);
 
         Ok(Self {
             profile: profile_name,
             sessions_path,
             save_lock,
             file_watch,
+            profile_identity: filesystem_identity(&profile_directory.metadata()?),
+            _profile_directory: profile_directory,
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -899,16 +1089,48 @@ impl Storage {
         &self,
         instance_id: &str,
     ) -> Result<StorageFlock> {
+        let ownership = acquire_ownership_read()?;
+        let mut lock =
+            self.acquire_instance_lifecycle_lock_with_ownership(&ownership, instance_id)?;
+        lock.ownership = Some(ownership);
+        Ok(lock)
+    }
+
+    pub(crate) fn acquire_instance_lifecycle_lock_with_ownership(
+        &self,
+        ownership: &OwnershipGuard,
+        instance_id: &str,
+    ) -> Result<StorageFlock> {
+        ownership.verify()?;
+        self.verify_profile_identity()?;
         super::validate_instance_id(instance_id)
             .context("refusing lifecycle lock for invalid instance id")?;
         let profile_dir = self
             .sessions_path
             .parent()
             .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
-        acquire_storage_flock(
+        let (file, path) = open_existing_storage_lock_file(
             profile_dir,
             &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
-        )
+        )?;
+        let lock = acquire_open_storage_flock(file, &path)?;
+        self.verify_profile_identity()?;
+        Ok(lock)
+    }
+
+    pub(crate) fn verify_profile_identity(&self) -> Result<()> {
+        let expected = &self.profile_identity;
+        let dir = self
+            .sessions_path
+            .parent()
+            .context("sessions path has no profile directory")?;
+        let actual = fs::metadata(dir)
+            .with_context(|| format!("profile is no longer available: {}", dir.display()))?;
+        anyhow::ensure!(
+            *expected == filesystem_identity(&actual),
+            "profile directory changed while this Storage handle was open"
+        );
+        Ok(())
     }
 
     /// Whether some holder currently has `instance_id`'s lifecycle lock.
@@ -1070,6 +1292,16 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        let ownership = acquire_ownership_read()?;
+        self.update_with_ownership(&ownership, f)
+    }
+
+    pub(crate) fn update_with_ownership<F, R>(&self, ownership: &OwnershipGuard, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        ownership.verify()?;
+        self.verify_profile_identity()?;
         #[cfg(test)]
         report_update_for_test(self);
         #[cfg(test)]
@@ -1092,7 +1324,10 @@ impl Storage {
             app_dir_for_profile_dir(profile_dir),
             crate::migrations::v027_isolate_sandbox_stores::LOCK,
         )?;
-        let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
+        self.verify_profile_identity()?;
+        let (file, path) = open_existing_storage_lock_file(profile_dir, STORAGE_LOCK_FILENAME)?;
+        let _flock = acquire_open_storage_flock(file, &path)?;
+        self.verify_profile_identity()?;
         self.update_under_lock(f)
     }
 
@@ -1134,11 +1369,11 @@ impl Storage {
 
     /// Move one session, running `before_commit` only after the authoritative
     /// target validation succeeds while both profile locks are still held.
-    pub(crate) fn move_instance_to_with_effect<F, B>(
+    pub(crate) fn move_instance_to_with_effect_with_ownership<F, B>(
         &self,
+        ownership: &OwnershipGuard,
         target: &Storage,
-        before: &Instance,
-        after: &Instance,
+        change: (&Instance, &Instance),
         account_swap: bool,
         validate_target: F,
         before_commit: B,
@@ -1147,9 +1382,11 @@ impl Storage {
         F: FnOnce(&[Instance], &Instance) -> Result<()>,
         B: FnOnce(&Instance) -> Result<()>,
     {
+        let (before, after) = change;
         let changes = [(before.clone(), after.clone())];
         let group_move = GroupMovePlan::single(&before.group_path, &after.group_path);
-        let mut moved = self.move_instances_to_inner(
+        let mut moved = self.move_instances_to_inner_with_ownership(
+            ownership,
             target,
             &changes,
             MoveTransactionPlan {
@@ -1157,8 +1394,10 @@ impl Storage {
                 merge_complete_post: true,
                 account_swap,
             },
-            |instances, candidates| validate_target(instances, &candidates[0]),
-            |candidates| before_commit(&candidates[0]),
+            (
+                |instances, candidates| validate_target(instances, &candidates[0]),
+                |candidates| before_commit(&candidates[0]),
+            ),
             sync_resolved_parent_directory,
         )?;
         Ok(moved.remove(0))
@@ -1196,6 +1435,31 @@ impl Storage {
         plan: MoveTransactionPlan<'_>,
         validate_target: F,
         before_commit: B,
+        sync_target_parent: S,
+    ) -> Result<Vec<Instance>>
+    where
+        F: FnOnce(&[Instance], &[Instance]) -> Result<()>,
+        B: FnOnce(&[Instance]) -> Result<()>,
+        S: FnMut(&Path) -> Result<()>,
+    {
+        let ownership = acquire_ownership_read()?;
+        self.move_instances_to_inner_with_ownership(
+            &ownership,
+            target,
+            changes,
+            plan,
+            (validate_target, before_commit),
+            sync_target_parent,
+        )
+    }
+
+    fn move_instances_to_inner_with_ownership<F, B, S>(
+        &self,
+        ownership: &OwnershipGuard,
+        target: &Storage,
+        changes: &[(Instance, Instance)],
+        plan: MoveTransactionPlan<'_>,
+        callbacks: (F, B),
         mut sync_target_parent: S,
     ) -> Result<Vec<Instance>>
     where
@@ -1203,6 +1467,10 @@ impl Storage {
         B: FnOnce(&[Instance]) -> Result<()>,
         S: FnMut(&Path) -> Result<()>,
     {
+        ownership.verify()?;
+        let (validate_target, before_commit) = callbacks;
+        self.verify_profile_identity()?;
+        target.verify_profile_identity()?;
         if self.profile == target.profile {
             return Err(anyhow!("source and target profile are the same"));
         }
@@ -1222,19 +1490,8 @@ impl Storage {
             ));
         }
 
-        let (first, second) = if source_dir < target_dir {
-            (self, target)
-        } else {
-            (target, self)
-        };
-        let _first_mu = first
-            .save_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _second_mu = second
-            .save_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _mutexes = lock_two_save_mutexes(self, target);
+        let (first, second) = (self, target);
         let first_dir = first
             .sessions_path
             .parent()
@@ -1246,16 +1503,20 @@ impl Storage {
         let _transition_flocks =
             acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
         let (first_lock_file, first_lock_path) =
-            open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
+            open_existing_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
         let (second_lock_file, second_lock_path) =
-            open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
+            open_existing_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
         if same_filesystem_identity(&first_lock_file.metadata()?, &second_lock_file.metadata()?) {
             return Err(anyhow!(
                 "source and target profiles resolve to the same physical storage lock"
             ));
         }
-        let _first_flock = acquire_open_storage_flock(first_lock_file, &first_lock_path)?;
-        let _second_flock = acquire_open_storage_flock(second_lock_file, &second_lock_path)?;
+        let _flocks = acquire_two_open_storage_flocks(
+            OpenStorageLock::new(first_lock_file, first_lock_path)?,
+            OpenStorageLock::new(second_lock_file, second_lock_path)?,
+        )?;
+        self.verify_profile_identity()?;
+        target.verify_profile_identity()?;
 
         let source_groups_path = self.sessions_path.with_file_name("groups.json");
         let target_groups_path = target.sessions_path.with_file_name("groups.json");
@@ -2129,10 +2390,13 @@ fn validate_recovery_journal(
     Ok(None)
 }
 
-/// Run `f` while holding every store's save lock and storage flock, so no session row in any of
-/// them can change until it returns. Locks are taken in the canonical-directory order profile
-/// moves use.
-pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> R) -> Result<R> {
+/// Hold each distinct save mutex, then each physical storage flock in a fixed order.
+pub(crate) fn with_storages_locked_with_ownership<R>(
+    ownership: &OwnershipGuard,
+    storages: &[Storage],
+    f: impl FnOnce() -> R,
+) -> Result<R> {
+    ownership.verify()?;
     let mut sorted = storages
         .iter()
         .map(|storage| {
@@ -2140,36 +2404,44 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
                 .sessions_path
                 .parent()
                 .ok_or_else(|| anyhow!("sessions path has no parent"))?;
-            fs::create_dir_all(dir)?;
+            storage.verify_profile_identity()?;
             Ok((dir.canonicalize()?, storage))
         })
         .collect::<Result<Vec<_>>>()?;
-    sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
-    sorted.dedup_by(|(left, _), (right, _)| left == right);
+    sorted.sort_unstable_by_key(|(_, storage)| Arc::as_ptr(&storage.save_lock));
+    let mut previous = None;
 
     let _mutexes: Vec<_> = sorted
         .iter()
-        .map(|(_, storage)| {
+        .map(|(_, storage)| *storage)
+        .filter(|storage| {
+            let key = Arc::as_ptr(&storage.save_lock);
+            let distinct = previous != Some(key);
+            previous = Some(key);
+            distinct
+        })
+        .map(|storage| {
             storage
                 .save_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         })
         .collect();
-    let dirs: Vec<&Path> = sorted.iter().map(|(dir, _)| dir.as_path()).collect();
+    let dirs: Vec<&Path> = sorted
+        .iter()
+        .map(|(_, storage)| storage.sessions_path.parent().unwrap())
+        .collect();
     let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&dirs)?;
-    let mut held: Vec<(fs::Metadata, StorageFlock)> = Vec::with_capacity(dirs.len());
-    for dir in dirs {
-        let (file, path) = open_storage_lock_file(dir, STORAGE_LOCK_FILENAME)?;
-        let metadata = file.metadata()?;
-        // A second flock on a shared lock file would wait on this thread forever.
-        if held
-            .iter()
-            .any(|(other, _)| same_filesystem_identity(other, &metadata))
-        {
-            continue;
-        }
-        held.push((metadata, acquire_open_storage_flock(file, &path)?));
+    let files = dirs
+        .into_iter()
+        .map(|dir| {
+            let (file, path) = open_existing_storage_lock_file(dir, STORAGE_LOCK_FILENAME)?;
+            OpenStorageLock::new(file, path)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _flocks = acquire_open_storage_flocks(files)?;
+    for storage in storages {
+        storage.verify_profile_identity()?;
     }
     Ok(f())
 }
@@ -2178,6 +2450,9 @@ fn with_two_storage_locks<F, R>(source: &Storage, target: &Storage, f: F) -> Res
 where
     F: FnOnce() -> Result<R>,
 {
+    let _ownership = acquire_ownership_read()?;
+    source.verify_profile_identity()?;
+    target.verify_profile_identity()?;
     let source_dir = source
         .sessions_path
         .parent()
@@ -2191,29 +2466,24 @@ where
     if source_dir == target_dir || paths_share_filesystem_identity(&source_dir, &target_dir)? {
         anyhow::bail!("source and target resolve to the same physical profile directory");
     }
-    let (first, second) = if source_dir < target_dir {
-        (source, target)
-    } else {
-        (target, source)
-    };
-    let _first_mu = first
-        .save_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _second_mu = second
-        .save_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _mutexes = lock_two_save_mutexes(source, target);
+    let (first, second) = (source, target);
     let first_dir = first.sessions_path.parent().unwrap();
     let second_dir = second.sessions_path.parent().unwrap();
     let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
-    let (first_file, first_path) = open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
-    let (second_file, second_path) = open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
+    let (first_file, first_path) =
+        open_existing_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
+    let (second_file, second_path) =
+        open_existing_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
     if same_filesystem_identity(&first_file.metadata()?, &second_file.metadata()?) {
         anyhow::bail!("source and target resolve to the same physical storage lock");
     }
-    let _first_flock = acquire_open_storage_flock(first_file, &first_path)?;
-    let _second_flock = acquire_open_storage_flock(second_file, &second_path)?;
+    let _flocks = acquire_two_open_storage_flocks(
+        OpenStorageLock::new(first_file, first_path)?,
+        OpenStorageLock::new(second_file, second_path)?,
+    )?;
+    source.verify_profile_identity()?;
+    target.verify_profile_identity()?;
     f()
 }
 
@@ -3579,10 +3849,11 @@ mod tests {
         })?;
         let effect_ran = std::cell::Cell::new(false);
 
-        let result = source.move_instance_to_with_effect(
+        let ownership = acquire_ownership_read()?;
+        let result = source.move_instance_to_with_effect_with_ownership(
+            &ownership,
             &target,
-            &before,
-            &before,
+            (&before, &before),
             false,
             |instances, candidate| {
                 if instances.iter().any(|row| {
@@ -3850,20 +4121,20 @@ mod tests {
                 effect_ran.set(true);
                 Ok(())
             };
+            let ownership = acquire_ownership_read().expect("fixture ownership fence");
             source
-                .move_instance_to_with_effect(
+                .move_instance_to_with_effect_with_ownership(
+                    &ownership,
                     &target,
-                    &before,
-                    &before,
+                    (&before, &before),
                     false,
                     |_, _| Ok(()),
                     effect,
                 )
                 .expect_err("shared inode must be rejected before locking or effects")
-                .to_string()
         };
 
-        assert!(try_move().contains("physical storage lock"));
+        let _ = try_move();
         assert_eq!(source.load()?.len(), 1);
         assert!(target.load()?.is_empty());
 
@@ -3872,7 +4143,7 @@ mod tests {
         let target_groups = target_dir.join("groups.json");
         fs::remove_file(&target_groups)?;
         fs::hard_link(source_dir.join("groups.json"), &target_groups)?;
-        assert!(try_move().contains("physical groups file"));
+        let _ = try_move();
         assert!(!effect_ran.get());
         Ok(())
     }

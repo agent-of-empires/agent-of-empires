@@ -421,6 +421,8 @@ pub fn plan(
     }
 
     Ok(AttachPlan {
+        original: instance.clone(),
+        profile: profile.to_string(),
         // Appending to an existing workspace leaves `project_path` alone; the
         // other two shapes move the session into a new workspace directory.
         moves_session: !matches!(conversion, Conversion::Append { .. }),
@@ -436,6 +438,8 @@ pub fn plan(
 
 /// A validated attach, with nothing written yet.
 pub struct AttachPlan {
+    original: super::Instance,
+    profile: String,
     /// True when the session's working directory changes, so the caller has to stop the session
     /// around [`execute`] and start it again afterwards.
     pub moves_session: bool,
@@ -455,9 +459,54 @@ impl AttachPlan {
     }
 }
 
+fn same_checkout(left: &super::Instance, right: &super::Instance) -> bool {
+    fn worktree(row: &super::Instance) -> Option<(&str, &str, bool)> {
+        row.worktree_info.as_ref().map(|wt| {
+            (
+                wt.main_repo_path.as_str(),
+                wt.branch.as_str(),
+                wt.managed_by_aoe,
+            )
+        })
+    }
+    left.id == right.id
+        && left.created_at == right.created_at
+        && left.project_path == right.project_path
+        && worktree(left) == worktree(right)
+        && left
+            .workspace_info
+            .as_ref()
+            .map(|ws| ws.workspace_dir.as_str())
+            == right
+                .workspace_info
+                .as_ref()
+                .map(|ws| ws.workspace_dir.as_str())
+        && left
+            .all_repos()
+            .iter()
+            .map(|repo| {
+                (
+                    &repo.worktree_path,
+                    &repo.main_repo_path,
+                    &repo.branch,
+                    repo.managed_by_aoe,
+                )
+            })
+            .eq(right.all_repos().iter().map(|repo| {
+                (
+                    &repo.worktree_path,
+                    &repo.main_repo_path,
+                    &repo.branch,
+                    repo.managed_by_aoe,
+                )
+            }))
+}
+
 /// Do the filesystem work for a validated plan, without persisting anything.
-pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedAttach> {
+fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedAttach> {
     let AttachPlan {
+        original: _,
+        profile: _,
         conversion,
         workspace_dir,
         added_name: repo_name,
@@ -657,7 +706,7 @@ impl Undo {
 }
 
 /// A created worktree that has not been recorded on the session yet.
-pub struct PreparedAttach {
+struct PreparedAttach {
     pub outcome: AttachOutcome,
     /// The workspace the session becomes, ready for the caller to persist.
     pub workspace_info: WorkspaceInfo,
@@ -666,13 +715,13 @@ pub struct PreparedAttach {
 
 impl PreparedAttach {
     /// Undo every filesystem change this attach made.
-    pub fn rollback(&self) {
+    fn rollback(&self) {
         self.undo.run();
     }
 
     /// Where the session's working directory ends up, for the caller to persist
     /// alongside `workspace_info`.
-    pub fn project_path(&self) -> &str {
+    fn project_path(&self) -> &str {
         &self.workspace_info.workspace_dir
     }
 }
@@ -728,13 +777,78 @@ pub fn attach_planned(
             ),
         }
     }
-    let prepared = execute(instance, plan)?;
+    let ownership = super::storage::acquire_ownership_lock()?;
+    anyhow::ensure!(
+        storage.profile() == plan.profile,
+        "attach plan belongs to a different profile"
+    );
+    let _lifecycle =
+        storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, session_id)?;
+    let mut current = None;
+    storage.update_with_ownership(&ownership, |instances, _| {
+        let row = instances
+            .iter()
+            .find(|row| row.id == session_id)
+            .with_context(|| format!("session not found: {session_id}"))?;
+        anyhow::ensure!(
+            same_checkout(row, &plan.original),
+            "session checkout changed after attach was planned"
+        );
+        anyhow::ensure!(
+            !row.is_trashed() && row.lifecycle_reservation.is_none(),
+            "session is changing lifecycle"
+        );
+        anyhow::ensure!(
+            !plan.moves_session || !conversation_cannot_follow(row),
+            "session conversation cannot follow conversion"
+        );
+        current = Some(row.clone());
+        Ok(())
+    })?;
+    let current = current.context("attach validation produced no row")?;
+    let paths = super::deletion::paths_in_use_except_with_ownership(
+        &ownership,
+        storage.profile(),
+        &[session_id],
+    );
+    anyhow::ensure!(
+        !paths.covers(&plan.added_worktree),
+        "attached worktree path is already owned or inventory is unreadable"
+    );
+    if plan.moves_session {
+        anyhow::ensure!(
+            !paths.covers(Path::new(&current.project_path)) && !paths.covers(&plan.workspace_dir),
+            "conversion path is already owned or inventory is unreadable"
+        );
+    }
+    match &plan.conversion {
+        Conversion::MoveIn { primary, .. } | Conversion::WorktreePrimary { primary, .. } => {
+            anyhow::ensure!(
+                !paths.covers(Path::new(&primary.worktree_path)),
+                "primary destination is already owned or inventory is unreadable"
+            );
+        }
+        Conversion::Append { .. } => {}
+    }
+    if plan.added_branch.create {
+        anyhow::ensure!(
+            !super::deletion::branch_in_use_with_ownership(
+                &ownership,
+                storage.profile(),
+                &[session_id],
+                &plan.added_main_repo,
+                &plan.added_branch.branch
+            )?,
+            "attached branch is already owned"
+        );
+    }
+    let prepared = execute(&current, plan)?;
 
     let id = session_id.to_string();
     let workspace = prepared.workspace_info.clone();
     let new_project_path = prepared.project_path().to_string();
     let converted = prepared.outcome.moved_to.is_some();
-    let persisted = storage.update(|instances, _groups| {
+    let persisted = storage.update_with_ownership(&ownership, |instances, _groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
@@ -1119,6 +1233,175 @@ mod tests {
         let guard = crate::session::test_support::isolate_app_dir_at(temp);
         crate::session::create_profile(name).expect("profile");
         guard
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_rejects_checkout_or_profile_changed_after_unlocked_hooks() {
+        for replace_profile in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = "attach-hook-refresh";
+            let _home = isolated_profile(temp.path(), profile);
+            let backend = temp.path().join("src/backend");
+            let frontend = temp.path().join("src/frontend");
+            init_repo(&backend);
+            init_repo(&frontend);
+            let worktree = temp.path().join("src/backend-hook");
+            git_in(
+                &backend,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/hook",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            let mut original = Instance::new("hook", worktree.to_str().unwrap());
+            original.source_profile = profile.to_string();
+            original.worktree_info = Some(WorktreeInfo {
+                branch: "feature/hook".into(),
+                main_repo_path: backend.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: Utc::now(),
+                base_branch: None,
+            });
+            let storage = Storage::open_unwatched(profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(original.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let attach_plan = plan(&original, profile, &frontend, ExistingBranch::Refuse).unwrap();
+            let destination = attach_plan.workspace_dir.clone();
+            let mut current = original.clone();
+            if replace_profile {
+                crate::session::rename_profile(profile, "attach-hook-original").unwrap();
+                crate::session::create_profile(profile).unwrap();
+                Storage::open_unwatched(profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        rows.push(current.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+            } else {
+                let moved = temp.path().join("src/backend-moved");
+                git_in(
+                    &backend,
+                    &[
+                        "worktree",
+                        "move",
+                        worktree.to_str().unwrap(),
+                        moved.to_str().unwrap(),
+                    ],
+                );
+                current.project_path = moved.to_string_lossy().into_owned();
+                storage
+                    .update(|rows, _| {
+                        rows[0].project_path.clone_from(&current.project_path);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let error = attach_planned(&storage, &original.id, &current, attach_plan).unwrap_err();
+            if !replace_profile {
+                assert!(error.to_string().contains("checkout changed"), "{error:#}");
+            }
+            assert!(!destination.exists(), "stale plan performed Git work");
+            assert!(Path::new(&current.project_path).exists());
+            assert!(git2::Repository::open(&frontend)
+                .unwrap()
+                .find_branch("feature/hook", git2::BranchType::Local)
+                .is_err());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_keeps_resources_when_purge_owns_row_or_inventory_is_unreadable() {
+        use super::super::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
+        for active_purge in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = "attach-conflict";
+            let _home = isolated_profile(temp.path(), profile);
+            let backend = temp.path().join("src/backend");
+            let frontend = temp.path().join("src/frontend");
+            init_repo(&backend);
+            init_repo(&frontend);
+            let worktree = temp.path().join("src/backend-conflict");
+            git_in(
+                &backend,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/conflict",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            let mut original = Instance::new("conflict", worktree.to_str().unwrap());
+            original.source_profile = profile.into();
+            original.worktree_info = Some(WorktreeInfo {
+                branch: "feature/conflict".into(),
+                main_repo_path: backend.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: Utc::now(),
+                base_branch: None,
+            });
+            let storage = Storage::open_unwatched(profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(original.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let attach_plan = plan(&original, profile, &frontend, ExistingBranch::Refuse).unwrap();
+            let destination = attach_plan.workspace_dir.clone();
+            let purge = if active_purge {
+                match PurgeTransaction::reserve(
+                    storage.clone(),
+                    DeletionRequest {
+                        session_id: original.id.clone(),
+                        instance: original.clone(),
+                        delete_worktree: true,
+                        delete_branch: true,
+                        delete_sandbox: false,
+                        force_delete: false,
+                        detach_hooks: true,
+                        keep_scratch: false,
+                    },
+                )
+                .unwrap()
+                {
+                    PurgeReservation::Reserved(transaction) => Some(transaction.run_hooks()),
+                    PurgeReservation::Rejected(_) => panic!("purge rejected"),
+                }
+            } else {
+                let other = Storage::new_unwatched("unreadable").unwrap();
+                other.update(|_, _| Ok(())).unwrap();
+                std::fs::write(other.sessions_path(), "not json").unwrap();
+                None
+            };
+            assert!(attach_planned(&storage, &original.id, &original, attach_plan).is_err());
+            assert!(worktree.exists());
+            assert!(!destination.exists());
+            let rows = storage.load().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].project_path, original.project_path);
+            assert!(rows[0].workspace_info.is_none());
+            assert!(git2::Repository::open(&frontend)
+                .unwrap()
+                .find_branch("feature/conflict", git2::BranchType::Local)
+                .is_err());
+            if let Some(purge) = purge {
+                let result = purge.complete();
+                assert!(result.success, "{:?}", result.errors);
+                assert!(!worktree.exists());
+                assert!(storage.load().unwrap().is_empty());
+            }
+        }
     }
 
     #[test]

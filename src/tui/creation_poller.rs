@@ -24,6 +24,7 @@ pub struct CreationRequest {
 #[derive(Debug)]
 pub enum CreationResult {
     Success {
+        ownership: Option<crate::session::storage::OwnershipGuard>,
         session_id: String,
         instance: Box<Instance>,
         created_worktree: Option<CreatedWorktreeInfo>,
@@ -157,6 +158,8 @@ impl CreationPoller {
                 Err(e) => return CreationResult::Error(format!("{:#}", e)),
             };
 
+        let ownership = std::cell::RefCell::new(build_result.ownership);
+        let profile_storage = build_result.profile_storage;
         let mut instance = build_result.instance;
         // Tag the instance with its profile NOW, before container creation or any
         // hook execution. Downstream config-resolution sites (build_container_config,
@@ -171,6 +174,7 @@ impl CreationPoller {
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
         let roll_back = |instance: &Instance| {
+            drop(ownership.borrow_mut().take());
             builder::cleanup_instance(
                 instance,
                 created_worktree.as_ref(),
@@ -203,6 +207,9 @@ impl CreationPoller {
         let mut container_started = false;
         let hook_env = repo_config::lifecycle_env_vars(&instance);
 
+        if has_on_create || has_on_launch {
+            drop(ownership.borrow_mut().take());
+        }
         // Execute on_create hooks after worktree setup, before starting
         if has_on_create {
             let hooks = hooks.as_ref().unwrap();
@@ -288,6 +295,18 @@ impl CreationPoller {
             }
         }
 
+        if ownership.borrow().is_none() {
+            match crate::session::storage::acquire_ownership_read() {
+                Ok(guard) => *ownership.borrow_mut() = Some(guard),
+                Err(error) => return failed(&instance, format!("{error:#}")),
+            }
+        }
+        if let Err(error) = profile_storage.verify_profile_identity() {
+            return failed(&instance, format!("{error:#}"));
+        }
+        if let Err(error) = builder::validate_creation_paths(&instance) {
+            return failed(&instance, format!("{error:#}"));
+        }
         if sandbox && !container_started {
             // Only ensure the container is running here if hooks didn't already
             // start it. Don't create the tmux session yet -- that happens at attach time
@@ -307,6 +326,7 @@ impl CreationPoller {
             .collect();
 
         CreationResult::Success {
+            ownership: ownership.into_inner(),
             session_id: instance.id.clone(),
             instance: Box::new(instance),
             created_worktree: created_worktree_info,

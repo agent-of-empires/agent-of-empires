@@ -4,6 +4,12 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **worktree:** Make ownership transitions atomic across profiles, preserving referenced worktrees and branches during purge, attachment, creation and rename (#4107).
+
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 
 

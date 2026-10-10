@@ -92,11 +92,9 @@ pub(crate) async fn spawn_structured_session(
     drop(instances);
 
     let file_watch_for_create = service.file_watch.clone();
-
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
         use crate::session::Config;
-        use crate::session::Storage;
 
         let StructuredSessionSpec {
             title,
@@ -200,6 +198,8 @@ pub(crate) async fn spawn_structured_session(
         };
 
         let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
+        let mut ownership = build_result.ownership;
+        let storage = crate::session::Storage::open_with_ownership(&profile, file_watch_for_create, ownership.as_ref().expect("builder retains creation ownership"))?;
         let mut instance = build_result.instance;
         instance.source_profile = profile.clone();
         instance.created_by_plugin = created_by_plugin;
@@ -318,6 +318,7 @@ pub(crate) async fn spawn_structured_session(
             agent_effort
         };
 
+        drop(ownership.take());
         // Run on_create hooks now that the worktree exists, before the session is persisted
         // or started.
         if let Err(e) = crate::server::api::sessions::run_create_hooks(
@@ -350,12 +351,15 @@ pub(crate) async fn spawn_structured_session(
         // storage.update, instance.start). Wrap the tail in an IIFE-equivalent closure so
         // we can run cleanup on Err once, regardless of which step tripped.
         let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
+            ownership = Some(crate::session::storage::acquire_ownership_read()?);
+            storage.verify_profile_identity()?;
+            builder::validate_creation_paths(&instance)?;
             let to_persist = instance.clone();
             storage.update(|all, _groups| {
                 all.push(to_persist);
                 Ok(())
             })?;
+            drop(ownership.take());
 
             // Acp-mode sessions are not backed by tmux; the structured view supervisor
             // spawns the ACP agent on demand.
@@ -367,20 +371,8 @@ pub(crate) async fn spawn_structured_session(
         };
 
         if let Err(e) = persist_and_start() {
-            // Guarded the same way as the deletion path.
-            if instance.scratch {
-                let scratch_path = std::path::PathBuf::from(&instance.project_path);
-                if crate::session::scratch::is_scratch_path(&scratch_path) {
-                    if let Err(rm_err) = std::fs::remove_dir_all(&scratch_path) {
-                        tracing::warn!(
-                            target: "http.api.sessions",
-                            "Failed to clean up orphan scratch dir {} after create failure: {}",
-                            scratch_path.display(),
-                            rm_err
-                        );
-                    }
-                }
-            }
+            drop(ownership.take());
+            builder::cleanup_instance(&instance, created_worktree.as_ref(), &created_workspace_worktrees, None);
             return Err(e);
         }
 
