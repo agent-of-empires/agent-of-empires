@@ -1,7 +1,9 @@
 use super::*;
 use crate::session::config::{update_app_state, update_config, AppStateConfig, SidebarPosition};
 use crate::tips::SHORTCUT_BAR_TIP_ID;
-use crate::tui::home::live_send::{parse_chord, parse_chord_list, LiveSendState, LiveSendTarget};
+use crate::tui::home::live_send::{
+    parse_chord, parse_chord_list, LiveCaptureWorker, LiveSendState, LiveSendTarget,
+};
 
 fn live_state() -> LiveSendState {
     LiveSendState {
@@ -116,6 +118,12 @@ fn hidden_bar_link_hover_keeps_the_preview_geometry_stable() {
     let id = env.view.selected_session.clone().unwrap();
     env.view.show_shortcut_bar = false;
     env.view.view_mode = ViewMode::Structured;
+    let (mut worker, _) =
+        LiveCaptureWorker::spawn_with_capture_for_test(env.view.preview_wake.clone(), || {
+            (None, None)
+        });
+    worker.stop_for_test();
+    env.view.preview_capture_worker = Some(worker);
     let url = "https://example.com/review";
     let content = format!("{}{url}\nbelow link", "output line\n".repeat(80));
     let target = env.view.displayed_pane_tmux_name().unwrap();
@@ -140,7 +148,10 @@ fn hidden_bar_link_hover_keeps_the_preview_geometry_stable() {
         let geometry = env.view.preview_text_view;
         for _ in 0..4 {
             let screen = render_home_to_string(&mut env.view, 120, 24);
-            assert!(screen.lines().last().unwrap().contains(url));
+            assert!(
+                screen.lines().last().unwrap().contains(url),
+                "live={live}:\n{screen}"
+            );
             assert!(!screen.contains("Cmds"));
             assert!(!screen.contains("LIVE"));
             assert_eq!(env.view.preview_text_view.pane, geometry.pane);
