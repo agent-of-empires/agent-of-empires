@@ -150,11 +150,34 @@ fn run_inner<R: Read>(
             .ok_or_else(|| {
                 anyhow!("payload has no top-level string conversation_id or session_id")
             })?,
+        crate::agents::HookIdentityField::HermesForegroundSessionId => {
+            hermes_foreground_session_id(&value)
+                .ok_or_else(|| anyhow!("payload is not from the Hermes foreground agent"))?
+        }
     };
     if !crate::session::capture::is_valid_session_id(sid) {
         return Err(anyhow!("payload contains an unsafe native session id"));
     }
     crate::hooks::write_session_id_via_guard(instance_id, sid, source)
+}
+
+/// The CLI or TUI foreground agent reports `platform: cli` or `tui` and a `YYYYMMDD_HHMMSS_<hex>`
+/// id. Subagents report `subagent` and side tasks use `bg_` or `preview_` ids; any other shape is
+/// refused, so a Hermes change stops capture instead of adopting a foreign conversation.
+fn hermes_foreground_session_id(value: &serde_json::Value) -> Option<&str> {
+    let platform = value.pointer("/extra/platform").and_then(|v| v.as_str());
+    if !matches!(platform, Some("cli" | "tui")) {
+        return None;
+    }
+    let sid = value.get("session_id")?.as_str()?;
+    let mut parts = sid.splitn(3, '_');
+    let (date, time, hex) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());
+    let lower_hex = !hex.is_empty()
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (digits(date, 8) && digits(time, 6) && lower_hex).then_some(sid)
 }
 
 #[cfg(test)]
@@ -397,6 +420,53 @@ mod tests {
             read_sidecar(&base, "conversation_fallback").as_deref(),
             Some(OTHER)
         );
+    }
+
+    /// Hermes runs delegated subagents and side tasks in the pane's own process, firing the same
+    /// hooks with their own ids; only the foreground agent's id may be adopted.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn hermes_identity_accepts_only_the_cli_foreground_agent() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        const FOREGROUND: &str = "20261001_231100_a1b2c3";
+        let field = crate::agents::HookIdentityField::HermesForegroundSessionId;
+        for (name, sid, platform, accepted) in [
+            ("hermes_foreground", FOREGROUND, Some("cli"), true),
+            ("hermes_subagent", FOREGROUND, Some("subagent"), false),
+            ("hermes_background", "bg_231100_a1b2c3", Some("cli"), false),
+            ("hermes_tui", FOREGROUND, Some("tui"), true),
+            ("hermes_tui_preview", "preview_a1b2c3", Some("tui"), false),
+            ("hermes_no_platform", FOREGROUND, None, false),
+            (
+                "hermes_short_date",
+                "2026101_231100_a1b2c3",
+                Some("cli"),
+                false,
+            ),
+            (
+                "hermes_upper_hex",
+                "20261001_231100_A1B2C3",
+                Some("cli"),
+                false,
+            ),
+            ("hermes_no_hex", "20261001_231100_", Some("cli"), false),
+        ] {
+            let extra = platform.map_or_else(
+                || "{}".to_string(),
+                |platform| format!(r#"{{"platform":"{platform}"}}"#),
+            );
+            let payload = format!(r#"{{"session_id":"{sid}","extra":{extra}}}"#);
+            assert_eq!(
+                run_inner(payload.as_bytes(), name, field, None).is_ok(),
+                accepted,
+                "{name}"
+            );
+            assert_eq!(
+                read_sidecar(&base, name).as_deref(),
+                accepted.then_some(sid),
+                "{name}"
+            );
+        }
     }
 
     #[test]
