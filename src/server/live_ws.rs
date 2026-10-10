@@ -165,15 +165,19 @@ enum LiveControlMessage {
     },
 }
 
-/// ESC is removed so pasted text cannot end the bracketed paste early. A submit
-/// drops trailing line breaks, since Enter follows.
-fn paste_payload(text: &str, submit: bool) -> String {
-    let text = if submit {
-        text.trim_end_matches(['\r', '\n'])
-    } else {
-        text
-    };
-    text.replace('\x1b', "")
+/// ESC is removed so pasted text cannot end the bracketed paste early.
+pub(crate) fn strip_paste_escapes(text: &mut String) {
+    text.retain(|ch| ch != '\x1b');
+}
+
+/// A submit drops trailing line breaks, since Enter follows.
+fn paste_payload(mut text: String, submit: bool) -> String {
+    if submit {
+        let len = text.trim_end_matches(['\r', '\n']).len();
+        text.truncate(len);
+    }
+    strip_paste_escapes(&mut text);
+    text
 }
 
 /// Paste, then Enter after the agent's paste-burst delay when submitting. A live input
@@ -1495,7 +1499,7 @@ async fn handle_live_ws_inner(
                                 if read_only || !settings.is_owner.load(Ordering::Relaxed) {
                                     continue;
                                 }
-                                let text = paste_payload(&text, submit);
+                                let text = paste_payload(text, submit);
                                 if text.is_empty() {
                                     continue;
                                 }
@@ -1752,7 +1756,7 @@ mod tests {
             };
             assert_eq!(&text, want_text, "{json}");
             assert_eq!(submit, *want_submit, "{json}");
-            assert_eq!(paste_payload(&text, submit), *want_payload, "{json}");
+            assert_eq!(paste_payload(text, submit), *want_payload, "{json}");
         }
         assert!(serde_json::from_str::<LiveControlMessage>(r#"{"type":"paste"}"#).is_err());
     }

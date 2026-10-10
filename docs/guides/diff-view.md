@@ -44,7 +44,7 @@ The dashboard can annotate diff lines and send the comments to the agent as one 
 2. Write the comment (markdown supported); `Cmd/Ctrl+Enter` saves, `Esc` cancels. Saved comments render inline as editable cards.
 3. A banner above the file list appears once you have one: **Send** (`Cmd/Ctrl+Shift+S`) opens a dialog with an editable intro, a preview of each comment with its captured snippet, and an outro. Comments clear on success unless you uncheck "Clear comments after sending".
 
-Comments live in `localStorage` per session. If the agent edits a file so a range no longer matches, the comment moves to a stale-comments block with a `[stale]` chip; its captured snippet still goes to the agent. Both structured and terminal sessions can annotate. Structured sends use a typed ACP prompt and wake a dormant worker; terminal sends submit assembled markdown to the agent pane. Send is disabled for archived or trashed sessions, and terminal sends are disabled in read-only mode. A failed send keeps comments and the dialog open for retry.
+Comments live in `localStorage` per session. If the agent edits a file so a range no longer matches, the comment moves to a stale-comments block with a `[stale]` chip; its captured snippet still goes to the agent. Both structured and terminal sessions can annotate. Structured sends use a typed ACP prompt and wake a dormant worker; terminal sends submit assembled markdown to the agent pane. Terminal input strips ESC characters before pasting, so source text cannot embed a bracketed-paste terminator. Send is disabled for archived or trashed sessions, and terminal sends are disabled in read-only mode. A failed send keeps comments and the dialog open for retry.
 
 ## Base override
 
