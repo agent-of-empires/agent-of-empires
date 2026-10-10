@@ -117,6 +117,7 @@ mod tests {
         let session_id = instance.id.clone();
 
         poller.request_trash(TrashRequest {
+            storage: crate::session::Storage::open_unwatched("default").unwrap(),
             session_id: session_id.clone(),
             instance,
             generation,

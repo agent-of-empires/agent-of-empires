@@ -170,6 +170,8 @@ pub struct WorktreeEditOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeEditError {
+    #[error("{0}")]
+    Ownership(String),
     #[error("this worktree is not managed by aoe; its workdir name cannot be edited")]
     NotManaged,
     #[error("the new workdir name is empty")]
@@ -194,6 +196,62 @@ pub enum WorktreeEditError {
     },
     #[error(transparent)]
     Git(#[from] GitError),
+}
+
+pub(crate) fn ensure_worktree_unshared(
+    ownership: &super::storage::OwnershipGuard,
+    profile: &str,
+    id: &str,
+    path: &Path,
+    info: &WorktreeInfo,
+    moves_path: bool,
+    renames_branch: bool,
+) -> Result<(), WorktreeEditError> {
+    if (moves_path || renames_branch)
+        && super::deletion::paths_in_use_except_with_ownership(ownership, profile, &[id])
+            .covers(path)
+    {
+        return Err(WorktreeEditError::Ownership(
+            "Another session shares this worktree, or its owners could not be checked".to_string(),
+        ));
+    }
+    if renames_branch {
+        let in_use = super::deletion::branch_in_use_with_ownership(
+            ownership,
+            profile,
+            &[id],
+            Path::new(&info.main_repo_path),
+            &info.branch,
+        )
+        .map_err(|error| WorktreeEditError::Ownership(error.to_string()))?;
+        if in_use {
+            return Err(WorktreeEditError::Ownership(
+                "Another session shares this branch".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn edit_worktree_workdir_with_ownership(
+    ownership: &super::storage::OwnershipGuard,
+    profile: &str,
+    id: &str,
+    req: WorktreeEditRequest<'_>,
+) -> Result<WorktreeEditOutcome, WorktreeEditError> {
+    if !req.worktree_info.managed_by_aoe || req.new_name.trim().is_empty() {
+        return edit_worktree_workdir(req);
+    }
+    ensure_worktree_unshared(
+        ownership,
+        profile,
+        id,
+        req.current_path,
+        req.worktree_info,
+        worktree_move_required(req.current_path, req.new_name),
+        worktree_branch_rename_required(req.worktree_info, req.new_name, req.rename_branch),
+    )?;
+    edit_worktree_workdir(req)
 }
 
 /// Validate and apply an in-place worktree workdir edit.
@@ -353,6 +411,57 @@ pub fn rollback_worktree_branch(
 mod tests {
     use super::*;
     use chrono::Utc;
+    #[test]
+    #[serial_test::serial]
+    fn worktree_move_refuses_same_id_owner_in_another_profile() {
+        let app = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(app.path());
+        let dirs = tempfile::tempdir().unwrap();
+        let main = dirs.path().join("repo");
+        let path = dirs.path().join("checkout");
+        let repo = git2::Repository::init(&main).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+        let git = GitWorktree::new(main.clone()).unwrap();
+        let base = repo.head().unwrap().shorthand().unwrap().to_owned();
+        git.create_worktree("feature", &path, true, Some(&base))
+            .unwrap();
+        let info = wt_info("feature", &main.to_string_lossy(), true);
+        let mut original = crate::session::Instance::new("original", &path.to_string_lossy());
+        original.worktree_info = Some(info.clone());
+        let id = original.id.clone();
+        let a = crate::session::Storage::new_unwatched("rename-a").unwrap();
+        let b = crate::session::Storage::new_unwatched("rename-b").unwrap();
+        a.update(|rows, _| {
+            rows.push(original.clone());
+            Ok(())
+        })
+        .unwrap();
+        b.update(|rows, _| {
+            rows.push(original);
+            Ok(())
+        })
+        .unwrap();
+        let ownership = super::super::storage::acquire_ownership_lock().unwrap();
+        let result = edit_worktree_workdir_with_ownership(
+            &ownership,
+            "rename-a",
+            &id,
+            WorktreeEditRequest {
+                worktree_info: &info,
+                current_path: &path,
+                new_name: "moved",
+                rename_branch: true,
+            },
+        );
+        assert!(matches!(result, Err(WorktreeEditError::Ownership(_))));
+        assert!(path.is_dir());
+        assert!(!dirs.path().join("moved").exists());
+        assert!(git.branch_exists("feature").unwrap());
+    }
 
     fn wt_info(branch: &str, main_repo: &str, managed: bool) -> WorktreeInfo {
         WorktreeInfo {

@@ -145,6 +145,84 @@ async fn ensure_sandbox_container_released_blocking(id: &str, is_sandboxed: bool
         true
     })
 }
+async fn reacquire_worktree_rename(
+    state: &Arc<AppState>,
+    profile: &str,
+    id: &str,
+    original: &Instance,
+    previous_storage: &Storage,
+    target: (&str, &str),
+) -> Result<
+    (
+        Arc<crate::session::storage::OwnershipGuard>,
+        crate::session::StorageFlock,
+        crate::session::StorageFlock,
+        crate::session::StorageFlock,
+        Storage,
+    ),
+    axum::response::Response,
+> {
+    let profile = profile.to_string();
+    let work_id = id.to_string();
+    let file_watch = state.file_watch.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let ownership = Arc::new(crate::session::storage::acquire_ownership_lock()?);
+        let identity =
+            crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+        let title = crate::session::storage::acquire_session_title_lock_with_ownership(
+            &ownership, &work_id,
+        )?;
+        let storage = Storage::open_with_ownership(&profile, file_watch, &ownership)?;
+        let lifecycle =
+            storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &work_id)?;
+        let rows = storage.load()?;
+        Ok((ownership, identity, title, lifecycle, storage, rows))
+    })
+    .await;
+    let (ownership, identity, title, lifecycle, storage, rows) = match result {
+        Ok(Ok(locked)) => locked,
+        _ => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    };
+    if previous_storage.verify_profile_identity().is_err() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "profile_changed",
+            "Session profile changed while preparing its worktree rename",
+        ));
+    }
+    let Some(current) = rows.iter().find(|instance| instance.id == id) else {
+        return Err(session_not_found());
+    };
+    if current.project_path != original.project_path
+        || current.title != original.title
+        || current
+            .worktree_info
+            .as_ref()
+            .map(|info| (&info.main_repo_path, &info.branch, info.managed_by_aoe))
+            != original
+                .worktree_info
+                .as_ref()
+                .map(|info| (&info.main_repo_path, &info.branch, info.managed_by_aoe))
+        || current.lifecycle_generation != original.lifecycle_generation
+        || current.is_sandboxed() != original.is_sandboxed()
+        || current.is_structured() != original.is_structured()
+        || current.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        || current.is_trashed()
+        || current.status.blocks_worktree_edit()
+    {
+        return Err(api_error(StatusCode::CONFLICT, "session_changed", "Session changed while preparing its worktree rename; retry against the current session"));
+    }
+    let pair_changed = target.0 != current.title
+        || target.1.trim_end_matches('/') != current.project_path.trim_end_matches('/');
+    if pair_changed && is_duplicate_session(rows.iter(), target.0, target.1, Some(id)) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "duplicate_session",
+            duplicate_session_error(target.0).to_string(),
+        ));
+    }
+    Ok((ownership, identity, title, lifecycle, storage))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RenamePersistOutcome {
@@ -154,12 +232,13 @@ pub(super) enum RenamePersistOutcome {
 
 pub(super) fn persist_rename_metadata(
     storage: &Storage,
+    ownership: &crate::session::storage::OwnershipGuard,
     id: &str,
     title: &str,
     new_path: Option<&str>,
     new_branch: Option<&str>,
 ) -> anyhow::Result<RenamePersistOutcome> {
-    storage.update(|instances, _groups| {
+    storage.update_with_ownership(ownership, |instances, _groups| {
         let Some(inst) = instances.iter_mut().find(|instance| instance.id == id) else {
             return Ok(RenamePersistOutcome::Missing);
         };
@@ -233,9 +312,15 @@ pub async fn rename_session(
     // acquire them on a Tokio worker. Identity nests outside session title,
     // source lifecycle, and profile Storage.
     // source lifecycle, and profile Storage.
-    let _identity_lock = match tokio::task::spawn_blocking(
-        crate::session::acquire_session_identity_lock,
-    )
+    let mut ownership =
+        match tokio::task::spawn_blocking(crate::session::storage::acquire_ownership_read).await {
+            Ok(Ok(guard)) => Arc::new(guard),
+            _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    let identity_ownership = Arc::clone(&ownership);
+    let mut _identity_lock = match tokio::task::spawn_blocking(move || {
+        crate::session::storage::acquire_session_identity_lock_with_ownership(&identity_ownership)
+    })
     .await
     {
         Ok(Ok(lock)) => lock,
@@ -251,11 +336,18 @@ pub async fn rename_session(
     let lock_id = id.clone();
     let lock_profile = profile.clone();
     let lock_file_watch = state.file_watch.clone();
-    let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
+    let lock_ownership = Arc::clone(&ownership);
+    let (mut _session_title_lock, mut _lifecycle_lock, mut storage, disk_instances) =
         match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let session_title_lock = crate::session::acquire_session_title_lock(&lock_id)?;
-            let storage = Storage::new(&lock_profile, lock_file_watch)?;
-            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
+            let session_title_lock =
+                crate::session::storage::acquire_session_title_lock_with_ownership(
+                    &lock_ownership,
+                    &lock_id,
+                )?;
+            let storage =
+                Storage::open_with_ownership(&lock_profile, lock_file_watch, &lock_ownership)?;
+            let lifecycle_lock = storage
+                .acquire_instance_lifecycle_lock_with_ownership(&lock_ownership, &lock_id)?;
             let instances = storage.load()?;
             Ok((session_title_lock, lifecycle_lock, storage, instances))
         })
@@ -356,22 +448,50 @@ pub async fn rename_session(
             return api_error(StatusCode::CONFLICT, "session_running", "Stop the session before renaming its worktree directory or branch. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session.");
         }
 
-        // Stop a live structured-view worker only when its cwd will move; a
-        // title-only or branch-only edit leaves the cwd valid.
-        // interrupt the worker.
-        if moves_worktree {
-            if let Err(response) =
-                quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
-            {
-                return response;
+        if moves_worktree || renames_branch {
+            drop(_lifecycle_lock);
+            drop(_session_title_lock);
+            drop(_identity_lock);
+            drop(ownership);
+            if moves_worktree {
+                if let Err(response) =
+                    quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+                {
+                    return response;
+                }
             }
+            (
+                ownership,
+                _identity_lock,
+                _session_title_lock,
+                _lifecycle_lock,
+                storage,
+            ) = match reacquire_worktree_rename(
+                &state,
+                &profile,
+                &id,
+                &fresh,
+                &storage,
+                (&title, &duplicate_path),
+            )
+            .await
+            {
+                Ok(locked) => locked,
+                Err(response) => return response,
+            };
         }
 
         let wt = worktree_info.expect("tied implies worktree_info is Some");
         let cur = current_path.clone();
         let rename_branch = body.rename_branch;
+        let edit_ownership = Arc::clone(&ownership);
+        let edit_profile = profile.clone();
+        let edit_id = id.clone();
         let edit = tokio::task::spawn_blocking(move || {
-            crate::session::worktree_edit::edit_worktree_workdir(
+            crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+                &edit_ownership,
+                &edit_profile,
+                &edit_id,
                 crate::session::worktree_edit::WorktreeEditRequest {
                     worktree_info: &wt,
                     current_path: std::path::Path::new(&cur),
@@ -430,6 +550,7 @@ pub async fn rename_session(
     let persisted = tokio::task::spawn_blocking(move || {
         persist_rename_metadata(
             &storage,
+            &ownership,
             &id_clone,
             &title_clone,
             new_path_clone.as_deref(),
@@ -556,6 +677,7 @@ fn worktree_edit_error_response(
 ) -> (StatusCode, String) {
     use crate::session::worktree_edit::WorktreeEditError as E;
     match e {
+        E::Ownership(_) => (StatusCode::CONFLICT, "Another session uses this checkout or branch, or its owners could not be checked".to_string()),
         E::NotManaged => (
             StatusCode::BAD_REQUEST,
             "This worktree is not managed by aoe; its workdir name cannot be edited".to_string(),
@@ -647,9 +769,15 @@ pub async fn set_worktree_name(
         inst.clone()
     };
     let profile = live.source_profile.clone();
-    let _identity_lock = match tokio::task::spawn_blocking(
-        crate::session::acquire_session_identity_lock,
-    )
+    let mut ownership =
+        match tokio::task::spawn_blocking(crate::session::storage::acquire_ownership_read).await {
+            Ok(Ok(guard)) => Arc::new(guard),
+            _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    let identity_ownership = Arc::clone(&ownership);
+    let mut _identity_lock = match tokio::task::spawn_blocking(move || {
+        crate::session::storage::acquire_session_identity_lock_with_ownership(&identity_ownership)
+    })
     .await
     {
         Ok(Ok(lock)) => lock,
@@ -665,26 +793,28 @@ pub async fn set_worktree_name(
     let lock_id = id.clone();
     let lock_profile = profile.clone();
     let lock_file_watch = state.file_watch.clone();
-    let (_lifecycle_lock, storage, authoritative_instances) = match tokio::task::spawn_blocking(
-        move || -> anyhow::Result<_> {
-            let storage = Storage::new(&lock_profile, lock_file_watch)?;
-            let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
+    let lock_ownership = Arc::clone(&ownership);
+    let (mut _lifecycle_lock, mut storage, authoritative_instances) =
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let storage =
+                Storage::open_with_ownership(&lock_profile, lock_file_watch, &lock_ownership)?;
+            let lifecycle = storage
+                .acquire_instance_lifecycle_lock_with_ownership(&lock_ownership, &lock_id)?;
             let instances = storage.load()?;
             Ok((lifecycle, storage, instances))
-        },
-    )
-    .await
-    {
-        Ok(Ok(locked)) => locked,
-        Ok(Err(error)) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree rename lock task failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+        })
+        .await
+        {
+            Ok(Ok(locked)) => locked,
+            Ok(Err(error)) => {
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Err(error) => {
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree rename lock task failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
     let Some(mut fresh) = authoritative_instances
         .iter()
         .find(|instance| instance.id == id)
@@ -756,10 +886,9 @@ pub async fn set_worktree_name(
             .into_response();
     }
 
-    // Stop any live structured-view worker before the move so it cannot crash
-    // on the pulled-out cwd and respawn-loop at the stale path (#2260). Gated on
-    // `moves_worktree` for the same reason as the tied rename path: a
-    // branch-only edit leaves the cwd valid.
+    drop(_lifecycle_lock);
+    drop(_identity_lock);
+    drop(ownership);
     if moves_worktree {
         if let Err(resp) =
             quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
@@ -767,13 +896,37 @@ pub async fn set_worktree_name(
             return resp;
         }
     }
+    let (new_ownership, new_identity, _exclusive_title_lock, new_lifecycle, new_storage) =
+        match reacquire_worktree_rename(
+            &state,
+            &profile,
+            &id,
+            &fresh,
+            &storage,
+            (&fresh.title, &duplicate_path),
+        )
+        .await
+        {
+            Ok(locked) => locked,
+            Err(response) => return response,
+        };
+    ownership = new_ownership;
+    _identity_lock = new_identity;
+    _lifecycle_lock = new_lifecycle;
+    storage = new_storage;
 
     let wt = worktree_info.clone();
     let cur = current_path.clone();
     let new_name = name.clone();
     let rename_branch = body.rename_branch;
+    let edit_ownership = Arc::clone(&ownership);
+    let edit_profile = profile.clone();
+    let edit_id = id.clone();
     let edit = tokio::task::spawn_blocking(move || {
-        crate::session::worktree_edit::edit_worktree_workdir(
+        crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+            &edit_ownership,
+            &edit_profile,
+            &edit_id,
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &wt,
                 current_path: std::path::Path::new(&cur),
@@ -831,7 +984,7 @@ pub async fn set_worktree_name(
     let new_path_clone = new_path.clone();
     let new_branch_clone = new_branch.clone();
     match tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
+        storage.update_with_ownership(&ownership, |instances, _groups| {
             let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
                 return Ok(false);
             };
@@ -1048,6 +1201,72 @@ pub(super) fn apply_worktree_name_edit(
     if let Some(branch) = new_branch {
         if let Some(wt) = inst.worktree_info.as_mut() {
             wt.branch = branch.to_string();
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_review_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ownership_review_rename_rejects_a_duplicate_admitted_during_quiescence() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let target = temp.path().join("target").to_string_lossy().into_owned();
+        for target_title in ["renamed", "original"] {
+            let storage = Storage::new_unwatched("default").unwrap();
+            let mut original = Instance::new("original", &source.to_string_lossy());
+            original.source_profile = storage.profile().into();
+            original.status = crate::session::Status::Stopped;
+            original.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "source".into(),
+                main_repo_path: temp.path().to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            storage
+                .update(|rows, _| {
+                    *rows = vec![original.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!is_duplicate_session(
+                storage.load().unwrap().iter(),
+                target_title,
+                &target,
+                Some(&original.id)
+            ));
+            let state = crate::server::test_support::build_test_app_state(vec![original.clone()]);
+            storage
+                .update(|rows, _| {
+                    rows.push(Instance::new(target_title, &target));
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!std::path::Path::new(&target).exists());
+            let response = match reacquire_worktree_rename(
+                &state,
+                storage.profile(),
+                &original.id,
+                &original,
+                &storage,
+                (target_title, &target),
+            )
+            .await
+            {
+                Err(response) => response,
+                Ok(_) => panic!("a newly occupied identity must be rejected after quiescence"),
+            };
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), 2048)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("duplicate_session"));
         }
     }
 }

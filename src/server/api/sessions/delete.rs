@@ -318,9 +318,28 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
                 _ => continue,
             }
         };
+        let profile = snapshot.source_profile.clone();
+        let file_watch = state.file_watch.clone();
+        let storage = match tokio::task::spawn_blocking(move || {
+            anyhow::ensure!(!profile.is_empty(), "session has no source profile");
+            crate::session::Storage::open(&profile, file_watch)
+        })
+        .await
+        {
+            Ok(Ok(storage)) => storage,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile profile unavailable: {error}");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile profile join failed: {error}");
+                continue;
+            }
+        };
         let reconciled = match tokio::task::spawn_blocking(move || {
             let mut instance = snapshot;
-            let changed = crate::session::trash::reconcile_trashed_transition(&mut instance)?;
+            let changed =
+                crate::session::trash::reconcile_trashed_transition(&storage, &mut instance)?;
             anyhow::Ok((changed, instance))
         })
         .await
@@ -641,8 +660,16 @@ pub(super) fn order_workspace_deletion(
 /// removed, so its dirtiness does not block. Returns the first dirty message.
 async fn workspace_dirty_message(instance: Instance, session_ids: Vec<String>) -> Option<String> {
     tokio::task::spawn_blocking(move || {
+        let ownership = match crate::session::storage::acquire_ownership_read() {
+            Ok(ownership) => ownership,
+            Err(error) => return Some(format!("ownership check failed: {error}")),
+        };
         let ids: Vec<&str> = session_ids.iter().map(String::as_str).collect();
-        let kept = crate::session::deletion::paths_in_use_except(&ids);
+        let kept = crate::session::deletion::paths_in_use_except_with_ownership(
+            &ownership,
+            &instance.source_profile,
+            &ids,
+        );
         workspace_dirty_message_blocking(&instance, &kept)
     })
     .await

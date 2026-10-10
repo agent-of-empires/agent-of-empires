@@ -4,7 +4,7 @@ use crate::session::builder::{self, InstanceParams};
 use crate::session::conversation_carry;
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
+    GroupMovePlan, GroupTree, Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
@@ -250,6 +250,7 @@ impl HomeView {
             &existing_branches,
             &target_profile,
         )?;
+        let ownership = build_result.ownership;
         let mut instance = build_result.instance;
         instance.source_profile = target_profile.clone();
         if structured {
@@ -265,6 +266,40 @@ impl HomeView {
             );
         }
 
+        let persist = self
+            .storages
+            .get(&target_profile)
+            .expect("creation storage registered above")
+            .update(|instances, groups| {
+                build_result.profile_storage.verify_profile_identity()?;
+                build_result.witness.validate(&instance)?;
+                if is_duplicate_session(
+                    instances.iter(),
+                    &instance.title,
+                    &instance.project_path,
+                    None,
+                ) {
+                    return Err(duplicate_session_error(&instance.title));
+                }
+                instances.push(instance.clone());
+                if !instance.group_path.is_empty() {
+                    let mut tree = GroupTree::new_with_groups(instances, groups);
+                    tree.create_group(&instance.group_path);
+                    *groups = tree.get_all_groups();
+                }
+                Ok(())
+            });
+        if let Err(error) = persist {
+            drop(ownership);
+            builder::cleanup_unpublished_instance(
+                &instance,
+                build_result.created_worktree.as_ref(),
+                &build_result.created_workspace_worktrees,
+                None,
+                &build_result.witness,
+            );
+            return Err(error);
+        }
         self.add_instance(instance.clone());
         self.rebuild_group_trees();
         if !instance.group_path.is_empty() {
@@ -272,7 +307,7 @@ impl HomeView {
                 tree.create_group(&instance.group_path);
             }
         }
-        self.save()?;
+        drop(ownership);
 
         crate::tips::record_session_creations(1);
         self.reload()?;
@@ -1234,9 +1269,13 @@ impl HomeView {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         let source_profile = live.source_profile.clone();
-        let _identity_lock = acquire_session_identity_lock()?;
-        let storage = Storage::new(&source_profile, self.file_watch.clone())?;
-        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
+        let ownership = crate::session::storage::acquire_ownership_lock()?;
+        let _identity_lock =
+            crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+        let storage =
+            Storage::open_with_ownership(&source_profile, self.file_watch.clone(), &ownership)?;
+        let _lifecycle_lock =
+            storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &id)?;
         let authoritative_instances = storage.load()?;
         let mut authoritative = authoritative_instances
             .iter()
@@ -1292,7 +1331,10 @@ impl HomeView {
             );
         }
 
-        let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+        let outcome = crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+            &ownership,
+            &source_profile,
+            &id,
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
                 current_path: std::path::Path::new(&project_path),
@@ -1311,7 +1353,7 @@ impl HomeView {
             crate::session::worktree_edit::discard_sandbox_container_after_move(&id, is_sandboxed);
         }
 
-        self.apply_user_action(&id, |inst| {
+        self.apply_user_action_with_ownership(&ownership, &id, |inst| {
             inst.project_path = new_path.clone();
             if let Some(branch) = &new_branch {
                 if let Some(wt) = inst.worktree_info.as_mut() {
@@ -1320,6 +1362,8 @@ impl HomeView {
             }
         })?;
         drop(_identity_lock);
+        drop(_lifecycle_lock);
+        drop(ownership);
 
         self.rebuild_group_trees();
         self.save()?;
@@ -1378,16 +1422,20 @@ impl HomeView {
             anyhow::bail!("An attach is already running for this session; wait for it to finish");
         }
 
-        // Everything blocking runs on the poller thread: `git worktree add` alone takes
-        // seconds, and the fetch, submodule init, worker bounce and container removal
-        // behind it take longer. `apply_attach_project_results` reloads and reports.
+        let storage = self
+            .storages
+            .get(&instance.source_profile)
+            .ok_or_else(|| anyhow::anyhow!("session profile storage is unavailable"))?
+            .clone();
+        // Everything blocking runs on the poller thread: Git worktree creation, worker stop,
+        // conversion and restart. Results reload the durable profile and report the outcome.
         self.attach_project_in_flight.insert(id.to_string());
         self.attach_project_poller.request_attach(
             crate::session::attach_project::AttachProjectRequest {
                 session_id: id.to_string(),
-                profile: instance.source_profile.clone(),
+                storage,
+                instance: instance.clone(),
                 repo_path: repo_path.to_path_buf(),
-                is_sandboxed: instance.is_sandboxed(),
             },
         );
         Ok(())
@@ -1410,8 +1458,11 @@ impl HomeView {
             let title_changed_by_user = !new_title.is_empty() && new_title != live.title;
             // The app-wide identity guard covers profile-changing renames too; the
             // existing-session guards nest beneath it, title -> lifecycle -> Storage.
-            let _identity_lock = acquire_session_identity_lock()?;
-            let _mutation_guards = self.lock_session_mutation_and_reload(&id)?;
+            let ownership = crate::session::storage::acquire_ownership_lock()?;
+            let _identity_lock =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+            let _mutation_guards =
+                self.lock_session_mutation_and_reload_with_ownership(&ownership, &id)?;
             let previous = self
                 .get_instance(&id)
                 .cloned()
@@ -1458,7 +1509,12 @@ impl HomeView {
                 let candidates = if let Some(storage) = self.storages.get(target_profile) {
                     storage.load()?
                 } else {
-                    Storage::open(target_profile, self.file_watch.clone())?.load()?
+                    Storage::open_with_ownership(
+                        target_profile,
+                        self.file_watch.clone(),
+                        &ownership,
+                    )?
+                    .load()?
                 };
                 if is_duplicate_session(
                     candidates.iter(),
@@ -1521,7 +1577,11 @@ impl HomeView {
 
                 // Advisory preflight before any worktree, container, or branch
                 // effect. The dual-locked transaction repeats this check.
-                let target_storage = Storage::open(target_profile, self.file_watch.clone())?;
+                let target_storage = Storage::open_with_ownership(
+                    target_profile,
+                    self.file_watch.clone(),
+                    &ownership,
+                )?;
                 let target_rows = target_storage.load()?;
                 if is_duplicate_session(
                     target_rows.iter(),
@@ -1565,7 +1625,10 @@ impl HomeView {
                         ));
                         return Ok(());
                     }
-                    match crate::session::worktree_edit::edit_worktree_workdir(
+                    match crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+                        &ownership,
+                        &current_profile,
+                        &id,
                         crate::session::worktree_edit::WorktreeEditRequest {
                             worktree_info: &worktree_info,
                             current_path: std::path::Path::new(&project_path),
@@ -1599,10 +1662,37 @@ impl HomeView {
             // Cross-profile worktree and container effects run inside the dual-profile
             // transaction; tmux rekeying waits until persistence and publication succeed.
             if let Some(target_profile) = cross_profile_target.as_deref() {
+                if tied_edit {
+                    if let Some(info) = current_instance.worktree_info.as_ref() {
+                        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(
+                            &effective_title,
+                        );
+                        crate::session::worktree_edit::ensure_worktree_unshared(
+                            &ownership,
+                            &current_profile,
+                            &id,
+                            std::path::Path::new(&current_instance.project_path),
+                            info,
+                            crate::session::worktree_edit::worktree_move_required(
+                                std::path::Path::new(&current_instance.project_path),
+                                &leaf,
+                            ),
+                            crate::session::worktree_edit::worktree_branch_rename_required(
+                                info,
+                                &leaf,
+                                rename_branch,
+                            ),
+                        )?;
+                    }
+                }
                 if !self.storages.contains_key(target_profile) {
                     self.storages.insert(
                         target_profile.to_string(),
-                        Storage::open(target_profile, self.file_watch.clone())?,
+                        Storage::open_with_ownership(
+                            target_profile,
+                            self.file_watch.clone(),
+                            &ownership,
+                        )?,
                     );
                 }
                 let tied_edit = (current_title != effective_title || rename_branch)
@@ -1610,11 +1700,11 @@ impl HomeView {
                 let effect_instance = current_instance.clone();
                 let effect_id = id.clone();
                 let effect_title = effective_title.clone();
-                self.move_to_profile_with_effect(
+                self.move_to_profile_with_effect_with_ownership(
+                    &ownership,
                     &id,
                     target_profile,
-                    projected_move,
-                    Some(&current_instance),
+                    (projected_move, Some(&current_instance)),
                     false,
                     move |candidate| {
                         if tied_edit {
@@ -1679,17 +1769,18 @@ impl HomeView {
                         Ok(())
                     },
                 )?;
-                self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
-                drop(_identity_lock);
-                let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
                 drop(_mutation_guards);
+                drop(_identity_lock);
+                drop(ownership);
+                self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
+                let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
                 if let Some(warning) = tmux_warning {
                     self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
                 }
                 return Ok(());
             }
 
-            self.apply_user_action(&id, |inst| {
+            self.apply_user_action_with_ownership(&ownership, &id, |inst| {
                 inst.title = effective_title.clone();
                 inst.group_path = effective_group.clone();
                 if let Some(path) = &new_path {
@@ -1701,9 +1792,10 @@ impl HomeView {
                     }
                 }
             })?;
-            drop(_identity_lock);
-            let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
             drop(_mutation_guards);
+            drop(_identity_lock);
+            drop(ownership);
+            let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
 
             // Rebuild group trees and create group if needed
             self.rebuild_group_trees();
@@ -2000,6 +2092,7 @@ impl HomeView {
         }
         self.trash_poller
             .request_trash(crate::session::trash::TrashRequest {
+                storage: storage.clone(),
                 session_id: id.to_string(),
                 instance: request_instance,
                 generation,
@@ -2320,14 +2413,35 @@ fn restore_from_trash_with_storage(
     id: &str,
     owned_trash_generation: Option<u64>,
 ) -> RestoreFromTrash {
-    let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(id) {
+    let ownership = match crate::session::storage::acquire_ownership_lock() {
         Ok(lock) => lock,
         Err(error) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore lock failed: {error}");
+            tracing::warn!(target: "tui.home", id = %id, "restore ownership lock failed: {error}");
             return RestoreFromTrash::PersistFailed;
         }
     };
-    let decision = match storage.update(|instances, _groups| {
+    let _identity_lock = match crate::session::storage::acquire_session_identity_lock_with_ownership(
+        &ownership,
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore identity lock failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
+    let _lifecycle_lock =
+        match storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(target: "tui.home", id = %id, "restore lock failed: {error}");
+                return RestoreFromTrash::PersistFailed;
+            }
+        };
+    if let Err(error) = storage.load_strict_for_worktree_ownership() {
+        tracing::warn!(target: "tui.home", id = %id, "restore ownership inventory failed: {error}");
+        return RestoreFromTrash::PersistFailed;
+    }
+    let decision = match storage.update_with_ownership(&ownership, |instances, _groups| {
         let decision = match owned_trash_generation {
             Some(generation) => crate::session::claim::decide_restore_claim_after_trash(
                 instances,
@@ -2359,7 +2473,7 @@ fn restore_from_trash_with_storage(
         Ok(all) => all.into_iter().find(|instance| instance.id == id),
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore load failed: {error}");
-            let _ = storage.update(|instances, _groups| {
+            let _ = storage.update_with_ownership(&ownership, |instances, _groups| {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                     stored.release_lifecycle_reservation_if_owned(
                         LifecycleOperation::Restore,
@@ -2376,9 +2490,9 @@ fn restore_from_trash_with_storage(
     };
 
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut instance)
+        crate::session::trash::restore_worktree_location(&mut instance, &ownership)
     {
-        let _ = storage.update(|instances, _groups| {
+        let _ = storage.update_with_ownership(&ownership, |instances, _groups| {
             if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
                 stored.release_lifecycle_reservation_if_owned(
                     LifecycleOperation::Restore,
@@ -2392,7 +2506,7 @@ fn restore_from_trash_with_storage(
     let restored_path = instance.project_path.clone();
     let restored_pre = instance.pre_trash_project_path.clone();
 
-    match storage.update(|instances, _groups| {
+    match storage.update_with_ownership(&ownership, |instances, _groups| {
         Ok(crate::session::claim::finalize_restore_commit(
             instances,
             id,

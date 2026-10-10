@@ -89,6 +89,9 @@ pub struct InstanceParams {
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
 pub struct BuildResult {
+    pub(crate) ownership: Option<super::storage::OwnershipGuard>,
+    pub(crate) profile_storage: super::Storage,
+    pub(crate) witness: CreationWitness,
     pub instance: Instance,
     /// Path to worktree if one was created and managed by aoe
     pub created_worktree: Option<CreatedWorktree>,
@@ -105,6 +108,143 @@ pub struct CreatedWorktree {
     pub main_repo_path: PathBuf,
     /// Branch created by this build. `None` when attaching an existing branch.
     pub owned_branch: Option<String>,
+    pub(crate) witness: CheckoutWitness,
+}
+
+/// Pins the originals across hooks and queued worker results, without holding a flock.
+#[derive(Debug, Clone)]
+pub(crate) struct DirectoryWitness {
+    path: PathBuf,
+    directory: std::sync::Arc<std::fs::File>,
+}
+
+impl DirectoryWitness {
+    fn capture(path: &Path) -> Result<Self> {
+        let directory = std::fs::File::open(path)?;
+        anyhow::ensure!(
+            directory.metadata()?.is_dir(),
+            "Session path is not a directory"
+        );
+        let witness = Self {
+            path: path.to_path_buf(),
+            directory: std::sync::Arc::new(directory),
+        };
+        witness.verify()?;
+        Ok(witness)
+    }
+
+    fn verify(&self) -> Result<()> {
+        let actual = std::fs::metadata(&self.path)?;
+        anyhow::ensure!(
+            actual.is_dir()
+                && super::storage::filesystem_identity(&actual)
+                    == super::storage::filesystem_identity(&self.directory.metadata()?),
+            "Session directory changed before publication or cleanup: {}",
+            self.path.display()
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CheckoutWitness {
+    checkout: DirectoryWitness,
+    git_directory: DirectoryWitness,
+    branch: Option<String>,
+}
+
+impl CheckoutWitness {
+    pub(crate) fn capture(path: &Path) -> Result<Self> {
+        let repo = git2::Repository::open(path)?;
+        let branch = Some(repo.head()?.shorthand()?.to_owned());
+        Ok(Self {
+            checkout: DirectoryWitness::capture(path)?,
+            git_directory: DirectoryWitness::capture(repo.path())?,
+            branch,
+        })
+    }
+
+    fn verify(&self) -> Result<()> {
+        self.checkout.verify()?;
+        self.git_directory.verify()?;
+        let repo = git2::Repository::open(&self.checkout.path)?;
+        anyhow::ensure!(
+            Some(repo.head()?.shorthand()?) == self.branch.as_deref(),
+            "Session checkout branch changed before publication or cleanup"
+        );
+        anyhow::ensure!(
+            super::storage::filesystem_identity(&std::fs::metadata(repo.path())?)
+                == super::storage::filesystem_identity(&self.git_directory.directory.metadata()?),
+            "Session Git checkout changed before publication or cleanup"
+        );
+        Ok(())
+    }
+}
+
+/// Original directory and checkout identities retained through unlocked creation hooks.
+/// These handles carry no app-root flock and can safely wait in a result channel.
+#[derive(Debug, Clone)]
+pub struct CreationWitness {
+    directories: Vec<DirectoryWitness>,
+    checkouts: Vec<CheckoutWitness>,
+}
+
+impl CreationWitness {
+    pub(crate) fn capture(instance: &Instance) -> Result<Self> {
+        validate_creation_paths(instance)?;
+        let mut witness = Self {
+            directories: vec![DirectoryWitness::capture(Path::new(
+                &instance.project_path,
+            ))?],
+            checkouts: Vec::new(),
+        };
+        if let Some(workspace) = &instance.workspace_info {
+            if workspace.workspace_dir != instance.project_path {
+                witness
+                    .directories
+                    .push(DirectoryWitness::capture(Path::new(
+                        &workspace.workspace_dir,
+                    ))?);
+            }
+            for repo in &workspace.repos {
+                witness
+                    .checkouts
+                    .push(CheckoutWitness::capture(Path::new(&repo.worktree_path))?);
+            }
+        } else if instance.worktree_info.is_some() {
+            witness
+                .checkouts
+                .push(CheckoutWitness::capture(Path::new(&instance.project_path))?);
+        }
+        Ok(witness)
+    }
+
+    pub(crate) fn original_project_path(&self) -> &Path {
+        &self.directories[0].path
+    }
+
+    pub(crate) fn validate(&self, instance: &Instance) -> Result<()> {
+        for directory in &self.directories {
+            directory.verify()?;
+        }
+        for checkout in &self.checkouts {
+            checkout.verify()?;
+        }
+        validate_creation_paths(instance)
+    }
+
+    pub(crate) fn checkout(&self, path: &Path) -> Option<CheckoutWitness> {
+        self.checkouts
+            .iter()
+            .find(|checkout| checkout.checkout.path == path)
+            .cloned()
+    }
+
+    fn original_directory(&self, path: &Path) -> bool {
+        self.directories
+            .iter()
+            .any(|directory| directory.path == path && directory.verify().is_ok())
+    }
 }
 
 /// Result of creating a multi-repo workspace.
@@ -238,6 +378,27 @@ pub fn create_workspace(
     workspace_template: &str,
     init_submodules: bool,
 ) -> Result<WorkspaceResult> {
+    let mut ownership = Some(super::storage::acquire_ownership_read()?);
+    create_workspace_with_ownership(
+        primary,
+        extra_repos,
+        branch,
+        create_new_branch,
+        workspace_template,
+        init_submodules,
+        &mut ownership,
+    )
+}
+
+pub(crate) fn create_workspace_with_ownership(
+    primary: &WorkspaceRepoSpec,
+    extra_repos: &[WorkspaceRepoSpec],
+    branch: &str,
+    create_new_branch: bool,
+    workspace_template: &str,
+    init_submodules: bool,
+    ownership: &mut Option<super::storage::OwnershipGuard>,
+) -> Result<WorkspaceResult> {
     let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
@@ -248,6 +409,7 @@ pub fn create_workspace(
         primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
     let workspace_dir = workspace_path.to_string_lossy().to_string();
     std::fs::create_dir_all(&workspace_path)?;
+    let workspace_witness = DirectoryWitness::capture(&workspace_path)?;
 
     // (canonicalized path, resolved base branch) for the primary repo followed by every extra repo.
     let all_repos: Vec<(PathBuf, Option<String>)> =
@@ -268,7 +430,8 @@ pub fn create_workspace(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
         if !seen_names.insert(name.clone()) {
-            let _ = std::fs::remove_dir_all(&workspace_path);
+            drop(ownership.take());
+            cleanup_workspace_resources(&[], &workspace_path, &workspace_witness);
             bail!(
                 "Duplicate repository name '{}' in workspace\n\
                  Tip: Rename one of the directories to avoid the collision",
@@ -277,12 +440,9 @@ pub fn create_workspace(
         }
     }
 
-    let cleanup = |created: &[CreatedWorktree], ws_path: &std::path::Path| {
-        let protection = CleanupProtection::default();
-        for worktree in created {
-            cleanup_created_worktree(worktree, "workspace worktree", &protection);
-        }
-        let _ = std::fs::remove_dir_all(ws_path);
+    let mut cleanup = |created: &[CreatedWorktree], ws_path: &std::path::Path| {
+        drop(ownership.take());
+        cleanup_workspace_resources(created, ws_path, &workspace_witness);
     };
 
     // Pre-validate every repo and resolve metadata sequentially. This is cheap
@@ -390,6 +550,7 @@ pub fn create_workspace(
                     path: plan.worktree_subdir.clone(),
                     main_repo_path: plan.main_repo_path.clone(),
                     owned_branch: create_new_branch.then(|| branch.to_string()),
+                    witness: CheckoutWitness::capture(&plan.worktree_subdir)?,
                 });
                 repos.push(WorkspaceRepo {
                     name: plan.repo_name.clone(),
@@ -447,6 +608,8 @@ pub fn build_instance(
     existing_branches: &[&str],
     profile: &str,
 ) -> Result<BuildResult> {
+    let mut ownership = Some(super::storage::acquire_ownership_read()?);
+    let profile_storage = super::Storage::new_unwatched(profile)?;
     // Host-only agents (e.g. settl) cannot run in a sandbox or use worktrees.
     let is_host_only = crate::agents::get_agent(&params.tool).is_some_and(|a| a.host_only);
     if is_host_only && params.sandbox {
@@ -580,13 +743,14 @@ pub fn build_instance(
                 })
                 .collect();
 
-            let ws_result = create_workspace(
+            let ws_result = create_workspace_with_ownership(
                 &primary,
                 &extra_repos,
                 branch,
                 params.create_new_branch,
                 &config.worktree.workspace_path_template,
                 config.worktree.init_submodules,
+                &mut ownership,
             )?;
 
             final_path = ws_result.workspace_path.to_string_lossy().to_string();
@@ -644,6 +808,7 @@ pub fn build_instance(
 
                     final_path = worktree_path.to_string_lossy().to_string();
                     created_worktree = Some(CreatedWorktree {
+                        witness: CheckoutWitness::capture(&worktree_path)?,
                         path: worktree_path,
                         main_repo_path: main_repo_path.clone(),
                         owned_branch: None,
@@ -686,6 +851,7 @@ pub fn build_instance(
 
                 final_path = worktree_path.to_string_lossy().to_string();
                 created_worktree = Some(CreatedWorktree {
+                    witness: CheckoutWitness::capture(&worktree_path)?,
                     path: worktree_path,
                     main_repo_path: main_repo_path.clone(),
                     owned_branch: Some(branch.clone()),
@@ -824,7 +990,11 @@ pub fn build_instance(
         }
     }
 
+    let witness = CreationWitness::capture(&instance)?;
     Ok(BuildResult {
+        ownership,
+        profile_storage,
+        witness,
         instance,
         created_worktree,
         created_workspace_worktrees,
@@ -832,62 +1002,140 @@ pub fn build_instance(
     })
 }
 
+pub(crate) fn validate_creation_paths(instance: &Instance) -> Result<()> {
+    if !Path::new(&instance.project_path).is_dir() {
+        bail!("Session working directory disappeared before publication");
+    }
+    if let Some(workspace) = &instance.workspace_info {
+        if !Path::new(&workspace.workspace_dir).is_dir() {
+            bail!("Session workspace disappeared before publication");
+        }
+        for repo in &workspace.repos {
+            validate_checkout(&repo.main_repo_path, &repo.worktree_path, &repo.branch)?;
+        }
+    } else if let Some(worktree) = &instance.worktree_info {
+        validate_checkout(
+            &worktree.main_repo_path,
+            &instance.project_path,
+            &worktree.branch,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_checkout(main_repo: &str, path: &str, branch: &str) -> Result<()> {
+    let path = Path::new(path).canonicalize()?;
+    let worktrees = GitWorktree::new(PathBuf::from(main_repo))?.list_worktrees()?;
+    if !worktrees.iter().any(|entry| {
+        entry.branch.as_deref() == Some(branch)
+            && entry.path.canonicalize().ok().as_ref() == Some(&path)
+    }) {
+        bail!("Session checkout or branch changed before publication");
+    }
+    Ok(())
+}
+
+fn cleanup_owners(ownership: &super::storage::OwnershipGuard) -> Result<Vec<Instance>> {
+    let mut owners = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for profile in super::list_profiles_for_worktree_inventory()? {
+        let storage = super::Storage::open_unwatched_with_ownership(&profile, ownership)?;
+        if seen.insert(storage.physical_profile_identity()?) {
+            owners.extend(storage.load_strict_for_worktree_ownership()?);
+        }
+    }
+    Ok(owners)
+}
+
+fn cleanup_workspace_resources(
+    created: &[CreatedWorktree],
+    workspace_path: &Path,
+    witness: &DirectoryWitness,
+) {
+    let Ok(ownership) = super::storage::acquire_ownership_lock() else {
+        return;
+    };
+    let Ok(owners) = cleanup_owners(&ownership) else {
+        return;
+    };
+    let protection = CleanupProtection {
+        owner: None,
+        owners,
+    };
+    let originals_intact = created
+        .iter()
+        .all(|worktree| worktree.witness.verify().is_ok());
+    for worktree in created {
+        cleanup_created_worktree(worktree, "workspace worktree", &protection);
+    }
+    if originals_intact && witness.verify().is_ok() && !protection.references_path(workspace_path) {
+        let _ = std::fs::remove_dir_all(workspace_path);
+    }
+}
+
 #[derive(Default)]
 struct CleanupProtection<'a> {
     owner: Option<&'a Instance>,
+    owners: Vec<Instance>,
 }
 
 impl CleanupProtection<'_> {
     fn paths_equal(left: &Path, right: &Path) -> bool {
-        left == right
-            || left
-                .canonicalize()
-                .ok()
-                .zip(right.canonicalize().ok())
-                .is_some_and(|(left, right)| left == right)
+        match (
+            super::deletion::resolve_claim_path(left),
+            super::deletion::resolve_claim_path(right),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
     }
 
-    /// Exact matches protect a winner-owned worktree; containment protects a
-    /// winner path nested under a workspace root from recursive root cleanup.
     fn path_references_target(reference: &Path, target: &Path) -> bool {
-        if reference == target || reference.starts_with(target) {
-            return true;
+        match (
+            super::deletion::resolve_claim_path(reference),
+            super::deletion::resolve_claim_path(target),
+        ) {
+            (Some(reference), Some(target)) => {
+                reference.starts_with(&target) || target.starts_with(reference)
+            }
+            _ => true,
         }
-        reference
-            .canonicalize()
-            .ok()
-            .zip(target.canonicalize().ok())
-            .is_some_and(|(reference, target)| reference == target || reference.starts_with(target))
     }
 
     fn references_path(&self, target: &Path) -> bool {
-        let Some(owner) = self.owner else {
-            return false;
-        };
-        if Self::path_references_target(Path::new(&owner.project_path), target) {
-            return true;
-        }
-        owner.workspace_info.as_ref().is_some_and(|workspace| {
-            Self::path_references_target(Path::new(&workspace.workspace_dir), target)
-                || workspace.repos.iter().any(|repo| {
-                    Self::path_references_target(Path::new(&repo.worktree_path), target)
-                })
-        })
+        self.owner
+            .into_iter()
+            .chain(self.owners.iter())
+            .any(|owner| {
+                Self::path_references_target(Path::new(&owner.project_path), target)
+                    || owner
+                        .pre_trash_project_path
+                        .as_deref()
+                        .is_some_and(|path| Self::path_references_target(Path::new(path), target))
+                    || owner.workspace_info.as_ref().is_some_and(|workspace| {
+                        Self::path_references_target(Path::new(&workspace.workspace_dir), target)
+                            || workspace.repos.iter().any(|repo| {
+                                Self::path_references_target(Path::new(&repo.worktree_path), target)
+                            })
+                    })
+            })
     }
 
     fn references_branch(&self, main_repo_path: &Path, branch: &str) -> bool {
-        let Some(owner) = self.owner else {
-            return false;
-        };
-        owner.worktree_info.as_ref().is_some_and(|worktree| {
-            Self::paths_equal(Path::new(&worktree.main_repo_path), main_repo_path)
-                && worktree.branch == branch
-        }) || owner.workspace_info.as_ref().is_some_and(|workspace| {
-            workspace.repos.iter().any(|repo| {
-                Self::paths_equal(Path::new(&repo.main_repo_path), main_repo_path)
-                    && repo.branch == branch
+        self.owner
+            .into_iter()
+            .chain(self.owners.iter())
+            .any(|owner| {
+                owner.worktree_info.as_ref().is_some_and(|worktree| {
+                    Self::paths_equal(Path::new(&worktree.main_repo_path), main_repo_path)
+                        && worktree.branch == branch
+                }) || owner.workspace_info.as_ref().is_some_and(|workspace| {
+                    workspace.repos.iter().any(|repo| {
+                        Self::paths_equal(Path::new(&repo.main_repo_path), main_repo_path)
+                            && repo.branch == branch
+                    })
+                })
             })
-        })
     }
 }
 
@@ -898,6 +1146,9 @@ fn cleanup_created_worktree(
     label: &str,
     protection: &CleanupProtection<'_>,
 ) {
+    if created.witness.verify().is_err() {
+        return;
+    }
     if protection.references_path(&created.path) {
         tracing::debug!(
             target: "session.create",
@@ -924,20 +1175,18 @@ fn cleanup_created_worktree(
     }
 }
 
-/// Clean up resources created during a failed or cancelled instance build.
-pub fn cleanup_instance(
+/// Roll back resources of a creation candidate that was never published.
+pub fn cleanup_unpublished_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
     protected_owner: Option<&Instance>,
+    witness: &CreationWitness,
 ) {
-    // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
-    // row.
     instance.kill_all_tmux_sessions_without_lifecycle_row();
 
     if let Some(sandbox) = &instance.sandbox_info {
         if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence probe.
             let container = containers::DockerContainer::from_session_id(&instance.id);
             if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
                 tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
@@ -945,16 +1194,30 @@ pub fn cleanup_instance(
         }
     }
 
-    let protection = CleanupProtection {
-        owner: protected_owner,
+    let ownership = match super::storage::acquire_ownership_lock() {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            tracing::warn!(target: "session.create", "Retaining creation paths: ownership lock failed: {error:#}");
+            return;
+        }
+    };
+    let owners = match cleanup_owners(&ownership) {
+        Ok(owners) => owners,
+        Err(error) => {
+            tracing::warn!(target: "session.create", "Retaining creation paths: ownership inventory failed: {error:#}");
+            return;
+        }
     };
 
-    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
-    // cleanup targets exist), so an abort between provisioning and the caller finishing the session
-    // would otherwise leak the directory on disk.
+    let protection = CleanupProtection {
+        owner: protected_owner,
+        owners,
+    };
+
     if instance.scratch {
         let scratch_path = PathBuf::from(&instance.project_path);
-        if !protection.references_path(&scratch_path)
+        if witness.original_directory(&scratch_path)
+            && !protection.references_path(&scratch_path)
             && super::scratch::is_scratch_path(&scratch_path)
         {
             if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
@@ -967,6 +1230,9 @@ pub fn cleanup_instance(
         }
     }
 
+    let originals_intact = created_workspace_worktrees
+        .iter()
+        .all(|worktree| worktree.witness.verify().is_ok());
     if let Some(worktree) = created_worktree {
         cleanup_created_worktree(worktree, "worktree", &protection);
     }
@@ -976,7 +1242,10 @@ pub fn cleanup_instance(
     }
     if let Some(workspace) = &instance.workspace_info {
         let workspace_dir = Path::new(&workspace.workspace_dir);
-        if !protection.references_path(workspace_dir) {
+        if originals_intact
+            && witness.original_directory(workspace_dir)
+            && !protection.references_path(workspace_dir)
+        {
             let _ = std::fs::remove_dir_all(workspace_dir);
         }
     }
@@ -1326,6 +1595,132 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn creation_publication_rejects_removed_or_replaced_checkout() {
+        let (parent, _) = init_repo_with_branch("publication", "release");
+        let main = parent.path().join("publication");
+        let path = parent.path().join("checkout");
+        let git = GitWorktree::new(main.clone()).unwrap();
+        git.create_worktree("publication-branch", &path, true, Some("release"))
+            .unwrap();
+        let mut instance = Instance::new("publication", &path.to_string_lossy());
+        instance.worktree_info = Some(WorktreeInfo {
+            branch: "publication-branch".to_string(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        let witness = CreationWitness::capture(&instance).unwrap();
+        witness.validate(&instance).unwrap();
+        git.remove_worktree(&path, false).unwrap();
+        assert!(witness.validate(&instance).is_err());
+        git.create_worktree("publication-branch", &path, false, None)
+            .unwrap();
+        assert!(witness.validate(&instance).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_preserves_later_profile_path_and_branch_claims() {
+        let app = tempfile::tempdir().unwrap();
+        let _home = super::super::test_support::isolate_app_dir_at(app.path());
+        let (parent, _) = init_repo_with_branch("cleanup-owner", "release");
+        let main = parent.path().join("cleanup-owner");
+        let path = parent.path().join("checkout");
+        let git = GitWorktree::new(main.clone()).unwrap();
+        git.create_worktree("claimed-branch", &path, true, Some("release"))
+            .unwrap();
+        let mut unpublished = Instance::new("unpublished", &path.to_string_lossy());
+        unpublished.worktree_info = Some(WorktreeInfo {
+            branch: "claimed-branch".to_string(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        let created = CreatedWorktree {
+            path: path.clone(),
+            main_repo_path: main.clone(),
+            owned_branch: Some("claimed-branch".to_string()),
+            witness: CheckoutWitness::capture(&path).unwrap(),
+        };
+        let witness = CreationWitness::capture(&unpublished).unwrap();
+        let storage = super::super::Storage::new_unwatched("later-owner").unwrap();
+        let owner = unpublished.clone();
+        storage
+            .update(|rows, _| {
+                rows.push(owner);
+                Ok(())
+            })
+            .unwrap();
+        cleanup_unpublished_instance(&unpublished, Some(&created), &[], None, &witness);
+        assert!(path.is_dir());
+        storage
+            .update(|rows, _| {
+                rows[0].project_path = main.to_string_lossy().into_owned();
+                Ok(())
+            })
+            .unwrap();
+        cleanup_unpublished_instance(&unpublished, Some(&created), &[], None, &witness);
+        assert!(!path.exists());
+        assert!(git.branch_exists("claimed-branch").unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_rollback_preserves_raw_ancestor_and_unknown_alias_claims() {
+        for claim in ["ancestor", "aliased-ancestor", "broken-alias"] {
+            let app = tempfile::tempdir().unwrap();
+            let _home = super::super::test_support::isolate_app_dir_at(app.path());
+            let (parent, _) = init_repo_with_branch("rollback-claims", "release");
+            let main = parent.path().join("rollback-claims");
+            let path = parent.path().join("checkout");
+            let git = GitWorktree::new(main.clone()).unwrap();
+            git.create_worktree("claimed-branch", &path, true, Some("release"))
+                .unwrap();
+            let mut unpublished = Instance::new("unpublished", &path.to_string_lossy());
+            unpublished.worktree_info = Some(WorktreeInfo {
+                branch: "claimed-branch".into(),
+                main_repo_path: main.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: Utc::now(),
+                base_branch: None,
+            });
+            let created = CreatedWorktree {
+                path: path.clone(),
+                main_repo_path: main,
+                owned_branch: Some("claimed-branch".into()),
+                witness: CheckoutWitness::capture(&path).unwrap(),
+            };
+            let witness = CreationWitness::capture(&unpublished).unwrap();
+            let reference = if claim == "ancestor" {
+                parent.path().to_path_buf()
+            } else {
+                let alias = parent.path().join("alias");
+                let target = if claim == "broken-alias" {
+                    parent.path().join("missing")
+                } else {
+                    parent.path().to_path_buf()
+                };
+                std::os::unix::fs::symlink(target, &alias).unwrap();
+                alias
+            };
+            let storage = super::super::Storage::new_unwatched("raw-peer").unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(Instance::new("raw", &reference.to_string_lossy()));
+                    Ok(())
+                })
+                .unwrap();
+            cleanup_unpublished_instance(&unpublished, Some(&created), &[], None, &witness);
+            assert!(path.is_dir(), "{claim}: raw peer checkout was removed");
+            assert!(
+                git.branch_exists("claimed-branch").unwrap(),
+                "{claim}: branch was removed"
+            );
+        }
+    }
 
     fn roman_for_test(n: u32) -> String {
         let mut remaining = n;
@@ -1798,6 +2193,7 @@ mod tests {
             path: worktree_path.clone(),
             main_repo_path: main_repo_path.clone(),
             owned_branch: Some("rollback-branch".to_string()),
+            witness: CheckoutWitness::capture(&worktree_path).unwrap(),
         };
         cleanup_created_worktree(&created, "test worktree", &CleanupProtection::default());
 
@@ -2286,6 +2682,48 @@ mod tests {
         assert!(
             refused.contains("codex") && refused.contains("claude"),
             "the refusal must name both agents: {refused}"
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn ownership_review_cleanup_retires_unpublished_tmux_with_unknown_claims() {
+        if which::which("tmux").is_err() {
+            eprintln!("tmux unavailable; runtime cleanup scenario skipped");
+            return;
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let peer = super::super::Storage::new_unwatched("opaque-peer").unwrap();
+        let mut instance = Instance::new("unpublished", "/unused");
+        let scratch = super::super::scratch::provision_scratch_dir(&instance.id).unwrap();
+        instance.project_path = scratch.to_string_lossy().into_owned();
+        instance.scratch = true;
+        let witness = CreationWitness::capture(&instance).unwrap();
+        struct RuntimeCleanup<'a>(&'a Instance);
+        impl Drop for RuntimeCleanup<'_> {
+            fn drop(&mut self) {
+                self.0.kill_all_tmux_sessions_without_lifecycle_row();
+            }
+        }
+        let _cleanup = RuntimeCleanup(&instance);
+        let tmux = instance.tmux_session().unwrap();
+        tmux.create(&instance.project_path, Some("exec sleep 300"), "default")
+            .unwrap();
+        assert!(tmux.exists());
+        std::fs::write(peer.sessions_path(), b"{invalid").unwrap();
+        cleanup_unpublished_instance(&instance, None, &[], None, &witness);
+        assert!(
+            !tmux.exists(),
+            "unknown filesystem ownership must not strand an unpublished runtime"
+        );
+        assert!(
+            scratch.is_dir(),
+            "unknown ownership must still preserve the checkout"
+        );
+        std::fs::write(peer.sessions_path(), b"[]").unwrap();
+        cleanup_unpublished_instance(&instance, None, &[], None, &witness);
+        assert!(
+            !scratch.exists(),
+            "a known unclaimed original scratch directory can be rolled back"
         );
     }
 }

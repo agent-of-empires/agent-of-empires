@@ -275,35 +275,67 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         return Ok(());
     }
 
+    let ownership = crate::session::storage::acquire_ownership_lock()?;
+    let _identity =
+        crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+    storage.verify_profile_identity()?;
     let mut removed_count = 0;
 
     if !orphaned_sessions.is_empty() {
-        let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
-        storage.update(|all_instances, _groups| {
-            all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
-            Ok(())
+        let removed = storage.update_with_ownership(&ownership, |all_instances, _groups| {
+            let before = all_instances.len();
+            all_instances.retain(|inst| {
+                let Some(snapshot) = orphaned_sessions.iter().find(|old| old.id == inst.id) else {
+                    return true;
+                };
+                if inst.created_at != snapshot.created_at
+                    || inst.project_path != snapshot.project_path
+                    || inst.workspace_info.as_ref().map(|workspace| {
+                        (
+                            &workspace.workspace_dir,
+                            &workspace.branch,
+                            &workspace.repos,
+                            workspace.created_at,
+                            workspace.cleanup_on_delete,
+                        )
+                    }) != snapshot.workspace_info.as_ref().map(|workspace| {
+                        (
+                            &workspace.workspace_dir,
+                            &workspace.branch,
+                            &workspace.repos,
+                            workspace.created_at,
+                            workspace.cleanup_on_delete,
+                        )
+                    })
+                    || inst.worktree_info != snapshot.worktree_info
+                    || inst.lifecycle_reservation != snapshot.lifecycle_reservation
+                {
+                    return true;
+                }
+                let path = inst
+                    .workspace_info
+                    .as_ref()
+                    .map_or(Path::new(&inst.project_path), |workspace| {
+                        Path::new(&workspace.workspace_dir)
+                    });
+                !matches!(path.try_exists(), Ok(false))
+            });
+            Ok(before - all_instances.len())
         })?;
-
-        removed_count += orphaned_sessions.len();
-        println!("✓ Removed {} orphaned sessions", orphaned_sessions.len());
+        removed_count += removed;
+        println!("✓ Removed {removed} orphaned sessions");
     }
 
     if !orphaned_worktrees.is_empty() {
         let current_dir = std::env::current_dir()?;
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
-
-        for wt in &orphaned_worktrees {
-            match git_wt.remove_worktree(&wt.path, true) {
-                Ok(_) => {
-                    println!("✓ Removed worktree: {}", wt.path.display());
-                    removed_count += 1;
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to remove {}: {}", wt.path.display(), e);
-                }
-            }
-        }
+        removed_count += cleanup_worktrees_with_ownership(
+            &git_wt,
+            &orphaned_worktrees,
+            storage.profile(),
+            &ownership,
+        )?;
     }
 
     println!("\n✓ Cleanup complete: {} items removed", removed_count);
@@ -311,9 +343,108 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_worktrees_with_ownership(
+    git_wt: &GitWorktree,
+    candidates: &[WorktreeEntry],
+    profile: &str,
+    ownership: &crate::session::storage::OwnershipGuard,
+) -> Result<usize> {
+    let claims =
+        crate::session::deletion::paths_in_use_except_with_ownership(ownership, profile, &[]);
+    let live = git_wt.list_worktrees()?;
+    let protected = git_wt.protected_default_branch_names()?;
+    let mut removed = 0;
+    for wt in candidates {
+        if claims.covers(&wt.path)
+            || !live
+                .iter()
+                .any(|current| current.path == wt.path && current.branch == wt.branch)
+            || wt
+                .branch
+                .as_ref()
+                .is_some_and(|branch| protected.contains(branch))
+        {
+            println!(
+                "Retained claimed or changed worktree: {}",
+                wt.path.display()
+            );
+            continue;
+        }
+        match git_wt.remove_worktree(&wt.path, true) {
+            Ok(_) => {
+                println!("✓ Removed worktree: {}", wt.path.display());
+                removed += 1;
+            }
+            Err(e) => eprintln!("✗ Failed to remove {}: {}", wt.path.display(), e),
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn confirmed_cleanup_rechecks_late_and_unreadable_peer_claims() -> Result<()> {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::tempdir()?;
+        let repo_path = temp.path().join("repo");
+        let repo = git2::Repository::init(&repo_path)?;
+        let signature = git2::Signature::now("Test", "test@example.invalid")?;
+        let tree_id = repo.index()?.write_tree()?;
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "initial",
+            &repo.find_tree(tree_id)?,
+            &[],
+        )?;
+        let base = repo.head()?.shorthand().unwrap().to_owned();
+        let git = GitWorktree::new(repo_path)?;
+        let path = temp.path().join("candidate");
+        git.create_worktree("candidate", &path, true, Some(&base))?;
+        let candidates: Vec<_> = git
+            .list_worktrees()?
+            .into_iter()
+            .filter(|worktree| worktree.branch.as_deref() == Some("candidate"))
+            .collect();
+        let cleaner = Storage::new_unwatched("cleaner")?;
+        let peer = Storage::new_unwatched("late-peer")?;
+        peer.update(|rows, _| {
+            rows.push(crate::session::Instance::new(
+                "peer",
+                path.to_str().unwrap(),
+            ));
+            Ok(())
+        })?;
+        let ownership = crate::session::storage::acquire_ownership_lock()?;
+        assert_eq!(
+            cleanup_worktrees_with_ownership(&git, &candidates, cleaner.profile(), &ownership)?,
+            0
+        );
+        assert!(path.is_dir());
+        assert_eq!(peer.load()?[0].project_path, path.to_string_lossy());
+        std::fs::write(
+            peer.sessions_path(),
+            r#"[{"project_path":"/unreadable-owner"}]"#,
+        )?;
+        assert_eq!(
+            cleanup_worktrees_with_ownership(&git, &candidates, cleaner.profile(), &ownership)?,
+            0
+        );
+        assert!(path.is_dir());
+        std::fs::write(peer.sessions_path(), "[]")?;
+        assert_eq!(
+            cleanup_worktrees_with_ownership(&git, &candidates, cleaner.profile(), &ownership)?,
+            1
+        );
+        assert!(!path.exists());
+        assert!(git.branch_exists("candidate")?);
+        Ok(())
+    }
 
     fn entry(path: &str, branch: Option<&str>) -> WorktreeEntry {
         WorktreeEntry {

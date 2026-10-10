@@ -21,22 +21,36 @@ pub struct CreationRequest {
     pub cancel: CancellationToken,
 }
 
-#[derive(Debug)]
+pub struct CreationSuccess {
+    pub profile_storage: crate::session::Storage,
+    pub witness: builder::CreationWitness,
+    pub session_id: String,
+    pub instance: Instance,
+    pub created_worktree: Option<CreatedWorktreeInfo>,
+    pub created_workspace_worktrees: Vec<CreatedWorktreeInfo>,
+    pub on_launch_hooks_ran: bool,
+    pub warnings: Vec<String>,
+}
+
 pub enum CreationResult {
-    Success {
-        session_id: String,
-        instance: Box<Instance>,
-        created_worktree: Option<CreatedWorktreeInfo>,
-        /// Workspace worktrees created during build, needed for rollback.
-        created_workspace_worktrees: Vec<CreatedWorktreeInfo>,
-        on_launch_hooks_ran: bool,
-        /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
-        /// failures). Surfaced as a transient toast in the UI.
-        warnings: Vec<String>,
-    },
+    Success(Box<CreationSuccess>),
     Error(String),
-    /// Cancelled before success; the worker already rolled back what it built.
+    /// The worker already rolled back the cancelled build.
     Cancelled,
+}
+
+impl std::fmt::Debug for CreationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success(success) => f
+                .debug_struct("Success")
+                .field("session_id", &success.session_id)
+                .field("profile", &success.profile_storage.profile())
+                .finish_non_exhaustive(),
+            Self::Error(error) => f.debug_tuple("Error").field(error).finish(),
+            Self::Cancelled => f.write_str("Cancelled"),
+        }
+    }
 }
 
 pub struct CreationOutcome {
@@ -45,12 +59,13 @@ pub struct CreationOutcome {
     pub cancelled: bool,
 }
 
-/// Serializable worktree info for passing across thread boundary
+/// Worktree cleanup information and pinned originals passed across the worker boundary.
 #[derive(Debug, Clone)]
 pub struct CreatedWorktreeInfo {
     pub path: String,
     pub main_repo_path: String,
     pub owned_branch: Option<String>,
+    pub(crate) witness: builder::CheckoutWitness,
 }
 
 impl From<&CreatedWorktree> for CreatedWorktreeInfo {
@@ -59,6 +74,7 @@ impl From<&CreatedWorktree> for CreatedWorktreeInfo {
             path: wt.path.to_string_lossy().to_string(),
             main_repo_path: wt.main_repo_path.to_string_lossy().to_string(),
             owned_branch: wt.owned_branch.clone(),
+            witness: wt.witness.clone(),
         }
     }
 }
@@ -69,6 +85,7 @@ impl From<&CreatedWorktreeInfo> for CreatedWorktree {
             path: worktree.path.as_str().into(),
             main_repo_path: worktree.main_repo_path.as_str().into(),
             owned_branch: worktree.owned_branch.clone(),
+            witness: worktree.witness.clone(),
         }
     }
 }
@@ -81,8 +98,8 @@ pub struct CreationPoller {
     _handle: thread::JoinHandle<()>,
     /// Requests sent and not yet received, including cancelled ones still winding down.
     in_flight: usize,
-    /// Profile from the last creation request (for cross-profile saves)
-    last_profile: Option<String>,
+    #[cfg(test)]
+    result_queued_observer: std::sync::Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
 }
 
 /// Appends which config file declared the failing `on_create` commands.
@@ -100,6 +117,11 @@ impl CreationPoller {
             mpsc::channel::<(CreationRequest, mpsc::Sender<HookProgress>)>();
         let (result_tx, result_rx) = mpsc::channel::<(CreationResult, CancellationToken)>();
         let (progress_tx, progress_rx) = mpsc::channel::<HookProgress>();
+        #[cfg(test)]
+        let result_queued_observer =
+            std::sync::Arc::new(std::sync::Mutex::new(None::<mpsc::Sender<()>>));
+        #[cfg(test)]
+        let queued_observer = result_queued_observer.clone();
 
         let handle = thread::spawn(move || {
             while let Ok((request, prog_tx)) = request_rx.recv() {
@@ -107,6 +129,10 @@ impl CreationPoller {
                 let result = Self::create_instance(request, &prog_tx);
                 if result_tx.send((result, cancel)).is_err() {
                     break;
+                }
+                #[cfg(test)]
+                if let Some(observer) = queued_observer.lock().unwrap().take() {
+                    let _ = observer.send(());
                 }
             }
         });
@@ -118,7 +144,8 @@ impl CreationPoller {
             progress_tx,
             _handle: handle,
             in_flight: 0,
-            last_profile: None,
+            #[cfg(test)]
+            result_queued_observer,
         }
     }
 
@@ -157,6 +184,9 @@ impl CreationPoller {
                 Err(e) => return CreationResult::Error(format!("{:#}", e)),
             };
 
+        let ownership = std::cell::RefCell::new(build_result.ownership);
+        let profile_storage = build_result.profile_storage;
+        let witness = build_result.witness;
         let mut instance = build_result.instance;
         // Tag the instance with its profile NOW, before container creation or any
         // hook execution. Downstream config-resolution sites (build_container_config,
@@ -171,11 +201,13 @@ impl CreationPoller {
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
         let roll_back = |instance: &Instance| {
-            builder::cleanup_instance(
+            drop(ownership.borrow_mut().take());
+            builder::cleanup_unpublished_instance(
                 instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
                 None,
+                &witness,
             )
         };
         let cancelled = |instance: &Instance| {
@@ -203,6 +235,9 @@ impl CreationPoller {
         let mut container_started = false;
         let hook_env = repo_config::lifecycle_env_vars(&instance);
 
+        if has_on_create || has_on_launch {
+            drop(ownership.borrow_mut().take());
+        }
         // Execute on_create hooks after worktree setup, before starting
         if has_on_create {
             let hooks = hooks.as_ref().unwrap();
@@ -289,15 +324,25 @@ impl CreationPoller {
         }
 
         if sandbox && !container_started {
-            // Only ensure the container is running here if hooks didn't already
-            // start it. Don't create the tmux session yet -- that happens at attach time
-            // where the terminal size is available.
-            if let Err(e) = instance.get_container_until_cancelled(&cancel) {
-                return failed(&instance, format!("{:#}", e));
+            drop(ownership.borrow_mut().take());
+            if let Err(error) = instance.get_container_until_cancelled(&cancel) {
+                return failed(&instance, format!("{error:#}"));
             }
         }
         if cancel.is_cancelled() {
             return cancelled(&instance);
+        }
+        if ownership.borrow().is_none() {
+            match crate::session::storage::acquire_ownership_read() {
+                Ok(guard) => *ownership.borrow_mut() = Some(guard),
+                Err(error) => return failed(&instance, format!("{error:#}")),
+            }
+        }
+        if let Err(error) = profile_storage.verify_profile_identity() {
+            return failed(&instance, format!("{error:#}"));
+        }
+        if let Err(error) = witness.validate(&instance) {
+            return failed(&instance, format!("{error:#}"));
         }
 
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
@@ -306,18 +351,22 @@ impl CreationPoller {
             .map(CreatedWorktreeInfo::from)
             .collect();
 
-        CreationResult::Success {
+        // A queued root flock would deadlock an exclusive UI action before polling.
+        drop(ownership.into_inner());
+        CreationResult::Success(Box::new(CreationSuccess {
+            profile_storage,
+            witness,
             session_id: instance.id.clone(),
-            instance: Box::new(instance),
+            instance,
             created_worktree: created_worktree_info,
             created_workspace_worktrees: created_workspace_worktree_info,
             on_launch_hooks_ran: has_on_launch,
             warnings,
-        }
+        }))
     }
 
     pub fn request_creation(&mut self, request: CreationRequest) {
-        self.last_profile = Some(request.data.profile.clone());
+        // The result carries the original Storage rather than a mutable last-profile hint.
         if self
             .request_tx
             .send((request, self.progress_tx.clone()))
@@ -329,8 +378,11 @@ impl CreationPoller {
         }
     }
 
-    pub fn last_profile(&self) -> Option<String> {
-        self.last_profile.clone()
+    #[cfg(test)]
+    pub(crate) fn observe_next_queued_result(&self) -> mpsc::Receiver<()> {
+        let (sender, receiver) = mpsc::channel();
+        *self.result_queued_observer.lock().unwrap() = Some(sender);
+        receiver
     }
 
     pub fn try_recv_result(&mut self) -> Option<CreationOutcome> {

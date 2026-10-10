@@ -10,6 +10,19 @@ impl HomeView {
     where
         F: FnOnce(&mut Instance),
     {
+        let ownership = crate::session::storage::acquire_ownership_read()?;
+        self.apply_user_action_with_ownership(&ownership, id, mutate)
+    }
+
+    pub(in crate::tui) fn apply_user_action_with_ownership<F>(
+        &mut self,
+        ownership: &crate::session::storage::OwnershipGuard,
+        id: &str,
+        mutate: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut Instance),
+    {
         let Some(profile) = self
             .instances
             .get(id)
@@ -26,7 +39,7 @@ impl HomeView {
 
         let id_owned = id.to_string();
         let result = if let Some(storage) = self.storages.get(&profile) {
-            storage.update(|instances, _groups| {
+            storage.update_with_ownership(ownership, |instances, _groups| {
                 if let Some(disk) = instances
                     .iter_mut()
                     .find(|instance| instance.id == id_owned)

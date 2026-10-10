@@ -35,7 +35,7 @@ fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
 }
 fn build_rename_test_state(
     persisted: Vec<Instance>,
-    cached: Vec<Instance>,
+    mut cached: Vec<Instance>,
 ) -> (Storage, std::sync::Arc<crate::server::AppState>) {
     let storage = Storage::new_unwatched("default").unwrap();
     storage
@@ -44,6 +44,9 @@ fn build_rename_test_state(
             Ok(())
         })
         .unwrap();
+    for instance in &mut cached {
+        instance.source_profile = storage.profile().to_string();
+    }
     let state = crate::server::test_support::build_test_app_state(cached);
     (storage, state)
 }
@@ -3906,7 +3909,10 @@ fn rename_persistence_reports_missing_authoritative_row() {
     let _ = crate::session::get_app_dir().expect("isolated app dir");
     let storage = Storage::new_unwatched("rename-missing").unwrap();
 
-    let outcome = persist_rename_metadata(&storage, "missing-id", "New title", None, None).unwrap();
+    let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+    let outcome =
+        persist_rename_metadata(&storage, &ownership, "missing-id", "New title", None, None)
+            .unwrap();
     assert_eq!(outcome, RenamePersistOutcome::Missing);
     assert!(
         storage.load().unwrap().is_empty(),

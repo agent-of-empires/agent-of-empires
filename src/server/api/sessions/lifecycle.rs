@@ -364,8 +364,8 @@ pub async fn update_session_archive(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/trash`. The per-instance lifecycle flock is held
-/// from the durable Trash reservation through teardown, relocation, and final commit.
+/// Trash releases the reservation locks before SDK shutdown, then reacquires exclusive
+/// ownership and revalidates the physical profile and durable row before relocation.
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -388,22 +388,23 @@ pub async fn trash_session(
     };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-    let (profile, snapshot) = {
+    let profile = {
         let instances = state.instances.read().await;
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return session_not_found();
         };
-        (instance.source_profile.clone(), instance.clone())
+        instance.source_profile.clone()
     };
 
     let reserve_profile = profile.clone();
     let reserve_id = id.clone();
     let file_watch = state.file_watch.clone();
-    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
+    let (storage, generation, snapshot) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
-            let storage = Storage::new(&reserve_profile, file_watch)?;
+            let storage = Storage::open(&reserve_profile, file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
-            let generation = storage.update(|instances, _groups| {
+            storage.load_strict_for_worktree_ownership()?;
+            let (generation, snapshot) = storage.update(|instances, _groups| {
                 let Some(instance) = instances
                     .iter_mut()
                     .find(|instance| instance.id == reserve_id)
@@ -418,9 +419,10 @@ pub async fn trash_session(
                     )
                     .map_err(anyhow::Error::new)?;
                 instance.trash();
-                Ok(instance.lifecycle_generation)
+                Ok((instance.lifecycle_generation, instance.clone()))
             })?;
-            Ok((storage, lifecycle_lock, generation))
+            drop(lifecycle_lock);
+            Ok((storage, generation, snapshot))
         },
     )
     .await
@@ -435,6 +437,12 @@ pub async fn trash_session(
             return persist_failed_response();
         }
     };
+    let mut cleanup = crate::session::claim::ReservationCleanup::new(
+        &storage,
+        &snapshot,
+        LifecycleOperation::Trash,
+        generation,
+    );
 
     let was_structured_view = snapshot.is_structured();
     {
@@ -457,11 +465,35 @@ pub async fn trash_session(
         }
     }
 
+    cleanup.disarm();
+    drop(cleanup);
     let work_id = id.clone();
     let kill_pane = body.kill_pane;
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let _lifecycle_lock = lifecycle_lock;
-        let mut instance = snapshot;
+        let mut cleanup = crate::session::claim::ReservationCleanup::new(
+            &storage,
+            &snapshot,
+            LifecycleOperation::Trash,
+            generation,
+        );
+        let ownership = crate::session::storage::acquire_ownership_lock()?;
+        let _identity_lock =
+            crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+        let _lifecycle_lock =
+            storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &work_id)?;
+        let mut instance = storage
+            .load_strict_for_worktree_ownership()?
+            .into_iter()
+            .find(|instance| instance.id == work_id)
+            .ok_or_else(|| anyhow::anyhow!("session disappeared before trash relocation"))?;
+        anyhow::ensure!(
+            instance.created_at == snapshot.created_at
+                && instance.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
+                && crate::session::trash::plan_inputs_unchanged(&snapshot, &instance),
+            "trash lifecycle reservation or relocation plan was superseded"
+        );
+        cleanup.disarm();
+        drop(cleanup);
         if kill_pane {
             if was_structured_view {
                 instance.kill_ancillary_tmux_sessions_locked();
@@ -469,7 +501,7 @@ pub async fn trash_session(
                 instance.kill_all_tmux_sessions_locked();
             }
         }
-        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance, &ownership);
         let relocation = match &outcome {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {
                 Some(crate::session::trash::TrashRelocation {
@@ -480,7 +512,7 @@ pub async fn trash_session(
             crate::session::trash::RelocateOutcome::Skipped
             | crate::session::trash::RelocateOutcome::Failed { .. } => None,
         };
-        storage.update(|instances, _groups| {
+        storage.update_with_ownership(&ownership, |instances, _groups| {
             if let Some(relocation) = &relocation {
                 let commit = crate::session::claim::commit_trash_relocation(
                     instances, &work_id, generation, relocation,
@@ -577,13 +609,21 @@ pub async fn restore_session(
     let file_watch = state.file_watch.clone();
     let restored = tokio::task::spawn_blocking(move || {
         let run = || -> Result<Instance, RestoreTransitionError> {
-            let storage = Storage::new(&restore_profile, file_watch)
+            let ownership = crate::session::storage::acquire_ownership_lock()
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let _identity_lock =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)
+                    .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let storage = Storage::open_with_ownership(&restore_profile, file_watch, &ownership)
                 .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
             let _lifecycle_lock = storage
-                .acquire_instance_lifecycle_lock(&restore_id)
+                .acquire_instance_lifecycle_lock_with_ownership(&ownership, &restore_id)
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            storage
+                .load_strict_for_worktree_ownership()
                 .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
             let decision = storage
-                .update(|instances, _groups| {
+                .update_with_ownership(&ownership, |instances, _groups| {
                     crate::session::claim::decide_restore_claim(
                         instances,
                         &restore_id,
@@ -602,7 +642,7 @@ pub async fn restore_session(
                 }
             };
             let Some(mut instance) = storage
-                .load()
+                .load_strict_for_worktree_ownership()
                 .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
                 .into_iter()
                 .find(|candidate| candidate.id == restore_id)
@@ -610,9 +650,9 @@ pub async fn restore_session(
                 return Err(RestoreTransitionError::NotFound);
             };
             if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                crate::session::trash::restore_worktree_location(&mut instance)
+                crate::session::trash::restore_worktree_location(&mut instance, &ownership)
             {
-                let _ = storage.update(|instances, _groups| {
+                let _ = storage.update_with_ownership(&ownership, |instances, _groups| {
                     if let Some(stored) = instances
                         .iter_mut()
                         .find(|candidate| candidate.id == restore_id)
@@ -629,7 +669,7 @@ pub async fn restore_session(
             let restored_path = instance.project_path.clone();
             let restored_pre = instance.pre_trash_project_path.clone();
             let commit = storage
-                .update(|instances, _groups| {
+                .update_with_ownership(&ownership, |instances, _groups| {
                     Ok(crate::session::claim::finalize_restore_commit(
                         instances,
                         &restore_id,

@@ -779,6 +779,138 @@ fn test_q_in_search_mode_types_q_not_quit() {
     assert_eq!(view.search_query.value(), "q");
 }
 
+#[test]
+#[serial]
+fn queued_creation_result_does_not_block_exclusive_ownership() {
+    let mut env = setup_creation_test_env();
+    let queued = env.view.creation_poller.observe_next_queued_result();
+    env.view
+        .request_creation(creation_data(&env.project_dir, "Queued", ""), None);
+    queued
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("worker queued its real result");
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+        acquired_tx.send(()).unwrap();
+        drop(ownership);
+    });
+    let acquired_while_queued = acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .is_ok();
+    // Consume before asserting so even the broken implementation releases its
+    // queued guard and lets the peer retire rather than stranding a test thread.
+    let created = drain_creation_result(&mut env.view);
+    peer.join().unwrap();
+    assert!(
+        acquired_while_queued,
+        "the UI must be able to take exclusive ownership before polling"
+    );
+    assert!(created.is_some());
+}
+
+#[test]
+#[serial]
+fn queued_creation_rejects_replaced_plain_scratch_and_managed_directories() {
+    for kind in ["plain", "scratch", "managed"] {
+        let mut env = setup_creation_test_env();
+        let queued = env.view.creation_poller.observe_next_queued_result();
+        let mut data = creation_data(&env.project_dir, "Original", "");
+        data.scratch = kind == "scratch";
+        if kind == "managed" {
+            data.worktree_enabled = true;
+            data.worktree_branch = Some("queued-original".into());
+            data.create_new_branch = true;
+        }
+        env.view.request_creation(data, None);
+        queued
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker queued its real result");
+        let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+        let git = crate::git::GitWorktree::new(env.project_dir.clone()).unwrap();
+        let path = match kind {
+            "managed" => {
+                git.list_worktrees()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.branch.as_deref() == Some("queued-original"))
+                    .unwrap()
+                    .path
+            }
+            "scratch" => std::fs::read_dir(crate::session::get_app_dir().unwrap().join("scratch"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+            _ => env.project_dir.clone(),
+        };
+        if kind == "managed" {
+            git.remove_worktree(&path, false).unwrap();
+            git.create_worktree("queued-original", &path, false, None)
+                .unwrap();
+        } else {
+            let retired = env._temp.path().join("retired-original");
+            std::fs::rename(&path, retired).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+        }
+        std::fs::write(path.join("replacement-marker"), b"keep").unwrap();
+        drop(ownership);
+        assert_eq!(drain_creation_result(&mut env.view), None, "{kind}");
+        assert!(env.view.info_dialog.is_some(), "{kind}");
+        assert!(env.storage.load().unwrap().is_empty(), "{kind}");
+        assert_eq!(
+            std::fs::read(path.join("replacement-marker")).unwrap(),
+            b"keep",
+            "{kind}"
+        );
+        if kind == "managed" {
+            assert!(git
+                .list_worktrees()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == path));
+            assert!(git.branch_exists("queued-original").unwrap());
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn queued_creation_cannot_publish_into_a_replacement_profile() {
+    let mut env = setup_creation_test_env();
+    let queued = env.view.creation_poller.observe_next_queued_result();
+    env.view.request_creation(
+        creation_data(&env.project_dir, "Original profile", ""),
+        None,
+    );
+    queued
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("worker queued its real result");
+    let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+    let profile_dir = env.storage.sessions_path().parent().unwrap().to_path_buf();
+    std::fs::rename(&profile_dir, env._temp.path().join("retired-profile")).unwrap();
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    let replacement = Storage::open_unwatched_with_ownership("default", &ownership).unwrap();
+    let peer = Instance::new(
+        "replacement profile owner",
+        &env.project_dir.to_string_lossy(),
+    );
+    let peer_id = peer.id.clone();
+    replacement
+        .update_with_ownership(&ownership, |rows, _| {
+            rows.push(peer);
+            Ok(())
+        })
+        .unwrap();
+    drop(ownership);
+    assert_eq!(drain_creation_result(&mut env.view), None);
+    assert!(env.view.info_dialog.is_some());
+    let rows = replacement.load().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, peer_id);
+}
+
 /// The async CreationPoller result must replace a `Creating` stub even when an intervening
 /// save already persisted it, keep the finalized row's group, and treat the committed row as
 /// authoritative rather than a provisional pending add, so a later peer deletion is not
@@ -1210,4 +1342,159 @@ fn test_cursor_follows_session_after_deletion() {
         Some(tracked_id.as_str())
     );
     assert_eq!(env.view.cursor, 1);
+}
+
+#[test]
+#[serial]
+fn ownership_review_sandbox_pull_releases_root_and_revalidates_creation() {
+    use crate::session::storage::acquire_ownership_lock;
+    use crate::tui::creation_poller::{CreationPoller, CreationRequest, CreationResult};
+    use std::time::{Duration, Instant};
+    for scenario in ["success", "retry", "profile", "checkout", "cancel"] {
+        let env = setup_creation_test_env();
+        let root = env._temp.path();
+        let ready = root.join("pull-ready");
+        let release = root.join("pull-release");
+        struct ReleasePull<'a>(&'a std::path::Path);
+        impl Drop for ReleasePull<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, b"release");
+            }
+        }
+        let _release_pull = ReleasePull(&release);
+        let escape = crate::session::environment::shell_escape;
+        let script = format!(
+            r#"#!/bin/sh
+case "$1" in
+  context) printf '%s' '{{"Name":"default","Endpoints":{{"docker":{{"Host":"unix:///var/run/docker.sock"}}}}}}' ;;
+  info|--version) exit 0 ;;
+  container)
+    case "$2" in
+      inspect) printf '%s\n' 'Error response from daemon: No such container: fixture' >&2; exit 1 ;;
+      rm|stop|start) exit 0 ;;
+      *) printf 'unsupported container command: %s\n' "$*" >&2; exit 64 ;;
+    esac ;;
+  inspect) printf '%s\n' 'Error response from daemon: No such container: fixture' >&2; exit 1 ;;
+  image) exit 1 ;;
+  pull)
+    if [ '{scenario}' = retry ] && [ ! -f {attempt} ]; then : > {attempt}; exit 1; fi
+    : > {ready}
+    while [ ! -f {release} ]; do sleep 0.01; done ;;
+  run|create) printf '%s\n' fixture-container ;;
+  start|stop|rm) exit 0 ;;
+  exec) exit 1 ;;
+  *) printf 'unsupported fixture command: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+            attempt = escape(&root.join("pull-attempt").to_string_lossy()),
+            ready = escape(&ready.to_string_lossy()),
+            release = escape(&release.to_string_lossy())
+        );
+        let _docker =
+            crate::session::test_support::install_login_shell_path_command(root, "docker", &script);
+        let _routing = crate::session::test_support::EnvGuard::unset(&[
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "DOCKER_TLS",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
+        ]);
+        let mut config = crate::session::Config::default();
+        config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        let mut data = creation_data(&env.project_dir, "sandbox", "");
+        data.sandbox = true;
+        data.sandbox_image = "fixture-image".into();
+        data.command_override = "true".into();
+        let hooks = if scenario == "retry" {
+            let mut hooks = crate::session::config::repo_config::HooksConfig::default();
+            hooks.on_launch.push("true".into());
+            crate::session::config::repo_config::ResolvedHooks::with_repo(
+                "default",
+                &env.project_dir,
+                hooks,
+            )
+        } else {
+            None
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut poller = CreationPoller::new();
+        poller.request_creation(CreationRequest {
+            data,
+            existing_instances: vec![],
+            hooks,
+            cancel: cancel.clone(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let entered_pull = ready.exists();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let _ = sender.send(acquire_ownership_lock().unwrap());
+        });
+        let ownership = receiver.recv_timeout(Duration::from_secs(2)).ok();
+        let available_during_pull = ownership.is_some();
+        let mut replacement_bytes = None;
+        if let Some(ownership) = ownership {
+            match scenario {
+                "profile" => {
+                    let profile_dir = env.storage.sessions_path().parent().unwrap().to_path_buf();
+                    std::fs::rename(&profile_dir, root.join("retired-profile")).unwrap();
+                    std::fs::create_dir_all(&profile_dir).unwrap();
+                    let replacement =
+                        Storage::open_unwatched_with_ownership("default", &ownership).unwrap();
+                    replacement
+                        .update_with_ownership(&ownership, |rows, _| {
+                            rows.push(Instance::new("peer", &env.project_dir.to_string_lossy()));
+                            Ok(())
+                        })
+                        .unwrap();
+                    replacement_bytes = Some(std::fs::read(replacement.sessions_path()).unwrap());
+                }
+                "checkout" => {
+                    std::fs::rename(&env.project_dir, root.join("moved-project")).unwrap()
+                }
+                "cancel" => cancel.cancel(),
+                _ => {}
+            }
+            drop(ownership);
+        }
+        std::fs::write(&release, b"release").unwrap();
+        let outcome = poller
+            .recv_result_timeout(Duration::from_secs(10))
+            .expect("producer completed after pull release");
+        drop(receiver);
+        peer.join().unwrap();
+        assert!(
+            entered_pull,
+            "{scenario}: the actual producer must reach the supervised pull: {:?}",
+            outcome.result
+        );
+        assert!(
+            available_during_pull,
+            "{scenario}: unrelated ownership mutations must progress while Docker is blocked"
+        );
+        match (scenario, outcome.result) {
+            ("success" | "retry", CreationResult::Success(success)) => {
+                success.profile_storage.verify_profile_identity().unwrap();
+                success.witness.validate(&success.instance).unwrap();
+            }
+            ("profile" | "checkout", CreationResult::Error(_)) => {
+                if let Some(bytes) = replacement_bytes {
+                    assert_eq!(std::fs::read(env.storage.sessions_path()).unwrap(), bytes);
+                }
+                if scenario == "checkout" {
+                    assert!(root.join("moved-project").is_dir());
+                }
+            }
+            ("cancel", CreationResult::Cancelled) => assert!(outcome.cancelled),
+            (_, result) => panic!("{scenario}: unexpected producer outcome: {result:?}"),
+        }
+    }
 }

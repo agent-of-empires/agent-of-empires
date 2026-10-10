@@ -1012,6 +1012,7 @@ mod tests {
     #[serial]
     fn persist_session_id_writes_none_atomically_when_sid_absent() {
         let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let profile = "persist-none-sid";
         let storage = Storage::new_for_test_path(
             profile,

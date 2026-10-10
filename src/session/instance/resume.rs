@@ -25,6 +25,13 @@ const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// `Alive`.
 const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
 
+struct ResumeLaunchAction {
+    restart: bool,
+    discard_sandbox_container: bool,
+    conversation_carry: Option<ConversationCarry>,
+    original_checkout: bool,
+}
+
 impl Instance {
     pub fn restart_with_size(&mut self, size: Option<(u16, u16)>) -> Result<StartOutcome> {
         self.restart_with_size_opts(size, false)
@@ -71,6 +78,29 @@ impl Instance {
             true,
             discard_sandbox_container,
             conversation_carry,
+        )
+    }
+
+    /// Run the existing restart cascade against the profile captured by attach admission.
+    pub(crate) fn restart_with_original_storage(
+        &mut self,
+        storage: &crate::session::Storage,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        discard_sandbox_container: bool,
+        conversation_carry: Option<ConversationCarry>,
+    ) -> Result<StartOutcome> {
+        self.orchestrate_resume_launch_with_storage(
+            storage,
+            size,
+            skip_on_launch,
+            ResumeAttemptPolicy::HonorAutoResumeSetting,
+            ResumeLaunchAction {
+                restart: true,
+                discard_sandbox_container,
+                conversation_carry,
+                original_checkout: true,
+            },
         )
     }
 
@@ -139,12 +169,57 @@ impl Instance {
         let profile = self.effective_profile();
         let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
+        self.orchestrate_resume_launch_with_storage(
+            &storage,
+            size,
+            skip_on_launch,
+            resume_policy,
+            ResumeLaunchAction {
+                restart,
+                discard_sandbox_container,
+                conversation_carry,
+                original_checkout: false,
+            },
+        )
+    }
+
+    fn orchestrate_resume_launch_with_storage(
+        &mut self,
+        storage: &crate::session::Storage,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        resume_policy: ResumeAttemptPolicy,
+        action: ResumeLaunchAction,
+    ) -> Result<StartOutcome> {
+        let ResumeLaunchAction {
+            restart,
+            discard_sandbox_container,
+            conversation_carry,
+            original_checkout,
+        } = action;
+        let profile = self.effective_profile();
+        let expected_checkout = original_checkout.then(|| self.clone());
+        storage.verify_profile_identity()?;
+        crate::session::validate_instance_id(&self.id)?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
             .context("failed to acquire instance start title lock")?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance start lock")?;
+        if let Some(expected) = &expected_checkout {
+            let fresh = storage
+                .load_strict_for_worktree_ownership()?
+                .into_iter()
+                .find(|row| row.id == self.id)
+                .context("session disappeared before attach resume admission")?;
+            anyhow::ensure!(
+                crate::session::attach_project::same_checkout(&fresh, expected)
+                    && fresh.lifecycle_generation == expected.lifecycle_generation
+                    && fresh.lifecycle_reservation.is_none(),
+                "session changed before attach resume admission"
+            );
+        }
         self.reconcile_from_disk();
         if self.is_structured() {
             return Ok(StartOutcome::Fresh);
@@ -159,7 +234,7 @@ impl Instance {
             self.last_error_check = None;
         }
         self.acquire_lifecycle_reservation(
-            &storage,
+            storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
@@ -169,7 +244,7 @@ impl Instance {
         }
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
-                self.fail_reserved_launch(&storage, &error, false);
+                self.fail_reserved_launch(storage, &error, false);
                 return Err(error);
             }
         }
@@ -180,7 +255,23 @@ impl Instance {
         drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
         let (_title_lock, _lifecycle_lock) =
-            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
+            self.reacquire_launch_locks_after_hooks(storage, hook_result)?;
+        if let Some(expected) = &expected_checkout {
+            let fresh = storage
+                .load_strict_for_worktree_ownership()?
+                .into_iter()
+                .find(|row| row.id == self.id)
+                .context("session disappeared during attach resume hooks")?;
+            if !crate::session::attach_project::same_checkout(&fresh, expected)
+                || !fresh.lifecycle_reservation_is_owned(
+                    LifecycleOperation::Launch,
+                    self.lifecycle_generation,
+                )
+            {
+                let _ = self.release_lifecycle_reservation(storage, LifecycleOperation::Launch);
+                anyhow::bail!("session changed during attach resume hooks");
+            }
+        }
         self.reconcile_sidecar_into_disk();
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         let expected = self.apply_fresh_launch_intent();
@@ -190,11 +281,11 @@ impl Instance {
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             let outcome =
                 self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
-            self.commit_lifecycle_launch(&storage, restart)?;
+            self.commit_lifecycle_launch(storage, restart)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
-            self.fail_reserved_launch(&storage, &error, true);
+            self.fail_reserved_launch(storage, &error, true);
             return Err(error);
         }
         result
@@ -710,7 +801,7 @@ mod tests {
         let outcome = instance.restart_discarding_sandbox_container(None, true, false, Some(carry));
         instance.stop_and_flush_poller();
         let observed = std::fs::read_to_string(&record).unwrap();
-        instance.kill_clean().unwrap();
+        instance.kill().unwrap();
         assert!(outcome.is_ok(), "{outcome:?}");
         // Line 0 is the launched CLAUDE_CONFIG_DIR; the remaining lines are
         // the argv.
@@ -1163,7 +1254,7 @@ mod tests {
                 assert_eq!(outcome, StartOutcome::Fresh);
                 assert_ne!(inst.agent_session_id.as_deref(), Some(sid));
             }
-            inst.kill_clean().unwrap();
+            inst.kill().unwrap();
         }
     }
 
@@ -1226,11 +1317,8 @@ mod tests {
             Some(stale_sid.as_str())
         );
 
-        // Second attempt, same sid, same doomed command: on the pre-fix
-        // tree this reproduces the reported bug (identical `ResumeFailed`
-        // forever). The fix must instead skip the resume attempt and
-        // start fresh.
-        inst.kill_clean().unwrap();
+        // A failed resume target is skipped on the next launch.
+        inst.kill().unwrap();
         let second = inst
             .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
             .unwrap();

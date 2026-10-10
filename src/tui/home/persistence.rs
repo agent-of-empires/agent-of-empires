@@ -255,18 +255,32 @@ impl HomeView {
         &mut self,
         id: &str,
     ) -> anyhow::Result<SessionMutationGuards> {
+        let ownership = crate::session::storage::acquire_ownership_read()?;
+        let mut guards = self.lock_session_mutation_and_reload_with_ownership(&ownership, id)?;
+        guards._ownership = Some(ownership);
+        Ok(guards)
+    }
+
+    pub(in crate::tui) fn lock_session_mutation_and_reload_with_ownership(
+        &mut self,
+        ownership: &crate::session::storage::OwnershipGuard,
+        id: &str,
+    ) -> anyhow::Result<SessionMutationGuards> {
         let snapshot = self
             .instances
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
         let source_profile = snapshot.source_profile.clone();
-        let session_title = crate::session::acquire_session_title_lock(id)
-            .map_err(|error| anyhow::anyhow!("failed to acquire session title lock: {error}"))?;
+        let session_title =
+            crate::session::storage::acquire_session_title_lock_with_ownership(ownership, id)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to acquire session title lock: {error}")
+                })?;
         if !self.storages.contains_key(&source_profile) {
             self.storages.insert(
                 source_profile.clone(),
-                Storage::open(&source_profile, self.file_watch.clone())?,
+                Storage::open_with_ownership(&source_profile, self.file_watch.clone(), ownership)?,
             );
         }
         let storage = self
@@ -274,7 +288,7 @@ impl HomeView {
             .get(&source_profile)
             .expect("source storage was registered above");
         let lifecycle = storage
-            .acquire_instance_lifecycle_lock(id)
+            .acquire_instance_lifecycle_lock_with_ownership(ownership, id)
             .map_err(|error| {
                 anyhow::anyhow!("failed to acquire session lifecycle lock: {error}")
             })?;
@@ -301,6 +315,7 @@ impl HomeView {
             authoritative_last_accessed_at.max(snapshot.last_accessed_at);
         self.instances.insert(id.to_string(), authoritative);
         Ok(SessionMutationGuards {
+            _ownership: None,
             _session_title: session_title,
             _lifecycle: lifecycle,
         })
@@ -331,7 +346,7 @@ impl HomeView {
         &mut self,
         id: &str,
         target: &str,
-        mut requested: Instance,
+        requested: Instance,
         baseline: Option<&Instance>,
         account_swap: bool,
         before_commit: B,
@@ -339,6 +354,30 @@ impl HomeView {
     where
         B: FnOnce(&Instance) -> anyhow::Result<()>,
     {
+        let ownership = crate::session::storage::acquire_ownership_read()?;
+        self.move_to_profile_with_effect_with_ownership(
+            &ownership,
+            id,
+            target,
+            (requested, baseline),
+            account_swap,
+            before_commit,
+        )
+    }
+
+    pub(in crate::tui) fn move_to_profile_with_effect_with_ownership<B>(
+        &mut self,
+        ownership: &crate::session::storage::OwnershipGuard,
+        id: &str,
+        target: &str,
+        change: (Instance, Option<&Instance>),
+        account_swap: bool,
+        before_commit: B,
+    ) -> anyhow::Result<()>
+    where
+        B: FnOnce(&Instance) -> anyhow::Result<()>,
+    {
+        let (mut requested, baseline) = change;
         let Some(current) = self.instances.get(id).cloned() else {
             return Ok(());
         };
@@ -363,7 +402,7 @@ impl HomeView {
         if !self.storages.contains_key(target) {
             self.storages.insert(
                 target.to_string(),
-                Storage::open(target, self.file_watch.clone())?,
+                Storage::open_with_ownership(target, self.file_watch.clone(), ownership)?,
             );
         }
         let source = self
@@ -374,10 +413,10 @@ impl HomeView {
             .storages
             .get(target)
             .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
-        let mut moved = source.move_instance_to_with_effect(
+        let mut moved = source.move_instance_to_with_effect_with_ownership(
+            ownership,
             target_storage,
-            &before,
-            &requested,
+            (&before, &requested),
             account_swap,
             |instances, candidate| {
                 if crate::session::is_duplicate_session(

@@ -320,7 +320,7 @@ fn plan_conversion(
     })
 }
 
-/// Validate the request and create the worktree, without persisting anything.
+/// Validate an attach request without checkout or row mutations.
 pub fn plan(
     instance: &super::Instance,
     profile: &str,
@@ -374,16 +374,15 @@ pub fn plan(
     let repo_name = repo_leaf_name(&main_repo_path);
     reject_duplicate(instance, &main_repo_path, &repo_name)?;
 
-    // Resolved against the repo being attached: it is the repo a worktree gets created in, so its
-    // own `.agent-of-empires/config.toml` governs submodule init and the default base branch.
+    let profile = super::config::effective_profile(profile);
     let config =
-        super::config::repo_config::resolve_config_with_repo_or_warn(profile, &main_repo_path);
+        super::config::repo_config::resolve_config_with_repo_or_warn(&profile, &main_repo_path);
     let git_wt = GitWorktree::new(main_repo_path.clone())?
         .with_init_submodules(config.worktree.init_submodules);
 
     let base = builder::resolve_base_branch(
         None,
-        builder::project_base_branches(profile)
+        builder::project_base_branches(&profile)
             .get(&super::projects::canonical_key(
                 &main_repo_path.to_string_lossy(),
             ))
@@ -399,7 +398,7 @@ pub fn plan(
 
     // Plan the conversion before touching anything, so a refusal (dirty checkout, workspace path
     // taken, branch already checked out) happens with nothing created.
-    let conversion = plan_conversion(instance, profile, on_existing)?;
+    let conversion = plan_conversion(instance, &profile, on_existing)?;
     if !matches!(conversion, Conversion::Append { .. }) && conversation_cannot_follow(instance) {
         bail!(
             "'{}' carries a conversation bound to its current working directory; \
@@ -421,6 +420,9 @@ pub fn plan(
     }
 
     Ok(AttachPlan {
+        original: instance.clone(),
+        reservation: None,
+        profile,
         // Appending to an existing workspace leaves `project_path` alone; the
         // other two shapes move the session into a new workspace directory.
         moves_session: !matches!(conversion, Conversion::Append { .. }),
@@ -436,8 +438,10 @@ pub fn plan(
 
 /// A validated attach, with nothing written yet.
 pub struct AttachPlan {
-    /// True when the session's working directory changes, so the caller has to stop the session
-    /// around [`execute`] and start it again afterwards.
+    original: super::Instance,
+    reservation: Option<std::sync::Arc<AttachReservation>>,
+    profile: String,
+    /// Whether conversion changes the working directory and requires a stop/restart.
     pub moves_session: bool,
     conversion: Conversion,
     workspace_dir: PathBuf,
@@ -455,9 +459,200 @@ impl AttachPlan {
     }
 }
 
+struct AttachReservation {
+    storage: Storage,
+    id: String,
+    generation: u64,
+}
+
+impl Drop for AttachReservation {
+    fn drop(&mut self) {
+        let Ok(_lifecycle_lock) = self.storage.acquire_instance_lifecycle_lock(&self.id) else {
+            return;
+        };
+        if self.storage.load_strict_for_worktree_ownership().is_err() {
+            return;
+        }
+        let _ = self.storage.update(|rows, _| {
+            if let Some(row) = rows.iter_mut().find(|row| row.id == self.id) {
+                row.release_lifecycle_reservation_if_owned(
+                    super::LifecycleOperation::Stop,
+                    self.generation,
+                );
+            }
+            Ok(())
+        });
+    }
+}
+
+fn validate_attach_row(row: &super::Instance, plan: &AttachPlan) -> Result<()> {
+    anyhow::ensure!(
+        same_checkout(row, &plan.original),
+        "session checkout changed after attach was planned"
+    );
+    anyhow::ensure!(
+        !row.is_trashed() && !row.is_archived(),
+        "session is changing lifecycle"
+    );
+    anyhow::ensure!(
+        !matches!(
+            row.status,
+            super::Status::Creating | super::Status::Deleting
+        ),
+        "session is changing lifecycle"
+    );
+    anyhow::ensure!(
+        match &plan.reservation {
+            Some(lease) => row
+                .lifecycle_reservation_is_owned(super::LifecycleOperation::Stop, lease.generation),
+            None =>
+                row.lifecycle_generation == plan.original.lifecycle_generation
+                    && row.lifecycle_reservation.is_none(),
+        },
+        "session is changing lifecycle"
+    );
+    anyhow::ensure!(
+        !plan.moves_session || !conversation_cannot_follow(row),
+        "session conversation cannot follow conversion"
+    );
+    Ok(())
+}
+
+/// Admit the original row and every conversion path before stopping any runtime.
+/// Only conversions requiring quiescence use the existing Stop operation.
+pub fn reserve_attach(storage: &Storage, plan: &mut AttachPlan) -> Result<super::Instance> {
+    let ownership = super::storage::acquire_ownership_lock()?;
+    anyhow::ensure!(
+        storage.profile() == plan.profile,
+        "attach plan belongs to a different profile"
+    );
+    let _lifecycle =
+        storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &plan.original.id)?;
+    storage.load_strict_for_worktree_ownership()?;
+    let current = storage.update_with_ownership(&ownership, |rows, _| {
+        let row = rows
+            .iter()
+            .find(|row| row.id == plan.original.id)
+            .context("session disappeared before attach admission")?;
+        validate_attach_row(row, plan)?;
+        Ok(row.clone())
+    })?;
+    validate_attach_paths(storage, &ownership, &current, plan)?;
+    if needs_restart(plan, current.is_sandboxed()) {
+        let generation = storage.update_with_ownership(&ownership, |rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == current.id)
+                .context("session disappeared before attach reservation")?;
+            validate_attach_row(row, plan)?;
+            Ok(row.try_acquire_lifecycle_reservation(
+                super::LifecycleOperation::Stop,
+                super::Instance::LIFECYCLE_RESERVATION_TTL,
+                Utc::now(),
+            )?)
+        })?;
+        plan.reservation = Some(std::sync::Arc::new(AttachReservation {
+            storage: storage.clone(),
+            id: current.id.clone(),
+            generation,
+        }));
+    }
+    Ok(current)
+}
+
+fn validate_attach_paths(
+    storage: &Storage,
+    ownership: &super::storage::OwnershipGuard,
+    current: &super::Instance,
+    plan: &AttachPlan,
+) -> Result<()> {
+    let paths = super::deletion::paths_in_use_except_with_ownership(
+        ownership,
+        storage.profile(),
+        &[&current.id],
+    );
+    anyhow::ensure!(
+        !paths.covers(&plan.added_worktree),
+        "attached worktree path is already owned or inventory is unreadable"
+    );
+    if plan.moves_session {
+        anyhow::ensure!(
+            !paths.covers(Path::new(&current.project_path)) && !paths.covers(&plan.workspace_dir),
+            "conversion path is already owned or inventory is unreadable"
+        );
+    }
+    match &plan.conversion {
+        Conversion::MoveIn { primary, .. } | Conversion::WorktreePrimary { primary, .. } => {
+            anyhow::ensure!(
+                !paths.covers(Path::new(&primary.worktree_path)),
+                "primary destination is already owned or inventory is unreadable"
+            );
+        }
+        Conversion::Append { .. } => {}
+    }
+    if plan.added_branch.create {
+        anyhow::ensure!(
+            !super::deletion::branch_in_use_with_ownership(
+                ownership,
+                storage.profile(),
+                &[&current.id],
+                &plan.added_main_repo,
+                &plan.added_branch.branch
+            )?,
+            "attached branch is already owned"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn same_checkout(left: &super::Instance, right: &super::Instance) -> bool {
+    fn worktree(row: &super::Instance) -> Option<(&str, &str, bool)> {
+        row.worktree_info.as_ref().map(|wt| {
+            (
+                wt.main_repo_path.as_str(),
+                wt.branch.as_str(),
+                wt.managed_by_aoe,
+            )
+        })
+    }
+    left.id == right.id
+        && left.created_at == right.created_at
+        && left.project_path == right.project_path
+        && worktree(left) == worktree(right)
+        && left
+            .workspace_info
+            .as_ref()
+            .map(|ws| ws.workspace_dir.as_str())
+            == right
+                .workspace_info
+                .as_ref()
+                .map(|ws| ws.workspace_dir.as_str())
+        && left
+            .all_repos()
+            .iter()
+            .map(|repo| {
+                (
+                    &repo.worktree_path,
+                    &repo.main_repo_path,
+                    &repo.branch,
+                    repo.managed_by_aoe,
+                )
+            })
+            .eq(right.all_repos().iter().map(|repo| {
+                (
+                    &repo.worktree_path,
+                    &repo.main_repo_path,
+                    &repo.branch,
+                    repo.managed_by_aoe,
+                )
+            }))
+}
+
 /// Do the filesystem work for a validated plan, without persisting anything.
-pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedAttach> {
+fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedAttach> {
     let AttachPlan {
+        original: _,
+        profile: _,
         conversion,
         workspace_dir,
         added_name: repo_name,
@@ -657,7 +852,7 @@ impl Undo {
 }
 
 /// A created worktree that has not been recorded on the session yet.
-pub struct PreparedAttach {
+struct PreparedAttach {
     pub outcome: AttachOutcome,
     /// The workspace the session becomes, ready for the caller to persist.
     pub workspace_info: WorkspaceInfo,
@@ -666,13 +861,13 @@ pub struct PreparedAttach {
 
 impl PreparedAttach {
     /// Undo every filesystem change this attach made.
-    pub fn rollback(&self) {
+    fn rollback(&self) {
         self.undo.run();
     }
 
     /// Where the session's working directory ends up, for the caller to persist
     /// alongside `workspace_info`.
-    pub fn project_path(&self) -> &str {
+    fn project_path(&self) -> &str {
         &self.workspace_info.workspace_dir
     }
 }
@@ -691,8 +886,16 @@ pub fn attach(
         .find(|i| i.id == session_id)
         .with_context(|| format!("session not found: {session_id}"))?;
 
-    let plan = plan(instance, profile, repo_path, on_existing)?;
-    attach_planned(storage, session_id, instance, plan)
+    let mut plan = plan(instance, profile, repo_path, on_existing)?;
+    let instance = reserve_attach(storage, &mut plan)?;
+    let quiesced = if needs_restart(&plan, instance.is_sandboxed()) {
+        quiesce_for_conversion(storage, &plan)?
+    } else {
+        Quiesced::default()
+    };
+    let result = attach_planned(storage, session_id, &instance, plan);
+    resume_after_conversion(storage, &instance, quiesced, result.as_ref().ok());
+    result
 }
 
 /// Execute an already-validated plan and persist it.
@@ -728,13 +931,39 @@ pub fn attach_planned(
             ),
         }
     }
-    let prepared = execute(instance, plan)?;
+    // Keep the lease alive until the root and lifecycle locks below have dropped.
+    let _reservation = plan.reservation.clone();
+    let ownership = super::storage::acquire_ownership_lock()?;
+    anyhow::ensure!(
+        storage.profile() == plan.profile,
+        "attach plan belongs to a different profile"
+    );
+    let _lifecycle =
+        storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, session_id)?;
+    storage.load_strict_for_worktree_ownership()?;
+    let mut current = None;
+    storage.update_with_ownership(&ownership, |instances, _| {
+        let row = instances
+            .iter()
+            .find(|row| row.id == session_id)
+            .with_context(|| format!("session not found: {session_id}"))?;
+        validate_attach_row(row, &plan)?;
+        current = Some(row.clone());
+        Ok(())
+    })?;
+    let current = current.context("attach validation produced no row")?;
+    validate_attach_paths(storage, &ownership, &current, &plan)?;
+    anyhow::ensure!(
+        !needs_restart(&plan, current.is_sandboxed()) || plan.reservation.is_some(),
+        "attach conversion must reserve quiescence before filesystem effects"
+    );
+    let prepared = execute(&current, plan)?;
 
     let id = session_id.to_string();
     let workspace = prepared.workspace_info.clone();
     let new_project_path = prepared.project_path().to_string();
     let converted = prepared.outcome.moved_to.is_some();
-    let persisted = storage.update(|instances, _groups| {
+    let persisted = storage.update_with_ownership(&ownership, |instances, _groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
@@ -788,15 +1017,42 @@ pub struct Quiesced {
     pub worker_generation: u64,
     /// The tmux session was killed, so the pane has to be recreated.
     pub pane_was_live: bool,
+    pub attach_generation: u64,
 }
 
 /// Stop everything holding the session's current working directory.
-pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> Result<Quiesced> {
-    let mut quiesced = Quiesced::default();
+pub fn quiesce_for_conversion(storage: &Storage, plan: &AttachPlan) -> Result<Quiesced> {
+    let ownership = super::storage::acquire_ownership_lock()?;
+    let _lifecycle =
+        storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &plan.original.id)?;
+    let instance = storage
+        .load_strict_for_worktree_ownership()?
+        .into_iter()
+        .find(|row| row.id == plan.original.id)
+        .context("session disappeared before attach quiescence")?;
+    validate_attach_row(&instance, plan)?;
+    anyhow::ensure!(
+        plan.reservation.is_some(),
+        "attach quiescence was not reserved"
+    );
+    validate_attach_paths(storage, &ownership, &instance, plan)?;
+    let mut quiesced = Quiesced {
+        attach_generation: plan.reservation.as_ref().unwrap().generation,
+        ..Quiesced::default()
+    };
 
     // The worker registry only exists in a build with the structured view, and
     // without it there is no ACP worker to stop.
-    if let Ok(Some(record)) = crate::process::worker_registry::load(&instance.id) {
+    if let Some(record) = crate::process::worker_registry::load(&instance.id)? {
+        anyhow::ensure!(
+            record.session_id == instance.id
+                && record.cwd == Path::new(&instance.project_path)
+                && record
+                    .source_profile
+                    .as_deref()
+                    .is_none_or(|profile| profile == storage.profile()),
+            "worker changed before attach quiescence"
+        );
         crate::process::worker_registry::delete(&instance.id).ok();
         crate::process::worker::terminate_process_group(record.pid);
         quiesced.worker_was_running = true;
@@ -804,7 +1060,7 @@ pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> 
     }
 
     if instance.tmux_session().is_ok_and(|s| s.exists()) {
-        instance.kill_clean().with_context(|| {
+        instance.kill_locked().with_context(|| {
             format!(
                 "could not stop '{}' before moving it into a workspace",
                 instance.title
@@ -813,71 +1069,111 @@ pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> 
         quiesced.pane_was_live = true;
     }
 
-    reset_sandbox_container(storage, &instance.id, instance.is_sandboxed())?;
+    reset_sandbox_container(storage, &ownership, &instance.id, instance.is_sandboxed())?;
     Ok(quiesced)
+}
+
+pub(crate) fn resume_instance(
+    storage: &Storage,
+    original: &super::Instance,
+    generation: u64,
+    outcome: Option<&AttachOutcome>,
+) -> Result<super::Instance> {
+    let _ownership = super::storage::acquire_ownership_read()?;
+    let row = storage
+        .load_strict_for_worktree_ownership()?
+        .into_iter()
+        .find(|row| row.id == original.id)
+        .context("session disappeared before attach restart")?;
+    let mut expected = original.clone();
+    if let Some(outcome) = outcome {
+        expected.workspace_info = Some(outcome.workspace_info.clone());
+        if let Some(path) = &outcome.moved_to {
+            expected.project_path = path.clone();
+            expected.worktree_info = None;
+        }
+    }
+    anyhow::ensure!(
+        same_checkout(&row, &expected)
+            && row.lifecycle_generation == generation
+            && row.lifecycle_reservation.is_none()
+            && !row.is_trashed()
+            && !row.is_archived(),
+        "session changed before attach restart"
+    );
+    Ok(row)
 }
 
 /// Start the session again, in whatever directory it now has.
 pub fn resume_after_conversion(
     storage: &Storage,
-    session_id: &str,
+    original: &super::Instance,
     quiesced: Quiesced,
+    outcome: Option<&AttachOutcome>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
+    let session_id = original.id.as_str();
+    if !quiesced.pane_was_live && !quiesced.worker_was_running {
+        return warnings;
+    }
+    let fresh = match resume_instance(storage, original, quiesced.attach_generation, outcome) {
+        Ok(row) => row,
+        Err(error) => return vec![format!("attach restart refused: {error:#}")],
+    };
 
     if quiesced.pane_was_live {
-        match storage
-            .load()
-            .ok()
-            .and_then(|all| all.into_iter().find(|i| i.id == session_id))
-        {
-            Some(instance) => {
-                let before = instance.clone();
-                let result = super::restart::perform_restart(super::restart::RestartRequest {
-                    session_id: session_id.to_string(),
-                    instance,
-                    size: None,
-                    // No wake-up keys.
-                    wake_message: String::new(),
-                    skip_on_launch: false,
-                    bound_hooks: true,
-                    discard_sandbox_container: false,
-                    conversation_carry: None,
-                });
-                match result.outcome {
-                    Ok(_) => {
-                        let after = *result.instance;
-                        let id = session_id.to_string();
-                        // The same compare-and-swap merge the TUI's restart poller uses, so the
-                        // cascade's mutations (container id, cleared stale agent session id) land
-                        // without clobbering a peer's concurrent edit.
-                        if let Err(e) = storage.update(|instances, _groups| {
-                            if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-                                slot.merge_post_restart_with_baseline(&before, &after);
-                            }
-                            Ok(())
-                        }) {
-                            warnings.push(format!(
-                                "the session restarted but its record could not be updated ({e:#})"
-                            ));
-                        }
+        let before = fresh.clone();
+        let result = super::restart::perform_restart_with_storage(
+            super::restart::RestartRequest {
+                session_id: session_id.to_string(),
+                instance: fresh,
+                size: None,
+                wake_message: String::new(),
+                skip_on_launch: false,
+                bound_hooks: true,
+                discard_sandbox_container: false,
+                conversation_carry: None,
+            },
+            storage,
+        );
+        match result.outcome {
+            Ok(_) => {
+                let after = *result.instance;
+                // Merge only the restart-owned fields without clobbering concurrent identity edits.
+                if let Err(error) = storage.update(|rows, _| {
+                    if let Some(row) = rows.iter_mut().find(|row| row.id == session_id) {
+                        row.merge_post_restart_with_baseline(&before, &after);
                     }
-                    Err(e) => warnings.push(format!(
-                        "the session could not be started again in its new directory ({e}); \
-                         start it from the session list"
-                    )),
+                    Ok(())
+                }) {
+                    warnings.push(format!("the session restarted but its record could not be updated ({error:#})"));
                 }
             }
-            None => warnings
-                .push("the session disappeared before it could be started again".to_string()),
+            Err(error) => warnings.push(format!(
+                "the session could not be started again in its new directory ({error}); start it from the session list"
+            )),
         }
     }
 
     if quiesced.worker_was_running {
-        crate::process::worker_registry::mark_restart_pending(
-            session_id,
-            quiesced.worker_generation,
-        );
+        let marker = (|| -> Result<()> {
+            let _ownership = super::storage::acquire_ownership_read()?;
+            let generation = quiesced
+                .attach_generation
+                .checked_add(u64::from(
+                    quiesced.pane_was_live && !original.is_structured(),
+                ))
+                .context("attach restart generation overflow")?;
+            resume_instance(storage, original, generation, outcome)?;
+            crate::process::worker_registry::mark_restart_pending(
+                session_id,
+                quiesced.worker_generation,
+            );
+            Ok(())
+        })();
+        if let Err(error) = marker {
+            warnings.push(format!("worker restart refused: {error:#}"));
+        }
     }
 
     warnings
@@ -886,11 +1182,9 @@ pub fn resume_after_conversion(
 /// A TUI-initiated attach, handed to a background worker thread.
 pub struct AttachProjectRequest {
     pub session_id: String,
-    pub profile: String,
+    pub storage: Storage,
+    pub instance: super::Instance,
     pub repo_path: PathBuf,
-    /// Snapshotted by the caller so the worker does not have to re-derive it,
-    /// and so the container reset is skipped without a `docker` call.
-    pub is_sandboxed: bool,
 }
 
 /// Result of [`perform_attach_project`], already phrased for the user.
@@ -913,16 +1207,12 @@ pub fn perform_attach_project(request: AttachProjectRequest) -> AttachProjectRes
 
 /// Plan, stop, convert, start again.
 fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
-    let storage = Storage::open_unwatched(&request.profile).map_err(|e| format!("{e:#}"))?;
-    let instances = storage.load().map_err(|e| format!("{e:#}"))?;
-    let instance = instances
-        .iter()
-        .find(|i| i.id == request.session_id)
-        .ok_or_else(|| format!("session not found: {}", request.session_id))?;
+    let storage = request.storage;
+    let instance = &request.instance;
 
-    let plan = plan(
+    let mut plan = plan(
         instance,
-        &request.profile,
+        storage.profile(),
         &request.repo_path,
         // The TUI picker has no place to confirm reusing a branch, so it takes the safe path and
         // refuses; `aoe session add-project --attach-existing-branch` is the way to opt in.
@@ -930,18 +1220,19 @@ fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
     )
     .map_err(|e| format!("{e:#}"))?;
 
-    let restarts = needs_restart(&plan, request.is_sandboxed);
+    let instance = reserve_attach(&storage, &mut plan).map_err(|e| format!("{e:#}"))?;
+    let restarts = needs_restart(&plan, instance.is_sandboxed());
     let quiesced = if restarts {
-        quiesce_for_conversion(&storage, instance).map_err(|e| format!("{e:#}"))?
+        quiesce_for_conversion(&storage, &plan).map_err(|e| format!("{e:#}"))?
     } else {
         Quiesced::default()
     };
 
-    let outcome = match attach_planned(&storage, &request.session_id, instance, plan) {
+    let outcome = match attach_planned(&storage, &request.session_id, &instance, plan) {
         Ok(outcome) => outcome,
         Err(e) => {
             // The session was stopped for an attach that then failed.
-            resume_after_conversion(&storage, &request.session_id, quiesced);
+            resume_after_conversion(&storage, &instance, quiesced, None);
             return Err(format!("{e:#}"));
         }
     };
@@ -967,7 +1258,7 @@ fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
             "\n\nThe agent is already working in this directory, so nothing was restarted.",
         );
     }
-    for warning in resume_after_conversion(&storage, &request.session_id, quiesced) {
+    for warning in resume_after_conversion(&storage, &instance, quiesced, Some(&outcome)) {
         message.push_str(&format!("\n\nWarning: {warning}"));
     }
 
@@ -975,8 +1266,9 @@ fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
 }
 
 /// Drop a sandbox session's container so its next start mounts the new repo.
-pub fn reset_sandbox_container(
+fn reset_sandbox_container(
     storage: &Storage,
+    ownership: &super::storage::OwnershipGuard,
     session_id: &str,
     is_sandboxed: bool,
 ) -> Result<()> {
@@ -997,7 +1289,7 @@ pub fn reset_sandbox_container(
     }
 
     let id = session_id.to_string();
-    let cleared = storage.update(|instances, _groups| {
+    let cleared = storage.update_with_ownership(ownership, |instances, _groups| {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             if let Some(sandbox) = inst.sandbox_info.as_mut() {
                 sandbox.container_id = None;
@@ -1020,6 +1312,301 @@ pub fn reset_sandbox_container(
 mod tests {
     use super::*;
     use crate::session::{Instance, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+
+    #[cfg(unix)]
+    fn stop_runtime_fixture(temp: &Path) -> (crate::session::test_support::EnvGuard, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = temp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let calls = temp.join("attach-runtime-calls");
+        let tmux = bin.join("tmux");
+        std::fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh
+printf '%s\n' \"$*\" >> '{}'
+exit 0
+",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (crate::session::test_support::path_prepended(&bin), calls)
+    }
+
+    fn attach_fixture(temp: &Path, profile: &str) -> (Storage, Instance, AttachPlan) {
+        let primary = temp.join("src/primary");
+        let added = temp.join("src/added");
+        init_repo(&primary);
+        init_repo(&added);
+        let mut instance = Instance::new("attach admission", primary.to_str().unwrap());
+        instance.source_profile = profile.to_string();
+        let storage = Storage::open_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let plan = plan(&instance, profile, &added, ExistingBranch::Refuse).unwrap();
+        (storage, instance, plan)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_resolves_implicit_profile_before_original_storage_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = "chosen-owner";
+        let _home = isolated_profile(temp.path(), profile);
+        crate::session::create_profile("alphabetically-first").unwrap();
+        super::super::config::update_config(|config| {
+            config.default_profile = profile.to_string();
+        })
+        .unwrap();
+        let (storage, mut original, _) = attach_fixture(temp.path(), profile);
+        original.status = super::super::Status::Starting;
+        storage
+            .update(|rows, _| {
+                rows[0].status = original.status;
+                Ok(())
+            })
+            .unwrap();
+        let mut plan = plan(
+            &original,
+            "",
+            &temp.path().join("src/added"),
+            ExistingBranch::Refuse,
+        )
+        .unwrap();
+        let admitted = reserve_attach(&storage, &mut plan).unwrap();
+        let outcome = attach_planned(&storage, &original.id, &admitted, plan).unwrap();
+        let row = storage
+            .load_strict_for_worktree_ownership()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == original.id)
+            .unwrap();
+        assert_eq!(row.project_path, outcome.moved_to.unwrap());
+        let added_checkout = Path::new(&outcome.repo.worktree_path);
+        assert!(added_checkout.join("README.md").exists());
+        let repository = git2::Repository::open(added_checkout).unwrap();
+        let head = repository.head().unwrap();
+        assert_eq!(head.shorthand().unwrap(), outcome.repo.branch);
+        assert_eq!(row.source_profile, profile);
+        assert!(Storage::open_unwatched("alphabetically-first")
+            .unwrap()
+            .load_strict_for_worktree_ownership()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn attach_original_profile_is_not_reopened_after_runtime_stop() {
+        for replace in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = "attach-stop-owner";
+            let _home = isolated_profile(temp.path(), profile);
+            let (_path, calls) = stop_runtime_fixture(temp.path());
+            let (storage, original, mut plan) = attach_fixture(temp.path(), profile);
+            reserve_attach(&storage, &mut plan).unwrap();
+            let destination = plan.workspace_dir.clone();
+            let quiesced = quiesce_for_conversion(&storage, &plan).unwrap();
+            assert!(quiesced.pane_was_live);
+            let stopped_calls = std::fs::read(&calls).unwrap();
+            assert!(String::from_utf8_lossy(&stopped_calls).contains("kill-session"));
+            crate::session::rename_profile(profile, "attach-stop-original").unwrap();
+            let replacement = if replace {
+                crate::session::create_profile(profile).unwrap();
+                let replacement = Storage::open_unwatched(profile).unwrap();
+                replacement
+                    .update(|rows, _| {
+                        rows.push(original.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                Some((
+                    replacement.sessions_path().to_path_buf(),
+                    std::fs::read(replacement.sessions_path()).unwrap(),
+                ))
+            } else {
+                None
+            };
+            assert!(attach_planned(&storage, &original.id, &original, plan).is_err());
+            let warnings = resume_after_conversion(&storage, &original, quiesced, None);
+            assert!(!warnings.is_empty());
+            assert_eq!(
+                std::fs::read(&calls).unwrap(),
+                stopped_calls,
+                "stale attach relaunched a pane"
+            );
+            assert!(
+                !destination.exists(),
+                "stale attach performed checkout effects"
+            );
+            if let Some((path, bytes)) = replacement {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    bytes,
+                    "replacement profile was mutated"
+                );
+            } else {
+                assert!(
+                    !crate::session::get_profile_dir_path(profile)
+                        .unwrap()
+                        .exists(),
+                    "attach recreated the renamed profile"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn attach_stale_quiescence_cannot_kill_or_release_a_peer_launch() {
+        use crate::session::LifecycleOperation;
+        for takeover in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = "attach-stop-stale";
+            let _home = isolated_profile(temp.path(), profile);
+            let (_path, calls) = stop_runtime_fixture(temp.path());
+            let (storage, original, mut plan) = attach_fixture(temp.path(), profile);
+            reserve_attach(&storage, &mut plan).unwrap();
+            storage
+                .update(|rows, _| {
+                    let row = &mut rows[0];
+                    assert!(
+                        row.try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Launch,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            Utc::now()
+                        )
+                        .is_err(),
+                        "attach left a launch gap before quiescence"
+                    );
+                    if takeover {
+                        row.lifecycle_reservation.as_mut().unwrap().at = Utc::now()
+                            - Instance::LIFECYCLE_RESERVATION_TTL
+                            - chrono::Duration::seconds(1);
+                        row.try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Launch,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            Utc::now(),
+                        )?;
+                    } else {
+                        row.project_path = temp
+                            .path()
+                            .join("peer-checkout")
+                            .to_string_lossy()
+                            .into_owned();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let record = crate::process::worker_registry::WorkerRecord::new(
+                original.id.clone(),
+                2_000_000_000,
+                temp.path().join("worker.sock"),
+                "codex".into(),
+                "codex".into(),
+                PathBuf::from(&original.project_path),
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(profile.into()),
+            )
+            .with_generation(73);
+            crate::process::worker_registry::save(&record).unwrap();
+            assert!(quiesce_for_conversion(&storage, &plan).is_err());
+            assert!(!calls.exists(), "stale quiescence reached the runtime");
+            assert_eq!(
+                crate::process::worker_registry::load(&original.id)
+                    .unwrap()
+                    .unwrap()
+                    .generation,
+                73
+            );
+            assert_eq!(
+                crate::process::worker_registry::peek_restart_marker(&original.id),
+                None
+            );
+            drop(plan);
+            let row = storage.load().unwrap().remove(0);
+            if takeover {
+                assert_eq!(
+                    row.lifecycle_reservation.unwrap().op,
+                    LifecycleOperation::Launch
+                );
+            } else {
+                assert!(row.lifecycle_reservation.is_none());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn attach_admission_refuses_launch_or_unreadable_inventory_before_any_stop() {
+        for corrupt_inventory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = "attach-launch-admission";
+            let _home = isolated_profile(temp.path(), profile);
+            let (_path, calls) = stop_runtime_fixture(temp.path());
+            let (storage, _, mut plan) = attach_fixture(temp.path(), profile);
+            if corrupt_inventory {
+                crate::session::create_profile("attach-unreadable").unwrap();
+                let foreign = Storage::open_unwatched("attach-unreadable").unwrap();
+                std::fs::write(foreign.sessions_path(), b"{invalid inventory").unwrap();
+            } else {
+                storage
+                    .update(|rows, _| {
+                        rows[0].try_acquire_lifecycle_reservation(
+                            crate::session::LifecycleOperation::Launch,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            Utc::now(),
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert!(reserve_attach(&storage, &mut plan).is_err());
+            assert!(!calls.exists());
+            assert!(plan.reservation.is_none());
+            let row = storage.load().unwrap().remove(0);
+            if corrupt_inventory {
+                assert!(row.lifecycle_reservation.is_none());
+            } else {
+                assert_eq!(
+                    row.lifecycle_reservation.unwrap().op,
+                    crate::session::LifecycleOperation::Launch
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_cancellation_preserves_unreadable_owner_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = "attach-cancel-owner";
+        let _home = isolated_profile(temp.path(), profile);
+        let (storage, original, mut plan) = attach_fixture(temp.path(), profile);
+        reserve_attach(&storage, &mut plan).unwrap();
+        let mut rows = serde_json::to_value(storage.load().unwrap()).unwrap();
+        let mut unreadable = rows[0].clone();
+        unreadable["id"] = "unreadable-peer".into();
+        unreadable["status"] = "invalid-status".into();
+        rows.as_array_mut().unwrap().push(unreadable);
+        let bytes = serde_json::to_vec(&rows).unwrap();
+        std::fs::write(storage.sessions_path(), &bytes).unwrap();
+        drop(plan);
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+        assert!(Path::new(&original.project_path).is_dir());
+    }
 
     fn workspace_instance() -> Instance {
         let mut inst = Instance::new("WS", "/tmp/ws");
@@ -1086,7 +1673,13 @@ mod tests {
         crate::session::create_profile("attach-noop").expect("profile");
         let storage = Storage::open_unwatched("attach-noop").expect("storage");
         assert!(
-            reset_sandbox_container(&storage, "no-such-session", false).is_ok(),
+            reset_sandbox_container(
+                &storage,
+                &super::super::storage::acquire_ownership_lock().unwrap(),
+                "no-such-session",
+                false
+            )
+            .is_ok(),
             "an unsandboxed session must not touch the container runtime"
         );
     }
@@ -1119,6 +1712,175 @@ mod tests {
         let guard = crate::session::test_support::isolate_app_dir_at(temp);
         crate::session::create_profile(name).expect("profile");
         guard
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_rejects_checkout_or_profile_changed_after_unlocked_hooks() {
+        for replace_profile in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = "attach-hook-refresh";
+            let _home = isolated_profile(temp.path(), profile);
+            let backend = temp.path().join("src/backend");
+            let frontend = temp.path().join("src/frontend");
+            init_repo(&backend);
+            init_repo(&frontend);
+            let worktree = temp.path().join("src/backend-hook");
+            git_in(
+                &backend,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/hook",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            let mut original = Instance::new("hook", worktree.to_str().unwrap());
+            original.source_profile = profile.to_string();
+            original.worktree_info = Some(WorktreeInfo {
+                branch: "feature/hook".into(),
+                main_repo_path: backend.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: Utc::now(),
+                base_branch: None,
+            });
+            let storage = Storage::open_unwatched(profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(original.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let attach_plan = plan(&original, profile, &frontend, ExistingBranch::Refuse).unwrap();
+            let destination = attach_plan.workspace_dir.clone();
+            let mut current = original.clone();
+            if replace_profile {
+                crate::session::rename_profile(profile, "attach-hook-original").unwrap();
+                crate::session::create_profile(profile).unwrap();
+                Storage::open_unwatched(profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        rows.push(current.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+            } else {
+                let moved = temp.path().join("src/backend-moved");
+                git_in(
+                    &backend,
+                    &[
+                        "worktree",
+                        "move",
+                        worktree.to_str().unwrap(),
+                        moved.to_str().unwrap(),
+                    ],
+                );
+                current.project_path = moved.to_string_lossy().into_owned();
+                storage
+                    .update(|rows, _| {
+                        rows[0].project_path.clone_from(&current.project_path);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let error = attach_planned(&storage, &original.id, &current, attach_plan).unwrap_err();
+            if !replace_profile {
+                assert!(error.to_string().contains("checkout changed"), "{error:#}");
+            }
+            assert!(!destination.exists(), "stale plan performed Git work");
+            assert!(Path::new(&current.project_path).exists());
+            assert!(git2::Repository::open(&frontend)
+                .unwrap()
+                .find_branch("feature/hook", git2::BranchType::Local)
+                .is_err());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_keeps_resources_when_purge_owns_row_or_inventory_is_unreadable() {
+        use super::super::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
+        for active_purge in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = "attach-conflict";
+            let _home = isolated_profile(temp.path(), profile);
+            let backend = temp.path().join("src/backend");
+            let frontend = temp.path().join("src/frontend");
+            init_repo(&backend);
+            init_repo(&frontend);
+            let worktree = temp.path().join("src/backend-conflict");
+            git_in(
+                &backend,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/conflict",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            let mut original = Instance::new("conflict", worktree.to_str().unwrap());
+            original.source_profile = profile.into();
+            original.worktree_info = Some(WorktreeInfo {
+                branch: "feature/conflict".into(),
+                main_repo_path: backend.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: Utc::now(),
+                base_branch: None,
+            });
+            let storage = Storage::open_unwatched(profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(original.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let attach_plan = plan(&original, profile, &frontend, ExistingBranch::Refuse).unwrap();
+            let destination = attach_plan.workspace_dir.clone();
+            let purge = if active_purge {
+                match PurgeTransaction::reserve(
+                    storage.clone(),
+                    DeletionRequest {
+                        session_id: original.id.clone(),
+                        instance: original.clone(),
+                        delete_worktree: true,
+                        delete_branch: true,
+                        delete_sandbox: false,
+                        force_delete: false,
+                        detach_hooks: true,
+                        keep_scratch: false,
+                    },
+                )
+                .unwrap()
+                {
+                    PurgeReservation::Reserved(transaction) => Some(transaction.run_hooks()),
+                    PurgeReservation::Rejected(_) => panic!("purge rejected"),
+                }
+            } else {
+                let other = Storage::new_unwatched("unreadable").unwrap();
+                other.update(|_, _| Ok(())).unwrap();
+                std::fs::write(other.sessions_path(), "not json").unwrap();
+                None
+            };
+            assert!(attach_planned(&storage, &original.id, &original, attach_plan).is_err());
+            assert!(worktree.exists());
+            assert!(!destination.exists());
+            let rows = storage.load().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].project_path, original.project_path);
+            assert!(rows[0].workspace_info.is_none());
+            assert!(git2::Repository::open(&frontend)
+                .unwrap()
+                .find_branch("feature/conflict", git2::BranchType::Local)
+                .is_err());
+            if let Some(purge) = purge {
+                let result = purge.complete();
+                assert!(result.success, "{:?}", result.errors);
+                assert!(!worktree.exists());
+                assert!(storage.load().unwrap().is_empty());
+            }
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub(crate) mod serde_helpers;
 pub mod skills_model;
 pub mod smart_rename;
 pub mod stop;
-mod storage;
+pub(crate) mod storage;
 pub(crate) mod sync;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -148,9 +148,9 @@ pub use scope::SessionScope;
 #[cfg(test)]
 pub(crate) use storage::migration_backups;
 pub(crate) use storage::{
-    acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
-    backup_before_migration, read_file_no_follow, replace_file_no_follow, resolve_symlink_chain,
-    try_acquire_storage_flock, GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
+    acquire_storage_flock, acquire_storage_shared_flock, atomic_write, backup_before_migration,
+    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock,
+    GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
@@ -316,6 +316,7 @@ pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
 }
 
 pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
+    let _ownership = storage::acquire_ownership_read()?;
     let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
@@ -376,6 +377,44 @@ pub fn list_profiles() -> Result<Vec<String>> {
     }
 
     list_profile_names_in(&profiles_dir)
+}
+
+/// Ownership inventory includes external directory aliases, unlike the UI profile picker.
+/// Broken aliases and unreadable entries make the inventory uncertain, never empty.
+pub(crate) fn list_profiles_for_worktree_inventory() -> Result<Vec<String>> {
+    #[cfg(test)]
+    if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("list_profiles failure injected for test");
+    }
+    let directory = get_app_dir()?.join("profiles");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(&directory) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error.into()),
+                Ok(_) => anyhow::bail!("profile inventory directory is a broken alias"),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut profiles = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() || kind.is_symlink() {
+            anyhow::ensure!(
+                fs::metadata(entry.path())?.is_dir(),
+                "profile alias is not a directory: {}",
+                entry.path().display()
+            );
+            profiles.push(entry.file_name().into_string().map_err(|_| {
+                anyhow::anyhow!("profile ownership inventory has a non-UTF-8 name")
+            })?);
+        }
+    }
+    profiles.sort();
+    Ok(profiles)
 }
 
 /// Picker order: alphabetical, with a profile named `default` last.
@@ -577,6 +616,7 @@ fn validate_new_profile_name(name: &str) -> Result<()> {
 }
 
 pub fn create_profile(name: &str) -> Result<()> {
+    let _ownership = storage::acquire_ownership_read()?;
     validate_new_profile_name(name)?;
 
     let profiles = list_profiles()?;
@@ -589,9 +629,14 @@ pub fn create_profile(name: &str) -> Result<()> {
 }
 
 pub fn delete_profile(name: &str) -> Result<()> {
+    let _ownership = storage::acquire_ownership_lock()?;
     validate_profile_name(name)?;
 
     let base = get_app_dir()?;
+    let _transition = storage::acquire_storage_shared_flock(
+        &base,
+        crate::migrations::v027_isolate_sandbox_stores::LOCK,
+    )?;
     let profile_dir = base.join("profiles").join(name);
 
     if !profile_dir.exists() {
@@ -611,10 +656,15 @@ pub fn delete_profile(name: &str) -> Result<()> {
 /// The source keeps the permissive traversal guard so a stray minted by an older binary stays
 /// renameable; the destination is a new profile and is held to the create grammar.
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
+    let _ownership = storage::acquire_ownership_lock()?;
     validate_profile_name(old_name)?;
     validate_new_profile_name(new_name)?;
 
     let base = get_app_dir()?;
+    let _transition = storage::acquire_storage_shared_flock(
+        &base,
+        crate::migrations::v027_isolate_sandbox_stores::LOCK,
+    )?;
     let old_dir = base.join("profiles").join(old_name);
     let new_dir = base.join("profiles").join(new_name);
 
@@ -854,6 +904,83 @@ pub fn is_tui_active(threshold: Duration) -> bool {
 mod tests {
     use super::test_support::{isolate_app_dir, AppDirGuard};
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn ownership_fence_serializes_profile_namespace_changes() -> Result<()> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _app = isolate_app_dir();
+        create_profile("retained")?;
+        create_profile("source")?;
+        for operation in ["create", "implicit", "rename", "delete"] {
+            let ownership = storage::acquire_ownership_lock()?;
+            let (contended_tx, contended_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _observer = storage::observe_lock_contention_for_test(contended_tx);
+                let result = match operation {
+                    "create" => create_profile("explicit"),
+                    "implicit" => Storage::new_unwatched("implicit").map(|_| ()),
+                    "rename" => rename_profile("source", "renamed"),
+                    "delete" => delete_profile("renamed"),
+                    _ => unreachable!(),
+                };
+                finished_tx.send(result).unwrap();
+            });
+            let blocked = contended_rx.recv_timeout(Duration::from_secs(10));
+            assert_eq!(blocked?, get_app_dir()?.join(".workspace-claim.lock"));
+            assert!(matches!(
+                finished_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            drop(ownership);
+            finished_rx.recv_timeout(Duration::from_secs(10))??;
+            worker.join().unwrap();
+        }
+        let profiles = list_profiles()?;
+        assert!(profiles.contains(&"explicit".to_string()));
+        assert!(profiles.contains(&"implicit".to_string()));
+        assert!(!profiles.contains(&"source".to_string()));
+        assert!(!profiles.contains(&"renamed".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stale_storage_does_not_recreate_or_write_replaced_profiles() -> Result<()> {
+        let _app = isolate_app_dir();
+        create_profile("retained")?;
+        for operation in ["rename", "delete", "replace"] {
+            let storage = Storage::new_unwatched("original")?;
+            storage.update(|_, _| Ok(()))?;
+            let path = get_profile_dir_path("original")?;
+            match operation {
+                "rename" => rename_profile("original", "renamed")?,
+                "delete" => delete_profile("original")?,
+                "replace" => {
+                    delete_profile("original")?;
+                    create_profile("original")?;
+                }
+                _ => unreachable!(),
+            }
+            assert!(storage.update(|_, _| Ok(())).is_err(), "{operation}");
+            assert!(
+                storage.acquire_instance_lifecycle_lock("12345678").is_err(),
+                "{operation}"
+            );
+            if operation == "replace" {
+                assert!(!path.join("sessions.json").exists());
+                delete_profile("original")?;
+            } else {
+                assert!(!path.exists(), "stale handle recreated {operation} source");
+                if operation == "rename" {
+                    delete_profile("renamed")?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn app_dir(root: impl AsRef<Path>) -> PathBuf {
         let root = root.as_ref();
