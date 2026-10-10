@@ -3066,13 +3066,14 @@ mod tests {
     fn opencode_routing_consumes_the_physical_store_and_compares_native_cwd() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
-        let host = temp.path().join("host");
-        let native = temp.path().join("native");
+        // Native launch inputs require canonical paths.
+        let root = temp.path().canonicalize().unwrap();
+        let host = root.join("host");
+        let native = root.join("native");
         for directory in [&host, &native] {
             std::fs::create_dir_all(directory.join("checkout")).unwrap();
         }
-        let transport = temp.path().join("transport");
-        // Run the production path resolver; replace only the container transport.
+        let transport = root.join("transport");
         std::fs::write(&transport, "#!/bin/sh\n[ \"$1\" = exec ] && [ \"$2\" = -w ] && [ \"$3\" = / ] && [ \"$4\" = fixture-id ] || exit 2\nshift 4\nexec \"$@\"\n").unwrap();
         std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o700)).unwrap();
         let database = host.join("opencode.db");
@@ -3113,7 +3114,7 @@ mod tests {
                 runtime: crate::containers::RuntimeExecutionSnapshot {
                     kind: crate::session::ContainerRuntimeName::Docker,
                     program: transport,
-                    cwd: temp.path().into(),
+                    cwd: root,
                     endpoint: String::new(),
                     local_mounts: true,
                     routing: Vec::new(),
