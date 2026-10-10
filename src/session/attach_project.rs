@@ -467,6 +467,12 @@ struct AttachReservation {
 
 impl Drop for AttachReservation {
     fn drop(&mut self) {
+        let Ok(_lifecycle_lock) = self.storage.acquire_instance_lifecycle_lock(&self.id) else {
+            return;
+        };
+        if self.storage.load_strict_for_worktree_ownership().is_err() {
+            return;
+        }
         let _ = self.storage.update(|rows, _| {
             if let Some(row) = rows.iter_mut().find(|row| row.id == self.id) {
                 row.release_lifecycle_reservation_if_owned(
@@ -1580,6 +1586,26 @@ exit 0
                 );
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_cancellation_preserves_unreadable_owner_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = "attach-cancel-owner";
+        let _home = isolated_profile(temp.path(), profile);
+        let (storage, original, mut plan) = attach_fixture(temp.path(), profile);
+        reserve_attach(&storage, &mut plan).unwrap();
+        let mut rows = serde_json::to_value(storage.load().unwrap()).unwrap();
+        let mut unreadable = rows[0].clone();
+        unreadable["id"] = "unreadable-peer".into();
+        unreadable["status"] = "invalid-status".into();
+        rows.as_array_mut().unwrap().push(unreadable);
+        let bytes = serde_json::to_vec(&rows).unwrap();
+        std::fs::write(storage.sessions_path(), &bytes).unwrap();
+        drop(plan);
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+        assert!(Path::new(&original.project_path).is_dir());
     }
 
     fn workspace_instance() -> Instance {
