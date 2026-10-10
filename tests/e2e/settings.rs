@@ -99,12 +99,15 @@ fn shortcut_bar_tip_after_cli_creation_waits_for_home_and_is_seen_once() {
     let mut config = fs::read_to_string(&config_path).unwrap();
     config.push_str("\nsessions_created = 30\n");
     fs::write(&config_path, config).unwrap();
-    h.spawn_tui();
+    h.run_cli_ok(&["profile", "create", "other"]);
+    h.spawn(&["--profile", "default"]);
     h.wait_for_ready();
     h.send_keys("?");
     h.wait_for("Keyboard Shortcuts");
     let project = h.project_path();
     let args = [
+        "--profile",
+        "other",
         "add",
         project.to_str().unwrap(),
         "-t",
@@ -125,7 +128,6 @@ fn shortcut_bar_tip_after_cli_creation_waits_for_home_and_is_seen_once() {
     h.send_keys("Escape");
     h.wait_for_timeout("More room for your sessions", Duration::from_secs(15));
     h.assert_screen_contains("Show shortcut bar");
-    h.send_keys("Escape");
     let state = read_state();
     assert!(state["tips_seen"]
         .as_array()
@@ -133,7 +135,7 @@ fn shortcut_bar_tip_after_cli_creation_waits_for_home_and_is_seen_once() {
         .iter()
         .any(|id| id.as_str() == Some("hide-shortcut-bar")));
     h.kill_tui();
-    h.spawn_tui();
+    h.spawn(&["--profile", "default"]);
     h.wait_for_ready();
     h.send_keys("?");
     h.wait_for("Keyboard Shortcuts");

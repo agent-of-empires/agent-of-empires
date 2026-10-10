@@ -111,6 +111,52 @@ fn hidden_bar_preserves_temporary_feedback_and_keyboard_actions() {
 
 #[test]
 #[serial]
+fn hidden_bar_link_hover_keeps_the_preview_geometry_stable() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.selected_session.clone().unwrap();
+    env.view.show_shortcut_bar = false;
+    env.view.view_mode = ViewMode::Structured;
+    let url = "https://example.com/review";
+    let content = format!("{}{url}\nbelow link", "output line\n".repeat(80));
+    let target = env.view.displayed_pane_tmux_name().unwrap();
+    env.view
+        .preview_cache
+        .store_capture(content, id.clone(), target.clone(), 1, (120, 24), None);
+    for live in [false, true] {
+        env.view.live_send = live.then(|| LiveSendState {
+            session_id: id.clone(),
+            tmux_name: target.clone(),
+            ..live_state()
+        });
+        env.view.hover_cell = None;
+        let before = render_home_to_string(&mut env.view, 120, 24);
+        let (row, line) = before
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(url))
+            .unwrap_or_else(|| panic!("URL missing from preview:\n{before}"));
+        let column = line[..line.find(url).unwrap()].chars().count();
+        assert!(env.view.update_hovered_link(column as u16, row as u16));
+        let geometry = env.view.preview_text_view;
+        for _ in 0..4 {
+            let screen = render_home_to_string(&mut env.view, 120, 24);
+            assert!(screen.lines().last().unwrap().contains(url));
+            assert!(!screen.contains("Cmds"));
+            assert!(!screen.contains("LIVE"));
+            assert_eq!(env.view.preview_text_view.pane, geometry.pane);
+            assert_eq!(env.view.preview_text_view.first_line, geometry.first_line);
+            assert_eq!(env.view.hovered_link().as_deref(), Some(url));
+            assert!(env.view.footer_buttons.is_empty());
+        }
+        env.view.update_hovered_link(0, 0);
+        let screen = render_home_to_string(&mut env.view, 120, 24);
+        assert!(!screen.lines().last().unwrap().contains(url));
+        assert_eq!(env.view.preview_text_view.pane, geometry.pane);
+    }
+}
+
+#[test]
+#[serial]
 fn shortcut_bar_setting_reloads_and_is_global_across_profiles() {
     let mut env = create_test_env_empty();
     assert!(env.view.show_shortcut_bar);
@@ -144,6 +190,14 @@ fn shortcut_bar_tip_waits_for_idle_and_persists_seen_state() {
         env.view.pending_tip_pop.map(|tip| tip.id),
         Some(SHORTCUT_BAR_TIP_ID)
     );
+    for picker_key in ['g', 'o'] {
+        env.view.handle_key(key(KeyCode::Char(picker_key)), None);
+        assert!(env.view.group_picker_dialog.is_some() || env.view.sort_picker_dialog.is_some());
+        assert!(!env.view.try_present_shortcut_bar_tip());
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(env.view.group_picker_dialog.is_none());
+        assert!(env.view.sort_picker_dialog.is_none());
+    }
     env.view.show_help = true;
     assert!(!env.view.try_present_shortcut_bar_tip());
     env.view.show_help = false;
@@ -177,6 +231,28 @@ fn shortcut_bar_tip_waits_for_idle_and_persists_seen_state() {
     assert!(!env.view.try_present_shortcut_bar_tip());
     let mut restarted = test_view(Some("test"));
     assert!(!restarted.try_present_shortcut_bar_tip());
+}
+
+#[test]
+#[serial]
+fn shortcut_bar_tip_is_claimed_before_dialog_close() {
+    let mut env = create_test_env_empty();
+    update_app_state(|state| state.sessions_created = 31).unwrap();
+    env.view.refresh_shortcut_bar_tip();
+    let mut peer = test_view(Some("test"));
+    assert!(peer.pending_tip_pop.is_some());
+    assert!(env.view.try_present_shortcut_bar_tip());
+    assert!(AppStateConfig::load()
+        .unwrap()
+        .tips_seen
+        .iter()
+        .any(|id| id == SHORTCUT_BAR_TIP_ID));
+    assert!(!peer.try_present_shortcut_bar_tip());
+    env.view.tips_dialog = None;
+    let mut restarted = test_view(Some("test"));
+    assert!(!restarted.try_present_shortcut_bar_tip());
+    restarted.open_tips_dialog();
+    assert!(restarted.tips_dialog.is_some());
 }
 
 #[test]

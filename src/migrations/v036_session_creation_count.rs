@@ -32,13 +32,20 @@ pub fn run() -> Result<()> {
         }
     }
     // Archives and trash retain their rows; purged history cannot be recovered.
-    crate::session::config::update_app_state(|state| {
+    let seeded = crate::session::config::update_app_state(|state| {
+        if state.sessions_created_seeded {
+            return false;
+        }
         state.sessions_created = state.sessions_created.max(ids.len() as u64);
+        state.sessions_created_seeded = true;
+        true
     })?;
-    tracing::info!(
-        "v036: seeded session creation count from {} retained sessions",
-        ids.len()
-    );
+    if seeded {
+        tracing::info!(
+            "v036: seeded session creation count from {} retained sessions",
+            ids.len()
+        );
+    }
     Ok(())
 }
 
@@ -73,6 +80,16 @@ mod tests {
         let state = AppStateConfig::load().unwrap();
         assert_eq!(state.sessions_created, 3);
         assert_eq!(state.tips_seen, ["existing-tip"]);
+        // A late migrator can observe a newly persisted row before its counter increment.
+        std::fs::write(
+            app_dir.join("profiles/work/sessions.json"),
+            r#"[{"id":"trash"},{"id":"active"},{"id":"new"}]"#,
+        )
+        .unwrap();
+        run().unwrap();
+        assert_eq!(AppStateConfig::load().unwrap().sessions_created, 3);
+        crate::tips::record_session_creations(1);
+        assert_eq!(AppStateConfig::load().unwrap().sessions_created, 4);
         update_app_state(|state| state.sessions_created = 40).unwrap();
         run().unwrap();
         assert_eq!(AppStateConfig::load().unwrap().sessions_created, 40);

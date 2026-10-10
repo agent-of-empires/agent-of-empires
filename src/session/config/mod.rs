@@ -917,6 +917,10 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub sessions_created: u64,
 
+    /// Stops concurrent upgrade migrations from seeding the counter twice.
+    #[serde(default)]
+    pub sessions_created_seeded: bool,
+
     /// How many times the new-session dialog has been opened while a project or
     /// session was selected. Once this passes
     /// [`crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD`], the "new from

@@ -5113,6 +5113,23 @@ impl HomeView {
         {
             return false;
         }
+        if tip.id == crate::tips::SHORTCUT_BAR_TIP_ID {
+            // Claim before opening so concurrent TUIs and interrupted dialogs cannot repeat it.
+            match update_app_state(|state| {
+                if state.tips_seen.iter().any(|seen| seen == tip.id) {
+                    return false;
+                }
+                state.tips_seen.push(tip.id.to_owned());
+                true
+            }) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    tracing::warn!(target: "tui.input", %error, "Failed to persist shortcut bar tip state");
+                    return false;
+                }
+            }
+        }
         self.tips_dialog = Some(TipsDialog::new(
             vec![tip],
             config.app_state.tips_seen.clone(),

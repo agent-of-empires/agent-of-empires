@@ -939,7 +939,6 @@ impl HomeView {
         // Keep temporary feedback and the leader menu available with the bar hidden.
         let has_status_bar = self.show_shortcut_bar
             || self.status_flash_text().is_some()
-            || (!self.live_send_pending_leader && self.hovered_link().is_some())
             || (self.live_send.is_some()
                 && (self.live_send_pending_leader || self.live_send_ctrl_c_flash_active()));
         let has_update_bar =
@@ -1042,6 +1041,16 @@ impl HomeView {
         }
         if let Some(idx) = status_idx {
             self.render_status_bar(frame, main_chunks[idx], theme);
+        } else if !self.live_send_pending_leader && self.hovered_link().is_some() {
+            // Overlay the border so hovering cannot move the link out from under the pointer.
+            let row = Rect::new(
+                content_area.x,
+                content_area.bottom().saturating_sub(1),
+                content_area.width,
+                content_area.height.min(1),
+            );
+            frame.render_widget(Clear, row);
+            self.render_status_bar(frame, row, theme);
         }
 
         if let Some(idx) = update_bar_idx {
@@ -3699,6 +3708,12 @@ impl HomeView {
                 spans.push(Span::styled(exit, Style::default().fg(theme.dimmed)));
             }
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
+        if !self.show_shortcut_bar
+            && !(self.live_send.is_some()
+                && (self.live_send_pending_leader || self.live_send_ctrl_c_flash_active()))
+        {
             return;
         }
         // LIVE shares the shortcut row; its temporary menu and feedback can restore it.
