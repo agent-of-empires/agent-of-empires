@@ -2537,7 +2537,12 @@ impl HomeView {
         // Drain a queued earned-tip pop now that the home view is idle: every
         // overlay-routing block above has returned. Skipped while searching so it can't
         // interrupt a query, and opening it consumes the keystroke. #2262
-        if !self.search_active && self.pending_tip_pop.is_some() && self.drain_pending_tip_pop() {
+        if !self.search_active
+            && self
+                .pending_tip_pop
+                .is_some_and(|tip| tip.id != crate::tips::SHORTCUT_BAR_TIP_ID)
+            && self.drain_pending_tip_pop()
+        {
             return None;
         }
 
@@ -4953,12 +4958,7 @@ impl HomeView {
     /// gives an empty state rather than silence.
     pub(super) fn open_tips_dialog(&mut self) {
         let config = load_config().ok().flatten().unwrap_or_default();
-        let signals = crate::tips::TipSignals {
-            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
-            used_new_from_selection: config.app_state.used_new_from_selection,
-            system_health_tip_earned: config.app_state.system_health_tip_earned,
-            used_system_health: config.app_state.used_system_health,
-        };
+        let signals = crate::tips::TipSignals::from(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
             eligible,
@@ -5037,9 +5037,47 @@ impl HomeView {
         }
     }
 
-    /// After the new-session dialog closes, queue an earned tip if one just became
-    /// eligible and tips aren't disabled. `drain_pending_tip_pop` shows it on the next
-    /// keystroke, so it never interrupts an in-flight action.
+    /// Refresh on startup and the storage heartbeat, including creates in other profiles.
+    pub(super) fn refresh_shortcut_bar_tip(&mut self) {
+        if let Ok(Some(config)) = load_config() {
+            self.tips_unseen = super::tips_unseen_count(&config);
+            self.queue_shortcut_bar_tip(&config);
+        }
+    }
+
+    pub(super) fn queue_shortcut_bar_tip(&mut self, config: &crate::session::Config) {
+        if !config.session.show_tips || self.pending_tip_pop.is_some() {
+            return;
+        }
+        self.pending_tip_pop = crate::tips::eligible_unseen(
+            crate::tips::TipSurface::Tui,
+            &config.app_state.tips_seen,
+            &crate::tips::TipSignals::from(config),
+        )
+        .into_iter()
+        .find(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID);
+    }
+
+    /// Present without consuming a key or interrupting agent input or another action.
+    pub(in crate::tui) fn try_present_shortcut_bar_tip(&mut self) -> bool {
+        if !self
+            .pending_tip_pop
+            .is_some_and(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID)
+            || self.has_dialog()
+            || self.is_creation_pending()
+            || self.structured_preview_pending
+            || self
+                .structured_preview
+                .as_ref()
+                .is_some_and(|view| view.is_active())
+            || self.pending_paste.is_some()
+        {
+            return false;
+        }
+        self.drain_pending_tip_pop()
+    }
+
+    /// Queue an earned tip after an action closes its dialog.
     pub(super) fn queue_earned_tip_pop(&mut self) {
         if self.pending_tip_pop.is_some() {
             return;
@@ -5048,12 +5086,7 @@ impl HomeView {
         if !config.session.show_tips {
             return;
         }
-        let signals = crate::tips::TipSignals {
-            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
-            used_new_from_selection: config.app_state.used_new_from_selection,
-            system_health_tip_earned: config.app_state.system_health_tip_earned,
-            used_system_health: config.app_state.used_system_health,
-        };
+        let signals = crate::tips::TipSignals::from(&config);
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
             &config.app_state.tips_seen,
@@ -5069,9 +5102,33 @@ impl HomeView {
             return false;
         };
         let config = load_config().ok().flatten().unwrap_or_default();
-        // Re-check: the user may have disabled tips between queueing and now.
-        if !config.session.show_tips {
+        if !config.session.show_tips
+            || !crate::tips::eligible_unseen(
+                crate::tips::TipSurface::Tui,
+                &config.app_state.tips_seen,
+                &crate::tips::TipSignals::from(&config),
+            )
+            .iter()
+            .any(|eligible| eligible.id == tip.id)
+        {
             return false;
+        }
+        if tip.id == crate::tips::SHORTCUT_BAR_TIP_ID {
+            // Claim before opening so concurrent TUIs and interrupted dialogs cannot repeat it.
+            match update_app_state(|state| {
+                if state.tips_seen.iter().any(|seen| seen == tip.id) {
+                    return false;
+                }
+                state.tips_seen.push(tip.id.to_owned());
+                true
+            }) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    tracing::warn!(target: "tui.input", %error, "Failed to persist shortcut bar tip state");
+                    return false;
+                }
+            }
         }
         self.tips_dialog = Some(TipsDialog::new(
             vec![tip],
