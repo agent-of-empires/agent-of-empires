@@ -22,7 +22,8 @@ pub enum ContextMenuAction {
     /// Open the new-session dialog (`'n'`).
     NewSession,
     /// New session prefilled from the right-clicked row (`'N'`): a session row
-    /// inherits its repo path and group, a project or group row a member's path.
+    /// inherits its repo path, group, agent and view, and its sandbox when it has
+    /// one; a project or group row a member's path.
     NewFromSelection,
     /// Fork the session into an independent one resuming its conversation.
     Fork,

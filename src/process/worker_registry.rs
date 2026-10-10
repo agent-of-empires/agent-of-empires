@@ -641,17 +641,31 @@ fn signal_runner_if_owned(
             let control = crate::process::worker::control_socket_sibling(&base);
             let control_pid = crate::process::worker::peer_pid_from_socket(&control);
             let base_pid = crate::process::worker::peer_pid_from_socket(&base);
-            let (pid, socket) = match (control_pid, base_pid) {
+            let (identity, socket) = match (control_pid, base_pid) {
                 (Some(control_pid), Some(base_pid)) if control_pid != base_pid => {
                     anyhow::bail!("ACP runner socket identities disagree")
                 }
-                (Some(pid), _) => (pid, control),
-                (None, Some(pid)) => (pid, base),
-                (None, None) => return Ok(None),
-            };
-            let identity = RunnerIdentity {
-                pid,
-                generation: None,
+                (Some(pid), _) => (
+                    RunnerIdentity {
+                        pid,
+                        generation: None,
+                    },
+                    control,
+                ),
+                (None, Some(pid)) => (
+                    RunnerIdentity {
+                        pid,
+                        generation: None,
+                    },
+                    base,
+                ),
+                (None, None) => match expected_runner {
+                    Some(identity) => (identity, control),
+                    None => {
+                        remove_runner_sockets(&base);
+                        return Ok(None);
+                    }
+                },
             };
             if expected_runner.is_some_and(|expected| expected != identity) {
                 return Ok(None);
@@ -659,10 +673,16 @@ fn signal_runner_if_owned(
             (identity, socket)
         };
 
-        anyhow::ensure!(
-            crate::process::worker::peer_pid_from_socket(&socket) == Some(identity.pid),
-            "ACP runner identity cannot be confirmed through its control socket"
-        );
+        match crate::process::worker::peer_pid_from_socket(&socket) {
+            Some(peer) if peer == identity.pid => {}
+            Some(_) => {
+                anyhow::bail!("ACP runner identity cannot be confirmed through its control socket")
+            }
+            None if !runner_group_alive(identity.pid) => return Ok(Some(identity)),
+            None => {
+                anyhow::bail!("ACP runner identity cannot be confirmed through its control socket")
+            }
+        }
         if force_kill {
             crate::process::worker::kill_process_group(identity.pid);
         } else {
@@ -909,6 +929,16 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    struct KillProcessGroupOnDrop(u32);
+
+    #[cfg(unix)]
+    impl Drop for KillProcessGroupOnDrop {
+        fn drop(&mut self) {
+            crate::process::worker::kill_process_group(self.0);
         }
     }
 
@@ -1371,6 +1401,126 @@ mod tests {
         assert!(child.wait().unwrap().success());
         assert!(!record_path(session_id).unwrap().exists());
         assert!(!control.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_completes_when_recorded_runner_has_exited_and_socket_remains() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "dead-runner-artifacts";
+        let socket = socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let stale_listener = UnixListener::bind(&control).unwrap();
+        drop(stale_listener);
+        let record = new_record(session_id, 2_000_000_000, socket.clone()).with_generation(8);
+        save(&record).unwrap();
+        fence_for_purge(session_id, "profile", 9).unwrap();
+
+        terminate_and_confirm_stopped(session_id, "profile", 9).unwrap();
+
+        assert!(load(session_id).unwrap().is_none());
+        assert!(!socket_exists(&socket));
+        assert!(!socket_exists(&control));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_removes_stale_sockets_when_no_registry_record_exists() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "stale-sockets-no-record";
+        let socket = socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let stale_listener = UnixListener::bind(&control).unwrap();
+        drop(stale_listener);
+        fence_for_purge(session_id, "profile", 10).unwrap();
+
+        terminate_and_confirm_stopped(session_id, "profile", 10).unwrap();
+
+        assert!(!record_path(session_id).unwrap().exists());
+        assert!(!socket_exists(&socket));
+        assert!(!socket_exists(&control));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_preserves_live_runner_when_its_socket_is_missing() {
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "live-runner-missing-socket";
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn runner stand-in"),
+        );
+        let socket = socket_path_for(session_id).unwrap();
+        let record = new_record(session_id, child.0.id(), socket).with_generation(11);
+        save(&record).unwrap();
+        fence_for_purge(session_id, "profile", 12).unwrap();
+
+        let error = terminate_and_confirm_stopped(session_id, "profile", 12)
+            .expect_err("a live process without a confirming socket must not be signaled");
+
+        assert!(error.to_string().contains("identity cannot be confirmed"));
+        assert!(is_pid_alive(child.0.id()));
+        assert!(record_path(session_id).unwrap().exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_preserves_process_group_when_runner_leader_has_exited() {
+        use std::os::unix::net::UnixListener;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "exit-leader-child";
+        let leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 & printf '%s\\n' \"$!\""])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn runner leader stand-in");
+        let leader_pid = leader.id();
+        let _kill_group = KillProcessGroupOnDrop(leader_pid);
+        let child_pid = String::from_utf8(leader.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .expect("read surviving child PID");
+        assert!(!is_pid_alive(leader_pid));
+        assert!(is_pid_alive(child_pid));
+        assert!(crate::process::worker::is_process_group_alive(leader_pid));
+
+        let socket = socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let stale_listener = UnixListener::bind(&control).unwrap();
+        drop(stale_listener);
+        let record = new_record(session_id, leader_pid, socket).with_generation(13);
+        save(&record).unwrap();
+        fence_for_purge(session_id, "profile", 14).unwrap();
+
+        let error = terminate_and_confirm_stopped(session_id, "profile", 14)
+            .expect_err("an unverified live group must not be signaled by its saved leader PID");
+
+        assert!(error.to_string().contains("identity cannot be confirmed"));
+        assert!(is_pid_alive(child_pid));
+        assert!(record_path(session_id).unwrap().exists());
+        assert!(control.exists());
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]

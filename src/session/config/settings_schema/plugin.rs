@@ -188,6 +188,7 @@ fn widget_and_validation(s: &SettingContribution) -> (WidgetKind, ValidationKind
             ValidationKind::StringValue,
         ),
         SettingType::Cron => (WidgetKind::Cron, ValidationKind::Cron),
+        SettingType::StringList => (WidgetKind::List, ValidationKind::StringListValue),
         SettingType::ObjectList => {
             let fields: Vec<ObjectFieldDescriptor> =
                 s.fields.iter().map(object_field_descriptor).collect();
@@ -282,6 +283,7 @@ fn object_field_descriptor(f: &aoe_plugin_api::ObjectFieldContribution) -> Objec
             ValidationKind::StringListValue,
         ),
         T::Cron => (ObjectFieldWidget::Cron, ValidationKind::Cron),
+        T::StringList => (ObjectFieldWidget::List, ValidationKind::StringListValue),
     };
     ObjectFieldDescriptor {
         field: f.key.clone(),
@@ -367,6 +369,51 @@ mod tests {
         assert_eq!(descs[0].label, "on");
         // Plugin settings are global.
         assert!(!descs[0].profile_overridable);
+    }
+
+    #[test]
+    fn string_list_maps_to_list_widget_and_rejects_non_string_arrays() {
+        let item_field = aoe_plugin_api::ObjectFieldContribution {
+            key: "match".to_string(),
+            label: String::new(),
+            description: String::new(),
+            value_type: aoe_plugin_api::ObjectFieldType::StringList,
+            required: true,
+            multiline: false,
+            options: Vec::new(),
+            min: None,
+            max: None,
+            default: None,
+            option_source: None,
+            depends_on: Vec::new(),
+        };
+        let list = SettingContribution {
+            fields: vec![item_field],
+            item_id_key: Some("id".to_string()),
+            ..contrib("snooze", SettingType::ObjectList)
+        };
+        let descs = plugin_field_descriptors(
+            "acme.kit",
+            &[contrib("tags", SettingType::StringList), list],
+        );
+        assert_eq!(descs[0].widget, WidgetKind::List);
+        assert_eq!(descs[0].validation, ValidationKind::StringListValue);
+        let WidgetKind::ObjectList { fields, .. } = &descs[1].widget else {
+            panic!("expected object list");
+        };
+        assert_eq!(fields[0].widget, ObjectFieldWidget::List);
+
+        let validate = |body: &Value| {
+            super::super::validate_patch_with(&descs, body, super::super::Scope::Global, true)
+        };
+        assert!(validate(&json!({ "plugin:acme.kit": { "tags": ["a", "b"] } })).is_ok());
+        for bad in [
+            json!({ "plugin:acme.kit": { "tags": "a" } }),
+            json!({ "plugin:acme.kit": { "tags": ["a", 1] } }),
+            json!({ "plugin:acme.kit": { "snooze": [{ "id": "1", "match": [2] }] } }),
+        ] {
+            assert!(validate(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

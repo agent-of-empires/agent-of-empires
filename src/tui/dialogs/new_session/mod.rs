@@ -120,6 +120,8 @@ pub struct NewSessionData {
     /// exclusive with worktree mode.
     pub scratch: bool,
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// The user typed `title` rather than leaving it empty or as suggested.
+    pub title_typed: bool,
     /// Create in the structured (ACP) view instead of a tmux terminal. Only
     /// true for ACP-capable tools; `validate_structured_choice` enforces it.
     pub structured: bool,
@@ -134,6 +136,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
     fn from(data: NewSessionData) -> Self {
         Self {
             title: data.title,
+            title_typed: data.title_typed,
             path: data.path,
             group: data.group,
             tool: data.tool,
@@ -248,6 +251,8 @@ pub struct NewSessionDialog {
     /// provisions the scratch directory. Mutually exclusive with worktree mode.
     pub(super) scratch: bool,
     pub(super) fork_seed: Option<crate::session::ForkSeed>,
+    /// The title the dialog was opened with, which the user did not type.
+    pub(super) suggested_title: String,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
     /// frame and empty while an overlay is up, so a click during one cannot
     /// snap focus to the field that used to sit there.
@@ -557,6 +562,7 @@ impl NewSessionDialog {
             confirm_create_dir: None,
             scratch: false,
             fork_seed: None,
+            suggested_title: String::new(),
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -580,7 +586,8 @@ impl NewSessionDialog {
     }
 
     pub fn set_title(&mut self, title: String) {
-        self.title = Input::new(title);
+        self.title = Input::new(title.clone());
+        self.suggested_title = title;
     }
 
     pub fn set_fork_from(&mut self, seed: crate::session::ForkSeed) {
@@ -627,6 +634,44 @@ impl NewSessionDialog {
         self.reload_tool_config();
     }
 
+    /// Carry a session's agent, view and sandbox, each only as far as this form allows.
+    /// Yolo stays a choice made for each new session.
+    pub fn inherit_session(&mut self, source: &crate::session::Instance) {
+        if !self.available_tools.contains(&source.tool) {
+            return;
+        }
+        self.set_tool(&source.tool);
+        self.inherit_modes(source.is_structured(), source.is_sandboxed());
+    }
+
+    fn inherit_modes(&mut self, structured: bool, sandboxed: bool) {
+        if self.structured_capable {
+            self.structured_enabled = structured;
+            self.structured_choice = Some(structured);
+        }
+        if sandboxed && self.docker_available && !self.selected_tool_host_only() {
+            self.set_sandbox_enabled(true);
+        }
+    }
+
+    /// Switch the sandbox, loading or dropping the environment that goes with it.
+    fn set_sandbox_enabled(&mut self, enabled: bool) {
+        self.sandbox_enabled = enabled;
+        if enabled {
+            let config = self.resolve_config_for_path(&self.profile);
+            self.extra_env = config.sandbox.environment.clone();
+            self.inherited_settings = build_inherited_settings(&config.sandbox);
+            self.extra_env_overridden = false;
+        } else {
+            self.extra_env.clear();
+            self.extra_env_overridden = false;
+            self.env_list_expanded = false;
+            self.env_editing_input = None;
+            self.inherited_settings.clear();
+            self.sandbox_config_mode = false;
+        }
+    }
+
     /// Move focus to the title field, for "new from selection" where the path
     /// is already filled.
     pub fn focus_title(&mut self) {
@@ -641,6 +686,11 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn group_value(&self) -> &str {
         self.group.value()
+    }
+
+    #[cfg(test)]
+    pub fn yolo_value(&self) -> bool {
+        self.yolo_mode
     }
 
     #[cfg(test)]
@@ -959,6 +1009,7 @@ impl NewSessionDialog {
             confirm_create_dir: None,
             scratch: false,
             fork_seed: None,
+            suggested_title: String::new(),
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1039,6 +1090,7 @@ impl NewSessionDialog {
             confirm_create_dir: None,
             scratch: false,
             fork_seed: None,
+            suggested_title: String::new(),
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1225,20 +1277,7 @@ impl NewSessionDialog {
                 }
             }
         } else if self.focused_field == fields.sandbox {
-            self.sandbox_enabled = !self.sandbox_enabled;
-            if self.sandbox_enabled {
-                let config = self.resolve_config_for_path(&self.profile);
-                self.extra_env = config.sandbox.environment.clone();
-                self.inherited_settings = build_inherited_settings(&config.sandbox);
-                self.extra_env_overridden = false;
-            } else {
-                self.extra_env.clear();
-                self.extra_env_overridden = false;
-                self.env_list_expanded = false;
-                self.env_editing_input = None;
-                self.inherited_settings.clear();
-                self.sandbox_config_mode = false;
-            }
+            self.set_sandbox_enabled(!self.sandbox_enabled);
         }
     }
 
@@ -1480,20 +1519,7 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.sandbox =>
             {
-                self.sandbox_enabled = !self.sandbox_enabled;
-                if self.sandbox_enabled {
-                    let config = self.resolve_config_for_path(&self.profile);
-                    self.extra_env = config.sandbox.environment.clone();
-                    self.inherited_settings = build_inherited_settings(&config.sandbox);
-                    self.extra_env_overridden = false;
-                } else {
-                    self.extra_env.clear();
-                    self.extra_env_overridden = false;
-                    self.env_list_expanded = false;
-                    self.env_editing_input = None;
-                    self.inherited_settings.clear();
-                    self.sandbox_config_mode = false;
-                }
+                self.set_sandbox_enabled(!self.sandbox_enabled);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -1933,7 +1959,7 @@ impl NewSessionDialog {
 
     fn reload_tool_config(&mut self) {
         let profile = self.selected_profile().to_string();
-        let config = resolve_config_or_warn(&profile);
+        let config = self.resolve_config_for_path(&profile);
         let tool = self
             .available_tools
             .get(self.tool_index)
@@ -2008,6 +2034,7 @@ impl NewSessionDialog {
     fn build_submit_result(&self) -> DialogResult<NewSessionData> {
         let title_value = self.title.value().trim();
         let final_title = title_value.to_string();
+        let title_typed = !title_value.is_empty() && title_value != self.suggested_title.trim();
         let worktree_value = self.worktree_branch.value().trim();
         let worktree_branch = if self.worktree_enabled && !worktree_value.is_empty() {
             Some(worktree_value.to_string())
@@ -2024,6 +2051,7 @@ impl NewSessionDialog {
         DialogResult::Submit(NewSessionData {
             profile: self.selected_profile().to_string(),
             title: final_title,
+            title_typed,
             // Scratch sends an empty path; the server provisions the dir.
             path: if self.scratch {
                 String::new()

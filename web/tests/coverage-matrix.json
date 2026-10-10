@@ -477,6 +477,7 @@
       "specs": ["src/components/settings/__tests__/StructuredWidgets.test.tsx"],
       "components": [
         "web/src/components/settings/StructuredWidgets.tsx",
+        "web/src/components/settings/FormFields.tsx",
         "web/src/components/settings/SchemaSection.tsx"
       ]
     },
@@ -1228,17 +1229,28 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ]
     },
     {
-      "id": "wizard.import-claude-session.unit",
+      "id": "wizard.import-session",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/wizard-project.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
+      ]
+    },
+    {
+      "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/session-wizard/__tests__/ProjectStep.test.tsx"],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ]
     },
     {
@@ -1752,8 +1764,13 @@
       "id": "sidebar.plugin-row-slots",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/plugin-row-slots-mobile.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+      "specs": ["tests/plugin-row-slots-mobile.spec.ts", "src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/components/plugin/SlotChrome.tsx"
+      ],
+      "notes": "Grouped badge items collapse into one chip that cycles on click. The Playwright story clicks it inside the real session-row link, which jsdom cannot cover: the click must cycle without the row selecting or the browser following the row href. Group, wrap-around and clamping logic is in PluginSlots.test.tsx."
     },
     {
       "id": "sidebar.group-axis-pure",
@@ -2539,10 +2556,13 @@
         "tests/live/acp-worker-api.spec.ts",
         "tests/acp-config-pickers-ui.spec.ts",
         "src/components/acp/SessionConfigControls.test.tsx",
+        "src/components/acp/__tests__/useProviderSwitch.test.tsx",
+        "src/lib/switchAcpProvider.test.ts",
         "src/hooks/useAcpSession.test.ts"
       ],
       "components": [
         "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/acp/useProviderSwitch.ts",
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
@@ -2841,11 +2861,32 @@
       "components": ["web/src/components/acp/ToolDisplayMode.tsx"]
     },
     {
+      "id": "acp.tool-output-wrap",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["src/components/acp/WrapToggle.test.tsx", "tests/acp-tool-output-wrap.spec.ts"],
+      "components": ["web/src/components/acp/WrapToggle.tsx"]
+    },
+    {
       "id": "acp.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/QueuedPromptsStrip.test.tsx"],
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PromptStrips.tsx"]
+    },
+    {
+      "id": "acp.session-notices",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/SessionNoticesStrip.test.tsx", "src/lib/acpTypes.test.ts"],
+      "components": [
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/lib/acpTypes.ts"
+      ]
     },
     {
       "id": "acp.queue-send-now",
@@ -3948,7 +3989,7 @@
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
-      "description": "Attach eligibility, request, and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
+      "description": "Picker lists saved and recent projects, and a clicked row or typed path posts to attach; attach eligibility and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
       "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",

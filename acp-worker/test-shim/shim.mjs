@@ -40,6 +40,23 @@ async function record(envVar, line) {
   if (file) await appendFile(file, line);
 }
 
+// SHIM_ENV_RECORD_FILE: the Claude routing variables as the adapter process
+// actually received them, so a test can assert which provider aoe pinned.
+// Unset and empty are reported differently: an override has to beat an
+// inherited value, not merely fail to set one.
+await record(
+  "SHIM_ENV_RECORD_FILE",
+  JSON.stringify(
+    Object.fromEntries(
+      [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+      ].map((key) => [key, process.env[key] ?? null]),
+    ),
+  ) + "\n",
+);
+
 function park() {
   return new Promise((resolve) => {
     parkedPromptResolve = resolve;
@@ -88,6 +105,10 @@ function handleInitialize(params) {
   // SHIM_DELETE_CAPABILITY=1 advertises session/delete.
   if (process.env.SHIM_DELETE_CAPABILITY === "1") {
     agentCapabilities.sessionCapabilities = { delete: {} };
+  }
+  // SHIM_LIST_SESSIONS: JSON array of SessionInfo served by session/list.
+  if (process.env.SHIM_LIST_SESSIONS) {
+    agentCapabilities.sessionCapabilities = { ...agentCapabilities.sessionCapabilities, list: {} };
   }
   // SHIM_MCP_CAPABILITY: comma list of "http" / "sse" MCP transports.
   if (process.env.SHIM_MCP_CAPABILITY) {
@@ -179,9 +200,21 @@ function withConfigOptions(response) {
   return options ? { ...response, configOptions: options } : response;
 }
 
-// session/load, registered only with SHIM_LOAD_SESSION=1.
-function handleLoadSession(params) {
+// session/load, registered only with SHIM_LOAD_SESSION=1. SHIM_RESUMED_MODEL
+// resumes on that model, as claude-agent-acp lands on the transcript's last one.
+// SHIM_LOAD_RECORD_FILE records `<sessionId> <cwd>`; SHIM_LOAD_REPLAY replays that
+// text as history before answering.
+async function handleLoadSession(params, client) {
   sessions.set(params.sessionId, {});
+  if (process.env.SHIM_RESUMED_MODEL) model = process.env.SHIM_RESUMED_MODEL;
+  await record("SHIM_LOAD_RECORD_FILE", `${params.sessionId} ${params.cwd}\n`);
+  const replay = process.env.SHIM_LOAD_REPLAY;
+  if (replay) {
+    client.notify("session/update", {
+      sessionId: params.sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: replay } },
+    });
+  }
   return withConfigOptions({});
 }
 
@@ -481,7 +514,10 @@ async function bootstrap() {
     app.onRequest("session/delete", ({ params }) => handleDeleteSession(params));
   }
   if (process.env.SHIM_LOAD_SESSION === "1") {
-    app.onRequest("session/load", ({ params }) => handleLoadSession(params));
+    app.onRequest("session/load", ({ params, client }) => handleLoadSession(params, client));
+  }
+  if (process.env.SHIM_LIST_SESSIONS) {
+    app.onRequest("session/list", () => ({ sessions: JSON.parse(process.env.SHIM_LIST_SESSIONS) }));
   }
   app.connect(stream);
 

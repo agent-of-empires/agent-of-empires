@@ -180,7 +180,8 @@ pub struct RestartArgs {
     /// Restart every session in the active profile. Useful after
     /// `aoe update`, after editing `sandbox.environment`, after a
     /// Docker hiccup, or after changing a hook. Mutually exclusive
-    /// with `identifier`.
+    /// with `identifier`. When run from an agent session, the caller is
+    /// skipped so the command can finish.
     #[arg(long, conflicts_with = "identifier")]
     pub all: bool,
 
@@ -891,11 +892,14 @@ fn apply_import_mode(
 }
 
 async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
-    use crate::session::claude_import::{scan_sessions, sessions_under_paths, MAX_SESSIONS};
+    use crate::session::claude_import::{scan_sessions, sessions_under_paths};
+    use crate::session::import::{worktree_dir_markers, Owned, MAX_SESSIONS};
 
     let structured = args.structured;
 
+    let provisioned = Owned::new(&[], worktree_dir_markers());
     let mut discovered = scan_sessions();
+    discovered.retain(|s| !provisioned.excludes(&s.session_id, &s.cwd));
     if !args.all {
         let roots = resolve_import_roots(&args.paths)?;
         discovered = sessions_under_paths(discovered, &roots);
@@ -1106,9 +1110,31 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
     let (instances, _groups) = storage.load_with_groups()?;
-    let target_ids = pick_targets_for_restart_all(&instances);
+    let current_tmux_session = current_tmux_session_for_restart_all()?;
+    let current_instance = current_tmux_session.as_ref().and_then(|tmux_session| {
+        instances.iter().find(|instance| {
+            crate::tmux::agent_session_belongs_to_marked(
+                &tmux_session.name,
+                tmux_session.kind,
+                &instance.id,
+            )
+        })
+    });
+    let skipped_current_instance =
+        current_instance.filter(|instance| is_restart_all_target(instance));
+    let target_ids = pick_targets_for_restart_all(&instances, current_tmux_session.as_ref());
+    if let Some(instance) = skipped_current_instance {
+        println!(
+            "Skipping current session '{}' so `restart --all` can finish.",
+            instance.title
+        );
+    }
     if target_ids.is_empty() {
-        println!("No sessions to restart in profile '{}'.", profile);
+        if skipped_current_instance.is_some() {
+            println!("No other sessions to restart in profile '{}'.", profile);
+        } else {
+            println!("No sessions to restart in profile '{}'.", profile);
+        }
         return Ok(());
     }
 
@@ -1256,12 +1282,37 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     Ok(())
 }
 
-fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<String> {
+fn current_tmux_session_for_restart_all() -> Result<Option<crate::tmux::CurrentTmuxSession>> {
+    crate::tmux::current_session_for_current_pane().map_err(|error| {
+        anyhow::anyhow!(
+            "Could not determine the current tmux session; refusing `session restart --all`: {error}"
+        )
+    })
+}
+
+fn is_restart_all_target(instance: &crate::session::Instance) -> bool {
     use crate::session::Status;
+    !matches!(instance.status, Status::Deleting | Status::Creating)
+        && !instance.is_structured()
+        && instance.ensure_startable().is_ok()
+}
+
+fn pick_targets_for_restart_all(
+    instances: &[crate::session::Instance],
+    current_tmux_session: Option<&crate::tmux::CurrentTmuxSession>,
+) -> Vec<String> {
     instances
         .iter()
-        .filter(|i| !matches!(i.status, Status::Deleting | Status::Creating))
-        .filter(|i| !i.is_structured() && i.ensure_startable().is_ok())
+        .filter(|instance| is_restart_all_target(instance))
+        .filter(|instance| {
+            !current_tmux_session.is_some_and(|tmux_session| {
+                crate::tmux::agent_session_belongs_to_marked(
+                    &tmux_session.name,
+                    tmux_session.kind,
+                    &instance.id,
+                )
+            })
+        })
         .map(|i| i.id.clone())
         .collect()
 }
@@ -3042,13 +3093,45 @@ mod target_filter_tests {
                 inst
             },
         ];
-        let mut picked = pick_targets_for_restart_all(&instances);
+        let mut picked = pick_targets_for_restart_all(&instances, None);
         picked.sort();
         assert_eq!(
             picked,
             ["error", "idle", "running", "starting", "stopped", "unknown", "waiting"]
         );
-        assert!(pick_targets_for_restart_all(&[]).is_empty());
+        assert!(pick_targets_for_restart_all(&[], None).is_empty());
+    }
+
+    #[test]
+    fn restart_all_skips_only_the_current_agent_session() {
+        use crate::tmux::{CurrentTmuxSession, SessionKind};
+
+        let mut caller = Instance::new("caller", "/tmp");
+        caller.id = "caller-session-01".to_string();
+        let mut other = Instance::new("other", "/tmp");
+        other.id = "other-session-02".to_string();
+        let instances = vec![caller.clone(), other.clone()];
+        let caller_tmux_session = CurrentTmuxSession {
+            name: crate::tmux::Session::generate_name(&caller.id, &caller.title),
+            kind: Some(SessionKind::Agent),
+        };
+
+        assert_eq!(
+            pick_targets_for_restart_all(&instances, Some(&caller_tmux_session)),
+            [other.id.clone()]
+        );
+        assert_eq!(
+            pick_targets_for_restart_all(&instances[..1], Some(&caller_tmux_session)),
+            Vec::<String>::new()
+        );
+        let ordinary_context = CurrentTmuxSession {
+            name: "ordinary-tmux-session".to_string(),
+            kind: None,
+        };
+        assert_eq!(
+            pick_targets_for_restart_all(&instances, Some(&ordinary_context)),
+            [caller.id, other.id]
+        );
     }
 }
 

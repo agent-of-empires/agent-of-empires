@@ -72,10 +72,10 @@ pub struct CreateSessionBody {
     /// `hooks_need_trust` error. Already-trusted hooks run regardless.
     #[serde(default)]
     pub trust_hooks: Option<bool>,
-    /// Import an existing Claude Code session by its on-disk id. The new
-    /// session adopts it as `acp_session_id`, is forced to the structured view,
-    /// and seeds its transcript from history replay. `path` must be the
-    /// session's original cwd (#2276).
+    /// Import an existing native session by the id `GET /api/importable-sessions`
+    /// listed for `tool`. The new session adopts it as `acp_session_id`, is
+    /// forced to the structured view, and seeds its transcript from history
+    /// replay. `path` must be the listed cwd (#2276).
     #[serde(default)]
     pub import_acp_session_id: Option<String>,
     /// Fork an existing session from its captured session id, leaving the
@@ -792,31 +792,12 @@ pub async fn create_session(
             return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         }
     }
-    if let Some(ref profile_name) = body.profile {
-        // Every profile is a real directory under profiles/. Distinguish an
-        // enumeration failure from a missing profile so the client does not see
-        // a 400 when the real problem is server-side.
-        let known = match crate::session::list_profiles() {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::error!(
-                    target: "server.sessions",
-                    "failed to enumerate profiles while validating create_session: {e:#}"
-                );
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    format!("Failed to enumerate profiles: {e}"),
-                );
-            }
-        };
-        if !known.contains(profile_name) {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "profile_not_found",
-                format!("Profile '{}' does not exist", profile_name),
-            );
-        }
+    if let Some(resp) = body
+        .profile
+        .as_deref()
+        .and_then(crate::server::api::unknown_profile_response)
+    {
+        return resp;
     }
 
     let validation_profile = body.profile.as_deref().unwrap_or(&state.profile);
@@ -871,10 +852,9 @@ pub async fn create_session(
 
     let worktree_enabled = create_body_uses_worktree(&body);
 
-    // Importing a Claude session (#2276) is tightly scoped: it resumes one
-    // on-disk id in its original cwd via the claude structured agent. Reject an
-    // id paired with a different workspace shape, a non-claude agent, or a
-    // foreign cwd. Runs after tool-identity validation, ahead of the build.
+    // An import resumes one native id in its recorded cwd on the host. AoE
+    // enforces the cwd because pi-acp loads at any absolute path, and lists
+    // again so the id must still be one the picker could have shown.
     if let Some(import_id) = body
         .import_acp_session_id
         .as_deref()
@@ -882,30 +862,34 @@ pub async fn create_session(
         .filter(|s| !s.is_empty())
     {
         let bad = |msg: &str| api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
-        if body.tool != "claude"
-            || body
-                .agent_name
-                .as_deref()
-                .is_some_and(|n| !n.trim().is_empty())
+        if body
+            .agent_name
+            .as_deref()
+            .is_some_and(|n| !n.trim().is_empty())
         {
-            return bad("Importing a Claude session requires the built-in claude agent");
+            return bad("Importing a session requires a built-in ACP agent");
         }
-        if body.scratch || worktree_enabled || !body.extra_repo_paths.is_empty() {
+        if body.scratch || worktree_enabled || !body.extra_repo_paths.is_empty() || body.sandbox {
             return bad(
-                "Importing a Claude session cannot use scratch, a worktree, or extra repos",
+                "Importing a session cannot use scratch, a worktree, extra repos, or a sandbox",
             );
         }
-        let import_cwd = body.path.trim().to_string();
-        let import_id_owned = import_id.to_string();
-        let belongs = tokio::task::spawn_blocking(move || {
-            crate::session::claude_import::scan_sessions()
-                .into_iter()
-                .any(|s| s.session_id == import_id_owned && s.cwd == import_cwd)
-        })
+        let listed = match crate::server::api::acp::importable_sessions(
+            &state,
+            &body.tool,
+            validation_profile,
+        )
         .await
-        .unwrap_or(false);
-        if !belongs {
-            return bad("Unknown Claude session for this directory");
+        {
+            Ok(list) => list.sessions,
+            Err(e) => return crate::server::api::acp::list_error_response(e),
+        };
+        let import_cwd = body.path.trim();
+        if !listed
+            .iter()
+            .any(|s| s.session_id == import_id && s.cwd == import_cwd)
+        {
+            return bad("Unknown session for this agent and directory");
         }
     }
 

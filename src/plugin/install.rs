@@ -167,6 +167,7 @@ fn install_validation(featured_verified: bool, source: &str) -> ValidationState 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentMode {
     Interactive,
+    AssumeYes,
     CleanOnlyNonInteractive,
 }
 
@@ -407,8 +408,13 @@ pub async fn apply_install(
     apply_prepared_install(&prepared, log)
 }
 
-pub async fn update(id: &str) -> Result<InstallReport> {
-    match update_with_consent(id, ConsentMode::Interactive).await? {
+pub async fn update(id: &str, assume_yes: bool) -> Result<InstallReport> {
+    let mode = if assume_yes {
+        ConsentMode::AssumeYes
+    } else {
+        ConsentMode::Interactive
+    };
+    match update_with_consent(id, mode).await? {
         UpdateOutcome::Applied(report) => Ok(report),
         UpdateOutcome::Skipped { id, reason, .. } => {
             bail!("update for {id} was skipped unexpectedly: {reason}")
@@ -618,7 +624,7 @@ fn apply_prepared(
 
 async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcome> {
     let prepared = prepare_update(id).await?;
-    if mode == ConsentMode::Interactive {
+    if mode != ConsentMode::CleanOnlyNonInteractive {
         eprintln!("{}", prepared.notice);
     }
 
@@ -630,12 +636,14 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
                 fingerprint: prepared.fingerprint.clone(),
             });
         }
-        if confirm_capabilities(
-            id,
-            &prepared.capabilities,
-            &prepared.fetched.manifest.ui,
-            build_steps(&prepared.fetched.manifest),
-        )? {
+        if mode == ConsentMode::AssumeYes
+            || confirm_capabilities(
+                id,
+                &prepared.capabilities,
+                &prepared.fetched.manifest.ui,
+                build_steps(&prepared.fetched.manifest),
+            )?
+        {
             Some(CapabilityGrant {
                 manifest_hash: prepared.manifest_hash.clone(),
                 capabilities: prepared.capabilities.clone(),

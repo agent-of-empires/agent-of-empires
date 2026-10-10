@@ -137,6 +137,7 @@ impl PurgeTransaction {
     ) -> Result<PurgeReservation> {
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
+        let expected_trashed_at = request.instance.trashed_at;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
@@ -182,6 +183,10 @@ impl PurgeTransaction {
                 .find(|instance| instance.id == id)
                 .expect("reserved purge row must still exist");
             let status_before = stored.status;
+            // Drop stale force permission before persisting the recovery intent.
+            if was_trashed && stored.trashed_at != expected_trashed_at {
+                request.force_delete = false;
+            }
             let mut snapshot = stored.clone();
             snapshot.source_profile = storage.profile().to_string();
             let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
@@ -2848,6 +2853,7 @@ mod tests {
 
     fn sandbox_info(container_name: &str) -> SandboxInfo {
         SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "alpine".to_string(),
@@ -3109,6 +3115,51 @@ mod tests {
             let result = perform_deletion(&request);
             assert!(result.success && result.errors.is_empty());
             assert_eq!(result.session_id, "custom-session-id-123");
+        }
+    }
+
+    /// A force chosen against an earlier trash lifecycle is dropped at the claim, so a row
+    /// a peer restored and re-trashed keeps its dirty-worktree guard.
+    #[test]
+    #[serial]
+    fn purge_claim_drops_force_from_a_stale_trash_lifecycle() {
+        let _guard = isolate_app_dir();
+        let earlier = chrono::Utc::now() - chrono::Duration::minutes(5);
+        // (profile, lifecycle the request was chosen against matches the stored one)
+        for (profile, same_lifecycle) in [("purge-stale-force", false), ("purge-same-force", true)]
+        {
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut requested = stored_instance(&storage, profile, "/tmp/test-project");
+            let trashed_at = chrono::Utc::now();
+            storage
+                .update(|instances, _groups| {
+                    instances[0].trashed_at = Some(trashed_at);
+                    Ok(())
+                })
+                .unwrap();
+            requested.trashed_at = Some(if same_lifecycle { trashed_at } else { earlier });
+            let transaction = match PurgeTransaction::reserve(
+                storage,
+                DeletionRequest {
+                    force_delete: true,
+                    ..request(requested)
+                },
+            )
+            .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
+            };
+            assert_eq!(
+                transaction.request.force_delete, same_lifecycle,
+                "{profile}"
+            );
+            let persisted = crate::session::lifecycle_journal::read_deletion(
+                transaction.journal_path.as_deref().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(persisted.force_delete, same_lifecycle, "{profile}");
         }
     }
 

@@ -427,7 +427,7 @@ mod tests {
     use super::*;
 
     use crate::session::instance::launch_command::build_resume_flags;
-    use crate::session::instance::test_helpers::install_aliases;
+    use crate::session::instance::test_helpers::{install_aliases, seed_claude_transcript};
     use serial_test::serial;
     use tempfile::tempdir;
     #[test]
@@ -977,24 +977,6 @@ mod tests {
             "failed marker persistence must not clean up the pane"
         );
         assert!(inst.tmux_session().unwrap().is_pane_dead());
-    }
-
-    /// Seed a resumable Claude conversation in the isolated native store.
-    fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
-        let home = std::env::var("CLAUDE_CONFIG_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| dirs::home_dir().expect("home dir").join(".claude"));
-        let canonical = std::fs::canonicalize(&instance.project_path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&instance.project_path));
-        let dir = home
-            .join("projects")
-            .join(crate::session::capture::encode_claude_project_path(
-                &canonical.to_string_lossy(),
-            ));
-        std::fs::create_dir_all(&dir).expect("create claude project dir");
-        std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
-        let binding = instance.asserted_resume_binding(sid, None).unwrap();
-        instance.set_agent_conversation(Some(sid.into()), Some(binding), None);
     }
 
     #[test]

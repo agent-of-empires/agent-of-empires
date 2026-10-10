@@ -45,6 +45,12 @@ export const HOST_STATE_VARS = new Set([
   "AOE_E2E_STORAGE_LOCK_CONTENDED",
   "AOE_TUI_TEST_CHILD",
   "AOE_TUI_TEST_ENTERED",
+  // Test-only subprocess controls must never leak from the host shell.
+  "AOE_TEST_ACP_WRITER_OUTPUT",
+  "AOE_TEST_ACP_WRITER_SOCKET",
+  "AOE_TEST_CONTROL_RUNNER_IGNORE_TERM",
+  "AOE_TEST_CONTROL_RUNNER_MARKER",
+  "AOE_TEST_CONTROL_RUNNER_SOCKET",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one

@@ -87,7 +87,7 @@ describe("Markdown wrapper", () => {
     expect(plain!.remarkPlugins).toEqual([remarkGfm]);
     expect(user!.remarkPlugins).toEqual([remarkGfm, remarkBreaks]);
     expect(Object.keys(plain!.components)).toEqual(
-      expect.arrayContaining(["SyntaxHighlighter", "CodeHeader", "table", "blockquote", "a", "img"]),
+      expect.arrayContaining(["SyntaxHighlighter", "table", "blockquote", "a", "img"]),
     );
     // A text-size utility would outrank the conversation font-size variable.
     const node = container.querySelector(".acp-markdown") as HTMLElement;
@@ -225,18 +225,26 @@ describe("anchor override", () => {
   });
 });
 
-describe("code header override", () => {
+describe("code block header", () => {
   it.each([
     ["rust", "rust"],
     [undefined, "text"],
   ])("labels language %s and copies the raw source", (language, label) => {
-    const Header = override<{ language?: string; code: string }>("CodeHeader");
+    const Highlighter = override<{ language?: string; code: string }>("SyntaxHighlighter");
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
-    const { container, getByText } = render(<Header language={language} code="alert('hi')" />);
+    const { container, getByText } = render(<Highlighter language={language} code="alert('hi')" />);
     expect(container.textContent).toContain(label);
     fireEvent.click(getByText("copy"));
     expect(writeText).toHaveBeenCalledWith("alert('hi')");
+  });
+
+  it("wraps the code per line when the header toggle is pressed", () => {
+    const Highlighter = override<{ language?: string; code: string }>("SyntaxHighlighter");
+    const { container, getByRole } = render(<Highlighter code={"one\ntwo"} />);
+    expect(container.querySelector(".wrap-lines")).toBeNull();
+    fireEvent.click(getByRole("button", { name: /wrap/i }));
+    expect([...container.querySelectorAll(".wrap-lines .wrap-line")].map((l) => l.textContent)).toEqual(["one", "two"]);
   });
 });
 

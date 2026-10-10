@@ -3,7 +3,7 @@
 // shiki code blocks and transcript-aware links, images, tables, and callouts.
 
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import type { CodeHeaderProps, SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
+import type { SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
 import * as React from "react";
 import { useEffect, useMemo, useState } from "react";
 import remarkBreaks from "remark-breaks";
@@ -15,6 +15,7 @@ import { parseFileRef, resolveArtifactUrl, resolveToRepoRelative } from "../../l
 import { useAcpFileRef } from "./AcpFileRefContext";
 import { openInNewTab } from "../../lib/openInNewTab";
 import { ArtifactImage } from "./artifactMedia";
+import { WrapLines, WrapToggle, useWrapState } from "./WrapToggle";
 
 interface Props {
   text: string;
@@ -39,7 +40,6 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
       className="acp-markdown acp-markdown-body leading-relaxed"
       components={{
         SyntaxHighlighter: ShikiSyntaxHighlighter,
-        CodeHeader,
         table: TableWithScroll,
         blockquote: Blockquote,
         a: TranscriptLink,
@@ -151,6 +151,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   const inputKey = `${language ?? ""}\u0000${code}`;
   const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const shiki = useShikiTheme();
+  const [wrapped, toggleWrap] = useWrapState();
 
   useEffect(() => {
     let cancelled = false;
@@ -176,30 +177,49 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   const html = result && result.key === inputKey ? result.html : null;
 
   // The em-based size carries no line-height, so set it or code inherits the looser body leading.
-  if (html) {
-    return (
-      <div
-        className="overflow-x-auto px-3 py-2 text-[0.86em] leading-[1.3333] [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0"
-        dangerouslySetInnerHTML={{ __html: html }}
-      />
-    );
-  }
   return (
-    <pre className="overflow-x-auto px-3 py-2 text-[0.86em] leading-[1.3333] font-mono text-text-primary">{code}</pre>
+    <>
+      <CodeHeader language={language} code={code} wrapped={wrapped} onToggleWrap={toggleWrap} />
+      {html ? (
+        <div
+          className={`px-3 py-2 text-[0.86em] leading-[1.3333] [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0 ${wrapped ? "wrap-lines" : "overflow-x-auto"}`}
+          dangerouslySetInnerHTML={{ __html: html }}
+        />
+      ) : (
+        <pre
+          className={`px-3 py-2 text-[0.86em] leading-[1.3333] font-mono text-text-primary ${wrapped ? "wrap-lines" : "overflow-x-auto"}`}
+        >
+          {wrapped ? <WrapLines text={code} /> : code}
+        </pre>
+      )}
+    </>
   );
 }
 
-function CodeHeader({ language, code }: CodeHeaderProps) {
+function CodeHeader({
+  language,
+  code,
+  wrapped,
+  onToggleWrap,
+}: {
+  language?: string;
+  code: string;
+  wrapped: boolean;
+  onToggleWrap: () => void;
+}) {
   return (
     <div className="flex items-center justify-between border-b border-surface-800 bg-surface-950 px-3 py-1 text-[0.79em] font-mono uppercase tracking-wider text-text-dim">
       <span>{language ?? "text"}</span>
-      <button
-        type="button"
-        className="rounded px-2 py-0.5 hover:bg-surface-800 hover:text-text-secondary"
-        onClick={() => navigator.clipboard?.writeText(code).catch(() => {})}
-      >
-        copy
-      </button>
+      <span className="flex items-center">
+        <WrapToggle wrapped={wrapped} onToggle={onToggleWrap} />
+        <button
+          type="button"
+          className="min-h-8 rounded px-2 py-0.5 hover:bg-surface-800 hover:text-text-secondary"
+          onClick={() => navigator.clipboard?.writeText(code).catch(() => {})}
+        >
+          copy
+        </button>
+      </span>
     </div>
   );
 }

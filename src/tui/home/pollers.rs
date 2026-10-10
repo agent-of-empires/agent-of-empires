@@ -10,6 +10,15 @@ impl HomeView {
 
         match self.deletion_poller.try_recv_result() {
             Ok(result) => {
+                let attempt = self.deletes_in_flight.remove(&result.session_id);
+                if result.disposition == DeletionDisposition::Failed {
+                    if let Some(attempt) = attempt {
+                        self.failed_deletes
+                            .insert(result.session_id.clone(), attempt);
+                    }
+                } else {
+                    self.failed_deletes.remove(&result.session_id);
+                }
                 match result.disposition {
                     DeletionDisposition::Removed | DeletionDisposition::AlreadyGone => {
                         self.instances.shift_remove(&result.session_id);

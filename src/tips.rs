@@ -66,9 +66,9 @@ static CATALOG: &[Tip] = &[
         id: "new-from-selection",
         title: "Reuse the selected session's settings",
         // `{placeholder}` keys are substituted with the live chord by the tips overlay.
-        body: "Tired of choosing the directory, profile, and group every time? Press \
+        body: "Tired of choosing the directory, profile, agent, and group every time? Press \
                {new_from_selection} on the home view to start a new session that inherits \
-               all of them from the session you have selected.",
+               all of them, with the view and sandbox, from the session you have selected.",
         trigger: TipTrigger::Earned(earned_new_from_selection),
         surfaces: &[TipSurface::Tui],
     },

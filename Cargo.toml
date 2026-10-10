@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.18.0"
+version = "1.19.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -172,7 +172,7 @@ jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 getrandom = "0.4"
 
 # Agent Client Protocol — drives the structured view surface.
-agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage", "unstable_elicitation", "unstable_session_fork"] }
+agent-client-protocol = { version = "2.2", features = ["unstable_end_turn_token_usage", "unstable_session_fork", "unstable_session_notices"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = "1"
@@ -194,9 +194,11 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["r
 # escape the intended root.
 cap-std = "4.0.2"
 
-# Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant).
+# Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant);
+# sd-notify reports readiness to systemd (no-op without NOTIFY_SOCKET).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+sd-notify = "0.5"
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a

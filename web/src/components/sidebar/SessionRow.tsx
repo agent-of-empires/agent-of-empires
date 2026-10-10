@@ -5,7 +5,6 @@ import type { Workspace } from "../../lib/types";
 import {
   attachSessionProject,
   createSession,
-  fetchProjects,
   renameSession,
   setSessionColor,
   setSessionNotifications,
@@ -90,7 +89,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   };
 
   const [modal, setModal] = useState<Modal>(null);
-  const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
@@ -132,12 +130,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     rename: startRename,
     notify: setNotify,
     color: setColor,
-  };
-  const openAddProject = () => {
-    actions.addProject();
-    void fetchProjects().then((projects) =>
-      setAddProjectOptions(projects.map((p) => ({ name: p.name, path: p.path }))),
-    );
   };
 
   if (renaming) {
@@ -291,7 +283,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
               readOnly={readOnly}
               colorsEnabled={sessionColorsEnabled}
               unreadEnabled={unreadIndicatorEnabled}
-              actions={{ ...actions, addProject: openAddProject }}
+              actions={actions}
             />
           )}
         </ContextMenu>
@@ -300,7 +292,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         modal={modal}
         setModal={setModal}
         model={model}
-        addProjectOptions={addProjectOptions}
         onSnooze={(minutes) => {
           closeMenu();
           setModal(null);
@@ -381,13 +372,11 @@ function RowModals({
   modal,
   setModal,
   model,
-  addProjectOptions,
   onSnooze,
 }: {
   modal: Modal;
   setModal: (m: Modal) => void;
   model: RowModel;
-  addProjectOptions: { name: string; path: string }[];
   onSnooze: (minutes: number) => void;
 }) {
   const { label, sessionId } = model;
@@ -426,7 +415,6 @@ function RowModals({
     return createPortal(
       <AddProjectModal
         title={label}
-        projects={addProjectOptions}
         onCancel={close}
         onDone={close}
         onSubmit={(project, attachExistingBranch) => attachSessionProject(sessionId, project, { attachExistingBranch })}

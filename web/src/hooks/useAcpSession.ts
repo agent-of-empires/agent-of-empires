@@ -401,6 +401,7 @@ export function useAcpSession(
       dismissCompactionReminder: () => dispatch({ kind: "dismiss_compaction_reminder" }),
       dismissRejectedPrompt: (id: string) => dispatch({ kind: "dismiss_rejected_prompt", id }),
       dismissModeSwitchFailed: () => dispatch({ kind: "dismiss_mode_switch_failed" }),
+      dismissSessionNotice: (id: string) => dispatch({ kind: "dismiss_session_notice", id }),
       dismissConfigOptionSwitchFailed: () => dispatch({ kind: "dismiss_config_option_switch_failed" }),
     }),
     [],
