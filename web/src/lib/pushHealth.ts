@@ -40,7 +40,20 @@ const PERMANENT_FAILURES = new Set(["gone", "key-mismatch", "rejected"]);
 
 function lastSendFailed(s: ServerSubscriptionStatus): boolean {
   if (!s.last_failure || !PERMANENT_FAILURES.has(s.last_failure) || !s.last_failure_at) return false;
-  return !s.last_success_at || Date.parse(s.last_failure_at) > Date.parse(s.last_success_at);
+  return failureIsNewerThanSuccess(s.last_failure_at, s.last_success_at);
+}
+
+function failureIsNewerThanSuccess(failureAt: string, successAt: string | null): boolean {
+  return !successAt || Date.parse(failureAt) > Date.parse(successAt);
+}
+
+/** Whether the push service permanently retired this endpoint after its last success. */
+export function hasFreshGoneFailure(server: ServerSubscriptionStatus | null): boolean {
+  return (
+    server?.last_failure === "gone" &&
+    !!server.last_failure_at &&
+    failureIsNewerThanSuccess(server.last_failure_at, server.last_success_at)
+  );
 }
 
 export function classifyPushHealth(input: PushHealthInput): PushHealth {
