@@ -381,44 +381,55 @@ async fn spawn_worker(
     };
 
     let spawned = state.acp_supervisor.spawn(request).await;
-    let generation = inst.lifecycle_generation;
-    let id_owned = inst.id.clone();
     let committed = run_blocking(storage, move |storage| {
-        let ownership =
-            crate::session::storage::acquire_ownership_lock().map_err(|e| format!("{e:#}"))?;
-        let _lifecycle = storage
-            .acquire_instance_lifecycle_lock_with_ownership(&ownership, &id_owned)
-            .map_err(|e| format!("{e:#}"))?;
-        storage
-            .load_strict_for_worktree_ownership()
-            .map_err(|e| format!("{e:#}"))?;
-        storage
-            .update_with_ownership(&ownership, |rows, _| {
-                let row = rows
-                    .iter_mut()
-                    .find(|row| row.id == id_owned)
-                    .ok_or_else(|| anyhow::anyhow!("session disappeared during worker restart"))?;
-                anyhow::ensure!(
-                    crate::session::attach_project::same_checkout(row, &inst),
-                    "session checkout changed during worker restart"
-                );
-                anyhow::ensure!(
-                    row.release_lifecycle_reservation_if_owned(
-                        crate::session::LifecycleOperation::Launch,
-                        generation
-                    ),
-                    "worker restart reservation was superseded"
-                );
-                Ok(())
-            })
-            .map_err(|e| format!("{e:#}"))
+        complete_worker_restart(storage, &inst).map_err(|error| format!("{error:#}"))
     })
     .await;
     match (spawned, committed) {
-        (Ok(()), Ok(())) => WorkerOutcome::Restarted,
+        (Ok(()), Ok(true)) => WorkerOutcome::Restarted,
+        (Ok(()), Ok(false)) => {
+            WorkerOutcome::RestartFailed("session checkout changed during worker restart".into())
+        }
         (Err(error), _) => WorkerOutcome::RestartFailed(format!("worker respawn failed: {error}")),
         (Ok(()), Err(error)) => WorkerOutcome::RestartFailed(error),
     }
+}
+
+fn complete_worker_restart(
+    storage: &Storage,
+    instance: &crate::session::Instance,
+) -> anyhow::Result<bool> {
+    let mut cleanup = crate::session::claim::ReservationCleanup::new(
+        storage,
+        instance,
+        crate::session::LifecycleOperation::Launch,
+        instance.lifecycle_generation,
+    );
+    let ownership = crate::session::storage::acquire_ownership_lock()?;
+    let _lifecycle =
+        storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &instance.id)?;
+    storage.load_strict_for_worktree_ownership()?;
+    let checkout_matches = storage.update_with_ownership(&ownership, |rows, _| {
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == instance.id)
+            .ok_or_else(|| anyhow::anyhow!("session disappeared during worker restart"))?;
+        anyhow::ensure!(
+            row.created_at == instance.created_at,
+            "session incarnation changed during worker restart"
+        );
+        let checkout_matches = crate::session::attach_project::same_checkout(row, instance);
+        anyhow::ensure!(
+            row.release_lifecycle_reservation_if_owned(
+                crate::session::LifecycleOperation::Launch,
+                instance.lifecycle_generation,
+            ),
+            "worker restart reservation was superseded"
+        );
+        Ok(checkout_matches)
+    })?;
+    cleanup.disarm();
+    Ok(checkout_matches)
 }
 
 /// Drop the create-time container pins from the live instance.
@@ -475,5 +486,69 @@ mod tests {
             _ => panic!("an archived row must not restart its worker"),
         }
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ownership_review_restart_commit_releases_changed_checkout_but_not_replacement() {
+        for change in ["checkout", "generation", "incarnation", "corrupt"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let storage = Storage::new_unwatched("default").unwrap();
+            let mut original = crate::session::Instance::new("restart", "/checkout/original");
+            original.view = crate::session::View::Structured;
+            original
+                .try_acquire_lifecycle_reservation(
+                    crate::session::LifecycleOperation::Launch,
+                    crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            let mut current = original.clone();
+            match change {
+                "checkout" => current.project_path = "/checkout/changed".into(),
+                "generation" => {
+                    current.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Launch,
+                        original.lifecycle_generation,
+                    );
+                    current
+                        .try_acquire_lifecycle_reservation(
+                            crate::session::LifecycleOperation::Launch,
+                            crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .unwrap();
+                }
+                "incarnation" => current.created_at += chrono::Duration::seconds(1),
+                _ => {}
+            }
+            storage
+                .update(|rows, _| {
+                    rows.push(current);
+                    Ok(())
+                })
+                .unwrap();
+            if change == "corrupt" {
+                std::fs::write(storage.sessions_path(), b"[{broken").unwrap();
+            }
+            let before = std::fs::read(storage.sessions_path()).unwrap();
+            let result = complete_worker_restart(&storage, &original);
+            if change == "checkout" {
+                assert!(!result.unwrap());
+                let row = storage
+                    .load_strict_for_worktree_ownership()
+                    .unwrap()
+                    .remove(0);
+                assert_eq!(row.project_path, "/checkout/changed");
+                assert!(row.lifecycle_reservation.is_none());
+            } else {
+                assert!(result.is_err(), "{change}");
+                assert_eq!(
+                    std::fs::read(storage.sessions_path()).unwrap(),
+                    before,
+                    "{change}"
+                );
+            }
+        }
     }
 }

@@ -77,6 +77,12 @@ pub fn resolve_worktree_path(
     select_live_worktree(entries, &info.branch, Path::new(&info.main_repo_path))
 }
 
+fn already_current(inst: &Instance) -> bool {
+    inst.worktree_info.as_ref().is_none_or(|info| {
+        inst.is_trashed() || !info.managed_by_aoe || Path::new(&inst.project_path).exists()
+    })
+}
+
 /// Reconcile one session: on [`WorktreePathResolution::Moved`], rewrite `inst.project_path` and
 /// persist it, so every later path-derived decision (the rename pre-flight gates, attach, status,
 /// diff) sees the live location.
@@ -85,6 +91,9 @@ pub fn reconcile_and_persist(
     inst: &mut Instance,
     cache: &mut ReconcileCache,
 ) -> anyhow::Result<WorktreePathResolution> {
+    if already_current(inst) {
+        return Ok(WorktreePathResolution::Current);
+    }
     let ownership = super::storage::acquire_ownership_lock()?;
     let _identity = super::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
     let _lifecycle =
@@ -101,24 +110,19 @@ pub(crate) fn reconcile_and_persist_with_ownership(
     cache: &mut ReconcileCache,
 ) -> anyhow::Result<WorktreePathResolution> {
     ownership.require_exclusive()?;
-    let Some(info) = inst.worktree_info.clone() else {
-        return Ok(WorktreePathResolution::Current);
-    };
-    // A trashed session's directory belongs to [`crate::session::trash`], which relocates the
-    // checkout into a holding dir and back and keeps its own pre-trash marker alongside
-    // `project_path`.
-    if inst.is_trashed() {
+    if already_current(inst) {
         return Ok(WorktreePathResolution::Current);
     }
+    let info = inst
+        .worktree_info
+        .as_ref()
+        .expect("managed reconciliation has worktree info");
     let recorded = PathBuf::from(&inst.project_path);
     if super::deletion::resolve_claim_path(&recorded).is_none() {
         return Ok(WorktreePathResolution::Current);
     }
-    if !info.managed_by_aoe || recorded.exists() {
-        return Ok(WorktreePathResolution::Current);
-    }
 
-    let resolution = resolve_worktree_path(cache.entries(&info.main_repo_path)?, &recorded, &info);
+    let resolution = resolve_worktree_path(cache.entries(&info.main_repo_path)?, &recorded, info);
     match &resolution {
         WorktreePathResolution::Moved(found) => {
             let id = inst.id.clone();
@@ -135,14 +139,11 @@ pub(crate) fn reconcile_and_persist_with_ownership(
             let applied = storage.update_with_ownership(ownership, |instances, _groups| {
                 // The UI loader is forgiving; never commit a claim from an incomplete inventory.
                 storage.load_strict_for_worktree_ownership()?;
-                // Compare and set: a peer process could have renamed or trashed this session while
-                // the lookup ran, and its path is fresher than a location we resolved from the old
-                // one.
                 let Some(stored) = instances.iter_mut().find(|c| c.id == id) else {
                     return Ok(false);
                 };
                 if stored.project_path != stale
-                    || stored.worktree_info.as_ref() != Some(&info)
+                    || stored.worktree_info.as_ref() != Some(info)
                     || stored.is_trashed()
                     || stored.has_fresh_lifecycle_reservation(chrono::Utc::now())
                 {
@@ -286,6 +287,51 @@ mod tests {
             ],
         );
         (temp, row, moved)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ownership_review_current_returns_while_an_unrelated_root_lease_is_held() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("exists");
+        std::fs::create_dir(&existing).unwrap();
+        let storage = Storage::new_unwatched("current").unwrap();
+        for case in ["ordinary", "unmanaged", "trashed", "present"] {
+            let mut row = Instance::new(case, &temp.path().join("missing").to_string_lossy());
+            if case != "ordinary" {
+                row.worktree_info = Some(WorktreeInfo {
+                    branch: "feature".into(),
+                    main_repo_path: temp.path().to_string_lossy().into_owned(),
+                    managed_by_aoe: case != "unmanaged",
+                    created_at: chrono::Utc::now(),
+                    base_branch: None,
+                });
+            }
+            if case == "trashed" {
+                row.trash();
+            }
+            if case == "present" {
+                row.project_path = existing.to_string_lossy().into_owned();
+            }
+            let ownership = super::super::storage::acquire_ownership_lock().unwrap();
+            std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let storage = &storage;
+                let worker = scope.spawn(move || {
+                    let result = reconcile_and_persist(storage, &mut row, &mut Default::default());
+                    tx.send(result).unwrap();
+                });
+                let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+                drop(ownership);
+                worker.join().unwrap();
+                assert_eq!(
+                    result.expect(case).unwrap(),
+                    WorktreePathResolution::Current,
+                    "{case}"
+                );
+            });
+        }
     }
 
     #[test]

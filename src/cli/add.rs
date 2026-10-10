@@ -237,9 +237,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut workspace_info_opt = None;
 
     let storage = Storage::new_unwatched(profile)?;
-    let mut ownership = Some(crate::session::storage::acquire_ownership_read()?);
     let (instances, _groups) = storage.load_with_groups()?;
     let final_title = resolve_session_title(&args, &instances)?;
+    let mut ownership = Some(crate::session::storage::acquire_ownership_read()?);
+    storage.verify_profile_identity()?;
 
     let mut resolved_tool = resolve_tool_for_add(&args, &config)?;
 
@@ -1209,7 +1210,7 @@ fn cleanup_partial_session(
                 })
         })
         .collect();
-    builder::cleanup_instance(
+    builder::cleanup_unpublished_instance(
         &instance,
         created_worktree.as_ref(),
         &created_workspace_worktrees,

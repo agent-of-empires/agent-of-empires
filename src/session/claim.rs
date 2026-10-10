@@ -3,6 +3,78 @@
 use super::{Instance, LifecycleOperation, LifecycleReservationError};
 use chrono::{DateTime, Utc};
 
+/// Declare before fenced guards so abandonment releases after their locks drop.
+pub(crate) struct ReservationCleanup<'a> {
+    storage: &'a super::Storage,
+    id: &'a str,
+    created_at: DateTime<Utc>,
+    operation: LifecycleOperation,
+    generation: u64,
+    active: bool,
+}
+
+impl<'a> ReservationCleanup<'a> {
+    pub(crate) fn new(
+        storage: &'a super::Storage,
+        instance: &'a Instance,
+        operation: LifecycleOperation,
+        generation: u64,
+    ) -> Self {
+        Self {
+            storage,
+            id: &instance.id,
+            created_at: instance.created_at,
+            operation,
+            generation,
+            active: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.active = false;
+    }
+
+    fn owns(&self, instance: &Instance) -> bool {
+        instance.id == self.id
+            && instance.created_at == self.created_at
+            && instance.lifecycle_reservation_is_owned(self.operation, self.generation)
+    }
+
+    fn release(&self) -> anyhow::Result<()> {
+        let ownership = super::storage::acquire_ownership_read()?;
+        let _lifecycle = self
+            .storage
+            .acquire_instance_lifecycle_lock_with_ownership(&ownership, self.id)?;
+        if !self
+            .storage
+            .load_strict_for_worktree_ownership()?
+            .iter()
+            .any(|instance| self.owns(instance))
+        {
+            return Ok(());
+        }
+        self.storage
+            .update_with_ownership(&ownership, |instances, _groups| {
+                let instance = instances
+                    .iter_mut()
+                    .find(|instance| self.owns(instance))
+                    .ok_or_else(|| anyhow::anyhow!("abandoned reservation was superseded"))?;
+                instance.release_lifecycle_reservation_if_owned(self.operation, self.generation);
+                Ok(())
+            })
+    }
+}
+
+impl Drop for ReservationCleanup<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            if let Err(error) = self.release() {
+                tracing::warn!(target: "session.lifecycle", session = %self.id, operation = ?self.operation, "Could not release abandoned reservation: {error:#}");
+            }
+        }
+    }
+}
+
 pub(crate) fn purge_restored_row_must_be_kept(targeted_trashed: bool, still_trashed: bool) -> bool {
     targeted_trashed && !still_trashed
 }
@@ -151,6 +223,102 @@ pub(crate) fn commit_trash_relocation(
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    #[serial_test::serial]
+    fn ownership_review_abandonment_only_releases_the_original_reservation() {
+        for operation in [LifecycleOperation::Trash, LifecycleOperation::Launch] {
+            for change in [
+                "checkout",
+                "generation",
+                "incarnation",
+                "missing",
+                "corrupt",
+                "profile",
+            ] {
+                let _home = crate::session::test_support::isolate_app_dir();
+                let storage = super::super::Storage::new_unwatched("cleanup").unwrap();
+                let mut original = Instance::new("candidate", "/checkout/original");
+                original.source_profile = storage.profile().into();
+                let generation = original
+                    .try_acquire_lifecycle_reservation(
+                        operation,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap();
+                storage
+                    .update(|rows, _| {
+                        rows.push(original.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                let mut current = original.clone();
+                match change {
+                    "checkout" => current.project_path = "/checkout/changed".into(),
+                    "generation" => {
+                        current.release_lifecycle_reservation_if_owned(operation, generation);
+                        current
+                            .try_acquire_lifecycle_reservation(
+                                operation,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                Utc::now(),
+                            )
+                            .unwrap();
+                    }
+                    "incarnation" => current.created_at += chrono::Duration::seconds(1),
+                    _ => {}
+                }
+                storage
+                    .update(|rows, _| {
+                        *rows = if change == "missing" {
+                            Vec::new()
+                        } else {
+                            vec![current]
+                        };
+                        Ok(())
+                    })
+                    .unwrap();
+                let replacement;
+                let observed_storage = if change == "profile" {
+                    let profile_dir = crate::session::get_profile_dir(storage.profile()).unwrap();
+                    std::fs::rename(&profile_dir, profile_dir.with_extension("retired")).unwrap();
+                    replacement = super::super::Storage::new_unwatched(storage.profile()).unwrap();
+                    replacement
+                        .update(|rows, _| {
+                            rows.push(original.clone());
+                            Ok(())
+                        })
+                        .unwrap();
+                    &replacement
+                } else {
+                    &storage
+                };
+                if change == "corrupt" {
+                    std::fs::write(storage.sessions_path(), b"[{broken").unwrap();
+                }
+                let before = std::fs::read(observed_storage.sessions_path()).unwrap();
+                drop(ReservationCleanup::new(
+                    &storage, &original, operation, generation,
+                ));
+                if change == "checkout" {
+                    let mut rows = storage.load_strict_for_worktree_ownership().unwrap();
+                    assert_eq!(rows[0].project_path, "/checkout/changed");
+                    assert!(rows[0].lifecycle_reservation.is_none());
+                    assert!(matches!(
+                        decide_restore_claim(&mut rows, &original.id, Utc::now()),
+                        Ok(RestoreClaimDecision::Claimed(_))
+                    ));
+                } else {
+                    assert_eq!(
+                        std::fs::read(observed_storage.sessions_path()).unwrap(),
+                        before,
+                        "{operation:?}/{change}"
+                    );
+                }
+            }
+        }
+    }
 
     fn trashed(id: &str) -> Instance {
         let mut instance = Instance::new("session", "/tmp/worktree");

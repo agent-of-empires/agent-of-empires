@@ -291,7 +291,7 @@ impl HomeView {
             });
         if let Err(error) = persist {
             drop(ownership);
-            builder::cleanup_instance(
+            builder::cleanup_unpublished_instance(
                 &instance,
                 build_result.created_worktree.as_ref(),
                 &build_result.created_workspace_worktrees,

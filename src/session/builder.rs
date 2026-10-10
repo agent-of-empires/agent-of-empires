@@ -1171,27 +1171,18 @@ fn cleanup_created_worktree(
     }
 }
 
-/// Clean up resources created during a failed or cancelled instance build.
-pub fn cleanup_instance(
+/// Roll back resources of a creation candidate that was never published.
+pub fn cleanup_unpublished_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
     protected_owner: Option<&Instance>,
     witness: &CreationWitness,
 ) {
-    let Ok(ownership) = super::storage::acquire_ownership_lock() else {
-        return;
-    };
-    let Ok(owners) = cleanup_owners(&ownership) else {
-        return;
-    };
-    // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
-    // row.
     instance.kill_all_tmux_sessions_without_lifecycle_row();
 
     if let Some(sandbox) = &instance.sandbox_info {
         if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence probe.
             let container = containers::DockerContainer::from_session_id(&instance.id);
             if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
                 tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
@@ -1199,14 +1190,26 @@ pub fn cleanup_instance(
         }
     }
 
+    let ownership = match super::storage::acquire_ownership_lock() {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            tracing::warn!(target: "session.create", "Retaining creation paths: ownership lock failed: {error:#}");
+            return;
+        }
+    };
+    let owners = match cleanup_owners(&ownership) {
+        Ok(owners) => owners,
+        Err(error) => {
+            tracing::warn!(target: "session.create", "Retaining creation paths: ownership inventory failed: {error:#}");
+            return;
+        }
+    };
+
     let protection = CleanupProtection {
         owner: protected_owner,
         owners,
     };
 
-    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
-    // cleanup targets exist), so an abort between provisioning and the caller finishing the session
-    // would otherwise leak the directory on disk.
     if instance.scratch {
         let scratch_path = PathBuf::from(&instance.project_path);
         if witness.original_directory(&scratch_path)
@@ -1647,7 +1650,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        cleanup_instance(&unpublished, Some(&created), &[], None, &witness);
+        cleanup_unpublished_instance(&unpublished, Some(&created), &[], None, &witness);
         assert!(path.is_dir());
         storage
             .update(|rows, _| {
@@ -1655,7 +1658,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        cleanup_instance(&unpublished, Some(&created), &[], None, &witness);
+        cleanup_unpublished_instance(&unpublished, Some(&created), &[], None, &witness);
         assert!(!path.exists());
         assert!(git.branch_exists("claimed-branch").unwrap());
     }
@@ -1706,7 +1709,7 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            cleanup_instance(&unpublished, Some(&created), &[], None, &witness);
+            cleanup_unpublished_instance(&unpublished, Some(&created), &[], None, &witness);
             assert!(path.is_dir(), "{claim}: raw peer checkout was removed");
             assert!(
                 git.branch_exists("claimed-branch").unwrap(),
@@ -2675,6 +2678,48 @@ mod tests {
         assert!(
             refused.contains("codex") && refused.contains("claude"),
             "the refusal must name both agents: {refused}"
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn ownership_review_cleanup_retires_unpublished_tmux_with_unknown_claims() {
+        if which::which("tmux").is_err() {
+            eprintln!("tmux unavailable; runtime cleanup scenario skipped");
+            return;
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let peer = super::super::Storage::new_unwatched("opaque-peer").unwrap();
+        let mut instance = Instance::new("unpublished", "/unused");
+        let scratch = super::super::scratch::provision_scratch_dir(&instance.id).unwrap();
+        instance.project_path = scratch.to_string_lossy().into_owned();
+        instance.scratch = true;
+        let witness = CreationWitness::capture(&instance).unwrap();
+        struct RuntimeCleanup<'a>(&'a Instance);
+        impl Drop for RuntimeCleanup<'_> {
+            fn drop(&mut self) {
+                self.0.kill_all_tmux_sessions_without_lifecycle_row();
+            }
+        }
+        let _cleanup = RuntimeCleanup(&instance);
+        let tmux = instance.tmux_session().unwrap();
+        tmux.create(&instance.project_path, Some("exec sleep 300"), "default")
+            .unwrap();
+        assert!(tmux.exists());
+        std::fs::write(peer.sessions_path(), b"{invalid").unwrap();
+        cleanup_unpublished_instance(&instance, None, &[], None, &witness);
+        assert!(
+            !tmux.exists(),
+            "unknown filesystem ownership must not strand an unpublished runtime"
+        );
+        assert!(
+            scratch.is_dir(),
+            "unknown ownership must still preserve the checkout"
+        );
+        std::fs::write(peer.sessions_path(), b"[]").unwrap();
+        cleanup_unpublished_instance(&instance, None, &[], None, &witness);
+        assert!(
+            !scratch.exists(),
+            "a known unclaimed original scratch directory can be rolled back"
         );
     }
 }

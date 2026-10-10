@@ -151,6 +151,7 @@ async fn reacquire_worktree_rename(
     id: &str,
     original: &Instance,
     previous_storage: &Storage,
+    target: (&str, &str),
 ) -> Result<
     (
         Arc<crate::session::storage::OwnershipGuard>,
@@ -162,24 +163,23 @@ async fn reacquire_worktree_rename(
     axum::response::Response,
 > {
     let profile = profile.to_string();
-    let id = id.to_string();
+    let work_id = id.to_string();
     let file_watch = state.file_watch.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let ownership = Arc::new(crate::session::storage::acquire_ownership_lock()?);
         let identity =
             crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
-        let title =
-            crate::session::storage::acquire_session_title_lock_with_ownership(&ownership, &id)?;
+        let title = crate::session::storage::acquire_session_title_lock_with_ownership(
+            &ownership, &work_id,
+        )?;
         let storage = Storage::open_with_ownership(&profile, file_watch, &ownership)?;
-        let lifecycle = storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &id)?;
-        let current = storage
-            .load()?
-            .into_iter()
-            .find(|instance| instance.id == id);
-        Ok((ownership, identity, title, lifecycle, storage, current))
+        let lifecycle =
+            storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &work_id)?;
+        let rows = storage.load()?;
+        Ok((ownership, identity, title, lifecycle, storage, rows))
     })
     .await;
-    let (ownership, identity, title, lifecycle, storage, current) = match result {
+    let (ownership, identity, title, lifecycle, storage, rows) = match result {
         Ok(Ok(locked)) => locked,
         _ => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     };
@@ -190,7 +190,7 @@ async fn reacquire_worktree_rename(
             "Session profile changed while preparing its worktree rename",
         ));
     }
-    let Some(current) = current else {
+    let Some(current) = rows.iter().find(|instance| instance.id == id) else {
         return Err(session_not_found());
     };
     if current.project_path != original.project_path
@@ -211,6 +211,15 @@ async fn reacquire_worktree_rename(
         || current.status.blocks_worktree_edit()
     {
         return Err(api_error(StatusCode::CONFLICT, "session_changed", "Session changed while preparing its worktree rename; retry against the current session"));
+    }
+    let pair_changed = target.0 != current.title
+        || target.1.trim_end_matches('/') != current.project_path.trim_end_matches('/');
+    if pair_changed && is_duplicate_session(rows.iter(), target.0, target.1, Some(id)) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "duplicate_session",
+            duplicate_session_error(target.0).to_string(),
+        ));
     }
     Ok((ownership, identity, title, lifecycle, storage))
 }
@@ -457,7 +466,16 @@ pub async fn rename_session(
                 _session_title_lock,
                 _lifecycle_lock,
                 storage,
-            ) = match reacquire_worktree_rename(&state, &profile, &id, &fresh, &storage).await {
+            ) = match reacquire_worktree_rename(
+                &state,
+                &profile,
+                &id,
+                &fresh,
+                &storage,
+                (&title, &duplicate_path),
+            )
+            .await
+            {
                 Ok(locked) => locked,
                 Err(response) => return response,
             };
@@ -879,7 +897,16 @@ pub async fn set_worktree_name(
         }
     }
     let (new_ownership, new_identity, _exclusive_title_lock, new_lifecycle, new_storage) =
-        match reacquire_worktree_rename(&state, &profile, &id, &fresh, &storage).await {
+        match reacquire_worktree_rename(
+            &state,
+            &profile,
+            &id,
+            &fresh,
+            &storage,
+            (&fresh.title, &duplicate_path),
+        )
+        .await
+        {
             Ok(locked) => locked,
             Err(response) => return response,
         };
@@ -1174,6 +1201,72 @@ pub(super) fn apply_worktree_name_edit(
     if let Some(branch) = new_branch {
         if let Some(wt) = inst.worktree_info.as_mut() {
             wt.branch = branch.to_string();
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_review_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ownership_review_rename_rejects_a_duplicate_admitted_during_quiescence() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let target = temp.path().join("target").to_string_lossy().into_owned();
+        for target_title in ["renamed", "original"] {
+            let storage = Storage::new_unwatched("default").unwrap();
+            let mut original = Instance::new("original", &source.to_string_lossy());
+            original.source_profile = storage.profile().into();
+            original.status = crate::session::Status::Stopped;
+            original.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "source".into(),
+                main_repo_path: temp.path().to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            storage
+                .update(|rows, _| {
+                    *rows = vec![original.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!is_duplicate_session(
+                storage.load().unwrap().iter(),
+                target_title,
+                &target,
+                Some(&original.id)
+            ));
+            let state = crate::server::test_support::build_test_app_state(vec![original.clone()]);
+            storage
+                .update(|rows, _| {
+                    rows.push(Instance::new(target_title, &target));
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!std::path::Path::new(&target).exists());
+            let response = match reacquire_worktree_rename(
+                &state,
+                storage.profile(),
+                &original.id,
+                &original,
+                &storage,
+                (target_title, &target),
+            )
+            .await
+            {
+                Err(response) => response,
+                Ok(_) => panic!("a newly occupied identity must be rejected after quiescence"),
+            };
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), 2048)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("duplicate_session"));
         }
     }
 }

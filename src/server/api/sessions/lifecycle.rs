@@ -437,6 +437,12 @@ pub async fn trash_session(
             return persist_failed_response();
         }
     };
+    let mut cleanup = crate::session::claim::ReservationCleanup::new(
+        &storage,
+        &snapshot,
+        LifecycleOperation::Trash,
+        generation,
+    );
 
     let was_structured_view = snapshot.is_structured();
     {
@@ -459,9 +465,17 @@ pub async fn trash_session(
         }
     }
 
+    cleanup.disarm();
+    drop(cleanup);
     let work_id = id.clone();
     let kill_pane = body.kill_pane;
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut cleanup = crate::session::claim::ReservationCleanup::new(
+            &storage,
+            &snapshot,
+            LifecycleOperation::Trash,
+            generation,
+        );
         let ownership = crate::session::storage::acquire_ownership_lock()?;
         let _identity_lock =
             crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
@@ -473,10 +487,13 @@ pub async fn trash_session(
             .find(|instance| instance.id == work_id)
             .ok_or_else(|| anyhow::anyhow!("session disappeared before trash relocation"))?;
         anyhow::ensure!(
-            instance.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
+            instance.created_at == snapshot.created_at
+                && instance.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
                 && crate::session::trash::plan_inputs_unchanged(&snapshot, &instance),
             "trash lifecycle reservation or relocation plan was superseded"
         );
+        cleanup.disarm();
+        drop(cleanup);
         if kill_pane {
             if was_structured_view {
                 instance.kill_ancillary_tmux_sessions_locked();

@@ -202,7 +202,7 @@ impl CreationPoller {
         let warnings = build_result.warnings;
         let roll_back = |instance: &Instance| {
             drop(ownership.borrow_mut().take());
-            builder::cleanup_instance(
+            builder::cleanup_unpublished_instance(
                 instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
@@ -323,6 +323,15 @@ impl CreationPoller {
             }
         }
 
+        if sandbox && !container_started {
+            drop(ownership.borrow_mut().take());
+            if let Err(error) = instance.get_container_until_cancelled(&cancel) {
+                return failed(&instance, format!("{error:#}"));
+            }
+        }
+        if cancel.is_cancelled() {
+            return cancelled(&instance);
+        }
         if ownership.borrow().is_none() {
             match crate::session::storage::acquire_ownership_read() {
                 Ok(guard) => *ownership.borrow_mut() = Some(guard),
@@ -334,17 +343,6 @@ impl CreationPoller {
         }
         if let Err(error) = witness.validate(&instance) {
             return failed(&instance, format!("{error:#}"));
-        }
-        if sandbox && !container_started {
-            // Only ensure the container is running here if hooks didn't already
-            // start it. Don't create the tmux session yet -- that happens at attach time
-            // where the terminal size is available.
-            if let Err(e) = instance.get_container_until_cancelled(&cancel) {
-                return failed(&instance, format!("{:#}", e));
-            }
-        }
-        if cancel.is_cancelled() {
-            return cancelled(&instance);
         }
 
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);

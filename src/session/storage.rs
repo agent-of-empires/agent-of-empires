@@ -1,7 +1,7 @@
 //! Session storage with a stable app-root fence before identity, title, lifecycle and storage locks.
 //! Shared ownership covers ordinary claims and profile creation. Exclusive ownership covers
 //! destructive Git effects and profile rename/delete, through authoritative reload and commit.
-//! Hooks and SDK waits release ownership; reacquisition revalidates the original profile and claims.
+//! Prompts, hooks and container/SDK waits release ownership; reacquisition revalidates the original profile and claims.
 //! Multi-store operations order save mutexes by identity and flocks by physical file identity.
 
 use anyhow::{anyhow, Context, Result};
@@ -3793,8 +3793,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn profile_batch_move_rejects_collision_and_merges_fresh_source() -> Result<()> {
         let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
         let source_dir = temp.path().join("source");
         let target_dir = temp.path().join("target");
         std::fs::create_dir_all(&source_dir)?;
@@ -3872,8 +3874,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn profile_move_runs_external_effect_only_after_locked_target_validation() -> Result<()> {
         let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
         let source_dir = temp.path().join("source-effect");
         let target_dir = temp.path().join("target-effect");
         fs::create_dir_all(&source_dir)?;
@@ -3921,8 +3925,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn profile_move_transfers_explicit_empty_group_metadata() -> Result<()> {
         let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
         let source_dir = temp.path().join("source-empty-group");
         let target_dir = temp.path().join("target-empty-group");
         fs::create_dir_all(&source_dir)?;
@@ -3966,8 +3972,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn profile_group_move_rejects_fresh_unplanned_member() -> Result<()> {
         let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
         let source_dir = temp.path().join("source-members");
         let target_dir = temp.path().join("target-members");
         fs::create_dir_all(&source_dir)?;
@@ -4010,10 +4018,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn profile_move_syncs_resolved_symlink_target_parent() -> Result<()> {
         use std::os::unix::fs::symlink;
 
         let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
         let source_dir = temp.path().join("source-symlink");
         let target_dir = temp.path().join("target-symlink");
         let resolved_sessions_dir = temp.path().join("resolved-sessions");

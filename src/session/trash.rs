@@ -282,6 +282,12 @@ pub struct TrashResult {
 
 /// Execute and commit a trash transition under exclusive ownership and lifecycle locks.
 pub fn perform_trash(request: &TrashRequest) -> TrashResult {
+    let mut cleanup = crate::session::claim::ReservationCleanup::new(
+        &request.storage,
+        &request.instance,
+        crate::session::LifecycleOperation::Trash,
+        request.generation,
+    );
     let failed = |reason: String| TrashResult {
         session_id: request.session_id.clone(),
         relocation: None,
@@ -313,6 +319,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         .and_then(|instances| {
             instances.into_iter().find(|instance| {
                 instance.id == request.session_id
+                    && instance.created_at == request.instance.created_at
                     && instance.lifecycle_reservation_is_owned(
                         crate::session::LifecycleOperation::Trash,
                         request.generation,
@@ -325,6 +332,8 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             "trash lifecycle reservation or relocation plan was superseded before teardown".into(),
         );
     };
+    cleanup.disarm();
+    drop(cleanup);
     inst.kill_all_tmux_sessions_locked();
     let outcome = prepare_trashed_worktree(&mut inst, &ownership);
     let relocation = match &outcome {
@@ -1930,6 +1939,7 @@ mod tests {
         assert!(original.join(".git").exists());
         assert!(Path::new(&other.project_path).join(".git").exists());
         assert_eq!(storage.load().unwrap()[0].project_path, other.project_path);
+        assert!(storage.load().unwrap()[0].lifecycle_reservation.is_none());
         assert!(!trash_holding_path(&original, &request.session_id)
             .unwrap()
             .exists());

@@ -334,7 +334,7 @@ pub(crate) async fn spawn_structured_session(
             std::path::Path::new(&original_path),
             progress.as_deref(),
         ) {
-            builder::cleanup_instance(
+            builder::cleanup_unpublished_instance(
                 &instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
@@ -354,36 +354,30 @@ pub(crate) async fn spawn_structured_session(
             progress.set_stage(crate::server::create_progress::CreateStage::Starting);
         }
 
-        // Anything that fails between here and the final `Ok(..)` would otherwise orphan
-        // the scratch directory `build_instance` already provisioned (Storage::new,
-        // storage.update, instance.start). Wrap the tail in an IIFE-equivalent closure so
-        // we can run cleanup on Err once, regardless of which step tripped.
-        let mut persist_and_start = || -> anyhow::Result<()> {
+        let mut persist = || -> anyhow::Result<()> {
             ownership = Some(crate::session::storage::acquire_ownership_read()?);
             storage.verify_profile_identity()?;
             witness.validate(&instance)?;
-            let to_persist = instance.clone();
             storage.update_with_ownership(
                 ownership.as_ref().expect("creation ownership reacquired"),
                 |all, _groups| {
-                all.push(to_persist);
-                Ok(())
-            })?;
-            drop(ownership.take());
-
-            // Acp-mode sessions are not backed by tmux; the structured view supervisor
-            // spawns the ACP agent on demand.
-            let skip_tmux_start = instance.is_structured();
-            if !skip_tmux_start {
-                instance.start()?;
-            }
-            Ok(())
+                    all.push(instance.clone());
+                    Ok(())
+                },
+            )
         };
-
-        if let Err(e) = persist_and_start() {
+        if let Err(error) = persist() {
             drop(ownership.take());
-            builder::cleanup_instance(&instance, created_worktree.as_ref(), &created_workspace_worktrees, None, &witness);
-            return Err(e);
+            builder::cleanup_unpublished_instance(
+                &instance, created_worktree.as_ref(), &created_workspace_worktrees, None, &witness,
+            );
+            return Err(error);
+        }
+        drop(ownership.take());
+        if !instance.is_structured() {
+            if let Err(error) = instance.start() {
+                return Err(error.context("Session metadata was persisted; created resources were retained after startup failed"));
+            }
         }
 
         Ok::<_, anyhow::Error>((

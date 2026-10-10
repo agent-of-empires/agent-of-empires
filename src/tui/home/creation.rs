@@ -15,7 +15,7 @@ pub(super) fn cleanup_creation_resources(
         .iter()
         .map(crate::session::builder::CreatedWorktree::from)
         .collect();
-    crate::session::builder::cleanup_instance(
+    crate::session::builder::cleanup_unpublished_instance(
         instance,
         worktree.as_ref(),
         &workspace_worktrees,
