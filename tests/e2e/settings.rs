@@ -4,6 +4,144 @@ use serial_test::parallel;
 
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
 
+#[test]
+#[parallel]
+fn settings_shortcut_bar_hides_the_row_and_survives_restart() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("settings_shortcut_bar");
+    h.spawn_tui();
+    h.wait_for_ready();
+    h.assert_screen_contains("Cmds");
+    h.send_keys("s");
+    h.wait_for("Settings");
+    h.send_keys("/");
+    h.type_text("Show shortcut bar");
+    h.send_keys("Enter");
+    h.send_keys("Enter");
+    h.send_keys("C-s");
+    let config: toml::Table =
+        std::fs::read_to_string(app_dir_in(h.home_path()).join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(
+        config["session"]["show_shortcut_bar"].as_bool(),
+        Some(false)
+    );
+    h.send_keys("Escape");
+    h.send_keys("Escape");
+    h.wait_for_ready();
+    h.assert_screen_not_contains("Cmds");
+    h.send_keys("?");
+    h.wait_for("Keyboard Shortcuts");
+    h.send_keys("Escape");
+    h.send_keys("C-k");
+    h.type_text("Show tips");
+    h.send_keys("Enter");
+    h.wait_for("Tips");
+    h.send_keys("Escape");
+    h.kill_tui();
+    h.spawn_tui();
+    h.wait_for_ready();
+    h.assert_screen_not_contains("Cmds");
+    h.send_keys("s");
+    h.wait_for("Settings");
+    h.send_keys("/");
+    h.type_text("Show shortcut bar");
+    h.send_keys("Enter");
+    h.send_keys("Enter");
+    h.send_keys("C-s");
+    h.send_keys("Escape");
+    h.send_keys("Escape");
+    h.wait_for("Cmds");
+}
+
+#[test]
+#[parallel]
+fn shortcut_bar_hidden_live_still_relays_input_and_exits() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("shortcut_bar_live");
+    let config_path = app_dir_in(h.home_path()).join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config
+        .push_str("\n[session]\nshow_shortcut_bar = false\ndefault_attach_mode = \"live_send\"\n");
+    std::fs::write(&config_path, config).unwrap();
+    let bin = h.install_path_command("claude");
+    std::fs::write(
+        bin.join("claude"),
+        "#!/bin/sh\nstty -echo -icanon min 1 time 0\nprintf 'agent-ready\\n'\nexec cat\n",
+    )
+    .unwrap();
+    let project = h.project_path();
+    h.add_session(&[project.to_str().unwrap(), "-t", "Hidden bar"]);
+    h.spawn_tui();
+    h.wait_for("Hidden bar");
+    h.send_keys("Enter");
+    h.wait_for("agent-ready");
+    h.assert_screen_not_contains("LIVE");
+    h.assert_screen_not_contains("Cmds");
+    h.type_text("input-reached-agent");
+    h.wait_for("input-reached-agent");
+    h.send_keys("C-q");
+    h.send_keys("?");
+    h.wait_for("Keyboard Shortcuts");
+}
+
+#[test]
+#[parallel]
+fn shortcut_bar_tip_after_cli_creation_waits_for_home_and_is_seen_once() {
+    use std::{fs, time::Duration};
+
+    require_tmux!();
+    let mut h = TuiTestHarness::new("shortcut_bar_tip");
+    let app = app_dir_in(h.home_path());
+    let config_path = app.join("config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str("\nsessions_created = 30\n");
+    fs::write(&config_path, config).unwrap();
+    h.spawn_tui();
+    h.wait_for_ready();
+    h.send_keys("?");
+    h.wait_for("Keyboard Shortcuts");
+    let project = h.project_path();
+    let args = [
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "Threshold session",
+        "--cmd-override",
+        "sleep 600",
+    ];
+    h.run_cli_ok(&args);
+    let read_state = || -> toml::Table {
+        fs::read_to_string(app.join("state.toml"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(read_state()["sessions_created"].as_integer(), Some(31));
+    h.run_cli_err(&args);
+    assert_eq!(read_state()["sessions_created"].as_integer(), Some(31));
+    h.send_keys("Escape");
+    h.wait_for_timeout("More room for your sessions", Duration::from_secs(15));
+    h.assert_screen_contains("Show shortcut bar");
+    h.send_keys("Escape");
+    let state = read_state();
+    assert!(state["tips_seen"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id.as_str() == Some("hide-shortcut-bar")));
+    h.kill_tui();
+    h.spawn_tui();
+    h.wait_for_ready();
+    h.send_keys("?");
+    h.wait_for("Keyboard Shortcuts");
+    h.send_keys("Escape");
+    h.assert_screen_not_contains("More room for your sessions");
+    h.assert_screen_contains("Cmds");
+}
+
 /// Save each sidebar position through Settings and verify it in a fresh TUI process.
 #[test]
 #[parallel]
