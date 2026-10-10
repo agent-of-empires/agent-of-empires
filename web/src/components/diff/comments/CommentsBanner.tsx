@@ -9,7 +9,7 @@ interface Props {
   onDiscardAll: () => void;
 }
 
-/** Comment count chip above the diff list; Send is disabled for a trashed session. */
+/** Floating chip above the diff list; Send is disabled when the session cannot accept input. */
 export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend, onDiscardAll }: Props) {
   if (count === 0) return null;
   return (
