@@ -107,14 +107,12 @@ fn queue_drain_batch<'a>(
     if queue.is_empty() {
         return (&[], String::new());
     }
-    let batch_end = if profile.clear_aliases.is_empty() {
-        queue.len()
-    } else if profile.is_clear_command(&queue[0].text) {
+    let batch_end = if profile.is_solo_command(&queue[0].text) {
         1
     } else {
         queue
             .iter()
-            .position(|e| profile.is_clear_command(&e.text))
+            .position(|e| profile.is_solo_command(&e.text))
             .unwrap_or(queue.len())
     };
     let sub = &queue[..batch_end];
@@ -1150,7 +1148,7 @@ impl SessionService {
             return;
         }
 
-        // Leading batch up to a clear boundary (mirrors the client's split).
+        // Leading batch up to a clear or compact boundary.
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
         let sent_ids: Vec<String> = sub.iter().map(|e| e.id.clone()).collect();
@@ -1367,6 +1365,7 @@ impl SessionService {
     pub(crate) async fn prompt_dispatch_under_submission(
         &self,
         id: &str,
+        text: &str,
         idle_dormant: bool,
         no_revive: bool,
     ) -> crate::acp::dispatch::PromptDispatch {
@@ -1384,7 +1383,16 @@ impl SessionService {
             idle_dormant,
             rate_limit_parked,
         };
-        crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness)
+        let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
+        crate::acp::dispatch::hold_solo_command(dispatch, self.is_solo_command(id, text).await)
+    }
+
+    async fn is_solo_command(&self, id: &str, text: &str) -> bool {
+        let instances = self.instances.read().await;
+        instances.iter().find(|i| i.id == id).is_some_and(|inst| {
+            let agent_key = inst.agent_name.as_deref().unwrap_or(&inst.tool);
+            crate::acp::agent_profiles::resolve(agent_key).is_solo_command(text)
+        })
     }
 
     /// See [`crate::acp::dispatch::WorkerLiveness::rate_limit_parked`].
@@ -2767,6 +2775,15 @@ mod tests {
         let (sub, combined) = queue_drain_batch(&q, claude);
         assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["c"]);
         assert_eq!(combined, "/clear");
+
+        // A compact command splits the batch the same way.
+        let q = vec![entry("a", 0, "one"), entry("c", 1, "/compact focus")];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(combined, "one");
+        let q = vec![entry("c", 0, "/compact"), entry("a", 1, "one")];
+        let (sub, _) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.len(), 1);
 
         // No clear anywhere.
         let q = vec![

@@ -913,6 +913,14 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tips_seen: Vec<String>,
 
+    /// Successful session creations across all profiles, independent of telemetry.
+    #[serde(default)]
+    pub sessions_created: u64,
+
+    /// Stops concurrent upgrade migrations from seeding the counter twice.
+    #[serde(default)]
+    pub sessions_created_seeded: bool,
+
     /// How many times the new-session dialog has been opened while a project or
     /// session was selected. Once this passes
     /// [`crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD`], the "new from
@@ -1651,6 +1659,18 @@ pub struct SessionConfig {
     )]
     pub show_tips: bool,
 
+    /// Show the bottom shortcut bar, including the LIVE banner. Hiding it frees
+    /// one row; shortcuts, help, and temporary notifications remain available.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Show shortcut bar",
+        widget = "toggle",
+        category = "Interaction",
+        global_only,
+        tui_only
+    )]
+    pub show_shortcut_bar: bool,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -1942,6 +1962,7 @@ impl Default for SessionConfig {
             show_session_colors: true,
             favorites_first: true,
             show_tips: true,
+            show_shortcut_bar: true,
             tie_workdir_to_name: true,
         }
     }

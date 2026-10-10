@@ -32,7 +32,7 @@ use super::token::{
     load_or_generate_token, test_token_grace_override, test_token_lifetime_override,
     write_secret_file, TokenManager, DEFAULT_TOKEN_GRACE,
 };
-use crate::server::{api, callback, login, push, session_service, tunnel};
+use crate::server::{api, callback, login, plugin_status, push, session_service, tunnel};
 
 /// Build the owner-only `serve.url` contents for a remotely exposed daemon.
 pub(super) fn remote_serve_url_contents(
@@ -378,6 +378,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
         supervisor
     };
+    let cityhall_mode = std::env::var_os("AOE_CITYHALL_MODE").is_some();
+    let status_tx = broadcast::channel(STATUS_CHANNEL_CAPACITY).0;
     // The Tier 1 plugin worker host.
     let instances = Arc::new(RwLock::new(loaded.instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -414,6 +416,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                         session_service: Arc::clone(&session_service),
                         policy: Arc::new(policy),
                         profile: profile.to_string(),
+                        cityhall_mode,
+                        status_tx: status_tx.clone(),
                     })),
                     Err(e) => {
                         tracing::warn!(
@@ -648,7 +652,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
-        cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
+        cityhall_mode,
         instances,
         runtime_read_cache: std::sync::RwLock::new(loaded.cache),
         session_service,
@@ -688,7 +692,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
-        status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+        status_tx,
         acp_events_tx: acp_events_tx.clone(),
         acp_event_store: acp_event_store.clone(),
         acp_control_cache: acp_control_cache.clone(),
@@ -878,6 +882,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Launch plugin workers for every active plugin that declares a runtime.
     if let Some(host) = state.plugin_host.clone() {
+        // Subscribe before any worker can register, or a transition published meanwhile has no
+        // forwarder to carry it.
+        plugin_status::spawn_forwarder(state.clone(), host.clone());
         host.start(&crate::plugin::registry()).await;
     }
 

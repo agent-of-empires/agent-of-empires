@@ -921,7 +921,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         Ok(true)
     });
     match persist_result {
-        Ok(true) => {}
+        Ok(true) => crate::tips::record_session_creations(1),
         Ok(false) => {
             cleanup_partial_session(
                 &path,

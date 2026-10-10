@@ -68,6 +68,28 @@ describe("UserMessage image part", () => {
   });
 });
 
+describe("AssistantMessage compaction summary", () => {
+  it("renders the retained summary collapsed under its own label", () => {
+    const rows: ActivityRow[] = [
+      {
+        id: "compaction-summary-1",
+        kind: "compaction_summary",
+        text: "Kept **PINEAPPLE-42**",
+        at: "2026-10-06T00:00:00Z",
+      },
+      // An empty row only anchors a summary that has not arrived yet.
+      { id: "compaction-summary-2", kind: "compaction_summary", text: "", at: "2026-10-06T00:00:00Z" },
+    ];
+    const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
+    expect(container.querySelectorAll("details")).toHaveLength(1);
+    const details = container.querySelector("details");
+    expect(details).not.toBeNull();
+    expect(details!.open).toBe(false);
+    expect(details!.querySelector("summary")?.textContent).toContain("Compaction summary");
+    expect(details!.textContent).toContain("PINEAPPLE-42");
+  });
+});
+
 describe("AssistantMessage group parts", () => {
   const at = "2026-05-12T00:00:00Z";
   const start = (id: string, tool: Partial<ToolCall> = {}): ActivityRow => ({

@@ -157,6 +157,14 @@ pub struct SessionNotice {
     pub description: Option<String>,
 }
 
+/// A keyed notice keeps one id across updates; others are minted from the seq.
+pub fn notice_id(key: Option<&str>, seq: u64) -> String {
+    match key {
+        Some(key) => format!("notice-{key}"),
+        None => format!("notice-{seq}"),
+    }
+}
+
 /// Snapshot of the most recent ACP agent handoff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSwitchInfo {
@@ -198,6 +206,10 @@ pub struct ModeInfo {
     #[serde(default)]
     pub description: Option<String>,
 }
+
+/// Title of the tool call the adapter opens for `/compact`; newer adapters emit
+/// it instead of the `Compacting...` text chunk.
+const COMPACT_TOOL_NAME: &str = "Compact conversation";
 
 /// Agent-to-client notification carrying the agent's own auth identity.
 pub const AUTH_STATUS_UPDATE_METHOD: &str = "_auth/status_update";
@@ -452,6 +464,10 @@ pub struct AcpState {
     /// A `/compact` is running; the adapter goes silent for minutes.
     #[serde(default)]
     pub compacting: bool,
+    /// The adapter's `/compact` tool call, whose completion ends `compacting`.
+    /// Held by id because a later update can retitle the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_tool_id: Option<String>,
 
     pub last_seq: u64,
     pub updated_at: DateTime<Utc>,
@@ -568,6 +584,9 @@ pub enum Event {
         title: String,
         #[serde(default)]
         description: Option<String>,
+        /// A later notice with the same key replaces this one in place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     /// Auto-resume breadcrumb; `manual` when the user pressed RESUME NOW.
     RateLimitAutoResumed {
@@ -740,6 +759,15 @@ pub enum Event {
     ConversationCompactionStarted,
     /// `/compact` replaced the model's context with a summary.
     ConversationCompacted,
+    /// A compaction ended without replacing the context.
+    ConversationCompactionFailed,
+    /// The summary the agent retained when compacting, after its
+    /// `ConversationCompacted`. A later one for the same compaction replaces
+    /// it; empty `text` clears it.
+    ConversationCompactionSummary {
+        compaction_id: String,
+        text: String,
+    },
     AgentSwitched {
         from: String,
         to: String,
@@ -788,6 +816,10 @@ impl AcpState {
                     .is_some_and(|t| t.id == tool_call_id)
                 {
                     self.in_flight_tool = None;
+                }
+                if self.compaction_tool_id.as_ref() == Some(&tool_call_id) {
+                    self.compaction_tool_id = None;
+                    self.compacting = false;
                 }
             }
             Event::ToolCallUpdated {
@@ -860,13 +892,18 @@ impl AcpState {
                 severity,
                 title,
                 description,
+                key,
             } => {
-                self.session_notices.push(SessionNotice {
-                    id: format!("notice-{}", self.last_seq.saturating_add(1)),
+                let notice = SessionNotice {
+                    id: notice_id(key.as_deref(), self.last_seq.saturating_add(1)),
                     severity,
                     title,
                     description,
-                });
+                };
+                match self.session_notices.iter_mut().find(|n| n.id == notice.id) {
+                    Some(existing) => *existing = notice,
+                    None => self.session_notices.push(notice),
+                }
                 let excess = self
                     .session_notices
                     .len()
@@ -938,6 +975,10 @@ impl AcpState {
             Event::ConversationCompacted => {
                 self.compacting = false;
                 self.usage = None;
+            }
+            Event::ConversationCompactionFailed => {
+                self.compacting = false;
+                self.compaction_tool_id = None;
             }
             Event::PromptRejected { .. } => self.turn_active = false,
             Event::AgentSwitched { from, to, reason } => self.switch_agent(from, to, reason),
@@ -1016,6 +1057,7 @@ impl AcpState {
             | Event::RawAgentUpdate { .. }
             | Event::AgentMessageChunk { .. }
             | Event::ConversationSummary { .. }
+            | Event::ConversationCompactionSummary { .. }
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. } => {}
         }
@@ -1025,6 +1067,10 @@ impl AcpState {
     }
 
     fn start_tool_call(&mut self, tool_call: ToolCall) {
+        if tool_call.name == COMPACT_TOOL_NAME {
+            self.compacting = true;
+            self.compaction_tool_id = Some(tool_call.id.clone());
+        }
         match self.in_flight_tool.as_mut() {
             // A repeated start frame for the same call keeps diffs an update already attached.
             Some(existing) if existing.id == tool_call.id => {
@@ -1057,6 +1103,7 @@ impl AcpState {
         self.turn_active = false;
         self.cancelling = false;
         self.compacting = false;
+        self.compaction_tool_id = None;
         self.in_flight_tool = None;
         self.thinking = None;
         if reason != "rate_limited" && reason != RATE_LIMIT_EXHAUSTED_RETRIES_REASON {
@@ -1162,7 +1209,31 @@ mod tests {
             severity: "warning".into(),
             title: title.into(),
             description: None,
+            key: None,
         }
+    }
+
+    #[test]
+    fn keyed_session_notice_replaces_in_place() {
+        let keyed = |description: &str| Event::SessionNotice {
+            severity: "error".into(),
+            title: "Compaction failed".into(),
+            description: Some(description.into()),
+            key: Some("compaction-a".into()),
+        };
+        let s = applied([keyed("aborted"), notice("other"), keyed("out of tokens")]);
+        let got: Vec<(&str, Option<&str>)> = s
+            .session_notices
+            .iter()
+            .map(|n| (n.id.as_str(), n.description.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("notice-compaction-a", Some("out of tokens")),
+                ("notice-2", None)
+            ]
+        );
     }
 
     /// #4242: notices are live advisories, so they are capped and retired on
@@ -1412,6 +1483,55 @@ mod tests {
         assert!(
             !applied([Event::ConversationCompactionStarted, stopped("end_turn")]).compacting,
             "Stopped self-heals a stuck compaction"
+        );
+
+        let compact_tool = || {
+            let mut tc = tool_call("tc-compact");
+            tc.name = COMPACT_TOOL_NAME.into();
+            Event::ToolCallStarted { tool_call: tc }
+        };
+        let tool_done = |id: &str, is_error: bool| Event::ToolCallCompleted {
+            tool_call_id: id.into(),
+            is_error,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: Utc::now(),
+            async_subagent: false,
+        };
+        assert!(
+            applied([compact_tool()]).compacting,
+            "the adapter's compact tool call marks compaction"
+        );
+        assert!(
+            !applied([compact_tool(), tool_done("tc-compact", true)]).compacting,
+            "a failed compaction clears the flag"
+        );
+        assert!(
+            applied([compact_tool(), tool_done("other", false)]).compacting,
+            "another tool's completion leaves it set"
+        );
+        let retitle = Event::ToolCallUpdated {
+            tool_call_id: "tc-compact".into(),
+            title: Some("Compacting context".into()),
+            args_preview: None,
+            started_at: None,
+            diffs: None,
+        };
+        assert!(
+            !applied([compact_tool(), retitle, tool_done("tc-compact", false)]).compacting,
+            "a retitled compact call still clears by id"
+        );
+        assert!(
+            !applied([compact_tool(), Event::ConversationCompactionFailed]).compacting,
+            "a reported failure clears the flag"
+        );
+        assert!(
+            !applied([
+                Event::ConversationCompactionStarted,
+                Event::ConversationCompactionFailed
+            ])
+            .compacting,
+            "a failure also ends a text-marked compaction"
         );
 
         let mut s = fresh_state();

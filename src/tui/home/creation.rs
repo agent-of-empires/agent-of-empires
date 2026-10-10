@@ -398,10 +398,8 @@ impl HomeView {
                     },
                 }
 
-                // `publish_persisted_instance` records the create-count and clears the id
-                // from `pending_added`, since the row is authoritative now. Its in-memory
-                // insert is superseded by the `reload()` below on success and is the
-                // fallback that keeps the row visible if that reload fails.
+                crate::tips::record_session_creations(1);
+                // Keep the committed row visible even if reloading fails.
                 self.publish_persisted_instance(instance.clone());
                 self.rebuild_group_trees();
 

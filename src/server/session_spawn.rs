@@ -384,6 +384,7 @@ pub(crate) async fn spawn_structured_session(
             return Err(e);
         }
 
+        crate::tips::record_session_creations(1);
         Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
             instance,
             build_warnings,
@@ -645,6 +646,12 @@ mod tests {
         );
         let response = response.expect("creation finishes").expect("creation task");
         assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        assert_eq!(
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sessions_created,
+            1
+        );
         let response: serde_json::Value = serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await

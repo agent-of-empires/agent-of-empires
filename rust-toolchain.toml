@@ -1,2 +1,6 @@
+# Pinned so a new stable cannot break every PR at once (#4246).
+# `.github/workflows/rust-toolchain-bump.yml` opens a PR for each new stable.
+# `rust-version` in Cargo.toml stays the MSRV.
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

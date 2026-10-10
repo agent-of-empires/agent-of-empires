@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.18.0"
+version = "1.19.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -172,7 +172,7 @@ jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 getrandom = "0.4"
 
 # Agent Client Protocol — drives the structured view surface.
-agent-client-protocol = { version = "2.2", features = ["unstable_end_turn_token_usage", "unstable_session_fork", "unstable_session_notices"] }
+agent-client-protocol = { version = "2.2", features = ["unstable_end_turn_token_usage", "unstable_session_compaction", "unstable_session_fork", "unstable_session_notices"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = "1"

@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use crate::server::api::{find_instance, instance_exists};
+use crate::server::push::publish_status_change;
 use crate::session::{Instance, ResumeIntent, Status, View};
 
 use super::*;
@@ -227,7 +228,9 @@ async fn commit_structured_view(
     let mut instances = state.instances.write().await;
     if let Some(slot) = instances.iter_mut().find(|candidate| candidate.id == id) {
         if lifecycle_generation >= slot.lifecycle_generation {
+            let old_status = slot.status;
             apply(slot);
+            publish_status_change(&state.status_tx, slot, old_status);
             state
                 .mutation_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -623,6 +626,29 @@ mod tests {
             routing.contains(&("CLAUDE_CODE_USE_VERTEX".to_string(), "1".to_string())),
             "{routing:?}"
         );
+    }
+
+    /// The terminal-to-ACP switch settles the live slot to Idle itself. A plugin that last heard
+    /// Running would never learn the session went Idle unless the switch publishes the move.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn switching_to_structured_view_publishes_the_idle_it_settles_to() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("switch-notify", "/tmp/aoe-switch-notify");
+        inst.source_profile = "default".to_string();
+        inst.status = Status::Running;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let mut rx = state.status_tx.subscribe();
+        let mut working = inst.clone();
+
+        assert!(commit_structured_view(&state, &mut working, None)
+            .await
+            .is_ok());
+
+        let change = rx.try_recv().expect("the live slot's move is published");
+        assert_eq!(change.instance_id, inst.id);
+        assert_eq!((change.old, change.new), (Status::Running, Status::Idle));
     }
 
     #[test]

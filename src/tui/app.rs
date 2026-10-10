@@ -129,6 +129,8 @@ pub struct App {
     pending_view_switch: Option<String>,
     pending_daemon_start_open: Option<String>,
     pending_smart_rename: Option<String>,
+    /// Outcome line of an in-flight "Auto-name now", which waits for the agent's one-shot.
+    smart_rename_rx: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     /// Debounce for structured preview-on-select, so fast navigation doesn't
     /// connect a WebSocket per keystroke.
     preview_mount_pending: Option<(String, std::time::Instant)>,
@@ -342,6 +344,7 @@ impl App {
             preview_mount_pending: None,
             pending_view_switch: None,
             pending_smart_rename: None,
+            smart_rename_rx: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
         })
@@ -1177,7 +1180,8 @@ impl App {
             let banner_changed = self.poll_update_check()
                 | self.poll_update_status()
                 | self.poll_image_update_check()
-                | self.poll_image_pull_status();
+                | self.poll_image_pull_status()
+                | self.poll_smart_rename();
             if banner_changed {
                 self.needs_redraw = true;
                 full = true;
@@ -1295,6 +1299,7 @@ impl App {
             full |= self.home.try_clear_recovered_reload_dialog();
             // Another surface took the size-owner lock: leave live mode.
             full |= self.home.poll_live_send_takeover();
+            full |= self.home.try_present_shortcut_bar_tip();
 
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 crate::session::write_tui_heartbeat();
@@ -2109,6 +2114,11 @@ impl App {
     async fn perform_smart_rename(&mut self, session_id: &str) {
         use crate::acp::client::{require_daemon, HttpClient, ManagerError};
 
+        // A second request would replace the receiver and lose the first one's result.
+        if self.smart_rename_rx.is_some() {
+            self.set_status("auto-name already in progress");
+            return;
+        }
         let title = self
             .home
             .get_instance(session_id)
@@ -2135,10 +2145,39 @@ impl App {
                 return;
             }
         };
-        self.set_status(match http.smart_rename(session_id).await {
-            Ok(()) => format!("auto-naming \"{title}\"…"),
-            Err(e) => format!("auto-name failed: {e}"),
+        self.set_status(format!("auto-naming \"{title}\"…"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.smart_rename_rx = Some(rx);
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let outcome = http
+                .smart_rename(&session_id)
+                .await
+                .map_err(|e| smart_rename_failure(&e));
+            let _ = tx.send(outcome);
         });
+    }
+
+    /// Surfaces a failed "Auto-name now"; success shows as the new title.
+    fn poll_smart_rename(&mut self) -> bool {
+        let Some(mut rx) = self.smart_rename_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => false,
+            Ok(Err(failure)) => {
+                self.set_status(failure);
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.smart_rename_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.set_status("auto-name ended unexpectedly");
+                true
+            }
+        }
     }
 
     /// POST the view switch, starting a local daemon first if needed: the user
@@ -3071,11 +3110,49 @@ pub enum Action {
     SmartRenameNow(String),
 }
 
+/// Leads with the API `message` so the agent's reason fits the one-row banner.
+fn smart_rename_failure(e: &crate::acp::client::HttpError) -> String {
+    let message = match e {
+        crate::acp::client::HttpError::Server { body, .. } => {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v["message"].as_str().map(str::to_owned))
+        }
+        _ => None,
+    };
+    format!(
+        "auto-name failed: {}",
+        message.unwrap_or_else(|| e.to_string())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::telemetry::SendOutcome;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn smart_rename_failure_leads_with_the_api_message() {
+        use crate::acp::client::HttpError;
+        use reqwest::StatusCode;
+        for (body, want) in [
+            (
+                r#"{"error":"smart_rename_failed","message":"`opencode` failed: token expired"}"#,
+                "auto-name failed: `opencode` failed: token expired",
+            ),
+            (
+                "upstream down",
+                "auto-name failed: daemon returned HTTP 502 Bad Gateway: upstream down",
+            ),
+        ] {
+            let e = HttpError::Server {
+                status: StatusCode::BAD_GATEWAY,
+                body: body.to_string(),
+            };
+            assert_eq!(smart_rename_failure(&e), want);
+        }
+    }
 
     /// Read a signal's disposition; `sigaction` sets while reading, so restore it.
     #[cfg(unix)]
