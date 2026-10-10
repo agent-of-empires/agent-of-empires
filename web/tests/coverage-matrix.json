@@ -2915,6 +2915,18 @@
       ]
     },
     {
+      "id": "acp.table-copy",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "src/lib/tableMarkdown.test.tsx",
+        "src/components/acp/Markdown.test.tsx",
+        "src/components/acp/ThreadMessages.test.tsx",
+        "tests/acp-table-copy.spec.ts"
+      ],
+      "components": ["web/src/components/acp/Markdown.tsx"]
+    },
+    {
       "id": "acp.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",

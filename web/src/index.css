@@ -385,8 +385,22 @@ html[data-ios-standalone]:not([data-editing]) {
   border-top: 1px solid var(--color-surface-800);
   margin: 0.75rem 0;
 }
-.acp-markdown .acp-table-wrap {
+.acp-markdown .acp-table-block {
+  position: relative;
   margin: 0.75rem 0;
+}
+/* Hidden until hover or focus; touch has no hover, so it stays visible there. */
+@media (hover: hover) and (pointer: fine) {
+  .acp-markdown .acp-table-copy {
+    opacity: 0;
+  }
+  .acp-markdown .acp-table-block:hover .acp-table-copy,
+  .acp-markdown .acp-table-copy:focus-visible,
+  .acp-markdown .acp-table-copy[data-copied="true"] {
+    opacity: 1;
+  }
+}
+.acp-markdown .acp-table-wrap {
   border: 1px solid var(--color-surface-800);
   border-radius: 0.375rem;
   overflow: auto;
