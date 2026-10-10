@@ -78,6 +78,17 @@ The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the l
 
 A foreground `aoe serve` reports readiness over `sd_notify` when systemd sets `NOTIFY_SOCKET`, so a unit can use `Type=notify`. `READY=1` is sent once the listener is bound, plugin workers are launched and background tasks are running; `STOPPING=1` is sent when shutdown starts. If aoe runs as a child of a wrapper (for example `cargo run`), add `NotifyAccess=all`, since systemd otherwise accepts messages only from the main process.
 
+### Running in a container
+
+Each release publishes `ghcr.io/agent-of-empires/aoe-server` for `linux/amd64` and `linux/arm64`, tagged with the version (`1.2.3`, `1.2`) and `latest`. It runs as uid 1000 with aoe's data under `/home/aoe/.config/agent-of-empires`, so mount a volume there. The default command is `aoe serve --host 0.0.0.0 --port 8080` with token auth:
+
+```bash
+docker run -p 8080:8080 -v aoe-data:/home/aoe/.config/agent-of-empires \
+  ghcr.io/agent-of-empires/aoe-server:latest
+```
+
+Behind a gating proxy, pass the whole command instead, for example `aoe serve --host 0.0.0.0 --auth none --behind-proxy --allowed-host aoe.example.com`. The image ships tmux, git and Node but no coding agent; install one inside the container with `npm install -g`, which lands in the user's home.
+
 ## Security
 
 **The dashboard exposes terminal access.** Anyone who authenticates can send keystrokes to your agent sessions, which run as your user.

@@ -330,3 +330,75 @@ jobs:
       - name: Skip notice
         if: env.CLAWHUB_TOKEN == ''
         run: echo "::notice::Skipping ClawHub publish -- CLAWHUB_TOKEN secret not configured"
+
+  publish-server-image:
+    name: Publish aoe-server image
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
+
+      # Package the binaries this run just released rather than recompiling,
+      # so the image runs the exact bytes attached to the GitHub release.
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: aoe-linux-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Stage build context
+        run: |
+          set -euo pipefail
+          mkdir -p image-context
+          for arch in amd64 arm64; do
+            (cd artifacts && sha256sum -c "aoe-linux-${arch}.tar.gz.sha256")
+            tar -xzf "artifacts/aoe-linux-${arch}.tar.gz" -C image-context
+          done
+          ls -lR image-context
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/agent-of-empires/aoe-server
+          # `latest` is set explicitly so a prerelease never takes it.
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.version }}
+            type=raw,value=latest,enable=${{ !contains(needs.release.outputs.version, '-') }}
+          labels: |
+            org.opencontainers.image.title=aoe-server
+            org.opencontainers.image.description=Agent of Empires web dashboard (aoe serve)
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: image-context
+          file: docker/Dockerfile.server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=aoe-server
+          cache-to: type=gha,mode=max,scope=aoe-server

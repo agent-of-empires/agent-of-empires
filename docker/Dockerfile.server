@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+# aoe-server: the released aoe binary running `aoe serve`, for hosting the web
+# dashboard in a container. Published per release by release.yml.
+#
+# The build context is the unpacked release tarballs, not this directory:
+#
+#   aoe-linux-amd64  aoe-linux-arm64  LICENSE  THIRD_PARTY_NOTICES.md  licenses/
+#
+# The default command uses token auth. Behind a gating proxy, override it:
+#
+#   aoe serve --host 0.0.0.0 --auth none --behind-proxy --allowed-host <host>
+
+# Node is the runtime for the npm-installed agents aoe launches.
+FROM node:22-bookworm-slim
+
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git tini tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=755 aoe-linux-${TARGETARCH} /usr/local/bin/aoe
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/aoe/
+COPY licenses /usr/share/doc/aoe/licenses
+
+# Replace the base image's `node` user so uid 1000 owns /home/aoe. The app dir
+# is created up front so a volume mounted there inherits that ownership.
+RUN userdel node \
+    && rm -rf /home/node \
+    && useradd -m -d /home/aoe -u 1000 aoe \
+    && mkdir -p /home/aoe/.config/agent-of-empires \
+    && chown -R aoe:aoe /home/aoe
+
+USER aoe
+WORKDIR /home/aoe
+ENV HOME=/home/aoe \
+    LANG=C.UTF-8 \
+    NPM_CONFIG_PREFIX=/home/aoe/.npm-global
+ENV PATH=/home/aoe/.npm-global/bin:/home/aoe/.local/bin:$PATH
+
+EXPOSE 8080
+
+# tini reaps the tmux and agent processes aoe leaves behind. The command is the
+# full `aoe serve ...` invocation so a deployment can replace it wholesale.
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
+CMD ["aoe", "serve", "--host", "0.0.0.0", "--port", "8080"]
