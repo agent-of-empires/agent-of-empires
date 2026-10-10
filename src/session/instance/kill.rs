@@ -805,6 +805,7 @@ mod tests {
             .output()
             .expect("tmux");
         assert!(created.status.success(), "the test needs a real pane");
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
         crate::tmux::refresh_session_cache();
         let wait_for = |path: &std::path::Path, what: &str| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
