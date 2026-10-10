@@ -2816,8 +2816,8 @@
       "id": "acp.ws-reconnect-liveness",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useAcpSession.test.ts"],
-      "components": ["web/src/hooks/useAcpSession.ts"]
+      "specs": ["src/hooks/useAcpSession.test.ts", "tests/acp-reconnect-hung-dial.spec.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/useAcpConnection.ts"]
     },
     {
       "id": "acp.args",
