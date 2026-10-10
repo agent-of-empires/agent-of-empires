@@ -391,10 +391,16 @@ describe("usePushSubscription enable() with an existing subscription", () => {
     expect(currentSub).toBe(existing);
   });
 
-  it("does not report success when expired endpoint removal fails", async () => {
+  it.each<[string, boolean]>([
+    ["a server error", false],
+    ["a lost response after server removal", true],
+  ])("continues renewal after %s during best-effort cleanup", async (_label, removed) => {
     const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
     currentSub = existing;
-    subscribeImpl = vi.fn(async () => makeSubscription("https://push.example/should-not-exist", keyBytes("ABC")));
+    const subscribe = vi.fn(async () => (currentSub = replacement));
+    subscribeImpl = subscribe;
+    let serverRegistered = true;
     installFetch({
       ...statusWith(
         serverSub({
@@ -404,79 +410,26 @@ describe("usePushSubscription enable() with an existing subscription", () => {
           last_failure_at: "2026-09-02T10:00:00Z",
         }),
       ),
-      unsubscribe: 500,
-    });
-    const { result } = await mountAndSettle();
-
-    const state = await act_(result, "enable");
-    expect(state.kind).toBe("error");
-    expect(state).toEqual({ kind: "error", message: "Could not remove the expired notification subscription" });
-    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
-    expect(subscribeImpl).not.toHaveBeenCalled();
-  });
-
-  it("reconciles a lost removal response on retry before registering", async () => {
-    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
-    const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
-    currentSub = existing;
-    const subscribe = vi.fn(async () => (currentSub = replacement));
-    subscribeImpl = subscribe;
-    let serverRegistered = true;
-    let statusRequests = 0;
-    let removalRequests = 0;
-    const statusResponse = (): StubStatusResponse => {
-      statusRequests += 1;
-      if (statusRequests === 3) return new Error("status unavailable");
-      return {
-        ok: true,
-        body: {
-          enabled: true,
-          public_key: SERVER_KEY,
-          subscription: serverSub({
-            registered: serverRegistered,
-            owned: serverRegistered,
-            last_failure: "gone",
-            last_failure_at: "2026-09-02T10:00:00Z",
-          }),
-        },
-      };
-    };
-    const unsubscribeResponse = (): StubUnsubscribeResponse => {
-      removalRequests += 1;
-      if (!serverRegistered) return 403;
-      serverRegistered = false;
-      return new Error("removal response lost");
-    };
-    installFetch({
-      statusResponses: statusResponse,
-      unsubscribeResponses: unsubscribeResponse,
+      unsubscribeResponses: () => {
+        if (removed) serverRegistered = false;
+        return removed ? new Error("removal response lost") : 500;
+      },
     });
     const { result } = await mountAndSettle();
     calls.length = 0;
 
-    expect(await act_(result, "enable")).toEqual(error("status unavailable"));
-    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
-    expect(serverRegistered).toBe(false);
-    expect(currentSub).toBeNull();
-    expect(subscribe).not.toHaveBeenCalled();
-
     expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
     expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
-    expect(removalRequests).toBe(2);
-    expect(serverRegistered).toBe(false);
     expect(subscribe).toHaveBeenCalledTimes(1);
     expect(currentSub).toBe(replacement);
     const removalIndex = calls.findLastIndex((url) => url.includes("/api/push/unsubscribe"));
-    const absenceCheckIndex = calls.findIndex(
-      (url, index) => index > removalIndex && url.includes("/api/push/status?endpoint="),
-    );
     const registrationIndex = calls.findIndex((url) => url.includes("/api/push/subscribe"));
     expect(removalIndex).toBeGreaterThanOrEqual(0);
-    expect(absenceCheckIndex).toBeGreaterThan(removalIndex);
-    expect(registrationIndex).toBeGreaterThan(absenceCheckIndex);
+    expect(registrationIndex).toBeGreaterThan(removalIndex);
+    expect(serverRegistered).toBe(!removed);
   });
 
-  it("renews after confirming a forbidden cleanup belongs to another owner", async () => {
+  it("does not let a forbidden best-effort cleanup block renewal", async () => {
     const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
     const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
     currentSub = existing;
@@ -487,9 +440,8 @@ describe("usePushSubscription enable() with an existing subscription", () => {
         last_failure_at: "2026-09-02T10:00:00Z",
       }),
     );
-    const otherOwnerStatus = statusWith(serverSub({ owned: false }));
     installFetch({
-      statusResponses: [expiredStatus.status, expiredStatus.status, otherOwnerStatus.status],
+      statusResponses: [expiredStatus.status, expiredStatus.status],
       unsubscribeResponses: [403],
     });
     const { result } = await mountAndSettle();
@@ -500,6 +452,7 @@ describe("usePushSubscription enable() with an existing subscription", () => {
     expect(subscribeImpl).toHaveBeenCalledTimes(1);
     expect(currentSub).toBe(replacement);
     expect(calls.filter((url) => url.includes("/api/push/unsubscribe"))).toHaveLength(1);
+    expect(calls.filter((url) => url.includes("/api/push/status?endpoint="))).toHaveLength(1);
     expect(calls.at(-1)).toContain("/api/push/subscribe");
   });
 

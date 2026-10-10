@@ -55,22 +55,6 @@ function postPush(path: string, body: unknown): Promise<Response> {
   });
 }
 
-async function removeExpiredPushEndpoint(endpoint: string): Promise<void> {
-  const response = await postPush("unsubscribe", { endpoint }).catch(() => null);
-  if (response?.ok) return;
-
-  // A removal may succeed server-side before its response is lost. A 403 also
-  // means another owner may hold the endpoint, so confirm its current state.
-  const status = await fetchStatus(endpoint);
-  if (
-    status.subscription?.registered === false ||
-    (status.subscription?.registered === true && !status.subscription.owned)
-  ) {
-    return;
-  }
-  throw new Error("Could not remove the expired notification subscription");
-}
-
 function subscribeBody(sub: PushSubscription) {
   const json = sub.toJSON();
   return { endpoint: json.endpoint, keys: json.keys };
@@ -132,7 +116,6 @@ export function usePushSubscription() {
   const [health, setHealth] = useState<PushHealth>("unknown");
   // A visibility refresh must not overwrite the state of an action in flight.
   const busy = useRef(false);
-  const pendingCleanup = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
     const unsupported = unsupportedState();
@@ -214,11 +197,6 @@ export function usePushSubscription() {
       }
       const { public_key } = (await vapidResp.json()) as { public_key: string };
       const reg = await navigator.serviceWorker.ready;
-      const pendingEndpoint = pendingCleanup.current;
-      if (pendingEndpoint) {
-        await removeExpiredPushEndpoint(pendingEndpoint);
-        pendingCleanup.current = null;
-      }
       let sub = await reg.pushManager.getSubscription();
       // A 404/410 permanently retires a browser endpoint. Re-subscribing the same
       // endpoint only stores a dead subscription again, so renew it before posting.
@@ -231,13 +209,9 @@ export function usePushSubscription() {
         if (!unsubscribed && (await reg.pushManager.getSubscription())?.endpoint === stale) {
           throw new Error("Could not unsubscribe the expired notification subscription");
         }
-        if (gone && status?.subscription?.registered && status.subscription.owned) {
-          pendingCleanup.current = stale;
-          await removeExpiredPushEndpoint(stale);
-          pendingCleanup.current = null;
-        } else {
-          await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
-        }
+        // Browser ownership is already retired; a failed server cleanup must
+        // not block registering the replacement endpoint.
+        await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
         sub = null;
       }
       sub ??= await reg.pushManager.subscribe({
