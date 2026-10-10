@@ -84,6 +84,12 @@ pub(super) async fn establish(
     let shared = ctx.shared.clone();
     let label = shared.session_label.clone();
     info!(target: "acp.protocol", session = %label, "initializing ACP agent");
+    // A new adapter process may never report, so an earlier process's
+    // identity must not carry over. Cleared before `initialize`, so nothing
+    // the new process sends can precede it; a reattach keeps its report.
+    if matches!(ctx.mode, ConnectMode::Fresh { .. }) {
+        shared.emit(Event::AuthStatusUpdated { status: None }).await;
+    }
     let init: InitializeResponse = match ctx.control.as_ref() {
         Some(control) => {
             let params = serde_json::to_value(build_initialize_request())

@@ -166,6 +166,7 @@ pub(crate) async fn spawn_structured_session(
 
         let params = InstanceParams {
             title,
+            title_typed: false,
             path,
             group,
             tool,
@@ -383,6 +384,7 @@ pub(crate) async fn spawn_structured_session(
             return Err(e);
         }
 
+        crate::tips::record_session_creations(1);
         Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
             instance,
             build_warnings,
@@ -463,6 +465,7 @@ pub(crate) async fn spawn_structured_session(
                     let inst_lock = service_for_check.instance_lock(&id).await;
                     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
                         &service_for_check.instances,
+                        &service_for_check.mutation_epoch,
                         &inst_lock,
                         &id,
                         true,
@@ -490,6 +493,8 @@ pub(crate) async fn spawn_structured_session(
                             cwd,
                             additional_dirs: vec![],
                             provider_env: vec![],
+                            // A pick is made on a live session, never at create.
+                            provider: None,
                             model,
                             effort,
                             effort_explicit,
@@ -641,6 +646,12 @@ mod tests {
         );
         let response = response.expect("creation finishes").expect("creation task");
         assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        assert_eq!(
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sessions_created,
+            1
+        );
         let response: serde_json::Value = serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await

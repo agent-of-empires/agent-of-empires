@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 
 const CONTROL = "w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary";
 const FOCUS = "focus:border-brand-600 focus:outline-none";
@@ -314,6 +314,23 @@ export function SliderField({
   );
 }
 
+/** Where the entry at `index` of `prev` sits in `next`, or null once it can't be identified. */
+function followEdit(prev: string[], next: string[], index: number): number | null {
+  let at = index;
+  if (next.length === prev.length - 1) {
+    // One entry was removed. Equal neighbours make its exact position ambiguous,
+    // so work out the range of positions that fit and bail out if it can reach the edited row.
+    let last = 0;
+    while (last < next.length && prev[last] === next[last]) last++;
+    let tail = 0;
+    while (tail < next.length && prev[prev.length - 1 - tail] === next[next.length - 1 - tail]) tail++;
+    const first = next.length - tail;
+    if (first > last || (first <= index && index <= last)) return null;
+    if (last < index) at = index - 1;
+  }
+  return next[at] === prev[index] ? at : null;
+}
+
 export function ListField({
   label,
   description,
@@ -329,13 +346,34 @@ export function ListField({
   placeholder?: string;
   validate?: (value: string) => string | null;
 }) {
+  const inputId = useId();
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<number | null>(null);
+  const [seen, setSeen] = useState(items);
 
   const cancel = () => {
     setAdding(false);
+    setEditing(null);
     setDraft("");
+    setError(null);
+  };
+
+  // Keep the edit pointed at the same entry when the parent changes the list.
+  if (seen.length !== items.length || seen.some((v, i) => v !== items[i])) {
+    setSeen(items);
+    if (editing !== null) {
+      const at = followEdit(seen, items, editing);
+      if (at === null) cancel();
+      else setEditing(at);
+    }
+  }
+
+  const startEdit = (i: number) => {
+    setAdding(false);
+    setEditing(i);
+    setDraft(items[i]!);
     setError(null);
   };
 
@@ -347,15 +385,51 @@ export function ListField({
       setError(err);
       return;
     }
-    onChange([...items, trimmed]);
+    onChange(editing === null ? [...items, trimmed] : items.map((item, i) => (i === editing ? trimmed : item)));
     cancel();
   };
+
+  const draftInput = (
+    <div className="mt-2">
+      <div className="flex gap-2">
+        <input
+          id={inputId}
+          type="text"
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setError(null);
+          }}
+          onKeyDown={(e) => {
+            // Safari ends a composition with isComposing already false and keyCode 229.
+            if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) submit();
+            if (e.key === "Escape") cancel();
+          }}
+          placeholder={placeholder}
+          autoFocus
+          className={`flex-1 bg-surface-900 border rounded-md px-3 py-1.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:outline-none ${error ? "border-red-500" : "border-surface-700 focus:border-brand-600"}`}
+        />
+        <button
+          onClick={submit}
+          className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-sm font-medium text-surface-950 cursor-pointer"
+        >
+          {editing === null ? "Add" : "Save"}
+        </button>
+        <button onClick={cancel} className="px-2 py-1.5 text-sm text-text-dim hover:text-text-primary cursor-pointer">
+          Cancel
+        </button>
+      </div>
+      {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
+    </div>
+  );
 
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
-        <label className="text-sm text-text-bright">{label}</label>
-        {!adding && (
+        <label htmlFor={inputId} className="text-sm text-text-bright">
+          {label}
+        </label>
+        {!adding && editing === null && (
           <button
             onClick={() => setAdding(true)}
             className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer"
@@ -367,56 +441,38 @@ export function ListField({
       {description && <div className="text-xs text-text-dim mb-2">{description}</div>}
       {items.length === 0 && !adding && <div className="text-xs text-text-dim italic py-2">No items configured</div>}
       <div className="space-y-1 max-h-[320px] overflow-y-auto">
-        {items.map((item, i) => (
-          <div key={i} className="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-900 rounded group">
-            <span className="text-sm font-mono text-text-primary truncate">{item}</span>
-            <button
-              onClick={() => onChange(items.filter((_, j) => j !== i))}
-              className="text-text-dim hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shrink-0"
-              title="Remove"
-            >
-              <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="currentColor">
-                <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0z" />
-                <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1M4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4z" />
-              </svg>
-            </button>
-          </div>
-        ))}
+        {items.map((item, i) =>
+          editing === i ? (
+            <div key={i}>{draftInput}</div>
+          ) : (
+            <div key={i} className="flex items-center justify-between gap-2 pl-2 pr-1 py-0.5 bg-surface-900 rounded">
+              <span className="text-sm font-mono text-text-primary truncate">{item}</span>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => startEdit(i)}
+                  className="p-2 text-text-dim hover:text-text-primary cursor-pointer"
+                  title={`Edit ${item}`}
+                >
+                  <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => onChange(items.filter((_, j) => j !== i))}
+                  className="p-2 text-text-dim hover:text-red-400 cursor-pointer"
+                  title={`Remove ${item}`}
+                >
+                  <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0z" />
+                    <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1M4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          ),
+        )}
       </div>
-      {adding && (
-        <div className="mt-2">
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={draft}
-              onChange={(e) => {
-                setDraft(e.target.value);
-                setError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") submit();
-                if (e.key === "Escape") cancel();
-              }}
-              placeholder={placeholder}
-              autoFocus
-              className={`flex-1 bg-surface-900 border rounded-md px-3 py-1.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:outline-none ${error ? "border-red-500" : "border-surface-700 focus:border-brand-600"}`}
-            />
-            <button
-              onClick={submit}
-              className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-sm font-medium text-surface-950 cursor-pointer"
-            >
-              Add
-            </button>
-            <button
-              onClick={cancel}
-              className="px-2 py-1.5 text-sm text-text-dim hover:text-text-primary cursor-pointer"
-            >
-              Cancel
-            </button>
-          </div>
-          {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
-        </div>
-      )}
+      {adding && draftInput}
     </div>
   );
 }

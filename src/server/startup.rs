@@ -32,7 +32,7 @@ use super::token::{
     load_or_generate_token, test_token_grace_override, test_token_lifetime_override,
     write_secret_file, TokenManager, DEFAULT_TOKEN_GRACE,
 };
-use crate::server::{api, callback, login, push, session_service, tunnel};
+use crate::server::{api, callback, login, plugin_status, push, session_service, tunnel};
 
 /// Build the owner-only `serve.url` contents for a remotely exposed daemon.
 pub(super) fn remote_serve_url_contents(
@@ -200,6 +200,26 @@ fn check_auth_gate(
     )
 }
 
+/// systemd `Type=notify` readiness. No-op unless `NOTIFY_SOCKET` is set.
+#[cfg(unix)]
+fn notify_ready(status: &str) {
+    use sd_notify::NotifyState;
+    if let Err(e) = sd_notify::notify(&[NotifyState::Ready, NotifyState::Status(status)]) {
+        tracing::warn!(target: "serve.lifecycle", "sd_notify READY failed: {e}");
+    }
+}
+
+#[cfg(unix)]
+fn notify_stopping() {
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+}
+
+#[cfg(not(unix))]
+fn notify_ready(_status: &str) {}
+
+#[cfg(not(unix))]
+fn notify_stopping() {}
+
 pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let ServerConfig {
         profile,
@@ -358,6 +378,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
         supervisor
     };
+    let cityhall_mode = std::env::var_os("AOE_CITYHALL_MODE").is_some();
+    let status_tx = broadcast::channel(STATUS_CHANNEL_CAPACITY).0;
     // The Tier 1 plugin worker host.
     let instances = Arc::new(RwLock::new(instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -394,6 +416,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                         session_service: Arc::clone(&session_service),
                         policy: Arc::new(policy),
                         profile: profile.to_string(),
+                        cityhall_mode,
+                        status_tx: status_tx.clone(),
                     })),
                     Err(e) => {
                         tracing::warn!(
@@ -628,7 +652,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
-        cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
+        cityhall_mode,
         instances,
         session_service,
         token_manager: Arc::clone(&token_manager),
@@ -664,7 +688,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
-        status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+        status_tx,
         acp_events_tx: acp_events_tx.clone(),
         acp_event_store: acp_event_store.clone(),
         acp_control_cache: acp_control_cache.clone(),
@@ -849,6 +873,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Launch plugin workers for every active plugin that declares a runtime.
     if let Some(host) = state.plugin_host.clone() {
+        // Subscribe before any worker can register, or a transition published meanwhile has no
+        // forwarder to carry it.
+        plugin_status::spawn_forwarder(state.clone(), host.clone());
         host.start(&crate::plugin::registry()).await;
     }
 
@@ -927,6 +954,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
+        notify_stopping();
         let plugin_host = shutdown_state.plugin_host.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
@@ -940,6 +968,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         )
         .await;
     };
+
+    notify_ready(&format!("listening on {addr}"));
 
     axum::serve(
         listener,
@@ -1052,6 +1082,27 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_ready_sends_ready_and_status_to_notify_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        std::env::set_var("NOTIFY_SOCKET", &path);
+
+        notify_ready("listening on 127.0.0.1:1");
+
+        let mut buf = [0u8; 256];
+        let n = socket.recv(&mut buf).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buf[..n]).unwrap(),
+            "READY=1\nSTATUS=listening on 127.0.0.1:1\n"
+        );
+    }
 
     /// The sweep fires at its interval, not the next recheck, and a window
     /// shortened mid-wait applies at the next recheck.

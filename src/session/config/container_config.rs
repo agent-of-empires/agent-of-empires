@@ -2630,7 +2630,9 @@ pub(crate) fn build_container_config(
     // `CLAUDE_CODE_USE_VERTEX` is Claude-specific, so a globally exported flag
     // must not hand GCP creds to other agents. `GOOGLE_APPLICATION_CREDENTIALS`
     // is not forwarded: client libraries find the well-known path themselves.
-    if agent_selection.tool == "claude" && crate::session::environment::host_vertex_enabled() {
+    if agent_selection.tool == "claude"
+        && crate::session::environment::vertex_enabled(sandbox_info.provider.as_deref())
+    {
         let container_cred_path = format!(
             "{}/.config/gcloud/application_default_credentials.json",
             CONTAINER_HOME
@@ -4534,6 +4536,7 @@ mod tests {
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4688,6 +4691,7 @@ mount_ssh = true
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4810,6 +4814,7 @@ extra_run_args = ["--privileged"]
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4867,6 +4872,7 @@ extra_run_args = ["--privileged"]
             git2::Repository::init(project_dir.path()).unwrap();
 
             let sandbox_info = crate::session::instance::SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -4929,6 +4935,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5019,6 +5026,7 @@ volume_ignores_strategy = "named"
             )
             .unwrap();
             let sandbox_info = crate::session::instance::SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -5150,6 +5158,7 @@ volume_ignores = ["node_modules"]
         }
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5200,6 +5209,7 @@ volume_ignores = ["node_modules"]
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5488,6 +5498,7 @@ volume_ignores = ["node_modules"]
             git2::Repository::init(project_dir.path()).unwrap();
 
             let sandbox_info = crate::session::instance::SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -5567,6 +5578,7 @@ claude-personal = "~/.claude-personal"
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5659,6 +5671,7 @@ codex-work = "{}"
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5844,6 +5857,7 @@ codex-work = "{}"
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
         let sandbox_info = crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5945,6 +5959,7 @@ codex-work = "{}"
         let project = TempDir::new().unwrap();
         git2::Repository::init(project.path()).unwrap();
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".into(),
@@ -6034,6 +6049,7 @@ codex-work = "{}"
             );
 
             let sandbox_info = crate::session::instance::SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -6126,6 +6142,7 @@ codex-work = "{}"
         build_container_config(
             project_dir.path().to_str().unwrap(),
             &crate::session::SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -6194,6 +6211,7 @@ codex-work = "{}"
         build_container_config(
             project_dir.path().to_str().unwrap(),
             &crate::session::instance::SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -6379,6 +6397,7 @@ codex-work = "{}"
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -6481,6 +6500,7 @@ trusted_hash = "keep"
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -6572,6 +6592,7 @@ trusted_hash = "keep"
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -6854,6 +6875,7 @@ volume_ignores = ["target", "node_modules"]
         .unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -6946,6 +6968,7 @@ volume_ignores = ["target"]
         .unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -7033,6 +7056,7 @@ volume_ignores = ["target"]
 
     fn test_sandbox_info() -> crate::session::instance::SandboxInfo {
         crate::session::instance::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -7052,30 +7076,46 @@ volume_ignores = ["target"]
         adc_path
     }
 
-    fn run_build_for_vertex_test(tool: &str, project_dir: &std::path::Path) -> ContainerConfig {
+    fn run_build_for_vertex_test(
+        tool: &str,
+        provider: Option<&str>,
+        project_dir: &std::path::Path,
+    ) -> ContainerConfig {
         git2::Repository::init(project_dir).unwrap();
-        Build::new(tool).run(project_dir).unwrap()
+        let info = SandboxInfo {
+            provider: provider.map(str::to_string),
+            ..test_sandbox_info()
+        };
+        Build::new(tool).info(info).run(project_dir).unwrap()
     }
 
-    /// The ADC mount is Claude-only, needs a non-empty `CLAUDE_CODE_USE_VERTEX`
-    /// and an existing credential file, and prefers an explicit
-    /// `GOOGLE_APPLICATION_CREDENTIALS` over the well-known host path.
+    /// The ADC mount is Claude-only and needs an existing credential file, and
+    /// prefers an explicit `GOOGLE_APPLICATION_CREDENTIALS` over the well-known
+    /// host path. A session's provider pick decides it outright; only an
+    /// unpinned session falls back to `CLAUDE_CODE_USE_VERTEX` on the host.
+    /// The mount is made at container-create time, which is why a pick that
+    /// disagrees with it has to rebuild the container.
     #[test]
     #[serial_test::serial]
     fn vertex_adc_is_mounted_only_for_claude_with_the_flag_and_a_file() {
         const TARGET: &str = "/root/.config/gcloud/application_default_credentials.json";
-        // (CLAUDE_CODE_USE_VERTEX, tool, default ADC on disk, custom credential, mounted)
-        let cases: &[(Option<&str>, &str, bool, bool, bool)] = &[
-            (Some("1"), "claude", true, false, true),
-            (Some("1"), "claude", false, true, true),
-            (None, "claude", true, false, false),
-            (Some("1"), "opencode", true, false, false),
-            (Some(""), "claude", true, false, false),
-            (Some("1"), "claude", false, false, false),
+        // (CLAUDE_CODE_USE_VERTEX, provider pick, tool, default ADC on disk, custom credential, mounted)
+        let cases: &[(Option<&str>, Option<&str>, &str, bool, bool, bool)] = &[
+            (Some("1"), None, "claude", true, false, true),
+            (Some("1"), None, "claude", false, true, true),
+            (None, None, "claude", true, false, false),
+            (Some("1"), None, "opencode", true, false, false),
+            (Some(""), None, "claude", true, false, false),
+            (Some("1"), None, "claude", false, false, false),
+            // The pick outranks the host flag in both directions.
+            (None, Some("vertex"), "claude", true, false, true),
+            (Some("1"), Some("api"), "claude", true, false, false),
+            (Some("1"), Some("bedrock"), "claude", true, false, false),
+            (None, Some("vertex"), "opencode", true, false, false),
         ];
 
-        for &(flag, tool, write_default, write_custom, mounted) in cases {
-            let label = format!("flag={flag:?} tool={tool}");
+        for &(flag, provider, tool, write_default, write_custom, mounted) in cases {
+            let label = format!("flag={flag:?} provider={provider:?} tool={tool}");
             let temp_home = TempDir::new().unwrap();
             let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
             match flag {
@@ -7095,7 +7135,7 @@ volume_ignores = ["target"]
             }
 
             let project_dir = TempDir::new().unwrap();
-            let config = run_build_for_vertex_test(tool, project_dir.path());
+            let config = run_build_for_vertex_test(tool, provider, project_dir.path());
             let mount = config.volumes.iter().find(|v| v.container_path == TARGET);
 
             match mount {
@@ -7399,6 +7439,7 @@ volume_ignores = ["target"]
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
         let sandbox_info = crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),

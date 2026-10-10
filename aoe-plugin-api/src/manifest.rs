@@ -187,6 +187,8 @@ pub enum ObjectFieldType {
     DynamicSelect,
     DynamicMultiSelect,
     Cron,
+    /// A freeform list of user-typed strings (API v14).
+    StringList,
 }
 
 fn validate_object_list_settings(
@@ -392,7 +394,7 @@ fn validate_object_list_default(
                         | ObjectFieldType::Cron => v.is_str(),
                         ObjectFieldType::Bool => v.as_bool().is_some(),
                         ObjectFieldType::Integer => v.as_integer().is_some(),
-                        ObjectFieldType::DynamicMultiSelect => {
+                        ObjectFieldType::DynamicMultiSelect | ObjectFieldType::StringList => {
                             v.as_array().is_some_and(|a| a.iter().all(|e| e.is_str()))
                         }
                     };
@@ -404,7 +406,7 @@ fn validate_object_list_default(
                         ),
                     );
                     let empty_required = match f.value_type {
-                        ObjectFieldType::DynamicMultiSelect => {
+                        ObjectFieldType::DynamicMultiSelect | ObjectFieldType::StringList => {
                             v.as_array().is_none_or(|a| a.is_empty())
                         }
                         _ => v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false),
@@ -471,6 +473,8 @@ pub enum SettingType {
     ObjectList,
     /// A cron expression, rendered as a validated text field (API v9).
     Cron,
+    /// A freeform list of user-typed strings (API v14).
+    StringList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -859,6 +863,9 @@ impl PluginManifest {
                     SettingType::Bool => def.as_bool().is_some(),
                     SettingType::Integer => def.as_integer().is_some(),
                     SettingType::ObjectList => matches!(def, toml::Value::Array(_)),
+                    SettingType::StringList => {
+                        def.as_array().is_some_and(|a| a.iter().all(|e| e.is_str()))
+                    }
                 };
                 check(
                     type_ok,
@@ -1013,6 +1020,26 @@ impl PluginManifest {
                 "home-pane UI slots require api_version >= 13".into(),
             );
         }
+        if self.api_version < 14 {
+            check(
+                self.settings.iter().all(|s| {
+                    s.value_type != SettingType::StringList
+                        && s.fields
+                            .iter()
+                            .all(|f| f.value_type != ObjectFieldType::StringList)
+                }),
+                "string_list settings require api_version >= 14".into(),
+            );
+        }
+        if self.api_version < 15 {
+            check(
+                !self
+                    .capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "session.message"),
+                "the session.message capability requires api_version >= 15".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1070,6 +1097,22 @@ mod tests {
         )
     }
 
+    fn string_list_toml(api_version: u32) -> String {
+        format!(
+            "{HEAD}{api_version}\n\n\
+             [[settings]]\nkey = \"tags\"\nlabel = \"Tags\"\ntype = \"string_list\"\n"
+        )
+    }
+
+    fn string_list_field_toml(api_version: u32) -> String {
+        format!(
+            "{HEAD}{api_version}\n\n\
+             [[settings]]\nkey = \"snooze\"\nlabel = \"Snooze rules\"\ntype = \"object_list\"\nitem_id_key = \"id\"\n\n\
+             [[settings.fields]]\nkey = \"match\"\nlabel = \"URL patterns\"\ntype = \"string_list\"\nrequired = true\n\n\
+             [[settings.fields]]\nkey = \"gate\"\nlabel = \"Gate check command\"\ntype = \"string\"\nrequired = true\n"
+        )
+    }
+
     fn rejects(cases: &[(&str, String, &str)]) {
         for (label, toml, needle) in cases {
             let err = PluginManifest::from_toml_str(toml).unwrap_err().to_string();
@@ -1104,6 +1147,20 @@ mod tests {
     }
 
     #[test]
+    fn string_list_parses_from_v14() {
+        let m = PluginManifest::from_toml_str(&string_list_toml(14)).expect("v14 parses");
+        assert_eq!(m.settings[0].value_type, SettingType::StringList);
+
+        let m =
+            PluginManifest::from_toml_str(&string_list_field_toml(14)).expect("v14 field parses");
+        assert_eq!(
+            m.settings[0].fields[0].value_type,
+            ObjectFieldType::StringList
+        );
+        assert!(m.settings[0].fields[0].option_source.is_none());
+    }
+
+    #[test]
     fn newer_setting_shapes_are_gated_on_their_api_version() {
         rejects(&[
             (
@@ -1116,6 +1173,16 @@ mod tests {
                 multi_select_toml(10),
                 "api_version >= 11",
             ),
+            (
+                "string_list below v14",
+                string_list_toml(13),
+                "api_version >= 14",
+            ),
+            (
+                "string_list field below v14",
+                string_list_field_toml(13),
+                "api_version >= 14",
+            ),
         ]);
         let err = PluginManifest::from_toml_str(&home_pane_toml(12))
             .unwrap_err()
@@ -1125,6 +1192,17 @@ mod tests {
             "{err}"
         );
         PluginManifest::from_toml_str(&home_pane_toml(13)).expect("home-pane parses from v13");
+    }
+
+    #[test]
+    fn session_message_capability_is_gated_on_v15() {
+        let toml = |v: u32| {
+            format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = {v}\ncapabilities = [\"runtime.worker\", \"session.message\"]\n"
+            )
+        };
+        rejects(&[("session.message below v15", toml(14), "api_version >= 15")]);
+        PluginManifest::from_toml_str(&toml(15)).expect("v15 parses");
     }
 
     #[test]
@@ -1189,6 +1267,20 @@ mod tests {
                     "{HEAD}9\n\n[[settings]]\nkey = \"x\"\ntype = \"string\"\noption_source = \"projects\"\n"
                 ),
                 "only valid on a dynamic_select",
+            ),
+            (
+                "string_list default not an array of strings",
+                format!("{HEAD}14\n\n[[settings]]\nkey = \"tags\"\ntype = \"string_list\"\ndefault = \"nope\"\n"),
+                "does not match type",
+            ),
+            (
+                "string_list item field default not an array of strings",
+                format!(
+                    "{HEAD}14\n\n[[settings]]\nkey = \"jobs\"\ntype = \"object_list\"\nitem_id_key = \"id\"\n\
+                     default = [{{ id = \"j1\", tags = \"nope\" }}]\n\n\
+                     [[settings.fields]]\nkey = \"tags\"\ntype = \"string_list\"\n"
+                ),
+                "does not match type",
             ),
         ]);
     }

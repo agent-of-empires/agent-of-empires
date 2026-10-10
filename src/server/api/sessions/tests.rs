@@ -693,6 +693,7 @@ async fn wait_until_left_starting_resolves_on_broadcast() {
         .send(crate::server::push::StatusChange {
             instance_id: "wait-resolves".to_string(),
             instance_title: "starting".to_string(),
+            effective_profile: "default".to_string(),
             old: Status::Starting,
             new: Status::Waiting,
             at: chrono::Utc::now(),
@@ -1923,6 +1924,31 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
 
 #[test]
 #[serial_test::serial]
+fn sync_live_after_restart_publishes_the_status_move_it_makes() {
+    // The tmux restart, ensure and send paths sync the live row through this wrapper, and
+    // none of them runs without tmux, so the wrapper carries the publish contract.
+    let mut live = make_test_instance();
+    live.status = Status::Stopped;
+    let before = live.clone();
+    let mut started = make_test_instance();
+    started.status = Status::Starting;
+    let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+
+    assert!(sync_live_after_restart(&tx, &mut live, &before, &started));
+
+    let change = rx.try_recv().expect("the status move is published");
+    assert_eq!(
+        (change.old, change.new),
+        (Status::Stopped, Status::Starting)
+    );
+    assert!(rx.try_recv().is_err(), "exactly one move");
+
+    // A sync that moves nothing publishes nothing.
+    assert!(sync_live_after_restart(&tx, &mut live, &before, &started));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn apply_post_restart_sync_propagates_agent_session_id() {
     // The rapid double-restart case: in-memory state is stale because the 2s
     // poller has not refreshed, while the just-finished restart produced a
@@ -2654,6 +2680,167 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     }
 }
 
+/// What an opted-in plugin worker receives: the real forwarder runs over `status_tx`, so a test
+/// sees exactly what a plugin would, including transitions no producer published. Subscribe
+/// before calling the handler under test.
+struct PluginStatusFeed {
+    rx: tokio::sync::mpsc::Receiver<String>,
+    _host: std::sync::Arc<crate::plugin::host::PluginHost>,
+    _dir: tempfile::TempDir,
+}
+
+impl PluginStatusFeed {
+    async fn attach(state: &std::sync::Arc<crate::server::AppState>, profile: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let host = crate::plugin::host::PluginHost::new(dir.path(), profile, None).unwrap();
+        let rx = host.register_test_worker("acme.watcher", Some(16)).await;
+        tokio::spawn(crate::server::plugin_status::run_forwarder(
+            state.status_tx.subscribe(),
+            host.clone(),
+            state.shutdown.clone(),
+        ));
+        Self {
+            rx,
+            _host: host,
+            _dir: dir,
+        }
+    }
+
+    /// The next `(session, from, to)` the worker was notified of.
+    async fn next_of_session(&mut self) -> (String, String, String) {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), self.rx.recv())
+            .await
+            .expect("the plugin was never notified of the transition")
+            .expect("worker queue closed");
+        let msg: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        (
+            msg["params"]["session_id"].as_str().unwrap().to_string(),
+            msg["params"]["from"].as_str().unwrap().to_string(),
+            msg["params"]["to"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// The next `(from, to)` the worker was notified of.
+    async fn next(&mut self) -> (String, String) {
+        let (_, from, to) = self.next_of_session().await;
+        (from, to)
+    }
+}
+
+/// `Instance::archive` settles a Running, Waiting or Starting row to Idle on the live row. With
+/// `kill_pane = false` no worker or pane teardown reports it, and the next poll tick snapshots the
+/// row already Idle, so unless the handler publishes the move no plugin ever hears of it.
+#[tokio::test]
+async fn archive_session_notifies_plugins_of_the_idle_it_settles_to() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut running = make_test_instance();
+    running.source_profile = "default".to_string();
+    let mut idle = make_test_instance();
+    idle.source_profile = "default".to_string();
+    idle.status = Status::Idle;
+    let (running_id, idle_id) = (running.id.clone(), idle.id.clone());
+    let state = crate::server::test_support::build_test_app_state(vec![idle, running]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+    let archive = |id: String| {
+        let state = std::sync::Arc::clone(&state);
+        async move {
+            update_session_archive(
+                State(state),
+                Path(id),
+                Ok(Json(UpdateArchiveBody {
+                    archived: true,
+                    kill_pane: false,
+                })),
+            )
+            .await
+        }
+    };
+
+    // An already-Idle row moves nothing, so it must publish nothing. Events are handled in
+    // order, so the next event seen being the running session's proves that.
+    archive(idle_id).await;
+    archive(running_id.clone()).await;
+
+    assert_eq!(
+        feed.next_of_session().await,
+        (running_id, "Running".into(), "Idle".into())
+    );
+}
+
+/// `stop_session` writes `Stopped` straight onto the live row. The next poll tick snapshots
+/// the row already stopped and trailing ACP events are ignored for a stopped row, so unless
+/// the handler publishes the move itself no plugin ever hears of it.
+#[tokio::test]
+async fn stop_session_notifies_plugins() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = make_test_instance();
+    inst.view = crate::session::View::Structured;
+    inst.source_profile = "default".to_string();
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+
+    stop_session(State(std::sync::Arc::clone(&state)), Path(id)).await;
+
+    assert_eq!(feed.next().await, ("Running".into(), "Stopped".into()));
+}
+
+/// The same gap for the explicit structured start, which flips the live row to `Idle`.
+#[tokio::test]
+async fn start_session_notifies_plugins() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = Instance::new("start-notify", "/tmp/aoe-start-notify");
+    inst.view = crate::session::View::Structured;
+    inst.source_profile = "default".to_string();
+    inst.status = Status::Stopped;
+    let id = inst.id.clone();
+    Storage::new_unwatched("default")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+
+    start_session(State(std::sync::Arc::clone(&state)), Path(id)).await;
+
+    assert_eq!(feed.next().await, ("Stopped".into(), "Idle".into()));
+}
+
+/// Marking a session `Deleting` is a live-row write too.
+#[tokio::test]
+async fn delete_session_notifies_plugins_that_the_session_is_deleting() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = delete_race_state("sess-delete-notify");
+    let mut feed =
+        PluginStatusFeed::attach(&state, &crate::session::config::effective_profile("")).await;
+
+    delete_session(
+        State(std::sync::Arc::clone(&state)),
+        Path("sess-delete-notify".to_string()),
+        Some(Json(DeleteSessionBody::default())),
+    )
+    .await;
+
+    assert_eq!(feed.next().await, ("Idle".into(), "Deleting".into()));
+}
+
+/// A delete whose bookkeeping fails flips `Deleting` to `Error`; that move is published too.
+#[tokio::test]
+async fn failed_delete_notifies_plugins_of_the_error() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = delete_race_state("sess-delete-error");
+    state.instances.write().await[0].status = Status::Deleting;
+    let mut feed =
+        PluginStatusFeed::attach(&state, &crate::session::config::effective_profile("")).await;
+
+    super::delete::mark_delete_error(&state, "sess-delete-error", "boom".to_string()).await;
+
+    assert_eq!(feed.next().await, ("Deleting".into(), "Error".into()));
+}
+
 /// A direct stop sets `Stopped` on the live in-memory row without going through
 /// `apply_status_intent`, which normally releases a plugin's pending revival mark on reaching
 /// a terminal status; `stop_session` must do the same itself, on that same in-memory row (the
@@ -3239,6 +3426,7 @@ async fn container_terminal_refuses_archived_trashed_and_purged_sessions() {
     for (shelve, status, code) in cases {
         let mut inst = make_test_instance();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ubuntu:latest".to_string(),
@@ -4598,4 +4786,117 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn import_requires_a_listed_id_in_its_cwd_on_a_plain_host_session() {
+    use crate::session::test_support::isolate_home;
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = tmp.path().join("claude");
+    let project = tmp.path().join("proj");
+    let other = tmp.path().join("other");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let pi_acp = bin.join("pi-acp");
+    std::fs::write(
+        &pi_acp,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true,"sessionCapabilities":{{"list":{{}}}}}}}}}}\n' "$id" ;;
+    *'"method":"session/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessions":[{{"sessionId":"listed","cwd":"{}"}}]}}}}\n' "$id" ;;
+  esac
+done
+"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &pi_acp,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let _env = isolate_home(tmp.path())
+        .and_set("CLAUDE_CONFIG_DIR", &claude)
+        .and_set("PATH", path);
+    let store = claude.join("projects").join("-proj");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("listed.jsonl"),
+        format!(
+            r#"{{"type":"user","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let other = other.to_string_lossy().into_owned();
+    for (extra, message) in [
+        (
+            serde_json::json!({ "agent_name": "wrapper" }),
+            "requires a built-in ACP agent",
+        ),
+        (
+            serde_json::json!({ "scratch": true, "path": "" }),
+            "cannot use scratch",
+        ),
+        (
+            serde_json::json!({ "extra_repo_paths": ["/x"] }),
+            "cannot use scratch",
+        ),
+        (serde_json::json!({ "sandbox": true }), "cannot use scratch"),
+        (
+            serde_json::json!({ "worktree_branch": "feat/x" }),
+            "cannot use scratch",
+        ),
+        (serde_json::json!({ "path": other }), "Unknown session"),
+        (
+            serde_json::json!({ "import_acp_session_id": "unlisted" }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "pi", "path": other }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "pi", "import_acp_session_id": "unlisted" }),
+            "Unknown session",
+        ),
+    ] {
+        let mut body = serde_json::json!({
+            "path": project.to_string_lossy(),
+            "tool": "claude",
+            "title": "imported",
+            "import_acp_session_id": "listed",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, json) = post_create(&state, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{extra}: {json}"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(message),
+            "{extra}: {json}"
+        );
+    }
 }

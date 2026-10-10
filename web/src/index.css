@@ -110,6 +110,9 @@
      from `theme.unread` (see resolved.rs); this default matches `zinc`. */
   --color-status-unread: #38bdf8;
   --color-status-error: #ef4444;
+  /* Error as body text: projected as the theme error lifted until it clears
+     4.5:1 on surface-900 and -850 (see resolved.rs). This default is zinc's. */
+  --color-status-error-text: #f26969;
   --color-status-starting: #f59e0b;
   --color-status-stopped: #52525b;
   /* Dormant: a structured-view worker auto-stopped for inactivity
@@ -134,6 +137,7 @@
   --color-terminal-active: #0d9488;
   --color-branch: #0d9488;
   --color-sandbox: #94a3b8;
+  --color-favorite: #a78bfa;
   --color-diff-add: #22c55e;
   --color-diff-delete: #ef4444;
   --color-diff-modified: #fbbf24;
@@ -667,4 +671,35 @@ select:focus-visible,
      owns its own `env(safe-area-inset-bottom)` clearance, and the composer
      hugs the bottom with no reservation. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+
+/* Line-wrapped code: each source line hangs 2ch, and a corner arrow in that
+   gutter marks every wrapped row after the first. Needs `.wrap-line` or
+   shiki's `.line` per source line. */
+.wrap-lines,
+.wrap-lines :is(pre, code) {
+  white-space: normal;
+}
+.wrap-lines :is(.line, .wrap-line) {
+  display: block;
+  position: relative;
+  min-height: 1lh;
+  padding-left: 2ch;
+  text-indent: -2ch;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.wrap-lines :is(.line, .wrap-line)::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 1lh;
+  bottom: 0;
+  width: 2ch;
+  background-color: var(--color-text-dim);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 3v5h8M9 5l3 3-3 3' fill='none' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E")
+    0 0 / 2ch 1lh repeat-y;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 3v5h8M9 5l3 3-3 3' fill='none' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E")
+    0 0 / 2ch 1lh repeat-y;
+  pointer-events: none;
 }

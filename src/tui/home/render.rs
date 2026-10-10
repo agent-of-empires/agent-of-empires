@@ -10,8 +10,8 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
-    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
-    ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
+    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE, ICON_IDLE, ICON_PINNED,
+    ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, RowTagMode, SidebarPosition, SortOrder};
@@ -433,13 +433,12 @@ enum SunkRow {
     Pane,
 }
 
-/// The archive/trash, snooze, urgent and favorite overlays every view mode paints on top
-/// of its [`RowSeed`], plus the matching title prefix. `sunk` says how this view resolves
-/// a sunk row; see [`SunkRow`].
+/// The archive/trash, snooze and urgent overlays every view mode paints on top of its
+/// [`RowSeed`], plus the matching title prefix. `sunk` says how this view resolves a sunk
+/// row; see [`SunkRow`].
 fn decorate_row(
     inst: &crate::session::Instance,
     in_attention: bool,
-    show_favorite: bool,
     seed: RowSeed,
     sunk: SunkRow,
     theme: &Theme,
@@ -478,24 +477,16 @@ fn decorate_row(
             .fg(theme.error)
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::RAPID_BLINK);
-    } else if show_favorite && crate::session::is_live_favorite(inst) {
-        style = style
-            .add_modifier(Modifier::BOLD)
-            .add_modifier(Modifier::UNDERLINED);
     }
 
-    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `) > favorite (`* `).
-    // Snooze and urgent are Attention-only so other sorts show no decoration for state the
-    // user did not opt into; the star also shows elsewhere because favorites-first pins
-    // the row there too.
+    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `). Both are
+    // Attention-only so other sorts show no decoration for state the user did not opt into.
     let title_text = if inst.is_archived() || inst.is_trashed() {
         Cow::Owned(inst.title.clone())
     } else if in_attention && inst.is_snoozed() {
         Cow::Owned(format!("z {}", inst.title))
     } else if in_attention && inst.is_urgent() {
         Cow::Owned(format!("! {}", inst.title))
-    } else if show_favorite && crate::session::is_live_favorite(inst) {
-        Cow::Owned(format!("* {}", inst.title))
     } else {
         Cow::Owned(inst.title.clone())
     };
@@ -785,11 +776,6 @@ fn format_snooze_remaining(delta: chrono::Duration) -> String {
     format!("{}d", days)
 }
 
-/// Minimum list width for the last-activity column; below it the column is hidden.
-/// Compared against `inner.width` (the pane minus its border), so 30 lets the column
-/// appear for `home_list_width` in the common 35-45 range and on tight mobile panes, where
-/// the 6-char age slot plus ~24 chars of title/branch still fits.
-///
 /// Width reserved for the right-aligned column: 5 for the label (`"<1m"`, `"30mo"`) plus
 /// one of left padding.
 const LAST_ACTIVITY_SLOT: usize = 6;
@@ -814,22 +800,61 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
 /// Where the right-aligned activity column lives on a session row.
 ///
 /// `prefix_width` is the display width of the spans already pushed, `list_width` the inner
-/// width of the list pane, `badge_width` 0 when no terminal-mode badge follows. `Some(pad)`
-/// is the padding to push between prefix and column when it fits with
-/// `LAST_ACTIVITY_SLOT`, the badge and `LAST_ACTIVITY_RIGHT_MARGIN`; `None` means the row
-/// is too wide and the title wins.
+/// width of the list pane, `slot_width` 0 when the age is hidden, `badge_width` 0 when no
+/// terminal-mode badge follows. `Some(pad)` is the padding to push between prefix and
+/// column when it fits with the slot, the badge and `LAST_ACTIVITY_RIGHT_MARGIN`; `None`
+/// means the row is too wide and the title wins.
 fn activity_column_padding(
     prefix_width: usize,
     list_width: u16,
+    slot_width: usize,
     badge_width: usize,
 ) -> Option<usize> {
-    let trailing = LAST_ACTIVITY_SLOT + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
+    let trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
     let total = prefix_width.checked_add(trailing)?;
     if total <= list_width as usize {
         Some(list_width as usize - total)
     } else {
         None
     }
+}
+
+/// Fewest title cells kept before a row gives up its right-edge column.
+const MIN_TITLE_CELLS: usize = 8;
+
+/// Cells the title gets on a session row, and whether the row tag stays. `room` is what
+/// is left after the prefix, `trailing` the right-edge column (age slot, badge, margin).
+/// Space runs out in this order: the tag goes first, then the title shortens down to
+/// `MIN_TITLE_CELLS`, then the column goes and the title takes all of `room`.
+fn title_width_for_column(
+    title_width: usize,
+    room: usize,
+    tag_width: usize,
+    trailing: usize,
+) -> (usize, bool) {
+    if title_width + tag_width + trailing <= room {
+        return (title_width, true);
+    }
+    let beside_column = room.saturating_sub(trailing);
+    let budget = if beside_column >= MIN_TITLE_CELLS {
+        beside_column
+    } else {
+        room
+    };
+    (title_width.min(budget), false)
+}
+
+/// The activity column's text: remaining snooze under Attention sort, else the age of a
+/// resting (Idle or Unknown) row, else blank. `last_accessed_at` is only a fallback for a
+/// missing `idle_entered_at`; on an active row it reads as idle time.
+fn row_age(inst: &crate::session::Instance, in_attention: bool) -> String {
+    if let Some(remaining) = in_attention.then(|| inst.snooze_remaining()).flatten() {
+        return format_snooze_remaining(remaining);
+    }
+    if !matches!(inst.status, Status::Idle | Status::Unknown) {
+        return String::new();
+    }
+    format_relative_age(inst.idle_entered_at.or(inst.last_accessed_at))
 }
 
 impl HomeView {
@@ -843,11 +868,13 @@ impl HomeView {
         update_status: Option<&str>,
         image_update: Option<&ImageUpdate>,
     ) {
-        // Start each frame with no footer buttons and no sidebar collapse rects; the home
-        // render paths repopulate them. The takeover views return before those run, so
-        // clearing here keeps a stale rect from swallowing a click on the diff/serve
-        // surface (the collapse handler runs ahead of `hit_diff`).
+        // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
+        self.tips_badge_rect = None;
+        if !self.show_shortcut_bar {
+            self.footer_hover = None;
+            self.tips_badge_hovered = false;
+        }
         self.collapse_button_area = Rect::default();
         self.expand_strip_area = Rect::default();
         // Hyperlink cells are per-frame: a takeover view or a link-free preview must
@@ -903,24 +930,46 @@ impl HomeView {
             return;
         }
 
-        // Layout: main area + status bar + optional update bar. The update bar carries
-        // both persistent banners and transient toasts, so it needs a row whenever either
-        // is present, or a toast fired without a pending update would never show.
+        // Scrape the last prompt for the footer (throttled; a no-op unless the
+        // Ctrl+L toggle is on and a session is selected). The owned line is shown
+        // just above the status bar.
+        self.refresh_last_prompt();
+        let last_prompt = self.last_prompt_footer_line();
+
+        // Keep temporary feedback and the leader menu available with the bar hidden.
+        let has_status_bar = self.show_shortcut_bar
+            || self.status_flash_text().is_some()
+            || (self.live_send.is_some()
+                && (self.live_send_pending_leader || self.live_send_ctrl_c_flash_active()));
         let has_update_bar =
             update_info.is_some() || update_status.is_some() || image_update.is_some();
-        let constraints = if has_update_bar {
-            vec![
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ]
-        } else {
-            vec![Constraint::Min(0), Constraint::Length(1)]
-        };
+        let mut constraints = vec![Constraint::Min(0)];
+        if last_prompt.is_some() {
+            constraints.push(Constraint::Length(1)); // last-prompt footer
+        }
+        if has_status_bar {
+            constraints.push(Constraint::Length(1));
+        }
+        if has_update_bar {
+            constraints.push(Constraint::Length(1)); // update bar
+        }
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
+
+        let mut next_row = 1;
+        let last_prompt_idx = last_prompt.as_ref().map(|_| {
+            let i = next_row;
+            next_row += 1;
+            i
+        });
+        let status_idx = has_status_bar.then(|| {
+            let i = next_row;
+            next_row += 1;
+            i
+        });
+        let update_bar_idx = has_update_bar.then_some(next_row);
 
         // The diagnostics strip docks under the session-list column (see
         // `diagnostics_dock`) so it stays narrow and the preview keeps its height.
@@ -987,12 +1036,27 @@ impl HomeView {
             self.render_list(frame, list_rect, theme, layout);
             self.render_preview(frame, preview_area, theme);
         }
-        self.render_status_bar(frame, main_chunks[1], theme);
+        if let (Some(idx), Some(text)) = (last_prompt_idx, last_prompt.as_deref()) {
+            self.render_last_prompt_footer(frame, main_chunks[idx], theme, text);
+        }
+        if let Some(idx) = status_idx {
+            self.render_status_bar(frame, main_chunks[idx], theme);
+        } else if !self.live_send_pending_leader && self.hovered_link().is_some() {
+            // Overlay the border so hovering cannot move the link out from under the pointer.
+            let row = Rect::new(
+                content_area.x,
+                content_area.bottom().saturating_sub(1),
+                content_area.width,
+                content_area.height.min(1),
+            );
+            frame.render_widget(Clear, row);
+            self.render_status_bar(frame, row, theme);
+        }
 
-        if has_update_bar {
+        if let Some(idx) = update_bar_idx {
             self.render_update_bar(
                 frame,
-                main_chunks[2],
+                main_chunks[idx],
                 theme,
                 update_info,
                 update_status,
@@ -1304,6 +1368,7 @@ impl HomeView {
         self.shelf_inner_area = shelf_region;
 
         let hover_idx = self.hovered_index();
+        let favorite_gutter = self.favorite_gutter();
 
         // --- Workspace list (every row before the shelf) ---
         let list_visible_height = if self.search_bar_visible() {
@@ -1340,7 +1405,14 @@ impl HomeView {
             let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
             let is_match =
                 !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
-            let mut line = self.render_item_line(item, is_selected, is_match, theme, inner.width);
+            let mut line = self.render_item_line(
+                item,
+                is_selected,
+                is_match,
+                theme,
+                inner.width,
+                favorite_gutter,
+            );
             // Selection wins over hover, so the already-selected row under the
             // mouse keeps the brighter selected background.
             if is_selected || is_hovered {
@@ -1414,8 +1486,14 @@ impl HomeView {
                 let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
                 let is_match =
                     !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
-                let mut line =
-                    self.render_item_line(item, is_selected, is_match, theme, inner.width);
+                let mut line = self.render_item_line(
+                    item,
+                    is_selected,
+                    is_match,
+                    theme,
+                    inner.width,
+                    favorite_gutter,
+                );
                 if is_selected || is_hovered {
                     let pad = (inner.width as usize).saturating_sub(line.width());
                     if pad > 0 {
@@ -1530,6 +1608,18 @@ impl HomeView {
             || serve_open
     }
 
+    /// Reserve the favorite gutter on every row while any session is a pinned favorite,
+    /// so titles stay aligned and collapsing a group does not shift the list. Favorite
+    /// pins under Attention sort, or in any sort with favorites-first on (the
+    /// `Context::FavoritesUsable` predicate).
+    pub(super) fn favorite_gutter(&self) -> bool {
+        (self.sort_order == SortOrder::Attention || crate::session::favorites_first())
+            && self
+                .instances
+                .values()
+                .any(crate::session::is_live_favorite)
+    }
+
     pub(super) fn render_item_line(
         &self,
         item: &Item,
@@ -1537,18 +1627,15 @@ impl HomeView {
         is_match: bool,
         theme: &Theme,
         list_width: u16,
+        favorite_gutter: bool,
     ) -> Line<'static> {
         let indent = " ".repeat(item.depth().min(9));
 
-        // Favorite, snooze and urgent visuals render only under Attention sort, so the
-        // sidebar stays clean for users who don't run a triage workflow. Archive is
-        // universal: it is a lifecycle action and its rows live in the pinned Archived
-        // section in every sort mode.
+        // Snooze and urgent visuals render only under Attention sort, so the sidebar
+        // stays clean for users who don't run a triage workflow. Archive is universal:
+        // it is a lifecycle action and its rows live in the pinned Archived section in
+        // every sort mode.
         let in_attention = self.sort_order == SortOrder::Attention;
-        // Favorite is a pin in every sort order once favorites-first is on, so its
-        // decoration follows the keybinding's predicate (`Context::FavoritesUsable`).
-        // Snooze and urgent stay Attention-only, tied to the tier model.
-        let show_favorite = in_attention || crate::session::favorites_first();
 
         use std::borrow::Cow;
 
@@ -1559,6 +1646,7 @@ impl HomeView {
                 collapsed,
                 session_count,
                 archived_at,
+                profile,
                 ..
             } => {
                 let icon = if *collapsed {
@@ -1580,6 +1668,14 @@ impl HomeView {
                     Some(ICON_ARCHIVED_SECTION)
                 } else {
                     None
+                };
+                // While stopped sessions are hidden, a header that lost some reads `shown/total`.
+                let total = (!self.group_totals.is_empty())
+                    .then(|| self.group_totals.get(&(path.clone(), profile.clone())))
+                    .flatten();
+                let session_count = match total {
+                    Some(total) if total > session_count => format!("{session_count}/{total}"),
+                    _ => session_count.to_string(),
                 };
                 let text = if let Some(glyph) = section_glyph {
                     Cow::Owned(format!("{} {} ({})", glyph, name, session_count))
@@ -1743,7 +1839,7 @@ impl HomeView {
                                 )
                             }
                         };
-                    decorate_row(inst, in_attention, show_favorite, seed, sunk, theme)
+                    decorate_row(inst, in_attention, seed, sunk, theme)
                 } else {
                     (
                         "?",
@@ -1754,7 +1850,24 @@ impl HomeView {
             }
         };
 
-        let mut line_spans = Vec::with_capacity(5);
+        let mut line_spans = Vec::with_capacity(6);
+        if favorite_gutter {
+            let favorited = matches!(item, Item::Session { id, .. }
+                if self.get_instance(id).is_some_and(crate::session::is_live_favorite));
+            line_spans.push(if favorited {
+                let star_style = Style::default().fg(theme.favorite);
+                Span::styled(
+                    format!("{ICON_FAVORITE} "),
+                    if is_selected {
+                        selected_row_style(star_style, theme)
+                    } else {
+                        star_style
+                    },
+                )
+            } else {
+                Span::raw("  ")
+            });
+        }
         line_spans.push(Span::raw(indent));
         // A search match highlights with weight only: recoloring to `theme.search` (amber
         // in most themes) turned a running match's spinner amber and read as "waiting"
@@ -1770,122 +1883,121 @@ impl HomeView {
             text_style = text_style.add_modifier(ratatui::style::Modifier::BOLD);
         }
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
-        line_spans.push(Span::styled(text.into_owned(), text_style));
+        let prefix_width: usize = line_spans.iter().map(|s| s.width()).sum();
+        let room = (list_width as usize).saturating_sub(prefix_width);
 
-        if let Item::Session { id, .. } = item {
-            if let Some(inst) = self.get_instance(id) {
-                // Config-driven suffix next to the title; it owns the
-                // branch/profile/sandbox slot, so `None` means no suffix. Counted into
-                // `used_width` so the activity column still right-aligns past it.
-                if let Some(tag) =
-                    compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none())
-                {
-                    let tag_style =
-                        Style::default().fg(if self.row_tag_mode == RowTagMode::Branch {
-                            theme.branch
-                        } else {
-                            theme.dimmed
-                        });
-                    line_spans.push(Span::styled(
-                        format!("  {}", tag.rendered()),
-                        if is_selected {
-                            selected_row_style(tag_style, theme)
-                        } else {
-                            tag_style
-                        },
-                    ));
-                }
+        let inst = match item {
+            Item::Session { id, .. } => self.get_instance(id).map(|inst| (id, inst)),
+            _ => None,
+        };
+        let Some((id, inst)) = inst else {
+            line_spans.push(Span::styled(truncate_to_width(&text, room), text_style));
+            return Line::from(line_spans);
+        };
 
-                // Right edge of the row: an optional terminal-mode badge and the
-                // activity column, both pinned to the pane's right edge so the column
-                // lines up down the list. The column shows only if the prefix plus the
-                // slot and badge fit inside `list_width`; on a narrow pane the row drops
-                // the column rather than mangling the title.
-                //
-                // Idle rows drive off `idle_entered_at`, not `last_accessed_at`, which
-                // user interaction bumps and would lie about how long the agent has been
-                // stopped.
-                //
-                // Acp-mode sessions get a badge because Enter opens an info dialog rather
-                // than attaching to a pane that doesn't exist; it takes precedence over
-                // the container/host badge in Structured view, while Terminal view keeps
-                // its own badging since the host terminal still works.
-                let badge_text: Option<&'static str> =
-                    if inst.is_structured() && self.view_mode != ViewMode::Terminal {
-                        // `[structured]` rather than `[web]`: the TUI renders these
-                        // sessions natively now, so the badge marks the view.
-                        Some(" [structured]")
-                    } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
-                        Some(match self.get_terminal_mode(id) {
-                            TerminalMode::Container => " [container]",
-                            TerminalMode::Host => " [host]",
-                        })
-                    } else if inst.is_structured() {
-                        // Terminal view, non-sandboxed: the container/host badge does
-                        // not apply, but structured rows still need marking or Enter
-                        // opening the structured view surprises the user.
-                        Some(" [structured]")
+        // Config-driven suffix next to the title; it owns the branch/profile/sandbox
+        // slot, so `None` means no suffix.
+        let tag_span =
+            compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none()).map(|tag| {
+                let tag_style = Style::default().fg(if self.row_tag_mode == RowTagMode::Branch {
+                    theme.branch
+                } else {
+                    theme.dimmed
+                });
+                Span::styled(
+                    format!("  {}", tag.rendered()),
+                    if is_selected {
+                        selected_row_style(tag_style, theme)
                     } else {
-                        None
-                    };
-                let badge_width = badge_text.map_or(0, |s| s.len());
+                        tag_style
+                    },
+                )
+            });
 
-                let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
-                let column_pad = activity_column_padding(used_width, list_width, badge_width);
-                let column_fits = column_pad.is_some();
-                if let Some(pad_len) = column_pad {
-                    if pad_len > 0 {
-                        line_spans.push(Span::raw(" ".repeat(pad_len)));
-                    }
-                    // Snoozed rows show remaining sleep time under Attention sort; in
-                    // other sorts snooze is invisible and the column falls through to the
-                    // normal age. Idle rows show time-since-stop (`idle_entered_at`),
-                    // falling back to `last_accessed_at` when it is missing, which would
-                    // otherwise lie after an attach or send.
-                    let snooze_remaining = if in_attention {
-                        inst.snooze_remaining()
-                    } else {
-                        None
-                    };
-                    let age = if let Some(remaining) = snooze_remaining {
-                        format_snooze_remaining(remaining)
-                    } else {
-                        let age_ts = if inst.status == Status::Idle {
-                            inst.idle_entered_at.or(inst.last_accessed_at)
-                        } else {
-                            inst.last_accessed_at
-                        };
-                        format_relative_age(age_ts)
-                    };
-                    let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-                    let activity_style = Style::default().fg(theme.dimmed);
-                    line_spans.push(Span::styled(
-                        padded,
-                        if is_selected {
-                            selected_row_style(activity_style, theme)
-                        } else {
-                            activity_style
-                        },
-                    ));
-                }
+        // Right edge of the row: an optional terminal-mode badge and the activity column,
+        // both pinned to the pane's right edge so the column lines up down the list.
+        //
+        // Acp-mode sessions get a badge because Enter opens an info dialog rather than
+        // attaching to a pane that doesn't exist; it takes precedence over the
+        // container/host badge in Structured view, while Terminal view keeps its own
+        // badging since the host terminal still works.
+        let badge_text: Option<&'static str> =
+            if inst.is_structured() && self.view_mode != ViewMode::Terminal {
+                // `[structured]` rather than `[web]`: the TUI renders these sessions
+                // natively now, so the badge marks the view.
+                Some(" [structured]")
+            } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
+                Some(match self.get_terminal_mode(id) {
+                    TerminalMode::Container => " [container]",
+                    TerminalMode::Host => " [host]",
+                })
+            } else if inst.is_structured() {
+                // Terminal view, non-sandboxed: the container/host badge does not apply,
+                // but structured rows still need marking or Enter opening the structured
+                // view surprises the user.
+                Some(" [structured]")
+            } else {
+                None
+            };
+        let badge_width = badge_text.map_or(0, |s| s.len());
+        let age = if self.show_activity_age {
+            row_age(inst, in_attention)
+        } else {
+            String::new()
+        };
+        // A blank age keeps its slot only to line the badge up with the rows around it.
+        let slot_width = if self.show_activity_age && (!age.is_empty() || badge_text.is_some()) {
+            LAST_ACTIVITY_SLOT
+        } else {
+            0
+        };
 
-                if let Some(badge) = badge_text {
-                    let badge_style = Style::default().fg(theme.sandbox);
-                    line_spans.push(Span::styled(
-                        badge,
-                        if is_selected {
-                            selected_row_style(badge_style, theme)
-                        } else {
-                            badge_style
-                        },
-                    ));
-                }
-                if column_fits {
-                    let trailing_margin: String =
-                        std::iter::repeat_n(' ', LAST_ACTIVITY_RIGHT_MARGIN).collect();
-                    line_spans.push(Span::raw(trailing_margin));
-                }
-            }
+        let (title_width, keep_tag) = title_width_for_column(
+            rendered_width(&text),
+            room,
+            tag_span.as_ref().map_or(0, |s| s.width()),
+            slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN,
+        );
+        line_spans.push(Span::styled(
+            truncate_to_width(&text, title_width),
+            text_style,
+        ));
+        line_spans.extend(tag_span.filter(|_| keep_tag));
+
+        let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
+        let column_pad = activity_column_padding(used_width, list_width, slot_width, badge_width);
+        let column_fits = column_pad.is_some();
+        if let Some(pad_len) = column_pad.filter(|&p| p > 0) {
+            line_spans.push(Span::raw(" ".repeat(pad_len)));
+        }
+        if column_fits && slot_width > 0 {
+            let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
+            let activity_style = Style::default().fg(theme.dimmed);
+            line_spans.push(Span::styled(
+                padded,
+                if is_selected {
+                    selected_row_style(activity_style, theme)
+                } else {
+                    activity_style
+                },
+            ));
+        }
+
+        if let Some(badge) = badge_text {
+            let badge_style = Style::default().fg(theme.sandbox);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
+        if column_fits {
+            let trailing_margin: String =
+                std::iter::repeat_n(' ', LAST_ACTIVITY_RIGHT_MARGIN).collect();
+            line_spans.push(Span::raw(trailing_margin));
         }
 
         Line::from(line_spans)
@@ -3541,16 +3653,24 @@ impl HomeView {
         );
     }
 
+    /// Show the first line of the last submitted prompt as a clipped footer.
+    fn render_last_prompt_footer(&self, frame: &mut Frame, area: Rect, theme: &Theme, text: &str) {
+        // `text` is the scrape's first prompt line, already whitespace-collapsed
+        // and length-capped; the paragraph clips whatever still overruns the row.
+        let spans = vec![
+            Span::styled(
+                " ↑ last prompt: ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text.to_string(), Style::default().fg(theme.dimmed)),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Cleared each frame and set only when the badge is drawn, so a stale rect can't
-        // make a footer click open tips while the badge is hidden.
-        self.tips_badge_rect = None;
-        // A flash is one-shot feedback on something the user just did, so it takes the
-        // row for its few seconds and wins over a hovered link's target, which it is
-        // usually reporting anyway. The LIVE chip stays either way: which pane keystrokes
-        // land on must never be hidden. A hovered target shows only while no overlay
-        // covers the preview (the click is inert there) and is resolved per frame, and it
-        // is suppressed while the leader is armed so the which-key menu stays visible.
+        // Action feedback takes precedence over a hovered link target.
         let hovered = (!self.live_send_pending_leader)
             .then(|| self.hovered_link())
             .flatten()
@@ -3559,10 +3679,8 @@ impl HomeView {
         if let Some(text) = transient {
             let mut spans = Vec::new();
             let mut budget = area.width as usize;
-            // In live-send the chip and the way out both stay: a flash lasts three
-            // seconds but a hovered target lasts as long as the pointer rests, and that
-            // is too long to leave the user with no visible exit chord.
-            let exit = self.live_send.as_ref().map(|state| {
+            let visible_live = self.live_send.as_ref().filter(|_| self.show_shortcut_bar);
+            let exit = visible_live.map(|state| {
                 let chord = if state.exit_chords.is_empty() {
                     "?".to_string()
                 } else {
@@ -3570,7 +3688,7 @@ impl HomeView {
                 };
                 format!(" {chord} to exit ")
             });
-            if self.live_send.is_some() {
+            if visible_live.is_some() {
                 let chip = " \u{25CF} LIVE ";
                 budget = budget.saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
                 spans.push(Span::styled(
@@ -3592,10 +3710,13 @@ impl HomeView {
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
-        // The live-send banner takes over the status bar as an always-visible reminder
-        // that keystrokes are relayed, and how to get out. Distinct color and bold so it
-        // is not read as the regular footer. The scroll indicator, present only when the
-        // user scrolled back, sits between title and exit hint.
+        if !self.show_shortcut_bar
+            && !(self.live_send.is_some()
+                && (self.live_send_pending_leader || self.live_send_ctrl_c_flash_active()))
+        {
+            return;
+        }
+        // LIVE shares the shortcut row; its temporary menu and feedback can restore it.
         if let Some(state) = &self.live_send {
             let base_title = if state.title.is_empty() {
                 "session"
@@ -4647,26 +4768,93 @@ mod tests {
 
     #[test]
     fn activity_column_padding_cases() {
-        // Trailing block = SLOT(6) + badge + MARGIN(1). A badge that fits alone does not
+        // Trailing block = slot + badge + MARGIN(1). A badge that fits alone does not
         // keep the column: the badge has its own unconditional render path.
         let cases = [
-            ("room to spare", 12, 35, 0, Some(16)),
-            ("exact fit", 13, 20, 0, Some(0)),
-            ("one column over", 14, 20, 0, None),
+            ("room to spare", 12, 35, 6, 0, Some(16)),
+            ("exact fit", 13, 20, 6, 0, Some(0)),
+            ("one column over", 14, 20, 6, 0, None),
             // No fixed 30-column floor: a narrow pane with room keeps the column.
-            ("narrow pane", 8, 25, 0, Some(10)),
-            ("host badge", 10, 35, 7, Some(11)),
-            ("container badge", 10, 35, 12, Some(6)),
-            ("long title with badge", 20, 35, 12, None),
-            ("prefix overflow saturates", usize::MAX, 1000, 0, None),
+            ("narrow pane", 8, 25, 6, 0, Some(10)),
+            ("host badge", 10, 35, 6, 7, Some(11)),
+            ("container badge", 10, 35, 6, 12, Some(6)),
+            ("long title with badge", 20, 35, 6, 12, None),
+            // Hidden age: the badge alone sits against the margin.
+            ("hidden age with badge", 20, 35, 0, 12, Some(2)),
+            ("prefix overflow saturates", usize::MAX, 1000, 6, 0, None),
         ];
-        for (name, prefix, width, badge, expected) in cases {
+        for (name, prefix, width, slot, badge, expected) in cases {
             assert_eq!(
-                activity_column_padding(prefix, width, badge),
+                activity_column_padding(prefix, width, slot, badge),
                 expected,
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn title_width_for_column_cases() {
+        // (name, title, room, tag, trailing, expected); MIN_TITLE_CELLS is 8.
+        let cases = [
+            ("fits beside column", 10, 25, 0, 7, (10, true)),
+            ("shortened to keep column", 20, 25, 0, 7, (18, false)),
+            ("too narrow, column dropped", 20, 14, 0, 7, (14, false)),
+            ("short title keeps column", 5, 12, 0, 7, (5, true)),
+            ("no room", 5, 0, 0, 7, (0, false)),
+            ("fits beside tag and column", 10, 40, 16, 7, (10, true)),
+            (
+                "tag dropped before title shortens",
+                20,
+                30,
+                16,
+                7,
+                (20, false),
+            ),
+            (
+                "tag dropped, then title shortened",
+                30,
+                30,
+                16,
+                7,
+                (23, false),
+            ),
+        ];
+        for (name, title, room, tag, trailing, expected) in cases {
+            assert_eq!(
+                title_width_for_column(title, room, tag, trailing),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_age_only_on_resting_or_snoozed_rows() {
+        let five_min_ago = Some(Utc::now() - chrono::Duration::minutes(5));
+        let mut inst = crate::session::Instance::new("a", "/tmp/a");
+        inst.idle_entered_at = five_min_ago;
+        inst.last_accessed_at = five_min_ago;
+        for (status, expected) in [
+            (Status::Idle, "5m"),
+            (Status::Unknown, "5m"),
+            (Status::Running, ""),
+            (Status::Waiting, ""),
+            (Status::Error, ""),
+        ] {
+            inst.status = status;
+            assert_eq!(row_age(&inst, false), expected, "{status:?}");
+        }
+        inst.idle_entered_at = None;
+        inst.status = Status::Idle;
+        assert_eq!(row_age(&inst, false), "5m", "falls back to last access");
+
+        inst.status = Status::Running;
+        inst.snooze(30);
+        assert_eq!(row_age(&inst, false), "", "snooze hidden outside Attention");
+        assert!(
+            !row_age(&inst, true).is_empty(),
+            "snooze shown under Attention"
+        );
     }
 
     /// The bracketed tag must occupy `max_width + 2` cells as the renderer paints them:

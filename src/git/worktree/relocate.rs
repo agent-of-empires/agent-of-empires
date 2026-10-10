@@ -720,6 +720,32 @@ mod tests {
     fn move_worktree_relocates_non_utf8_submodule_paths() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
+        // EILSEQ and EINVAL can signal a filesystem rejecting non-UTF-8 names.
+        fn refused(result: std::io::Result<()>) -> bool {
+            match result {
+                Ok(()) => false,
+                Err(err)
+                    if matches!(err.raw_os_error(), Some(libc::EILSEQ) | Some(libc::EINVAL)) =>
+                {
+                    true
+                }
+                Err(err) => panic!("non-UTF-8 name probe failed for another reason: {err}"),
+            }
+        }
+
+        let probe = TempDir::new().unwrap();
+        let named = |bytes: &[u8]| probe.path().join(OsStr::from_bytes(bytes));
+        let control = named(b"probe-utf8");
+        std::fs::create_dir(&control).expect("probe dir must be writable");
+        let created = named(b"probe-\xff");
+        if refused(std::fs::create_dir(&created)) || refused(std::fs::rename(&control, created)) {
+            eprintln!(
+                "skipping move_worktree_relocates_non_utf8_submodule_paths: {} refuses non-UTF-8 names",
+                probe.path().display()
+            );
+            return;
+        }
+
         let home_dir = TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home_dir.path());
 

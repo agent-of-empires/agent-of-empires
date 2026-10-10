@@ -216,9 +216,14 @@ impl HomeView {
             selected_group: None,
             selected_group_profile: None,
             view_mode,
+            show_last_prompt: false,
+            last_prompt_cache: None,
+            last_prompt_slot: last_prompt::new_slot(),
+            last_prompt_in_flight: false,
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
+            show_activity_age: resolved.session.show_activity_age,
             sidebar_position: user_config
                 .as_ref()
                 .map(|c| c.session.sidebar_position)
@@ -329,6 +334,7 @@ impl HomeView {
             pending_stop_terminal: None,
             pending_stop_tool: None,
             pending_image_pull: None,
+            confirm_checked: Vec::new(),
             pending_switch_view_session: None,
             pending_daemon_start_session: None,
             structured_preview: None,
@@ -345,6 +351,7 @@ impl HomeView {
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
             show_diagnostics: resolved.session.show_diagnostics_pane,
+            show_shortcut_bar: resolved.session.show_shortcut_bar,
             metrics_poller: crate::tui::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
             metrics: crate::process::metrics::MetricsSnapshot::default(),
@@ -367,8 +374,14 @@ impl HomeView {
             daemon_sidebar: resolved.session.daemon_sidebar,
             sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
             deletion_poller: DeletionPoller::new(),
+            deletes_in_flight: HashMap::new(),
+            failed_deletes: HashMap::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
+            drop_poller: crate::tui::worker::TrackedWorker::spawn(
+                "aoe-drop-poller",
+                super::operations::perform_drop,
+            ),
             reconcile_poller: make_reconcile(),
             startup_recovery_gate: None,
             pending_reconcile_reload: false,
@@ -444,6 +457,8 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
+            hide_stopped_in_groups: false,
+            group_totals: HashMap::new(),
             recovery_rx: None,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
@@ -555,7 +570,7 @@ impl HomeView {
         }
 
         view.refresh_registered_projects();
-        view.flat_items = view.build_flat_items();
+        view.refresh_flat_items();
         view.update_selected();
         // Disk subscriptions stay scoped to the loaded storages: in single-profile mode
         // the user opted into that profile's instance state only. Sorted so the
@@ -592,6 +607,7 @@ impl HomeView {
             }
         };
         view.rewire_config_subscriptions(&initial_config_profiles);
+        view.refresh_shortcut_bar_tip();
         Ok(view)
     }
 
@@ -602,6 +618,7 @@ impl HomeView {
     /// `refresh_from_config`.
     pub fn reload(&mut self) -> anyhow::Result<()> {
         self.refresh_status_hook_config_cache();
+        self.refresh_shortcut_bar_tip();
         self.reload_storage_only()
     }
 

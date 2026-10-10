@@ -32,6 +32,10 @@ export function acpRetryDelayMs(attempt: number): number {
 const ACP_WS_WATCHDOG_INTERVAL_MS = 15000;
 export const ACP_WS_STALE_MS = 75000;
 
+// Each dial phase (replay catch-up, then socket handshake) gets this long. Mobile networks can leave
+// a request or handshake hanging for minutes after a resume, which would stall the whole retry loop.
+export const ACP_DIAL_TIMEOUT_MS = 10000;
+
 type ServerMessage =
   | AcpFrame
   | { kind: "lagged"; skipped?: number }
@@ -90,6 +94,8 @@ export function useAcpConnection(
   const connectRef = useRef<(() => void) | null>(null);
   // Bumped per dial; handlers of a superseded dial must not touch the current socket.
   const dialGenRef = useRef(0);
+  // Aborted when a newer replay, a dial timeout or teardown supersedes the in-flight one.
+  const replayAbortRef = useRef<AbortController | null>(null);
   const lastServerMsgRef = useRef(0);
   // Last applied frame or submit, polled by the force-end-turn affordance without re-rendering.
   const lastActivityRef = useRef(0);
@@ -109,6 +115,7 @@ export function useAcpConnection(
 
   const redial = useCallback(() => {
     retryCountRef.current = 0;
+    setReconnecting(false);
     setRetryCount(0);
     setRetryCountdown(0);
     clearRetryTimers();
@@ -233,6 +240,16 @@ export function useAcpConnection(
       }, delayMs);
     };
 
+    const startReplay = (): { done: Promise<void>; abort: () => void } => {
+      replayAbortRef.current?.abort();
+      const controller = new AbortController();
+      replayAbortRef.current = controller;
+      return {
+        done: fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder, controller.signal),
+        abort: () => controller.abort(),
+      };
+    };
+
     const handleMessage = (data: ServerMessage) => {
       const kind = typeof data === "object" && data !== null && "kind" in data ? data.kind : undefined;
       switch (kind) {
@@ -240,7 +257,7 @@ export function useAcpConnection(
           return;
         case "lagged":
           dispatch({ kind: "lagged", skipped: (data as { skipped?: number }).skipped ?? 0 });
-          void fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
+          void startReplay();
           return;
         case "reduced_state": {
           const { state: reduced, unchanged } = data as { state?: ReducedState; unchanged?: string[] };
@@ -280,14 +297,37 @@ export function useAcpConnection(
       }
       const myGen = dialGenRef.current;
       const isCurrentDial = () => !cancelled && dialGenRef.current === myGen;
+      setStatus("connecting");
       void (async () => {
-        await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
+        // Replay is best effort and the socket's `since=` covers the gap, so a hung fetch must not block the dial.
+        // On timeout the replay is aborted so a late snapshot cannot overwrite rows the socket has since updated.
+        const replay = startReplay();
+        let replayTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          replay.done,
+          new Promise<void>((resolve) => {
+            replayTimer = setTimeout(() => {
+              replay.abort();
+              resolve();
+            }, ACP_DIAL_TIMEOUT_MS);
+          }),
+        ]);
+        clearTimeout(replayTimer);
         if (!isCurrentDial()) return;
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
         const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${lastSeqRef.current}`;
         const ws = new WebSocket(url, acpSocketProtocols());
         wsRef.current = ws;
+        const handshakeTimer = setTimeout(() => {
+          if (!isCurrentDial() || ws.readyState !== WebSocket.CONNECTING) return;
+          ws.onclose = null;
+          closeQuietly(ws);
+          wsRef.current = null;
+          setStatus("closed");
+          scheduleReconnect();
+        }, ACP_DIAL_TIMEOUT_MS);
         ws.onopen = () => {
+          clearTimeout(handshakeTimer);
           if (!isCurrentDial()) {
             closeQuietly(ws);
             return;
@@ -304,6 +344,7 @@ export function useAcpConnection(
           if (isCurrentDial()) setStatus("error");
         };
         ws.onclose = () => {
+          clearTimeout(handshakeTimer);
           if (!isCurrentDial()) return;
           setStatus("closed");
           wsRef.current = null;
@@ -326,6 +367,8 @@ export function useAcpConnection(
     return () => {
       cancelled = true;
       dialGenRef.current += 1;
+      replayAbortRef.current?.abort();
+      replayAbortRef.current = null;
       clearRetryTimers();
       if (wsRef.current) closeQuietly(wsRef.current);
       wsRef.current = null;

@@ -63,8 +63,10 @@ impl HomeView {
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.host_tab_title = config.session.host_tab_title;
         self.row_tag_mode = config.session.row_tag;
+        self.show_activity_age = config.session.show_activity_age;
         self.set_sidebar_position(sidebar_position);
         self.show_diagnostics = config.session.show_diagnostics_pane;
+        self.show_shortcut_bar = config.session.show_shortcut_bar;
         self.daemon_sidebar = config.session.daemon_sidebar;
         if !self.daemon_sidebar {
             self.set_sidebar_source(
@@ -87,6 +89,7 @@ impl HomeView {
         crate::session::set_unread_enabled(config.session.unread_indicator);
         crate::session::set_favorites_first(config.session.favorites_first);
         self.tips_unseen = tips_unseen_count(&config);
+        self.queue_shortcut_bar_tip(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
         let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);

@@ -4,14 +4,28 @@ prompt_marker = ['^\s*╭[─-]*\s+\S']
 [markers.composer_top]
 line_regex = ['^\s*╭[─-]*\s+\S']
 
-# omp stacks live markers, so priority-960 rules compete by screen position.
+[markers.selector_footer]
+line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$']
+max_depth = 12
+
+# OMP stacks live markers, so positional rules compete by screen position.
+
+# The spinner-free Processing footer also carries a live interrupt token.
+[[rules]]
+id = "active_interrupt_hint"
+state = "running"
+priority = 970
+positional = true
+region = "bottom_non_empty_lines(3)"
+visible = true
+line_regex = ['^\s*Processing…\s+⟦esc⟧\s*$']
 
 # The loader: a frame glyph opening the line, plus either the word `working` or
 # an interrupt hint.
 [[rules]]
 id = "loader_braille"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
@@ -21,7 +35,7 @@ contains_any = ["working", "⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"]
 [[rules]]
 id = "loader_hint_frame"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
@@ -40,7 +54,7 @@ not = [{ line_regex = ['^\s*[\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{
 [[rules]]
 id = "active_brand"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 max_position = 2
 region = "bottom_non_empty_lines(3)"
@@ -58,13 +72,25 @@ not = [
   { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
   # A lowercase word before and after the timer is ordinary duration prose.
   { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?\p{Ll}\s+(?:0|[1-9]\d*)[smh]\s+\p{Ll}'] },
+  # An approval with an older activity hint parks a stale band below its footer.
+  { region = "bottom_non_empty_lines(12)", all = [
+    { line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>])\s+\S[^│|]*[│|]\s*$'] },
+    { line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$'] },
+  ], not = [
+    { region = "after(selector_footer)", any = [
+      { line = { regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'], not_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+waiting\b'] } },
+      { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+      { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
+      { line_regex = ['(?i)^ {2}cancel\s+\S'] },
+    ] },
+  ] },
 ]
 
 # A wrapped draft moves the band above the fixed bottom-line windows.
 [[rules]]
 id = "active_composer"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "from_prompt_marker"
 visible = true
@@ -88,7 +114,7 @@ not = [
 [[rules]]
 id = "active_statusline"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
@@ -103,18 +129,6 @@ all = [
 ]
 not = [
   { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
-  # A blocked panel keeps the composer and status row below it; the panel's own
-  # rules must win, so a genuine live dialog silences this rule.
-  { region = "bottom_non_empty_lines(12)", all = [
-    { line_regex = ['(?i)^\s*[│|][^\n]*(?:up/down navigate|enter select|esc cancel)'] },
-    { line_regex = ['(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve\s*[│|]?\s*$'] },
-    { line_regex = ['(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?deny\s*[│|]?\s*$'] },
-  ] },
-  # Live plan panel
-  { region = "bottom_non_empty_lines(12)", all = [
-    { line_regex = ['(?i)^\s*[│|][^\n]*(?:tab regions|esc cancel)'] },
-    { line_regex = ['(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve and execute'] },
-  ] },
   # Live ask panel
   { region = "bottom_non_empty_lines(12)", all = [
     { line_regex = ['(?i)^\s*(?:╭[─-]*|\+[=-]*)\s*ask\b'] },
@@ -125,13 +139,24 @@ not = [
       "current prompt to answer",
     ] },
   ] },
+  { region = "bottom_non_empty_lines(12)", all = [
+    { line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>])\s+\S[^│|]*[│|]\s*$'] },
+    { line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$'] },
+  ], not = [
+    { region = "after(selector_footer)", any = [
+      { line = { regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'], not_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+waiting\b'] } },
+      { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+      { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
+      { line_regex = ['(?i)^ {2}cancel\s+\S'] },
+    ] },
+  ] },
 ]
 
 # Presets without the pi segment expose one bottommost interrupt row.
 [[rules]]
 id = "active_interrupt"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 max_position = 1
 region = "bottom_non_empty_lines(3)"
@@ -147,7 +172,7 @@ not = [
 [[rules]]
 id = "loader_wrapped"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 wrap = 2
 max_position = 3
@@ -165,7 +190,7 @@ not = [
 [[rules]]
 id = "retry_countdown"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 wrap = 6
 region = "bottom_non_empty_lines(6)"
@@ -175,7 +200,7 @@ regex = ['(?i)retrying\s+\(\d+/\d+\)\s+in\s+\d+\s*s\s*\x{2026}']
 [[rules]]
 id = "banner_dismissal"
 state = "error"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(6)"
 visible = true
@@ -184,7 +209,7 @@ contains = ["dismissed when you send your next message"]
 [[rules]]
 id = "retry_exhausted"
 state = "error"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(6)"
 visible = true
@@ -194,7 +219,7 @@ contains_any = ["error: retry budget exhausted", "error: retry failed after"]
 [[rules]]
 id = "panel_prompt"
 state = "waiting"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(8)"
 visible = true
@@ -211,71 +236,31 @@ not = [
   ] },
 ]
 
-# The approve/deny selector: its footer decides the position, gated on both
-# options really being on the panel.
+# Generic OMP selectors use a selected row, multiple options, and a keyboard footer.
 [[rules]]
-id = "approve_deny_panel"
-state = "waiting"
-priority = 960
-positional = true
-region = "bottom_non_empty_lines(8)"
-visible = true
-line_regex = ['^\s*[│|].*[│|]\s*$']
-contains = ["up/down navigate", "enter select", "esc cancel"]
-all = [
-  { region = "bottom_non_empty_lines(8)", line_regex = [
-    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve\s*[│|]?\s*$',
-    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?deny\s*[│|]?\s*$',
-  ] },
-]
-
-# Standard OMP confirmation selectors use Yes/No regardless of their title.
-# A blocked panel can retain a status band beneath its navigation footer.
-[[rules]]
-id = "yes_no_panel"
+id = "selector_panel"
 state = "waiting"
 priority = 970
 positional = true
-max_position = 6
-region = "bottom_non_empty_lines(8)"
-visible = true
-line_regex = ['(?i)^\s*[│|].*(?:up/down|↑/↓|\^/v)\s+navigate\s+(?:enter|⏎)\s+select\s+(?:esc|⎋)\s+cancel\s*[│|]\s*$']
-any = [
-  { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*[│|].*(?:up/down|↑/↓|\^/v)\s+navigate\s+(?:enter|⏎)\s+select\s+(?:esc|⎋)\s+cancel\s*[│|]\s*$'] },
-  { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+waiting\s*$'] },
-]
-all = [
-  { region = "bottom_non_empty_lines(12)", line_regex = [
-    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?yes\s*[│|]?\s*$',
-    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?no\s*[│|]?\s*$',
-  ] },
-]
-
-# The plan panel: its footer decides the position, but only when the panel is
-# really on screen, which is its three options plus a cursor on one of them.
-[[rules]]
-id = "plan_panel"
-state = "waiting"
-priority = 960
-positional = true
+max_position = 12
 region = "bottom_non_empty_lines(12)"
 visible = true
-line_regex = ['^\s*[│|].*[│|]\s*$']
-contains = ["tab regions", "esc cancel"]
+line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$']
 all = [
-  { region = "bottom_non_empty_lines(12)", line_regex = [
-    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve and execute',
-    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?refine plan',
-    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?save and quit',
-    '^\s*[│|]\s*[\x{276F}\x{f054}>] ',
-  ] },
+  { region = "bottom_non_empty_lines(12)", line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>])\s+\S[^│|]*[│|]\s*$'] },
+  { region = "bottom_non_empty_lines(12)", line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s+\S|\s{2,}\S|\p{Lu})[^│|]*[│|]\s*$'], min_lines = 2 },
+]
+not = [
+  { region = "bottom_non_empty_lines(12)", line_regex = ['^\s*(?:╭[─-]*|\+[=-]*)\s*(?:π|\x{f0d57}|pi)\s*>'] },
+  { region = "bottom_non_empty_lines(3)", contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"] },
+  { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)'] },
 ]
 
 # omp's own retry labels, which keep rendering between attempts.
 [[rules]]
 id = "retry_labels"
 state = "running"
-priority = 960
+priority = 970
 positional = true
 region = "bottom_non_empty_lines(12)"
 visible = true

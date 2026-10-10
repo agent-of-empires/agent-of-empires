@@ -15,7 +15,7 @@ import type {
   DockerStatusResponse,
   CreateProgress,
   CreateSessionRequest,
-  ClaudeSessionSummary,
+  ImportableSession,
   SettingsFieldDescriptor,
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
@@ -918,6 +918,7 @@ export interface ServerAbout {
   cityhall_mode: boolean;
   profile: string;
   acp_show_tool_durations: boolean;
+  acp_wrap_tool_output: boolean;
   /** Per-session event log retention cap; 0 means unlimited. */
   acp_replay_events: number;
   acp_compaction_reminder: boolean;
@@ -1079,6 +1080,39 @@ export function switchAcpAgent(
     `/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-agent`,
     jsonInit("POST", body),
   );
+}
+
+export interface SwitchProviderResponse {
+  session_id: string;
+  provider: string;
+  /** Whether a model pick was replaced by the new provider's default. */
+  model_cleared: boolean;
+  status: string;
+}
+
+/** Re-route a Claude session to `provider`, keeping the transcript. Throws with
+ *  the server's reason rather than collapsing to null: the refusals worth
+ *  reading (an agent that does not route through a provider, a respawn that
+ *  failed after the worker stopped) exist only in the body, and the second kind
+ *  leaves the session changed, so the caller must not read a failure as a
+ *  no-op. */
+export async function switchAcpProvider(sessionId: string, provider: string): Promise<SwitchProviderResponse> {
+  const res = await fetch(
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-provider`,
+    jsonInit("POST", { provider }),
+  );
+  const body = await res.text();
+  if (!res.ok) {
+    // Structured refusals carry `message`; the respawn failures are plain text.
+    let message: string | undefined;
+    try {
+      message = stringField(JSON.parse(body) as Payload, "message");
+    } catch {
+      message = undefined;
+    }
+    throw new Error(message || body.slice(0, 200) || `request failed (${res.status})`);
+  }
+  return JSON.parse(body) as SwitchProviderResponse;
 }
 
 export interface ViewSwitchResponse {
@@ -1291,9 +1325,29 @@ export async function fetchProjects(scope?: "global" | "profile"): Promise<Proje
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];
 }
 
-/** Claude Code sessions on disk, newest first, for the import picker. */
-export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
-  return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
+export type ImportableSessionsResult =
+  | { ok: true; sessions: ImportableSession[]; truncated: boolean }
+  | { ok: false; error: string; message: string };
+
+/** Native sessions `agent` can import under `profile`, newest first, for the import picker. */
+export async function listImportableSessions(agent: string, profile?: string): Promise<ImportableSessionsResult> {
+  const params = new URLSearchParams({ agent });
+  if (profile) params.set("profile", profile);
+  const reply = await send(`/api/importable-sessions?${params}`).catch(() => null);
+  if (!reply) return { ok: false, error: "network", message: "Network error" };
+  const payload = reply.payload ?? {};
+  if (!reply.ok) {
+    return {
+      ok: false,
+      error: typeof payload.error === "string" ? payload.error : "server_error",
+      message: typeof payload.message === "string" ? payload.message : `Server error (${reply.status})`,
+    };
+  }
+  return {
+    ok: true,
+    sessions: (payload.sessions as ImportableSession[] | undefined) ?? [],
+    truncated: payload.truncated === true,
+  };
 }
 
 /** Error bodies may be JSON `{message}` or plain text. */

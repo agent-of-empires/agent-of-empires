@@ -265,6 +265,24 @@ pub struct SwitchAgentResponse {
     pub status: String,
 }
 
+/// `POST /api/sessions/{id}/acp/switch-provider` body.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SwitchProviderRequest {
+    /// One of `crate::session::environment::AGENT_PROVIDERS`.
+    pub provider: String,
+}
+
+/// `POST /api/sessions/{id}/acp/switch-provider` response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SwitchProviderResponse {
+    pub session_id: String,
+    pub provider: String,
+    /// Whether a model pick was replaced. The switch resets the model to the
+    /// new provider's default, because model ids are provider-specific.
+    pub model_cleared: bool,
+    pub status: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

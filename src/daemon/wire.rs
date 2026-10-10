@@ -212,6 +212,9 @@ pub struct SessionResponse {
     pub acp_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_agent: Option<String>,
+    /// LLM backend the session is pinned to; absent means the host decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_provider: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -8,6 +8,7 @@ mod dialogs;
 mod file_watch_tests;
 mod icons;
 mod input;
+mod last_prompt;
 mod layout;
 mod lifecycle;
 mod live_send;
@@ -65,8 +66,8 @@ use super::stop_poller::StopPoller;
 use self::creation::SessionMutationGuards;
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
-    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
-    UNREAD_DWELL,
+    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN,
+    ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
@@ -81,6 +82,13 @@ pub(super) enum DragKind {
     ListDivider,
     PreviewSelect,
     SettingsScrollbar,
+}
+
+/// A deletion's force level and the trash lifecycle it ran in.
+#[derive(Clone, Copy)]
+pub(super) struct DeleteAttempt {
+    pub(super) forced: bool,
+    pub(super) trashed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub(super) struct GroupRenameContext {
@@ -145,9 +153,20 @@ pub struct HomeView {
     pub(super) selected_group: Option<String>,
     pub(super) selected_group_profile: Option<String>,
     pub(super) view_mode: ViewMode,
+    /// Whether the terminal-view last-prompt footer (toggled with `Ctrl+L`) is on.
+    pub(super) show_last_prompt: bool,
+    /// Latest last-prompt scrape adopted for rendering. Module-private: only the
+    /// `home` submodules touch it.
+    last_prompt_cache: Option<last_prompt::LastPromptCache>,
+    /// Drop-box a background scrape thread writes into, keeping `capture-pane` off
+    /// the render/input path.
+    last_prompt_slot: last_prompt::LastPromptSlot,
+    /// Whether a background last-prompt scrape is currently running.
+    last_prompt_in_flight: bool,
     pub(super) sort_order: SortOrder,
     pub(super) group_by: GroupByMode,
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
+    pub(super) show_activity_age: bool,
     pub(super) agent_clipboard_forward: bool,
     pub(super) hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks,
     pub(super) vt_live_enabled: bool,
@@ -232,6 +251,8 @@ pub struct HomeView {
     pub(super) pending_stop_terminal: Option<(String, TerminalMode)>,
     pub(super) pending_stop_tool: Option<(String, String)>,
     pub(super) pending_image_pull: Option<String>,
+    /// Checkbox keys the last submitted confirm dialog had checked.
+    pub(super) confirm_checked: Vec<&'static str>,
     pub(super) pending_switch_view_session: Option<String>,
     pub(super) pending_daemon_start_session: Option<String>,
     pub(in crate::tui) structured_preview:
@@ -254,6 +275,7 @@ pub struct HomeView {
     pub(super) pending_status_refresh: bool,
 
     pub(super) show_diagnostics: bool,
+    pub(super) show_shortcut_bar: bool,
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,
@@ -273,10 +295,16 @@ pub struct HomeView {
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 
     pub(super) deletion_poller: DeletionPoller,
+    pub(super) deletes_in_flight: HashMap<String, DeleteAttempt>,
+    /// Each session's last failed deletion, so Empty Trash can escalate: a failed delete
+    /// is offered a forced retry, a failed forced delete removal from aoe without cleanup.
+    pub(super) failed_deletes: HashMap<String, DeleteAttempt>,
 
     pub(super) stop_poller: StopPoller,
 
     pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
+    pub(super) drop_poller:
+        crate::tui::worker::TrackedWorker<operations::DropRequest, operations::DropResult>,
     pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,
     pub(super) startup_recovery_gate: Option<std::time::Instant>,
     pub(super) pending_reconcile_reload: bool,
@@ -379,6 +407,12 @@ pub struct HomeView {
     pub(super) show_preview_info: bool,
 
     pub(super) archived_section_collapsed: bool,
+
+    /// Stopped sessions inside groups are left out of the sidebar, for this run only.
+    pub(super) hide_stopped_in_groups: bool,
+    /// While stopped sessions are hidden, each group header's full count, keyed by path and
+    /// profile, so the header can show `visible/total`.
+    pub(super) group_totals: HashMap<(String, Option<String>), usize>,
 
     pub(super) trashed_section_collapsed: bool,
 

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
-use super::state::{DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock};
+use super::state::{notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock};
 use crate::daemon::PromptAttachmentRef;
 
 /// One renderable row of the transcript.
@@ -54,9 +54,14 @@ pub enum TranscriptRowKind {
     ContextReset,
     SessionCleared,
     Compacted,
+    /// The agent's retained summary; `text` holds its markdown.
+    CompactionSummary,
     Summary,
     /// An error or lifecycle notice the user needs in the timeline.
     Notice,
+    /// An agent session advisory. Unlike `Notice`, every surface keeps it in
+    /// the timeline, since its banner is capped and retired by the next turn.
+    Advisory,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +82,18 @@ pub enum TranscriptDelta {
     },
     /// A row was removed (an AskUserQuestion card superseded by its form).
     Remove(String),
+}
+
+/// The row carries no severity field, so the text spells it out.
+fn session_notice_text(severity: &str, title: &str, description: &Option<String>) -> String {
+    match description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(description) => format!("{severity}: {title}: {description}"),
+        None => format!("{severity}: {title}"),
+    }
 }
 
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
@@ -287,12 +304,31 @@ impl TranscriptModel {
                 TranscriptRowKind::SessionCleared,
                 "Conversation cleared, the model no longer remembers earlier turns.".to_string(),
             )],
-            Event::ConversationCompacted => vec![self.push(
-                format!("compacted-{seq}"),
-                TranscriptRowKind::Compacted,
-                "Conversation compacted; earlier turns above are summarised in the model's context."
-                    .to_string(),
-            )],
+            Event::ConversationCompacted => {
+                self.turn_has_output = true;
+                vec![self.push(
+                    format!("compacted-{seq}"),
+                    TranscriptRowKind::Compacted,
+                    "Conversation compacted; earlier turns above are summarised in the model's \
+                     context."
+                        .to_string(),
+                )]
+            }
+            Event::ConversationCompactionSummary {
+                compaction_id,
+                text,
+            } => {
+                // Kept even when empty (clients hide it), so a later summary
+                // lands beside its divider.
+                let id = format!("compaction-summary-{compaction_id}");
+                match self.rows.iter().position(|r| r.id == id) {
+                    Some(i) => {
+                        self.rows[i].text = text.clone();
+                        vec![patch(&self.rows[i])]
+                    }
+                    None => vec![self.push(id, TranscriptRowKind::CompactionSummary, text.clone())],
+                }
+            }
             Event::SessionContextReset { reason } => {
                 let has_prior_prompt = self.rows.iter().any(|r| {
                     matches!(
@@ -325,6 +361,23 @@ impl TranscriptModel {
                 seq,
                 format!("mode switch to \"{mode_id}\" failed: {reason}"),
             )],
+            Event::SessionNotice {
+                severity,
+                title,
+                description,
+                key,
+            } => {
+                self.turn_has_output = true;
+                let id = notice_id(key.as_deref(), seq);
+                let text = session_notice_text(severity, title, description);
+                match self.rows.iter().position(|r| r.id == id) {
+                    Some(i) => {
+                        self.rows[i].text = text;
+                        vec![patch(&self.rows[i])]
+                    }
+                    None => vec![self.push(id, TranscriptRowKind::Advisory, text)],
+                }
+            }
             Event::RateLimitAutoResumed { resets_at, manual } => {
                 let how = if *manual { "resumed" } else { "auto-resumed" };
                 vec![self.notice(seq, format!("{how} at {resets_at} after rate-limit park"))]
@@ -812,6 +865,28 @@ mod tests {
                 "mode switch to \"bypassPermissions\" failed: denied".to_string(),
             ),
             (
+                Event::SessionNotice {
+                    severity: "warning".into(),
+                    title: "Model fallback".into(),
+                    description: Some("Switched to Sonnet.".into()),
+                    key: None,
+                },
+                "notice-1",
+                TranscriptRowKind::Advisory,
+                "warning: Model fallback: Switched to Sonnet.".to_string(),
+            ),
+            (
+                Event::SessionNotice {
+                    severity: "info".into(),
+                    title: "Task stopped by user".into(),
+                    description: None,
+                    key: None,
+                },
+                "notice-1",
+                TranscriptRowKind::Advisory,
+                "info: Task stopped by user".to_string(),
+            ),
+            (
                 Event::RateLimitAutoResumed {
                     resets_at,
                     manual: false,
@@ -842,6 +917,15 @@ mod tests {
                 TranscriptRowKind::Compacted,
                 "Conversation compacted; earlier turns above are summarised in the model's context."
                     .to_string(),
+            ),
+            (
+                Event::ConversationCompactionSummary {
+                    compaction_id: "c-1".into(),
+                    text: "1. Primary request".into(),
+                },
+                "compaction-summary-c-1",
+                TranscriptRowKind::CompactionSummary,
+                "1. Primary request".to_string(),
             ),
             (
                 Event::ConversationSummary {
@@ -1200,6 +1284,59 @@ mod tests {
         assert_eq!(tool_of(&m, "start-dup").name, "Edit a.rs");
     }
 
+    /// ACP compaction updates are upserts by id: a late, cleared or restored
+    /// summary stays beside its divider, past any later turn.
+    #[test]
+    fn compaction_summary_row_is_keyed_by_compaction() {
+        let summary = |id: &str, text: &str| Event::ConversationCompactionSummary {
+            compaction_id: id.into(),
+            text: text.into(),
+        };
+        let mut m = fold([
+            Event::ConversationCompacted,
+            summary("a", ""),
+            summary("b", "other"),
+            Event::AgentMessageChunk {
+                text: "later turn".into(),
+            },
+        ]);
+        let ids = |m: &TranscriptModel| -> Vec<String> {
+            m.rows().iter().map(|r| r.id.clone()).collect()
+        };
+        let layout = ids(&m);
+        for (seq, text) in [(5, "late"), (6, ""), (7, "restored")] {
+            let deltas = m.apply_event(seq, &summary("a", text));
+            assert!(
+                matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, row }] if id == "compaction-summary-a" && row.text == text),
+                "{text:?}"
+            );
+            assert_eq!(ids(&m), layout, "{text:?}");
+        }
+        assert_eq!(layout[1], "compaction-summary-a");
+        assert_eq!(row(&m, "compaction-summary-b").text, "other");
+    }
+
+    #[test]
+    fn keyed_session_notice_is_replaced_in_place() {
+        let failed = |reason: &str| Event::SessionNotice {
+            severity: "error".into(),
+            title: "Compaction failed".into(),
+            description: Some(reason.into()),
+            key: Some("compaction-a".into()),
+        };
+        let mut m = fold([
+            failed("aborted"),
+            Event::AgentMessageChunk {
+                text: "later turn".into(),
+            },
+        ]);
+        let deltas = m.apply_event(3, &failed("out of tokens"));
+        assert!(
+            matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, row }] if id == "notice-compaction-a" && row.text == "error: Compaction failed: out of tokens")
+        );
+        assert_eq!(m.rows()[0].id, "notice-compaction-a");
+    }
+
     #[test]
     fn ask_user_question_cards_are_suppressed_in_either_order() {
         let mut m = fold([started(tool("tc-ask", "Asking"))]);
@@ -1316,6 +1453,17 @@ mod tests {
             (vec![chunk("hi")], false),
             (vec![Event::ThinkingStarted], false),
             (vec![runtime_error], false),
+            // A typed `/compact` streams no text; its divider is the output.
+            (vec![Event::ConversationCompacted], false),
+            (
+                vec![Event::SessionNotice {
+                    severity: "error".into(),
+                    title: "Compaction failed".into(),
+                    description: None,
+                    key: None,
+                }],
+                false,
+            ),
         ];
         for (i, (mid, notice)) in cases.into_iter().enumerate() {
             let mut events = vec![prompt("/usage")];

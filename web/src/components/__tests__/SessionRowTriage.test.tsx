@@ -46,6 +46,16 @@ describe("SessionRow chips", () => {
     },
   );
 
+  it("marks a favorite with the theme-colored star, and nothing otherwise", () => {
+    renderRow(ws({ favorited: true }));
+    const star = label("Favorited")!;
+    expect(star.textContent).toBe("✦");
+    expect(star.className).toContain("text-favorite");
+    cleanup();
+    renderRow(ws({ favorited: false }));
+    expect(label("Favorited")).toBeNull();
+  });
+
   it("shows the snooze remaining time and the payload rate-limit park", () => {
     renderRow(ws({ snoozed_until: inMinutes(90) }));
     expect(label("Snoozed")!.textContent).toMatch(/1h/);
@@ -102,15 +112,16 @@ describe("SessionRow unread", () => {
     expect(testId("sidebar-context-menu-unread")).toBeNull();
   });
 
-  it.each([
-    [false, "Unread", true],
-    [true, "Read", false],
-  ])("unread=%s offers %j and PATCHes { unread: %s }", async (unread, text, next) => {
+  it.each([false, true])("unread=%s toggles in place and PATCHes the opposite", async (unread) => {
+    const next = !unread;
     openRowMenu(ws({ id: "sess-u", unread }));
-    expect(testId("sidebar-context-menu-unread")!.textContent).toContain(text);
+    const toggle = () => testId("sidebar-context-menu-unread")!;
+    expect(toggle().getAttribute("aria-pressed")).toBe(String(unread));
     click("sidebar-context-menu-unread");
-    // The dot flips optimistically before the PATCH lands.
+    // The dot and the toggle flip optimistically before the PATCH lands, with the menu still open.
     await vi.waitFor(() => expect(testId("sidebar-unread-dot") != null).toBe(next));
+    expect(toggle().getAttribute("aria-pressed")).toBe(String(next));
+    expect(testId("sidebar-context-menu")).not.toBeNull();
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
     expect(firstRequest(fetchSpy)).toEqual({
       url: "/api/sessions/sess-u/unread",
@@ -199,7 +210,7 @@ describe("SessionRow context menu", () => {
 
   it.each([
     // Archiving or snoozing a pinned session clears the pin server-side, as in the TUI.
-    ["pinned", { pinned_at: PAST }, ["Unpin", "Archive", "Snooze"], []],
+    ["pinned", { pinned_at: PAST }, ["Pinned", "Archive", "Snooze"], []],
     ["archived", { archived_at: PAST }, ["Unarchive"], ["Pin", "Snooze"]],
     ["snoozed", { snoozed_until: inMinutes(60) }, ["Unsnooze"], ["Pin", "Archive"]],
     ["live", {}, ["Pin", "Archive", "Snooze"], []],
@@ -266,8 +277,45 @@ describe("SessionRow triage actions", () => {
     click(item);
     // Regression: the chip must read the optimistic state, not wait for the poll.
     await vi.waitFor(() => expect(label(chip)).not.toBeNull());
+    // Pin toggles in place; Archive moves the row out of view, so it closes the menu.
+    expect(testId("sidebar-context-menu") != null).toBe(item === "sidebar-context-menu-pin");
     fail();
     await vi.waitFor(() => expect(label(chip)).toBeNull());
+  });
+
+  it.each([
+    ["Notify all", "sidebar-context-menu-notify-all", "notifications"],
+    ["Color", "sidebar-context-menu-color-red", "color"],
+  ])("%s keeps the menu open, shows the pick, and reverts on failure", async (_n, item, path) => {
+    let fail = () => {};
+    fetchSpy.mockImplementation(
+      () => new Promise((resolve) => (fail = () => resolve(new Response("nope", { status: 500 })))),
+    );
+    openRowMenu(ws({ id: "sess-pick" }));
+    click(item);
+    expect(testId("sidebar-context-menu")).not.toBeNull();
+    expect(testId(item)!.getAttribute("aria-pressed")).toBe("true");
+    expect(fetchSpy.mock.calls[0]![0]).toBe(`/api/sessions/sess-pick/${path}`);
+    fail();
+    await vi.waitFor(() => expect(testId(item)!.getAttribute("aria-pressed")).toBe("false"));
+    expect(testId("sidebar-context-menu")).not.toBeNull();
+  });
+
+  it("No color on a multi-session row clears every session, including the one carrying the color", async () => {
+    openRowMenu(makeWorkspace("w", [makeSession({ id: "s1" }), makeSession({ id: "s2", color: "red" })]));
+    expect(testId("sidebar-context-menu-color-red")!.getAttribute("aria-pressed")).toBe("true");
+    click("sidebar-context-menu-color-clear");
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+    expect(fetchSpy.mock.calls.map(([url]) => url).sort()).toEqual([
+      "/api/sessions/s1/color",
+      "/api/sessions/s2/color",
+    ]);
+  });
+
+  it("the close button closes the menu", () => {
+    openRowMenu(ws());
+    click("sidebar-context-menu-close");
+    expect(testId("sidebar-context-menu")).toBeNull();
   });
 
   it("Snooze… opens the modal without a request", () => {
@@ -316,9 +364,10 @@ describe("SessionRow color label (#2383)", () => {
     if (shown) expect(dot!.className).toContain("bg-red-500");
   });
 
-  it("offers Clear only for a colored row and no color section when disabled", () => {
+  it("marks No color as picked on an uncolored row and hides the section when disabled", () => {
     openRowMenu(ws());
-    expect(testId("sidebar-context-menu-color-clear")).toBeNull();
+    expect(testId("sidebar-context-menu-color-clear")!.getAttribute("aria-pressed")).toBe("true");
+    expect(testId("sidebar-context-menu-color-red")!.getAttribute("aria-pressed")).toBe("false");
     cleanup();
     openRowMenu(ws({ color: "green" }), { colorsEnabled: false });
     for (const key of ["red", "amber", "green", "clear"]) {

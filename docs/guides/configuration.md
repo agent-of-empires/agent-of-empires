@@ -65,7 +65,7 @@ aoe theme list
 aoe theme dir
 ```
 
-Every field is optional. Missing colors fall back to the Empire baseline, while an omitted `appearance` or `[syntax].shiki_theme` is derived from the theme's background luminance. `appearance = "dark" | "light"` and `[syntax].shiki_theme` (any id [Shiki bundles](https://shiki.style/themes)) drive the dashboard's surface ramp and code highlighting.
+Every field is optional. Missing colors fall back to the Empire baseline, except `unread` and `favorite`, which inherit the theme's own `accent`. An omitted `appearance` or `[syntax].shiki_theme` is derived from the theme's background luminance. `appearance = "dark" | "light"` and `[syntax].shiki_theme` (any id [Shiki bundles](https://shiki.style/themes)) drive the dashboard's surface ramp and code highlighting.
 
 ## Session
 
@@ -75,10 +75,15 @@ default_tool = "claude"
 yolo_mode_default = false
 agent_status_hooks = true
 smart_rename = true
+name_agent_session = false
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"        # none | auto | profile | sandbox | branch
 sidebar_position = "left" # left | right; TUI session list
 ```
+
+After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
+It waits until the home screen is free, respects **Show tips**, and never changes the setting.
+You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -89,7 +94,9 @@ sidebar_position = "left" # left | right; TUI session list
 | `prevent_sleep_idle_grace_minutes` | `15` | Minutes (0 to 240) every session must stay idle before the inhibitor is released. A session that never reaches `Idle` (`Waiting` on a prompt, `Creating` forever) holds it indefinitely. |
 | `session_id_poller_max_threads` | `50` | Ceiling on concurrent session-id pollers per process. Past the ceiling, an overflow session's id is not refreshed until it gets a poller; starting one is retried on a 5 s to 60 s backoff. Global only, applied at process start. |
 | `row_tag` | `"branch"` | Metadata next to a TUI session title: `none`, `auto` (profile code in all-profiles view), `profile`, `sandbox`, or `branch`. |
+| `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
 | `sidebar_position` | `"left"` | TUI session sidebar position: `left` or `right`. Global only. Narrow terminals keep the stacked layout. |
+| `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view; shortcuts, `?` help, dialog controls, and temporary notifications still work. |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `pre_trust_agent_folders` | `false` | Pre-trust each host session's worktree in the agent's own config (Claude Code, Codex, Gemini) so it does not open on a folder-trust prompt. Config-dir overrides are honored, and an `agent_config_dir` entry wins over them. Trust also activates the repo's `.claude/settings.json`, hooks included, so enable it only for directories you would have trusted by hand. Sandboxed sessions always pre-trust their own staged config. |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config; see [Agent hook approval](#agent-hook-approval) for the approval that gates it and [Adding a New Agent](../development/adding-agents.md#hook-format-reference) for the formats. Disabling it leaves status to pane reading but keeps identity hooks used for native resume. |
@@ -97,6 +104,7 @@ sidebar_position = "left" # left | right; TUI session list
 | `smart_rename` | `true` | Auto-rename a still-default-named structured session from its first turn, using the session's agent in one-shot mode. Title only; a session you named is never touched. Skipped for agents with no one-shot mode and command-overridden agents. Overridable per project. |
 | `smart_rename_agent` | `""` | Agent used for one-shot utility calls (the rename title and the conversation summary). Empty means the session's own agent. A sandboxed session only mounts its own agent's credentials, so a different value makes it ineligible instead of falling back. |
 | `smart_rename_model` | `{}` | Per-agent model for the rename one-shot, e.g. `{ claude = "haiku" }`. An absent key uses the agent's built-in default, an empty value forces the CLI default, and any other value is passed to the agent's model flag. |
+| `name_agent_session` | `false` | For a session whose title was typed in the TUI's New Session dialog, give its title at the first launch (including a rename in AoE before then) to the agent as its own session name, so it shows in the agent's own apps (Claude's `--name`). For a structured session that is its first terminal launch. Skipped for a generated or suggested title, a title starting with `-`, a launch that resumes a conversation, sandboxed sessions, a launch whose command, arguments or `PATH` AoE cannot attest (including your own `-n`/`--name`), and when the agent's `--help` does not list the flag. |
 | `inherit_host_environment` | `false` | Forward AoE's whole environment to host sessions. See [Host environment](#host-environment). |
 | `agent_extra_args` | `{}` | Per-agent arguments appended after the binary, e.g. `{ opencode = "--port 8080" }`. Ignored for structured view sessions. |
 | `agent_command_override` | `{}` | Per-agent command replacing the binary. Managed resume and fork validate the actual native command and store; opaque wrappers require an explicit execution contract. See [execution identity and wrappers](session-resume.md#execution-identity-and-wrappers). |

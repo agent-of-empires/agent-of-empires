@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `13`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `15`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 13
+api_version = 14
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `13`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `15`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -48,7 +48,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 | Capability | Grants |
 |---|---|
 | `runtime.worker` | Running any plugin code at all (host RPCs the worker initiates). Any worker needs this. |
-| `session.read` | Reading the attached session. |
+| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` notifications (`api_version >= 14`). |
 | `session.write` | Mutating the attached session. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
@@ -67,6 +67,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 | `session.create` | Creating a host-owned structured session via `sessions.create` (`api_version >= 9`). |
 | `session.prompt` | Delivering a turn to a session the plugin created via `sessions.turn.send`, and the initial turn on `sessions.create` (`api_version >= 9`). |
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
+| `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. It is the plugin equivalent of the user typing into the session, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -153,6 +154,7 @@ Setting types:
 | `dynamic_multi_select` | Multi-select (checkbox list) whose choices the host resolves from `option_source`; the stored value is an array of chosen values. Object-list item fields only (`api_version >= 11`). |
 | `cron` | Validated 5-field cron expression text field (`api_version >= 9`). |
 | `object_list` | A repeatable list of structured items described by `fields` (`api_version >= 9`). |
+| `string_list` | Freeform add/remove list of user-typed strings; no closed option set. Top-level setting or object-list item field (`api_version >= 14`). |
 
 ### Dynamic selects (`api_version >= 9`)
 
@@ -191,7 +193,21 @@ type = "cron"
 required = true
 ```
 
-An item field takes the same keys as a top-level setting (`key`, `label`, `description`, `type`, `options`, `min`, `max`, `default`, `multiline`, `option_source`, `depends_on`) plus `required`. It may be a `dynamic_multi_select` (`api_version >= 11`), whose stored value is an array of the chosen option values.
+An item field takes the same keys as a top-level setting (`key`, `label`, `description`, `type`, `options`, `min`, `max`, `default`, `multiline`, `option_source`, `depends_on`) plus `required`. It may be a `dynamic_multi_select` (`api_version >= 11`), whose stored value is an array of the chosen option values, or a `string_list` (`api_version >= 14`), whose stored value is an array of freeform user-typed strings.
+
+## Session listing
+
+`sessions.list` (capability `session.read`) returns `{ "sessions": [...] }`. The optional `exclude` param is an array of `archived`, `snoozed` and `trashed`; with none, every stored session is returned. A trashed session stays present with `trashed: true`; a permanently purged session is absent.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id`, `title`, `tool`, `status` | string | Identity and current status. |
+| `project_path` | string | The session's own working directory; for a worktree session this is the worktree, not the main repo. |
+| `archived`, `snoozed`, `trashed` | bool | Lifecycle flags. |
+| `workspace_repos` | array | One `{ source_path, branch }` per repo checkout of a multi-repo workspace; empty otherwise. |
+| `worktree` | object | `{ branch, main_repo_path, managed_by_aoe }`; present only for worktree sessions. |
+
+`trashed`, `workspace_repos` and `worktree` were added after the first release; they are additive RPC fields and do not change the manifest `api_version`. Treat a missing key as absent on an older host.
 
 ## Session-driving RPCs
 
@@ -203,6 +219,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 | `acp.capabilities.probe` | `acp.capabilities.probe` | Populate the catalog for one agent (optional `agent_id`; otherwise every undiscovered registry agent) via a handshake-only probe, then return the same shape as `acp.capabilities.get`. Spawns the adapter and runs initialize + `session/new` with **no prompt turn** (no tokens); each probe degrades to a no-op on failure. `api_version >= 11`. |
 | `sessions.create` | `session.create` (+ `session.prompt` for an initial turn, + `session.unattended` for an unattended mode) | Create a structured session, optionally with an initial turn and a plugin-scoped idempotency key. |
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
+| `sessions.message.send` | `session.message` | Deliver a short text message to **any** session, like `aoe send`. See [Messaging any session](#messaging-any-session). `api_version >= 15`. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
 
 **Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
@@ -213,15 +230,45 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 
 **Repository trust holds regardless of grants.** A session against a repository whose hooks need approval is refused even with `session.unattended`; a plugin cannot pre-approve trust. See [Unattended sessions](development/internals/plugin-system.md#unattended-plugin-sessions).
 
-**Ownership.** `sessions.turn.send` reaches only a session the calling plugin created.
+**Ownership.** `sessions.turn.send` reaches only a session the calling plugin created. To reach any other session, use `sessions.message.send`.
 
 **Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`.
 
 **Idempotency.** `sessions.create` takes a plugin-scoped `idempotency_key`: retrying with the same key and payload returns the existing session (`created: false`), while a different payload under that key is a conflict.
 
-**Limits.** Per plugin: 20 creates per hour, 5 active plugin-created sessions, 120 turns per hour, reported as `rate_limited` or `concurrency_limited`. Disabling the plugin stops all of its automation.
+**Limits.** Per plugin: 20 creates per hour, 5 active plugin-created sessions, 120 turns per hour, 600 messages per hour, reported as `rate_limited` or `concurrency_limited`. Disabling the plugin stops all of its automation.
 
 **Settings-change events.** After a settings write the host notifies the worker with `plugin.settings.changed` carrying `{ revision, changed_keys }`; the worker re-reads those values with `config.get`, whose response carries the current `revision`. Polling that method is the fallback for a worker that was down.
+
+**Session status events.** With `api_version >= 14` and the `session.read` capability, the host notifies the worker with `session.status.changed` on every status transition of a session in the host's profile (the same sessions `sessions.list` returns), for structured and terminal sessions alike. The params are `{ session_id, title, from, to, at }`: `from` and `to` use the same PascalCase spelling as `sessions.list` (`Running`, `Idle`, `Waiting`, `Stopped`, `Error`, and so on), and `at` is an RFC 3339 timestamp. The host sends the transitions it processes, so filter on `to` (for example `Idle` for "the agent stopped working"). Do not treat the notifications as a complete transition log: a status change made by another process, such as the CLI or TUI, is reported when the daemon next reloads it, changes within one poll tick can merge into one event, and delivery is best-effort as described below. It is a best-effort, fire-and-forget notification: do not reply, and an event is never replayed. It is lost if the worker was down when it fired, if the daemon's status stream lagged and skipped it, or if the worker had stopped reading stdin (at most 64 unread status events are queued per worker; later ones are dropped until it catches up). Resynchronize from `sessions.list` on startup and whenever you may have missed events, but it reads the stored sessions: the `status` of a structured (ACP) session moves on the live row without being persisted each time, so the listed value can be older than the live one. There is no live-status snapshot call yet.
+
+## Messaging any session
+
+`sessions.message.send` takes `{ session_id, message }` and delivers `message` to the session as if the user had typed it. It is for pings such as a PR notification, not for driving a session: it cannot create sessions or read their output, and there is no idempotency key.
+
+**Result.** `{ disposition, revived }`. `disposition` is `sent`, `steered` or `queued`. A structured session takes the same path as the web composer: a running agent that accepts steering takes the message mid-turn (`steered`), one that does not has it parked on the session's queue until the turn ends (`queued`), and an idle one starts a turn (`sent`). A busy agent is never refused. A terminal session always reports `sent`. `revived` is `true` when the host had to start something to take the message. For a structured session that is a stopped, dormant or snoozed worker, which is resumed and given the message immediately rather than queued. For a terminal session it is a stopped or dead pane that was started or respawned. A snoozed terminal keeps its live pane, so it reports `revived: false`; the message still clears the snooze.
+
+**Targets.** Any session, with no ownership check: the `session.message` grant is the gate. A woken session does not count toward the plugin's active-session limit, which only covers sessions the plugin created. Terminal (tmux) sessions are supported and a dead pane is revived first. In CityHall mode (`AOE_CITYHALL_MODE`) terminal sessions refuse plugin input with `terminal_unavailable`; this deliberately differs from `aoe send`, which does not check CityHall.
+
+**Validation.** An empty or whitespace-only message is `invalid_params` (`message_empty`); one over 64 KiB is `invalid_params` (`message_too_long`).
+
+**Errors.** All carry a stable `data.kind`:
+
+| `data.kind` | Meaning |
+|---|---|
+| `session_not_found` | No such session, which is also what a hard-deleted session looks like. |
+| `session_archived` | The session is archived; it is never woken. Skip it and keep the registration. |
+| `session_trashed` | The session is in the trash; it is never woken. |
+| `rate_limited` | More than 600 messages per rolling hour for this plugin. A bucket of its own, separate from turns. |
+| `resume_failed` | A terminal session's agent could not resume. `data.resume_session_id` holds the preserved session id. |
+| `session_not_running` | A terminal pane vanished between the revive and the send. |
+| `session_transient` | A terminal session is mid-start or mid-stop; retry when it settles. |
+| `worker_not_ready` | A structured session's worker did not come up, or could not be resumed. Retryable. |
+| `terminal_unavailable` | CityHall mode refuses terminal targets. |
+| `delivery_timeout` | The call did not finish within its deadline. The outcome is unknown: the message may still have been delivered. |
+| `capability_missing` | The manifest lacks, or the user has not approved, `session.message`. |
+
+**Timing.** The call is synchronous. It returns, or fails with `delivery_timeout`, within 25 seconds (a 10 second worker-ready wait plus 15 seconds for a terminal resume), so a worker may call it from a scheduler loop.
 
 ## Plugin storage
 
@@ -265,6 +312,22 @@ id = "my_pane"
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
 
+### Badge payload
+
+`status-bar`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
+
+Give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
+
+```json
+{ "items": [
+  { "text": "5h 40%", "group": "usage" },
+  { "text": "7d 12%", "group": "usage" },
+  { "text": "stale", "tone": "warn" }
+] }
+```
+
+Items without a `group` stay separate chips, and each distinct `group` cycles independently. The position is kept per browser tab and is never sent to the worker. A cycling chip ignores `href`; a group with a single item renders as a normal chip. The TUI cannot click and shows the first item with text.
+
 ### Pane payload
 
 A `pane` entry renders a dockable tool-window, pushed with `ui.state.set`:
@@ -296,6 +359,7 @@ The payload is capped at 64 KiB. Everything but `blocks` is validated strictly; 
 |---|---|---|
 | `heading` | `text` | |
 | `note` | `text` | `tone` |
+| `markdown` | `text` | `tone` (requires `api_version >= 15`) |
 | `divider` | | |
 | `row` | one of `label` / `value` / `prefix` / `icon` / `avatar` | `sublabel`, `tone`, `value_tone`, `color`, `href`, `tooltip`, `mono`, `selected`, `badges`, `method`, `params` |
 | `section` | | `title`, `children`, `value`, `value_tone`, `badges`, `icon`, `tone`, `boxed`, `scroll`, `collapsible`, `collapsed` |
@@ -317,6 +381,8 @@ An `href` renders as a link only when it is an `http(s)` URL or a path starting 
 **`callout`** is a tone-bordered verdict card: glyph, `title`, `detail` paragraph, and full-width `actions`. Use it for the one thing the pane is telling the user, and a `section` for a list.
 
 **`bar`** stacks `segments` (`{ value, tone?, color?, label? }`) proportionally; segments without a positive `value` are dropped and a bar left with nothing renders nothing. **`sparkline`** plots `values` (oldest first) as a history line, with `max` fixing the top of the scale so a series does not auto-scale each refresh and `bands` (`{ at, tone }` thresholds) recoloring each sample by the highest band it reaches. Both take a `caption` beneath.
+
+**`markdown`** renders `text` as GitHub-flavoured markdown: headings, emphasis, inline and fenced code, lists including task lists, blockquotes, links and tables. `text` must be a string, or the host rejects the push; it has no cap of its own beyond the pane payload cap. Plugin text is untrusted, so the web dashboard sanitises it: raw HTML, HTML comments and `<details>` tags are dropped (markdown inside them still renders when set off by blank lines, as on GitHub; without them the whole HTML block is dropped), an image shows its alt text and never loads its URL, and a link follows the `href` policy above (a link that fails it shows as plain text). The TUI cannot render rich markdown and shows `text` as plain lines with the markers kept.
 
 **`columns`** lays its `children` out in equal fractions, and a single child spans the full width, so eliding one card collapses the row cleanly.
 

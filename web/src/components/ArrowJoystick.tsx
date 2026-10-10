@@ -50,7 +50,7 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
     timerRef.current = setTimeout(tick, JOYSTICK_FIRST_REPEAT_MS);
   }, [emit]);
 
-  // The sidebar edge swipe listens on window, so the pad's touches stop here.
+  // The drawer swipe listens on window, so the pad's touches stop here.
   useEffect(() => {
     const pad = padRef.current;
     if (!pad) return;

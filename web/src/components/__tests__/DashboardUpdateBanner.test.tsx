@@ -17,6 +17,7 @@ function aboutWith(webBuildId: string | null): ServerAbout {
     behind_tunnel: false,
     profile: "main",
     acp_show_tool_durations: true,
+    acp_wrap_tool_output: false,
     acp_replay_events: 0,
     build_flavor: "release",
     web_build_id: webBuildId,

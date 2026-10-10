@@ -32,6 +32,7 @@ use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
 
 pub(crate) use agents::apply_agent_command_override;
+pub(crate) use launch::host_spawn_environment;
 pub use sink::{BroadcastSink, ChannelSink};
 
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.
@@ -40,7 +41,7 @@ const RESTART_WINDOW: Duration = Duration::from_secs(60);
 /// Backoff before respawning so an agent that crashes on startup cannot hot-loop.
 const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 /// How long a runner request path waits for a mid-resume worker to land.
-const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Builds the client for a spawn; swapped in tests to drive lifecycles without a runner.
 pub(crate) type Launcher = Arc<
@@ -223,6 +224,9 @@ pub struct SpawnRequest {
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
+    /// LLM backend pinned on the session row, one of
+    /// `session::environment::AGENT_PROVIDERS`; `None` defers to the host.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default.

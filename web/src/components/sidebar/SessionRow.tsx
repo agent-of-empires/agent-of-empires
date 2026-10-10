@@ -5,7 +5,6 @@ import type { Workspace } from "../../lib/types";
 import {
   attachSessionProject,
   createSession,
-  fetchProjects,
   renameSession,
   setSessionColor,
   setSessionNotifications,
@@ -30,11 +29,12 @@ import { StatusGlyph } from "../StatusGlyph";
 import { useContextMenu } from "../useContextMenu";
 import { AddProjectModal } from "./AddProjectModal";
 import { RowSubRows, RowTrailingBadges } from "./RowBadges";
-import { deriveRowModel, type RowModel } from "./rowModel";
+import { deriveRowModel, SESSION_COLOR_OPTIONS, type RowModel } from "./rowModel";
 import { BulkTriageMenuItems, SingleRowMenuItems, type SingleRowActions } from "./SessionRowMenu";
 import { SnoozeModal } from "./SnoozeModal";
 import type { RowActivate, RowBulkApi, RowContextScope } from "./types";
 import { useLongPress } from "./useLongPress";
+import { usePendingSetting } from "./usePendingSetting";
 import { WorkdirNameModal } from "./WorkdirNameModal";
 
 type Modal = "snooze" | "workdir" | "addProject" | "group" | null;
@@ -67,11 +67,28 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   const sessionColorsEnabled = useSessionColorsEnabled();
   const compact = useSidebarCompact();
-  const model = deriveRowModel(workspace, props.optimistic, { idleDecayWindowMs, isActive, unreadIndicatorEnabled });
-  const { label, sessionId, isDeleting, navigationSession } = model;
+  const derived = deriveRowModel(workspace, props.optimistic, { idleDecayWindowMs, isActive, unreadIndicatorEnabled });
+  const { label, sessionId, isDeleting, navigationSession } = derived;
+  const [notifyPreset, setNotify] = usePendingSetting(
+    derived.notifyPreset,
+    (preset) => (sessionId ? setSessionNotifications(sessionId, preset) : Promise.resolve(false)),
+    () => reportError("Could not change notifications. Please try again."),
+  );
+  const [sessionColor, setColor] = usePendingSetting(
+    derived.sessionColor,
+    // The row shows any session's color, so every session must change for the pick to stick.
+    async (color) =>
+      (await Promise.all(workspace.sessions.map((s) => setSessionColor(s.id, color)))).every((r) => r != null),
+    () => reportError("Could not change the session color. Please try again."),
+  );
+  const model: RowModel = {
+    ...derived,
+    notifyPreset,
+    sessionColor,
+    sessionColorDot: SESSION_COLOR_OPTIONS.find((o) => o.key === sessionColor)?.dotClass ?? null,
+  };
 
   const [modal, setModal] = useState<Modal>(null);
-  const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
@@ -108,12 +125,11 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     setRenaming(true);
     requestAnimationFrame(() => renameRef.current?.select());
   };
-  const actions = { ...buildRowActions(props, model, closeMenu, setModal), rename: startRename };
-  const openAddProject = () => {
-    actions.addProject();
-    void fetchProjects().then((projects) =>
-      setAddProjectOptions(projects.map((p) => ({ name: p.name, path: p.path }))),
-    );
+  const actions = {
+    ...buildRowActions(props, model, closeMenu, setModal),
+    rename: startRename,
+    notify: setNotify,
+    color: setColor,
   };
 
   if (renaming) {
@@ -145,14 +161,17 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         ? "text-text-primary"
         : "text-text-secondary";
   const navigationSessionId = navigationSession?.id ?? null;
+  const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
 
   return (
     <>
       <a
         ref={rowRef}
-        href={navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/"}
+        href={sessionPath}
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
+        aria-current={isActive && sessionPath === window.location.pathname ? "page" : undefined}
+        data-active-session-row={isActive || undefined}
         data-testid="sidebar-session-row"
         title={model.needsAttention ? `${label} · ${model.attentionHint}` : label}
         draggable={false}
@@ -172,7 +191,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-6 pr-3" : "px-3"
-        } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
+        } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500`}
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
@@ -198,7 +217,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           </span>
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.isFavorited || model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}
+              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
               {sessionColorsEnabled && model.sessionColorDot && (
                 <span
@@ -215,8 +234,8 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 </span>
               )}
               {!compact && model.isFavorited && (
-                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-amber-300">
-                  *
+                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-favorite">
+                  ✦
                 </span>
               )}
               <span className="truncate" title={label}>
@@ -236,23 +255,38 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           minWidth="min-w-[240px]"
           sheetOnMobile
           label={menu.scope.kind === "bulk" ? `${menu.scope.count} selected sessions` : `${label} actions`}
+          heading={
+            menu.scope.kind === "bulk" ? (
+              <span className="text-sm text-text-primary">{menu.scope.count} selected</span>
+            ) : (
+              <span className="flex items-center gap-2 text-sm font-mono text-text-primary">
+                <span className={`shrink-0 leading-none ${model.textClass}`}>
+                  <StatusGlyph
+                    status={model.status}
+                    createdAt={model.createdAt}
+                    idleEnteredAt={model.idleEnteredAt}
+                    dormant={model.dormant}
+                  />
+                </span>
+                {model.sessionColorDot && sessionColorsEnabled && (
+                  <span className={`h-2 w-2 shrink-0 rounded-full ${model.sessionColorDot}`} aria-hidden="true" />
+                )}
+                <span className="truncate">{label}</span>
+              </span>
+            )
+          }
           onClose={closeMenu}
           returnFocusTo={rowRef}
         >
           {menu.scope.kind === "bulk" ? (
-            <BulkTriageMenuItems
-              count={menu.scope.count}
-              buckets={menu.scope.buckets}
-              api={bulkApi}
-              onDone={closeMenu}
-            />
+            <BulkTriageMenuItems buckets={menu.scope.buckets} api={bulkApi} onDone={closeMenu} />
           ) : (
             <SingleRowMenuItems
               model={model}
               readOnly={readOnly}
               colorsEnabled={sessionColorsEnabled}
               unreadEnabled={unreadIndicatorEnabled}
-              actions={{ ...actions, addProject: openAddProject }}
+              actions={actions}
             />
           )}
         </ContextMenu>
@@ -261,7 +295,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         modal={modal}
         setModal={setModal}
         model={model}
-        addProjectOptions={addProjectOptions}
         onSnooze={(minutes) => {
           closeMenu();
           setModal(null);
@@ -272,15 +305,16 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   );
 });
 
-/** Menu actions; each closes the menu first so its dismiss listener cannot race a modal mount. */
+/** Menu actions; each closes the menu first so its dismiss listener cannot race a modal mount.
+ *  Pin, unread, notify and color are in-place toggles that keep it open; the row supplies the last two. */
 function buildRowActions(
   props: SessionRowProps,
   model: RowModel,
   closeMenu: () => void,
   setModal: (m: Modal) => void,
-): Omit<SingleRowActions, "rename"> {
+): Omit<SingleRowActions, "rename" | "notify" | "color"> {
   const { workspace } = props;
-  const { firstSession: first, acpSession: acp, sessionId } = model;
+  const { firstSession: first, acpSession: acp } = model;
   const after = (fn: () => unknown) => () => {
     closeMenu();
     void fn();
@@ -325,27 +359,14 @@ function buildRowActions(
     }),
     stop: after(() => first && props.onStop?.(first.id)),
     start: after(() => first && props.onStart?.(first.id)),
-    notify: (preset) =>
-      after(async () => {
-        if (!sessionId || preset === model.notifyPreset) return;
-        await setSessionNotifications(sessionId, preset);
-      })(),
-    // No optimistic overlay for color; the dot updates on the next poll.
-    color: (color) =>
-      after(async () => {
-        if (!sessionId || color === model.sessionColor) return;
-        if (!(await setSessionColor(sessionId, color))) {
-          reportError(color ? "Failed to set session color" : "Failed to clear session color");
-        }
-      })(),
-    pin: after(() => props.onPinToggle(workspace, !model.effectivePinned)),
+    pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),
     openSnooze: after(() => setModal("snooze")),
     unsnooze: after(() => {
       setModal(null);
       props.onSnooze(workspace, null);
     }),
-    unread: after(() => props.onUnreadToggle(workspace, !model.effectiveUnread)),
+    unread: () => props.onUnreadToggle(workspace, !model.effectiveUnread),
     remove: after(() => props.onDelete?.(workspace.sessions.map((s) => s.id))),
   };
 }
@@ -354,13 +375,11 @@ function RowModals({
   modal,
   setModal,
   model,
-  addProjectOptions,
   onSnooze,
 }: {
   modal: Modal;
   setModal: (m: Modal) => void;
   model: RowModel;
-  addProjectOptions: { name: string; path: string }[];
   onSnooze: (minutes: number) => void;
 }) {
   const { label, sessionId } = model;
@@ -399,7 +418,6 @@ function RowModals({
     return createPortal(
       <AddProjectModal
         title={label}
-        projects={addProjectOptions}
         onCancel={close}
         onDone={close}
         onSubmit={(project, attachExistingBranch) => attachSessionProject(sessionId, project, { attachExistingBranch })}

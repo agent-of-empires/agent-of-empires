@@ -412,6 +412,29 @@ test.describe("Long-press menu (mobile)", () => {
     expect(await sheet.evaluate((el) => el.scrollHeight <= el.clientHeight)).toBe(true);
   });
 
+  test("dragging the sheet header down past the threshold closes it; a short drag snaps back", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
+    await page.goto("/");
+    await openMobileSidebar(page);
+    await rows(page).first().click({ button: "right" });
+    await expect(menu(page)).toBeVisible();
+    const box = (await menu(page).boundingBox())!;
+    const x = box.x + box.width / 2;
+    const y = box.y + 8;
+
+    const cdp = await page.context().newCDPSession(page);
+    const drag = async (dy: number) => {
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y, id: 1 }] });
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x, y: y + dy, id: 1 }] });
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    };
+    await drag(30);
+    await expect(menu(page)).toBeVisible();
+    await expect.poll(async () => (await menu(page).boundingBox())!.y).toBeCloseTo(box.y, 0);
+    await drag(120);
+    await expect(menu(page)).toBeHidden();
+  });
+
   test("a native contextmenu after the long-press does not dismiss the row menu", async ({ page }) => {
     await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
     await page.goto("/");

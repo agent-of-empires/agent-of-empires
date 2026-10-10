@@ -166,6 +166,20 @@ pub enum AcpCommands {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Re-route a Claude session to a different LLM provider, keeping the
+    /// transcript. Refused mid-turn; once idle the worker restarts and
+    /// resumes the same conversation. Credentials are not provisioned by
+    /// this: the target provider's own variables must already be set on the
+    /// host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`
+    /// for vertex). The model resets to the new provider's default, because
+    /// model ids differ between providers.
+    SwitchProvider {
+        /// Acp session id.
+        session: String,
+        /// Provider to route through.
+        #[arg(value_parser = ["api", "bedrock", "vertex"])]
+        provider: String,
+    },
 }
 
 #[tracing::instrument(target = "cli.acp", skip_all)]
@@ -209,6 +223,9 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             target,
             model,
         } => switch_agent(&session, &target, model.as_deref()).await,
+        AcpCommands::SwitchProvider { session, provider } => {
+            switch_provider(&session, &provider).await
+        }
     }
 }
 
@@ -1012,6 +1029,20 @@ async fn switch_agent(session: &str, target: &str, model: Option<&str>) -> Resul
     Ok(())
 }
 
+async fn switch_provider(session: &str, provider: &str) -> Result<()> {
+    let endpoint = require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let resp = client
+        .switch_provider(session, provider)
+        .await
+        .map_err(map_http)?;
+    println!("switched provider for {session} -> {}", resp.provider);
+    if resp.model_cleared {
+        println!("model pick replaced by the provider's default; model ids are provider-specific");
+    }
+    Ok(())
+}
+
 async fn attach(session: &str) -> Result<()> {
     crate::tui::structured_view::run_standalone(session).await
 }
@@ -1082,6 +1113,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::AvailableCommandsUpdated { .. } => "available_commands_updated",
         Event::ConfigOptionsUpdated { .. } => "config_options_updated",
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
+        Event::AuthStatusUpdated { .. } => "auth_status_updated",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
         Event::BackgroundAgentProgress { .. } => "background_agent_progress",
@@ -1100,11 +1132,13 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::SessionCleared => "session_cleared",
         Event::ConversationCompactionStarted => "conversation_compaction_started",
         Event::ConversationCompacted => "conversation_compacted",
+        Event::ConversationCompactionSummary { .. } => "conversation_compaction_summary",
         Event::ConversationSummary { .. } => "conversation_summary",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
         Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
+        Event::SessionNotice { .. } => "session_notice",
     }
 }
 
@@ -1315,7 +1349,7 @@ mod tests {
             version_issue: issue,
         };
         let stale_issue = AgentVersionIssue {
-            reason: "installed 0.37.0; requires >=0.55.0".to_string(),
+            reason: "installed 0.37.0; requires >=0.82.0".to_string(),
             install_command: "npm install -g @x/y@latest".to_string(),
         };
         let marks = [

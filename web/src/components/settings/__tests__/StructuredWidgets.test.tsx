@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useState } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { ListField } from "../FormFields";
 import { SchemaSection } from "../SchemaSection";
 import type { SettingsFieldDescriptor, SettingsObjectField } from "../../../lib/types";
 
@@ -127,5 +129,152 @@ describe("dynamic_multi_select", () => {
       ).toBe(true),
     );
     expect(screen.getByText("models")).toBeTruthy();
+  });
+});
+
+describe("list (string_list item field)", () => {
+  it("adds and removes freeform entries", async () => {
+    const schema = jobs(itemField("match", { kind: "list" }, true));
+    const { lastValue } = renderSection(schema, { jobs: [{ id: "j1", match: ["a/*"] }] });
+    expect(screen.getByText("a/*")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("+ Add"));
+    expect(screen.getByLabelText("match")).toBe(screen.getByRole("textbox"));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "b/*" } });
+    fireEvent.click(screen.getByText("Add"));
+    expect(((await lastValue()) as { match: string[] }[])[0]!.match).toEqual(["a/*", "b/*"]);
+  });
+
+  it("removes one entry while another remains", async () => {
+    const schema = jobs(itemField("match", { kind: "list" }, true));
+    const { lastValue } = renderSection(schema, { jobs: [{ id: "j1", match: ["a/*", "b/*"] }] });
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    expect(((await lastValue()) as { match: string[] }[])[0]!.match).toEqual(["b/*"]);
+  });
+
+  it("keeps a cleared required list local, but persists an empty optional list", async () => {
+    const required = renderSection(jobs(itemField("match", { kind: "list" }, true)), {
+      jobs: [{ id: "j1", match: ["a/*"] }],
+    });
+    fireEvent.click(screen.getByTitle(/^Remove /));
+    await waitFor(() => expect(screen.queryByText("a/*")).toBeNull());
+    expect(required.onSave).not.toHaveBeenCalled();
+    required.unmount();
+
+    const optional = renderSection(jobs(itemField("match", { kind: "list" })), {
+      jobs: [{ id: "j1", match: ["a/*"] }],
+    });
+    fireEvent.click(screen.getByTitle(/^Remove /));
+    expect(((await optional.lastValue()) as { match: string[] }[])[0]!.match).toEqual([]);
+  });
+});
+
+describe("ListField editing", () => {
+  const schema = [descriptor("tags", { kind: "list" })];
+
+  it("edits an entry in place, keeping its position", async () => {
+    const { lastValue } = renderSection(schema, { tags: ["a", "b", "c"] });
+    fireEvent.click(screen.getByTitle("Edit b"));
+    const input = screen.getByDisplayValue("b");
+    fireEvent.change(input, { target: { value: "x" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(await lastValue()).toEqual(["a", "x", "c"]);
+  });
+
+  it("cancels an edit with Escape without saving", () => {
+    const { onSave } = renderSection(schema, { tags: ["a"] });
+    fireEvent.click(screen.getByTitle("Edit a"));
+    const input = screen.getByDisplayValue("a");
+    fireEvent.change(input, { target: { value: "z" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.getByText("a")).toBeTruthy();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("keeps the remove button visible without hover", () => {
+    renderSection(schema, { tags: ["a"] });
+    expect(screen.getByTitle("Remove a").className).not.toContain("opacity-0");
+  });
+});
+
+describe("ListField with a controlled parent", () => {
+  function Controlled({ initial, delayed = false }: { initial: string[]; delayed?: boolean }) {
+    const [items, setItems] = useState(initial);
+    return (
+      <ListField
+        label="tags"
+        items={items}
+        onChange={(next) => (delayed ? setTimeout(() => setItems(next), 0) : setItems(next))}
+      />
+    );
+  }
+  const rows = () => screen.getAllByTitle(/^Edit /).map((b) => b.getAttribute("title")!.slice(5));
+
+  it.each([
+    ["middle", false],
+    ["middle, parent updates asynchronously", true],
+  ])("keeps editing the same entry after an earlier one is removed (%s)", async (_name, delayed) => {
+    render(<Controlled initial={["a", "b", "c"]} delayed={delayed} />);
+    fireEvent.click(screen.getByTitle("Edit b"));
+    fireEvent.change(screen.getByDisplayValue("b"), { target: { value: "x" } });
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    await waitFor(() => expect(rows()).toEqual(["c"]));
+    const input = screen.getByDisplayValue("x");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
+    expect(screen.getByText("x")).toBeTruthy();
+    expect(screen.getByText("c")).toBeTruthy();
+  });
+
+  it("keeps editing the last entry after an earlier one is removed", async () => {
+    render(<Controlled initial={["a", "b", "c"]} />);
+    fireEvent.click(screen.getByTitle("Edit c"));
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    fireEvent.change(await screen.findByDisplayValue("c"), { target: { value: "x" } });
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() => expect(screen.getByText("x")).toBeTruthy());
+    expect(screen.getByText("b")).toBeTruthy();
+    expect(screen.queryByText("c")).toBeNull();
+  });
+
+  it("edits the right one of two identical entries after an earlier removal", async () => {
+    render(<Controlled initial={["a", "b", "b"]} />);
+    fireEvent.click(screen.getAllByTitle("Edit b")[0]!);
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    fireEvent.change(await screen.findByDisplayValue("b"), { target: { value: "x" } });
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() => expect(rows()).toEqual(["x", "b"]));
+  });
+
+  it("closes the editor when an equal-valued removal makes the edited entry ambiguous", async () => {
+    render(<Controlled initial={["a", "b", "b", "b"]} />);
+    fireEvent.click(screen.getAllByTitle("Edit b")[1]!);
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[1]!);
+    await waitFor(() => expect(rows()).toEqual(["a", "b", "b"]));
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+
+  it("closes the editor when the parent drops the edited entry", () => {
+    const noop = vi.fn();
+    const { rerender } = render(<ListField label="tags" items={["a", "b"]} onChange={noop} />);
+    fireEvent.click(screen.getByTitle("Edit b"));
+    expect(screen.getByRole("textbox")).toBeTruthy();
+    rerender(<ListField label="tags" items={["a"]} onChange={noop} />);
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.getByText("+ Add")).toBeTruthy();
+  });
+
+  it("ignores Enter that confirms an IME composition", () => {
+    const onChange = vi.fn();
+    render(<ListField label="tags" items={[]} onChange={onChange} />);
+    fireEvent.click(screen.getByText("+ Add"));
+    const input = screen.getByRole("textbox");
+    fireEvent.change(input, { target: { value: "か" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    // Safari reports the composition-ending Enter with isComposing false and keyCode 229.
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onChange).toHaveBeenCalledWith(["か"]);
   });
 });

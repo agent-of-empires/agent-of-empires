@@ -1,8 +1,9 @@
 //! The `initialize` request aoe sends and the wait for the agent's reply.
 
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, ElicitationCapabilities, ElicitationFormCapabilities,
-    FileSystemCapabilities, Implementation, InitializeRequest,
+    ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, ElicitationCapabilities,
+    ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
+    NoticeCapabilities,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use std::sync::Arc;
@@ -29,7 +30,17 @@ pub(super) fn build_initialize_request() -> InitializeRequest {
         // Form-mode elicitation re-enables claude-agent-acp's AskUserQuestion,
         // which it otherwise blacklists, and routes it to
         // `handle_elicitation_request`.
-        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+        // Without this the adapter must not send `notice` updates, and instead
+        // folds each advisory into a bold-label agent message that reads as the
+        // model's own prose. Compaction makes claude-agent-acp send typed
+        // `compaction_update`s carrying the retained summary instead of
+        // "Compacting..." text.
+        .session(
+            ClientSessionCapabilities::new()
+                .notices(NoticeCapabilities::new())
+                .compaction(CompactionCapabilities::new()),
+        );
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(capabilities)
         .client_info(
@@ -123,6 +134,21 @@ mod tests {
                 serde_json::from_value(serde_json::json!({ "sessionId": "child-123" }))
                     .expect("fork response parse");
             assert_eq!(resp.session_id.0.as_ref(), "child-123");
+        }
+    }
+
+    /// The adapter silently falls back to untyped text unless these exact keys
+    /// are advertised (#4242 for notices). Every other test builds its own
+    /// update, so a drift here would kill the feature with the suite green.
+    #[test]
+    fn initialize_advertises_the_session_capabilities() {
+        let wire = serde_json::to_value(build_initialize_request()).expect("serialize");
+        for key in ["notices", "compaction"] {
+            assert_eq!(
+                wire.pointer(&format!("/clientCapabilities/session/{key}")),
+                Some(&serde_json::json!({})),
+                "session {key} capability missing from {wire}"
+            );
         }
     }
 }

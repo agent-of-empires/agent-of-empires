@@ -51,8 +51,10 @@
                 ./acp-worker/aoe-agent/package.json
                 ./acp-worker/aoe-agent/package-lock.json
                 ./acp-worker/aoe-agent/src
+                ./acp-worker/test-shim/shim.mjs
                 ./assets
                 ./docker
+                ./web/tests/helpers/fakeAcpAgent.mjs
               ];
             };
             strictDeps = true;
@@ -102,7 +104,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-HPD3+bajeSFTC6gnEyZ/rc2HQfeWUgPHon/5hORI34A=";
+            npmDepsHash = "sha256-335L1+uhsKTXXkoNqlTTpVsRcvzXR/hynQIGSwikl4A=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

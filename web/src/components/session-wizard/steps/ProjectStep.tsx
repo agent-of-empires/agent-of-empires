@@ -1,7 +1,7 @@
 import { useState } from "react";
-import type { AgentInfo, ClaudeSessionSummary } from "../../../lib/types";
+import type { AgentInfo, ImportableSession } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
-import { ClaudeSessionPicker } from "./ClaudeSessionPicker";
+import { ImportSessionPicker } from "./ImportSessionPicker";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
 import { CloneRepoForm } from "./CloneRepoForm";
@@ -13,7 +13,7 @@ interface Props {
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
   initialTab?: Tab;
-  /** Only used to gate the Claude import tab. */
+  /** Only used to offer agents on the import tab. */
   agents?: AgentInfo[];
   /** Called on every path selection with the saved project's worktree override, or `undefined`
    *  when the path is unregistered or has none. */
@@ -39,24 +39,27 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
     onPicked?.();
   };
 
-  // Importing resumes via claude-agent-acp, so require both it and the claude CLI.
-  const claudeImportAvailable = agents.some((a) => a.name === "claude" && a.installed && a.acp_installed);
+  // Import resumes through the built-in ACP adapter, so it needs both the CLI and the adapter.
+  const importAgents = agents
+    .filter((a) => a.kind === "builtin" && a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
+    .map((a) => a.name);
 
   const tabs: { id: Tab; label: string }[] = [
     ...(hasPicks ? [{ id: "recent" as Tab, label: "Recent" }] : []),
     { id: "browse", label: "Browse" },
     { id: "clone", label: "Clone URL" },
-    ...(claudeImportAvailable ? [{ id: "import" as Tab, label: "Import from Claude" }] : []),
+    ...(importAgents.length > 0 ? [{ id: "import" as Tab, label: "Import session" }] : []),
     { id: "scratch", label: "Scratch" },
   ];
 
-  // The on-disk session id only resolves in its recorded cwd, so worktree and scratch are cleared.
-  const handleImportSelect = (s: ClaudeSessionSummary) => {
+  // A native id only resolves in its recorded cwd on the host, so worktree, scratch and sandbox are cleared.
+  const handleImportSelect = (s: ImportableSession, agent: string) => {
     onChange("scratch", false);
     onChange("path", s.cwd);
-    onChange("tool", "claude");
+    onChange("tool", agent);
     onChange("useStructuredView", true);
     onChange("useWorktree", false);
+    onChange("sandboxEnabled", false);
     onChange("attachExisting", false);
     onChange("importAcpSessionId", s.session_id);
     if (s.title) onChange("title", s.title.slice(0, 60));
@@ -106,8 +109,13 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
 
       {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} />}
 
-      {!loading && activeTab === "import" && claudeImportAvailable && (
-        <ClaudeSessionPicker onSelect={handleImportSelect} selectedSessionId={data.importAcpSessionId} />
+      {!loading && activeTab === "import" && importAgents.length > 0 && (
+        <ImportSessionPicker
+          agents={importAgents}
+          profile={data.profile || undefined}
+          onSelect={handleImportSelect}
+          selectedSessionId={data.importAcpSessionId}
+        />
       )}
 
       {!loading && activeTab === "clone" && <CloneRepoForm onCloned={selectPath} />}
