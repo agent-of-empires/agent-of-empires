@@ -464,6 +464,10 @@ pub struct AcpState {
     /// A `/compact` is running; the adapter goes silent for minutes.
     #[serde(default)]
     pub compacting: bool,
+    /// The adapter's `/compact` tool call, whose completion ends `compacting`.
+    /// Held by id because a later update can retitle the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_tool_id: Option<String>,
 
     pub last_seq: u64,
     pub updated_at: DateTime<Utc>,
@@ -755,6 +759,8 @@ pub enum Event {
     ConversationCompactionStarted,
     /// `/compact` replaced the model's context with a summary.
     ConversationCompacted,
+    /// A compaction ended without replacing the context.
+    ConversationCompactionFailed,
     /// The summary the agent retained when compacting, after its
     /// `ConversationCompacted`. A later one for the same compaction replaces
     /// it; empty `text` clears it.
@@ -804,8 +810,15 @@ impl AcpState {
             Event::TodoListUpdated { todos } => self.todos = todos,
             Event::ToolCallStarted { tool_call } => self.start_tool_call(tool_call),
             Event::ToolCallCompleted { tool_call_id, .. } => {
-                let finished = self.in_flight_tool.take_if(|t| t.id == tool_call_id);
-                if finished.is_some_and(|t| t.name == COMPACT_TOOL_NAME) {
+                if self
+                    .in_flight_tool
+                    .as_ref()
+                    .is_some_and(|t| t.id == tool_call_id)
+                {
+                    self.in_flight_tool = None;
+                }
+                if self.compaction_tool_id.as_ref() == Some(&tool_call_id) {
+                    self.compaction_tool_id = None;
                     self.compacting = false;
                 }
             }
@@ -963,6 +976,10 @@ impl AcpState {
                 self.compacting = false;
                 self.usage = None;
             }
+            Event::ConversationCompactionFailed => {
+                self.compacting = false;
+                self.compaction_tool_id = None;
+            }
             Event::PromptRejected { .. } => self.turn_active = false,
             Event::AgentSwitched { from, to, reason } => self.switch_agent(from, to, reason),
             Event::BackgroundAgentLaunched {
@@ -1052,6 +1069,7 @@ impl AcpState {
     fn start_tool_call(&mut self, tool_call: ToolCall) {
         if tool_call.name == COMPACT_TOOL_NAME {
             self.compacting = true;
+            self.compaction_tool_id = Some(tool_call.id.clone());
         }
         match self.in_flight_tool.as_mut() {
             // A repeated start frame for the same call keeps diffs an update already attached.
@@ -1085,6 +1103,7 @@ impl AcpState {
         self.turn_active = false;
         self.cancelling = false;
         self.compacting = false;
+        self.compaction_tool_id = None;
         self.in_flight_tool = None;
         self.thinking = None;
         if reason != "rate_limited" && reason != RATE_LIMIT_EXHAUSTED_RETRIES_REASON {
@@ -1490,6 +1509,29 @@ mod tests {
         assert!(
             applied([compact_tool(), tool_done("other", false)]).compacting,
             "another tool's completion leaves it set"
+        );
+        let retitle = Event::ToolCallUpdated {
+            tool_call_id: "tc-compact".into(),
+            title: Some("Compacting context".into()),
+            args_preview: None,
+            started_at: None,
+            diffs: None,
+        };
+        assert!(
+            !applied([compact_tool(), retitle, tool_done("tc-compact", false)]).compacting,
+            "a retitled compact call still clears by id"
+        );
+        assert!(
+            !applied([compact_tool(), Event::ConversationCompactionFailed]).compacting,
+            "a reported failure clears the flag"
+        );
+        assert!(
+            !applied([
+                Event::ConversationCompactionStarted,
+                Event::ConversationCompactionFailed
+            ])
+            .compacting,
+            "a failure also ends a text-marked compaction"
         );
 
         let mut s = fresh_state();
