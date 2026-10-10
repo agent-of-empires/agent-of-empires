@@ -211,7 +211,7 @@ impl Instance {
         // An archived or trashed session must not bring its container back (#4116).
         drop(self.lock_for_input()?);
 
-        let container = self.get_container_for_instance()?;
+        let container = self.get_container_admitted()?;
         let sandbox = self
             .sandbox_info
             .as_ref()
@@ -546,6 +546,138 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
             );
         }
         assert!(!injection_marker.exists());
+    }
+
+    /// #4205: a row archived or trashed while the container terminal's `before_start` hook runs
+    /// neither starts, recreates nor creates its container.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn container_terminal_refuses_a_row_shelved_during_before_start() {
+        use crate::session::StartBlocked;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls_path = temp.path().join("runtime-calls");
+        let exists_path = temp.path().join("exists");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\n\
+             if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then exit 0; fi\n\
+             if [ \"$1\" = container ] && [ \"$2\" = inspect ]; then\n\
+             if [ ! -e '{exists}' ]; then echo 'Error: No such container: c' >&2; exit 1; fi\n\
+             if [ \"$#\" -eq 3 ]; then echo '[{{\"Id\":\"fake\",\"State\":{{\"Running\":false}},\"Mounts\":[]}}]'; exit 0; fi\n\
+             case \"$*\" in\n\
+             *sandbox-store-generation*) echo 2 ;;\n\
+             *State.Running*) echo false ;;\n\
+             esac\n\
+             exit 0\n\
+             fi\n\
+             echo 'permission denied' >&2\nexit 1\n",
+            calls = calls_path.display(),
+            exists = exists_path.display(),
+        );
+        for binary in ["docker", "podman", "container"] {
+            let path = bin.join(binary);
+            std::fs::write(&path, &script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let ready = temp.path().join("hook-ready");
+        let release = temp.path().join("hook-release");
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_start = \": > {}; while [ ! -e {} ]; do sleep 0.01; done\"\n",
+                ready.display(),
+                release.display(),
+            ),
+        )
+        .unwrap();
+
+        let shelves: [(fn(&mut Instance), StartBlocked); 2] = [
+            (Instance::archive, StartBlocked::Archived),
+            (Instance::trash, StartBlocked::Trashed),
+        ];
+        // (tool, container exists): codex restarts a stopped container, claude's predates its
+        // shared credential label so it is recreated, and a missing one is created.
+        let branches = [("codex", true), ("claude", true), ("codex", false)];
+        for (shelve, want) in shelves {
+            for (tool, stopped) in branches {
+                let label = format!("{want:?} {tool} stopped={stopped}");
+                let profile = format!("container-terminal-{}-{tool}-{stopped}", want.code());
+                for path in [&calls_path, &ready, &release] {
+                    let _ = std::fs::remove_file(path);
+                }
+                if stopped {
+                    std::fs::write(&exists_path, b"").unwrap();
+                } else {
+                    let _ = std::fs::remove_file(&exists_path);
+                }
+                let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+                let mut instance = Instance::new("container terminal", project.to_str().unwrap());
+                instance.tool = tool.to_string();
+                instance.source_profile = profile.clone();
+                instance.sandbox_info = Some(SandboxInfo {
+                    enabled: true,
+                    container_id: None,
+                    image: "test:latest".to_string(),
+                    container_name: "container-terminal".to_string(),
+                    extra_env: None,
+                    custom_instruction: None,
+                    before_start_env: Vec::new(),
+                    container_workdir: None,
+                });
+                storage
+                    .update(|instances, _groups| {
+                        *instances = vec![instance.clone()];
+                        Ok(())
+                    })
+                    .unwrap();
+
+                let id = instance.id.clone();
+                let terminal =
+                    std::thread::spawn(move || instance.start_container_terminal_with_size(None));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !ready.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{label}: hook did not run"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                {
+                    let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                    storage
+                        .update(|instances, _groups| {
+                            shelve(&mut instances[0]);
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                std::fs::write(&release, b"release").unwrap();
+                let error = terminal.join().unwrap().expect_err(&label);
+
+                let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+                assert_eq!(
+                    error.downcast_ref::<StartBlocked>(),
+                    Some(&want),
+                    "{label}: {error:#}\n{calls}"
+                );
+                assert!(
+                    !calls.lines().any(|line| ["start ", "create ", "rm "]
+                        .iter()
+                        .any(|verb| line.starts_with(verb))),
+                    "{label}: the runtime brought the container up:\n{calls}"
+                );
+                let stored = storage.load().unwrap().remove(0);
+                assert_eq!(stored.ensure_startable(), Err(want), "{label}");
+            }
+        }
     }
 
     mod kill_terminal_if_dead {

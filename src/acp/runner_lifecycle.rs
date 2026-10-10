@@ -72,7 +72,8 @@ enum Phase {
         since: Instant,
     },
     TeardownRetry {
-        identity: RunnerIdentity,
+        /// Every runner that survived escalation, each retried until proven.
+        identities: Vec<RunnerIdentity>,
         attempts: u32,
     },
 }
@@ -81,6 +82,8 @@ enum Phase {
 struct Entry {
     epoch: u64,
     phase: Phase,
+    /// The session was forgotten while this epoch was in flight; its owner still settles it.
+    forgotten: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,21 +149,21 @@ impl ProcessControl for SystemProcessControl {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
     /// Process-group exit and registry cleanup were proven.
     Proven,
-    /// The process survived escalation; keep ownership and retry.
-    Unproven(RunnerIdentity),
+    /// These processes survived escalation; keep ownership and retry each.
+    Unproven(Vec<RunnerIdentity>),
 }
 
 /// Pending teardown a retry pass should drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryClaim {
     pub lease: Lease,
-    /// `None` for a reclaimed teardown whose driver never settled; the
+    /// Empty for a reclaimed teardown whose driver never settled; the
     /// registry record then names the runner.
-    pub identity: Option<RunnerIdentity>,
+    pub identities: Vec<RunnerIdentity>,
     pub attempts: u32,
 }
 
@@ -225,8 +228,16 @@ impl LifecycleTable {
         self.stale_cancels.remove(session_id);
     }
 
+    /// Drop the session's bookkeeping. An in-flight resume, respawn or teardown keeps its entry
+    /// until its owner settles it, so a runner it built is still torn down and an unproven
+    /// teardown still parks for retry.
     pub fn forget(&mut self, session_id: &str) {
-        self.entries.remove(session_id);
+        match self.entries.get_mut(session_id) {
+            Some(entry) if !matches!(entry.phase, Phase::Running { .. }) => entry.forgotten = true,
+            _ => {
+                self.entries.remove(session_id);
+            }
+        }
         self.last_generation.remove(session_id);
         self.stale_cancels.remove(session_id);
     }
@@ -253,6 +264,7 @@ impl LifecycleTable {
             Entry {
                 epoch,
                 phase: Phase::Starting { kind, cancel: None },
+                forgotten: false,
             },
         );
         Ok(self.lease(session_id, epoch))
@@ -294,8 +306,9 @@ impl LifecycleTable {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.clone(),
             _ => return false,
         };
+        let forgotten = entry.forgotten;
         self.entries.remove(&lease.session_id);
-        if let Some(reason) = cancel {
+        if let Some(reason) = cancel.filter(|_| !forgotten) {
             self.stale_cancels.insert(lease.session_id.clone(), reason);
         }
         true
@@ -354,6 +367,7 @@ impl LifecycleTable {
                     attempts: 0,
                     since: Instant::now(),
                 },
+                forgotten: false,
             },
         );
         Some(self.lease(session_id, epoch))
@@ -371,9 +385,9 @@ impl LifecycleTable {
             Settlement::Proven => {
                 self.entries.remove(&lease.session_id);
             }
-            Settlement::Unproven(identity) => {
+            Settlement::Unproven(identities) => {
                 entry.phase = Phase::TeardownRetry {
-                    identity,
+                    identities,
                     attempts: attempts + 1,
                 };
             }
@@ -442,10 +456,13 @@ impl LifecycleTable {
         orphaned_after: Duration,
     ) -> Option<RetryClaim> {
         let entry = self.entries.get_mut(session_id)?;
-        let (identity, attempts) = match entry.phase {
-            Phase::TeardownRetry { identity, attempts } => (Some(identity), attempts),
+        let (identities, attempts) = match &entry.phase {
+            Phase::TeardownRetry {
+                identities,
+                attempts,
+            } => (identities.clone(), *attempts),
             Phase::Stopping { attempts, since } if since.elapsed() >= orphaned_after => {
-                (None, attempts)
+                (Vec::new(), *attempts)
             }
             _ => return None,
         };
@@ -456,7 +473,7 @@ impl LifecycleTable {
         let epoch = entry.epoch;
         Some(RetryClaim {
             lease: self.lease(session_id, epoch),
-            identity,
+            identities,
             attempts: attempts + 1,
         })
     }
@@ -707,24 +724,24 @@ mod tests {
             })
         );
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
-        table.settle(&lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&lease, Settlement::Unproven(vec![identity(9, 1)]));
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
 
         let grace = Duration::from_secs(15);
         let claim = table.claim_retry(ID, grace).unwrap();
         assert_eq!(claim.attempts, 2);
-        assert_eq!(claim.identity, Some(identity(9, 1)));
+        assert_eq!(claim.identities, vec![identity(9, 1)]);
         assert!(
             table.claim_retry(ID, grace).is_none(),
             "a claimed retry is Stopping until it goes stale"
         );
         table.age_stopping(ID, grace);
         let orphan = table.claim_retry(ID, grace).unwrap();
-        assert_eq!(
-            orphan.identity, None,
+        assert!(
+            orphan.identities.is_empty(),
             "a stale claim is reclaimed without an identity"
         );
-        table.settle(&orphan.lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&orphan.lease, Settlement::Unproven(vec![identity(9, 1)]));
         let again = table.claim_retry(ID, grace).unwrap();
         assert_eq!(again.attempts, 3, "attempts accumulate per settled retry");
         table.settle(&again.lease, Settlement::Proven);
@@ -801,7 +818,7 @@ mod tests {
         let lease = table.adopt_for_stop(ID).unwrap();
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert!(table.adopt_for_stop(ID).is_none());
-        table.settle(&lease, Settlement::Unproven(identity(3, 0)));
+        table.settle(&lease, Settlement::Unproven(vec![identity(3, 0)]));
         assert_eq!(
             table.retry_ids_after(Duration::from_secs(15)),
             vec![ID.to_string()]
@@ -856,6 +873,55 @@ mod tests {
             table.admit(ID, ResumeKind::Spawn).is_ok(),
             "the stop is honored once; a later resume proceeds"
         );
+    }
+
+    /// #4212: a purge forgets the session while its respawn is in flight or its teardown is
+    /// pending; the owner must still convert and settle, and a forgotten stop is not carried over.
+    #[test]
+    fn forget_keeps_in_flight_ownership_until_settled() {
+        let mut table = LifecycleTable::new(1);
+        let lease = table.admit(ID, ResumeKind::Spawn).unwrap();
+        table.install(&lease, Some(identity(7, 1))).unwrap();
+        let (respawn, _) = table.begin_respawn(&lease).unwrap();
+        assert!(matches!(
+            table.begin_stop(ID, "user_stopped"),
+            StopDecision::CancelRequested
+        ));
+        table.forget(ID);
+        assert!(
+            table.convert_to_stopping(&respawn),
+            "the respawn still owns the replacement it built"
+        );
+        table.forget(ID);
+        table.settle(
+            &respawn,
+            Settlement::Unproven(vec![identity(8, respawn.epoch())]),
+        );
+        assert_eq!(
+            table.retry_ids_after(Duration::MAX),
+            vec![ID.to_string()],
+            "an unproven teardown parks for retry"
+        );
+        let claim = table.claim_retry(ID, Duration::MAX).unwrap();
+        table.settle(&claim.lease, Settlement::Proven);
+        assert_eq!(table.phase(ID), WorkerPhase::Absent);
+
+        let start = table.admit(ID, ResumeKind::Attach).unwrap();
+        assert!(matches!(
+            table.begin_stop(ID, "user_stopped"),
+            StopDecision::CancelRequested
+        ));
+        table.forget(ID);
+        assert!(table.abandon(&start));
+        assert!(
+            table.admit(ID, ResumeKind::Spawn).is_ok(),
+            "a stop asked of a forgotten session does not refuse its next admit"
+        );
+
+        let running = table.admit("s-2", ResumeKind::Spawn).unwrap();
+        table.install(&running, None).unwrap();
+        table.forget("s-2");
+        assert_eq!(table.phase("s-2"), WorkerPhase::Absent);
     }
 
     #[test]

@@ -28,6 +28,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         self
     }
 
+    pub(super) fn with_refusal_gate(mut self, gate: Arc<Gate>) -> Self {
+        self.refusal_gate = Some(gate);
+        self
+    }
+
     /// What the drain task records for a worker that failed before establishing a session.
     pub(crate) fn note_startup_failure(&self, session_id: &str) {
         lock_recover(&self.startup_failures).insert(session_id.to_string());

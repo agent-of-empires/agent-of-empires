@@ -126,6 +126,29 @@ impl Instance {
         &mut self,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<containers::DockerContainer> {
+        self.ensure_container(cancel, false)
+    }
+
+    /// [`Self::get_container_for_instance`] that refuses to start, recreate or create the
+    /// container of a stored row archived or trashed meanwhile. The `before_start` hook runs
+    /// unlocked because it may re-enter aoe; the lifecycle lock that archive and trash take is
+    /// held from after the hook through the runtime call.
+    pub(super) fn get_container_admitted(&mut self) -> Result<containers::DockerContainer> {
+        self.ensure_container(&tokio_util::sync::CancellationToken::new(), true)
+    }
+
+    fn admit_container_runtime(
+        &self,
+        admit: bool,
+    ) -> Result<Option<crate::session::storage::StorageFlock>> {
+        admit.then(|| self.lock_for_input()).transpose()
+    }
+
+    fn ensure_container(
+        &mut self,
+        cancel: &tokio_util::sync::CancellationToken,
+        admit: bool,
+    ) -> Result<containers::DockerContainer> {
         let checkpoint = || {
             if cancel.is_cancelled() {
                 anyhow::bail!("sandbox start cancelled");
@@ -252,6 +275,7 @@ impl Instance {
                     std::path::Path::new(&self.container_workdir()),
                 );
                 let config = self.build_container_config()?;
+                let admission = self.admit_container_runtime(admit)?;
                 // Built before its agent shared a credential file, so it
                 // mounts only the store, whose copy the come-up no longer
                 // refreshes.
@@ -261,6 +285,7 @@ impl Instance {
                 } else {
                     container_config::place_shadowed_credential_mountpoints(&config);
                     container.start()?;
+                    drop(admission);
                     self.finish_container_reuse(&container, &config, &command)?;
                     return Ok(container);
                 }
@@ -292,7 +317,9 @@ impl Instance {
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         container_config::place_shadowed_credential_mountpoints(&config);
         checkpoint()?;
+        let admission = self.admit_container_runtime(admit)?;
         let container_id = container.create(&config)?;
+        drop(admission);
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)
             && self.hook_session_publisher_allowed_by_argv();
