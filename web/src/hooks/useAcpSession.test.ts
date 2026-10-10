@@ -516,6 +516,22 @@ describe("server queue", () => {
     expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["migrated"]);
   });
 
+  it("re-POSTs only unconfirmed cached rows; a confirmed row the server drained stays gone", async () => {
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const state = {
+      ...emptyAcpState(),
+      queuedPrompts: [
+        { id: "drained", text: "already delivered", queuedAt, pending: false },
+        { id: "unsent", text: "never reached server", queuedAt, pending: true },
+      ],
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}sess-cached`, JSON.stringify({ savedAt: Date.now(), state }));
+    const { result } = await openSession("sess-cached");
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["unsent"]);
+    expect(serverQueue.has("drained")).toBe(false);
+    expect(result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["unsent"]);
+  });
+
   describe("sendQueuedNow", () => {
     async function sendNow(id: string, prepare: () => void = () => {}) {
       const { result } = await openSession(`sess-${id}`);
