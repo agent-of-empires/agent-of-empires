@@ -1,4 +1,8 @@
 // @vitest-environment jsdom
+//
+// Tests for SendCommentsDialog: the three-piece compose dialog that
+// forwards diff review comments to structured or terminal agents. Cover
+// payload, empty/disabled state, hotkeys, and failure paths.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
@@ -30,6 +34,7 @@ function comment(overrides?: Partial<DiffComment>): DiffComment {
 function setup(overrides?: {
   comments?: DiffComment[];
   isMultiRepo?: boolean;
+  delivery?: "structured" | "terminal";
   sendEnabled?: boolean;
   sendDisabledReason?: string;
   introDraft?: string;
@@ -44,6 +49,7 @@ function setup(overrides?: {
   const utils = render(
     <SendCommentsDialog
       sessionId="sess 1"
+      delivery={overrides?.delivery ?? "structured"}
       comments={overrides?.comments ?? [comment()]}
       isMultiRepo={overrides?.isMultiRepo ?? false}
       sendEnabled={overrides?.sendEnabled ?? true}
@@ -133,6 +139,30 @@ describe("SendCommentsDialog", () => {
     expect(body.assembledMarkdown).toContain("hello");
     expect(body.assembledMarkdown).toContain("fix me");
     expect(reportTelemetrySeen).toHaveBeenCalledWith("diff_comments");
+  });
+  it("sends the assembled markdown to the terminal agent pane and retains comments on failure", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 503, text: () => Promise.resolve("pane unavailable") });
+    const { container, onSent } = setup({
+      delivery: "terminal",
+      comments: [comment({ body: "fix the range", startLine: 10, endLine: 12 })],
+      introDraft: "Review this:",
+    });
+    fireEvent.click(sendButton(container));
+    await waitFor(() => expect(container.textContent).toContain("pane unavailable"));
+    expect(onSent).not.toHaveBeenCalled();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/sessions/sess%201/send");
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(init.body);
+    expect(Object.keys(body)).toEqual(["message"]);
+    expect(body.message).toContain("Review this:");
+    expect(body.message).toContain("src/foo.ts");
+    expect(body.message).toContain("lines 10-12 (new)");
+    expect(body.message).toContain("fix the range");
+
+    fetchMock.mockResolvedValueOnce({ ok: true });
+    fireEvent.click(sendButton(container));
+    await waitFor(() => expect(onSent).toHaveBeenCalledTimes(1));
   });
 
   it("Cmd+Enter triggers a send", async () => {

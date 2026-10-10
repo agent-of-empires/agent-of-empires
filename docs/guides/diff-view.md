@@ -36,7 +36,7 @@ The **Files** pane (folder icon in the activity bar) browses the session's whole
 
 Split layout shows old on the left and new on the right, with an aligned placeholder opposite a pure addition or deletion. The TUI stores the choice in `[diff].split_view`; the web dashboard stores it per browser (**Settings > Diff**). Both fall back to unified on a narrow pane.
 
-### Comments (structured view sessions)
+### Diff comments (web)
 
 The dashboard can annotate diff lines and send the comments to the agent as one prompt:
 
@@ -44,7 +44,7 @@ The dashboard can annotate diff lines and send the comments to the agent as one 
 2. Write the comment (markdown supported); `Cmd/Ctrl+Enter` saves, `Esc` cancels. Saved comments render inline as editable cards.
 3. A banner above the file list appears once you have one: **Send** (`Cmd/Ctrl+Shift+S`) opens a dialog with an editable intro, a preview of each comment with its captured snippet, and an outro. Comments clear on success unless you uncheck "Clear comments after sending".
 
-Comments live in `localStorage` per session. If the agent edits a file so a range no longer matches, the comment moves to a stale-comments block with a `[stale]` chip; its captured snippet still goes to the agent. The feature is hidden for terminal sessions, and Send is disabled while the worker is stopped.
+Comments live in `localStorage` per session. If the agent edits a file so a range no longer matches, the comment moves to a stale-comments block with a `[stale]` chip; its captured snippet still goes to the agent. Both structured and terminal sessions can annotate. Structured sends use a typed ACP prompt and wake a dormant worker; terminal sends submit assembled markdown to the agent pane. Send is disabled for archived or trashed sessions, and terminal sends are disabled in read-only mode. A failed send keeps comments and the dialog open for retry.
 
 ## Base override
 
