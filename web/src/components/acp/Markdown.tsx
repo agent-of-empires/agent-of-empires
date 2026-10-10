@@ -177,7 +177,7 @@ function CopyTableButton({ source }: { source: string }) {
       aria-label={label}
       title={label}
       onClick={() => void copy()}
-      className="acp-table-copy absolute right-1 top-1 z-10 rounded bg-surface-900 p-1.5 text-text-dim hover:bg-surface-800 hover:text-text-secondary"
+      className="acp-table-copy absolute right-1 top-1 z-10 inline-flex min-h-8 min-w-8 items-center justify-center rounded bg-surface-900 p-1.5 text-text-dim hover:bg-surface-800 hover:text-text-secondary"
       data-copied={copied}
     >
       {copied ? <Check className="h-3 w-3" /> : <CopyIcon className="h-3 w-3" />}

@@ -84,6 +84,10 @@ test.describe("touch device", () => {
     await openTables(page);
     const button = tableButton(page, 0);
     await expect(button).toHaveCSS("opacity", "1");
+    const bounds = await button.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(bounds!.width).toBeGreaterThanOrEqual(32);
+    expect(bounds!.height).toBeGreaterThanOrEqual(32);
     await button.tap();
     await expect(page.getByRole("button", { name: "Copied" })).toBeVisible();
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
