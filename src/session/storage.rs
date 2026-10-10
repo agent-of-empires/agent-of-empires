@@ -1,7 +1,7 @@
-//! Session storage with a stable app-root ownership fence before identity, lifecycle and storage locks.
+//! Session storage with a stable app-root fence before identity, title, lifecycle and storage locks.
 //! Shared ownership covers ordinary claims and profile creation. Exclusive ownership covers
 //! destructive Git effects and profile rename/delete, through authoritative reload and commit.
-//! Hooks run without ownership; reacquisition must revalidate profile identity and checkout claims.
+//! Hooks and SDK waits release ownership; reacquisition revalidates the original profile and claims.
 //! Multi-store operations order save mutexes by identity and flocks by physical file identity.
 
 use anyhow::{anyhow, Context, Result};
@@ -366,6 +366,7 @@ pub(crate) struct StorageFlock {
 pub(crate) struct OwnershipGuard {
     _held: HeldFlock,
     app_dir: PathBuf,
+    exclusive: bool,
 }
 
 impl OwnershipGuard {
@@ -373,6 +374,15 @@ impl OwnershipGuard {
         anyhow::ensure!(
             paths_share_filesystem_identity(&self.app_dir, &get_app_dir()?)?,
             "ownership guard belongs to a different application directory"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn require_exclusive(&self) -> Result<()> {
+        self.verify()?;
+        anyhow::ensure!(
+            self.exclusive,
+            "checkout claims require exclusive ownership"
         );
         Ok(())
     }
@@ -388,6 +398,7 @@ fn ownership_lock(shared: bool) -> Result<OwnershipGuard> {
     Ok(OwnershipGuard {
         _held: lock.held,
         app_dir,
+        exclusive: !shared,
     })
 }
 
@@ -422,7 +433,7 @@ fn acquire_transition_flocks_for_profile_dirs(profile_dirs: &[&Path]) -> Result<
         .collect()
 }
 
-fn filesystem_identity(metadata: &fs::Metadata) -> (u64, u64) {
+pub(crate) fn filesystem_identity(metadata: &fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (metadata.dev(), metadata.ino())
 }
@@ -1158,6 +1169,37 @@ impl Storage {
     /// duplicate-detection surface report it so users can act on exact files.
     pub(crate) fn sessions_path(&self) -> &Path {
         &self.sessions_path
+    }
+
+    pub(crate) fn physical_profile_identity(&self) -> Result<(u64, u64)> {
+        self.verify_profile_identity()?;
+        Ok(self.profile_identity)
+    }
+
+    /// Ownership decisions cannot quarantine or silently omit an undecodable owner.
+    /// Callers serialize this read with the ownership and storage fences.
+    pub(crate) fn load_strict_for_worktree_ownership(&self) -> Result<Vec<Instance>> {
+        self.verify_profile_identity()?;
+        match fs::symlink_metadata(&self.sessions_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let content = fs::read_to_string(&self.sessions_path)?;
+        let mut instances: Vec<Instance> = serde_json::from_str(&content).with_context(|| {
+            format!("reading ownership rows in {}", self.sessions_path.display())
+        })?;
+        let mut ids = std::collections::HashSet::with_capacity(instances.len());
+        for instance in &mut instances {
+            instance.source_profile = self.profile.clone();
+            instance.set_file_watch(self.file_watch.clone());
+            anyhow::ensure!(
+                !instance.id.is_empty() && ids.insert(instance.id.as_str()),
+                "ambiguous session id in ownership inventory"
+            );
+        }
+        self.verify_profile_identity()?;
+        Ok(instances)
     }
 
     pub fn load(&self) -> Result<Vec<Instance>> {

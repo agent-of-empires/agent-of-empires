@@ -85,16 +85,22 @@ pub fn reconcile_and_persist(
     inst: &mut Instance,
     cache: &mut ReconcileCache,
 ) -> anyhow::Result<WorktreePathResolution> {
-    let ownership = super::storage::acquire_ownership_read()?;
+    let ownership = super::storage::acquire_ownership_lock()?;
+    let _identity = super::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+    let _lifecycle =
+        storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &inst.id)?;
     reconcile_and_persist_with_ownership(storage, &ownership, inst, cache)
 }
 
+/// The caller already holds exclusive ownership, identity and this session's lifecycle lock.
+/// Do not reacquire them here: rename uses this variant inside its own fenced operation.
 pub(crate) fn reconcile_and_persist_with_ownership(
     storage: &Storage,
     ownership: &super::storage::OwnershipGuard,
     inst: &mut Instance,
     cache: &mut ReconcileCache,
 ) -> anyhow::Result<WorktreePathResolution> {
+    ownership.require_exclusive()?;
     let Some(info) = inst.worktree_info.clone() else {
         return Ok(WorktreePathResolution::Current);
     };
@@ -105,6 +111,9 @@ pub(crate) fn reconcile_and_persist_with_ownership(
         return Ok(WorktreePathResolution::Current);
     }
     let recorded = PathBuf::from(&inst.project_path);
+    if super::deletion::resolve_claim_path(&recorded).is_none() {
+        return Ok(WorktreePathResolution::Current);
+    }
     if !info.managed_by_aoe || recorded.exists() {
         return Ok(WorktreePathResolution::Current);
     }
@@ -115,42 +124,33 @@ pub(crate) fn reconcile_and_persist_with_ownership(
             let id = inst.id.clone();
             let stale = inst.project_path.clone();
             let new_path = found.to_string_lossy().into_owned();
-            // Both guards below need the storage lock the git lookup ran
-            // without, so they live inside the update rather than beside it.
-            let mut claimed_by: Option<String> = None;
+            let paths = super::deletion::paths_in_use_except_with_ownership(
+                ownership,
+                storage.profile(),
+                &[&id],
+            );
+            if paths.covers(found) {
+                return Ok(WorktreePathResolution::Current);
+            }
             let applied = storage.update_with_ownership(ownership, |instances, _groups| {
-                // Never adopt a checkout another session already records.
-                if let Some(owner) = instances.iter().find(|c| {
-                    c.id != id
-                        && Path::new(&c.project_path).canonicalize().ok().as_deref()
-                            == Some(found.as_path())
-                }) {
-                    claimed_by = Some(owner.id.clone());
-                    return Ok(false);
-                }
+                // The UI loader is forgiving; never commit a claim from an incomplete inventory.
+                storage.load_strict_for_worktree_ownership()?;
                 // Compare and set: a peer process could have renamed or trashed this session while
                 // the lookup ran, and its path is fresher than a location we resolved from the old
                 // one.
                 let Some(stored) = instances.iter_mut().find(|c| c.id == id) else {
                     return Ok(false);
                 };
-                if stored.project_path != stale {
+                if stored.project_path != stale
+                    || stored.worktree_info.as_ref() != Some(&info)
+                    || stored.is_trashed()
+                    || stored.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                {
                     return Ok(false);
                 }
                 stored.project_path = new_path.clone();
                 Ok(true)
             })?;
-            if let Some(owner) = claimed_by {
-                tracing::warn!(
-                    target: "session.worktree",
-                    session = %inst.id,
-                    branch = %info.branch,
-                    owner = %owner,
-                    candidate = %found.display(),
-                    "the only live checkout of the branch already belongs to another session; refusing to adopt it"
-                );
-                return Ok(WorktreePathResolution::Current);
-            }
             if !applied {
                 tracing::info!(
                     target: "session.worktree",
@@ -223,6 +223,231 @@ pub fn reconcile_profile(profile: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git_at(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn moved_checkout_fixture() -> (tempfile::TempDir, Instance, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let old = temp.path().join("old");
+        let moved = temp.path().join("moved");
+        std::fs::create_dir(&repo).unwrap();
+        git_at(&repo, &["init"]);
+        git_at(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        git_at(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/reconcile",
+                old.to_str().unwrap(),
+            ],
+        );
+        let mut row = Instance::new("owner", old.to_str().unwrap());
+        row.worktree_info = Some(WorktreeInfo {
+            branch: "feature/reconcile".into(),
+            main_repo_path: repo.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        git_at(
+            &repo,
+            &[
+                "worktree",
+                "move",
+                old.to_str().unwrap(),
+                moved.to_str().unwrap(),
+            ],
+        );
+        (temp, row, moved)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_refuses_cross_profile_and_pretrash_claims() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (_temp, row, moved) = moved_checkout_fixture();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let peer = Storage::new_unwatched("peer").unwrap();
+        for pretrash in [false, true] {
+            let mut other = Instance::new("peer", moved.to_str().unwrap());
+            other.id = row.id.clone();
+            if pretrash {
+                other.pre_trash_project_path = Some(other.project_path.clone());
+                other.project_path = "/holding".into();
+                other.trash();
+            }
+            peer.update(|rows, _| {
+                *rows = vec![other];
+                Ok(())
+            })
+            .unwrap();
+            let mut local = row.clone();
+            assert_eq!(
+                reconcile_and_persist(&storage, &mut local, &mut Default::default()).unwrap(),
+                WorktreePathResolution::Current
+            );
+            assert_eq!(local.project_path, row.project_path);
+            assert_eq!(storage.load().unwrap()[0].project_path, row.project_path);
+        }
+        std::fs::write(peer.sessions_path(), br#"[{"id":"opaque"}]"#).unwrap();
+        let mut local = row.clone();
+        assert_eq!(
+            reconcile_and_persist(&storage, &mut local, &mut Default::default()).unwrap(),
+            WorktreePathResolution::Current
+        );
+        assert_eq!(storage.load().unwrap()[0].project_path, row.project_path);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_commit_gate_checks_fresh_row_and_holds_all_claim_locks() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (_temp, row, moved) = moved_checkout_fixture();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        for change in ["reservation", "trash", "worktree-info", "path", "unchanged"] {
+            storage
+                .update(|rows, _| {
+                    *rows = vec![row.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let mut fresh = row.clone();
+            match change {
+                "reservation" => {
+                    fresh
+                        .try_acquire_lifecycle_reservation(
+                            crate::session::LifecycleOperation::Restore,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .unwrap();
+                }
+                "trash" => fresh.trash(),
+                "worktree-info" => fresh.worktree_info.as_mut().unwrap().branch = "changed".into(),
+                "path" => fresh.project_path = "/newer-path".into(),
+                _ => {}
+            }
+            let path = storage.sessions_path().to_path_buf();
+            let app = crate::session::get_app_dir().unwrap();
+            let id = row.id.clone();
+            let entered = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = entered.clone();
+            let observer = super::super::storage::observe_updates_for_test(move |_| {
+                assert!(!seen.replace(true));
+                let root = std::fs::File::open(app.join(".workspace-claim.lock")).unwrap();
+                assert_eq!(
+                    fs2::FileExt::try_lock_shared(&root).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                for lock in [
+                    app.join(".title-mutation.lock"),
+                    path.parent()
+                        .unwrap()
+                        .join(format!(".instance-lifecycle-{id}.lock")),
+                ] {
+                    let file = std::fs::File::open(lock).unwrap();
+                    assert_eq!(
+                        fs2::FileExt::try_lock_exclusive(&file).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                }
+                // Gate a durable row replacement between inventory and the authoritative CAS read.
+                std::fs::write(&path, serde_json::to_vec(&vec![fresh.clone()]).unwrap()).unwrap();
+            });
+            let mut local = row.clone();
+            let result =
+                reconcile_and_persist(&storage, &mut local, &mut Default::default()).unwrap();
+            drop(observer);
+            assert!(entered.get());
+            if change == "unchanged" {
+                assert_eq!(
+                    result,
+                    WorktreePathResolution::Moved(moved.canonicalize().unwrap())
+                );
+                assert_eq!(
+                    Path::new(&storage.load().unwrap()[0].project_path),
+                    moved.as_path()
+                );
+            } else {
+                assert_eq!(result, WorktreePathResolution::Current);
+                assert_eq!(local.project_path, row.project_path);
+                let stored = storage.load().unwrap().remove(0);
+                if change == "path" {
+                    assert_eq!(stored.project_path, "/newer-path");
+                } else {
+                    assert_eq!(stored.project_path, row.project_path);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_accepts_an_unclaimed_checkout_inside_rename_owned_locks() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (_temp, mut row, moved) = moved_checkout_fixture();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let ownership = super::super::storage::acquire_ownership_lock().unwrap();
+        let _identity =
+            super::super::storage::acquire_session_identity_lock_with_ownership(&ownership)
+                .unwrap();
+        let _lifecycle = storage
+            .acquire_instance_lifecycle_lock_with_ownership(&ownership, &row.id)
+            .unwrap();
+        assert_eq!(
+            reconcile_and_persist_with_ownership(
+                &storage,
+                &ownership,
+                &mut row,
+                &mut Default::default()
+            )
+            .unwrap(),
+            WorktreePathResolution::Moved(moved.canonicalize().unwrap())
+        );
+        assert_eq!(
+            Path::new(&storage.load().unwrap()[0].project_path),
+            moved.as_path()
+        );
+    }
 
     fn entry(path: &Path, branch: Option<&str>) -> WorktreeEntry {
         WorktreeEntry {

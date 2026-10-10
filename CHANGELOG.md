@@ -8,7 +8,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Bug Fixes
 
-- **worktree:** Make ownership transitions atomic across profiles, preserving referenced worktrees and branches during purge, attachment, creation and rename (#4107).
+- **worktree:** Serialize cross-profile ownership transitions through Git effects and durable publication. Preserve referenced worktrees and branches during purge, trash/restore, orphan cleanup, attachment, creation, reconciliation and rename, including external profile aliases and unreadable inventories (#4107).
 
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 

@@ -8,6 +8,7 @@ pub(super) fn cleanup_creation_resources(
     created_worktree: Option<&CreatedWorktreeInfo>,
     created_workspace_worktrees: &[CreatedWorktreeInfo],
     protected_owner: Option<&Instance>,
+    witness: &crate::session::builder::CreationWitness,
 ) {
     let worktree = created_worktree.map(crate::session::builder::CreatedWorktree::from);
     let workspace_worktrees: Vec<_> = created_workspace_worktrees
@@ -19,6 +20,7 @@ pub(super) fn cleanup_creation_resources(
         worktree.as_ref(),
         &workspace_worktrees,
         protected_owner,
+        witness,
     );
 }
 
@@ -210,25 +212,18 @@ impl HomeView {
         use crate::tui::creation_poller::CreationResult;
 
         let outcome = self.creation_poller.try_recv_result()?;
-        let mut result = outcome.result;
+        let result = outcome.result;
 
         // A cancelled request's stub is already gone; the fields below may belong to a
         // newer request, so leave them alone.
         if outcome.cancelled || matches!(result, CreationResult::Cancelled) {
-            if let CreationResult::Success {
-                ref instance,
-                ref created_worktree,
-                ref created_workspace_worktrees,
-                ref mut ownership,
-                ..
-            } = result
-            {
-                drop(ownership.take());
+            if let CreationResult::Success(success) = &result {
                 cleanup_creation_resources(
-                    instance,
-                    created_worktree.as_ref(),
-                    created_workspace_worktrees,
+                    &success.instance,
+                    success.created_worktree.as_ref(),
+                    &success.created_workspace_worktrees,
                     None,
+                    &success.witness,
                 );
             }
             return None;
@@ -245,30 +240,38 @@ impl HomeView {
         }
 
         match result {
-            CreationResult::Success {
-                session_id,
-                instance,
-                created_worktree,
-                created_workspace_worktrees,
-                on_launch_hooks_ran,
-                mut warnings,
-                mut ownership,
-            } => {
-                // Remove the stub instance
+            CreationResult::Success(success) => {
+                let crate::tui::creation_poller::CreationSuccess {
+                    session_id,
+                    instance,
+                    created_worktree,
+                    created_workspace_worktrees,
+                    on_launch_hooks_ran,
+                    mut warnings,
+                    profile_storage,
+                    witness,
+                } = *success;
                 if let Some(id) = &stub_id {
                     self.remove_instance(id);
                 }
 
-                let mut instance = *instance;
-                let target_profile = self.creation_poller.last_profile().unwrap_or_else(|| {
-                    self.active_profile
-                        .clone()
-                        .unwrap_or_else(crate::session::config::resolve_default_profile)
-                });
+                let mut instance = instance;
+                let target_profile = profile_storage.profile().to_string();
+                let mut ownership = None;
                 instance.source_profile = target_profile.clone();
 
-                if !self.storages.contains_key(&target_profile) {
-                    match Storage::new(&target_profile, self.file_watch.clone()) {
+                {
+                    let publication_storage = (|| -> anyhow::Result<Storage> {
+                        ownership = Some(crate::session::storage::acquire_ownership_read()?);
+                        profile_storage.verify_profile_identity()?;
+                        witness.validate(&instance)?;
+                        Storage::open_with_ownership(
+                            &target_profile,
+                            self.file_watch.clone(),
+                            ownership.as_ref().expect("creation ownership reacquired"),
+                        )
+                    })();
+                    match publication_storage {
                         Ok(storage) => {
                             self.storages.insert(target_profile.clone(), storage);
                         }
@@ -279,6 +282,7 @@ impl HomeView {
                                 created_worktree.as_ref(),
                                 &created_workspace_worktrees,
                                 None,
+                                &witness,
                             );
                             self.info_dialog = Some(InfoDialog::sized_to_fit(
                                 "Creation Failed",
@@ -298,39 +302,44 @@ impl HomeView {
                     // unreachable; bail without attaching rather than panicking.
                     return None;
                 };
-                let persist_result = storage.update(|instances, groups| {
-                    // `save()` can run while the builder works and persist the
-                    // placeholder, so remove that exact row under the same storage lock used
-                    // for collision detection and insertion, or it collides with its own
-                    // result.
-                    let removed_persisted_stub = stub_id.as_deref().is_some_and(|stub_id| {
-                        let before = instances.len();
-                        instances.retain(|row| row.id != stub_id);
-                        instances.len() != before
-                    });
-                    if removed_persisted_stub && !provisional_group_paths.is_empty() {
-                        groups.retain(|group| !provisional_group_paths.contains(&group.path));
-                        // A peer may have committed another row into one of these paths,
-                        // so rebuild from the remaining rows and let its group survive the
-                        // provisional stub metadata.
-                        *groups = GroupTree::new_with_groups(instances, groups).get_all_groups();
-                    }
-                    if let Some(owner) = crate::session::find_duplicate_session(
-                        instances.iter(),
-                        &instance.title,
-                        &instance.project_path,
-                        None,
-                    ) {
-                        return Ok(CreationCommit::Duplicate(Box::new(owner.clone())));
-                    }
-                    instances.push(instance.clone());
-                    if !instance.group_path.is_empty() {
-                        let mut tree = GroupTree::new_with_groups(instances, groups);
-                        tree.create_group(&instance.group_path);
-                        *groups = tree.get_all_groups();
-                    }
-                    Ok(CreationCommit::Inserted)
-                });
+                let persist_result = storage.update_with_ownership(
+                    ownership.as_ref().expect("creation ownership reacquired"),
+                    |instances, groups| {
+                        witness.validate(&instance)?;
+                        // `save()` can run while the builder works and persist the
+                        // placeholder, so remove that exact row under the same storage lock used
+                        // for collision detection and insertion, or it collides with its own
+                        // result.
+                        let removed_persisted_stub = stub_id.as_deref().is_some_and(|stub_id| {
+                            let before = instances.len();
+                            instances.retain(|row| row.id != stub_id);
+                            instances.len() != before
+                        });
+                        if removed_persisted_stub && !provisional_group_paths.is_empty() {
+                            groups.retain(|group| !provisional_group_paths.contains(&group.path));
+                            // A peer may have committed another row into one of these paths,
+                            // so rebuild from the remaining rows and let its group survive the
+                            // provisional stub metadata.
+                            *groups =
+                                GroupTree::new_with_groups(instances, groups).get_all_groups();
+                        }
+                        if let Some(owner) = crate::session::find_duplicate_session(
+                            instances.iter(),
+                            &instance.title,
+                            &instance.project_path,
+                            None,
+                        ) {
+                            return Ok(CreationCommit::Duplicate(Box::new(owner.clone())));
+                        }
+                        instances.push(instance.clone());
+                        if !instance.group_path.is_empty() {
+                            let mut tree = GroupTree::new_with_groups(instances, groups);
+                            tree.create_group(&instance.group_path);
+                            *groups = tree.get_all_groups();
+                        }
+                        Ok(CreationCommit::Inserted)
+                    },
+                );
                 match persist_result {
                     Ok(CreationCommit::Inserted) => {}
                     Ok(CreationCommit::Duplicate(owner)) => {
@@ -340,6 +349,7 @@ impl HomeView {
                             created_worktree.as_ref(),
                             &created_workspace_worktrees,
                             Some(&owner),
+                            &witness,
                         );
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
@@ -374,6 +384,7 @@ impl HomeView {
                                 created_worktree.as_ref(),
                                 &created_workspace_worktrees,
                                 owner.as_ref(),
+                                &witness,
                             );
                             self.info_dialog = Some(InfoDialog::sized_to_fit(
                                 "Creation Failed",
@@ -410,6 +421,7 @@ impl HomeView {
                 // insert is superseded by the `reload()` below on success and is the
                 // fallback that keeps the row visible if that reload fails.
                 self.publish_persisted_instance(instance.clone());
+                drop(ownership.take());
                 self.rebuild_group_trees();
 
                 if on_launch_hooks_ran {
@@ -575,20 +587,13 @@ impl HomeView {
             else {
                 break;
             };
-            if let crate::tui::creation_poller::CreationResult::Success {
-                ref instance,
-                ref created_worktree,
-                ref created_workspace_worktrees,
-                mut ownership,
-                ..
-            } = outcome.result
-            {
-                drop(ownership.take());
+            if let crate::tui::creation_poller::CreationResult::Success(success) = outcome.result {
                 cleanup_creation_resources(
-                    instance,
-                    created_worktree.as_ref(),
-                    created_workspace_worktrees,
+                    &success.instance,
+                    success.created_worktree.as_ref(),
+                    &success.created_workspace_worktrees,
                     None,
+                    &success.witness,
                 );
                 tracing::info!(target: "tui.home", "Cleaned up cancelled session on exit");
             }

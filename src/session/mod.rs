@@ -379,6 +379,44 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
+/// Ownership inventory includes external directory aliases, unlike the UI profile picker.
+/// Broken aliases and unreadable entries make the inventory uncertain, never empty.
+pub(crate) fn list_profiles_for_worktree_inventory() -> Result<Vec<String>> {
+    #[cfg(test)]
+    if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("list_profiles failure injected for test");
+    }
+    let directory = get_app_dir()?.join("profiles");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(&directory) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error.into()),
+                Ok(_) => anyhow::bail!("profile inventory directory is a broken alias"),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut profiles = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() || kind.is_symlink() {
+            anyhow::ensure!(
+                fs::metadata(entry.path())?.is_dir(),
+                "profile alias is not a directory: {}",
+                entry.path().display()
+            );
+            profiles.push(entry.file_name().into_string().map_err(|_| {
+                anyhow::anyhow!("profile ownership inventory has a non-UTF-8 name")
+            })?);
+        }
+    }
+    profiles.sort();
+    Ok(profiles)
+}
+
 /// Picker order: alphabetical, with a profile named `default` last.
 pub fn sort_profiles_for_display(profiles: &mut [String]) {
     profiles.sort_by(|a, b| {

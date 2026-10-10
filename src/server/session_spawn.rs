@@ -199,9 +199,16 @@ pub(crate) async fn spawn_structured_session(
 
         let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
         let mut ownership = build_result.ownership;
-        let storage = crate::session::Storage::open_with_ownership(&profile, file_watch_for_create, ownership.as_ref().expect("builder retains creation ownership"))?;
+        let original_storage = build_result.profile_storage;
+        original_storage.verify_profile_identity()?;
+        let storage = crate::session::Storage::open_with_ownership(
+            original_storage.profile(),
+            file_watch_for_create,
+            ownership.as_ref().expect("builder retains creation ownership"),
+        )?;
+        let witness = build_result.witness;
         let mut instance = build_result.instance;
-        instance.source_profile = profile.clone();
+        instance.source_profile = storage.profile().to_string();
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
         instance.pending_initial_turn =
@@ -332,6 +339,7 @@ pub(crate) async fn spawn_structured_session(
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
                 None,
+                &witness,
             );
             let hint = hook_plan
                 .hooks
@@ -353,9 +361,11 @@ pub(crate) async fn spawn_structured_session(
         let mut persist_and_start = || -> anyhow::Result<()> {
             ownership = Some(crate::session::storage::acquire_ownership_read()?);
             storage.verify_profile_identity()?;
-            builder::validate_creation_paths(&instance)?;
+            witness.validate(&instance)?;
             let to_persist = instance.clone();
-            storage.update(|all, _groups| {
+            storage.update_with_ownership(
+                ownership.as_ref().expect("creation ownership reacquired"),
+                |all, _groups| {
                 all.push(to_persist);
                 Ok(())
             })?;
@@ -372,20 +382,23 @@ pub(crate) async fn spawn_structured_session(
 
         if let Err(e) = persist_and_start() {
             drop(ownership.take());
-            builder::cleanup_instance(&instance, created_worktree.as_ref(), &created_workspace_worktrees, None);
+            builder::cleanup_instance(&instance, created_worktree.as_ref(), &created_workspace_worktrees, None, &witness);
             return Err(e);
         }
 
-        Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
+        Ok::<_, anyhow::Error>((
             instance,
             build_warnings,
             agent_effort,
+            storage,
+            witness,
         ))
     })
     .await;
 
     match result {
-        Ok(Ok((instance, warnings, agent_effort))) => {
+        Ok(Ok((instance, warnings, agent_effort, storage, witness))) => {
+            let instance = publish_created_instance(service, instance, storage, witness).await?;
             let response_instance = instance.clone();
             let acp_spawn_target = if instance.is_structured() {
                 Some((
@@ -407,7 +420,7 @@ pub(crate) async fn spawn_structured_session(
             } else {
                 None
             };
-            publish_created_instance(service, instance).await;
+            // The response and spawn target now use the authoritative durable row.
 
             // Count the create for the opt-in telemetry trend counter.
             service
@@ -549,21 +562,78 @@ pub(crate) async fn spawn_structured_session(
     }
 }
 
-async fn publish_created_instance(service: &SessionService, instance: Instance) {
-    let mut instances = service.instances.write().await;
-    crate::server::api::sessions::upsert_instance(&mut instances, instance);
-    #[cfg(test)]
-    {
-        let gate = service.created_instance_gate.lock().unwrap().take();
-        if let Some((arrived, resume)) = gate {
-            arrived.send(()).expect("publication observer");
-            resume.await.expect("publication gate released");
+async fn publish_created_instance(
+    service: &Arc<SessionService>,
+    instance: Instance,
+    storage: crate::session::Storage,
+    witness: crate::session::builder::CreationWitness,
+) -> anyhow::Result<Instance> {
+    let originals = Arc::new((storage, witness, instance));
+    loop {
+        let service_for_publish = service.clone();
+        let originals = originals.clone();
+        let published = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Instance>> {
+            let ownership = crate::session::storage::acquire_ownership_read()?;
+            // Never await a Tokio lock while holding root ownership. A lifecycle
+            // transaction may still need the live mirror after its durable commit.
+            // Take file locks before trying the live lock, and never wait for
+            // that live lock while retaining either ownership or lifecycle.
+            let (storage, witness, expected) = &*originals;
+            storage.verify_profile_identity()?;
+            let _lifecycle =
+                storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &expected.id)?;
+            let Ok(mut instances) = service_for_publish.instances.try_write() else {
+                return Ok(None);
+            };
+            let mut authoritative = storage
+                .load_strict_for_worktree_ownership()?
+                .into_iter()
+                .find(|row| row.id == expected.id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Created session was removed before live publication")
+                })?;
+            anyhow::ensure!(
+                authoritative.created_at == expected.created_at
+                    && authoritative.lifecycle_generation == expected.lifecycle_generation
+                    && authoritative.project_path == expected.project_path,
+                "Created session changed before live publication"
+            );
+            witness.validate(&authoritative)?;
+            // Preserve only the non-serialized startup environment, never stale
+            // durable fields from the worker snapshot.
+            if let (Some(current), Some(started)) = (
+                authoritative.sandbox_info.as_mut(),
+                expected.sandbox_info.as_ref(),
+            ) {
+                current.before_start_env = started.before_start_env.clone();
+            }
+            let response = authoritative.clone();
+            crate::server::api::sessions::upsert_instance(&mut instances, authoritative);
+            #[cfg(test)]
+            {
+                let gate = service_for_publish
+                    .created_instance_gate
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some((arrived, resume)) = gate {
+                    arrived.send(()).expect("publication observer");
+                    resume.blocking_recv().expect("publication gate released");
+                }
+            }
+            // Reloads compare this epoch under the same lock as the published row.
+            service_for_publish
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(response))
+        })
+        .await??;
+        if let Some(instance) = published {
+            return Ok(instance);
         }
+        // Wait only after the blocking attempt has released its shared root.
+        drop(service.instances.write().await);
     }
-    // Reloads compare this epoch under the same lock as the published row.
-    service
-        .mutation_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -733,32 +803,193 @@ mod tests {
         assert!(!state.acp_supervisor.is_running(&id).await);
     }
 
-    /// The test above runs on a current-thread runtime, where an unlock moved above the
-    /// epoch bump has no await to yield at and still passes.
-    #[test]
-    fn publication_bumps_the_epoch_before_releasing_the_instances_lock() {
-        // Whitespace-normalised so rustfmt's wrapping cannot change the result.
-        let source = include_str!("session_spawn.rs")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let start = source
-            .find("async fn publish_created_instance(")
-            .expect("publication function");
-        let body = &source[start..];
-        let body = &body[..body
-            .find("#[cfg(test)] mod tests")
-            .expect("tests follow publication")];
-        let lock = body
-            .find("let mut instances = service.instances.write().await;")
-            .expect("publication takes the instances write lock");
-        let bump = body
-            .find(".mutation_epoch .fetch_add(")
-            .expect("publication bumps the epoch");
-        assert!(lock < bump, "the bump must happen under the lock");
-        assert!(
-            !body[lock..bump].contains("drop(instances)"),
-            "the instances guard must be held until the epoch is bumped"
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn publication_refuses_prepublication_purge_generation_and_path_changes() {
+        for change in ["purge", "generation", "path", "profile"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let storage = crate::session::Storage::new_unwatched("test").unwrap();
+            let mut instance =
+                crate::session::Instance::new("original", &project.path().to_string_lossy());
+            instance.source_profile = "test".into();
+            let witness = crate::session::builder::CreationWitness::capture(&instance).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let live = state.instances.write().await;
+            let publish = super::publish_created_instance(
+                &state.session_service,
+                instance,
+                storage.clone(),
+                witness,
+            );
+            tokio::pin!(publish);
+            assert!(futures_util::poll!(&mut publish).is_pending());
+            // The live lock causally prevents publication until this peer has
+            // committed; exclusive root acquisition also proves no inversion.
+            let peer_storage = storage.clone();
+            tokio::task::spawn_blocking(move || {
+                let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+                if change == "profile" {
+                    let dir = peer_storage.sessions_path().parent().unwrap();
+                    std::fs::rename(dir, dir.with_file_name("retired-test")).unwrap();
+                    std::fs::create_dir_all(dir).unwrap();
+                } else {
+                    peer_storage
+                        .update_with_ownership(&ownership, |rows, _| {
+                            match change {
+                                "purge" => rows.clear(),
+                                "generation" => rows[0].lifecycle_generation += 1,
+                                "path" => rows[0].project_path.push_str("/changed"),
+                                _ => unreachable!(),
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            drop(live);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), publish)
+                .await
+                .unwrap();
+            assert!(result.is_err(), "{change}");
+            assert!(state.instances.read().await.is_empty(), "{change}");
+            assert_eq!(
+                state
+                    .mutation_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{change}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn publication_uses_authoritative_peer_fields_not_the_worker_snapshot() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let storage = crate::session::Storage::new_unwatched("test").unwrap();
+        let mut instance =
+            crate::session::Instance::new("worker title", &project.path().to_string_lossy());
+        instance.source_profile = "test".into();
+        let witness = crate::session::builder::CreationWitness::capture(&instance).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let live = state.instances.write().await;
+        let publish = super::publish_created_instance(
+            &state.session_service,
+            instance,
+            storage.clone(),
+            witness,
         );
+        tokio::pin!(publish);
+        assert!(futures_util::poll!(&mut publish).is_pending());
+        let peer_storage = storage.clone();
+        tokio::task::spawn_blocking(move || {
+            peer_storage
+                .update(|rows, _| {
+                    rows[0].title = "peer title".into();
+                    rows[0].callback_url = Some("https://peer.invalid/completed".into());
+                    Ok(())
+                })
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        drop(live);
+        let published = tokio::time::timeout(std::time::Duration::from_secs(10), publish)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published.title, "peer title");
+        assert_eq!(
+            published.callback_url.as_deref(),
+            Some("https://peer.invalid/completed")
+        );
+        let live = state.instances.read().await;
+        assert_eq!(live[0].title, published.title);
+        assert_eq!(live[0].callback_url, published.callback_url);
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_create_resolves_an_implicit_default_profile_before_opening_watched_storage() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let default_profile = "chosen-default";
+        crate::session::create_profile("alphabetically-first").unwrap();
+        crate::session::create_profile(default_profile).unwrap();
+        crate::session::config::update_config(|config| {
+            config.default_profile = default_profile.into();
+        })
+        .unwrap();
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        std::sync::Arc::get_mut(&mut state)
+            .expect("unshared test state")
+            .profile
+            .clear();
+        state.acp_supervisor.test_insert_worker("occupant").await;
+        let body = serde_json::from_value(serde_json::json!({
+            "title": "implicit-default", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured",
+        }))
+        .unwrap();
+        let response = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        let row = crate::session::Storage::open(default_profile, state.file_watch.clone())
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.title == "implicit-default")
+            .unwrap();
+        assert_eq!(row.source_profile, default_profile);
+        assert!(state
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|live| live.id == row.id));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !state
+                .acp_event_store
+                .replay_from(&row.id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity-rejected startup completes");
+        state.acp_supervisor.test_remove_worker("occupant").await;
     }
 }

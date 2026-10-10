@@ -779,6 +779,138 @@ fn test_q_in_search_mode_types_q_not_quit() {
     assert_eq!(view.search_query.value(), "q");
 }
 
+#[test]
+#[serial]
+fn queued_creation_result_does_not_block_exclusive_ownership() {
+    let mut env = setup_creation_test_env();
+    let queued = env.view.creation_poller.observe_next_queued_result();
+    env.view
+        .request_creation(creation_data(&env.project_dir, "Queued", ""), None);
+    queued
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("worker queued its real result");
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+        acquired_tx.send(()).unwrap();
+        drop(ownership);
+    });
+    let acquired_while_queued = acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .is_ok();
+    // Consume before asserting so even the broken implementation releases its
+    // queued guard and lets the peer retire rather than stranding a test thread.
+    let created = drain_creation_result(&mut env.view);
+    peer.join().unwrap();
+    assert!(
+        acquired_while_queued,
+        "the UI must be able to take exclusive ownership before polling"
+    );
+    assert!(created.is_some());
+}
+
+#[test]
+#[serial]
+fn queued_creation_rejects_replaced_plain_scratch_and_managed_directories() {
+    for kind in ["plain", "scratch", "managed"] {
+        let mut env = setup_creation_test_env();
+        let queued = env.view.creation_poller.observe_next_queued_result();
+        let mut data = creation_data(&env.project_dir, "Original", "");
+        data.scratch = kind == "scratch";
+        if kind == "managed" {
+            data.worktree_enabled = true;
+            data.worktree_branch = Some("queued-original".into());
+            data.create_new_branch = true;
+        }
+        env.view.request_creation(data, None);
+        queued
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker queued its real result");
+        let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+        let git = crate::git::GitWorktree::new(env.project_dir.clone()).unwrap();
+        let path = match kind {
+            "managed" => {
+                git.list_worktrees()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.branch.as_deref() == Some("queued-original"))
+                    .unwrap()
+                    .path
+            }
+            "scratch" => std::fs::read_dir(crate::session::get_app_dir().unwrap().join("scratch"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+            _ => env.project_dir.clone(),
+        };
+        if kind == "managed" {
+            git.remove_worktree(&path, false).unwrap();
+            git.create_worktree("queued-original", &path, false, None)
+                .unwrap();
+        } else {
+            let retired = env._temp.path().join("retired-original");
+            std::fs::rename(&path, retired).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+        }
+        std::fs::write(path.join("replacement-marker"), b"keep").unwrap();
+        drop(ownership);
+        assert_eq!(drain_creation_result(&mut env.view), None, "{kind}");
+        assert!(env.view.info_dialog.is_some(), "{kind}");
+        assert!(env.storage.load().unwrap().is_empty(), "{kind}");
+        assert_eq!(
+            std::fs::read(path.join("replacement-marker")).unwrap(),
+            b"keep",
+            "{kind}"
+        );
+        if kind == "managed" {
+            assert!(git
+                .list_worktrees()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == path));
+            assert!(git.branch_exists("queued-original").unwrap());
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn queued_creation_cannot_publish_into_a_replacement_profile() {
+    let mut env = setup_creation_test_env();
+    let queued = env.view.creation_poller.observe_next_queued_result();
+    env.view.request_creation(
+        creation_data(&env.project_dir, "Original profile", ""),
+        None,
+    );
+    queued
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("worker queued its real result");
+    let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+    let profile_dir = env.storage.sessions_path().parent().unwrap().to_path_buf();
+    std::fs::rename(&profile_dir, env._temp.path().join("retired-profile")).unwrap();
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    let replacement = Storage::open_unwatched_with_ownership("default", &ownership).unwrap();
+    let peer = Instance::new(
+        "replacement profile owner",
+        &env.project_dir.to_string_lossy(),
+    );
+    let peer_id = peer.id.clone();
+    replacement
+        .update_with_ownership(&ownership, |rows, _| {
+            rows.push(peer);
+            Ok(())
+        })
+        .unwrap();
+    drop(ownership);
+    assert_eq!(drain_creation_result(&mut env.view), None);
+    assert!(env.view.info_dialog.is_some());
+    let rows = replacement.load().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, peer_id);
+}
+
 /// The async CreationPoller result must replace a `Creating` stub even when an intervening
 /// save already persisted it, keep the finalized row's group, and treat the committed row as
 /// authoritative rather than a provisional pending add, so a later peer deletion is not
