@@ -79,7 +79,7 @@ Attachments persist with the transcript and queue alongside the prompt text, so 
 
 The composer keeps messages the session cannot accept yet:
 
-1. **Mid-turn follow-up.** With a steerable agent (Claude Code, from `claude-agent-acp` 0.64.0) your message goes into the running turn, the same as typing ahead in the CLI, so nothing is queued and `aoe acp prompt` works mid-turn too. Without steering, the text lands in the **Queued (N)** strip and drains when the agent reports `Stopped`, joined into one combined prompt (a clear command fires alone so it keeps its meaning).
+1. **Mid-turn follow-up.** With a steerable agent (Claude Code, from `claude-agent-acp` 0.64.0) your message goes into the running turn, the same as typing ahead in the CLI, so nothing is queued and `aoe acp prompt` works mid-turn too. Without steering, while the agent compacts, or for a `/clear` or `/compact` command, the text lands in the **Queued (N)** strip and drains when the agent reports `Stopped`, joined into one combined prompt (a clear or compact command fires alone so it keeps its meaning).
 2. **Inactive session.** While the WebSocket is reconnecting or the worker is stopped, submissions are still accepted and parked, and drain once both are back.
 3. **Idle-dormant session.** The POST itself is the wake path: the server respawns the worker, holds the request until it is ready, then delivers it.
 

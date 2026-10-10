@@ -20,7 +20,8 @@ pub enum PromptDispatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueReason {
-    /// A non-steerable turn is running.
+    /// A running turn that cannot take this prompt: the agent is not
+    /// steerable, or the prompt is a command that must run on its own.
     TurnActive,
     /// A cancel is pending on the running turn.
     Cancelling,
@@ -70,6 +71,17 @@ pub fn decide(state: &AcpState, worker: WorkerLiveness) -> PromptDispatch {
     }
     PromptDispatch::Queued {
         reason: QueueReason::TurnActive,
+    }
+}
+
+/// A command that must run on its own (`/compact`, `/clear`) would interrupt a
+/// running turn if steered into it, so it waits for the turn to end instead.
+pub fn hold_solo_command(dispatch: PromptDispatch, solo: bool) -> PromptDispatch {
+    match dispatch {
+        PromptDispatch::Steered if solo => PromptDispatch::Queued {
+            reason: QueueReason::TurnActive,
+        },
+        other => other,
     }
 }
 
@@ -191,6 +203,21 @@ mod tests {
         ];
         for (name, flags, liveness, expected) in cases {
             assert_eq!(decide(&state(flags), worker(liveness)), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_solo_command_is_held_instead_of_steered() {
+        let held = PromptDispatch::Queued {
+            reason: QueueReason::TurnActive,
+        };
+        let cases = [
+            (PromptDispatch::Steered, true, held),
+            (PromptDispatch::Steered, false, PromptDispatch::Steered),
+            (PromptDispatch::Sent, true, PromptDispatch::Sent),
+        ];
+        for (dispatch, solo, expected) in cases {
+            assert_eq!(hold_solo_command(dispatch, solo), expected);
         }
     }
 }

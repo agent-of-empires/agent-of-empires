@@ -306,6 +306,9 @@ pub(super) fn map_update_to_events(
                     events.push(Event::ConversationCompacted);
                     events.push(cleared_plan());
                 }
+                if is_compact_failure(&text.text) {
+                    events.push(Event::ConversationCompactionFailed);
+                }
                 events
             }
             other => vec![raw_event(&other)],
@@ -615,10 +618,10 @@ pub(super) fn map_update_to_events(
                     });
                 vec![Event::ConversationCompacted, summary, cleared_plan()]
             }
-            CompactionStatus::Failed => vec![compaction_failed_notice(
-                &update.compaction_id,
-                update.error.take(),
-            )],
+            CompactionStatus::Failed => vec![
+                Event::ConversationCompactionFailed,
+                compaction_failed_notice(&update.compaction_id, update.error.take()),
+            ],
             // A cancel is reported by the turn's own terminal.
             _ => Vec::new(),
         },
@@ -964,6 +967,9 @@ mod tests {
                 ),
             ]
         );
+        assert!(claude(failed(none()))
+            .iter()
+            .any(|e| matches!(e, Event::ConversationCompactionFailed)));
     }
 
     /// An agent switch opens a new native session that may reuse a compaction
@@ -1086,9 +1092,13 @@ mod tests {
             assert_eq!(is_compact_start(text), start, "{text:?}");
         }
         // #1050, #3219: typed lifecycle events follow the visible chunk.
-        let cases: [(&str, &[&str]); 4] = [
+        let cases: [(&str, &[&str]); 5] = [
             ("just some prose", &[]),
             ("Compacting...", &["conversation_compaction_started"]),
+            (
+                "\n\nCompacting failed: API Error: Request was aborted.",
+                &["conversation_compaction_failed"],
+            ),
             (
                 "\n\nCompacting completed.",
                 &["conversation_compacted", "plan_updated"],
@@ -1113,6 +1123,7 @@ mod tests {
         let cases = [
             (Event::ConversationCompactionStarted, true),
             (Event::ConversationCompacted, true),
+            (Event::ConversationCompactionFailed, true),
             (
                 Event::ConversationCompactionSummary {
                     compaction_id: "a".into(),

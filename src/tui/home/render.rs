@@ -868,11 +868,13 @@ impl HomeView {
         update_status: Option<&str>,
         image_update: Option<&ImageUpdate>,
     ) {
-        // Start each frame with no footer buttons and no sidebar collapse rects; the home
-        // render paths repopulate them. The takeover views return before those run, so
-        // clearing here keeps a stale rect from swallowing a click on the diff/serve
-        // surface (the collapse handler runs ahead of `hit_diff`).
+        // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
+        self.tips_badge_rect = None;
+        if !self.show_shortcut_bar {
+            self.footer_hover = None;
+            self.tips_badge_hovered = false;
+        }
         self.collapse_button_area = Rect::default();
         self.expand_strip_area = Rect::default();
         // Hyperlink cells are per-frame: a takeover view or a link-free preview must
@@ -934,17 +936,20 @@ impl HomeView {
         self.refresh_last_prompt();
         let last_prompt = self.last_prompt_footer_line();
 
-        // Layout: main area + optional last-prompt footer + status bar + optional
-        // update bar. The update bar carries both persistent banners and transient
-        // toasts, so it needs a row whenever either is present, or a toast fired
-        // without a pending update would never show.
+        // Keep temporary feedback and the leader menu available with the bar hidden.
+        let has_status_bar = self.show_shortcut_bar
+            || self.status_flash_text().is_some()
+            || (self.live_send.is_some()
+                && (self.live_send_pending_leader || self.live_send_ctrl_c_flash_active()));
         let has_update_bar =
             update_info.is_some() || update_status.is_some() || image_update.is_some();
         let mut constraints = vec![Constraint::Min(0)];
         if last_prompt.is_some() {
             constraints.push(Constraint::Length(1)); // last-prompt footer
         }
-        constraints.push(Constraint::Length(1)); // status bar
+        if has_status_bar {
+            constraints.push(Constraint::Length(1));
+        }
         if has_update_bar {
             constraints.push(Constraint::Length(1)); // update bar
         }
@@ -953,15 +958,17 @@ impl HomeView {
             .constraints(constraints)
             .split(area);
 
-        // Row indices shift when the footer row is present; resolve them once.
         let mut next_row = 1;
         let last_prompt_idx = last_prompt.as_ref().map(|_| {
             let i = next_row;
             next_row += 1;
             i
         });
-        let status_idx = next_row;
-        next_row += 1;
+        let status_idx = has_status_bar.then(|| {
+            let i = next_row;
+            next_row += 1;
+            i
+        });
         let update_bar_idx = has_update_bar.then_some(next_row);
 
         // The diagnostics strip docks under the session-list column (see
@@ -1032,7 +1039,19 @@ impl HomeView {
         if let (Some(idx), Some(text)) = (last_prompt_idx, last_prompt.as_deref()) {
             self.render_last_prompt_footer(frame, main_chunks[idx], theme, text);
         }
-        self.render_status_bar(frame, main_chunks[status_idx], theme);
+        if let Some(idx) = status_idx {
+            self.render_status_bar(frame, main_chunks[idx], theme);
+        } else if !self.live_send_pending_leader && self.hovered_link().is_some() {
+            // Overlay the border so hovering cannot move the link out from under the pointer.
+            let row = Rect::new(
+                content_area.x,
+                content_area.bottom().saturating_sub(1),
+                content_area.width,
+                content_area.height.min(1),
+            );
+            frame.render_widget(Clear, row);
+            self.render_status_bar(frame, row, theme);
+        }
 
         if let Some(idx) = update_bar_idx {
             self.render_update_bar(
@@ -3651,15 +3670,7 @@ impl HomeView {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Cleared each frame and set only when the badge is drawn, so a stale rect can't
-        // make a footer click open tips while the badge is hidden.
-        self.tips_badge_rect = None;
-        // A flash is one-shot feedback on something the user just did, so it takes the
-        // row for its few seconds and wins over a hovered link's target, which it is
-        // usually reporting anyway. The LIVE chip stays either way: which pane keystrokes
-        // land on must never be hidden. A hovered target shows only while no overlay
-        // covers the preview (the click is inert there) and is resolved per frame, and it
-        // is suppressed while the leader is armed so the which-key menu stays visible.
+        // Action feedback takes precedence over a hovered link target.
         let hovered = (!self.live_send_pending_leader)
             .then(|| self.hovered_link())
             .flatten()
@@ -3668,10 +3679,8 @@ impl HomeView {
         if let Some(text) = transient {
             let mut spans = Vec::new();
             let mut budget = area.width as usize;
-            // In live-send the chip and the way out both stay: a flash lasts three
-            // seconds but a hovered target lasts as long as the pointer rests, and that
-            // is too long to leave the user with no visible exit chord.
-            let exit = self.live_send.as_ref().map(|state| {
+            let visible_live = self.live_send.as_ref().filter(|_| self.show_shortcut_bar);
+            let exit = visible_live.map(|state| {
                 let chord = if state.exit_chords.is_empty() {
                     "?".to_string()
                 } else {
@@ -3679,7 +3688,7 @@ impl HomeView {
                 };
                 format!(" {chord} to exit ")
             });
-            if self.live_send.is_some() {
+            if visible_live.is_some() {
                 let chip = " \u{25CF} LIVE ";
                 budget = budget.saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
                 spans.push(Span::styled(
@@ -3701,10 +3710,13 @@ impl HomeView {
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
-        // The live-send banner takes over the status bar as an always-visible reminder
-        // that keystrokes are relayed, and how to get out. Distinct color and bold so it
-        // is not read as the regular footer. The scroll indicator, present only when the
-        // user scrolled back, sits between title and exit hint.
+        if !self.show_shortcut_bar
+            && !(self.live_send.is_some()
+                && (self.live_send_pending_leader || self.live_send_ctrl_c_flash_active()))
+        {
+            return;
+        }
+        // LIVE shares the shortcut row; its temporary menu and feedback can restore it.
         if let Some(state) = &self.live_send {
             let base_title = if state.title.is_empty() {
                 "session"
