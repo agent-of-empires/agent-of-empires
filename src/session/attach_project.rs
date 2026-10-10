@@ -320,7 +320,7 @@ fn plan_conversion(
     })
 }
 
-/// Validate the request and create the worktree, without persisting anything.
+/// Validate an attach request without checkout or row mutations.
 pub fn plan(
     instance: &super::Instance,
     profile: &str,
@@ -374,16 +374,15 @@ pub fn plan(
     let repo_name = repo_leaf_name(&main_repo_path);
     reject_duplicate(instance, &main_repo_path, &repo_name)?;
 
-    // Resolved against the repo being attached: it is the repo a worktree gets created in, so its
-    // own `.agent-of-empires/config.toml` governs submodule init and the default base branch.
+    let profile = super::config::effective_profile(profile);
     let config =
-        super::config::repo_config::resolve_config_with_repo_or_warn(profile, &main_repo_path);
+        super::config::repo_config::resolve_config_with_repo_or_warn(&profile, &main_repo_path);
     let git_wt = GitWorktree::new(main_repo_path.clone())?
         .with_init_submodules(config.worktree.init_submodules);
 
     let base = builder::resolve_base_branch(
         None,
-        builder::project_base_branches(profile)
+        builder::project_base_branches(&profile)
             .get(&super::projects::canonical_key(
                 &main_repo_path.to_string_lossy(),
             ))
@@ -399,7 +398,7 @@ pub fn plan(
 
     // Plan the conversion before touching anything, so a refusal (dirty checkout, workspace path
     // taken, branch already checked out) happens with nothing created.
-    let conversion = plan_conversion(instance, profile, on_existing)?;
+    let conversion = plan_conversion(instance, &profile, on_existing)?;
     if !matches!(conversion, Conversion::Append { .. }) && conversation_cannot_follow(instance) {
         bail!(
             "'{}' carries a conversation bound to its current working directory; \
@@ -423,7 +422,7 @@ pub fn plan(
     Ok(AttachPlan {
         original: instance.clone(),
         reservation: None,
-        profile: profile.to_string(),
+        profile,
         // Appending to an existing workspace leaves `project_path` alone; the
         // other two shapes move the session into a new workspace directory.
         moves_session: !matches!(conversion, Conversion::Append { .. }),
@@ -442,8 +441,7 @@ pub struct AttachPlan {
     original: super::Instance,
     reservation: Option<std::sync::Arc<AttachReservation>>,
     profile: String,
-    /// True when the session's working directory changes, so the caller has to stop the session
-    /// around [`execute`] and start it again afterwards.
+    /// Whether conversion changes the working directory and requires a stop/restart.
     pub moves_session: bool,
     conversion: Conversion,
     workspace_dir: PathBuf,
@@ -496,10 +494,6 @@ fn validate_attach_row(row: &super::Instance, plan: &AttachPlan) -> Result<()> {
             super::Status::Creating | super::Status::Deleting
         ),
         "session is changing lifecycle"
-    );
-    anyhow::ensure!(
-        !needs_restart(plan, row.is_sandboxed()) || !row.status.blocks_worktree_edit(),
-        "session has a turn in flight before attach quiescence"
     );
     anyhow::ensure!(
         match &plan.reservation {
@@ -1351,6 +1345,54 @@ exit 0
             .unwrap();
         let plan = plan(&instance, profile, &added, ExistingBranch::Refuse).unwrap();
         (storage, instance, plan)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_resolves_implicit_profile_before_original_storage_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = "chosen-owner";
+        let _home = isolated_profile(temp.path(), profile);
+        crate::session::create_profile("alphabetically-first").unwrap();
+        super::super::config::update_config(|config| {
+            config.default_profile = profile.to_string();
+        })
+        .unwrap();
+        let (storage, mut original, _) = attach_fixture(temp.path(), profile);
+        original.status = super::super::Status::Starting;
+        storage
+            .update(|rows, _| {
+                rows[0].status = original.status;
+                Ok(())
+            })
+            .unwrap();
+        let mut plan = plan(
+            &original,
+            "",
+            &temp.path().join("src/added"),
+            ExistingBranch::Refuse,
+        )
+        .unwrap();
+        let admitted = reserve_attach(&storage, &mut plan).unwrap();
+        let outcome = attach_planned(&storage, &original.id, &admitted, plan).unwrap();
+        let row = storage
+            .load_strict_for_worktree_ownership()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == original.id)
+            .unwrap();
+        assert_eq!(row.project_path, outcome.moved_to.unwrap());
+        let added_checkout = Path::new(&outcome.repo.worktree_path);
+        assert!(added_checkout.join("README.md").exists());
+        let repository = git2::Repository::open(added_checkout).unwrap();
+        let head = repository.head().unwrap();
+        assert_eq!(head.shorthand().unwrap(), outcome.repo.branch);
+        assert_eq!(row.source_profile, profile);
+        assert!(Storage::open_unwatched("alphabetically-first")
+            .unwrap()
+            .load_strict_for_worktree_ownership()
+            .unwrap()
+            .is_empty());
     }
 
     #[cfg(unix)]

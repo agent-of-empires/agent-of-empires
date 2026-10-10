@@ -398,8 +398,10 @@ mod tests {
                     WorktreePathResolution::Moved(moved.canonicalize().unwrap())
                 );
                 assert_eq!(
-                    Path::new(&storage.load().unwrap()[0].project_path),
-                    moved.as_path()
+                    Path::new(&storage.load().unwrap()[0].project_path)
+                        .canonicalize()
+                        .unwrap(),
+                    moved.canonicalize().unwrap()
                 );
             } else {
                 assert_eq!(result, WorktreePathResolution::Current);
@@ -444,8 +446,10 @@ mod tests {
             WorktreePathResolution::Moved(moved.canonicalize().unwrap())
         );
         assert_eq!(
-            Path::new(&storage.load().unwrap()[0].project_path),
-            moved.as_path()
+            Path::new(&storage.load().unwrap()[0].project_path)
+                .canonicalize()
+                .unwrap(),
+            moved.canonicalize().unwrap()
         );
     }
 

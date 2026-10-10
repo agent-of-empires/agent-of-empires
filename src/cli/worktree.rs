@@ -406,7 +406,11 @@ mod tests {
         let git = GitWorktree::new(repo_path)?;
         let path = temp.path().join("candidate");
         git.create_worktree("candidate", &path, true, Some(&base))?;
-        let candidates = vec![entry(path.to_str().unwrap(), Some("candidate"))];
+        let candidates: Vec<_> = git
+            .list_worktrees()?
+            .into_iter()
+            .filter(|worktree| worktree.branch.as_deref() == Some("candidate"))
+            .collect();
         let cleaner = Storage::new_unwatched("cleaner")?;
         let peer = Storage::new_unwatched("late-peer")?;
         peer.update(|rows, _| {
