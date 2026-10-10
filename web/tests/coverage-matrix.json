@@ -2118,6 +2118,30 @@
       ]
     },
     {
+      "id": "diff-comments.terminal-send-flow",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/diff-comments.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+      ]
+    },
+    {
+      "id": "diff-comments.terminal-live-delivery",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/diff-comments-terminal.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+      ]
+    },
+    {
       "id": "diff-comments.typed-event",
       "kind": "vitest",
       "risk": "high",

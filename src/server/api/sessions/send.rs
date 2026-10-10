@@ -252,11 +252,12 @@ pub async fn send_message(
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
     }
-    let Json(req) = match req {
+    let Json(mut req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
 
+    crate::server::live_ws::strip_paste_escapes(&mut req.message);
     if req.message.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,

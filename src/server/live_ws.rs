@@ -165,15 +165,35 @@ enum LiveControlMessage {
     },
 }
 
-/// ESC is removed so pasted text cannot end the bracketed paste early. A submit
-/// drops trailing line breaks, since Enter follows.
-fn paste_payload(text: &str, submit: bool) -> String {
-    let text = if submit {
-        text.trim_end_matches(['\r', '\n'])
-    } else {
-        text
-    };
-    text.replace('\x1b', "")
+/// Bracketed-paste delimiters and remaining ESC bytes are removed before terminal input.
+pub(crate) fn strip_paste_escapes(text: &mut String) {
+    // SAFETY: We only omit ASCII delimiters or ESC, so retained UTF-8 bytes stay in order.
+    let bytes = unsafe { text.as_mut_vec() };
+    let (mut read, mut write) = (0, 0);
+    while read < bytes.len() {
+        if bytes[read] == 0x1b {
+            let remaining = &bytes[read..];
+            if remaining.starts_with(b"\x1b[200~") || remaining.starts_with(b"\x1b[201~") {
+                read += 6;
+            } else {
+                read += 1;
+            }
+        } else {
+            bytes[write] = bytes[read];
+            read += 1;
+            write += 1;
+        }
+    }
+    bytes.truncate(write);
+}
+/// A submit drops trailing line breaks, since Enter follows.
+fn paste_payload(mut text: String, submit: bool) -> String {
+    strip_paste_escapes(&mut text);
+    if submit {
+        let len = text.trim_end_matches(['\r', '\n']).len();
+        text.truncate(len);
+    }
+    text
 }
 
 /// Paste, then Enter after the agent's paste-burst delay when submitting. A live input
@@ -1495,7 +1515,7 @@ async fn handle_live_ws_inner(
                                 if read_only || !settings.is_owner.load(Ordering::Relaxed) {
                                     continue;
                                 }
-                                let text = paste_payload(&text, submit);
+                                let text = paste_payload(text, submit);
                                 if text.is_empty() {
                                     continue;
                                 }
@@ -1729,7 +1749,19 @@ mod tests {
                 r#"{"type":"paste","text":"x\u001b[201~y\n","submit":true}"#,
                 "x\x1b[201~y\n",
                 true,
-                "x[201~y",
+                "xy",
+            ),
+            (
+                r#"{"type":"paste","text":"text\n\u001b[201~","submit":true}"#,
+                "text\n\x1b[201~",
+                true,
+                "text",
+            ),
+            (
+                r#"{"type":"paste","text":"\u001b[200~pasted\u001b[201~","submit":false}"#,
+                "\x1b[200~pasted\x1b[201~",
+                false,
+                "pasted",
             ),
             (
                 r#"{"type":"paste","text":"line\r\n\n","submit":false}"#,
@@ -1752,7 +1784,7 @@ mod tests {
             };
             assert_eq!(&text, want_text, "{json}");
             assert_eq!(submit, *want_submit, "{json}");
-            assert_eq!(paste_payload(&text, submit), *want_payload, "{json}");
+            assert_eq!(paste_payload(text, submit), *want_payload, "{json}");
         }
         assert!(serde_json::from_str::<LiveControlMessage>(r#"{"type":"paste"}"#).is_err());
     }
