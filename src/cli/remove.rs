@@ -186,7 +186,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         && config.sandbox.auto_cleanup;
 
     let storage_profile = storage.profile().to_string();
-    let reservation = crate::session::deletion::PurgeTransaction::reserve(
+    let reservation = crate::session::deletion::PurgeTransaction::reserve_with_acp_transcript(
         storage,
         crate::session::deletion::DeletionRequest {
             session_id: inst.id.clone(),

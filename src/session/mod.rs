@@ -21,6 +21,8 @@ mod groups;
 pub mod idle_reap;
 pub mod import;
 mod instance;
+pub(crate) mod lifecycle_journal;
+mod lifecycle_reservation;
 pub mod mcp;
 mod move_journal;
 pub mod poller;
@@ -92,11 +94,13 @@ pub use instance::{
     SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
     WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
+pub(crate) use lifecycle_reservation::ReservationHeartbeat;
 #[cfg(test)]
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
 pub(crate) use storage::acquire_session_identity_lock;
+pub(crate) use storage::{atomic_write_verified, sync_parent_directory};
 #[cfg(test)]
 pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};

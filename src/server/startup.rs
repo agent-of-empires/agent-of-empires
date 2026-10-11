@@ -720,6 +720,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Seed acp sessions' status from the on-disk event log before any background task runs.
     seed_acp_statuses(state.clone()).await;
 
+    if let Err(error) = crate::session::deletion::start_lifecycle_recovery_worker() {
+        tracing::warn!(
+            target: "session.delete_recovery",
+            %error,
+            "lifecycle journal recovery worker could not start"
+        );
+    }
+
     // Two-phase startup recovery.
     let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
 

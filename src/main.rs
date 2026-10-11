@@ -313,6 +313,25 @@ async fn run(
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );
+        if cli::should_recover_lifecycle(cli.command.as_ref()) {
+            match tokio::task::spawn_blocking(
+                agent_of_empires::session::deletion::recover_lifecycle_journals_once,
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    target: "session.delete_recovery",
+                    %error,
+                    "startup lifecycle journal recovery did not complete"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "session.delete_recovery",
+                    %error,
+                    "startup lifecycle journal recovery task failed"
+                ),
+            }
+        }
     }
 
     // Unknown keys are only reported here; parse failures only when no subscriber is up.

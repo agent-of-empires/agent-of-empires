@@ -66,8 +66,31 @@ impl HomeView {
             let mut expired: Vec<String> = instances
                 .iter()
                 .filter(|instance| {
-                    instance.lifecycle_reservation.is_some()
-                        && !instance.has_fresh_lifecycle_reservation(now)
+                    let Some(reservation) = instance.lifecycle_reservation.as_ref() else {
+                        return false;
+                    };
+                    if instance.status == crate::session::Status::Deleting
+                        && reservation.op == crate::session::LifecycleOperation::Purge
+                    {
+                        match crate::session::lifecycle_journal::deletion_exists(
+                            storage.sessions_path(),
+                            &instance.id,
+                            reservation.generation,
+                        ) {
+                            Ok(true) => return false,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "session.delete_recovery",
+                                    session = %instance.id,
+                                    %error,
+                                    "could not verify purge journal; preserving its reservation"
+                                );
+                                return false;
+                            }
+                        }
+                    }
+                    !instance.has_fresh_lifecycle_reservation(now)
                 })
                 .map(|instance| instance.id.clone())
                 .collect();

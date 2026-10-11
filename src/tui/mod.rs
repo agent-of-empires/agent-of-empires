@@ -261,6 +261,14 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         }
     }
 
+    if let Err(error) = crate::session::deletion::start_lifecycle_recovery_worker() {
+        tracing::warn!(
+            target: "session.delete_recovery",
+            %error,
+            "lifecycle journal recovery worker could not start"
+        );
+    }
+
     if !crate::tmux::is_tmux_available() {
         eprintln!("Error: tmux not found in PATH");
         eprintln!();

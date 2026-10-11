@@ -47,6 +47,12 @@ pub struct WorkerRecord {
     pub detached_at: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PurgeFence {
+    source_profile: String,
+    lifecycle_generation: u64,
+}
+
 impl WorkerRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -101,6 +107,81 @@ pub fn record_path(session_id: &str) -> Result<PathBuf> {
 
 pub fn socket_path_for(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::socket_path(&workers_dir()?, session_id)
+}
+
+fn purge_fence_path(session_id: &str) -> Result<PathBuf> {
+    validate_session_id(session_id)?;
+    Ok(workers_dir()?.join(format!("{session_id}.purge-fence")))
+}
+
+fn load_purge_fence_unlocked(session_id: &str) -> Result<Option<PurgeFence>> {
+    let path = purge_fence_path(session_id)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing purge fence {}", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading purge fence {}", path.display())),
+    }
+}
+
+/// Fence runner publication and readoption before a purge can remove session resources.
+pub fn fence_for_purge(
+    session_id: &str,
+    source_profile: &str,
+    lifecycle_generation: u64,
+) -> Result<()> {
+    with_registry_lock(session_id, || {
+        let current = load_purge_fence_unlocked(session_id)?;
+        if let Some(current) = current.as_ref() {
+            anyhow::ensure!(
+                current.source_profile == source_profile,
+                "ACP session id is already fenced by profile {}",
+                current.source_profile
+            );
+            anyhow::ensure!(
+                current.lifecycle_generation <= lifecycle_generation,
+                "a newer ACP purge fence is already present"
+            );
+        }
+        let fence = PurgeFence {
+            source_profile: source_profile.to_string(),
+            lifecycle_generation,
+        };
+        let bytes = serde_json::to_vec(&fence).context("serializing ACP purge fence")?;
+        crate::session::atomic_write_verified(&purge_fence_path(session_id)?, &bytes)
+    })
+}
+
+pub fn clear_purge_fence_if_owned(
+    session_id: &str,
+    source_profile: &str,
+    lifecycle_generation: u64,
+) -> Result<bool> {
+    with_registry_lock(session_id, || {
+        let Some(current) = load_purge_fence_unlocked(session_id)? else {
+            return Ok(false);
+        };
+        if current.source_profile != source_profile
+            || current.lifecycle_generation != lifecycle_generation
+        {
+            return Ok(false);
+        }
+        let path = purge_fence_path(session_id)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+        }
+        crate::session::sync_parent_directory(&path)?;
+        Ok(true)
+    })
+}
+
+pub fn is_purge_fenced(session_id: &str) -> Result<bool> {
+    Ok(load_purge_fence_unlocked(session_id)?.is_some())
 }
 
 pub fn log_path_for(session_id: &str) -> Result<PathBuf> {
@@ -160,7 +241,16 @@ pub fn clear_restart_marker(session_id: &str) {
 }
 
 pub fn save(record: &WorkerRecord) -> Result<()> {
-    with_registry_lock(&record.session_id, || save_unlocked(record))
+    with_registry_lock(&record.session_id, || {
+        if let Some(fence) = load_purge_fence_unlocked(&record.session_id)? {
+            anyhow::bail!(
+                "ACP runner publication is fenced by purge generation {} in profile {}",
+                fence.lifecycle_generation,
+                fence.source_profile
+            );
+        }
+        save_unlocked(record)
+    })
 }
 
 fn save_unlocked(record: &WorkerRecord) -> Result<()> {
@@ -313,6 +403,9 @@ fn update_if_owned(
     update: impl FnOnce(&mut WorkerRecord),
 ) -> Result<bool> {
     with_registry_lock(session_id, || {
+        if load_purge_fence_unlocked(session_id)?.is_some() {
+            return Ok(false);
+        }
         let Some(mut record) = load_strict_unlocked(session_id)? else {
             return Ok(false);
         };
@@ -325,6 +418,7 @@ fn update_if_owned(
     })
 }
 
+#[cfg(not(unix))]
 fn delete_if_absent(session_id: &str) -> Result<bool> {
     with_registry_lock(session_id, || {
         if load_strict_unlocked(session_id)?.is_some() {
@@ -471,33 +565,339 @@ pub fn pid_source_for(session_id: &str) -> Option<u32> {
     }
 }
 
-/// Signals the whole process group, since it can outlive its leader.
-pub fn terminate(session_id: &str) {
-    let terminated_pid = pid_source_for(session_id);
-    if let Some(pid) = terminated_pid {
-        crate::process::worker::terminate_process_group(pid);
-        delete_if_owned(session_id, pid).ok();
-    } else {
-        delete_if_absent(session_id).ok();
+#[cfg(unix)]
+fn signal_registered_runner_if_unfenced(
+    session_id: &str,
+    expected: Option<(u32, u64)>,
+) -> Result<Option<WorkerRecord>> {
+    with_registry_lock(session_id, || {
+        if load_purge_fence_unlocked(session_id)?.is_some() {
+            return Ok(None);
+        }
+        let Some(record) = load_strict_unlocked(session_id)? else {
+            return Ok(None);
+        };
+        if expected.is_some_and(|identity| identity != (record.pid, record.generation)) {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            record.pid > 0 && record.pid <= i32::MAX as u32,
+            "ACP runner PID {} is invalid",
+            record.pid
+        );
+        crate::process::worker::terminate_process_group(record.pid);
+        Ok(Some(record))
+    })
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunnerIdentity {
+    pid: u32,
+    generation: Option<u64>,
+}
+
+#[cfg(unix)]
+fn signal_runner_if_owned(
+    session_id: &str,
+    expected_fence: Option<(&str, u64)>,
+    expected_runner: Option<RunnerIdentity>,
+    force_kill: bool,
+) -> Result<Option<RunnerIdentity>> {
+    with_registry_lock(session_id, || {
+        let fence = load_purge_fence_unlocked(session_id)?;
+        match expected_fence {
+            Some((profile, generation))
+                if !fence.as_ref().is_some_and(|current| {
+                    current.source_profile == profile && current.lifecycle_generation == generation
+                }) =>
+            {
+                return Ok(None);
+            }
+            None if fence.is_some() => return Ok(None),
+            _ => {}
+        }
+
+        let record = load_strict_unlocked(session_id)?;
+        let (identity, socket) = if let Some(record) = record {
+            let identity = RunnerIdentity {
+                pid: record.pid,
+                generation: Some(record.generation),
+            };
+            if expected_runner.is_some_and(|expected| expected != identity) {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                identity.pid > 0 && identity.pid <= i32::MAX as u32,
+                "ACP runner PID {} is invalid",
+                identity.pid
+            );
+            (identity, expected_socket(&record))
+        } else {
+            if expected_runner.is_some_and(|expected| expected.generation.is_some()) {
+                return Ok(None);
+            }
+            let base = socket_path_for(session_id)?;
+            let control = crate::process::worker::control_socket_sibling(&base);
+            let control_pid = crate::process::worker::peer_pid_from_socket(&control);
+            let base_pid = crate::process::worker::peer_pid_from_socket(&base);
+            let (identity, socket) = match (control_pid, base_pid) {
+                (Some(control_pid), Some(base_pid)) if control_pid != base_pid => {
+                    anyhow::bail!("ACP runner socket identities disagree")
+                }
+                (Some(pid), _) => (
+                    RunnerIdentity {
+                        pid,
+                        generation: None,
+                    },
+                    control,
+                ),
+                (None, Some(pid)) => (
+                    RunnerIdentity {
+                        pid,
+                        generation: None,
+                    },
+                    base,
+                ),
+                (None, None) => match expected_runner {
+                    Some(identity) => (identity, control),
+                    None => {
+                        remove_runner_sockets(&base);
+                        return Ok(None);
+                    }
+                },
+            };
+            if expected_runner.is_some_and(|expected| expected != identity) {
+                return Ok(None);
+            }
+            (identity, socket)
+        };
+
+        match crate::process::worker::peer_pid_from_socket(&socket) {
+            Some(peer) if peer == identity.pid => {}
+            Some(_) => {
+                anyhow::bail!("ACP runner identity cannot be confirmed through its control socket")
+            }
+            None if !runner_group_alive(identity.pid) => return Ok(Some(identity)),
+            None => {
+                anyhow::bail!("ACP runner identity cannot be confirmed through its control socket")
+            }
+        }
+        if force_kill {
+            crate::process::worker::kill_process_group(identity.pid);
+        } else {
+            crate::process::worker::terminate_process_group(identity.pid);
+        }
+        Ok(Some(identity))
+    })
+}
+
+#[cfg(unix)]
+async fn wait_for_runner_group_exit(pid: u32) {
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while runner_group_alive(pid) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
-/// Waits through escalation so the old process cannot clean up after the new one publishes.
-pub async fn terminate_and_wait(session_id: &str) {
-    let terminated_pid = pid_source_for(session_id);
-    if let Some(pid) = terminated_pid {
-        crate::process::worker::terminate_process_group(pid);
-        #[cfg(unix)]
-        {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-            while is_pid_alive(pid) && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            crate::process::worker::kill_process_group(pid);
-        }
-        delete_if_owned(session_id, pid).ok();
-    } else {
-        delete_if_absent(session_id).ok();
+
+#[cfg(unix)]
+fn wait_for_runner_group_exit_sync(pid: u32) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runner_group_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(unix)]
+fn delete_record_if_same(record: &WorkerRecord) -> Result<()> {
+    with_registry_lock(&record.session_id, || {
+        if let Some(current) = load_strict_unlocked(&record.session_id)? {
+            if current.pid == record.pid && current.generation == record.generation {
+                delete_unlocked(&record.session_id)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Signals only the process group currently registered for an unfenced session.
+pub fn terminate(session_id: &str) {
+    #[cfg(unix)]
+    {
+        let record = match signal_registered_runner_if_unfenced(session_id, None) {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(target: "acp.registry", session = %session_id, error = %error, "could not start runner termination");
+                return;
+            }
+        };
+        if let Err(error) = delete_record_if_same(&record) {
+            warn!(target: "acp.registry", session = %session_id, error = %error, "terminated runner record could not be cleared");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if is_purge_fenced(session_id).unwrap_or(true) {
+            return;
+        }
+        let terminated_pid = pid_source_for(session_id);
+        if let Some(pid) = terminated_pid {
+            crate::process::worker::terminate_process_group(pid);
+            delete_if_owned(session_id, pid).ok();
+        } else {
+            delete_if_absent(session_id).ok();
+        }
+    }
+}
+
+/// Waits for the old runner leader to exit before releasing its registry identity.
+pub async fn terminate_and_wait(session_id: &str) {
+    #[cfg(unix)]
+    {
+        let record = match signal_registered_runner_if_unfenced(session_id, None) {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(target: "acp.registry", session = %session_id, error = %error, "could not start runner termination");
+                return;
+            }
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::process::worker::is_pid_alive(record.pid)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        if crate::process::worker::is_pid_alive(record.pid) {
+            crate::process::worker::kill_process_group(record.pid);
+        }
+        if let Err(error) = delete_record_if_same(&record) {
+            warn!(target: "acp.registry", session = %session_id, error = %error, "terminated runner record could not be cleared");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if is_purge_fenced(session_id).unwrap_or(true) {
+            return;
+        }
+        let terminated_pid = pid_source_for(session_id);
+        if let Some(pid) = terminated_pid {
+            crate::process::worker::terminate_process_group(pid);
+            delete_if_owned(session_id, pid).ok();
+        } else {
+            delete_if_absent(session_id).ok();
+        }
+    }
+}
+
+/// Stop a fenced detached runner and prove its whole process group has exited.
+pub fn terminate_and_confirm_stopped(
+    session_id: &str,
+    source_profile: &str,
+    generation: u64,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let fence = Some((source_profile, generation));
+        let identity = signal_runner_if_owned(session_id, fence, None, false)?;
+        let Some(identity) = identity else {
+            let registry_exists = record_path(session_id)?.exists();
+            let socket = socket_path_for(session_id)?;
+            let control_socket = crate::process::worker::control_socket_sibling(&socket);
+            anyhow::ensure!(
+                !registry_exists && !socket_exists(&socket) && !socket_exists(&control_socket),
+                "ACP runner artifacts exist but no process identity can be confirmed"
+            );
+            return Ok(());
+        };
+
+        wait_for_runner_group_exit_sync(identity.pid);
+        if runner_group_alive(identity.pid) {
+            anyhow::ensure!(
+                signal_runner_if_owned(session_id, fence, Some(identity), true)? == Some(identity),
+                "ACP runner identity changed before SIGKILL escalation"
+            );
+            wait_for_runner_group_exit_sync(identity.pid);
+        }
+        anyhow::ensure!(
+            !runner_group_alive(identity.pid),
+            "ACP runner process group {} is still alive after SIGKILL",
+            identity.pid
+        );
+
+        with_registry_lock(session_id, || {
+            let current_fence = load_purge_fence_unlocked(session_id)?;
+            anyhow::ensure!(
+                current_fence.is_some_and(|current| {
+                    current.source_profile == source_profile
+                        && current.lifecycle_generation == generation
+                }),
+                "ACP purge fence changed while terminating the runner"
+            );
+            anyhow::ensure!(
+                !runner_group_alive(identity.pid),
+                "ACP runner process group {} became live before registry cleanup",
+                identity.pid
+            );
+            if let Some(current) = load_strict_unlocked(session_id)? {
+                anyhow::ensure!(
+                    identity.generation == Some(current.generation) && identity.pid == current.pid,
+                    "ACP registry changed while terminating the fenced runner"
+                );
+            }
+            delete_unlocked(session_id)?;
+            let registry_exists = record_path(session_id)?.exists();
+            let socket = socket_path_for(session_id)?;
+            let control_socket = crate::process::worker::control_socket_sibling(&socket);
+            anyhow::ensure!(
+                !registry_exists && !socket_exists(&socket) && !socket_exists(&control_socket),
+                "ACP runner registry or socket remains after confirmed process exit"
+            );
+            Ok(())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("cannot prove ACP runner process exit on this platform");
+    }
+}
+
+#[cfg(unix)]
+pub async fn terminate_orphan_and_confirm_stopped(record: WorkerRecord) -> Result<bool> {
+    let expected = RunnerIdentity {
+        pid: record.pid,
+        generation: Some(record.generation),
+    };
+    let Some(identity) = signal_runner_if_owned(&record.session_id, None, Some(expected), false)?
+    else {
+        return Ok(false);
+    };
+    wait_for_runner_group_exit(identity.pid).await;
+    if runner_group_alive(identity.pid) {
+        anyhow::ensure!(
+            signal_runner_if_owned(&record.session_id, None, Some(identity), true)?
+                == Some(identity),
+            "ACP runner identity changed before SIGKILL escalation"
+        );
+        wait_for_runner_group_exit(identity.pid).await;
+    }
+    anyhow::ensure!(
+        !runner_group_alive(identity.pid),
+        "ACP runner process group {} is still alive after SIGKILL",
+        identity.pid
+    );
+    delete_record_if_same(&record)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn runner_group_alive(pid: u32) -> bool {
+    crate::process::worker::is_pid_alive(pid) || crate::process::worker::is_process_group_alive(pid)
 }
 
 pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
@@ -532,11 +932,196 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    struct KillProcessGroupOnDrop(u32);
+
+    #[cfg(unix)]
+    impl Drop for KillProcessGroupOnDrop {
+        fn drop(&mut self) {
+            crate::process::worker::kill_process_group(self.0);
+        }
+    }
+
+    struct ReapedChild {
+        pid: u32,
+        kill: std::sync::mpsc::Sender<()>,
+        exit: std::sync::mpsc::Receiver<std::io::Result<std::process::ExitStatus>>,
+        finished: bool,
+    }
+
+    impl ReapedChild {
+        fn new(mut child: std::process::Child) -> Self {
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            let pid = child.id();
+            let (kill_tx, kill_rx) = mpsc::channel();
+            let (exit_tx, exit_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Ok(status),
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break Err(error);
+                        }
+                    }
+
+                    match kill_rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = child.kill();
+                            break child.wait();
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                };
+                let _ = exit_tx.send(result);
+            });
+
+            Self {
+                pid,
+                kill: kill_tx,
+                exit: exit_rx,
+                finished: false,
+            }
+        }
+
+        fn id(&self) -> u32 {
+            self.pid
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            let result = self.exit.recv().expect("runner waiter thread exited");
+            self.finished = true;
+            result
+        }
+    }
+
+    impl Drop for ReapedChild {
+        fn drop(&mut self) {
+            if !self.finished {
+                let _ = self.kill.send(());
+                let _ = self.exit.recv();
+            }
+        }
+    }
+
     fn with_temp_home<F: FnOnce()>(f: F) {
         // Keep worker socket paths below macOS sun_path limits.
         let tmp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
         f();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    static CONTROL_RUNNER_TERMINATE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    extern "C" fn request_control_runner_termination(_: i32) {
+        CONTROL_RUNNER_TERMINATE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn control_socket_runner_helper() {
+        use std::os::unix::net::UnixListener;
+
+        let Some(socket_path) = std::env::var_os("AOE_TEST_CONTROL_RUNNER_SOCKET") else {
+            return;
+        };
+        let marker =
+            std::env::var_os("AOE_TEST_CONTROL_RUNNER_MARKER").expect("helper marker path");
+        let listener = UnixListener::bind(socket_path).expect("bind helper control socket");
+        listener.set_nonblocking(true).unwrap();
+        let action = if std::env::var_os("AOE_TEST_CONTROL_RUNNER_IGNORE_TERM").is_some() {
+            nix::sys::signal::SigAction::new(
+                nix::sys::signal::SigHandler::SigIgn,
+                nix::sys::signal::SaFlags::empty(),
+                nix::sys::signal::SigSet::empty(),
+            )
+        } else {
+            nix::sys::signal::SigAction::new(
+                nix::sys::signal::SigHandler::Handler(request_control_runner_termination),
+                nix::sys::signal::SaFlags::empty(),
+                nix::sys::signal::SigSet::empty(),
+            )
+        };
+        unsafe {
+            nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGTERM, &action)
+                .expect("install helper SIGTERM handler");
+        }
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => drop(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("accept control probe: {error}"),
+            }
+            if CONTROL_RUNNER_TERMINATE.load(std::sync::atomic::Ordering::Relaxed) {
+                std::fs::write(marker, b"SIGTERM").expect("record graceful shutdown");
+                if let Some(session_id) = std::env::var_os("AOE_TEST_CONTROL_RUNNER_SELF_DELETE") {
+                    let generation = std::env::var("AOE_TEST_CONTROL_RUNNER_GENERATION")
+                        .expect("self-deleting runner generation")
+                        .parse::<u64>()
+                        .expect("valid self-deleting runner generation");
+                    assert!(delete_if_owned_by(
+                        session_id.to_string_lossy().as_ref(),
+                        std::process::id(),
+                        generation,
+                    ));
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn spawn_control_socket_runner(
+        session_id: &str,
+        ignore_term: bool,
+        self_delete_generation: Option<u64>,
+    ) -> (ReapedChild, u32, PathBuf, PathBuf) {
+        use std::os::unix::process::CommandExt as _;
+
+        let base = socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&base);
+        let marker = workers_dir()
+            .unwrap()
+            .join(format!("{session_id}.term-marker"));
+        let _ = std::fs::remove_file(&marker);
+        let executable = std::env::current_exe().unwrap();
+        let mut command = std::process::Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "process::worker_registry::tests::control_socket_runner_helper",
+                "--nocapture",
+            ])
+            .env("AOE_TEST_CONTROL_RUNNER_SOCKET", &control)
+            .env("AOE_TEST_CONTROL_RUNNER_MARKER", &marker)
+            .process_group(0);
+        if let Some(generation) = self_delete_generation {
+            command
+                .env("AOE_TEST_CONTROL_RUNNER_SELF_DELETE", session_id)
+                .env("AOE_TEST_CONTROL_RUNNER_GENERATION", generation.to_string());
+        }
+        if ignore_term {
+            command.env("AOE_TEST_CONTROL_RUNNER_IGNORE_TERM", "1");
+        }
+        let child = command.spawn().expect("spawn control-socket runner");
+        let reaped_child = ReapedChild::new(child);
+        let pid = reaped_child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if crate::process::worker::peer_pid_from_socket(&control) == Some(pid) {
+                return (reaped_child, pid, control, marker);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("control socket did not report its runner PID {pid}");
     }
 
     /// A minimal record; tests that care about other fields set them on the result.
@@ -719,6 +1304,284 @@ mod tests {
             terminate("term-dead");
             assert!(!record_path("term-dead").unwrap().exists());
         });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[tokio::test]
+    #[serial]
+    async fn orphan_reaper_leaves_fenced_runner_for_purge_owner() {
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let (mut child, pid, _control, marker) =
+            spawn_control_socket_runner("fenced-orphan", false, None);
+        let record = new_record(
+            "fenced-orphan",
+            pid,
+            socket_path_for("fenced-orphan").unwrap(),
+        )
+        .with_generation(9);
+        save(&record).unwrap();
+        fence_for_purge("fenced-orphan", "profile", 12).unwrap();
+
+        assert!(!terminate_orphan_and_confirm_stopped(record.clone())
+            .await
+            .unwrap());
+        assert!(is_pid_alive(pid));
+        assert_eq!(load("fenced-orphan").unwrap().unwrap().pid, pid);
+
+        terminate_and_confirm_stopped("fenced-orphan", "profile", 12).unwrap();
+        assert!(marker.exists(), "purge should send SIGTERM before cleanup");
+        assert!(child.wait().unwrap().success());
+        assert!(load("fenced-orphan").unwrap().is_none());
+        assert!(clear_purge_fence_if_owned("fenced-orphan", "profile", 12).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_does_not_signal_or_remove_artifacts_when_socket_pid_disagrees() {
+        use std::os::unix::net::UnixListener;
+        use std::os::unix::process::CommandExt as _;
+
+        with_temp_home(|| {
+            let session_id = "pid-reuse-protected";
+            let child = KillOnDrop(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn unrelated process stand-in"),
+            );
+            let socket = socket_path_for(session_id).unwrap();
+            let control = crate::process::worker::control_socket_sibling(&socket);
+            let _foreign_listener = UnixListener::bind(&control).unwrap();
+            let record = new_record(session_id, child.0.id(), socket);
+            save(&record).unwrap();
+            fence_for_purge(session_id, "profile", 3).unwrap();
+
+            let error = terminate_and_confirm_stopped(session_id, "profile", 3)
+                .expect_err("a mismatched socket peer must block signaling");
+
+            assert!(error.to_string().contains("identity cannot be confirmed"));
+            assert!(is_pid_alive(child.0.id()));
+            assert!(record_path(session_id).unwrap().exists());
+            assert!(control.exists());
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[tokio::test]
+    #[serial]
+    async fn orphan_reaper_preserves_artifacts_when_socket_pid_disagrees() {
+        use std::os::unix::net::UnixListener;
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "orphan-pid-reuse";
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn unrelated process stand-in"),
+        );
+        let socket = socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let _foreign_listener = UnixListener::bind(&control).unwrap();
+        let record = new_record(session_id, child.0.id(), socket).with_generation(7);
+        save(&record).unwrap();
+
+        let error = terminate_orphan_and_confirm_stopped(record.clone())
+            .await
+            .expect_err("an unverified socket peer must block orphan signaling");
+
+        assert!(error.to_string().contains("identity cannot be confirmed"));
+        assert!(is_pid_alive(child.0.id()));
+        assert!(record_path(session_id).unwrap().exists());
+        assert!(control.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_uses_a_live_socket_pid_when_the_registry_record_is_absent() {
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "socket-fallback";
+        let (mut child, _pid, control, marker) =
+            spawn_control_socket_runner(session_id, false, None);
+        fence_for_purge(session_id, "profile", 4).unwrap();
+
+        terminate_and_confirm_stopped(session_id, "profile", 4).unwrap();
+
+        assert!(marker.exists());
+        assert!(child.wait().unwrap().success());
+        assert!(!record_path(session_id).unwrap().exists());
+        assert!(!control.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_completes_when_recorded_runner_has_exited_and_socket_remains() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "dead-runner-artifacts";
+        let socket = socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let stale_listener = UnixListener::bind(&control).unwrap();
+        drop(stale_listener);
+        let record = new_record(session_id, 2_000_000_000, socket.clone()).with_generation(8);
+        save(&record).unwrap();
+        fence_for_purge(session_id, "profile", 9).unwrap();
+
+        terminate_and_confirm_stopped(session_id, "profile", 9).unwrap();
+
+        assert!(load(session_id).unwrap().is_none());
+        assert!(!socket_exists(&socket));
+        assert!(!socket_exists(&control));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_removes_stale_sockets_when_no_registry_record_exists() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "stale-sockets-no-record";
+        let socket = socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let stale_listener = UnixListener::bind(&control).unwrap();
+        drop(stale_listener);
+        fence_for_purge(session_id, "profile", 10).unwrap();
+
+        terminate_and_confirm_stopped(session_id, "profile", 10).unwrap();
+
+        assert!(!record_path(session_id).unwrap().exists());
+        assert!(!socket_exists(&socket));
+        assert!(!socket_exists(&control));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_preserves_live_runner_when_its_socket_is_missing() {
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "live-runner-missing-socket";
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn runner stand-in"),
+        );
+        let socket = socket_path_for(session_id).unwrap();
+        let record = new_record(session_id, child.0.id(), socket).with_generation(11);
+        save(&record).unwrap();
+        fence_for_purge(session_id, "profile", 12).unwrap();
+
+        let error = terminate_and_confirm_stopped(session_id, "profile", 12)
+            .expect_err("a live process without a confirming socket must not be signaled");
+
+        assert!(error.to_string().contains("identity cannot be confirmed"));
+        assert!(is_pid_alive(child.0.id()));
+        assert!(record_path(session_id).unwrap().exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_preserves_process_group_when_runner_leader_has_exited() {
+        use std::os::unix::net::UnixListener;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "exit-leader-child";
+        let leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 & printf '%s\\n' \"$!\""])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn runner leader stand-in");
+        let leader_pid = leader.id();
+        let _kill_group = KillProcessGroupOnDrop(leader_pid);
+        let child_pid = String::from_utf8(leader.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .expect("read surviving child PID");
+        assert!(!is_pid_alive(leader_pid));
+        assert!(is_pid_alive(child_pid));
+        assert!(crate::process::worker::is_process_group_alive(leader_pid));
+
+        let socket = socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let stale_listener = UnixListener::bind(&control).unwrap();
+        drop(stale_listener);
+        let record = new_record(session_id, leader_pid, socket).with_generation(13);
+        save(&record).unwrap();
+        fence_for_purge(session_id, "profile", 14).unwrap();
+
+        let error = terminate_and_confirm_stopped(session_id, "profile", 14)
+            .expect_err("an unverified live group must not be signaled by its saved leader PID");
+
+        assert!(error.to_string().contains("identity cannot be confirmed"));
+        assert!(is_pid_alive(child_pid));
+        assert!(record_path(session_id).unwrap().exists());
+        assert!(control.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_rechecks_runner_identity_before_sigkill_escalation() {
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "kill-escalation";
+        let (mut child, pid, _control, marker) =
+            spawn_control_socket_runner(session_id, true, None);
+        let record =
+            new_record(session_id, pid, socket_path_for(session_id).unwrap()).with_generation(5);
+        save(&record).unwrap();
+        fence_for_purge(session_id, "profile", 6).unwrap();
+
+        terminate_and_confirm_stopped(session_id, "profile", 6).unwrap();
+
+        assert!(!marker.exists(), "SIGKILL follows the SIGTERM grace period");
+        assert!(!child.wait().unwrap().success());
+        assert!(load(session_id).unwrap().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_succeeds_when_runner_removes_its_record_before_exit() {
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "self-deleting-runner";
+        let generation = 15;
+        let (mut child, pid, _control, marker) =
+            spawn_control_socket_runner(session_id, false, Some(3));
+        save(&new_record(session_id, pid, socket_path_for(session_id).unwrap()).with_generation(3))
+            .unwrap();
+        fence_for_purge(session_id, "profile", generation).unwrap();
+
+        terminate_and_confirm_stopped(session_id, "profile", generation).unwrap();
+
+        assert!(marker.exists());
+        assert!(child.wait().unwrap().success());
+        assert!(load(session_id).unwrap().is_none());
+        assert!(!socket_exists(&socket_path_for(session_id).unwrap()));
     }
 
     #[test]

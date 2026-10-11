@@ -1,18 +1,16 @@
 //! Durable journal for cross-profile session moves.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fs;
 
 use super::storage::{atomic_write_verified, sync_parent_directory};
 
 /// Bump when the entry shape changes. Entries written by an older version
 /// carry no arbitration authority (see [`MoveJournalEntry::is_current`]).
 pub(crate) const MOVE_JOURNAL_VERSION: u32 = 1;
-
-const JOURNAL_DIR_NAME: &str = ".move-journal";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MoveJournalEntry {
@@ -37,6 +35,8 @@ impl MoveJournalEntry {
     }
 }
 
+const JOURNAL_DIR_NAME: &str = ".move-journal";
+
 /// `.move-journal/` inside the directory holding `sessions_path`.
 fn journal_dir_for(sessions_path: &Path) -> PathBuf {
     sessions_path
@@ -60,14 +60,13 @@ where
 {
     let dir = journal_dir_for(source_sessions_path);
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    // create_dir_all only makes the new journal directory itself visible.
     sync(&dir)
         .with_context(|| format!("journal directory {} was not made durable", dir.display()))?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let path = dir.join(format!("move-{}-{}.json", nanos, std::process::id()));
+    let path = dir.join(format!("move-{nanos}-{}.json", std::process::id()));
     let bytes = serde_json::to_vec_pretty(entry)?;
     atomic_write_verified(&path, &bytes)
         .with_context(|| format!("failed to write move journal {}", path.display()))?;
@@ -131,7 +130,10 @@ pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanRes
         };
         let mut paths: Vec<PathBuf> = read_dir
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
             .collect();
         paths.sort();
         for path in paths {
@@ -161,6 +163,7 @@ pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn entry(source: &Path, target: &Path) -> MoveJournalEntry {
         MoveJournalEntry {
@@ -219,6 +222,67 @@ mod tests {
         assert!(result.entries.is_empty());
         assert_eq!(result.unreadable_dirs.len(), 1);
         assert_eq!(result.unreadable_dirs[0].0, journal_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn record_and_scan_keep_the_existing_path_and_flat_schema() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source/sessions.json");
+        let target = temp.path().join("target/sessions.json");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::create_dir_all(target.parent().unwrap())?;
+        let path = record(&entry(&source, &target), &source)?;
+        assert_eq!(path.parent(), Some(journal_dir_for(&source).as_path()));
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        assert!(value.get("intent").is_none());
+
+        let result = scan([source]);
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].0, path);
+        assert_eq!(result.entries[0].1.as_ref().unwrap().ids[0], "session-id");
+        Ok(())
+    }
+
+    #[test]
+    fn scan_reads_a_flat_record_from_the_existing_move_journal_directory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source/sessions.json");
+        let target = temp.path().join("target/sessions.json");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::create_dir_all(target.parent().unwrap())?;
+        let journal_dir = journal_dir_for(&source);
+        fs::create_dir_all(&journal_dir)?;
+        let path = journal_dir.join("move-1-1.json");
+        fs::write(&path, serde_json::to_vec(&entry(&source, &target))?)?;
+
+        let result = scan([source]);
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].0, path);
+        assert_eq!(result.entries[0].1.as_ref().unwrap().ids, ["session-id"]);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_rejects_unsupported_move_record_versions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source/sessions.json");
+        let target = temp.path().join("target/sessions.json");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::create_dir_all(target.parent().unwrap())?;
+        let journal_dir = journal_dir_for(&source);
+        fs::create_dir_all(&journal_dir)?;
+        let path = journal_dir.join("move-unsupported.json");
+        let mut unsupported = entry(&source, &target);
+        unsupported.version = MOVE_JOURNAL_VERSION + 1;
+        fs::write(&path, serde_json::to_vec(&unsupported)?)?;
+
+        let result = scan([source]);
+
+        let error = result.entries[0].1.as_ref().unwrap_err();
+        assert!(error.contains("move journal version 2 is not supported"));
         Ok(())
     }
 }

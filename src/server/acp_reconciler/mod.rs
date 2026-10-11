@@ -115,7 +115,11 @@ fn due(last: &mut Option<Instant>, interval: Duration) -> bool {
 
 /// Structured and not archived, snoozed or trashed.
 fn is_untriaged_structured(i: &Instance) -> bool {
-    i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_trashed()
+    i.is_structured()
+        && i.status != crate::session::Status::Deleting
+        && !i.is_archived()
+        && !i.is_snoozed()
+        && !i.is_trashed()
 }
 
 /// Eligible for a reconciler-driven worker.
@@ -433,6 +437,9 @@ async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<S
         if state.acp_supervisor.is_owned(id).await {
             continue;
         }
+        if crate::process::worker_registry::is_purge_fenced(id).unwrap_or(true) {
+            continue;
+        }
         if matches!(
             crate::process::worker_registry::load(id),
             Ok(Some(record)) if crate::process::worker_registry::is_record_live(&record)
@@ -462,12 +469,23 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
             pid = record.pid,
             "sweeping orphan worker (no matching session on disk)"
         );
-        // Group kill with escalation, detached so one stubborn orphan cannot stall the sweep (#1921).
         #[cfg(unix)]
-        tokio::spawn(crate::process::worker::reap_group_escalating(
-            record.pid,
-            Duration::from_secs(2),
-        ));
+        let (session_id, pid) = (record.session_id.clone(), record.pid);
+        #[cfg(unix)]
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::process::worker_registry::terminate_orphan_and_confirm_stopped(record).await
+            {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    pid,
+                    error = %error,
+                    "orphan runner exit could not be confirmed; retaining its registry record"
+                );
+            }
+        });
+        #[cfg(not(unix))]
         crate::process::worker_registry::delete(&record.session_id).ok();
     }
 }

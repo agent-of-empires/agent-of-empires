@@ -2,6 +2,67 @@
 
 use super::*;
 
+#[test]
+#[serial]
+fn home_startup_preserves_expired_journaled_purge_until_recovery() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let profile = "journaled-purge-startup";
+    let storage = Storage::new_unwatched(profile).unwrap();
+    let mut instance = Instance::new("deleting", "/tmp/deleting-project");
+    instance.source_profile = profile.to_string();
+    let generation = instance
+        .try_acquire_lifecycle_reservation(
+            LifecycleOperation::Purge,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    instance.status = Status::Deleting;
+    instance.lifecycle_reservation.as_mut().unwrap().at =
+        chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
+    storage
+        .update(|instances, _groups| {
+            instances.push(instance.clone());
+            Ok(())
+        })
+        .unwrap();
+    let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
+        instance,
+        Status::Idle,
+        storage.sessions_path().to_path_buf(),
+        crate::session::lifecycle_journal::LifecycleDeletionOptions {
+            generation,
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: false,
+            keep_scratch: false,
+            purge_acp_transcript: false,
+        },
+    )
+    .with_phase(crate::session::lifecycle_journal::LifecyclePhase::TeardownStarted);
+    let journal_path = crate::session::lifecycle_journal::record(&entry).unwrap();
+
+    let _view = HomeView::new_for_test(
+        Some(profile.to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let retained = storage.load().unwrap().remove(0);
+    assert_eq!(retained.status, Status::Deleting);
+    assert!(retained.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
+    assert!(journal_path.exists());
+
+    crate::session::deletion::recover_lifecycle_journals_once().unwrap();
+
+    assert!(storage.load().unwrap().is_empty());
+    assert!(!journal_path.exists());
+}
+
 /// Archiving moves the cursor to the nearest active session, never into the Archived section:
 /// down to the next row (the section is not auto-revealed; its header count is the feedback),
 /// up when archiving the bottom row, and nowhere (selection cleared, cursor clamped) when no
