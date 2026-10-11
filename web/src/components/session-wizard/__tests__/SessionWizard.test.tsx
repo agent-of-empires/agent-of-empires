@@ -29,6 +29,7 @@ vi.mock("../../../lib/api", () => ({
     projects: [{ path: "/tmp/proj", display_name: "proj", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" }],
   }),
   fetchProjects: vi.fn().mockResolvedValue([]),
+  fetchProjectRegistry: vi.fn().mockResolvedValue([]),
   createSession: (...args: unknown[]) => createSession(...args),
 }));
 

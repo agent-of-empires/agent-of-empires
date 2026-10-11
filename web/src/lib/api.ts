@@ -1320,9 +1320,21 @@ export async function resolvePluginOptions(
   return body?.options ?? [];
 }
 
-export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
-  const url = scope ? `/api/projects?scope=${scope}` : "/api/projects";
-  return (await fetchJson<ProjectInfo[]>(url)) ?? [];
+/** `profile` resolves that profile's registry and per-project overrides; omitted means the served profile.
+ *  `null` means the request failed, which an empty registry is not. */
+export async function fetchProjectRegistry(
+  scope?: "global" | "profile",
+  profile?: string,
+): Promise<ProjectInfo[] | null> {
+  const params = new URLSearchParams();
+  if (scope) params.set("scope", scope);
+  if (profile) params.set("profile", profile);
+  const query = params.toString();
+  return fetchJson<ProjectInfo[]>(query ? `/api/projects?${query}` : "/api/projects");
+}
+
+export async function fetchProjects(scope?: "global" | "profile", profile?: string): Promise<ProjectInfo[]> {
+  return (await fetchProjectRegistry(scope, profile)) ?? [];
 }
 
 export type ImportableSessionsResult =

@@ -6,11 +6,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { ExtraReposPicker } from "../steps/ExtraReposPicker";
 import type { ProjectInfo } from "../../../lib/types";
 
-const fetchProjects = vi.fn();
+const fetchProjectRegistry = vi.fn();
 const fetchRecentProjects = vi.fn();
 const fetchBranches = vi.fn();
 vi.mock("../../../lib/api", () => ({
-  fetchProjects: () => fetchProjects(),
+  fetchProjectRegistry: () => fetchProjectRegistry(),
   fetchSessions: () => Promise.resolve({ sessions: [], workspace_ordering: [] }),
   fetchRecentProjects: () => fetchRecentProjects(),
   fetchBranches: (...args: unknown[]) => fetchBranches(...args),
@@ -19,7 +19,7 @@ vi.mock("../../../lib/api", () => ({
 const project = (name: string): ProjectInfo => ({ name, path: `/repos/${name}`, scope: "global", pinned: false });
 
 beforeEach(() => {
-  fetchProjects.mockResolvedValue([project("primary"), project("alpha"), project("beta")]);
+  fetchProjectRegistry.mockResolvedValue([project("primary"), project("alpha"), project("beta")]);
   fetchRecentProjects.mockResolvedValue({ projects: [] });
   fetchBranches.mockResolvedValue([]);
 });

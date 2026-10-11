@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentInfo, ImportableSession } from "../../../lib/types";
+import type { AgentInfo, ImportableSession, ProjectOverrides } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
 import { ImportSessionPicker } from "./ImportSessionPicker";
 import { ProjectSearchList } from "./ProjectSearchList";
@@ -15,9 +15,9 @@ interface Props {
   initialTab?: Tab;
   /** Only used to offer agents on the import tab. */
   agents?: AgentInfo[];
-  /** Called on every path selection with the saved project's worktree override, or `undefined`
-   *  when the path is unregistered or has none. */
-  onSelectSavedProject?: (override: boolean | undefined) => void;
+  /** Called on every path selection with the saved project's overrides, `undefined` when the path is
+   *  unregistered or has none, or `null` when the registry could not be loaded (unknown). */
+  onSelectSavedProject?: (overrides: ProjectOverrides | undefined | null, path: string) => void;
   /** Called after any pick, so the wizard can return to its form. */
   onPicked?: () => void;
 }
@@ -26,7 +26,8 @@ interface Props {
 export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectSavedProject, onPicked }: Props) {
   // Until a tab is picked, show Recent while loading or when there are picks, else Browse.
   const [manualTab, setManualTab] = useState<Tab | null>(initialTab ?? (data.scratch ? "scratch" : null));
-  const { loading, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker();
+  const { loading, registryAvailable, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } =
+    useProjectPicker([], data.profile || undefined);
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
 
   const normalizePath = (p: string) => p.replace(/\/+$/, "") || "/";
@@ -35,7 +36,8 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
   const selectPath = (path: string) => {
     onChange("path", path);
     const matched = saved.find((p) => normalizePath(p.path) === normalizePath(path));
-    onSelectSavedProject?.(matched?.overrides?.worktree_enabled);
+    // A failed registry request reports `null`: the overrides are unknown, which is not "none".
+    onSelectSavedProject?.(registryAvailable ? matched?.overrides : null, path);
     onPicked?.();
   };
 

@@ -70,6 +70,8 @@ mod plugin_install;
 #[cfg(debug_assertions)]
 mod project_create_dedupe;
 #[cfg(debug_assertions)]
+mod project_list_profile;
+#[cfg(debug_assertions)]
 mod serve_cityhall_lockdown;
 #[cfg(debug_assertions)]
 mod serve_daemon_session_id_drain;

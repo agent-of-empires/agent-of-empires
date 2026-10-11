@@ -1038,6 +1038,27 @@
       ]
     },
     {
+      "id": "wizard.project-sandbox-override",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.projectWorktreeOverride.test.tsx",
+        "src/components/session-wizard/__tests__/useProjectPicker.test.tsx",
+        "src/components/__tests__/ProjectFormModal.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/wizardReducer.ts",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/ProjectFormModal.tsx",
+        "web/src/lib/registeredProjects.ts",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "wizard.agent-lifecycle",
       "kind": "vitest",
       "risk": "low",
