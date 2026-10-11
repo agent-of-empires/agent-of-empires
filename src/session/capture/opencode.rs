@@ -15,16 +15,18 @@ use crate::agents::AgentGeneration;
 /// ~1.8s). Covers both the preassign and the fork.
 const OPENCODE_SERVE_DEADLINE: Duration = Duration::from_secs(6);
 
-struct ServeGuard(Option<std::process::Child>);
+const OPENCODE_SERVE_TERMINATION_GRACE: Duration = Duration::from_millis(150);
+
+struct ServeGuard {
+    child: Option<std::process::Child>,
+    grace: Duration,
+}
 
 impl ServeGuard {
     fn finish(mut self) -> Result<()> {
-        if let Some(mut child) = self.0.take() {
-            crate::process::terminate_and_reap_process_group(
-                &mut child,
-                Duration::from_millis(150),
-            )
-            .context("failed to stop the ephemeral OpenCode server")?;
+        if let Some(mut child) = self.child.take() {
+            crate::process::terminate_and_reap_process_group(&mut child, self.grace)
+                .context("failed to stop the ephemeral OpenCode server")?;
         }
         Ok(())
     }
@@ -32,11 +34,8 @@ impl ServeGuard {
 
 impl Drop for ServeGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = crate::process::terminate_and_reap_process_group(
-                &mut child,
-                Duration::from_millis(150),
-            );
+        if let Some(mut child) = self.child.take() {
+            let _ = crate::process::terminate_and_reap_process_group(&mut child, self.grace);
         }
     }
 }
@@ -152,6 +151,7 @@ impl ServeClient {
 fn with_serve<T: Send + 'static>(
     project_path: &str,
     mut cmd: std::process::Command,
+    grace: Duration,
     call: impl FnOnce(ServeClient) -> Pin<Box<dyn Future<Output = Result<T>> + Send>> + Send,
 ) -> Result<T> {
     // The bind/drop/bind race is covered by the readiness deadline.
@@ -178,7 +178,10 @@ fn with_serve<T: Send + 'static>(
     .stderr(Stdio::null());
     let child = crate::process::spawn_process_group(&mut cmd)
         .context("failed to spawn `opencode serve`")?;
-    let guard = ServeGuard(Some(child));
+    let guard = ServeGuard {
+        child: Some(child),
+        grace,
+    };
 
     let base = format!("http://127.0.0.1:{port}");
     // The caller may already be inside a Tokio runtime, so the blocking runtime
@@ -232,7 +235,7 @@ pub(crate) fn preassign_opencode_session_id(
     let id = format!("ses_{}", Uuid::new_v4().simple());
     let owned_path = project_path.to_owned();
     let served_path = owned_path.clone();
-    with_serve(&owned_path, command, move |client| {
+    with_serve(&owned_path, command, OPENCODE_SERVE_TERMINATION_GRACE, move |client| {
         let id = id.clone();
         Box::pin(async move { client.create_session(&id, &served_path).await.map(|()| id) })
     })
@@ -255,10 +258,15 @@ pub(crate) fn fork_opencode_session_id(
         return None;
     };
     let project_path = project_path.to_owned();
-    with_serve(&project_path, command, move |client| {
-        let parent_id = parent_id.clone();
-        Box::pin(async move { client.fork_session(&parent_id).await })
-    })
+    with_serve(
+        &project_path,
+        command,
+        OPENCODE_SERVE_TERMINATION_GRACE,
+        move |client| {
+            let parent_id = parent_id.clone();
+            Box::pin(async move { client.fork_session(&parent_id).await })
+        },
+    )
     .map_err(|e| {
         tracing::warn!(target: "session.capture", error = %e, "opencode session fork failed");
     })
@@ -291,6 +299,8 @@ mod tests {
                     Err(error) => panic!("local HTTP fixture did not receive a request: {error}"),
                 }
             };
+            // Accepted sockets inherit nonblocking mode on macOS.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -299,9 +309,7 @@ mod tests {
                 .unwrap();
             let mut request = Vec::new();
             let mut buffer = [0u8; 1024];
-            // One read can stop mid-request, so keep reading until the headers
-            // are complete and the body they announce has arrived. A POST here
-            // carries a JSON body, which routinely lands in a second segment.
+            // Read the complete headers and announced body before replying.
             loop {
                 let read = stream.read(&mut buffer).unwrap();
                 if read == 0 {
@@ -498,13 +506,14 @@ mod tests {
         let script = directory.path().join("opencode");
         std::fs::write(
             &script,
-            r#"import os, signal, socket, sys, time
+            r#"import os, signal, socket, sys
 if os.fork():
     os.wait()
     sys.exit(0)
+control = socket.create_connection(('127.0.0.1', int(os.environ['SHUTDOWN_CONTROL_PORT'])), timeout=3)
 def stopped(signum, frame):
-    # Model store flushing after TERM, not a readiness wait.
-    time.sleep(0.04)
+    control.sendall(b'T')
+    if control.recv(1) != b'R': sys.exit(2)
     with open(os.environ['SHUTDOWN_COMPLETE'], 'w') as marker: marker.write('finished')
     sys.exit(0)
 signal.signal(signal.SIGTERM, stopped)
@@ -522,16 +531,67 @@ while True:
         .unwrap();
         for outcome in ["success", "error", "panic"] {
             let finished = directory.path().join(outcome);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
             let mut command = std::process::Command::new(&python);
-            command.arg(&script).env("SHUTDOWN_COMPLETE", &finished);
-            let result = with_serve(directory.path().to_str().unwrap(), command, move |_| {
-                Box::pin(async move {
-                    match outcome {
-                        "success" => Ok("completed"),
-                        "error" => anyhow::bail!("call failed"),
-                        _ => panic!("worker failed"),
+            command
+                .arg(&script)
+                .env("SHUTDOWN_COMPLETE", &finished)
+                .env(
+                    "SHUTDOWN_CONTROL_PORT",
+                    listener.local_addr().unwrap().port().to_string(),
+                );
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let project_path = directory.path().to_str().unwrap();
+            let result = std::thread::scope(|scope| {
+                let worker = scope.spawn(move || {
+                    let result =
+                        with_serve(project_path, command, Duration::from_secs(5), move |_| {
+                            Box::pin(async move {
+                                match outcome {
+                                    "success" => Ok("completed"),
+                                    "error" => anyhow::bail!("call failed"),
+                                    _ => panic!("worker failed"),
+                                }
+                            })
+                        });
+                    let _ = sender.send(result);
+                });
+                let deadline = Instant::now() + Duration::from_secs(8);
+                let mut control = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("shutdown control did not connect: {error}"),
                     }
-                })
+                };
+                control.set_nonblocking(false).unwrap();
+                control
+                    .set_read_timeout(Some(Duration::from_secs(8)))
+                    .unwrap();
+                control
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut entered = [0];
+                control.read_exact(&mut entered).unwrap();
+                assert_eq!(entered, *b"T");
+                assert!(!finished.exists());
+                assert!(
+                    matches!(
+                        receiver.recv_timeout(Duration::from_millis(100)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "helper returned while descendant shutdown was blocked"
+                );
+                control.write_all(b"R").unwrap();
+                let result = receiver.recv_timeout(Duration::from_secs(8)).unwrap();
+                worker.join().unwrap();
+                result
             });
             assert_eq!(
                 result.is_ok(),
