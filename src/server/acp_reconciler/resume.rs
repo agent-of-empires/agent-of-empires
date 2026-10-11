@@ -213,11 +213,21 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach failed; terminating the worker and falling back to fresh spawn: {e}");
-                        worker_registry::terminate_and_wait(&id).await;
+                        if worker_registry::terminate_record_and_wait(record)
+                            .await
+                            .is_err()
+                        {
+                            return ResumeOutcome::RetryAfterAttachTimeout;
+                        }
                     }
                     Err(_) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach timed out after 3s; terminating the worker and falling back to fresh spawn");
-                        worker_registry::terminate_and_wait(&id).await;
+                        if worker_registry::terminate_record_and_wait(record)
+                            .await
+                            .is_err()
+                        {
+                            return ResumeOutcome::RetryAfterAttachTimeout;
+                        }
                         return ResumeOutcome::RetryAfterAttachTimeout;
                     }
                 }
@@ -235,7 +245,12 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_runner_version = worker_registry::RUNNER_VERSION,
                     "replacing incompatible structured view runner"
                 );
-                worker_registry::terminate_and_wait(&id).await;
+                if worker_registry::terminate_record_and_wait(record)
+                    .await
+                    .is_err()
+                {
+                    return ResumeOutcome::RetryAfterAttachTimeout;
+                }
             }
             AdoptDecision::RespawnStaleIdle => {
                 tracing::info!(
@@ -245,10 +260,22 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_build = crate::build_info::BUILD_VERSION,
                     "respawning idle build-stale structured view worker on current binary"
                 );
-                worker_registry::terminate_and_wait(&id).await;
+                if worker_registry::terminate_record_and_wait(record)
+                    .await
+                    .is_err()
+                {
+                    return ResumeOutcome::RetryAfterAttachTimeout;
+                }
             }
             // A dead record can still hold a live pid whose socket vanished.
-            AdoptDecision::FreshSpawn => worker_registry::terminate_and_wait(&id).await,
+            AdoptDecision::FreshSpawn => {
+                if worker_registry::terminate_record_and_wait(record)
+                    .await
+                    .is_err()
+                {
+                    return ResumeOutcome::RetryAfterAttachTimeout;
+                }
+            }
         }
     }
 
@@ -510,7 +537,10 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
         if let Some(generation) = generation {
             worker_registry::mark_restart_pending(&id, generation);
         }
-        worker_registry::terminate_and_wait(&id).await;
+        if let Err(error) = worker_registry::terminate_and_wait(&id).await {
+            tracing::warn!(target: "acp.supervisor", session = %id, %error, "runtime termination unproven; retaining restart marker");
+            continue;
+        }
         state.acp_supervisor.clear_respawn_pending(&id);
     }
 }

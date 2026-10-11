@@ -462,13 +462,14 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
             pid = record.pid,
             "sweeping orphan worker (no matching session on disk)"
         );
-        // Group kill with escalation, detached so one stubborn orphan cannot stall the sweep (#1921).
-        #[cfg(unix)]
-        tokio::spawn(crate::process::worker::reap_group_escalating(
-            record.pid,
-            Duration::from_secs(2),
-        ));
-        crate::process::worker_registry::delete(&record.session_id).ok();
+        let session_id = record.session_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::process::worker_registry::terminate_record_and_wait(record).await
+            {
+                tracing::warn!(target: "acp.supervisor", %session_id, %error, "orphan cleanup unproven; retaining registry route");
+            }
+        });
     }
 }
 

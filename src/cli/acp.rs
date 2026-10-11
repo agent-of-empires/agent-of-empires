@@ -48,10 +48,8 @@ pub enum AcpCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Gracefully stop an agent worker (SIGTERM the runner, agent
-    /// receives stdin EOF). Sessions can be reattached on the next
-    /// `aoe serve` only if they are still alive afterward; `stop`
-    /// destroys the worker.
+    /// Stop an agent worker and settle its owned native processes.
+    /// Unlike `aoe serve --stop`, this ends the worker rather than detaching.
     Stop {
         /// Session id to stop. Mutually exclusive with `--all`.
         session: Option<String>,
@@ -62,7 +60,7 @@ pub enum AcpCommands {
         #[arg(long, default_value = "5")]
         timeout_secs: u64,
     },
-    /// SIGKILL a worker immediately (use when `stop` doesn't take).
+    /// SIGKILL the runner, then settle its native workers.
     Kill {
         /// Session id to kill.
         session: String,
@@ -76,8 +74,7 @@ pub enum AcpCommands {
         #[arg(long)]
         follow: bool,
     },
-    /// Restart a wedged agent worker: stop the existing runner, then
-    /// let the daemon's reconciler spawn a fresh one on the next tick.
+    /// Restart a wedged worker after its runner and native workers have stopped.
     Restart {
         /// Session id whose worker to restart.
         session: String,
@@ -200,7 +197,7 @@ pub async fn run(command: AcpCommands) -> Result<()> {
         } => stop(session, all, timeout_secs).await,
         AcpCommands::Kill { session } => kill_now(&session),
         AcpCommands::Logs { session, follow } => logs(session, follow),
-        AcpCommands::Restart { session } => restart(&session),
+        AcpCommands::Restart { session } => restart(&session).await,
         AcpCommands::History {
             session,
             since,
@@ -769,30 +766,34 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
         println!("No matching agent workers.");
         return Ok(());
     }
-    stop_worker_records(&targets, timeout_secs).await;
+    stop_worker_records(&targets, timeout_secs).await?;
     Ok(())
 }
 
 pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
     use crate::process::worker_registry;
     let targets = worker_registry::list()?;
-    stop_worker_records(&targets, timeout_secs).await;
+    stop_worker_records(&targets, timeout_secs).await?;
     Ok(targets.len())
 }
 
 async fn stop_worker_records(
     targets: &[crate::process::worker_registry::WorkerRecord],
     timeout_secs: u64,
-) {
+) -> Result<()> {
     use crate::process::worker_registry;
     for record in targets {
-        worker_registry::delete(&record.session_id).ok();
-        signal_and_wait(record, timeout_secs).await;
+        signal_and_wait(record, timeout_secs).await?;
+        anyhow::ensure!(
+            worker_registry::delete_if_owned_by(&record.session_id, record.pid, record.generation),
+            "worker record could not be retired"
+        );
         println!(
             "Stopped agent worker for {} (PID {}).",
             record.session_id, record.pid
         );
     }
+    Ok(())
 }
 
 fn kill_now(session: &str) -> Result<()> {
@@ -800,8 +801,12 @@ fn kill_now(session: &str) -> Result<()> {
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
-    worker_registry::delete(session).ok();
     crate::process::worker::kill_process_group(record.pid);
+    worker_registry::cleanup_runtime(&record)?;
+    anyhow::ensure!(
+        worker_registry::delete_if_owned_by(session, record.pid, record.generation),
+        "worker record could not be retired"
+    );
     println!("Killed agent worker for {} (PID {}).", session, record.pid);
     Ok(())
 }
@@ -809,17 +814,22 @@ fn kill_now(session: &str) -> Result<()> {
 async fn signal_and_wait(
     record: &crate::process::worker_registry::WorkerRecord,
     timeout_secs: u64,
-) {
+) -> Result<()> {
     use crate::process::worker_registry;
     crate::process::worker::terminate_process_group(record.pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline {
         if !worker_registry::is_pid_alive(record.pid) {
-            return;
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    crate::process::worker::kill_process_group(record.pid);
+    if worker_registry::is_pid_alive(record.pid) {
+        crate::process::worker::kill_process_group(record.pid);
+    }
+    let record = record.clone();
+    tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&record)).await??;
+    Ok(())
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
@@ -874,17 +884,18 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
     Ok(())
 }
 
-fn restart(session: &str) -> Result<()> {
+async fn restart(session: &str) -> Result<()> {
     use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
     worker_registry::mark_restart_pending(session, record.generation);
-    worker_registry::delete(session).ok();
-    crate::process::worker::terminate_process_group(record.pid);
+    let pid = record.pid;
+    worker_registry::terminate_record_and_wait(record).await?;
+
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
-        session, record.pid
+        session, pid
     );
     Ok(())
 }

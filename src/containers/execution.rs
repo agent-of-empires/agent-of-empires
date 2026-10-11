@@ -325,9 +325,10 @@ impl RuntimeExecutionSnapshot {
         name: &str,
         options: Option<&str>,
         command: &str,
+        interactive: bool,
     ) -> String {
         let runtime = self.runtime();
-        let command = runtime.exec_command(name, options, command);
+        let command = runtime.exec_command(name, options, command, interactive);
         format!(
             "{}{}{}",
             crate::session::environment::shell_escape(
@@ -646,7 +647,7 @@ mod tests {
         assert!(direct.status.success());
         let shell = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(snapshot.exec_shell_command("fixture", None, "true"))
+            .arg(snapshot.exec_shell_command("fixture", None, "true", true))
             .output()
             .unwrap();
         assert!(shell.status.success());

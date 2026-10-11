@@ -60,6 +60,7 @@ pub(super) enum ClientCmd {
     ResumeBackgroundTailing(Vec<(String, String)>),
     #[cfg(test)]
     FlushForTest(oneshot::Sender<()>),
+    CloseSession(oneshot::Sender<super::close::CloseSessionOutcome>),
     Shutdown,
 }
 

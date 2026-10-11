@@ -78,8 +78,6 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
                 tracing::debug!(target: "acp.probe", agent, error = %e, "probe handshake failed");
                 return Ok(false);
             }
-            // ponytail: a wedged handshake leaks the child (no kill_on_drop on the
-            // spawn), reaped at daemon exit.
             Err(_) => {
                 tracing::debug!(target: "acp.probe", agent, "probe handshake timed out");
                 return Ok(false);
@@ -90,8 +88,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         .await
         .unwrap_or(false);
 
-    // Best-effort teardown; both calls are internally bounded.
-    let _ = client.delete_session(session_id.0.clone()).await;
+    let _ = client.close_session().await;
     let _ = client.shutdown().await;
     Ok(recorded)
 }

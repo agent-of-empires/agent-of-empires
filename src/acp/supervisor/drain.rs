@@ -113,7 +113,11 @@ impl<S: BroadcastSink> Drain<S> {
                 "drain channel closed (agent connection task ended); evaluating respawn"
             );
             if end.agent_unresponsive {
-                kill_wedged_runner(&*self.process_control, &self.session_id).await;
+                let identity = lock_recover(&self.lifecycle)
+                    .running(&self.session_id)
+                    .filter(|(current, _)| current == &lease)
+                    .and_then(|(_, identity)| identity);
+                kill_wedged_runner(&*self.process_control, &self.session_id, identity).await;
             }
             if end.rate_limited {
                 info!(
@@ -269,21 +273,43 @@ impl<S: BroadcastSink> Drain<S> {
         lock_recover(&self.pending_context_resets).remove(&self.session_id)
     }
 
-    /// Remove this epoch's handle; a no-op once a newer epoch replaced it.
-    /// Every caller is a terminal arm with no respawn behind it, so this
-    /// worker's background-agent tailers die here and nothing will report
-    /// their outcome: detach them, or a park leaves the panel showing them
-    /// running and holds the sidebar dot lit for its length (#4001). Gated on
-    /// the release so a newer epoch's sub-agents, which that epoch's own sweep
-    /// owns, are left alone; the detach runs off the workers guard because
-    /// it reads the store.
+    /// Keep a native lease occupied until its owned workers are proven gone.
     async fn drop_handle(&self, lease: &Lease) {
-        let dropped = {
-            let mut guard = self.workers.lock().await;
+        let native_record = worker_registry::load(&self.session_id)
+            .ok()
+            .flatten()
+            .is_some_and(|record| {
+                record.agent_key == "prime-agent" || record.prime_runtime.is_some()
+            });
+        let mut guard = self.workers.lock().await;
+        let native = native_record || guard.get(&self.session_id).is_some_and(|handle| matches!(&handle.kind, WorkerKind::Runner { spawn_config } if spawn_config.agent_key == "prime-agent"));
+        let dropped = if native {
+            let decision = {
+                let mut lifecycle = lock_recover(&self.lifecycle);
+                if !lifecycle
+                    .running(&self.session_id)
+                    .is_some_and(|(current, _)| &current == lease)
+                {
+                    return;
+                }
+                lifecycle.begin_stop(&self.session_id, "worker_connection_closed")
+            };
+            let crate::acp::runner_lifecycle::StopDecision::TearDown { lease, identity } = decision
+            else {
+                return;
+            };
+            guard.remove(&self.session_id);
+            drop(guard);
+            let settlement =
+                tear_down_runner(&*self.process_control, &self.session_id, identity).await;
+            settle_lease(&self.lifecycle, &self.notify, &lease, settlement);
+            true
+        } else {
             let dropped = lock_recover(&self.lifecycle).release_running(lease);
             if dropped {
                 guard.remove(&self.session_id);
             }
+            drop(guard);
             dropped
         };
         if dropped {
@@ -365,7 +391,7 @@ impl<S: BroadcastSink> Drain<S> {
     ) -> Option<(Lease, mpsc::Receiver<Event>)> {
         let session_id = &self.session_id;
         let begun = lock_recover(&self.lifecycle).begin_respawn(lease);
-        let Ok((respawn_lease, previous)) = begun else {
+        let Ok((respawn_lease, mut previous)) = begun else {
             debug!(
                 target: "acp.supervisor",
                 session = %session_id,
@@ -390,6 +416,22 @@ impl<S: BroadcastSink> Drain<S> {
             return None;
         }
 
+        if config.agent_key == "prime-agent" {
+            let settlement = tear_down_runner(&*self.process_control, session_id, previous).await;
+            if !matches!(settlement, crate::acp::runner_lifecycle::Settlement::Proven) {
+                if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                    self.workers.lock().await.remove(session_id);
+                    settle_lease(&self.lifecycle, &self.notify, &respawn_lease, settlement);
+                    self.publish(Event::AgentStartupError {
+                        message:
+                            "Prime native termination is unproven; replacement remains blocked"
+                                .into(),
+                    });
+                }
+                return None;
+            }
+            previous = None;
+        }
         Self::refresh_launch_env(&self.session_id, &mut config).await;
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
@@ -676,37 +718,32 @@ async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecisio
     }
 }
 
-/// Kill a runner a watchdog declared wedged, so the respawn cannot load against it.
-async fn kill_wedged_runner(control: &dyn ProcessControl, session_id: &str) {
-    let old_pid = worker_registry::load(session_id)
+/// Fence only the runner belonging to the ended connection.
+async fn kill_wedged_runner(
+    control: &dyn ProcessControl,
+    session_id: &str,
+    identity: Option<RunnerIdentity>,
+) {
+    let Some(identity) = identity else {
+        return;
+    };
+    let pid = identity.pid;
+    control.terminate_group(pid);
+    wait_for_exit(control, pid, Duration::from_secs(3)).await;
+    if control.is_alive(pid) {
+        control.kill_group(pid);
+        wait_for_exit(control, pid, Duration::from_millis(200)).await;
+    }
+    if control.is_alive(pid) {
+        return;
+    }
+    if worker_registry::load(session_id)
         .ok()
         .flatten()
-        .map(|r| r.pid);
-    if let Some(pid) = old_pid {
-        if control.is_alive(pid) {
-            info!(
-                target: "acp.supervisor",
-                session = %session_id,
-                pid,
-                "SIGTERM wedged runner process group before respawn (agent_unresponsive)"
-            );
-            control.terminate_group(pid);
-            wait_for_exit(control, pid, Duration::from_secs(3)).await;
-        }
-        if control.is_alive(pid) {
-            warn!(
-                target: "acp.supervisor",
-                session = %session_id,
-                pid,
-                "wedged runner survived SIGTERM grace; escalating to SIGKILL"
-            );
-            control.kill_group(pid);
-            wait_for_exit(control, pid, Duration::from_millis(200)).await;
-        }
-    }
-    if let Ok(socket_path) = worker_registry::socket_path_for(session_id) {
-        if socket_path.exists() {
-            let _ = std::fs::remove_file(&socket_path);
+        .is_some_and(|record| identity.matches_record(record.pid, record.generation))
+    {
+        if let Ok(socket_path) = worker_registry::socket_path_for(session_id) {
+            let _ = std::fs::remove_file(socket_path);
         }
     }
 }
@@ -716,6 +753,63 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::daemon::AcpWorkerState;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_ownership_without_a_cleanup_route_blocks_replacement_and_release() {
+        for attached in [false, true] {
+            let (_home, _tmp) = isolate_home();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            control.alive(4242);
+            let sup = Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(Arc::new(|_, _| {
+                    Box::pin(async {
+                        panic!("replacement launched before native ownership was settled")
+                    })
+                }));
+            let id = "prime-unproven";
+            save_record(id, 4242, 0);
+            let mut record = worker_registry::load(id).unwrap().unwrap();
+            record.agent_key = "prime-agent".into();
+            worker_registry::save(&record).unwrap();
+            let identity = Some(RunnerIdentity {
+                pid: 4242,
+                generation: 0,
+            });
+            let lease = if attached {
+                let (client, _tx) =
+                    crate::acp::acp_client::AcpClient::fake_for_test(AcpSessionId(id.into()));
+                sup.test_install_handle(id, client, WorkerKind::Attached, identity)
+                    .await
+            } else {
+                let mut config = runner_config(worker_registry::socket_path_for(id).unwrap());
+                config.agent_key = "prime-agent".into();
+                sup.test_install_runner(id, config, identity).await
+            };
+            let (tx, rx) = mpsc::channel(4);
+            let drain = sup.start_drain_task(id.into(), lease, rx, None);
+            tx.send(Event::AcpSessionAssigned {
+                acp_session_id: "native-context".into(),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(10), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            let retained = worker_registry::load(id).unwrap().unwrap();
+            assert_eq!((retained.pid, retained.generation), (4242, 0));
+            let mut lifecycle = lock_recover(&sup.lifecycle);
+            assert!(matches!(
+                lifecycle.admit(id, crate::acp::runner_lifecycle::ResumeKind::Spawn),
+                Err(crate::acp::runner_lifecycle::AdmitError::TeardownPending)
+            ));
+            assert_eq!(lifecycle.occupied_slots(), 1);
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]

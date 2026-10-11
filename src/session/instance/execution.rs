@@ -348,8 +348,9 @@ pub(crate) enum CaptureContext {
     Omp(super::OmpCaptureMetadata),
     Prime {
         plan: super::PrimeAgentCapturePlan,
-        sidecar: Option<super::SessionSidecarSource>,
+        runtime: Option<crate::process::prime::PrimeRuntime>,
     },
+    PrimeStatus(crate::process::prime::PrimeRuntime),
 }
 
 use super::{Instance, ResumeIntent};
@@ -1191,17 +1192,6 @@ impl Instance {
                     .context("invalid identity publisher environment")?;
                 environment.env.push((key.to_owned(), value.to_owned()));
             }
-            let root_only = matches!(
-                agent
-                    .and_then(|agent| agent.session_support.as_ref())
-                    .and_then(|support| support.capture.as_ref())
-                    .and_then(|capture| capture.backend.identity_publisher()),
-                Some(crate::agents::SessionIdentityPublisher::Extension { root_only: true })
-            );
-            environment.env.push((
-                "AOE_SESSION_ROOT_ONLY".into(),
-                if root_only { "1" } else { "0" }.into(),
-            ));
         }
         environment.docker_args = format!(
             "--env-file {}",
@@ -1418,6 +1408,7 @@ impl Instance {
             "native program must have an absolute UTF-8 path"
         );
         let mut prime = None;
+        let mut prime_runtime = None;
         let value = |key: &str| inputs.environment.get(key).cloned();
         let home = value("HOME")
             .filter(|home| !home.is_empty())
@@ -1703,12 +1694,23 @@ impl Instance {
                 let root = inputs.canonical_path(&root)?;
                 routing.push(("PRIME_AGENT_CODING_AGENT_DIR".into(), Some(root.to_str().context("Prime store is not UTF-8")?.into())));
                 let plan = self.prime_agent_launch_plan_from_inputs(&inputs, &root, &home)?;
-                configuration.push(root);
+                configuration.push(root.clone());
                 namespace_arguments.extend([
                     "--cwd".into(), plan.container_cwd.clone(),
                     "--session-dir".into(), plan.container_session_dir.to_str().context("Prime session directory is not UTF-8")?.into(),
                 ]);
                 let stores = vec![plan.container_session_dir.clone()];
+
+                if direct_capture {
+                    let container = inputs.container.as_ref().map(|snapshot| crate::process::prime::PrimeContainer {
+                        transport: snapshot.runtime.clone(),
+                        id: snapshot.id.clone(),
+                        cwd: PathBuf::from(&plan.container_cwd),
+                    });
+                    let runtime = crate::process::prime::PrimeRuntime::new(program.clone(), root.clone(), container);
+                    namespace_arguments.extend(["--daemon-socket".into(), runtime.socket().to_string_lossy().into_owned()]);
+                    prime_runtime = Some(runtime);
+                }
                 prime = Some(plan);
                 stores
             }
@@ -1947,16 +1949,15 @@ impl Instance {
                 })
             }) {
             inputs.hook_capture_context(&self.id)?
-        } else if let Some(plan) = prime
-            .take()
-            .filter(|_| direct_capture && inputs.container.is_some())
-        {
-            let sidecar = inputs.identity_extension.as_ref().map(|_| {
-                super::SessionSidecarSource::SandboxDir(
-                    plan.store.join("aoe-session").join(&self.id),
-                )
-            });
-            Some(CaptureContext::Prime { plan, sidecar })
+        } else if let Some(plan) = prime.take().filter(|_| direct_capture) {
+            if inputs.container.is_some() {
+                Some(CaptureContext::Prime {
+                    plan,
+                    runtime: prime_runtime,
+                })
+            } else {
+                prime_runtime.map(CaptureContext::PrimeStatus)
+            }
         } else if let Some(root) = pi_root {
             if let Some(path) = inputs
                 .environment
@@ -2236,6 +2237,7 @@ pub(super) fn validate_managed_arguments(
                     "--agent",
                     "--session-dir",
                     "--cwd",
+                    "--mode",
                 ],
                 &[
                     "--yolo",
@@ -2243,6 +2245,9 @@ pub(super) fn validate_managed_arguments(
                     "--allow-all-tools",
                     "--trust-all-tools",
                     "--verbose",
+                    "--offline",
+                    "--print",
+                    "-p",
                 ],
             ),
             _ => (

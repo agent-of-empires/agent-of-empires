@@ -289,8 +289,9 @@ impl DockerContainer {
         classify_running_probe(self.is_running())
     }
 
-    pub fn exec_command(&self, options: Option<&str>, cmd: &str) -> String {
-        self.runtime.exec_command(&self.name, options, cmd)
+    pub fn exec_command(&self, options: Option<&str>, cmd: &str, interactive: bool) -> String {
+        self.runtime
+            .exec_command(&self.name, options, cmd, interactive)
     }
 
     pub fn build_exec_argv(&self, workdir: &str, cmd: &[String]) -> Vec<String> {

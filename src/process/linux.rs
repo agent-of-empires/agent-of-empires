@@ -316,6 +316,50 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
+pub(super) fn foreground_arguments(shell_pid: u32) -> Vec<super::ProcessArguments> {
+    use std::io::Read;
+    let Some(foreground) = get_foreground_pid(shell_pid) else {
+        return Vec::new();
+    };
+    let group = unsafe { libc::getpgid(foreground as i32) };
+    if group < 0 {
+        return Vec::new();
+    }
+    collect_pid_tree(foreground)
+        .into_iter()
+        .filter_map(|pid| {
+            if unsafe { libc::getpgid(pid as i32) } != group {
+                return None;
+            }
+            let mut bytes = Vec::new();
+            fs::File::open(format!("/proc/{pid}/cmdline"))
+                .ok()?
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() > 256 * 1024 {
+                return None;
+            }
+            let argv: Vec<String> = bytes
+                .strip_suffix(&[0])
+                .unwrap_or(&bytes)
+                .split(|byte| *byte == 0)
+                .map(|word| std::str::from_utf8(word).map(str::to_owned))
+                .collect::<Result<_, _>>()
+                .ok()?;
+
+            let stdin = fs::read_link(format!("/proc/{pid}/fd/0")).ok();
+            let stdin_is_tty = stdin.map(|path| {
+                path.starts_with("/dev/pts")
+                    || path == std::path::Path::new("/dev/tty")
+                    || path == std::path::Path::new("/dev/console")
+                    || path.to_string_lossy().starts_with("/dev/tty")
+            });
+            Some(super::ProcessArguments { argv, stdin_is_tty })
+        })
+        .collect()
+}
+
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let ppid = u32::try_from(parse_stat_field(&stat, 3)?).ok()?;

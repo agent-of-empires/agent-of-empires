@@ -13,10 +13,9 @@ use crate::util::now_secs;
 
 pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_id};
 
-/// Runner protocol generation. Generation 4 announces authoritative native session identity
-/// before callbacks; the control wire version stays 3. Separate from liveness: a
-/// wrong-generation process is live and must be reaped before its replacement starts.
-pub const RUNNER_VERSION: u32 = 4;
+/// Runner generation 5 records ownership of detached native Prime workers.
+/// The control wire version stays 3; stale runners must settle before replacement.
+pub const RUNNER_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -39,6 +38,8 @@ pub struct WorkerRecord {
     pub stored_acp_session_id: Option<String>,
     #[serde(default)]
     pub source_profile: Option<String>,
+    #[serde(default)]
+    pub prime_runtime: Option<crate::process::prime::PrimeRuntime>,
     /// Together with `pid`, identifies the exact runner process. Older records default to 0.
     #[serde(default)]
     pub generation: u64,
@@ -76,6 +77,7 @@ impl WorkerRecord {
             provider_env_keys,
             stored_acp_session_id,
             source_profile,
+            prime_runtime: None,
             generation: 0,
             started_at: now_secs(),
             last_attached_at: None,
@@ -476,28 +478,73 @@ pub fn terminate(session_id: &str) {
     let terminated_pid = pid_source_for(session_id);
     if let Some(pid) = terminated_pid {
         crate::process::worker::terminate_process_group(pid);
-        delete_if_owned(session_id, pid).ok();
-    } else {
-        delete_if_absent(session_id).ok();
-    }
-}
-/// Waits through escalation so the old process cannot clean up after the new one publishes.
-pub async fn terminate_and_wait(session_id: &str) {
-    let terminated_pid = pid_source_for(session_id);
-    if let Some(pid) = terminated_pid {
-        crate::process::worker::terminate_process_group(pid);
-        #[cfg(unix)]
-        {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-            while is_pid_alive(pid) && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if let Ok(Some(record)) = load(session_id) {
+            if record.pid == pid && cleanup_runtime(&record).is_err() {
+                return;
             }
-            crate::process::worker::kill_process_group(pid);
         }
         delete_if_owned(session_id, pid).ok();
     } else {
+        if let Ok(Some(record)) = load(session_id) {
+            if cleanup_runtime(&record).is_err() {
+                return;
+            }
+        }
         delete_if_absent(session_id).ok();
     }
+}
+/// Settles the selected generation before replacement.
+pub async fn terminate_and_wait(session_id: &str) -> anyhow::Result<()> {
+    if let Some(record) = load(session_id)? {
+        terminate_record_and_wait(record).await
+    } else {
+        delete_if_absent(session_id)?;
+        Ok(())
+    }
+}
+
+pub(crate) async fn terminate_record_and_wait(record: WorkerRecord) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        load(&record.session_id)?.is_some_and(
+            |current| current.pid == record.pid && current.generation == record.generation
+        ),
+        "worker generation changed before termination"
+    );
+    crate::process::worker::terminate_process_group(record.pid);
+    #[cfg(unix)]
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while is_pid_alive(record.pid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        crate::process::worker::kill_process_group(record.pid);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_pid_alive(record.pid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        anyhow::ensure!(!is_pid_alive(record.pid), "runner termination unproven");
+    }
+    let record = tokio::task::spawn_blocking(move || {
+        cleanup_runtime(&record)?;
+        Ok::<_, anyhow::Error>(record)
+    })
+    .await??;
+    anyhow::ensure!(
+        delete_if_owned_by(&record.session_id, record.pid, record.generation),
+        "worker registry cleanup unproven"
+    );
+    Ok(())
+}
+
+pub(crate) fn cleanup_runtime(record: &WorkerRecord) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        record.agent_key != "prime-agent" || record.prime_runtime.is_some(),
+        "Prime worker has no generation-owned native route; refusing to discard unproven ownership"
+    );
+    if let Some(runtime) = &record.prime_runtime {
+        runtime.cleanup()?;
+    }
+    Ok(())
 }
 
 pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
@@ -970,6 +1017,41 @@ mod tests {
             assert!(delete_if_owned_by("g", 41, 3));
             assert!(load("g").unwrap().is_none());
             assert!(delete_if_owned_by("g", 41, 3), "missing record is settled");
+        });
+    }
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn deferred_termination_preserves_a_replacement_generation() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        with_temp_home(|| {
+            let mut victim = KillOnDrop(
+                std::process::Command::new("sh")
+                    .args(["-c", "printf 'ready\n'; exec sleep 60"])
+                    .stdout(std::process::Stdio::piped())
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut ready = String::new();
+            std::io::BufReader::new(victim.0.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            let original =
+                new_record("deferred", victim.0.id(), "/tmp/deferred.sock").with_generation(1);
+            let replacement = original.clone().with_generation(2);
+            save(&replacement).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            assert!(runtime
+                .block_on(terminate_record_and_wait(original))
+                .is_err());
+            assert!(victim.0.try_wait().unwrap().is_none());
+            assert_eq!(load("deferred").unwrap().unwrap().generation, 2);
         });
     }
 }

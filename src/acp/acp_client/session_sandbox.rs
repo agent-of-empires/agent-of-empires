@@ -176,7 +176,13 @@ pub(super) fn build_sandbox_docker_argv(
         }
     }
 
-    docker_args.push(sandbox.container_name.clone());
+    docker_args.push(
+        sandbox
+            .container_id
+            .as_ref()
+            .unwrap_or(&sandbox.container_name)
+            .clone(),
+    );
     docker_args.push(config.spec.command.clone());
     for a in &config.spec.args {
         docker_args.push(a.clone());

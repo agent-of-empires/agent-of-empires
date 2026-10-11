@@ -72,7 +72,7 @@ fn scan_prime_agent_sessions(store: &Path, session_dir: &Path) -> Vec<PrimeAgent
         .collect()
 }
 
-/// Newest unexcluded session whose cwd matches `project_path` and was modified at or after the launch floor.
+/// A private print store must contain exactly one eligible root, never merely the newest.
 fn select_prime_agent_session(
     sessions: Vec<PrimeAgentSession>,
     project_path: &str,
@@ -80,19 +80,21 @@ fn select_prime_agent_session(
     launch_time_ms: f64,
 ) -> Result<String> {
     let canonical_match = canonicalize_or_raw(project_path);
-    let mut candidates: Vec<(String, u64)> = sessions
+    let mut candidates = sessions
         .into_iter()
-        .filter(|s| !exclusion.contains(&s.id))
-        .filter(|s| canonicalize_or_raw(&s.cwd) == canonical_match)
-        .filter(|s| (s.mtime_ms as f64) + PRIME_AGENT_MTIME_FLOOR_SLACK_MS >= launch_time_ms)
-        .map(|s| (s.id, s.mtime_ms))
-        .collect();
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
-    candidates
-        .into_iter()
+        .filter(|session| !exclusion.contains(&session.id))
+        .filter(|session| canonicalize_or_raw(&session.cwd) == canonical_match)
+        .filter(|session| {
+            (session.mtime_ms as f64) + PRIME_AGENT_MTIME_FLOOR_SLACK_MS >= launch_time_ms
+        });
+    let candidate = candidates
         .next()
-        .map(|(id, _)| id)
-        .ok_or_else(|| anyhow::anyhow!("No Prime Agent session found matching project path"))
+        .ok_or_else(|| anyhow::anyhow!("No attributable Prime print session"))?;
+    anyhow::ensure!(
+        candidates.next().is_none(),
+        "Ambiguous Prime print sessions"
+    );
+    Ok(candidate.id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +106,7 @@ pub(crate) enum PrimeRootPublication {
 
 /// A pending root preserves an empty-conversation boundary instead of scanning older history.
 pub(crate) fn prime_agent_poll_fn_sandboxed(
-    preferred_sidecar: Box<dyn Fn() -> Option<PrimeRootPublication> + Send + 'static>,
+    preferred_root: Option<Box<dyn Fn() -> Option<PrimeRootPublication> + Send + 'static>>,
     plan: crate::session::instance::PrimeAgentCapturePlan,
     instance_id: String,
     launch_time_ms: f64,
@@ -113,10 +115,13 @@ pub(crate) fn prime_agent_poll_fn_sandboxed(
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = super::compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
-        match preferred_sidecar() {
-            Some(PrimeRootPublication::Ready(id)) if !exclusion.contains(&id) => Some(id),
-            Some(PrimeRootPublication::Pending(id)) if !exclusion.contains(&id) => None,
-            _ => select_prime_agent_session(
+        if let Some(root) = &preferred_root {
+            return match root() {
+                Some(PrimeRootPublication::Ready(id)) if !exclusion.contains(&id) => Some(id),
+                _ => None,
+            };
+        }
+        select_prime_agent_session(
                 scan_prime_agent_sessions(&plan.store, &plan.session_dir),
                 &plan.container_cwd,
                 &exclusion,
@@ -126,8 +131,7 @@ pub(crate) fn prime_agent_poll_fn_sandboxed(
                 tracing::debug!(target: "session.capture", "sandbox Prime Agent capture failed: {error}")
             })
             .ok()
-            .and_then(super::validated_session_id),
-        }
+            .and_then(super::validated_session_id)
     }
 }
 
@@ -209,60 +213,29 @@ mod tests {
         symlink(outside.path(), store.path().join("sessions")).unwrap();
         assert!(scanned_ids(store.path()).is_empty());
     }
-
     #[test]
-    fn poller_filters_preferred_and_fallback_from_one_exclusion() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session_dir = PathBuf::from("custom-sessions");
-        let sessions = tmp.path().join(&session_dir);
+    fn print_capture_rejects_ambiguity_instead_of_resuming_the_newest_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
         std::fs::create_dir(&sessions).unwrap();
-        for (name, id, cwd, mtime) in [
-            ("stale", "prime_stale", "/workspace", 1_000),
-            ("boundary", "prime_boundary", "/workspace", 2_000),
-            ("wrong", "prime_wrong", "/other", 4_000),
-            ("fresh", "prime_fresh", "/workspace", 3_000),
-        ] {
-            let path = write_prime_session(&sessions, &format!("{name}.jsonl"), id, cwd);
-            set_mtime_ms(&path, mtime * 1000);
-        }
-        let child = sessions.join("newest-child.jsonl");
-        std::fs::write(
-            &child,
-            "{\"type\":\"session\",\"id\":\"prime_child\",\"cwd\":\"/workspace\",\"rlmDepth\":1}\n",
-        )
-        .unwrap();
-        set_mtime_ms(&child, 5_000_000);
-
-        let poll = |preferred: Option<&'static str>, excluded: &[&str]| {
-            prime_agent_poll_fn_sandboxed(
-                Box::new(move || preferred.map(|id| PrimeRootPublication::Ready(id.to_string()))),
-                crate::session::instance::PrimeAgentCapturePlan {
-                    store: tmp.path().to_path_buf(),
-                    session_dir: session_dir.clone(),
-                    container_session_dir: "/root/.prime/agent/sessions".into(),
-                    container_cwd: "/workspace".into(),
-                },
-                "current".to_string(),
-                2_000_001.0,
-                excluded
-                    .iter()
-                    .map(|id| crate::session::ConversationBinding::unknown(*id))
-                    .collect(),
-                None,
-            )()
+        let one = write_prime_session(&sessions, "one.jsonl", "root-one", "/workspace");
+        set_mtime_ms(&one, 10_000);
+        let choose = |exclude: &HashSet<String>| {
+            select_prime_agent_session(
+                scan_prime_agent_sessions(temp.path(), Path::new("sessions")),
+                "/workspace",
+                exclude,
+                10_000.0,
+            )
         };
-        assert_eq!(poll(None, &[]).as_deref(), Some("prime_fresh"));
+        assert_eq!(choose(&HashSet::new()).unwrap(), "root-one");
+        let two = write_prime_session(&sessions, "two.jsonl", "root-two", "/workspace");
+        set_mtime_ms(&two, 20_000);
+        assert!(choose(&HashSet::new()).is_err());
         assert_eq!(
-            poll(Some("prime_parent"), &[]).as_deref(),
-            Some("prime_parent")
+            choose(&HashSet::from(["root-one".into()])).unwrap(),
+            "root-two"
         );
-        assert_eq!(
-            poll(Some("prime_parent"), &["prime_parent"]).as_deref(),
-            Some("prime_fresh")
-        );
-        assert_eq!(
-            poll(Some("prime_parent"), &["prime_parent", "prime_fresh"]),
-            None
-        );
+        assert!(choose(&HashSet::from(["root-one".into(), "root-two".into()])).is_err());
     }
 }

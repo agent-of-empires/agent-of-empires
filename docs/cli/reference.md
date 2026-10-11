@@ -1658,10 +1658,10 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
-* `stop` — Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
-* `kill` — SIGKILL a worker immediately (use when `stop` doesn't take)
+* `stop` — Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
+* `kill` — SIGKILL the runner, then settle its native workers
 * `logs` — Tail the runner's log file for an agent session
-* `restart` — Restart a wedged agent worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
+* `restart` — Restart a wedged worker after its runner and native workers have stopped
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
@@ -1702,7 +1702,7 @@ List configured agents (claude-code, aoe-agent, etc.)
 
 ## `aoe acp stop`
 
-Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
+Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
 
 **Usage:** `aoe acp stop [OPTIONS] [SESSION]`
 
@@ -1721,7 +1721,7 @@ Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). 
 
 ## `aoe acp kill`
 
-SIGKILL a worker immediately (use when `stop` doesn't take)
+SIGKILL the runner, then settle its native workers
 
 **Usage:** `aoe acp kill <SESSION>`
 
@@ -1746,7 +1746,7 @@ Tail the runner's log file for an agent session
 
 ## `aoe acp restart`
 
-Restart a wedged agent worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
+Restart a wedged worker after its runner and native workers have stopped
 
 **Usage:** `aoe acp restart <SESSION>`
 

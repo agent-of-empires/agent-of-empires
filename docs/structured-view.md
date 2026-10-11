@@ -25,8 +25,9 @@ aoe ships an ACP registry entry for each tool whose ACP server we have verified.
 | `pi` | `pi-acp` | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
 | `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | OMP login or provider env |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
-| `prime-agent` | `prime-agent --mode acp` (native) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
+| `prime-agent` | `prime-agent --mode acp` (native 0.10.x) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
 | `aoe-agent` | bundled (Vercel AI SDK 7) | `aoe acp doctor --fix --adapter aoe-agent` | provider env vars |
+
 
 Gemini CLI is deprecated upstream for individual accounts; enterprise and API-key auth remain valid, and Antigravity CLI is the consumer replacement.
 
@@ -48,6 +49,14 @@ Each built-in adapter receives only the provider variables it is known to read, 
 | `prime-agent` | `PRIME_API_KEY`, `PRIME_TEAM_ID`, every provider key its model registry reads, and the Vertex, Bedrock, and AWS credential-chain variables (see `src/acp/agent_registry.rs`) |
 
 `vibe`, `pi`, `omp`, `kimi`, and custom adapters have no ambient allowlist yet: give them auth through the session's `extra_env`, the `environment` list, or `session.inherit_host_environment` for host sessions. In a sandboxed session the per-adapter keys above still cross the container boundary, but `inherit_host_environment` does not, so use `sandbox.environment` there. Allowlist entries naming a file or directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`, the AWS file variables) are host-only and never cross, since each agent's config dir is already bind-mounted at its canonical container location; each drop is logged under the `acp` target with the key and the reason.
+
+### Prime runtime ownership
+
+Native Prime Agent 0.10.x uses a daemon owned by each structured execution. The daemon and frontend receive the same effective environment and use the original agent directory for credentials, settings, skills, and history. AoE does not reuse a daemon launched with another session's credentials.
+
+Stopping or restarting the session settles its runner and native workers before replacement. Container images must provide Bash and GNU grep for the scoped remote frontend fence. Stopping `aoe serve` only detaches; an admitted turn continues and the next daemon reattaches to the same worker. Native termination that cannot be proved retains the ownership record and blocks replacement, including older records without a native cleanup route.
+
+Prime 0.10.0 does not advertise ACP `session/load`: reattachment preserves a live session, but a cold ACP start creates a new native context and reports a context reset.
 
 ### Switching provider
 

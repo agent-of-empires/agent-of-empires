@@ -155,8 +155,10 @@ impl Instance {
         };
         let result = (|| {
             if corpse_pane {
+                let publication = self.prime_root_publication(true);
                 self.kill_clean_locked()?;
-                prepared = self.refresh_prepared_prime_launch_after_pane_stop(prepared)?;
+                prepared =
+                    self.refresh_prepared_prime_launch_after_pane_stop(prepared, publication)?;
             }
             let outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             self.commit_lifecycle_launch(&storage, false)?;

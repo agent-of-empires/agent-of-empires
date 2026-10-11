@@ -103,6 +103,8 @@ pub struct AcpRunnerArgs {
     /// the registry record and compared against the restart marker.
     #[arg(long, default_value_t = 0)]
     pub generation: u64,
+    #[arg(long)]
+    pub prime_runtime: Option<String>,
     /// Agent program + args after `--`.
     #[arg(last = true, required = true)]
     pub agent_argv: Vec<String>,
@@ -172,6 +174,13 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     )
     .with_generation(args.generation);
+    let mut record = record;
+    record.prime_runtime = args
+        .prime_runtime
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("parsing Prime runtime")?;
     if let Err(e) = worker_registry::save(&record).context("writing registry record") {
         let _ = std::fs::remove_file(&control_socket);
         return Err(e);
@@ -319,7 +328,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                 if matches!(reason, WatchdogShutdown::Superseded) {
                     preserve_registry = true;
                 }
-                self_terminate_agent_tree(reason, &session_id, our_pid, &mut agent_child).await;
+                self_terminate_agent_tree(reason, &record, &mut agent_child).await;
             }
         }
         terminate_runner = accept_loop => {
@@ -333,6 +342,9 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
+    let cleanup_record = record.clone();
+    tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
+        .await??;
     if !preserve_registry {
         worker_registry::delete_if_owned(&session_id, our_pid).ok();
     }
@@ -405,10 +417,11 @@ async fn run_watchdog(
 
 async fn self_terminate_agent_tree(
     reason: WatchdogShutdown,
-    session_id: &str,
-    own_pid: u32,
+    record: &WorkerRecord,
     agent_child: &mut Child,
 ) {
+    let session_id = &record.session_id;
+    let own_pid = record.pid;
     info!(
         target: "acp.runner",
         session = %session_id,
@@ -416,8 +429,11 @@ async fn self_terminate_agent_tree(
         "runner abandoned; terminating agent tree"
     );
 
-    worker_registry::delete_if_owned(session_id, own_pid).ok();
-
+    if record.prime_runtime.is_some() {
+        if let Some(pid) = agent_child.id() {
+            crate::process::kill_process_tree(pid);
+        }
+    }
     #[cfg(unix)]
     if let Some(agent_pid) = agent_child.id() {
         use nix::sys::signal::{kill, Signal};
@@ -426,6 +442,17 @@ async fn self_terminate_agent_tree(
     }
     let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
 
+    let cleanup_record = record.clone();
+    loop {
+        let route = cleanup_record.clone();
+        match tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&route)).await {
+            Ok(Ok(())) => break,
+            result => {
+                warn!(target: "acp.runner", ?result, "native cleanup unproven; retaining in-memory ownership route")
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     // As group leader this SIGKILLs the whole agent tree and the runner itself.
     if !crate::process::worker::kill_own_process_group_if_leader(own_pid) {
         let _ = agent_child.start_kill();
@@ -624,8 +651,9 @@ mod tests {
         .unwrap();
         let mut child = Command::new("sleep").arg("60").spawn().unwrap();
 
-        self_terminate_agent_tree(WatchdogShutdown::RecordMissing, session_id, 111, &mut child)
-            .await;
+        let mut original = worker_registry::load(session_id).unwrap().unwrap();
+        original.pid = 111;
+        self_terminate_agent_tree(WatchdogShutdown::RecordMissing, &original, &mut child).await;
 
         assert_eq!(worker_registry::load(session_id).unwrap().unwrap().pid, 222);
         assert!(control_socket.exists());

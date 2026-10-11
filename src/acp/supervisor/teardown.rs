@@ -107,11 +107,21 @@ impl<S: BroadcastSink> Supervisor<S> {
                 drop(workers);
                 worker_registry::clear_restart_marker(session_id);
                 let Some(handle) = handle else {
-                    self.settle(&lease, Settlement::Proven);
+                    let settlement =
+                        tear_down_runner(&*self.process_control, session_id, identity).await;
+                    self.settle(&lease, settlement);
                     return Ok(());
                 };
                 if delete_adapter_state {
                     try_session_delete(&handle.client, session_id).await;
+                }
+                let close = handle.client.close_session().await;
+                if matches!(
+                    close,
+                    crate::acp::acp_client::CloseSessionOutcome::Failed(_)
+                        | crate::acp::acp_client::CloseSessionOutcome::TimedOut
+                ) {
+                    warn!(target: "acp.supervisor", session = %session_id, ?close, "session close failed; continuing owned runtime cleanup");
                 }
                 let _ = handle.client.shutdown().await;
                 handle.drain_task.abort();
@@ -215,7 +225,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                 continue;
             };
             let pid = claim.identity.map(|i| i.pid);
-            if claim.attempts > TEARDOWN_RETRY_CAP
+            let native_unproven = worker_registry::load(&id)
+                .ok()
+                .flatten()
+                .is_some_and(|record| {
+                    record.prime_runtime.is_some() || record.agent_key == "prime-agent"
+                });
+            if !native_unproven
+                && claim.attempts > TEARDOWN_RETRY_CAP
                 && pid.is_none_or(|pid| !self.process_control.is_alive(pid))
             {
                 warn!(
@@ -503,6 +520,19 @@ async fn tear_down_runner_from(
             "runner survived SIGKILL; holding the session until it exits"
         );
         return Settlement::Unproven(identity);
+    }
+    let cleanup = worker_registry::load(session_id)
+        .ok()
+        .flatten()
+        .filter(|record| identity.matches_record(record.pid, record.generation));
+    if let Some(record) = cleanup {
+        if !matches!(
+            tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&record)).await,
+            Ok(Ok(()))
+        ) {
+            warn!(target: "acp.supervisor", session = %session_id, "native runtime termination unproven; retaining registry route");
+            return Settlement::Unproven(identity);
+        }
     }
     if !worker_registry::delete_if_owned_by(session_id, pid, identity.generation) {
         warn!(

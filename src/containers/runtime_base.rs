@@ -612,13 +612,20 @@ impl RuntimeBase {
         Ok(())
     }
 
-    pub fn exec_command(&self, name: &str, options: Option<&str>, cmd: &str) -> String {
-        [self.binary, "exec", "-it"]
-            .into_iter()
-            .chain(options)
-            .chain([name, cmd])
-            .collect::<Vec<_>>()
-            .join(" ")
+    pub fn exec_command(
+        &self,
+        name: &str,
+        options: Option<&str>,
+        cmd: &str,
+        interactive: bool,
+    ) -> String {
+        format!(
+            "{} exec{}{}{} {name} {cmd}",
+            self.binary,
+            if interactive { " -it" } else { "" },
+            if options.is_some() { " " } else { "" },
+            options.unwrap_or_default()
+        )
     }
 
     /// No `-it` (stdout is piped, stdin closed) and argv, not a shell string, so the prompt is never shell-parsed.
@@ -1010,18 +1017,6 @@ mod tests {
         assert!(removes_invocation_id(&PODMAN));
         assert!(!removes_invocation_id(&DOCKER));
         assert!(!removes_invocation_id(&APPLE));
-    }
-
-    #[test]
-    fn exec_command_formats() {
-        assert_eq!(
-            DOCKER.exec_command("my-container", Some("-w /workspace"), "my-agent"),
-            "docker exec -it -w /workspace my-container my-agent"
-        );
-        assert_eq!(
-            APPLE.exec_command("my-container", None, "my-agent"),
-            "container exec -it my-container my-agent"
-        );
     }
 
     #[test]

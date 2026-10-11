@@ -9,7 +9,13 @@ impl Instance {
                 self.active_execution
                     .as_ref()
                     .and_then(|active| active.capture.as_ref()),
-                Some(CaptureContext::Hooks(_))
+                Some(
+                    CaptureContext::Hooks(_)
+                        | CaptureContext::Prime {
+                            runtime: Some(_),
+                            ..
+                        }
+                )
             )
         {
             return;
@@ -35,7 +41,42 @@ impl Instance {
         &self,
         storage: &crate::session::storage::Storage,
     ) -> Option<SidWrite> {
-        let observation = self.final_publication_observation()?;
+        let observation = if self.prime_runtime().is_some() {
+            match self.prime_root_publication(true)? {
+                crate::session::capture::PrimeRootPublication::Ready(id) => {
+                    self.prime_root_observation(id)
+                }
+                crate::session::capture::PrimeRootPublication::Pending(id) => {
+                    if self.is_capture_excluded(
+                        &id,
+                        self.active_execution.as_ref().map(|active| &active.binding),
+                    ) {
+                        return None;
+                    }
+                    let expected = self.conversation_state();
+                    return Some(
+                        storage
+                            .update(|rows, _| {
+                                let Some(row) = rows.iter_mut().find(|row| row.id == self.id)
+                                else {
+                                    return Ok(SidWrite::Failed);
+                                };
+                                if !expected.matches(row) {
+                                    return Ok(SidWrite::Skipped);
+                                }
+                                if !row.resume_intent.is_default() {
+                                    return Ok(SidWrite::PinnedForeign);
+                                }
+                                row.set_agent_conversation(None, None, None);
+                                Ok(SidWrite::Applied)
+                            })
+                            .unwrap_or(SidWrite::Failed),
+                    );
+                }
+            }
+        } else {
+            self.final_publication_observation()?
+        };
         if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
         }
@@ -48,15 +89,7 @@ impl Instance {
         if outcome != SidWrite::Skipped {
             return Some(outcome);
         }
-        // `Skipped` reports a peer write between the caller's read and the CAS.
-        // Retry once against the row as it now stands: a peer that committed
-        // the same final observation makes this publication durable, while a
-        // fork intent or another conversation skips again. The retry emits
-        // `PinnedForeign` itself when the pin is the cause, so no post-hoc
-        // inference is needed here: any remaining `Skipped` keeps the doubt.
-        // A retry that cannot read the row leaves the publication in doubt, so
-        // it must fail the flush: `None` would read as "nothing to publish" and
-        // let teardown delete the evidence.
+        // Retry a peer CAS once; a second divergence retains the evidence.
         let Ok(rows) = storage.load() else {
             return Some(SidWrite::Failed);
         };
@@ -93,7 +126,7 @@ impl Instance {
                 .as_ref()
                 .and_then(|active| active.capture.as_ref()),
             Some(CaptureContext::Prime {
-                sidecar: Some(_),
+                runtime: Some(_),
                 ..
             })
         ) {
@@ -110,6 +143,9 @@ impl Instance {
         // The poller watches this pane, so it goes before the pane does, whether or not the pane
         // is still there to kill.
         self.stop_poller();
+        if let Some(runtime) = self.prime_runtime() {
+            runtime.cleanup()?;
+        }
         if !session.exists() {
             return Ok(());
         }
@@ -161,6 +197,9 @@ impl Instance {
 
     pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
+        if let Some(runtime) = self.prime_runtime() {
+            runtime.cleanup()?;
+        }
         let session = self.tmux_session()?;
         if session.exists() {
             session.kill()?;
@@ -354,7 +393,7 @@ impl Instance {
         lifecycle.source_profile = profile.clone();
         lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
         self.stop_poller();
-        let teardown = lifecycle.kill_locked().and_then(|()| {
+        let teardown = (|| {
             let mut current = storage
                 .load()?
                 .into_iter()
@@ -362,11 +401,7 @@ impl Instance {
                 .context("session disappeared during stop")?;
             current.source_profile = profile.clone();
             let flushed = current.flush_published_conversation(&storage);
-            // A pinned-foreign sid and a sid another row durably owns are both
-            // deliberate refusals rather than doubtful writes, so the teardown
-            // keeps no evidence to preserve. A real failure still keeps it, and
-            // the sandbox container always stops: the store is a host bind, not
-            // container state.
+            current.kill_locked()?;
             let container_result = crate::session::worktree_edit::stop_sandbox_container(
                 &current.id,
                 current.is_sandboxed(),
@@ -383,7 +418,7 @@ impl Instance {
                     )
                 }
             }
-        });
+        })();
         match teardown {
             Ok(()) => {
                 lifecycle.commit_lifecycle_status(

@@ -54,6 +54,7 @@ pub mod worker;
 
 pub mod worker_registry;
 
+pub mod prime;
 pub mod runner;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -325,6 +326,27 @@ pub fn boot_id() -> Option<String> {
 /// matches the host's, so the proof is skipped and declared mounts are trusted.
 pub fn host_shares_container_kernel() -> bool {
     cfg!(target_os = "linux")
+}
+
+pub(crate) struct ProcessArguments {
+    pub argv: Vec<String>,
+    pub stdin_is_tty: Option<bool>,
+}
+
+pub(crate) fn foreground_arguments(shell_pid: u32) -> Vec<ProcessArguments> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::foreground_arguments(shell_pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::foreground_arguments(shell_pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = shell_pid;
+        Vec::new()
+    }
 }
 
 pub fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {

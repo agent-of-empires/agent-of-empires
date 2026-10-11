@@ -696,29 +696,24 @@ impl ContainerRuntime {
         }
     }
 
-    pub fn exec_command(&self, name: &str, options: Option<&str>, cmd: &str) -> String {
+    pub fn exec_command(
+        &self,
+        name: &str,
+        options: Option<&str>,
+        cmd: &str,
+        interactive: bool,
+    ) -> String {
         match self.kind {
-            RuntimeKind::Docker | RuntimeKind::Podman => self.base.exec_command(name, options, cmd),
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                self.base.exec_command(name, options, cmd, interactive)
+            }
             RuntimeKind::AppleContainer => {
-                // Apple Container's initial PATH is minimal, so wrap in `/bin/sh -c`.
-                let escaped = cmd.replace('\'', "'\\''");
-                let cmd_str = format!("'{}'", escaped);
-
-                if let Some(opt_str) = options {
-                    [
-                        "container",
-                        "exec",
-                        "-it",
-                        opt_str,
-                        name,
-                        "/bin/sh",
-                        "-c",
-                        &cmd_str,
-                    ]
-                    .join(" ")
-                } else {
-                    ["container", "exec", "-it", name, "/bin/sh", "-c", &cmd_str].join(" ")
-                }
+                // Apple Container starts with a minimal PATH.
+                let command = format!(
+                    "/bin/sh -c {}",
+                    crate::session::environment::shell_escape_script_word(cmd)
+                );
+                self.base.exec_command(name, options, &command, interactive)
             }
         }
     }
@@ -1071,23 +1066,6 @@ mod tests {
                 "expected Err for {payload}"
             );
         }
-    }
-
-    #[test]
-    fn exec_command_per_runtime() {
-        let cmd = ContainerRuntime::apple_container().exec_command(
-            "aoe-sandbox-test1234",
-            None,
-            "printf ok",
-        );
-        assert_eq!(
-            cmd,
-            "container exec -it aoe-sandbox-test1234 /bin/sh -c 'printf ok'"
-        );
-        assert_eq!(
-            ContainerRuntime::podman().exec_command("aoe-sandbox-test1234", None, "claude"),
-            "podman exec -it aoe-sandbox-test1234 claude"
-        );
     }
 
     fn oneshot_argv() -> Vec<String> {

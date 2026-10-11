@@ -218,10 +218,16 @@ impl Instance {
         conversation_carry: Option<ConversationCarry>,
         expected: ConversationState,
     ) -> Result<PreparedLaunch> {
+        let publication = if restart {
+            self.prime_root_publication(true)
+        } else {
+            None
+        };
         if restart {
             self.kill_clean_locked()?;
         }
         if let Some(carry) = conversation_carry {
+            self.absorb_published_prime_session(publication);
             // Only the default conversation may be refreshed from a final
             // observation: under Use/Fork/Cleared the launch names a specific
             // conversation, and an outgoing sidecar must not rebind it
@@ -250,7 +256,7 @@ impl Instance {
         }
         let prepared = self.prepare_launch_command(expected)?;
         if restart {
-            return self.refresh_prepared_prime_launch_after_pane_stop(prepared);
+            return self.refresh_prepared_prime_launch_after_pane_stop(prepared, publication);
         }
         Ok(prepared)
     }
