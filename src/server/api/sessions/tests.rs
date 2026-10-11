@@ -3641,6 +3641,65 @@ async fn start_rechecks_the_stored_row() {
     }
 }
 
+/// The HTTP send boundary strips terminal control bytes from captured snippets before tmux input.
+#[tokio::test]
+#[serial_test::serial]
+async fn send_strips_bracketed_paste_escape_from_captured_snippet() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = make_test_instance();
+    inst.source_profile = "default".to_string();
+    Storage::new_unwatched("default")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let id = inst.id.clone();
+    let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+    let created = crate::tmux::tmux_command()
+        .args(["new-session", "-d", "-s", &pane, "cat"])
+        .status();
+    if !created.map(|status| status.success()).unwrap_or(false) {
+        eprintln!("tmux new-session failed; skipping");
+        return;
+    }
+    crate::tmux::refresh_session_cache();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let response = send_message(
+        State(state),
+        Path(id),
+        Ok(Json(SendMessageRequest {
+            message: "Captured snippet: prefix\x1b[200~code 雪\x1b[201~following text".to_string(),
+            revive: false,
+        })),
+    )
+    .await
+    .into_response();
+    let expected = "Captured snippet: prefixcode 雪following text";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let captured = loop {
+        let output = crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", &pane])
+            .output()
+            .expect("tmux capture-pane");
+        let captured = String::from_utf8_lossy(&output.stdout).into_owned();
+        if captured.contains(expected) || std::time::Instant::now() >= deadline {
+            break captured;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let _ = crate::tmux::tmux_command()
+        .args(["kill-session", "-t", &pane])
+        .output();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(captured.contains(expected), "{captured:?}");
+    assert!(!captured.contains('\x1b'), "{captured:?}");
+}
 /// #4116: web `/send` rechecks the stored row under the lifecycle lock, so a peer's archive or
 /// purge of a session with a live pane refuses the keystrokes, and an archive survives the send.
 #[tokio::test]

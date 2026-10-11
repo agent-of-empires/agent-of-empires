@@ -165,12 +165,34 @@ describe("MobileMainPane", () => {
     expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
   });
 
-  it("on send closes the dialog, clearing comments and the open file only when clearAfterSend is on", () => {
-    for (const clearAfterSend of [true, false]) {
+  it("shows the comments banner when there are comments", () => {
+    setup({
+      view: "diff",
+      commentsEnabled: true,
+      diffComments: { ...diffComments, count: 2 } as ReturnType<typeof useDiffComments>,
+    });
+    expect(screen.getByTestId("comments-banner")).toBeDefined();
+  });
+
+  it("renders the send dialog when open", () => {
+    setup({
+      view: "diff",
+      commentsEnabled: true,
+      sendDialogOpen: true,
+    });
+    expect(screen.getByTestId("send-dialog")).toBeDefined();
+  });
+
+  it("on send clears comments + drafts, closes dialog and file, and returns only terminal sessions to agent", () => {
+    for (const [view, returnsToAgent] of [
+      ["structured", false],
+      ["terminal", true],
+    ] as const) {
       const onCloseSendDialog = vi.fn();
       const onClearSelectedFile = vi.fn();
-      const store = makeStore({ clearAfterSend });
-      setup({
+      const store = makeStore({ clearAfterSend: true });
+      const { onBackToAgent } = setup({
+        activeSession: session({ view }),
         view: "diff",
         commentsEnabled: true,
         sendDialogOpen: true,
@@ -179,15 +201,27 @@ describe("MobileMainPane", () => {
         onClearSelectedFile,
       });
       fireEvent.click(screen.getByTestId("send-dialog"));
+      expect(store.clearComments).toHaveBeenCalled();
+      expect(store.setIntroDraft).toHaveBeenCalledWith("");
       expect(onCloseSendDialog).toHaveBeenCalled();
-      if (clearAfterSend) {
-        expect(store.clearComments).toHaveBeenCalled();
-        expect(store.setIntroDraft).toHaveBeenCalledWith("");
-        expect(onClearSelectedFile).toHaveBeenCalled();
-      } else {
-        expect(store.clearComments).not.toHaveBeenCalled();
-      }
+      expect(onClearSelectedFile).toHaveBeenCalled();
+      expect(onBackToAgent).toHaveBeenCalledTimes(returnsToAgent ? 1 : 0);
       cleanup();
     }
+  });
+
+  it("keeps comments when clearAfterSend is off while closing the dialog", () => {
+    const onCloseSendDialog = vi.fn();
+    const store = makeStore({ clearAfterSend: false });
+    setup({
+      view: "diff",
+      commentsEnabled: true,
+      sendDialogOpen: true,
+      diffComments: store,
+      onCloseSendDialog,
+    });
+    fireEvent.click(screen.getByTestId("send-dialog"));
+    expect(store.clearComments).not.toHaveBeenCalled();
+    expect(onCloseSendDialog).toHaveBeenCalled();
   });
 });

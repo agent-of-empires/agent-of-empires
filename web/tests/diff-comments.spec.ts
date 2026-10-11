@@ -4,7 +4,11 @@ import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { makePatch } from "./helpers/patch";
 
-// In-diff comments (#928, #1123): structured view only, saved to localStorage, sent as a structured body.
+// In-diff comments end-to-end against the @pierre/diffs renderer.
+// - Both structured and terminal sessions can annotate lines and ranges.
+// - Structured sends use a typed ACP prompt; terminal sends use the agent
+//   pane's session send endpoint with the assembled markdown.
+// - Comments persist to localStorage and reload back into the UI.
 
 const FILE_PATH = "src/example.ts";
 
@@ -226,11 +230,33 @@ test.describe("Diff comments (#928)", () => {
     await expect.poll(() => seenSignals).toContain("diff_comments");
   });
 
-  test("hides feature for non-structured view sessions", async ({ page }) => {
-    await setup(page, { structuredView: false });
+  test("terminal session annotates a diff and sends its feedback to the agent pane", async ({ page }) => {
+    await setup(page, { structuredView: false, acpWorkerState: "absent" });
+    let sent: { message?: string } | null = null;
+    await page.route("**/api/sessions/*/send", (r) => {
+      sent = JSON.parse(r.request().postData() || "{}");
+      return r.fulfill({ json: { sent: true } });
+    });
     await openSessionAndFile(page);
-    await startSingleLineComment(page, 3);
-    await expect(page.getByPlaceholder(/Leave a comment \(markdown supported\)/)).toHaveCount(0);
+    await selectRange(page, 3, 4);
+    const textarea = page.getByPlaceholder(/Leave a comment \(markdown supported\)/);
+    await expect(textarea).toBeVisible();
+    await textarea.fill("fix the greeting");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(page.getByText("lines 3-4 (new)").first()).toBeVisible();
+    const send = page.getByRole("button", { name: /^Send$/ }).first();
+    await expect(send).toBeEnabled();
+    await send.click();
+    await page.getByPlaceholder(/Anything you want to say/).fill("Review this:");
+    await page
+      .getByRole("button", { name: /^Send$/ })
+      .last()
+      .click();
+    await expect.poll(() => sent?.message).toContain("fix the greeting");
+    expect(sent?.message).toContain("src/example.ts");
+    expect(sent?.message).toContain("lines 3-4 (new)");
+    expect(sent?.message).toContain("Review this:");
+    await expect(page.getByText(/^1 comment$/)).toHaveCount(0);
   });
 
   // A dormant worker is woken by the send, so Send stays enabled.
