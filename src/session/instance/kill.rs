@@ -177,7 +177,9 @@ impl Instance {
             .context("failed to acquire instance kill lock")?;
         let mut lifecycle = self.clone();
         lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
-        match self.kill_locked() {
+        let killed = self.kill_locked();
+        self.release_scope();
+        match killed {
             Ok(()) => lifecycle.commit_lifecycle_status(
                 &storage,
                 LifecycleOperation::Stop,
@@ -276,6 +278,15 @@ impl Instance {
             );
         }
         self.kill_ancillary_tmux_sessions_locked();
+        self.release_scope();
+    }
+
+    /// Stops the session's scope, sweeping processes that escaped the pane.
+    /// Structured sessions are released by the ACP teardown.
+    pub(crate) fn release_scope(&self) {
+        if !self.is_structured() {
+            crate::process::systemd::release(&self.id);
+        }
     }
 
     pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) {
@@ -358,7 +369,9 @@ impl Instance {
             Some(Status::Stopped),
         )?;
         self.stop_poller();
-        let teardown = lifecycle.kill_locked().and_then(|()| {
+        let killed = lifecycle.kill_locked();
+        self.release_scope();
+        let teardown = killed.and_then(|()| {
             let mut current = storage
                 .load()?
                 .into_iter()

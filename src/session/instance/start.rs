@@ -315,6 +315,7 @@ impl Instance {
             profile,
             &prepared.launch_env.pane,
             &prepared.launch_env.container,
+            Some(&self.id),
         )?;
         if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
             crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(

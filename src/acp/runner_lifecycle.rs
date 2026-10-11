@@ -81,6 +81,9 @@ enum Phase {
 struct Entry {
     epoch: u64,
     phase: Phase,
+    /// An explicit stop, or a failed first launch, owes a scope sweep before
+    /// the settle. Kept through retries, so a reclaimed teardown sweeps too.
+    sweep_owed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +126,9 @@ pub trait ProcessControl: Send + Sync + 'static {
     fn is_alive(&self, pid: u32) -> bool;
     fn terminate_group(&self, pid: u32);
     fn kill_group(&self, pid: u32);
+    /// Stops every systemd scope of the session, sweeping processes that
+    /// escaped the runner's group. Blocking and bounded.
+    fn release_scope(&self, session_id: &str);
 }
 
 pub struct SystemProcessControl;
@@ -143,6 +149,10 @@ impl ProcessControl for SystemProcessControl {
         if pid != 0 {
             crate::process::worker::kill_process_group(pid);
         }
+    }
+
+    fn release_scope(&self, session_id: &str) {
+        crate::process::systemd::release(session_id);
     }
 }
 
@@ -253,6 +263,7 @@ impl LifecycleTable {
             Entry {
                 epoch,
                 phase: Phase::Starting { kind, cancel: None },
+                sweep_owed: false,
             },
         );
         Ok(self.lease(session_id, epoch))
@@ -276,6 +287,7 @@ impl LifecycleTable {
                 attempts: 0,
                 since: Instant::now(),
             };
+            entry.sweep_owed = true;
             return Err(InstallError::Cancelled { reason });
         }
         entry.phase = Phase::Running { identity };
@@ -331,12 +343,16 @@ impl LifecycleTable {
                     attempts: 0,
                     since: Instant::now(),
                 };
+                entry.sweep_owed = true;
                 StopDecision::TearDown {
                     lease: self.lease(session_id, epoch),
                     identity,
                 }
             }
-            Phase::Stopping { .. } | Phase::TeardownRetry { .. } => StopDecision::AlreadyStopping,
+            Phase::Stopping { .. } | Phase::TeardownRetry { .. } => {
+                entry.sweep_owed = true;
+                StopDecision::AlreadyStopping
+            }
         }
     }
 
@@ -354,6 +370,7 @@ impl LifecycleTable {
                     attempts: 0,
                     since: Instant::now(),
                 },
+                sweep_owed: true,
             },
         );
         Some(self.lease(session_id, epoch))
@@ -378,6 +395,27 @@ impl LifecycleTable {
                 };
             }
         }
+    }
+
+    /// Make the current stopping epoch sweep its scope before the settle.
+    pub fn owe_sweep(&mut self, lease: &Lease) {
+        if let Some(entry) = self.current(lease) {
+            if matches!(entry.phase, Phase::Stopping { .. }) {
+                entry.sweep_owed = true;
+            }
+        }
+    }
+
+    /// `settle`, unless this epoch owes a sweep: then the debt is taken,
+    /// nothing else changes, and the caller sweeps the scope before settling.
+    pub fn settle_unless_sweep_owed(&mut self, lease: &Lease, settlement: Settlement) -> bool {
+        if let Some(entry) = self.current(lease) {
+            if std::mem::take(&mut entry.sweep_owed) {
+                return false;
+            }
+        }
+        self.settle(lease, settlement);
+        true
     }
 
     /// Move a running worker into its respawn epoch.
@@ -414,6 +452,15 @@ impl LifecycleTable {
         ) {
             return false;
         }
+        // Only a pending stop owes the sweep: a failed respawn alone keeps
+        // its previous runner, which the session's scope glob also matches.
+        entry.sweep_owed = matches!(
+            &entry.phase,
+            Phase::Starting {
+                cancel: Some(_),
+                ..
+            } | Phase::Respawning { cancel: Some(_) }
+        );
         entry.phase = Phase::Stopping {
             attempts: 0,
             since: Instant::now(),
@@ -561,9 +608,11 @@ impl LifecycleTable {
 /// Scripted process control for lifecycle tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::ProcessControl;
+    use super::{ProcessControl, WorkerPhase};
     use std::collections::HashSet;
     use std::sync::Mutex;
+
+    type PhaseProbe = Box<dyn Fn(&str) -> WorkerPhase + Send + Sync>;
 
     #[derive(Default)]
     pub(crate) struct FakeProcessControl {
@@ -571,6 +620,10 @@ pub(crate) mod test_support {
         /// Pids that ignore SIGTERM and SIGKILL.
         immortal: Mutex<HashSet<u32>>,
         signals: Mutex<Vec<(u32, &'static str)>>,
+        terminated: tokio::sync::Notify,
+        /// Each scope release, with the session's phase at that moment.
+        releases: Mutex<Vec<(String, Option<WorkerPhase>)>>,
+        phase_probe: Mutex<Option<PhaseProbe>>,
     }
 
     impl FakeProcessControl {
@@ -593,6 +646,23 @@ pub(crate) mod test_support {
         pub(crate) fn signals(&self) -> Vec<(u32, &'static str)> {
             self.signals.lock().unwrap().clone()
         }
+
+        /// Resolves once a group was sent SIGTERM since the last call.
+        pub(crate) async fn terminated(&self) {
+            self.terminated.notified().await;
+        }
+
+        /// Record the lifecycle phase each release observes.
+        pub(crate) fn probe_phase(
+            &self,
+            probe: impl Fn(&str) -> WorkerPhase + Send + Sync + 'static,
+        ) {
+            *self.phase_probe.lock().unwrap() = Some(Box::new(probe));
+        }
+
+        pub(crate) fn releases(&self) -> Vec<(String, Option<WorkerPhase>)> {
+            self.releases.lock().unwrap().clone()
+        }
     }
 
     impl ProcessControl for FakeProcessControl {
@@ -605,6 +675,7 @@ pub(crate) mod test_support {
             if !self.immortal.lock().unwrap().contains(&pid) {
                 self.alive.lock().unwrap().remove(&pid);
             }
+            self.terminated.notify_one();
         }
 
         fn kill_group(&self, pid: u32) {
@@ -612,6 +683,19 @@ pub(crate) mod test_support {
             if !self.immortal.lock().unwrap().contains(&pid) {
                 self.alive.lock().unwrap().remove(&pid);
             }
+        }
+
+        fn release_scope(&self, session_id: &str) {
+            let phase = self
+                .phase_probe
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|p| p(session_id));
+            self.releases
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), phase));
         }
     }
 }

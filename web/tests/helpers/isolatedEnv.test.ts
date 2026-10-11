@@ -68,6 +68,13 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
 /** Every src/ environment read must be neutralized or explicitly safe to inherit. */
 const INHERITED_BY_CONTRACT = new Set([
   ...INHERITED_PATH_VARS,
+  // The host session bus, like XDG_RUNTIME_DIR a socket rather than data.
+  // `aoe list` and the scope setup only check that a user bus exists; specs
+  // seed `[systemd] enabled = false`, so nothing calls systemd through it.
+  "DBUS_SESSION_BUS_ADDRESS",
+  // systemd's id of the unit invocation; aoe only restores the caller's value
+  // after `systemd-run` overwrites it and resolves nothing from it.
+  "INVOCATION_ID",
   // Timing, tracing, and test switches. Their values are numbers or flags, so
   // a hostile one can slow a spec down but cannot point the daemon anywhere.
   "AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS",

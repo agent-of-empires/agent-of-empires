@@ -637,6 +637,13 @@
       "components": []
     },
     {
+      "id": "settings.systemd-persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
       "id": "settings.acp-persistence",
       "kind": "live-playwright",
       "risk": "high",
