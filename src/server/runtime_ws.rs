@@ -155,15 +155,19 @@ async fn run_read(
         return;
     };
     let runtime = &RUNTIME;
-    let (instances, cache, observed_at) = {
+    let (sessions, cache, observed_at) = {
         let instances = state.instances.read().await;
         let cache = state
             .runtime_read_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut rows = Vec::with_capacity(instances.len() + cache.alias_only_instances.len());
-        rows.extend(instances.iter().cloned());
-        rows.extend(cache.alias_only_instances.iter().cloned());
+        rows.extend(
+            instances
+                .iter()
+                .chain(cache.alias_only_instances.iter())
+                .map(SessionRead::from_instance),
+        );
         let metadata = super::reload::RuntimeReadCache {
             inventory: cache.inventory.clone(),
             alias_only_instances: Vec::new(),
@@ -177,7 +181,7 @@ async fn run_read(
             .flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sample = build_snapshot(runtime, &instances, owner, observed_at, &cache);
+        let sample = build_snapshot(runtime, sessions, owner, observed_at, &cache);
         (sample, admitted)
     })
     .await;
@@ -286,7 +290,7 @@ pub fn record_exchange(
     };
     let sampled = build_snapshot(
         &runtime,
-        instances,
+        instances.iter().map(SessionRead::from_instance).collect(),
         owner,
         pins.observed_at,
         &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -403,7 +407,7 @@ struct ProfileDisk {
 
 fn build_snapshot(
     runtime: &RuntimeState,
-    instances: &[Instance],
+    mut sessions: Vec<SessionRead>,
     owner: Owner,
     observed_at: DateTime<Utc>,
     cache: &super::reload::RuntimeReadCache,
@@ -412,10 +416,6 @@ fn build_snapshot(
     let local_owner = owner.is_local();
     let identity = &runtime.identity;
     let (freshness, cursor_revision) = publish_freshness(runtime, observed_at);
-
-    // Rows are projected before the disk reads so the session projection itself
-    // never runs behind a filesystem call.
-    let mut sessions: Vec<SessionRead> = instances.iter().map(SessionRead::from_instance).collect();
 
     let enumeration = super::reload::selectable_profiles();
     let enumeration_healthy = enumeration.is_ok();
@@ -758,18 +758,28 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead], listed: &HashSet<&str>) {
     }
 }
 
-/// Sever one edge of each scoped cycle in stored row order.
+/// Sever the first cycle entry reached from sorted starting rows.
 fn cycle_entries(parents: &mut HashMap<usize, usize>) -> HashSet<usize> {
+    use std::collections::hash_map::Entry;
+
     let mut entries = HashSet::new();
-    for start in parents.keys().copied().collect::<BTreeSet<_>>() {
-        let mut walked = HashSet::new();
+    let mut walked = HashMap::with_capacity(parents.len());
+    let mut starts: Vec<_> = parents.keys().copied().collect();
+    starts.sort_unstable();
+    for start in starts {
         let mut cursor = Some(start);
         while let Some(row) = cursor {
-            if !walked.insert(row) {
-                // Subsequent walks see the severed edge.
-                entries.insert(row);
-                parents.remove(&row);
-                break;
+            match walked.entry(row) {
+                Entry::Occupied(visit) => {
+                    if *visit.get() == start {
+                        entries.insert(row);
+                        parents.remove(&row);
+                    }
+                    break;
+                }
+                Entry::Vacant(visit) => {
+                    visit.insert(start);
+                }
             }
             cursor = parents.get(&row).copied();
         }
@@ -1122,7 +1132,10 @@ mod tests {
         empty_path.project_path.clear();
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &[session, empty_path],
+            [session, empty_path]
+                .iter()
+                .map(SessionRead::from_instance)
+                .collect(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1198,11 +1211,15 @@ mod tests {
         let instances = state.instances.read().await;
         let cache = state.runtime_read_cache.read().unwrap();
         let mut rows = Vec::with_capacity(instances.len() + cache.alias_only_instances.len());
-        rows.extend(instances.iter().cloned());
-        rows.extend(cache.alias_only_instances.iter().cloned());
+        rows.extend(
+            instances
+                .iter()
+                .chain(cache.alias_only_instances.iter())
+                .map(SessionRead::from_instance),
+        );
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &rows,
+            rows,
             Owner::remote(),
             Utc::now(),
             &cache,
@@ -1388,10 +1405,10 @@ mod tests {
         std::fs::create_dir_all(profiles.join("broken").join("projects.json"))
             .expect("a directory where the registry belongs: a read that cannot succeed");
         std::fs::create_dir_all(profiles.join("broken-groups").join("groups.json")).unwrap();
-        let instances = vec![instance("a", "main"), instance("b", "broken")];
+        let instances = [instance("a", "main"), instance("b", "broken")];
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &instances,
+            instances.iter().map(SessionRead::from_instance).collect(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1471,7 +1488,7 @@ mod tests {
 
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &[],
+            Vec::new(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1523,7 +1540,10 @@ mod tests {
 
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &[instance("a", "zeta")],
+            [instance("a", "zeta")]
+                .iter()
+                .map(SessionRead::from_instance)
+                .collect(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1602,10 +1622,10 @@ mod tests {
     #[serial_test::serial]
     fn emitted_frames_satisfy_the_client_wire_contract() {
         let _home = TempHome::new();
-        let instances = vec![instance("a", "main"), instance("b", "main")];
+        let instances = [instance("a", "main"), instance("b", "main")];
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &instances,
+            instances.iter().map(SessionRead::from_instance).collect(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1628,7 +1648,10 @@ mod tests {
         let _home = TempHome::new();
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &[instance("a", "main")],
+            [instance("a", "main")]
+                .iter()
+                .map(SessionRead::from_instance)
+                .collect(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1662,14 +1685,14 @@ mod tests {
         let runtime = RuntimeState::new();
         let first = build_snapshot(
             &runtime,
-            &[],
+            Vec::new(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
         let second = build_snapshot(
             &runtime,
-            &[],
+            Vec::new(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1691,7 +1714,7 @@ mod tests {
         runtime.sampler.lock().unwrap().successes = u64::MAX;
         let sampled = build_snapshot(
             &runtime,
-            &[],
+            Vec::new(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1778,10 +1801,10 @@ mod tests {
             trailing.project_path = "/repo/".into();
             let mut grouped = named("grouped", "main");
             grouped.group_path = key.into();
-            let instances = vec![named("a", "main"), orphan, trailing, grouped];
+            let instances = [named("a", "main"), orphan, trailing, grouped];
             let sampled = build_snapshot(
                 &RuntimeState::new(),
-                &instances,
+                instances.iter().map(SessionRead::from_instance).collect(),
                 Owner::remote(),
                 Utc::now(),
                 &crate::server::reload::RuntimeReadCache::accepted_inventory(),
@@ -1824,10 +1847,40 @@ mod tests {
         }
     }
 
-    /// A parent that names a row of another profile, and a cycle, are the two
-    /// relations the client refuses. Both are severed at the row that closes
-    /// them, and both choices are the same on every run. A parent that names no
-    /// row at all is neither: it is persisted state, and it is kept.
+    #[test]
+    fn cycle_entries_preserve_tree_entries_and_resolved_suffixes() {
+        let cases: &[(&[(usize, usize)], &[usize])] = &[
+            (&[], &[]),
+            (&[(0, 1), (1, 2)], &[]),
+            (&[(2, 1), (1, 0)], &[]),
+            (&[(0, 5), (1, 5), (5, 6)], &[]),
+            (&[(0, 9), (9, 7), (7, 8), (8, 9), (2, 8)], &[9]),
+            (&[(0, 1), (1, 0), (3, 4), (4, 3)], &[0, 3]),
+            (&[(2, 2), (usize::MAX, usize::MAX)], &[2, usize::MAX]),
+        ];
+        for &(edges, cuts) in cases {
+            let expected_cuts: HashSet<_> = cuts.iter().copied().collect();
+            let expected_parents: HashMap<_, _> = edges
+                .iter()
+                .copied()
+                .filter(|(row, _)| !expected_cuts.contains(row))
+                .collect();
+            for reversed in [false, true] {
+                let mut edges = edges.to_vec();
+                if reversed {
+                    edges.reverse();
+                }
+                let mut parents = edges.into_iter().collect();
+                assert_eq!(cycle_entries(&mut parents), expected_cuts);
+                assert_eq!(parents, expected_parents);
+            }
+        }
+        let mut chain: HashMap<_, _> = (0..4096).map(|row| (row, row + 1)).collect();
+        let unchanged = chain.clone();
+        assert!(cycle_entries(&mut chain).is_empty());
+        assert_eq!(chain, unchanged);
+    }
+
     #[test]
     fn cross_profile_parents_and_cycles_are_severed_at_the_closing_row() {
         let mut cross = row("a", Some("b"), "/repo");
@@ -1870,7 +1923,7 @@ mod tests {
         inst.pinned_at = Some("2026-01-02T03:04:06.5Z".parse().expect("timestamp"));
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            &[inst],
+            [inst].iter().map(SessionRead::from_instance).collect(),
             Owner::remote(),
             Utc::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),

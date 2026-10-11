@@ -42,6 +42,17 @@ pub(crate) fn effective_uid() -> u32 {
 pub(crate) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
     platform::metadata_identity(metadata)
 }
+pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::open_read_nonblocking(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) use linux::runtime_io;
 

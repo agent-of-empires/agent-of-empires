@@ -7,6 +7,15 @@ use std::process::Command;
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };
+pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
 pub(super) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
