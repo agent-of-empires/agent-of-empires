@@ -51,6 +51,13 @@ pub struct WorkerRecord {
 struct PurgeFence {
     source_profile: String,
     lifecycle_generation: u64,
+    /// Last runner identity observed while this purge fence was active. The
+    /// runner may remove its registry record before its whole process group
+    /// exits, so recovery must retain this evidence across retries.
+    #[serde(default)]
+    runner_pid: Option<u32>,
+    #[serde(default)]
+    runner_generation: Option<u64>,
 }
 
 impl WorkerRecord {
@@ -147,6 +154,8 @@ pub fn fence_for_purge(
         let fence = PurgeFence {
             source_profile: source_profile.to_string(),
             lifecycle_generation,
+            runner_pid: None,
+            runner_generation: None,
         };
         let bytes = serde_json::to_vec(&fence).context("serializing ACP purge fence")?;
         crate::session::atomic_write_verified(&purge_fence_path(session_id)?, &bytes)
@@ -634,7 +643,13 @@ fn signal_runner_if_owned(
             );
             (identity, expected_socket(&record))
         } else {
-            if expected_runner.is_some_and(|expected| expected.generation.is_some()) {
+            let fenced_identity = fence.as_ref().and_then(|current| {
+                current.runner_pid.map(|pid| RunnerIdentity {
+                    pid,
+                    generation: current.runner_generation,
+                })
+            });
+            if expected_runner.is_some_and(|expected| fenced_identity != Some(expected)) {
                 return Ok(None);
             }
             let base = socket_path_for(session_id)?;
@@ -648,18 +663,18 @@ fn signal_runner_if_owned(
                 (Some(pid), _) => (
                     RunnerIdentity {
                         pid,
-                        generation: None,
+                        generation: fenced_identity.and_then(|identity| identity.generation),
                     },
                     control,
                 ),
                 (None, Some(pid)) => (
                     RunnerIdentity {
                         pid,
-                        generation: None,
+                        generation: fenced_identity.and_then(|identity| identity.generation),
                     },
                     base,
                 ),
-                (None, None) => match expected_runner {
+                (None, None) => match fenced_identity.or(expected_runner) {
                     Some(identity) => (identity, control),
                     None => {
                         remove_runner_sockets(&base);
@@ -672,6 +687,26 @@ fn signal_runner_if_owned(
             }
             (identity, socket)
         };
+
+        if let Some(current) = fence.as_ref() {
+            let recorded = current.runner_pid.map(|pid| RunnerIdentity {
+                pid,
+                generation: current.runner_generation,
+            });
+            if let Some(recorded) = recorded {
+                anyhow::ensure!(
+                    recorded == identity,
+                    "ACP runner identity changed while purge fence was active"
+                );
+            } else {
+                let mut updated = current.clone();
+                updated.runner_pid = Some(identity.pid);
+                updated.runner_generation = identity.generation;
+                let bytes =
+                    serde_json::to_vec(&updated).context("serializing runner purge evidence")?;
+                crate::session::atomic_write_verified(&purge_fence_path(session_id)?, &bytes)?;
+            }
+        }
 
         match crate::process::worker::peer_pid_from_socket(&socket) {
             Some(peer) if peer == identity.pid => {}
@@ -1072,6 +1107,14 @@ mod tests {
                         generation,
                     ));
                 }
+                if let Some(marker) = std::env::var_os("AOE_TEST_CONTROL_RUNNER_SURVIVING_CHILD") {
+                    let child = std::process::Command::new("sh")
+                        .args(["-c", "trap '' TERM; sleep 30"])
+                        .spawn()
+                        .expect("spawn surviving process-group child");
+                    std::fs::write(marker, child.id().to_string())
+                        .expect("record surviving child PID");
+                }
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1083,6 +1126,7 @@ mod tests {
         session_id: &str,
         ignore_term: bool,
         self_delete_generation: Option<u64>,
+        surviving_child_marker: Option<&Path>,
     ) -> (ReapedChild, u32, PathBuf, PathBuf) {
         use std::os::unix::process::CommandExt as _;
 
@@ -1107,6 +1151,9 @@ mod tests {
             command
                 .env("AOE_TEST_CONTROL_RUNNER_SELF_DELETE", session_id)
                 .env("AOE_TEST_CONTROL_RUNNER_GENERATION", generation.to_string());
+        }
+        if let Some(marker) = surviving_child_marker {
+            command.env("AOE_TEST_CONTROL_RUNNER_SURVIVING_CHILD", marker);
         }
         if ignore_term {
             command.env("AOE_TEST_CONTROL_RUNNER_IGNORE_TERM", "1");
@@ -1313,7 +1360,7 @@ mod tests {
         let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let (mut child, pid, _control, marker) =
-            spawn_control_socket_runner("fenced-orphan", false, None);
+            spawn_control_socket_runner("fenced-orphan", false, None, None);
         let record = new_record(
             "fenced-orphan",
             pid,
@@ -1410,7 +1457,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let session_id = "socket-fallback";
         let (mut child, _pid, control, marker) =
-            spawn_control_socket_runner(session_id, false, None);
+            spawn_control_socket_runner(session_id, false, None, None);
         fence_for_purge(session_id, "profile", 4).unwrap();
 
         terminate_and_confirm_stopped(session_id, "profile", 4).unwrap();
@@ -1549,7 +1596,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let session_id = "kill-escalation";
         let (mut child, pid, _control, marker) =
-            spawn_control_socket_runner(session_id, true, None);
+            spawn_control_socket_runner(session_id, true, None, None);
         let record =
             new_record(session_id, pid, socket_path_for(session_id).unwrap()).with_generation(5);
         save(&record).unwrap();
@@ -1571,7 +1618,7 @@ mod tests {
         let session_id = "self-deleting-runner";
         let generation = 15;
         let (mut child, pid, _control, marker) =
-            spawn_control_socket_runner(session_id, false, Some(3));
+            spawn_control_socket_runner(session_id, false, Some(3), None);
         save(&new_record(session_id, pid, socket_path_for(session_id).unwrap()).with_generation(3))
             .unwrap();
         fence_for_purge(session_id, "profile", generation).unwrap();
@@ -1582,6 +1629,65 @@ mod tests {
         assert!(child.wait().unwrap().success());
         assert!(load(session_id).unwrap().is_none());
         assert!(!socket_exists(&socket_path_for(session_id).unwrap()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_preserves_fenced_identity_after_runner_self_deletes_with_live_descendant() {
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "self-child";
+        let generation = 16;
+        let child_marker = workers_dir().unwrap().join("child.pid");
+        let (mut child, pid, _control, marker) =
+            spawn_control_socket_runner(session_id, false, Some(generation), Some(&child_marker));
+        save(
+            &new_record(session_id, pid, socket_path_for(session_id).unwrap())
+                .with_generation(generation),
+        )
+        .unwrap();
+        fence_for_purge(session_id, "profile", generation).unwrap();
+
+        let first_error = terminate_and_confirm_stopped(session_id, "profile", generation)
+            .expect_err("a surviving descendant must keep the fenced identity live");
+        assert!(first_error
+            .to_string()
+            .contains("identity cannot be confirmed"));
+        assert!(marker.exists());
+        assert!(!record_path(session_id).unwrap().exists());
+        assert!(!socket_exists(&socket_path_for(session_id).unwrap()));
+        let child_pid = std::fs::read_to_string(&child_marker)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(is_pid_alive(child_pid));
+        assert!(crate::process::worker::is_process_group_alive(pid));
+
+        let second_error = terminate_and_confirm_stopped(session_id, "profile", generation)
+            .expect_err("a retry must not treat missing artifacts as an exited group");
+        assert!(second_error
+            .to_string()
+            .contains("identity cannot be confirmed"));
+        let fence = load_purge_fence_unlocked(session_id).unwrap().unwrap();
+        assert_eq!(fence.runner_pid, Some(pid));
+        assert_eq!(fence.runner_generation, Some(generation));
+        assert!(is_pid_alive(child_pid));
+
+        crate::process::worker::kill_process_group(pid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::process::worker::is_process_group_alive(pid)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!crate::process::worker::is_process_group_alive(pid));
+        terminate_and_confirm_stopped(session_id, "profile", generation).unwrap();
+        assert!(!record_path(session_id).unwrap().exists());
+        assert!(!socket_exists(&socket_path_for(session_id).unwrap()));
+        assert!(clear_purge_fence_if_owned(session_id, "profile", generation).unwrap());
+        assert!(child.wait().is_ok());
     }
 
     #[test]
