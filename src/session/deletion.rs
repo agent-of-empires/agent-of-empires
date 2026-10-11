@@ -4176,7 +4176,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        let _guard = isolate_app_dir();
+        let temp = tempfile::TempDir::with_prefix_in("aoe-purge-", "/tmp").unwrap();
+        let _guard = isolate_app_dir_at(temp.path());
         let profile = "purge-live-acp-recovery";
         let storage = Storage::new_unwatched(profile).unwrap();
         let (_temp, main_repo, worktree_path, mut instance) =

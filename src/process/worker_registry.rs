@@ -839,15 +839,15 @@ pub fn terminate_and_confirm_stopped(
                 }),
                 "ACP purge fence changed while terminating the runner"
             );
+            anyhow::ensure!(
+                !runner_group_alive(identity.pid),
+                "ACP runner process group {} became live before registry cleanup",
+                identity.pid
+            );
             if let Some(current) = load_strict_unlocked(session_id)? {
                 anyhow::ensure!(
                     identity.generation == Some(current.generation) && identity.pid == current.pid,
                     "ACP registry changed while terminating the fenced runner"
-                );
-            } else {
-                anyhow::ensure!(
-                    identity.generation.is_none(),
-                    "ACP registry disappeared while terminating the fenced runner"
                 );
             }
             delete_unlocked(session_id)?;
@@ -1061,6 +1061,17 @@ mod tests {
             }
             if CONTROL_RUNNER_TERMINATE.load(std::sync::atomic::Ordering::Relaxed) {
                 std::fs::write(marker, b"SIGTERM").expect("record graceful shutdown");
+                if let Some(session_id) = std::env::var_os("AOE_TEST_CONTROL_RUNNER_SELF_DELETE") {
+                    let generation = std::env::var("AOE_TEST_CONTROL_RUNNER_GENERATION")
+                        .expect("self-deleting runner generation")
+                        .parse::<u64>()
+                        .expect("valid self-deleting runner generation");
+                    assert!(delete_if_owned_by(
+                        session_id.to_string_lossy().as_ref(),
+                        std::process::id(),
+                        generation,
+                    ));
+                }
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1071,6 +1082,7 @@ mod tests {
     fn spawn_control_socket_runner(
         session_id: &str,
         ignore_term: bool,
+        self_delete_generation: Option<u64>,
     ) -> (ReapedChild, u32, PathBuf, PathBuf) {
         use std::os::unix::process::CommandExt as _;
 
@@ -1091,6 +1103,11 @@ mod tests {
             .env("AOE_TEST_CONTROL_RUNNER_SOCKET", &control)
             .env("AOE_TEST_CONTROL_RUNNER_MARKER", &marker)
             .process_group(0);
+        if let Some(generation) = self_delete_generation {
+            command
+                .env("AOE_TEST_CONTROL_RUNNER_SELF_DELETE", session_id)
+                .env("AOE_TEST_CONTROL_RUNNER_GENERATION", generation.to_string());
+        }
         if ignore_term {
             command.env("AOE_TEST_CONTROL_RUNNER_IGNORE_TERM", "1");
         }
@@ -1296,7 +1313,7 @@ mod tests {
         let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let (mut child, pid, _control, marker) =
-            spawn_control_socket_runner("fenced-orphan", false);
+            spawn_control_socket_runner("fenced-orphan", false, None);
         let record = new_record(
             "fenced-orphan",
             pid,
@@ -1392,7 +1409,8 @@ mod tests {
         let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let session_id = "socket-fallback";
-        let (mut child, _pid, control, marker) = spawn_control_socket_runner(session_id, false);
+        let (mut child, _pid, control, marker) =
+            spawn_control_socket_runner(session_id, false, None);
         fence_for_purge(session_id, "profile", 4).unwrap();
 
         terminate_and_confirm_stopped(session_id, "profile", 4).unwrap();
@@ -1530,7 +1548,8 @@ mod tests {
         let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let session_id = "kill-escalation";
-        let (mut child, pid, _control, marker) = spawn_control_socket_runner(session_id, true);
+        let (mut child, pid, _control, marker) =
+            spawn_control_socket_runner(session_id, true, None);
         let record =
             new_record(session_id, pid, socket_path_for(session_id).unwrap()).with_generation(5);
         save(&record).unwrap();
@@ -1541,6 +1560,28 @@ mod tests {
         assert!(!marker.exists(), "SIGKILL follows the SIGTERM grace period");
         assert!(!child.wait().unwrap().success());
         assert!(load(session_id).unwrap().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn purge_succeeds_when_runner_removes_its_record_before_exit() {
+        let temp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_id = "self-deleting-runner";
+        let generation = 15;
+        let (mut child, pid, _control, marker) =
+            spawn_control_socket_runner(session_id, false, Some(3));
+        save(&new_record(session_id, pid, socket_path_for(session_id).unwrap()).with_generation(3))
+            .unwrap();
+        fence_for_purge(session_id, "profile", generation).unwrap();
+
+        terminate_and_confirm_stopped(session_id, "profile", generation).unwrap();
+
+        assert!(marker.exists());
+        assert!(child.wait().unwrap().success());
+        assert!(load(session_id).unwrap().is_none());
+        assert!(!socket_exists(&socket_path_for(session_id).unwrap()));
     }
 
     #[test]

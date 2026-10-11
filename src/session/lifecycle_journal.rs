@@ -169,6 +169,24 @@ fn journal_dir_for(sessions_path: &Path) -> PathBuf {
         .join(JOURNAL_DIR_NAME)
 }
 
+pub(crate) fn deletion_exists(
+    sessions_path: &Path,
+    session_id: &str,
+    generation: u64,
+) -> Result<bool> {
+    let session_id_hex = session_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path =
+        journal_dir_for(sessions_path).join(format!("delete-{generation}-{session_id_hex}.json"));
+    match read_deletion(&path)? {
+        Some(entry) => Ok(entry.session_id == session_id && entry.generation == generation),
+        None => Ok(false),
+    }
+}
+
 pub(crate) fn record(entry: &LifecycleJournalEntry) -> Result<PathBuf> {
     let dir = journal_dir_for(&entry.sessions_path);
     let session_id_hex = entry
