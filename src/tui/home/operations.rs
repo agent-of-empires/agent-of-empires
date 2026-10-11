@@ -920,7 +920,9 @@ impl HomeView {
         };
         let inst = result.instance;
         self.deletes_in_flight.remove(&inst.id);
-        self.failed_deletes.remove(&inst.id);
+        if should_clear_drop_retry_state(&result.dropped, &inst, self.instances.get(&inst.id)) {
+            self.failed_deletes.remove(&inst.id);
+        }
         match result.dropped {
             Ok(true) => {
                 self.instances.shift_remove(&inst.id);
@@ -2469,6 +2471,17 @@ pub(super) fn perform_drop(request: DropRequest) -> DropResult {
     }
 }
 
+fn should_clear_drop_retry_state(
+    dropped: &anyhow::Result<bool>,
+    requested: &Instance,
+    current: Option<&Instance>,
+) -> bool {
+    matches!(dropped, Ok(true))
+        || !current.is_some_and(|current| {
+            requested.trashed_at.is_some() && current.trashed_at == requested.trashed_at
+        })
+}
+
 /// Tear down a removed session's tmux and sandbox off-thread so a hung call cannot block
 /// input.
 fn spawn_force_teardown(inst: Instance) {
@@ -2500,6 +2513,58 @@ fn spawn_force_teardown(inst: Instance) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn trashed_instance(trashed_at: chrono::DateTime<chrono::Utc>) -> Instance {
+        let mut instance = Instance::new("trashed", "/tmp/trashed");
+        instance.trashed_at = Some(trashed_at);
+        instance
+    }
+
+    #[test]
+    fn drop_retry_state_survives_failed_or_declined_removal() {
+        let trashed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("fixed test timestamp is valid");
+        let requested = trashed_instance(trashed_at);
+        let current = trashed_instance(trashed_at);
+
+        assert!(!should_clear_drop_retry_state(
+            &Err(anyhow::anyhow!("storage error")),
+            &requested,
+            Some(&current),
+        ));
+        assert!(!should_clear_drop_retry_state(
+            &Ok(false),
+            &requested,
+            Some(&current),
+        ));
+    }
+
+    #[test]
+    fn drop_retry_state_clears_after_success_or_lifecycle_change() {
+        let trashed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("fixed test timestamp is valid");
+        let requested = trashed_instance(trashed_at);
+        let current = trashed_instance(trashed_at);
+        let restored = Instance::new("trashed", "/tmp/trashed");
+        let re_trashed = trashed_instance(trashed_at + chrono::Duration::seconds(1));
+
+        assert!(should_clear_drop_retry_state(
+            &Ok(true),
+            &requested,
+            Some(&current),
+        ));
+        assert!(should_clear_drop_retry_state(
+            &Ok(false),
+            &requested,
+            Some(&restored),
+        ));
+        assert!(should_clear_drop_retry_state(
+            &Err(anyhow::anyhow!("storage error")),
+            &requested,
+            Some(&re_trashed),
+        ));
+        assert!(should_clear_drop_retry_state(&Ok(false), &requested, None,));
+    }
 
     // An Idle sandbox session whose container is still running is the #1927 follow-up:
     // the worktree dir is an active bind-mount source, so `git worktree move` fails with
