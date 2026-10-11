@@ -1288,6 +1288,13 @@
       "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
     },
     {
+      "id": "wizard.scratch-resolves-configured-default-profile",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-create.spec.ts"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
+    },
+    {
       "id": "wizard.recent-hides-workspaces",
       "kind": "vitest",
       "risk": "medium",

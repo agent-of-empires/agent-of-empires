@@ -5,7 +5,13 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { listSessions, seedSessionViaAoeAdd, waitForSessions, waitForView } from "../helpers/aoeServe";
+import {
+  listSessions,
+  resolveAoeBinary,
+  seedSessionViaAoeAdd,
+  waitForSessions,
+  waitForView,
+} from "../helpers/aoeServe";
 import { postPrompt, startAcpSession, waitForReplayContains, waitForStructuredView } from "../helpers/acp";
 import { gitEnv, initWorkingRepo } from "../helpers/gitFixture";
 
@@ -100,10 +106,27 @@ test.describe("wizard", () => {
 // #1324
 test.describe("scratch sessions", () => {
   test("deleting a scratch session removes its scratch dir", async ({ page, spawnServe }) => {
-    const serve = await spawnServe();
+    const profile = "scratch-owner";
+    const serve = await spawnServe({
+      seedFn: ({ env }) => {
+        for (const args of [
+          ["profile", "create", profile],
+          ["profile", "default", profile],
+        ]) {
+          const result = spawnSync(resolveAoeBinary(), args, { env, encoding: "utf8" });
+          expect(result.status, result.stderr).toBe(0);
+        }
+      },
+    });
     const wizard = await openWizard(page, serve);
     await pickScratch(wizard);
+    const createPromise = page.waitForResponse(
+      (res) => res.url().endsWith("/api/sessions") && res.request().method() === "POST",
+    );
     await wizard.getByRole("button", { name: /Launch session/ }).click();
+    const createRes = await createPromise;
+    expect(createRes.status()).toBe(201);
+    expect(((await createRes.json()) as { profile: string }).profile).toBe(profile);
     const [created] = await waitForSessions(serve.baseUrl);
     const projectPath = created!.project_path as string;
     expect(existsSync(projectPath)).toBe(true);

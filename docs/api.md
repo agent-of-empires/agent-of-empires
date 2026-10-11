@@ -82,6 +82,8 @@ A daemon older than this field omits it, so treat an absent `context_resume` as 
 
 Creates a session. Pass `?wait=ready` to block until the new session's status leaves `Starting` (bounded at 10s); the response `status` reports whatever it actually reached, including `Error`, so a timeout does not mean success.
 
+When `profile` is omitted, creation uses the server's selected profile or the configured default. An explicitly empty `profile` is rejected.
+
 ```json
 {
   "path": "/path/to/repo",
