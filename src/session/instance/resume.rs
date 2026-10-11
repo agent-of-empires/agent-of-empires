@@ -245,7 +245,7 @@ impl Instance {
             if let Some(binding) = excluded {
                 self.retroactive_capture_excludes.remove(&binding);
             }
-            prepared.carry_relocated = relocated;
+            prepared.require_conversation_publication |= relocated;
             return Ok(prepared);
         }
         let prepared = self.prepare_launch_command(expected)?;
@@ -793,7 +793,7 @@ mod tests {
                 "test",
                 inst.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.resolved_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))

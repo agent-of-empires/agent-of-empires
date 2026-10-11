@@ -1025,7 +1025,7 @@ impl AgentDef {
         command: &std::process::Command,
     ) -> Option<&'static str> {
         let flag = self.session_name_flag()?;
-        agent_help_advertises(command, flag).then_some(flag)
+        with_agent_help(command, false, |help| help_advertises_flag(help, flag)).then_some(flag)
     }
 
     pub fn launch_base_command(&self) -> String {
@@ -1606,6 +1606,40 @@ pub fn oneshot_capable_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn naming_reprobes_success_without_losing_context_failure_cooldown() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("claude");
+        let response = directory.path().join("help");
+        let probes = directory.path().join("probes");
+        std::fs::write(&program, "#!/bin/sh\nprintf '%s\\n' \"$AOE_SESSION_SOURCE\" >> \"$HELP_PROBES\"\ncat \"$HELP_RESPONSE\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = get_agent("claude").unwrap();
+        let mut command = std::process::Command::new(&program);
+        command
+            .current_dir(directory.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HELP_RESPONSE", &response)
+            .env("HELP_PROBES", &probes)
+            .env("AOE_SESSION_SOURCE", "failed-launch");
+        std::fs::write(&response, "").unwrap();
+        assert_eq!(agent.supported_session_name_flag(&command), None);
+        std::fs::write(&response, "--name <name>\n").unwrap();
+        assert_eq!(agent.supported_session_name_flag(&command), None);
+        command.env("AOE_SESSION_SOURCE", "fresh-launch");
+        assert_eq!(agent.supported_session_name_flag(&command), Some("--name"));
+        std::fs::write(&response, "--other <value>\n").unwrap();
+        assert_eq!(agent.supported_session_name_flag(&command), None);
+        std::fs::write(&response, "--name <name>\n").unwrap();
+        assert_eq!(agent.supported_session_name_flag(&command), Some("--name"));
+        assert_eq!(
+            std::fs::read_to_string(probes).unwrap(),
+            "failed-launch\nfresh-launch\nfresh-launch\nfresh-launch\n"
+        );
+    }
     #[test]
     fn acp_transcript_cli_resumable_only_for_claude_pairings() {
         assert!(acp_transcript_cli_resumable("claude", "claude"));

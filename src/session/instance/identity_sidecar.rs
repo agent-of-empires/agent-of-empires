@@ -708,7 +708,7 @@ pi = "~/.pi-personal"
                 "test",
                 crate::agents::get_agent("pi"),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     crate::agents::get_agent("pi"),
                     declared
                         .default_selector_agent()
@@ -870,7 +870,7 @@ pi = "~/.pi-personal"
                 "test",
                 crate::agents::get_agent("pi"),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     crate::agents::get_agent("pi"),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -895,7 +895,7 @@ pi = "~/.pi-personal"
                 "test",
                 crate::agents::get_agent("pi"),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))

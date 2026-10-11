@@ -43,7 +43,7 @@ impl Instance {
     fn acquire_session_id(
         &mut self,
         execution: Option<&super::execution::NativeExecution>,
-        launch_context: super::execution::AgentLaunchContext<'_>,
+        launch_context: &super::execution::AgentLaunchContext<'_>,
     ) -> (Option<String>, bool, bool) {
         let backend = execution.map_or_else(
             || self.default_selector_backend(),
@@ -86,7 +86,7 @@ impl Instance {
             let sid = crate::session::capture::preassign_opencode_session_id(
                 cwd,
                 command,
-                launch_context.generation,
+                launch_context.generation(),
             );
             native_created.set(sid.is_some());
             sid
@@ -277,7 +277,7 @@ impl Instance {
         }
     }
 
-    /// mirrors with the same binary.
+    /// Preassignment requires a directly mirrorable host OpenCode launch.
     fn opencode_preassign_enabled(&self) -> bool {
         !self.is_sandboxed()
             && crate::session::config::profile_config::resolve_config_or_warn(
@@ -300,7 +300,7 @@ impl Instance {
         execution: Option<&super::execution::NativeExecution>,
         parent_id: &str,
         expected: &mut ConversationState,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.opencode_store_fork_available(execution),
             "a fork through the agent's store needs a host launch of opencode itself"
@@ -330,7 +330,7 @@ impl Instance {
         self.set_agent_conversation(
             Some(child.clone()),
             Some(crate::session::ConversationBinding {
-                session_id: child.clone(),
+                session_id: child,
                 execution: Some(execution.binding.clone()),
                 provenance: crate::session::ConversationProvenance::Observed,
                 transcript_path: None,
@@ -345,17 +345,11 @@ impl Instance {
                 "the adopted fork child could not be written to the durable row; \
                  a retry before the launch publishes may fork the conversation again");
         }
-        Ok(child)
+        Ok(())
     }
 
-    /// The child a store fork already adopted for THIS launch. Returns `None`
-    /// until one is, so the first pass asks the store and a later one reuses it.
-    ///
-    /// An `Observed` binding outlives the launch, being the row's native
-    /// identity, so a child counts as this launch's only while the conversation
-    /// was branched from a different id. Otherwise forking an already-forked
-    /// session would hand back the first fork's child instead of branching.
-    pub(super) fn stored_fork_child(&self) -> Option<String> {
+    /// Only an observed child of a different pending Fork target can be reused.
+    pub(super) fn stored_fork_child(&self) -> Option<&str> {
         let binding = self.agent_session_binding.as_ref()?;
         (binding.provenance == crate::session::ConversationProvenance::Observed
             && Some(binding.session_id.as_str()) == self.agent_session_id.as_deref()
@@ -364,7 +358,7 @@ impl Instance {
                 .resume_binding
                 .as_ref()
                 .is_some_and(|parent| parent.session_id != binding.session_id))
-        .then(|| binding.session_id.clone())
+        .then_some(binding.session_id.as_str())
     }
     /// A store fork runs `opencode serve` against the launch's own store, so it
     /// needs a host launch that invokes the resolved binary directly and shares
@@ -640,7 +634,7 @@ impl Instance {
         context: &str,
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
-        launch_context: super::execution::AgentLaunchContext<'_>,
+        launch_context: &super::execution::AgentLaunchContext<'_>,
         expected: &mut ConversationState,
     ) -> Result<bool> {
         let agent = execution
@@ -691,7 +685,7 @@ impl Instance {
                 !(self.is_sandboxed() && agent.spans_agent_generations),
                 "OpenCode forks require a host launch; sandbox forks are unsupported"
             );
-            let generation = launch_context.generation;
+            let generation = launch_context.generation();
             if generation == crate::agents::AgentGeneration::Unknown {
                 anyhow::bail!(
                     "{} --help did not answer, so it is unknown whether this build forks \
@@ -705,27 +699,13 @@ impl Instance {
                 .resolve(generation)
                 .expect("the unknown generation bailed above");
             if matches!(fork_strategy, crate::agents::ForkStrategy::ServeFork) {
-                // A restart prepares the command twice, and asking the store
-                // again would leave a second conversation behind in the user's
-                // history, so an adopted child is reused. The intent stays a
-                // fork: `refresh_prepared_prime_launch_after_pane_stop` resets
-                // the conversation to the pre-fork seed, and promoting it here
-                // would send that reset straight to the command line.
-                let child_id = match self.stored_fork_child() {
-                    Some(adopted) => adopted,
-                    None => self
-                        .fork_session_in_store(execution, &from, expected)
-                        .with_context(|| {
-                            format!(
-                                "{} could not fork this conversation, so the fork was \
-                                 refused rather than started as a fresh session",
-                                agent.name
-                            )
-                        })?,
-                };
+                if self.stored_fork_child().is_none() {
+                    self.fork_session_in_store(execution, &from, expected)
+                        .with_context(|| format!("{} could not fork this conversation, so the fork was refused rather than started as a fresh session", agent.name))?;
+                }
                 append_resume_flags(
                     agent.name,
-                    Some(child_id.as_str()),
+                    self.agent_session_id.as_deref(),
                     false,
                     cmd,
                     parsed_command.executable_end,
@@ -857,7 +837,7 @@ impl Instance {
             let generation = if native_created {
                 crate::agents::AgentGeneration::Current
             } else {
-                launch_context.generation
+                launch_context.generation()
             };
             match generation {
                 crate::agents::AgentGeneration::Current => cmd.push_str(" --standalone"),
@@ -985,7 +965,7 @@ mod tests {
                 "test",
                 Some(agent),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     Some(agent),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1066,7 +1046,7 @@ mod tests {
             inst.resume_intent = intent;
             let (sid, existing, _) = inst.acquire_session_id(
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1103,7 +1083,7 @@ mod tests {
                 "test",
                 crate::agents::get_agent("claude"),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1124,7 +1104,7 @@ mod tests {
         let mut inst = tool_instance("claude", "/tmp/test");
         let (first, first_existing, _) = inst.acquire_session_id(
             None,
-            super::execution::AgentLaunchContext::host(
+            &super::execution::AgentLaunchContext::host(
                 inst.default_selector_agent(),
                 inst.default_selector_agent()
                     .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1136,7 +1116,7 @@ mod tests {
         // With no transcript on disk the same id stays fresh-pinned.
         let (sid, existing, _) = inst.acquire_session_id(
             None,
-            super::execution::AgentLaunchContext::host(
+            &super::execution::AgentLaunchContext::host(
                 inst.default_selector_agent(),
                 inst.default_selector_agent()
                     .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1153,7 +1133,7 @@ mod tests {
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     fresh.default_selector_agent(),
                     fresh
                         .default_selector_agent()
@@ -1171,7 +1151,7 @@ mod tests {
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     fresh.default_selector_agent(),
                     fresh
                         .default_selector_agent()
@@ -1213,7 +1193,7 @@ mod tests {
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1239,7 +1219,7 @@ mod tests {
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1261,7 +1241,7 @@ mod tests {
                     "test",
                     None,
                     None,
-                    super::execution::AgentLaunchContext::host(
+                    &super::execution::AgentLaunchContext::host(
                         inst.default_selector_agent(),
                         inst.default_selector_agent()
                             .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1288,7 +1268,7 @@ mod tests {
                     "test",
                     None,
                     None,
-                    super::execution::AgentLaunchContext::host(
+                    &super::execution::AgentLaunchContext::host(
                         inst.default_selector_agent(),
                         inst.default_selector_agent()
                             .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1310,7 +1290,7 @@ mod tests {
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1393,7 +1373,7 @@ work-opencode = "opencode"
             assert!(inst.supports_session_poller(), "{tool} lost its publisher");
             let (sid, existing, _) = inst.acquire_session_id(
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1410,7 +1390,7 @@ work-opencode = "opencode"
                         "test",
                         None,
                         None,
-                        super::execution::AgentLaunchContext::host(
+                        &super::execution::AgentLaunchContext::host(
                             inst.default_selector_agent(),
                             inst.default_selector_agent()
                                 .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1432,7 +1412,7 @@ work-opencode = "opencode"
                         "test",
                         None,
                         None,
-                        super::execution::AgentLaunchContext::host(
+                        &super::execution::AgentLaunchContext::host(
                             fresh.default_selector_agent(),
                             fresh
                                 .default_selector_agent()
@@ -1564,7 +1544,7 @@ work-opencode = "opencode"
             crate::session::ConversationProvenance::Observed,
         );
         assert_eq!(
-            inst.stored_fork_child().as_deref(),
+            inst.stored_fork_child(),
             Some(child),
             "a second pass must open the adopted child, not mint another"
         );
@@ -1623,7 +1603,7 @@ work-opencode = "opencode"
                 Some(agent),
                 host.host_agent_command(agent, None).as_ref()
             )
-            .generation,
+            .generation(),
             crate::agents::AgentGeneration::Legacy,
             "the host launch reads the stub's own answer"
         );
@@ -1637,32 +1617,23 @@ work-opencode = "opencode"
             from: "ses_1111111111111111111111111111aaaa".to_string(),
         };
         sandboxed.agent_session_id = Some("ses_2222222222222222222222222222bbbb".to_string());
+        let initial = sandboxed.conversation_state();
         let mut command = "opencode".to_string();
         for generation in [
             crate::agents::AgentGeneration::Legacy,
             crate::agents::AgentGeneration::Current,
             crate::agents::AgentGeneration::Unknown,
         ] {
-            let error = sandboxed
-                .apply_session_flags(
-                    &mut command,
-                    "sandbox fork",
-                    Some(agent),
-                    None,
-                    super::execution::AgentLaunchContext {
-                        generation,
-                        host_command: None,
-                    },
-                    &mut sandboxed.conversation_state(),
-                )
-                .unwrap_err();
-            assert!(
-                error
-                    .root_cause()
-                    .to_string()
-                    .contains("sandbox forks are unsupported"),
-                "{error:#}"
+            let result = sandboxed.apply_session_flags(
+                &mut command,
+                "sandbox fork",
+                Some(agent),
+                None,
+                &super::execution::AgentLaunchContext::resolved(generation),
+                &mut sandboxed.conversation_state(),
             );
+            assert!(result.is_err());
+            assert!(initial.matches(&sandboxed));
             assert_eq!(command, "opencode", "a refused fork must not alter argv");
         }
     }
@@ -1793,7 +1764,7 @@ work-opencode = "opencode"
 
         let (session_id, is_existing, _) = reloaded.acquire_session_id(
             None,
-            super::execution::AgentLaunchContext::host(
+            &super::execution::AgentLaunchContext::host(
                 reloaded.default_selector_agent(),
                 reloaded
                     .default_selector_agent()
@@ -1833,7 +1804,7 @@ work-opencode = "opencode"
                     "test",
                     crate::agents::get_agent(tool),
                     None,
-                    super::execution::AgentLaunchContext::host(
+                    &super::execution::AgentLaunchContext::host(
                         inst.default_selector_agent(),
                         inst.default_selector_agent()
                             .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1859,7 +1830,7 @@ work-opencode = "opencode"
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     automatic_copilot.default_selector_agent(),
                     automatic_copilot
                         .default_selector_agent()
@@ -1881,7 +1852,7 @@ work-opencode = "opencode"
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     host_prime.default_selector_agent(),
                     host_prime
                         .default_selector_agent()
@@ -1957,7 +1928,7 @@ work-opencode = "opencode"
                 "test",
                 wrapped.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     wrapped.default_selector_agent(),
                     wrapped
                         .default_selector_agent()
@@ -1990,7 +1961,7 @@ work-opencode = "opencode"
                 "test",
                 direct.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     direct.default_selector_agent(),
                     direct
                         .default_selector_agent()
@@ -2019,7 +1990,7 @@ work-opencode = "opencode"
                 "test",
                 qualified.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     qualified.default_selector_agent(),
                     qualified
                         .default_selector_agent()
@@ -2050,7 +2021,7 @@ work-opencode = "opencode"
                     "test",
                     bare.resolved_agent(),
                     None,
-                    super::execution::AgentLaunchContext::host(
+                    &super::execution::AgentLaunchContext::host(
                         bare.default_selector_agent(),
                         bare.default_selector_agent()
                             .and_then(|agent| bare.host_agent_command(agent, None))
@@ -2077,7 +2048,7 @@ work-opencode = "opencode"
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -2118,7 +2089,7 @@ work-opencode = "opencode"
                     "test",
                     None,
                     None,
-                    super::execution::AgentLaunchContext::host(
+                    &super::execution::AgentLaunchContext::host(
                         inst.default_selector_agent(),
                         inst.default_selector_agent()
                             .and_then(|agent| inst.host_agent_command(agent, None))
@@ -2148,7 +2119,7 @@ work-opencode = "opencode"
                         "test",
                         None,
                         None,
-                        super::execution::AgentLaunchContext::host(
+                        &super::execution::AgentLaunchContext::host(
                             None,
                             managed
                                 .default_selector_agent()
@@ -2178,7 +2149,7 @@ work-opencode = "opencode"
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     external.default_selector_agent(),
                     external
                         .default_selector_agent()
@@ -2200,7 +2171,7 @@ work-opencode = "opencode"
                 "test",
                 value_token.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     value_token.default_selector_agent(),
                     value_token
                         .default_selector_agent()
@@ -2225,7 +2196,7 @@ work-opencode = "opencode"
                 "test",
                 alias.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     alias.default_selector_agent(),
                     alias
                         .default_selector_agent()
@@ -2292,7 +2263,7 @@ work-opencode = "opencode"
                 "test",
                 inst.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -2345,7 +2316,7 @@ work-opencode = "opencode"
                 "test",
                 None,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -2511,7 +2482,7 @@ work-opencode = "opencode"
                 let dir = sidecar.map(|sid| write_sidecar(&inst.id, sid));
                 let acquired = inst.acquire_session_id(
                     None,
-                    super::execution::AgentLaunchContext::host(
+                    &super::execution::AgentLaunchContext::host(
                         inst.default_selector_agent(),
                         inst.default_selector_agent()
                             .and_then(|agent| inst.host_agent_command(agent, None))
@@ -2597,7 +2568,7 @@ work-opencode = "opencode"
                     .unwrap_or_default();
                 let (sid, existing, _) = inst.acquire_session_id(
                     None,
-                    super::execution::AgentLaunchContext::host(
+                    &super::execution::AgentLaunchContext::host(
                         inst.default_selector_agent(),
                         inst.default_selector_agent()
                             .and_then(|agent| inst.host_agent_command(agent, None))

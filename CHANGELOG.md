@@ -4,6 +4,15 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **opencode:** Resolve unbound shim approval flags after login, bypass proxies for authenticated loopback control, and complete bounded server-group shutdown before returning.
+- **session:** Require durable publication of adopted OpenCode fork children before reporting launch success.
+- **agents:** Avoid retaining successful first-launch naming probes and their unique environments.
+- **acp:** Recover the newest nonempty OpenCode error across both message layouts.
+
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 
 

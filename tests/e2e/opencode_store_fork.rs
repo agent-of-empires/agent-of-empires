@@ -459,6 +459,8 @@ fn opencode_host_launch_preserves_login_or_managed_environment() {
     for (mode, managed, inherit) in [
         ("current", false, false),
         ("legacy", false, false),
+        ("shim-current", false, true),
+        ("shim-legacy", false, true),
         ("external", false, false),
         ("current", true, false),
         ("current", true, true),
@@ -481,7 +483,9 @@ fn opencode_host_launch_preserves_login_or_managed_environment() {
         let wrong = h.home_path().join("wrong");
         fs::create_dir(&wrong).unwrap();
         let output = h.home_path().join("frontend.json");
-        let engine = if mode == "wrapper" {
+        let unbound_shim = mode.starts_with("shim-");
+        let initially_legacy = matches!(mode, "legacy" | "shim-legacy");
+        let engine = if mode == "wrapper" || unbound_shim {
             "engine"
         } else {
             "opencode"
@@ -490,14 +494,14 @@ fn opencode_host_launch_preserves_login_or_managed_environment() {
         h.set_env("SHELL", "/bin/bash");
         h.set_env("LOGIN_GENERATION", "captured");
         h.set_env("LOGIN_ENGINE", bin.join("engine").to_str().unwrap());
-        declare_host_environment(
-            &h,
-            &[
-                format!("LOGIN_ENGINE={}", bin.join("engine").display()),
-                "OPENCODE_PERMISSION=captured-user-policy".into(),
-                "REVIEW_DECLARED=explicit".into(),
-            ],
-        );
+        let mut declared = vec![
+            "OPENCODE_PERMISSION=captured-user-policy".into(),
+            "REVIEW_DECLARED=explicit".into(),
+        ];
+        if !unbound_shim {
+            declared.push(format!("LOGIN_ENGINE={}", bin.join("engine").display()));
+        }
+        declare_host_environment(&h, &declared);
         h.set_env("REVIEW_DECLARED", "ambient");
         h.set_env("AOE_REVIEW_INTERNAL", "fixture");
         h.set_env("OPENAI_API_KEY", "dummy-parent-key");
@@ -515,7 +519,7 @@ fn opencode_host_launch_preserves_login_or_managed_environment() {
         );
         h.set_env(std::ffi::OsStr::from_bytes(b"AOE_REVIEW_\xff"), "fixture");
         for directory in [&bin, &wrong] {
-            let legacy = (mode == "legacy") != (directory == &wrong);
+            let legacy = initially_legacy != (directory == &wrong);
             let help = if legacy { "--fork" } else { "--auto" };
             let script = format!(
                 r#"#!{python}
@@ -534,11 +538,14 @@ for line in sys.stdin: pass
                 output = output.to_str().unwrap()
             );
             crate::harness::write_executable(&directory.join(engine), &script);
-            if mode == "wrapper" {
+            if mode == "wrapper" || unbound_shim {
                 crate::harness::write_executable(&directory.join("opencode"), &format!(
                     "#!{}\nimport os, sys\nos.execv(os.environ['LOGIN_ENGINE'], [os.environ['LOGIN_ENGINE'], *sys.argv[1:]])\n", interpreter()
                 ));
             }
+        }
+        if unbound_shim {
+            crate::harness::write_executable(&wrong.join("opencode"), "#!/bin/sh\nexit 81\n");
         }
         fs::write(h.home_path().join(".bash_profile"), format!(
             "export PATH={}:{}\nexport LOGIN_GENERATION=login\nexport {added}=added\nexport OPENAI_API_KEY=dummy-login-key\nexport SSH_AUTH_SOCK=/login/agent.sock\nexport HTTPS_PROXY=http://login.invalid\nexport PRIVATE_EXEC_TOKEN=login-secret\nexport LOGIN_ENGINE={}\ncd /\n",
@@ -552,7 +559,11 @@ for line in sys.stdin: pass
         h.run_cli_ok(&[
             "add",
             h.project_path().to_str().unwrap(),
-            "--cmd",
+            if mode == "shim-current" {
+                "--tool"
+            } else {
+                "--cmd"
+            },
             command,
             "-t",
             "FrozenContext",
@@ -565,7 +576,11 @@ for line in sys.stdin: pass
                     .map_err(|e| e.to_string())
                     .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
             });
-        assert_eq!(record["program"], bin.join(engine).to_str().unwrap());
+        let expected_directory = if unbound_shim { &wrong } else { &bin };
+        assert_eq!(
+            record["program"],
+            expected_directory.join(engine).to_str().unwrap()
+        );
         assert_eq!(
             record["cwd"],
             fs::canonicalize(h.project_path())
@@ -611,12 +626,15 @@ for line in sys.stdin: pass
         assert_ne!(env["TMUX_PANE"], "%parent");
         assert!(env["TMUX_PANE"].as_str().unwrap().starts_with('%'));
         assert_eq!(record["tty"], true);
-        if managed {
-            assert_eq!(record["descriptors"], serde_json::json!([false, false]));
-        }
+        assert_eq!(record["descriptors"], serde_json::json!([false, false]));
         let argv = record["argv"].as_array().unwrap();
-        assert_eq!(argv.iter().any(|arg| arg == "--auto"), mode != "legacy");
-        if mode == "legacy" {
+        let launched_legacy = if unbound_shim {
+            !initially_legacy
+        } else {
+            initially_legacy
+        };
+        assert_eq!(argv.iter().any(|arg| arg == "--auto"), !launched_legacy);
+        if launched_legacy {
             assert_eq!(env["OPENCODE_PERMISSION"], r#"{"*":"allow"}"#);
         } else {
             assert_eq!(env["OPENCODE_PERMISSION"], "captured-user-policy");

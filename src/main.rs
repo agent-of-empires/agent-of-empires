@@ -48,6 +48,9 @@ fn main() -> Result<()> {
     if helper.as_deref() == Some("__frozen-env") {
         return agent_of_empires::process::exec_frozen_environment();
     }
+    if helper.as_deref() == Some("__opencode-yolo") {
+        return agent_of_empires::process::exec_post_login_opencode_yolo();
+    }
     async_main(helper, args)
 }
 

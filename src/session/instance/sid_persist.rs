@@ -1,6 +1,52 @@
 //! CAS-guarded persistence of `agent_session_id` and `resume_intent`.
 
 use super::*;
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use crate::session::storage::Storage;
+    #[derive(Clone, Copy)]
+    pub(super) enum Stage {
+        Adoption,
+        Finalize,
+    }
+    thread_local! { static FAIL_WRITES: std::cell::RefCell<Option<(String, bool, bool)>> = const { std::cell::RefCell::new(None) }; }
+    pub(in crate::session::instance) struct WriteFailures;
+    impl WriteFailures {
+        pub(in crate::session::instance) fn install(
+            id: String,
+            adoption: bool,
+            finalize: bool,
+        ) -> Self {
+            FAIL_WRITES.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some((id, adoption, finalize));
+            });
+            Self
+        }
+    }
+    impl Drop for WriteFailures {
+        fn drop(&mut self) {
+            FAIL_WRITES.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    pub(super) fn apply(mut storage: Storage, id: &str, stage: Stage) -> Storage {
+        FAIL_WRITES.with(|slot| {
+            if let Some((target, adoption, finalize)) = slot.borrow().as_ref() {
+                if target == id {
+                    storage.set_fail_writes_for_test(match stage {
+                        Stage::Adoption => *adoption,
+                        Stage::Finalize => *finalize,
+                    });
+                }
+            }
+        });
+        storage
+    }
+}
+
 /// Outcome of a CAS-guarded `agent_session_id` or `resume_intent` write.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,7 +245,8 @@ impl Instance {
                     return SidPersistOutcome::Skip;
                 }
             };
-
+        #[cfg(test)]
+        let storage = test_support::apply(storage, &self.id, test_support::Stage::Finalize);
         self.persist_session_id_with_storage(&storage, expected)
     }
 
@@ -227,6 +274,8 @@ impl Instance {
                     return SidPersistOutcome::Skip;
                 }
             };
+        #[cfg(test)]
+        let storage = test_support::apply(storage, &self.id, test_support::Stage::Adoption);
         let instance_id = self.id.clone();
         let binding = self.agent_session_binding.clone();
         let pi_session_path = self.pi_session_path.clone();

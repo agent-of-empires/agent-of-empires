@@ -520,30 +520,46 @@ impl NativeExecution {
         probe().map_err(|error| error.context(UnattestedOpenCodeSchema))
     }
 }
-#[derive(Clone, Copy)]
 pub(super) struct AgentLaunchContext<'a> {
-    pub(super) generation: crate::agents::AgentGeneration,
+    generation: std::cell::OnceCell<crate::agents::AgentGeneration>,
+    agent: Option<&'a crate::agents::AgentDef>,
     pub(super) host_command: Option<&'a std::process::Command>,
 }
 
 impl<'a> AgentLaunchContext<'a> {
     pub(super) fn host(
-        agent: Option<&crate::agents::AgentDef>,
+        agent: Option<&'a crate::agents::AgentDef>,
         host_command: Option<&'a std::process::Command>,
     ) -> Self {
-        let generation = agent.map_or(crate::agents::AgentGeneration::Current, |agent| {
-            if !agent.spans_agent_generations {
-                crate::agents::AgentGeneration::Current
-            } else {
-                host_command.map_or(crate::agents::AgentGeneration::Unknown, |command| {
-                    crate::agents::agent_generation_for(agent, command)
-                })
-            }
-        });
         Self {
-            generation,
+            generation: std::cell::OnceCell::new(),
+            agent,
             host_command,
         }
+    }
+
+    pub(super) fn resolved(generation: crate::agents::AgentGeneration) -> Self {
+        Self {
+            generation: std::cell::OnceCell::from(generation),
+            agent: None,
+            host_command: None,
+        }
+    }
+
+    pub(super) fn generation(&self) -> crate::agents::AgentGeneration {
+        *self.generation.get_or_init(|| {
+            self.agent
+                .map_or(crate::agents::AgentGeneration::Current, |agent| {
+                    if !agent.spans_agent_generations {
+                        crate::agents::AgentGeneration::Current
+                    } else {
+                        self.host_command
+                            .map_or(crate::agents::AgentGeneration::Unknown, |command| {
+                                crate::agents::agent_generation_for(agent, command)
+                            })
+                    }
+                })
+        })
     }
 }
 
@@ -2703,7 +2719,7 @@ impl Instance {
         &self,
         command: String,
         execution: Option<&super::execution::NativeExecution>,
-        launch_context: AgentLaunchContext<'_>,
+        launch_context: &AgentLaunchContext<'_>,
     ) -> Result<String> {
         let Some(execution) = execution else {
             return Ok(command);
@@ -2716,7 +2732,7 @@ impl Instance {
             .to_owned();
         // A shared service may have opened a different database.
         if execution.agent.name == "opencode" {
-            match launch_context.generation {
+            match launch_context.generation() {
                 crate::agents::AgentGeneration::Current => words.push("--standalone".into()),
                 crate::agents::AgentGeneration::Legacy => {},
                 crate::agents::AgentGeneration::Unknown => anyhow::bail!(

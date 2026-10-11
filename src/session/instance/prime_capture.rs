@@ -754,7 +754,7 @@ mod tests {
                 "test",
                 agent,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -774,7 +774,7 @@ mod tests {
                 "test",
                 agent,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     restarted.default_selector_agent(),
                     restarted
                         .default_selector_agent()
@@ -796,7 +796,7 @@ mod tests {
                 "test",
                 agent,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     restarted.default_selector_agent(),
                     restarted
                         .default_selector_agent()
@@ -932,7 +932,7 @@ mod tests {
                 "test",
                 agent,
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     inst.default_selector_agent(),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))

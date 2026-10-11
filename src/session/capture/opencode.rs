@@ -15,55 +15,30 @@ use crate::agents::AgentGeneration;
 /// ~1.8s). Covers both the preassign and the fork.
 const OPENCODE_SERVE_DEADLINE: Duration = Duration::from_secs(6);
 
-/// Reaps the ephemeral `opencode serve` process group on drop, so no attempt
-/// leaks a server and two servers never share the SQLite store.
 struct ServeGuard(Option<std::process::Child>);
+
+impl ServeGuard {
+    fn finish(mut self) -> Result<()> {
+        if let Some(mut child) = self.0.take() {
+            crate::process::terminate_and_reap_process_group(
+                &mut child,
+                Duration::from_millis(150),
+            )
+            .context("failed to stop the ephemeral OpenCode server")?;
+        }
+        Ok(())
+    }
+}
 
 impl Drop for ServeGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            let pid = child.id();
-            #[cfg(unix)]
-            {
-                signal_serve_group(pid, Signal::Term);
-                let deadline = Instant::now() + Duration::from_millis(150);
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(_)) => return,
-                        Ok(None) if Instant::now() < deadline => {
-                            std::thread::sleep(Duration::from_millis(10))
-                        }
-                        _ => break,
-                    }
-                }
-                signal_serve_group(pid, Signal::Kill);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = crate::process::terminate_and_reap_process_group(
+                &mut child,
+                Duration::from_millis(150),
+            );
         }
     }
-}
-
-enum Signal {
-    Term,
-    Kill,
-}
-
-/// Signals the process group, then the bare pid. No-op off unix.
-fn signal_serve_group(pid: u32, signal: Signal) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{kill, killpg, Signal as Nix};
-        let sig = match signal {
-            Signal::Term => Nix::SIGTERM,
-            Signal::Kill => Nix::SIGKILL,
-        };
-        let p = nix::unistd::Pid::from_raw(pid as i32);
-        let _ = killpg(p, sig);
-        let _ = kill(p, sig);
-    }
-    #[cfg(not(unix))]
-    let _ = (pid, signal);
 }
 
 /// An authenticated client for the ephemeral server. OpenCode 2.x refuses every
@@ -86,6 +61,7 @@ impl ServeClient {
                 .context("the pinned OpenCode server password is not a valid header value")?,
         );
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(2))
             .default_headers(headers)
             .build()
@@ -172,10 +148,7 @@ impl ServeClient {
     }
 }
 
-/// Runs `call` against a short-lived `opencode serve` on the launch's own
-/// environment, so both processes select the same store. The server is reaped
-/// before this returns, which is what keeps two processes from holding the
-/// store at once.
+/// Uses the launch environment and stops the isolated server group before returning.
 fn with_serve<T: Send + 'static>(
     project_path: &str,
     mut cmd: std::process::Command,
@@ -203,13 +176,9 @@ fn with_serve<T: Send + 'static>(
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let child = cmd.spawn().context("failed to spawn `opencode serve`")?;
-    let _guard = ServeGuard(Some(child));
+    let child = crate::process::spawn_process_group(&mut cmd)
+        .context("failed to spawn `opencode serve`")?;
+    let guard = ServeGuard(Some(child));
 
     let base = format!("http://127.0.0.1:{port}");
     // The caller may already be inside a Tokio runtime, so the blocking runtime
@@ -225,12 +194,14 @@ fn with_serve<T: Send + 'static>(
             call(client).await
         })
     };
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         scope
             .spawn(run)
             .join()
             .map_err(|_| anyhow::anyhow!("opencode serve worker thread panicked"))?
-    })
+    });
+    guard.finish()?;
+    result
 }
 
 /// Creates the OpenCode session up front under the launch's own `environment`
@@ -304,9 +275,28 @@ mod tests {
     /// returns the request line plus whatever `Authorization` header arrived.
     fn serve_once(response: &'static str) -> (std::thread::JoinHandle<String>, u16) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("local HTTP fixture did not receive a request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut request = Vec::new();
             let mut buffer = [0u8; 1024];
             // One read can stop mid-request, so keep reading until the headers
@@ -386,6 +376,48 @@ mod tests {
         assert_eq!(header(&request, "authorization"), Some(expected.as_str()));
     }
 
+    #[test]
+    fn the_loopback_client_bypasses_ambient_proxies() {
+        const CHILD_ENV: &str = "AOE_LOOPBACK_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            the_serve_client_authenticates_with_the_pinned_password();
+            println!("loopback-child-completed");
+            return;
+        }
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", proxy.local_addr().unwrap());
+        let module = module_path!().split_once("::").unwrap().1;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &format!("{module}::the_loopback_client_bypasses_ambient_proxies"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy");
+        for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            command.env(name, &url);
+        }
+        let output =
+            crate::process::run_with_timeout_process_group(&mut command, Duration::from_secs(20))
+                .unwrap()
+                .expect("proxy-isolation child timed out");
+        assert!(
+            matches!(proxy.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "loopback credentials were routed through a proxy"
+        );
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("loopback-child-completed"));
+    }
     /// The store mints the child, so the request names the parent in its path
     /// and the id that comes back is the one AoE must adopt.
     #[test]
@@ -456,29 +488,61 @@ mod tests {
         let _ = handle.join();
     }
 
-    /// The guard is what keeps two servers from sharing the store, so it must
-    /// have reaped the child before the helper returned.
     #[cfg(unix)]
     #[test]
-    fn the_serve_guard_reaps_the_server_before_the_helper_returns() {
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", "exec sleep 30"]);
-        let child = ServeGuard(Some(cmd.spawn().unwrap()));
-        let pid = child.0.as_ref().unwrap().id();
-        drop(child);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            // A reaped pid no longer resolves to a live process.
-            let alive =
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
-            if !alive {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the serve process outlived its guard"
+    fn serve_cleanup_waits_for_a_cooperative_descendant_on_every_return_path() {
+        let Ok(python) = which::which("python3") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("opencode");
+        std::fs::write(
+            &script,
+            r#"import os, signal, socket, sys, time
+if os.fork():
+    os.wait()
+    sys.exit(0)
+def stopped(signum, frame):
+    # Model store flushing after TERM, not a readiness wait.
+    time.sleep(0.04)
+    with open(os.environ['SHUTDOWN_COMPLETE'], 'w') as marker: marker.write('finished')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stopped)
+server = socket.socket()
+server.bind(('127.0.0.1', int(sys.argv[sys.argv.index('--port') + 1])))
+server.listen()
+server.settimeout(15)
+while True:
+    connection, _ = server.accept()
+    with connection:
+        connection.recv(8192)
+        connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{"data":{}}')
+"#,
+        )
+        .unwrap();
+        for outcome in ["success", "error", "panic"] {
+            let finished = directory.path().join(outcome);
+            let mut command = std::process::Command::new(&python);
+            command.arg(&script).env("SHUTDOWN_COMPLETE", &finished);
+            let result = with_serve(directory.path().to_str().unwrap(), command, move |_| {
+                Box::pin(async move {
+                    match outcome {
+                        "success" => Ok("completed"),
+                        "error" => anyhow::bail!("call failed"),
+                        _ => panic!("worker failed"),
+                    }
+                })
+            });
+            assert_eq!(
+                result.is_ok(),
+                outcome == "success",
+                "{outcome}: {result:?}"
             );
-            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(
+                std::fs::read_to_string(&finished).unwrap(),
+                "finished",
+                "{outcome}: descendant shutdown must finish before the helper returns"
+            );
         }
     }
 }

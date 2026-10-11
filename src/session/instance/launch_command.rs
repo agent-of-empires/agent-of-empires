@@ -27,32 +27,30 @@ pub(super) struct PreparedLaunch {
     pub(super) canonical_conversation: Option<ConversationState>,
     pub(super) expected_prior_omp_generation: Option<String>,
     pub(super) execution: Option<super::execution::NativeExecution>,
-    /// A known conversation was physically relocated before this launch; the
-    /// finalize step must confirm the durable row carries the relocated state
-    /// before the restart can claim success.
-    pub(super) carry_relocated: bool,
+    /// Relocated and store-adopted conversations require durable confirmation.
+    pub(super) require_conversation_publication: bool,
 }
 
 fn prepared_fork_mints_child(
     agent: Option<&'static crate::agents::AgentDef>,
     intent: &ResumeIntent,
-    context: super::execution::AgentLaunchContext<'_>,
+    context: &super::execution::AgentLaunchContext<'_>,
 ) -> bool {
     matches!(intent, ResumeIntent::Fork { .. })
         && agent.is_some_and(|agent| {
             agent
                 .fork_strategy
-                .resolve(context.generation)
+                .resolve(context.generation())
                 .is_some_and(|strategy| strategy.mints_child())
         })
 }
 
 fn resolved_yolo(
     agent: &'static crate::agents::AgentDef,
-    launch_context: super::execution::AgentLaunchContext<'_>,
+    launch_context: &super::execution::AgentLaunchContext<'_>,
 ) -> Option<&'static crate::agents::YoloMode> {
     let yolo = agent.yolo.as_ref()?;
-    let generation = launch_context.generation;
+    let generation = launch_context.generation();
     match yolo.resolve(generation) {
         Some(resolved) => Some(resolved),
         None => {
@@ -399,10 +397,6 @@ fn wrap_bound_opencode_command(
     working_dir: &str,
     snapshot: &std::process::Command,
 ) -> Result<String> {
-    let user = crate::session::environment::user_shell();
-    let posix = crate::session::environment::user_posix_shell();
-    let mut script = execution_context(working_dir, &[], &[]);
-    script.push_str("stty susp undef\nset --");
     let mut environment = Vec::with_capacity(snapshot.get_envs().size_hint().0);
     for (key, value) in snapshot.get_envs() {
         if crate::process::LIVE_PANE_ENV_KEYS
@@ -418,31 +412,65 @@ fn wrap_bound_opencode_command(
             ));
         }
     }
-    // These values belong to the new pane, not the process preparing it.
-    for key in crate::process::LIVE_PANE_ENV_KEYS {
-        script.push_str(&format!(
-            "\nif [ \"${{{key}+x}}\" = x ]; then set -- \"$@\" \"{key}=${key}\"; fi"
-        ));
-    }
     let cwd = snapshot
         .get_current_dir()
         .and_then(std::path::Path::to_str)
         .context("OpenCode launch cwd is not UTF-8")?;
-    let argv = shell_words::split(cmd).context("parsing frozen OpenCode launch argv")?;
-    let payload = serde_json::to_string(&crate::process::FrozenEnvironment {
+    let argv = shell_words::split(cmd).context("parsing OpenCode launch argv")?;
+    let payload = serde_json::to_string(&crate::process::NativeLaunchPayload {
         argv,
         cwd,
         environment,
     })?;
-    let delimiter = heredoc_delimiter(&payload, "AOE_FROZEN_ENV");
+    wrap_opencode_payload(&payload, working_dir, true)
+}
+
+fn wrap_unbound_opencode_yolo_command(
+    cmd: &str,
+    working_dir: &str,
+    overrides: &[(String, String)],
+) -> Result<String> {
+    let payload = serde_json::to_string(&crate::process::NativeLaunchPayload {
+        argv: shell_words::split(cmd)?,
+        cwd: working_dir,
+        environment: overrides
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect(),
+    })?;
+    wrap_opencode_payload(&payload, working_dir, false)
+}
+
+fn wrap_opencode_payload(payload: &str, working_dir: &str, frozen: bool) -> Result<String> {
+    let user = crate::session::environment::user_shell();
+    let posix = crate::session::environment::user_posix_shell();
+    let mut script = execution_context(working_dir, &[], &[]);
+    script.push_str("stty susp undef\n");
+    if frozen {
+        script.push_str("set --");
+        for key in crate::process::LIVE_PANE_ENV_KEYS {
+            script.push_str(&format!(
+                "\nif [ \"${{{key}+x}}\" = x ]; then set -- \"$@\" \"{key}=${key}\"; fi"
+            ));
+        }
+        script.push_str("\nexec /usr/bin/env -i -- \"$@\" ");
+    } else {
+        script.push_str("exec ");
+    }
+    let delimiter = heredoc_delimiter(payload, "AOE_NATIVE_LAUNCH");
     let executable = crate::process::executable_for_native_launch()
         .context("resolving AoE executable for native launch")?;
     let executable = executable
         .to_str()
         .context("AoE executable path is not UTF-8")?;
+    let helper = if frozen {
+        "__frozen-env"
+    } else {
+        "__opencode-yolo"
+    };
     script.push_str(&format!(
-        "\nexec /usr/bin/env -i -- \"$@\" {} __frozen-env 3<&- 4<<'{delimiter}'\n{payload}\n{delimiter}",
-        crate::session::environment::shell_escape_script_word(executable),
+        "{} {helper} 3<&- 4<<'{delimiter}'\n{payload}\n{delimiter}",
+        crate::session::environment::shell_escape_script_word(executable)
     ));
     Ok(shell_stdin_command(
         &posix,
@@ -623,10 +651,7 @@ impl Instance {
                 }
             }
         };
-        super::execution::AgentLaunchContext {
-            generation,
-            host_command: None,
-        }
+        super::execution::AgentLaunchContext::resolved(generation)
     }
 
     pub fn has_custom_command(&self) -> bool {
@@ -828,6 +853,11 @@ impl Instance {
                 &self.resolved_host_environment(),
             ));
         }
+        let require_conversation_publication = execution
+            .as_ref()
+            .is_some_and(|execution| execution.agent.name == "opencode")
+            && !fork_mints_child
+            && self.stored_fork_child().is_some();
         Ok(PreparedLaunch {
             command,
             is_existing,
@@ -839,7 +869,7 @@ impl Instance {
             expected_prior_omp_generation,
             sandbox_context_reset,
             execution,
-            carry_relocated: false,
+            require_conversation_publication,
         })
     }
 
@@ -848,8 +878,7 @@ impl Instance {
         &mut self,
         prepared: PreparedLaunch,
     ) -> Result<PreparedLaunch> {
-        // A store fork adopts a child the pre-fork seed cannot stand in for, so
-        // the reset to the recorded conversation is skipped once one exists.
+        // Preserve the already adopted child across the second preparation.
         if !prepared.is_existing && self.stored_fork_child().is_none() {
             self.set_agent_conversation(
                 prepared.expected_conversation.session_id.clone(),
@@ -859,6 +888,7 @@ impl Instance {
         }
         self.absorb_published_prime_session();
         let mut refreshed = self.prepare_launch_command(prepared.expected_conversation)?;
+        refreshed.require_conversation_publication |= prepared.require_conversation_publication;
         refreshed.expected_prior_omp_generation = prepared.expected_prior_omp_generation;
         Ok(refreshed)
     }
@@ -936,7 +966,7 @@ impl Instance {
                 .and_then(|execution| execution.inputs.cwd.to_str())
                 .or(fallback_cwd.as_deref())
                 .context("sandbox cwd is not UTF-8")?;
-            let launch_context = self.sandbox_launch_context(
+            let launch_context = &self.sandbox_launch_context(
                 agent,
                 execution,
                 runtime,
@@ -1116,12 +1146,16 @@ impl Instance {
             .filter(|agent| agent.spans_agent_generations)
             .and_then(|agent| self.host_agent_command(agent, execution));
         let launch_context =
-            super::execution::AgentLaunchContext::host(agent, host_command.as_ref());
+            &super::execution::AgentLaunchContext::host(agent, host_command.as_ref());
         let fork_mints_child =
             prepared_fork_mints_child(agent, &self.resume_intent, launch_context);
         let yolo = self
             .is_yolo_mode()
-            .then(|| agent.and_then(|agent| resolved_yolo(agent, launch_context)))
+            .then(|| {
+                agent
+                    .filter(|_| host_command.is_none())
+                    .and_then(|agent| resolved_yolo(agent, launch_context))
+            })
             .flatten();
         let omp_capture_plan = execution
             .and_then(|execution| execution.omp.as_ref())
@@ -1187,12 +1221,20 @@ impl Instance {
                         launch_context,
                         expected,
                     )?;
+                    let defer_yolo = self.is_yolo_mode()
+                        && host_command.is_some()
+                        && execution.is_none()
+                        && self.agent_session_id.is_none();
                     if let Some(snapshot) = host_command.as_ref() {
                         if execution.is_none() {
                             pin_host_program(&mut cmd, snapshot)?;
                         }
-                        if let Some(yolo) = yolo {
-                            apply_yolo_mode(&mut cmd, yolo, false);
+                        if !defer_yolo && self.is_yolo_mode() {
+                            if let Some(yolo) =
+                                agent.and_then(|agent| resolved_yolo(agent, launch_context))
+                            {
+                                apply_yolo_mode(&mut cmd, yolo, false);
+                            }
                         }
                     }
                     apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
@@ -1213,6 +1255,16 @@ impl Instance {
                                 &command,
                                 &self.project_path,
                                 snapshot,
+                            )?)
+                        } else if defer_yolo {
+                            let overrides =
+                                crate::session::environment::resolve_host_environment_pairs(
+                                    &self.resolved_host_environment(),
+                                );
+                            Some(wrap_unbound_opencode_yolo_command(
+                                &command,
+                                &self.project_path,
+                                &overrides,
                             )?)
                         } else {
                             Some(wrap_command_ignore_suspend(
@@ -1259,12 +1311,19 @@ impl Instance {
                 launch_context,
                 expected,
             )?;
+            let defer_yolo = self.is_yolo_mode()
+                && host_command.is_some()
+                && execution.is_none()
+                && self.agent_session_id.is_none();
             if let Some(snapshot) = host_command.as_ref() {
                 if execution.is_none() {
                     pin_host_program(&mut cmd, snapshot)?;
                 }
-                if let Some(yolo) = yolo {
-                    apply_yolo_mode(&mut cmd, yolo, false);
+                if !defer_yolo && self.is_yolo_mode() {
+                    if let Some(yolo) = agent.and_then(|agent| resolved_yolo(agent, launch_context))
+                    {
+                        apply_yolo_mode(&mut cmd, yolo, false);
+                    }
                 }
             }
             apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
@@ -1285,6 +1344,15 @@ impl Instance {
                         &command,
                         &self.project_path,
                         snapshot,
+                    )?)
+                } else if defer_yolo {
+                    let overrides = crate::session::environment::resolve_host_environment_pairs(
+                        &self.resolved_host_environment(),
+                    );
+                    Some(wrap_unbound_opencode_yolo_command(
+                        &command,
+                        &self.project_path,
+                        &overrides,
                     )?)
                 } else {
                     Some(wrap_command_ignore_suspend(
@@ -1655,7 +1723,7 @@ mod tests {
             "test",
             crate::agents::get_agent("codex"),
             None,
-            super::execution::AgentLaunchContext::host(
+            &super::execution::AgentLaunchContext::host(
                 crate::agents::get_agent("codex"),
                 inst.default_selector_agent()
                     .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1697,7 +1765,7 @@ mod tests {
         });
 
         assert_eq!(
-            inst.stored_fork_child().as_deref(),
+            inst.stored_fork_child(),
             Some(child),
             "a second pass opens the adopted child"
         );
@@ -1722,7 +1790,7 @@ mod tests {
                 "test",
                 crate::agents::get_agent("pi"),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     crate::agents::get_agent("pi"),
                     inst.default_selector_agent()
                         .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1790,7 +1858,7 @@ mod tests {
                     "test",
                     inst.resolved_agent(),
                     None,
-                    super::execution::AgentLaunchContext::host(
+                    &super::execution::AgentLaunchContext::host(
                         inst.default_selector_agent(),
                         inst.default_selector_agent()
                             .and_then(|agent| inst.host_agent_command(agent, None))
@@ -1824,7 +1892,7 @@ mod tests {
                 "test",
                 wrapper.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     wrapper.default_selector_agent(),
                     wrapper
                         .default_selector_agent()
@@ -1852,7 +1920,7 @@ mod tests {
                 "test",
                 launcher.resolved_agent(),
                 None,
-                super::execution::AgentLaunchContext::host(
+                &super::execution::AgentLaunchContext::host(
                     launcher.default_selector_agent(),
                     launcher
                         .default_selector_agent()
@@ -1923,68 +1991,6 @@ mod tests {
         assert_eq!(cmd, r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#);
         let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
         assert!(wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn opencode_yolo_follows_the_generation_the_installed_binary_advertises() {
-        const V2_HELP: &str =
-            "FLAGS\n  --auto       Auto-approve permissions\n  --session, -s string   Session ID";
-        const V1_HELP: &str =
-            "FLAGS\n  --fork       Fork the session\n  --session, -s string   Session ID";
-        for (stdout, stderr, expect_flag, expect_env) in [
-            (V2_HELP, "", true, false),
-            (V1_HELP, "", false, true),
-            ("", V1_HELP, false, true),
-            ("native CLI notice", V1_HELP, false, true),
-        ] {
-            let home = tempfile::tempdir().unwrap();
-            let _app = crate::session::test_support::isolate_app_dir_at(home.path());
-            let _opencode = crate::session::test_support::install_login_shell_path_command(
-                home.path(),
-                "opencode",
-                &format!(
-                    "#!/bin/sh\nprintf '%s\\n' {}\nprintf '%s\\n' {} >&2\nexit 0\n",
-                    shell_escape(stdout),
-                    shell_escape(stderr),
-                ),
-            );
-            crate::agents::forget_agent_help_for_test();
-
-            let mut inst = tool_instance("opencode", home.path().to_str().unwrap());
-            inst.yolo_mode = true;
-            let cmd = host_command(&mut inst);
-            assert_eq!(
-                cmd.contains("--auto"),
-                expect_flag,
-                "stdout={stdout:?}, stderr={stderr:?}: {cmd}"
-            );
-            assert_eq!(
-                cmd.contains("OPENCODE_PERMISSION"),
-                expect_env,
-                "stdout={stdout:?}, stderr={stderr:?}: {cmd}"
-            );
-        }
-    }
-
-    /// Fresh, unqualified launches do not guess an approval mechanism.
-    #[test]
-    #[serial_test::serial]
-    fn an_unreadable_help_sends_neither_yolo_spelling() {
-        let home = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
-        let _opencode = crate::session::test_support::install_login_shell_path_command(
-            home.path(),
-            "opencode",
-            "#!/bin/sh\nexit 0\n",
-        );
-        crate::agents::forget_agent_help_for_test();
-
-        let mut inst = tool_instance("opencode", home.path().to_str().unwrap());
-        inst.yolo_mode = true;
-        let cmd = host_command(&mut inst);
-        assert!(!cmd.contains("--auto"), "{cmd}");
-        assert!(!cmd.contains("OPENCODE_PERMISSION"), "{cmd}");
     }
 
     #[test]
@@ -2070,53 +2076,6 @@ mod tests {
                     "{version}:{mode}: refused launch changed its target"
                 );
             }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_profile_path_resolves_the_generation_from_the_launched_binary() {
-        for absolute_command in [false, true] {
-            let home = tempfile::tempdir().unwrap();
-            let _app = crate::session::test_support::isolate_app_dir_at(home.path());
-            let profile = "generation-from-profile-path";
-            let _current = crate::session::test_support::install_login_shell_path_command(
-                home.path(),
-                "opencode",
-                "#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  --auto  approve'\nexit 0\n",
-            );
-            let profile_bin = home.path().join("profile-bin");
-            std::fs::create_dir_all(&profile_bin).unwrap();
-            let profile_agent = profile_bin.join("opencode");
-            std::fs::write(
-                &profile_agent,
-                "#!/bin/sh\nprintf '%s\\n' 'FLAGS\n  --fork  fork'\nexit 0\n",
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&profile_agent, std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
-            }
-            crate::agents::forget_agent_help_for_test();
-            let mut inst = tool_instance("opencode", home.path().to_str().unwrap());
-            inst.source_profile = profile.into();
-            if absolute_command {
-                declare_execution_aliases(profile, &[("opencode", "opencode")], home.path());
-                inst.command = shell_escape(profile_agent.to_str().unwrap());
-                assert!(
-                    inst.resolve_native_execution(None).is_err(),
-                    "no store to attest"
-                );
-            } else {
-                write_profile_environment(profile, &format!("PATH={}", profile_bin.display()));
-                inst.command = "opencode".into();
-            }
-            inst.yolo_mode = true;
-            let cmd = host_command(&mut inst);
-            assert!(cmd.contains("OPENCODE_PERMISSION"), "{cmd}");
-            assert!(!cmd.contains("--auto"), "{cmd}");
         }
     }
 

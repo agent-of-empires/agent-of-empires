@@ -4,20 +4,16 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// OpenCode 2.x: the role is a column, the creation time too, and the error
-/// node is flat. The creation time is returned so the two layouts can be
-/// compared against each other.
+/// Current layout: assistant role and creation time are columns; errors are flat.
 const V2_ERROR_SQL: &str = "SELECT time_created, json_extract(data, '$.error.message')
      FROM session_message
      WHERE session_id = ?1
        AND type = 'assistant'
        AND time_created >= ?2
        AND json_extract(data, '$.error.message') IS NOT NULL
-     ORDER BY time_created DESC
-     LIMIT 1";
+     ORDER BY time_created DESC";
 
-/// OpenCode 1.x: the role and the creation time live inside the payload, and
-/// the error node is nested one level deeper.
+/// Legacy layout: role, creation time, and nested errors live inside the payload.
 const V1_ERROR_SQL: &str = "SELECT CAST(json_extract(data, '$.time.created') AS INTEGER),
                                  json_extract(data, '$.error.data.message')
      FROM message
@@ -25,8 +21,7 @@ const V1_ERROR_SQL: &str = "SELECT CAST(json_extract(data, '$.time.created') AS 
        AND json_extract(data, '$.role') = 'assistant'
        AND CAST(json_extract(data, '$.time.created') AS INTEGER) >= ?2
        AND json_extract(data, '$.error.data.message') IS NOT NULL
-     ORDER BY CAST(json_extract(data, '$.time.created') AS INTEGER) DESC
-     LIMIT 1";
+     ORDER BY CAST(json_extract(data, '$.time.created') AS INTEGER) DESC";
 
 pub(super) fn opencode_data_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
@@ -88,31 +83,40 @@ pub(super) fn recover_opencode_prompt_error_from_sqlite_at(
     )
     .ok()?;
     let _ = conn.busy_timeout(Duration::from_millis(100));
-    // OpenCode 2.x moved messages to `session_message`, where the role is a
-    // column and the error node sits at `$.error.message` instead of
-    // `$.error.data.message`. The table name tracks the build channel rather
-    // than the version, and a migrated store carries both tables at once, so
-    // each layout is read with its own statement and the newest of what they
-    // find wins: an older error in the v2 table must not hide a newer one in
-    // the v1 table.
+    // A migrated store may carry both layouts; compare their newest nonempty errors.
     let mut newest: Option<(i64, String)> = None;
     for sql in [V2_ERROR_SQL, V1_ERROR_SQL] {
         let Ok(mut stmt) = conn.prepare(sql) else {
             continue;
         };
-        let Ok((created_at, message)) = stmt.query_row(
-            rusqlite::params![acp_session_id, prompt_started_at_ms],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        ) else {
+        let Ok(mut rows) = stmt.query(rusqlite::params![acp_session_id, prompt_started_at_ms])
+        else {
             continue;
         };
-        let trimmed = message.trim();
-        if !trimmed.is_empty()
-            && newest
-                .as_ref()
-                .is_none_or(|(seen_at, _)| created_at > *seen_at)
-        {
-            newest = Some((created_at, trimmed.to_string()));
+        while let Ok(Some(row)) = rows.next() {
+            let Ok(created_at) = row.get::<_, i64>(0) else {
+                break;
+            };
+            let Ok(value) = row.get_ref(1) else {
+                break;
+            };
+            let Ok(message) = value.as_str() else {
+                break;
+            };
+            let trimmed = message.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match newest.as_mut() {
+                Some((seen_at, text)) if created_at > *seen_at => {
+                    *seen_at = created_at;
+                    text.clear();
+                    text.push_str(trimmed);
+                }
+                None => newest = Some((created_at, trimmed.to_owned())),
+                _ => {}
+            }
+            break;
         }
     }
     newest.map(|(_, message)| message)
@@ -277,8 +281,6 @@ mod tests {
         );
     }
 
-    /// A migrated store carries both layouts. The newest error wins even when the
-    /// v2 table is consulted first, or an older v2 row would mask the v1 one.
     #[test]
     fn recover_opencode_prompt_error_takes_the_newest_across_both_layouts() {
         let dir = tempfile::tempdir().unwrap();
@@ -292,48 +294,67 @@ mod tests {
              time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
         )
         .unwrap();
-        let flat = |at: i64, text: &str| {
-            serde_json::json!({
-                "time": { "created": at },
-                "error": { "message": text },
-            })
-        };
-        let nested = |at: i64, text: &str| {
-            serde_json::json!({
-                "role": "assistant",
-                "time": { "created": at },
-                "error": { "data": { "message": text } },
-            })
-        };
-        // The v2 row is the older of the two. Reading the v2 table first and
-        // returning its first row would answer with it, so only comparing the
-        // two layouts returns the v1 error that is actually newer.
-        conn.execute(
-            "INSERT INTO session_message VALUES ('m-v2', 'ses-1', 'assistant', 1, 110, 110, ?1)",
-            rusqlite::params![flat(110, "older v2 error").to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO message VALUES ('m-v1', 'ses-1', 120, 120, ?1)",
-            rusqlite::params![nested(120, "newer v1 error").to_string()],
-        )
-        .unwrap();
-        assert_eq!(
-            recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
-            Some("newer v1 error"),
-            "an older v2 row must not hide a newer v1 one"
-        );
-        // And the other order: the v2 table holding the newest answers alone.
-        conn.execute("DELETE FROM message", []).unwrap();
-        conn.execute(
-            "INSERT INTO session_message VALUES ('m-v2-new', 'ses-1', 'assistant', 2, 130, 130, ?1)",
-            rusqlite::params![flat(130, "newest v2 error").to_string()],
-        )
-        .unwrap();
-        assert_eq!(
-            recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
-            Some("newest v2 error")
-        );
+        for (current, legacy, expected) in [
+            (
+                vec![
+                    (110, "current"),
+                    (120, " \t\n"),
+                    (130, "\u{00a0}\u{2003}\u{2028}\u{3000}"),
+                ],
+                vec![],
+                Some("current"),
+            ),
+            (
+                vec![(110, "current"), (120, "")],
+                vec![(105, "legacy"), (140, " \n")],
+                Some("current"),
+            ),
+            (
+                vec![(110, "current"), (120, "")],
+                vec![(115, "legacy"), (140, "\u{3000}")],
+                Some("legacy"),
+            ),
+            (vec![], vec![(110, "legacy"), (120, "")], Some("legacy")),
+            (
+                vec![(110, "\u{3000}current\u{2003}")],
+                vec![(110, "legacy")],
+                Some("current"),
+            ),
+            (
+                vec![(120, "\u{200b}"), (130, "\u{3000}")],
+                vec![],
+                Some("\u{200b}"),
+            ),
+            (vec![(120, "")], vec![(130, " \t\n")], None),
+        ] {
+            conn.execute_batch("DELETE FROM session_message; DELETE FROM message;")
+                .unwrap();
+            for (index, (at, text)) in current.into_iter().enumerate() {
+                let data = serde_json::json!({"error": {"message": text}});
+                conn.execute(
+                    "INSERT INTO session_message VALUES (?1,'ses-1','assistant',?2,?3,?3,?4)",
+                    rusqlite::params![
+                        format!("current-{index}"),
+                        index as i64,
+                        at,
+                        data.to_string()
+                    ],
+                )
+                .unwrap();
+            }
+            for (index, (at, text)) in legacy.into_iter().enumerate() {
+                let data = serde_json::json!({"role":"assistant", "time":{"created":at}, "error":{"data":{"message":text}}});
+                conn.execute(
+                    "INSERT INTO message VALUES (?1,'ses-1',?2,?2,?3)",
+                    rusqlite::params![format!("legacy-{index}"), at, data.to_string()],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100).as_deref(),
+                expected
+            );
+        }
     }
 
     /// A store with neither table carries no recoverable detail.
