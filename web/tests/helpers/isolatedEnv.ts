@@ -48,8 +48,10 @@ export const HOST_STATE_VARS = new Set([
   // Test-only subprocess controls must never leak from the host shell.
   "AOE_TEST_ACP_WRITER_OUTPUT",
   "AOE_TEST_ACP_WRITER_SOCKET",
+  "AOE_TEST_CONTROL_RUNNER_GENERATION",
   "AOE_TEST_CONTROL_RUNNER_IGNORE_TERM",
   "AOE_TEST_CONTROL_RUNNER_MARKER",
+  "AOE_TEST_CONTROL_RUNNER_SELF_DELETE",
   "AOE_TEST_CONTROL_RUNNER_SOCKET",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
