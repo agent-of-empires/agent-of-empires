@@ -214,6 +214,8 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_lifecycle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_reservation: Option<LifecycleReservation>,
