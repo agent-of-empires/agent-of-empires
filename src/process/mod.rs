@@ -132,7 +132,11 @@ fn read_native_launch_payload() -> anyhow::Result<(
     let program_at = payload
         .argv
         .iter()
-        .position(|word| !word.contains('='))
+        .position(|word| {
+            !word
+                .split_once('=')
+                .is_some_and(|(key, _)| crate::session::environment::is_valid_env_key(key))
+        })
         .context("native launch program is missing")?;
     anyhow::ensure!(
         !payload.argv[program_at].is_empty(),
@@ -143,11 +147,10 @@ fn read_native_launch_payload() -> anyhow::Result<(
 
 #[doc(hidden)]
 pub fn exec_frozen_environment() -> anyhow::Result<()> {
-    let (payload, _) = read_native_launch_payload()?;
-    let mut command = Command::new("/usr/bin/env");
+    let (payload, program_at) = read_native_launch_payload()?;
+    let mut command = Command::new(&payload.argv[program_at]);
     command
-        .arg("--")
-        .args(&payload.argv)
+        .args(&payload.argv[program_at + 1..])
         .current_dir(payload.cwd)
         .env_clear();
     for (key, value) in payload.environment {
@@ -161,6 +164,10 @@ pub fn exec_frozen_environment() -> anyhow::Result<()> {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
+    }
+    for assignment in &payload.argv[..program_at] {
+        let (key, value) = assignment.split_once('=').unwrap();
+        command.env(key, value);
     }
     Err(platform::exec_command(&mut command).into())
 }

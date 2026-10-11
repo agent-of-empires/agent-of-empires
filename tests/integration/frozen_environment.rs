@@ -47,6 +47,8 @@ fn a_missing_program_cannot_dump_the_captured_environment() {
 #[parallel]
 fn argv_is_literal_and_explicit_assignments_override_the_snapshot() {
     let directory = tempfile::tempdir().unwrap();
+    let program = directory.path().join("sh=shim");
+    std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
     let sentinel = directory.path().join("must-not-exist");
     let substitution = format!("$(touch {})", sentinel.display());
     let literals = [
@@ -65,7 +67,7 @@ fn argv_is_literal_and_explicit_assignments_override_the_snapshot() {
     let mut argv = vec![
         r#"OPENCODE_PERMISSION={"*":"allow"}"#,
         "A=with spaces='\"$*=tail",
-        "/bin/sh",
+        program.to_str().unwrap(),
         "-c",
         "printf '%s\\0' \"$OPENCODE_PERMISSION\" \"$A\" \"${AMBIENT_FROZEN_SECRET-unset}\" \"$@\"; test ! -e /dev/fd/4",
         "probe",
@@ -99,7 +101,7 @@ fn argv_is_literal_and_explicit_assignments_override_the_snapshot() {
 fn post_login_yolo_uses_the_effective_environment_and_literal_argv() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
-    let program = directory.path().join("opencode");
+    let program = directory.path().join("opencode=shim");
     std::fs::write(
         &program,
         r#"#!/bin/sh

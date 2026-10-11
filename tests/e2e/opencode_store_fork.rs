@@ -479,7 +479,16 @@ fn opencode_host_launch_preserves_login_or_managed_environment() {
         h.append_config(&format!(
             "[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\ninherit_host_environment={inherit}",
         ));
-        let bin = h.install_path_command("opencode");
+        let bin = h.home_path().join("bin=tag");
+        fs::create_dir(&bin).unwrap();
+        h.set_env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
         let wrong = h.home_path().join("wrong");
         fs::create_dir(&wrong).unwrap();
         let output = h.home_path().join("frontend.json");

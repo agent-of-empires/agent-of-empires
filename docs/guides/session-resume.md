@@ -51,7 +51,7 @@ Store-bound launches, managed resume/fork and successful preassignment restore t
 
 Captured managed host environment values travel through a protected descriptor, not process arguments.
 The transport preserves non-UTF-8 keys and values, arbitrary environment names and multiline values without replacing the pane's standard input.
-The helper receives literal argv values, not a shell command string; a missing or empty program is refused before execution.
+The helper executes the pinned program directly and receives literal argv values. Only valid initial `KEY=value` assignments override the environment; `=` in an executable path or a later argument is preserved. A missing or empty program is refused before execution.
 Successful host generation and first-launch naming answers are reprobed without retaining their launch environments.
 A failed help probe cools down only the identical program, working directory and complete environment for 30 seconds; a different context, including a new launch-source ID, probes immediately.
 After a failure, later probes of that executable use the longer retry timeout.
