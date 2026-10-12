@@ -73,11 +73,17 @@ pub struct ProjectOverrides {
     /// sessions launched against this project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smart_rename: Option<bool>,
+    /// Overrides `sandbox.enabled_by_default` (start in container by default)
+    /// for new sessions launched against this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_enabled: Option<bool>,
 }
 
 impl ProjectOverrides {
     pub fn is_empty(&self) -> bool {
-        self.worktree_enabled.is_none() && self.smart_rename.is_none()
+        self.worktree_enabled.is_none()
+            && self.smart_rename.is_none()
+            && self.sandbox_enabled.is_none()
     }
 }
 
@@ -195,7 +201,8 @@ pub fn load_profile(profile: &str) -> Result<Vec<Project>> {
 }
 
 /// Load union of global + profile, deduped by canonical path. Profile entries
-/// shadow global ones with the same path.
+/// shadow global ones with the same path. An unreadable registry is skipped
+/// with a warning, so a broken file never hides the other one.
 pub fn load_merged(profile: &str) -> Result<Vec<Project>> {
     let global = load_global().unwrap_or_else(|e| {
         warn!("Failed to load global projects: {}", e);
@@ -205,7 +212,17 @@ pub fn load_merged(profile: &str) -> Result<Vec<Project>> {
         warn!("Failed to load profile projects: {}", e);
         Vec::new()
     });
+    Ok(merge_registries(global, profile))
+}
 
+/// Like [`load_merged`], but a registry that exists and cannot be read or parsed is an error.
+/// For callers that turn a project's per-project overrides into session defaults: a skipped
+/// registry would read as "no overrides" and silently change those defaults.
+pub fn load_merged_strict(profile: &str) -> Result<Vec<Project>> {
+    Ok(merge_registries(load_global()?, load_profile(profile)?))
+}
+
+fn merge_registries(global: Vec<Project>, profile: Vec<Project>) -> Vec<Project> {
     let mut merged: Vec<Project> = Vec::new();
     let mut seen_paths: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
@@ -221,7 +238,7 @@ pub fn load_merged(profile: &str) -> Result<Vec<Project>> {
             merged.push(p);
         }
     }
-    Ok(merged)
+    merged
 }
 
 pub(crate) fn canonical_key(path: &str) -> String {
@@ -475,6 +492,15 @@ pub fn find_by_canonical_path(profile: &str, path: &Path) -> Option<Project> {
         .find(|p| canonical_key(&p.path) == target)
 }
 
+/// Like [`find_by_canonical_path`], but an unreadable registry is an error rather than "not
+/// registered", for callers whose defaults depend on the project's overrides.
+pub fn find_by_canonical_path_strict(profile: &str, path: &Path) -> Result<Option<Project>> {
+    let target = canonical_key(&path.to_string_lossy());
+    Ok(load_merged_strict(profile)?
+        .into_iter()
+        .find(|p| canonical_key(&p.path) == target))
+}
+
 /// Resolve the effective `smart_rename` override for a session: `session_cfg`'s resolved
 /// `scratch_smart_rename` for scratch sessions (which have no stable path to key a registry entry
 /// on, so the setting lives on `Config` instead), otherwise the registered project's override at
@@ -636,8 +662,10 @@ mod tests {
         let updated = update_overrides("default", global, "MixedCase", |ov| {
             ov.worktree_enabled = Some(true);
             ov.smart_rename = Some(false);
+            ov.sandbox_enabled = Some(true);
         })?;
         assert_eq!(updated.overrides.worktree_enabled, Some(true));
+        assert_eq!(updated.overrides.sandbox_enabled, Some(true));
         let updated = update_overrides("default", global, "MixedCase", |ov| {
             ov.worktree_enabled = None;
         })?;
@@ -685,6 +713,26 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "second");
         assert_eq!(merged[0].scope, ProjectScope::Profile);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn strict_merged_load_fails_on_an_unreadable_registry_where_the_lenient_one_skips_it(
+    ) -> Result<()> {
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+
+        // A registry that does not exist is empty, not broken.
+        assert!(load_merged_strict("default")?.is_empty());
+
+        for path in [global_path()?, profile_path("default")?] {
+            fs::create_dir_all(path.parent().expect("registry dir"))?;
+            fs::write(&path, "{ not json")?;
+            assert!(load_merged_strict("default").is_err(), "{}", path.display());
+            assert!(load_merged("default")?.is_empty(), "{}", path.display());
+            fs::remove_file(&path)?;
+        }
         Ok(())
     }
 

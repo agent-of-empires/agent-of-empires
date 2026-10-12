@@ -40,6 +40,7 @@ pub(super) fn is_transcript_event(event: &Event) -> bool {
             // resume (#3219).
             | Event::ConversationCompactionStarted
             | Event::ConversationCompacted
+            | Event::ConversationCompactionFailed
             | Event::ConversationCompactionSummary { .. }
     )
 }
@@ -67,6 +68,7 @@ pub(super) fn transcript_event_kind(event: &Event) -> &'static str {
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         Event::ConversationCompactionStarted => "conversation_compaction_started",
         Event::ConversationCompacted => "conversation_compacted",
+        Event::ConversationCompactionFailed => "conversation_compaction_failed",
         Event::ConversationCompactionSummary { .. } => "conversation_compaction_summary",
         _ => "other",
     }
