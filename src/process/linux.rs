@@ -585,7 +585,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         if std::env::var_os("AOE_PRIME_CENSUS_CHILD").is_some() {
             assert_eq!(
-                unsafe { libc::prctl(libc::PR_SET_NAME, b"\xffowned\0".as_ptr(), 0, 0, 0) },
+                unsafe { libc::prctl(libc::PR_SET_NAME, c"\xffowned".as_ptr(), 0, 0, 0) },
                 0
             );
             let signal = |message: &[u8]| {
