@@ -71,6 +71,28 @@ describe("UserMessage image part", () => {
   });
 });
 
+describe("UserMessage plugin origin", () => {
+  const at = "2026-10-06T00:00:00Z";
+  const prompt = (id: string, originPlugin?: string): ActivityRow => ({
+    id,
+    kind: "user_prompt",
+    text: `text ${id}`,
+    at,
+    ...(originPlugin ? { originPlugin } : {}),
+  });
+
+  it("labels a plugin-sent prompt with its sender and leaves a typed one unlabelled", () => {
+    const { container } = render(
+      <Harness messages={activityToThreadMessages([prompt("typed"), prompt("sent", "cron")], false)} />,
+    );
+    const labels = container.querySelectorAll('[data-testid="user-message-origin"]');
+    expect(labels).toHaveLength(1);
+    expect(labels[0]!.textContent).toBe("Sent by plugin cron");
+    expect(container.textContent).toContain("text sent");
+    expect(container.textContent).toContain("text typed");
+  });
+});
+
 describe("AssistantMessage compaction summary", () => {
   it("renders the retained summary collapsed under its own label", () => {
     const rows: ActivityRow[] = [

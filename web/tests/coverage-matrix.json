@@ -2008,6 +2008,23 @@
       "notes": "The summary an agent retains on /compact renders as a collapsed card under the compaction divider; replacement and clearing are server-side row patches covered by Rust tests."
     },
     {
+      "id": "acp.plugin-message-origin",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/acp/ThreadMessages.test.tsx",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/hooks/useAcpSession.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "A prompt a plugin sent through sessions.message.send carries a \"Sent by plugin\" label instead of passing for the user's own; the server stamps the sender on the row, and Send now on a queued row names it so the daemon keeps that sender."
+    },
+    {
       "id": "acp.tool-group-chunking",
       "kind": "vitest",
       "risk": "medium",

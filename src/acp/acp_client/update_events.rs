@@ -320,6 +320,7 @@ pub(super) fn map_update_to_events(
                 attachments: Vec::new(),
                 prompt_id: None,
                 synthesized: false,
+                origin_plugin: None,
             }],
             other => vec![raw_event(&other)],
         },

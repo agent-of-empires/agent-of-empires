@@ -699,6 +699,8 @@ export interface ActivityRow {
     comments: DiffComment[];
   };
   attachments?: AcpAttachment[];
+  /** Plugin that sent a `user_prompt` row; unset when the user typed it. */
+  originPlugin?: string;
   output?: ToolOutputBlock[];
   elicitationAnswers?: ElicitationAnswer[];
   asyncSubagent?: boolean;
@@ -716,6 +718,7 @@ export interface TranscriptRow {
   tool?: ToolCall;
   output?: ToolOutputBlock[];
   attachments?: PromptAttachmentRefWire[];
+  origin_plugin?: string;
   diff_comments?: {
     intro: string;
     outro: string;
@@ -765,6 +768,7 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
     ...(tool ? { tool } : {}),
     ...(row.output && row.output.length > 0 ? { output: row.output } : {}),
     ...(attachments ? { attachments } : {}),
+    ...(row.origin_plugin ? { originPlugin: row.origin_plugin } : {}),
     ...(row.diff_comments
       ? {
           diffComments: {

@@ -709,6 +709,10 @@ pub enum Event {
         /// pre-existing persisted events deserialising as non-synthesized.
         #[serde(default)]
         synthesized: bool,
+        /// Id of the plugin that sent this through `sessions.message.send`; the
+        /// text was not typed by the user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_plugin: Option<String>,
     },
     PromptCapabilities {
         image: bool,
@@ -1169,6 +1173,7 @@ pub(crate) mod test_support {
             text: text.into(),
             attachments: Vec::new(),
             synthesized: false,
+            origin_plugin: None,
         }
     }
 

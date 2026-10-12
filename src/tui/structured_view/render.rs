@@ -1370,11 +1370,13 @@ fn transcript_lines(
             }
             TranscriptRowKind::UserPrompt => {
                 // Note attachments so an image-only prompt doesn't look empty.
-                let text = if row.attachments.is_empty() {
-                    row.text.clone()
-                } else {
-                    format!("{} [{} attachment(s)]", row.text, row.attachments.len())
+                let mut text = match &row.origin_plugin {
+                    Some(plugin) => format!("[plugin {plugin}] {}", row.text),
+                    None => row.text.clone(),
                 };
+                if !row.attachments.is_empty() {
+                    text = format!("{text} [{} attachment(s)]", row.attachments.len());
+                }
                 out.extend(user_message_lines(&text, theme));
                 out.push(Line::default());
             }
@@ -2680,6 +2682,7 @@ mod tests {
                 text: "Hello.".into(),
                 attachments: Vec::new(),
                 synthesized: false,
+                origin_plugin: None,
             },
             Event::AgentMessageChunk {
                 text: "What should we build?".into(),
@@ -2708,6 +2711,21 @@ mod tests {
         assert!(
             !prompt.starts_with('│') && !prompt.ends_with('│'),
             "{prompt:?}"
+        );
+
+        // A plugin-sent message names its sender; a typed one does not.
+        state.transcript.server_rows = server_rows(&[Event::UserPromptSent {
+            prompt_id: None,
+            text: "PR merged".into(),
+            attachments: Vec::new(),
+            synthesized: false,
+            origin_plugin: Some("cron".into()),
+        }]);
+        let rows = render_rows(&state, 80, 20, true);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("› [plugin cron] PR merged")),
+            "{rows:?}"
         );
     }
 }
