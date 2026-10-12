@@ -476,6 +476,7 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
             eprintln!("Warning: failed to kill agent tmux session: {}", e);
         }
         inst.kill_ancillary_tmux_sessions_locked();
+        inst.release_scope();
     }
 
     let landed = storage.update(|instances, _groups| {

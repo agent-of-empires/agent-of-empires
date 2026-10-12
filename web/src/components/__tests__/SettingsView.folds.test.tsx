@@ -40,6 +40,11 @@ const ROWS: Row[] = [
   ["sandbox", "extra_volumes", "Extra volumes", { kind: "list" }, true, true, "volume_list"],
   ["sandbox", "port_mappings", "Port mappings", { kind: "list" }, true, true, "port_mapping_list"],
   ["sandbox", "volume_ignores", "Volume ignores", { kind: "list" }, true],
+  ["systemd", "enabled", "Use systemd scopes", { kind: "toggle" }, false],
+  ["systemd", "slice", "Systemd slice", { kind: "text" }, false],
+  ["systemd", "survive_daemon_restart", "Sessions survive daemon restart", { kind: "toggle" }, false],
+  ["systemd", "memory_max", "Session memory limit", { kind: "optional_text" }, true, false, "memory_limit"],
+  ["systemd", "tasks_max", "Session task limit", { kind: "number", min: 0 }, true],
   ["acp", "show_tool_durations", "Show tool-call durations", { kind: "toggle" }, false],
   ["acp", "rate_limit_auto_resume", "Auto-resume after rate limit", { kind: "toggle" }, false],
   ["acp", "replay_events", "History cap (events)", { kind: "number", min: 0 }, false],
@@ -299,6 +304,29 @@ describe("Settings Advanced fold", () => {
       },
       "main",
     );
+  });
+
+  it("renders the systemd tab from the schema and saves its fields", async () => {
+    const { container } = renderView("systemd");
+    await screen.findByText("Use systemd scopes");
+
+    expect(screen.getByText("Systemd slice")).toBeTruthy();
+    expect(screen.getByText("Sessions survive daemon restart")).toBeTruthy();
+    expect(screen.queryByText("Session memory limit")).toBeNull();
+    expect(screen.queryByText("Session task limit")).toBeNull();
+
+    expandAdvanced(container);
+    expect(screen.getByText("Session memory limit")).toBeTruthy();
+
+    commit(fieldInputByLabel(container, "Systemd slice", "text"), "aoe.slice");
+    commit(fieldInputByLabel(container, "Session task limit", "number"), "4096");
+    clickToggle(container, "Use systemd scopes");
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ systemd: { slice: "aoe.slice" } }, "main"),
+    );
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ systemd: { tasks_max: 4096 } }, "main");
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ systemd: { enabled: true } }, "main");
   });
 
   // Regression: the mount-time fetchProfiles resolution flips selectedProfile from its "" seed to the default.

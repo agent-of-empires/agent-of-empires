@@ -70,6 +70,21 @@ pub fn shim_node() -> Result<&'static Path, String> {
     .map_err(Clone::clone)
 }
 
+/// Keeps a spawned or in-process aoe off the developer's systemd user manager.
+pub const SYSTEMD_OFF: &str = "[systemd]\nenabled = false\n";
+
+/// Appends [`SYSTEMD_OFF`] to the `config.toml` in `app_dir`.
+pub fn disable_systemd_scopes(app_dir: &Path) {
+    use std::io::Write;
+    std::fs::create_dir_all(app_dir).expect("create app dir");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(app_dir.join("config.toml"))
+        .expect("open config.toml");
+    writeln!(file, "\n{SYSTEMD_OFF}").expect("write config.toml");
+}
+
 /// Point `HOME` (and `XDG_CONFIG_HOME`) at a fresh temp dir; drop the guard to
 /// restore. `set_var` is not thread-safe, so callers must be `#[serial]`.
 pub fn setup_temp_home() -> TestHome {

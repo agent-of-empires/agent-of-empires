@@ -19,6 +19,8 @@ The `SettingsSection` derive turns it into a `FieldDescriptor` in `settings_sche
 
 The section comes from the struct's `#[setting_section(name = "...", category = "...")]`: `name` is the `[section]` table in `config.toml`, `category` the TUI tab, and an optional `repo_default = "allow" | "deny"` sets the repo-config policy its fields inherit.
 
+A new section struct is not the one-edit case: add it to `build_schema` in `settings_schema/registry.rs`, which every surface and the PATCH policy read, give a new `category` a `SettingsCategory` tab in `src/tui/settings/`, and give the section a web tab in `SettingsView.tsx` plus its `SECTION_TO_TAB` entry.
+
 | Widget | Backing type | Control |
 |--------|--------------|---------|
 | `toggle` | `bool` | switch |
@@ -34,7 +36,7 @@ The section comes from the struct's `#[setting_section(name = "...", category = 
 
 Beyond `label`, `desc` (defaults to the doc comment), `widget`, `options`, `min` / `max` / `step`, and `multiline` / `mono`:
 
-- `validate`: the server-authoritative check (`range:MIN[:MAX]`, `nonempty`, `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`, `capability_list`, `security_opt_list`, `network`). If none fits, add a `ValidationKind` variant and a `validate=` keyword; that one rule drives both the client UX validator and the server gate.
+- `validate`: the server-authoritative check (`range:MIN[:MAX]`, `nonempty`, `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`, `capability_list`, `security_opt_list`, `network`, `systemd_slice`). If none fits, add a `ValidationKind` variant and a `validate=` keyword; that one rule drives both the client UX validator and the server gate.
 - `web`: `elevation:<reason>` (passphrase step-up to save from the web) or `local_only:<reason>` (a host-execution surface the server rejects and the dashboard never renders, such as a binary path or command argv). Omit for a plain allow.
 - `repo`: `allow` or `deny`, defaulting to the section's `repo_default`. Global-only fields are never repo-settable.
 - `category` overrides the section's TUI tab, `advanced` groups the field under an Advanced fold, `tui_only` marks a field only the TUI reads so the web folds it under "Terminal UI", `global_only` shows it but makes it non-overridable per profile, and `skip` excludes it from the schema entirely.

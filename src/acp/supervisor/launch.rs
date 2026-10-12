@@ -10,7 +10,7 @@ use super::agents::{
     apply_agent_command_override, log_wrapper_substitution, wrapper_substitution_for,
 };
 use super::publish::collect_resumable_background_agent_launches;
-use super::teardown::tear_down_runner;
+use super::teardown::{release_scope, tear_down_runner};
 use super::{
     lock_recover, BroadcastSink, PendingContextReset, ResumeKind, ResumeReservation,
     ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError, WorkerHandle, WorkerKind,
@@ -447,24 +447,37 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(client)
     }
 
-    /// Retire a runner a failed spawn left behind under this lease's generation.
+    /// Retire a runner a failed spawn left behind under this lease's generation
+    /// and release the scope it created, while the lease still holds the
+    /// session. A first launch has no previous runner to keep. Under a pending
+    /// stop the scope is released even when no runner of this generation exists.
     async fn reap_failed_launch(&self, lease: &Lease) {
         let session_id = lease.session_id();
-        let Ok(Some(record)) = worker_registry::load(session_id) else {
-            return;
+        let identity = worker_registry::load(session_id)
+            .ok()
+            .flatten()
+            .filter(|record| record.generation == lease.epoch())
+            .map(|record| RunnerIdentity {
+                pid: record.pid,
+                generation: record.generation,
+            });
+        // One lock: a stop landing after the conversion sees `AlreadyStopping`,
+        // so the pending-stop check must be read in the same critical section.
+        let (stop_pending, converted) = {
+            let mut table = lock_recover(&self.lifecycle);
+            let stop_pending = table.cancel_requested(lease).is_some();
+            let converted = identity.is_some() && table.convert_to_stopping(lease);
+            if converted {
+                table.owe_sweep(lease);
+            }
+            (stop_pending, converted)
         };
-        if record.generation != lease.epoch() {
-            return;
+        if converted {
+            let settlement = tear_down_runner(&*self.process_control, session_id, identity).await;
+            self.settle_sweeping_if_owed(lease, settlement).await;
+        } else if stop_pending {
+            release_scope(&self.process_control, session_id).await;
         }
-        let identity = RunnerIdentity {
-            pid: record.pid,
-            generation: record.generation,
-        };
-        if !lock_recover(&self.lifecycle).convert_to_stopping(lease) {
-            return;
-        }
-        let settlement = tear_down_runner(&*self.process_control, session_id, Some(identity)).await;
-        self.settle(lease, settlement);
     }
 
     /// Tear down a built worker whose install the lifecycle table refused.
@@ -484,7 +497,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                     %reason,
                     "resume cancelled by a concurrent shutdown; runner torn down"
                 );
-                self.settle(lease, settlement);
+                // The refused install left this lease stopping and owing the
+                // sweep, which holds off a replacement start until the settle.
+                self.settle_sweeping_if_owed(lease, settlement).await;
                 self.publish_next(session_id, &Event::Stopped { reason });
             }
             InstallError::Stale => {

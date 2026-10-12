@@ -294,6 +294,20 @@ pub fn validate_network_format(network: &str) -> Result<(), String> {
     }
 }
 
+/// A systemd slice name template with `{profile}` as the only placeholder,
+/// checked by the same rule the scope setup applies at runtime.
+pub fn validate_systemd_slice(slice: &str) -> Result<(), String> {
+    // An escaped profile is never empty and never contains `-`, like `x`.
+    if crate::process::systemd::valid_slice(&slice.replace("{profile}", "x")) {
+        Ok(())
+    } else {
+        Err(
+            "Must end in .slice, use only letters, digits and : . - _, have no empty part around a -, stay within 255 characters, with {profile} as the only placeholder (e.g. background-aoe-{profile}.slice)"
+                .to_string(),
+        )
+    }
+}
+
 /// Validate Docker memory limit format (e.g., "512m", "2g")
 pub fn validate_memory_limit(limit: &str) -> Result<(), String> {
     if limit.is_empty() {
