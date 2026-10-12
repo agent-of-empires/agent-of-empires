@@ -860,6 +860,7 @@ impl HomeView {
             super::DeleteAttempt {
                 forced: request.force_delete,
                 trashed_at: request.instance.trashed_at,
+                trash_lifecycle_id: request.instance.trash_lifecycle_id.clone(),
             },
         );
         self.deletion_poller.request_deletion(request);
@@ -873,7 +874,12 @@ impl HomeView {
         }
         self.failed_deletes
             .get(&inst.id)
-            .filter(|attempt| inst.trashed_at.is_some() && attempt.trashed_at == inst.trashed_at)
+            .filter(|attempt| {
+                inst.trashed_at.is_some()
+                    && attempt.trashed_at == inst.trashed_at
+                    && inst.trash_lifecycle_id.is_some()
+                    && attempt.trash_lifecycle_id == inst.trash_lifecycle_id
+            })
             .map(|attempt| attempt.forced)
     }
 
@@ -903,6 +909,7 @@ impl HomeView {
             super::DeleteAttempt {
                 forced: true,
                 trashed_at: inst.trashed_at,
+                trash_lifecycle_id: inst.trash_lifecycle_id.clone(),
             },
         );
         self.set_instance_status(&inst.id, Status::Deleting);
@@ -920,7 +927,9 @@ impl HomeView {
         };
         let inst = result.instance;
         self.deletes_in_flight.remove(&inst.id);
-        self.failed_deletes.remove(&inst.id);
+        if should_clear_drop_retry_state(&result.dropped, &inst, self.instances.get(&inst.id)) {
+            self.failed_deletes.remove(&inst.id);
+        }
         match result.dropped {
             Ok(true) => {
                 self.instances.shift_remove(&inst.id);
@@ -1978,10 +1987,11 @@ impl HomeView {
                     generation,
                     stored.lifecycle_reservation.clone(),
                     stored.trashed_at,
+                    stored.trash_lifecycle_id.clone(),
                 ))
             })
         })();
-        let (generation, reservation, trashed_at) = match acquisition {
+        let (generation, reservation, trashed_at, trash_lifecycle_id) = match acquisition {
             Ok(acquired) => acquired,
             Err(error) => {
                 tracing::warn!(target: "tui.session", session = %id, "trash failed: {error}");
@@ -1991,10 +2001,12 @@ impl HomeView {
 
         // Copy the durable stamp so later lifecycle checks match the stored row.
         request_instance.trashed_at = trashed_at;
+        request_instance.trash_lifecycle_id = trash_lifecycle_id.clone();
         request_instance.lifecycle_generation = generation;
         request_instance.lifecycle_reservation = reservation.clone();
         if let Some(instance) = self.instances.get_mut(id) {
             instance.trashed_at = trashed_at;
+            instance.trash_lifecycle_id = trash_lifecycle_id;
             instance.lifecycle_generation = generation;
             instance.lifecycle_reservation = reservation;
         }
@@ -2444,7 +2456,7 @@ pub(super) fn perform_drop(request: DropRequest) -> DropResult {
         storage.update(|instances, _groups| {
             let same_lifecycle = instances
                 .iter()
-                .any(|stored| stored.id == id && stored.trashed_at == inst.trashed_at);
+                .any(|stored| stored.id == id && stored.same_trash_lifecycle(&inst));
             if same_lifecycle
                 && matches!(
                     crate::session::claim::decide_purge_claim(
@@ -2467,6 +2479,16 @@ pub(super) fn perform_drop(request: DropRequest) -> DropResult {
         instance: inst,
         dropped,
     }
+}
+
+/// Retain failed removal history only while its durable trash lifecycle remains current.
+fn should_clear_drop_retry_state(
+    dropped: &anyhow::Result<bool>,
+    requested: &Instance,
+    current: Option<&Instance>,
+) -> bool {
+    matches!(dropped, Ok(true))
+        || !current.is_some_and(|current| requested.same_trash_lifecycle(current))
 }
 
 /// Tear down a removed session's tmux and sandbox off-thread so a hung call cannot block
@@ -2500,6 +2522,88 @@ fn spawn_force_teardown(inst: Instance) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Construct a real trash lifecycle with a deterministic clock value.
+    fn trashed_instance(trashed_at: chrono::DateTime<chrono::Utc>) -> Instance {
+        let mut instance = Instance::new("trashed", "/tmp/trashed");
+        instance.trash();
+        instance.trashed_at = Some(trashed_at);
+        instance
+    }
+
+    #[test]
+    fn drop_retry_state_survives_failed_or_declined_removal() {
+        let trashed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("fixed test timestamp is valid");
+        let requested = trashed_instance(trashed_at);
+        let current = requested.clone();
+
+        assert!(!should_clear_drop_retry_state(
+            &Err(anyhow::anyhow!("storage error")),
+            &requested,
+            Some(&current),
+        ));
+        assert!(!should_clear_drop_retry_state(
+            &Ok(false),
+            &requested,
+            Some(&current),
+        ));
+    }
+
+    #[test]
+    fn drop_retry_state_clears_after_success_or_lifecycle_change() {
+        let trashed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("fixed test timestamp is valid");
+        let requested = trashed_instance(trashed_at);
+        let current = requested.clone();
+        let restored = Instance::new("trashed", "/tmp/trashed");
+        let re_trashed = trashed_instance(trashed_at + chrono::Duration::seconds(1));
+
+        assert!(should_clear_drop_retry_state(
+            &Ok(true),
+            &requested,
+            Some(&current),
+        ));
+        assert!(should_clear_drop_retry_state(
+            &Ok(false),
+            &requested,
+            Some(&restored),
+        ));
+        assert!(should_clear_drop_retry_state(
+            &Err(anyhow::anyhow!("storage error")),
+            &requested,
+            Some(&re_trashed),
+        ));
+        assert!(should_clear_drop_retry_state(&Ok(false), &requested, None,));
+    }
+
+    #[test]
+    fn drop_retry_state_invalidates_retrash_even_when_timestamps_collide() {
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let requested = trashed_instance(at);
+        let mut peer: Instance =
+            serde_json::from_str(&serde_json::to_string(&requested).unwrap()).unwrap();
+        peer.untrash();
+        peer.trash();
+        peer.trashed_at = requested.trashed_at;
+        let current: Instance =
+            serde_json::from_str(&serde_json::to_string(&peer).unwrap()).unwrap();
+        assert_ne!(current.trash_lifecycle_id, requested.trash_lifecycle_id);
+        for dropped in [Ok(false), Err(anyhow::anyhow!("storage error"))] {
+            assert!(should_clear_drop_retry_state(
+                &dropped,
+                &requested,
+                Some(&current),
+            ));
+        }
+        let mut unidentified = requested.clone();
+        unidentified.trash_lifecycle_id = None;
+        assert!(should_clear_drop_retry_state(
+            &Ok(false),
+            &unidentified,
+            Some(&unidentified),
+        ));
+    }
 
     // An Idle sandbox session whose container is still running is the #1927 follow-up:
     // the worktree dir is an active bind-mount source, so `git worktree move` fails with

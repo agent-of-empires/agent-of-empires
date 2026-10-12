@@ -43,7 +43,8 @@ pub(crate) mod v033_isolate_sandbox_content;
 mod v034_trash_retention_minutes;
 mod v035_custom_sort_order;
 mod v036_session_creation_count;
-mod v037_prime_native_runtime;
+mod v037_trash_lifecycle_id;
+mod v038_prime_native_runtime;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -89,7 +90,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 37;
+const CURRENT_VERSION: u32 = 38;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -224,7 +225,8 @@ const MIGRATIONS: &[Migration] = &[
         "session_creation_count",
         v036_session_creation_count::run,
     ),
-    (37, "prime_native_runtime", v037_prime_native_runtime::run),
+    (37, "trash_lifecycle_id", v037_trash_lifecycle_id::run),
+    (38, "prime_native_runtime", v038_prime_native_runtime::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

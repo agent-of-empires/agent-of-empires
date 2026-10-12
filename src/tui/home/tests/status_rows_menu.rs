@@ -1493,6 +1493,46 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
     }
 }
 
+/// A peer restore/re-trash invalidates cached force escalation even at the same timestamp.
+#[test]
+#[serial]
+fn failed_delete_retry_identity_survives_storage_and_rejects_peer_retrash() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _| {
+            instances.iter_mut().find(|i| i.id == id).unwrap().trash();
+            Ok(())
+        })
+        .unwrap();
+    env.view.reload().unwrap();
+    let requested = env.view.get_instance(&id).unwrap().clone();
+    env.view.failed_deletes.insert(
+        id.clone(),
+        super::super::DeleteAttempt {
+            forced: true,
+            trashed_at: requested.trashed_at,
+            trash_lifecycle_id: requested.trash_lifecycle_id.clone(),
+        },
+    );
+    assert_eq!(env.view.failed_delete_forced(&requested), Some(true));
+    storage
+        .update(|instances, _| {
+            let peer = instances.iter_mut().find(|i| i.id == id).unwrap();
+            peer.untrash();
+            peer.trash();
+            peer.trashed_at = requested.trashed_at;
+            Ok(())
+        })
+        .unwrap();
+    env.view.reload().unwrap();
+    let current = env.view.get_instance(&id).unwrap();
+    assert_eq!(current.trashed_at, requested.trashed_at);
+    assert_ne!(current.trash_lifecycle_id, requested.trash_lifecycle_id);
+    assert_eq!(env.view.failed_delete_forced(current), None);
+}
+
 /// Shelf bulk actions: "Empty Trash" routes through a destructive confirm and marks every trashed
 /// row Deleting (an empty trash shows an info dialog instead), and "Restore All" un-trashes or
 /// unarchives every row of its section.
