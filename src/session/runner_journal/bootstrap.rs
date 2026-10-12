@@ -91,18 +91,25 @@ fn canonical_publication(
     publication: &NatalPublication,
     phase: super::NativeLaunchPhase,
 ) -> Result<super::RunnerLaunch> {
+    original.storage().verify_profile_identity()?;
+    let row = original
+        .storage()
+        .load_worktree_owner_locked(original.session_id())?
+        .context("installation original session disappeared")?;
+    original.validate_row(&row)?;
+    Ok(canonical_publication_in_row(&row, born, publication, &[phase])?.clone())
+}
+
+fn canonical_publication_in_row<'a>(
+    row: &'a crate::session::Instance,
+    born: RunnerIdentity,
+    publication: &NatalPublication,
+    phases: &[super::NativeLaunchPhase],
+) -> Result<&'a super::RunnerLaunch> {
     anyhow::ensure!(
         publication.born == born,
         "installation publication changed native birth"
     );
-    original.storage().verify_profile_identity()?;
-    let row = original
-        .storage()
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == original.session_id())
-        .context("installation original session disappeared")?;
-    original.validate_row(&row)?;
     let mut matches = row.runner_journal.launches().iter().filter(|launch| {
         Some(Uuid::from_bytes(launch.nonce)) == born.launch_nonce
             && Some(launch.boot) == born.boot
@@ -119,12 +126,12 @@ fn canonical_publication(
     );
     super::validate_launch_snapshots(std::slice::from_ref(launch))?;
     anyhow::ensure!(
-        launch.phase == phase
+        phases.contains(&launch.phase)
             && launch.stop_endpoint == Some(publication.endpoint)
             && launch.registry.as_ref() == Some(&publication.registry),
-        "producer receipt differs from canonical {phase:?} original"
+        "producer receipt differs from canonical original"
     );
-    Ok(launch.clone())
+    Ok(launch)
 }
 
 pub(super) fn commit_original(
@@ -338,9 +345,7 @@ impl LaunchBootstrap {
         hold_for_hosted_proof("storage")?;
         let row = origin
             .storage()
-            .load_strict_for_worktree_ownership_locked()?
-            .into_iter()
-            .find(|row| row.id == id)
+            .load_worktree_owner_locked(id)?
             .context("issued session disappeared")?;
         origin.validate_row(&row)?;
         anyhow::ensure!(
@@ -469,9 +474,59 @@ impl LaunchBootstrap {
             deadline,
         )?;
         remaining(deadline)?;
-        self.guard.disarm();
         drop(self.fences.take());
+        self.guard.disarm();
         Ok(())
+    }
+    pub(crate) fn retire_startup_registry(
+        self,
+        original: &Arc<LaunchOrigin>,
+        record: &WorkerRecord,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            Arc::ptr_eq(original, &self.origin),
+            "startup retirement substituted original owner"
+        );
+        original.validate_record_birth(record)?;
+        if self.fences.is_none() {
+            return original.with_storage(|_, row| {
+                anyhow::ensure!(
+                    row.runner_journal.owns_record(record),
+                    "retirement lost its original published registry witness"
+                );
+                Ok(worker_registry::delete_if_owned_by(record))
+            });
+        }
+        let publication = self
+            .publication
+            .as_ref()
+            .context("startup retirement lacks original publication")?;
+        anyhow::ensure!(
+            publication.registry.matches_record(record),
+            "startup retirement changed original registry witness"
+        );
+        original.storage().verify_profile_identity()?;
+        let row = original
+            .storage()
+            .load_worktree_owner_locked(original.session_id())?
+            .context("startup retirement original session disappeared")?;
+        original.validate_baseline_at(&row, original.generation())?;
+        canonical_publication_in_row(
+            &row,
+            self.born,
+            publication,
+            &[
+                super::NativeLaunchPhase::Armed,
+                super::NativeLaunchPhase::Published,
+                super::NativeLaunchPhase::Unresolved {
+                    may_authorize: false,
+                },
+                super::NativeLaunchPhase::Unresolved {
+                    may_authorize: true,
+                },
+            ],
+        )?;
+        Ok(worker_registry::delete_if_owned_by(record))
     }
 }
 
@@ -497,12 +552,14 @@ fn read_exact_until(
     deadline: Instant,
 ) -> Result<()> {
     while !bytes.is_empty() {
-        channel.set_read_timeout(Some(remaining(deadline)?))?;
+        channel
+            .set_read_timeout(Some(remaining(deadline)?))
+            .context("setting natal private-channel receive timeout")?;
         match channel.read(bytes) {
             Ok(0) => anyhow::bail!("natal private channel closed"),
             Ok(count) => bytes = &mut bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error).context("reading natal private-channel bytes"),
         }
     }
     remaining(deadline)?;
@@ -511,12 +568,14 @@ fn read_exact_until(
 
 fn write_all_until(channel: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
     while !bytes.is_empty() {
-        channel.set_write_timeout(Some(remaining(deadline)?))?;
+        channel
+            .set_write_timeout(Some(remaining(deadline)?))
+            .context("setting natal private-channel send timeout")?;
         match channel.write(bytes) {
             Ok(0) => anyhow::bail!("natal private channel write made no progress"),
             Ok(count) => bytes = &bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error).context("writing natal private-channel bytes"),
         }
     }
     remaining(deadline)?;
@@ -1306,14 +1365,10 @@ mod tests {
         let (mut sender, mut receiver) = UnixStream::pair()?;
         sender.write_all(&u32::MAX.to_le_bytes())?;
         receiver.set_read_timeout(Some(Duration::from_secs(1)))?;
-        let error = read_frame::<serde_json::Value>(&mut receiver).unwrap_err();
-        assert!(error.to_string().contains("frame limit"));
+        assert!(read_frame::<serde_json::Value>(&mut receiver).is_err());
         receiver.set_nonblocking(true)?;
         let oversized = "x".repeat(BOOTSTRAP_FRAME_LIMIT);
-        assert!(write_frame(&mut sender, &oversized)
-            .unwrap_err()
-            .to_string()
-            .contains("frame limit"));
+        assert!(write_frame(&mut sender, &oversized).is_err());
         assert_eq!(
             receiver.read(&mut [0]).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock

@@ -629,19 +629,24 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> anyhow::Result<bool> {
     })
 }
 
-/// Reconcile trashed rows across original profiles using one fenced ownership inventory.
-/// Returned rows remain associated with the physical Storage that committed them.
+#[derive(Default)]
+pub struct TrashReconciliation {
+    pub committed: Vec<(crate::session::Storage, Vec<Instance>)>,
+    pub failure: Option<anyhow::Error>,
+}
+
+/// Reconcile using one fenced inventory, retaining acknowledgements before a failure.
 pub fn reconcile_trashed_profiles(
     storages: &[crate::session::Storage],
-) -> anyhow::Result<Vec<(crate::session::Storage, Vec<Instance>)>> {
+) -> anyhow::Result<TrashReconciliation> {
     if storages.is_empty() {
-        return Ok(Vec::new());
+        return Ok(TrashReconciliation::default());
     }
     let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
     let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let mut ownership = crate::session::deletion::PathClaimIndex::load(storages)?;
     let mut cache = ProtectedBranchCache::default();
-    let mut reconciled = Vec::new();
+    let mut reconciled = TrashReconciliation::default();
     for (target, profile, rows) in ownership.take_targets() {
         let storage = &storages[target];
         let mut candidates: Vec<Instance> = rows
@@ -653,19 +658,22 @@ pub fn reconcile_trashed_profiles(
         candidates.sort_by(|a, b| a.id.cmp(&b.id));
         let mut healed = Vec::new();
         for batch in candidates.chunks(RECONCILE_BATCH) {
-            match reconcile_trashed_batch(storage, profile, batch, &mut ownership) {
-                Ok(batch_healed) => healed.extend(batch_healed),
-                Err(error) => {
-                    ownership.invalidate();
-                    return Err(error.context(format!(
-                        "trash reconciliation for profile {} stopped after uncertain relocation",
-                        storage.profile()
-                    )));
+            if let Err(error) =
+                reconcile_trashed_batch(storage, profile, batch, &mut ownership, &mut healed)
+            {
+                ownership.invalidate();
+                if !healed.is_empty() {
+                    reconciled.committed.push((storage.clone(), healed));
                 }
+                reconciled.failure = Some(error.context(format!(
+                    "trash reconciliation for profile {} stopped after uncertain relocation",
+                    storage.profile()
+                )));
+                return Ok(reconciled);
             }
         }
         if !healed.is_empty() {
-            reconciled.push((storage.clone(), healed));
+            reconciled.committed.push((storage.clone(), healed));
         }
     }
     Ok(reconciled)
@@ -698,7 +706,8 @@ fn reconcile_trashed_batch(
     profile: usize,
     batch: &[Instance],
     ownership: &mut crate::session::deletion::PathClaimIndex,
-) -> anyhow::Result<Vec<Instance>> {
+    healed: &mut Vec<Instance>,
+) -> anyhow::Result<()> {
     let now = Utc::now();
     let reserved = storage.update_metadata(
         crate::session::MetadataSelection::Instances(batch),
@@ -737,7 +746,6 @@ fn reconcile_trashed_batch(
         },
     )?;
 
-    let mut healed = Vec::new();
     for (generation, snapshot) in reserved {
         let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&snapshot.id)?;
         let (changed, durable) =
@@ -747,7 +755,7 @@ fn reconcile_trashed_batch(
             healed.push(durable);
         }
     }
-    Ok(healed)
+    Ok(())
 }
 
 // Workspace and identity locks fence the pass; lifecycle fences this row.
@@ -1429,14 +1437,16 @@ mod tests {
         let mut ownership =
             crate::session::deletion::PathClaimIndex::load(std::slice::from_ref(&storage)).unwrap();
         let (_, profile, _) = ownership.take_targets().pop().unwrap();
-        assert!(reconcile_trashed_batch(
+        let mut healed = Vec::new();
+        reconcile_trashed_batch(
             &storage,
             profile,
             std::slice::from_ref(&snapshot),
             &mut ownership,
+            &mut healed,
         )
-        .unwrap()
-        .is_empty());
+        .unwrap();
+        assert!(healed.is_empty());
         let stored = storage.load().unwrap().into_iter().next().unwrap();
         assert_eq!(stored.id, id);
         assert!(
@@ -1481,7 +1491,9 @@ mod tests {
                 .unwrap();
         }
 
-        let healed = reconcile_trashed_profiles(std::slice::from_ref(&storage)).unwrap();
+        let result = reconcile_trashed_profiles(std::slice::from_ref(&storage)).unwrap();
+        assert!(result.failure.is_none());
+        let healed = result.committed;
         assert_eq!(healed.iter().map(|(_, rows)| rows.len()).sum::<usize>(), 2);
         let stored = storage.load().unwrap();
         for (id, original) in &originals {
@@ -1509,12 +1521,9 @@ mod tests {
             "a row needing nothing must not be reserved"
         );
 
-        assert!(
-            reconcile_trashed_profiles(std::slice::from_ref(&storage))
-                .unwrap()
-                .is_empty(),
-            "the sweep is idempotent"
-        );
+        let result = reconcile_trashed_profiles(std::slice::from_ref(&storage)).unwrap();
+        assert!(result.failure.is_none());
+        assert!(result.committed.is_empty());
         assert_eq!(
             generations(&storage.load().unwrap()),
             generations(&stored),
@@ -1573,9 +1582,9 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            assert!(reconcile_trashed_profiles(std::slice::from_ref(&storage))
-                .unwrap()
-                .is_empty());
+            let result = reconcile_trashed_profiles(std::slice::from_ref(&storage)).unwrap();
+            assert!(result.failure.is_none());
+            assert!(result.committed.is_empty());
             let refused = storage.load().unwrap().remove(0);
             assert_eq!(refused.project_path, row.project_path);
             assert_eq!(refused.pre_trash_project_path, row.pre_trash_project_path);
@@ -1587,7 +1596,9 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            let healed = reconcile_trashed_profiles(std::slice::from_ref(&storage)).unwrap();
+            let result = reconcile_trashed_profiles(std::slice::from_ref(&storage)).unwrap();
+            assert!(result.failure.is_none());
+            let healed = result.committed;
             assert_eq!(healed.len(), 1);
             assert_eq!(storage.load().unwrap()[0].project_path, destination);
         }

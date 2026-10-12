@@ -426,7 +426,7 @@ pub async fn update_session_archive(
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Option<Json<TrashSessionBody>>,
+    body: Result<Option<Json<TrashSessionBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(response) = cityhall_block_non_structured(&state, &id).await {
         return response;
@@ -434,6 +434,10 @@ pub async fn trash_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let body = body.map(|Json(body)| body).unwrap_or_default();
 
     let Some(_submission) = state
@@ -461,9 +465,8 @@ pub async fn trash_session(
             let storage = original.storage().reopen_preserving_watch()?;
             let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(original.session_id())?;
             let snapshot = storage
-                .load_strict_for_worktree_ownership_locked()?
-                .into_iter()
-                .find(|row| original.matches_instance(row))
+                .load_worktree_owner_locked(original.session_id())?
+                .filter(|row| original.matches_instance(row))
                 .ok_or_else(|| anyhow::anyhow!("trash original was replaced"))?;
             ensure_trash_paths_unclaimed(&storage, &snapshot)?;
             let (generation, plan) =
@@ -532,9 +535,7 @@ pub async fn trash_session(
         let storage = storage.reopen_preserving_watch()?;
         let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&work_id)?;
         let snapshot = storage
-            .load_strict_for_worktree_ownership_locked()?
-            .into_iter()
-            .find(|row| row.id == work_id)
+            .load_worktree_owner_locked(&work_id)?
             .ok_or_else(|| anyhow::anyhow!("session disappeared during trash"))?;
         let issued = native.current_projection();
         anyhow::ensure!(
@@ -781,10 +782,9 @@ pub async fn restore_session(
                     .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
                 let scope = native.current_projection();
                 let snapshot = storage
-                    .load_strict_for_worktree_ownership_locked()
+                    .load_worktree_owner_locked(native.session_id())
                     .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
-                    .into_iter()
-                    .find(|row| scope.matches_instance(row))
+                    .filter(|row| scope.matches_instance(row))
                     .ok_or_else(|| {
                         RestoreTransitionError::Busy(
                             crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),

@@ -365,11 +365,153 @@ fn daemon_status_skips_a_row_mid_recovery() {
     );
 }
 
-/// #3201: the daemon owns structured status and never persists it
-/// (`decide_passive_transition` returns `patch: None` for `is_structured()`), so the TUI's
-/// passive writer must gate the same way, or a `Running`/`Error` stamped mid-turn survives a
-/// daemon stop and a TUI restart with nothing left to heal it. The in-memory pill must still
-/// move.
+#[test]
+#[serial]
+fn sid_lane_keeps_input_responsive_preserves_edits_and_flushes_before_close() {
+    for newer_launch in [false, true] {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Running);
+        let storage = env
+            .view
+            .get_instance(&id)
+            .unwrap()
+            .original_storage()
+            .unwrap();
+        let sid = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
+        let poller = crate::session::poller::SessionPoller::new(
+            format!("absent-test-pane-{id}"),
+            "claude".into(),
+            None,
+        );
+        poller.inject_test_update(&id, sid);
+        let poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        env.view.instances.get_mut(&id).unwrap().session_id_poller = Some(poller.clone());
+        let lifecycle = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+        let (returned, receive) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let view = &mut env.view;
+            let id = &id;
+            scope.spawn(move || {
+                view.apply_session_id_updates();
+                let row = view.instances.get_mut(id).unwrap();
+                row.title = "newer title".into();
+                if newer_launch {
+                    row.last_start_time = Some(std::time::Instant::now());
+                }
+                view.record_row_edit("test", id);
+                returned.send(()).unwrap();
+            });
+            let responsive = receive.recv_timeout(std::time::Duration::from_secs(5));
+            drop(lifecycle);
+            assert!(
+                responsive.is_ok(),
+                "input waited behind the held lifecycle flock"
+            );
+        });
+        drain_persistence(&mut env.view).unwrap();
+        let live = env.view.get_instance(&id).unwrap();
+        assert_eq!(live.title, "newer title");
+        assert_eq!(
+            live.agent_session_id.as_deref(),
+            if newer_launch { None } else { Some(sid) }
+        );
+        let durable = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(durable.agent_session_id.as_deref(), Some(sid));
+        if !newer_launch {
+            let final_sid = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+            poller.lock().unwrap().inject_test_update(&id, final_sid);
+            env.view.request_persistence_close();
+            drain_persistence(&mut env.view).unwrap();
+            assert!(env.view.persistence.closed);
+            assert_eq!(
+                env.view
+                    .get_instance(&id)
+                    .unwrap()
+                    .agent_session_id
+                    .as_deref(),
+                Some(final_sid)
+            );
+            let durable = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(durable.agent_session_id.as_deref(), Some(final_sid));
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn failed_reload_clears_only_the_original_starting_overlay() {
+    use super::super::persistence_lane::ReloadContinuation;
+    for recovery in [false, true] {
+        for newer in [false, true] {
+            let mut env = create_test_env_empty();
+            let id = structured_row(&mut env, Status::Starting);
+            env.view.instances.get_mut(&id).unwrap().last_start_time =
+                Some(std::time::Instant::now());
+            let before = env.view.get_instance(&id).unwrap().clone();
+            let storage = before.original_storage().unwrap();
+            let bytes = "{ malformed canonical document";
+            std::fs::write(storage.sessions_path(), bytes).unwrap();
+            let after = if recovery {
+                ReloadContinuation::Recovery(super::super::RecoveryUpdate {
+                    instance_id: id.clone(),
+                    title: before.title.clone(),
+                    before: Box::new(before.clone()),
+                    instance: Box::new(before.clone()),
+                    result: Err("launch refused".into()),
+                })
+            } else {
+                ReloadContinuation::Restart {
+                    result: crate::session::restart::RestartResult {
+                        session_id: id.clone(),
+                        before: Box::new(before.clone()),
+                        instance: Box::new(before.clone()),
+                        outcome: Err("launch refused".into()),
+                    },
+                    attach_after: false,
+                }
+            };
+            if newer {
+                env.view
+                    .instances
+                    .get_mut(&id)
+                    .unwrap()
+                    .lifecycle_generation += 1;
+            }
+            let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
+            env.view
+                .request_reload_after(super::super::ReloadKind::Full, after);
+            assert!(drain_persistence(&mut env.view).is_err());
+            let current = env.view.get_instance(&id).unwrap();
+            assert_eq!(
+                current.status,
+                if newer {
+                    Status::Starting
+                } else {
+                    Status::Error
+                }
+            );
+            assert_eq!(current.lifecycle_generation, generation);
+            assert_eq!(current.active_execution, before.active_execution);
+            assert_eq!(
+                std::fs::read_to_string(storage.sessions_path()).unwrap(),
+                bytes
+            );
+            assert!(env.view.info_dialog.is_some());
+        }
+    }
+}
+
+/// #3201: structured status remains owned by the daemon.
 #[test]
 #[serial]
 fn daemon_status_does_not_persist_a_structured_row_to_disk() {

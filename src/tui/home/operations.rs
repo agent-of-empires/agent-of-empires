@@ -1243,8 +1243,8 @@ pub(super) fn restore_from_trash_with_storage(
         }
     };
 
-    let loaded = match storage.load_strict_for_worktree_ownership_locked() {
-        Ok(all) => all.into_iter().find(|instance| instance.id == id),
+    let loaded = match storage.load_worktree_owner_locked(id) {
+        Ok(owner) => owner,
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore load failed: {error}");
             let _ = storage.update_under_workspace_claim_lock(|instances, _groups| {

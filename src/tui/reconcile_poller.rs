@@ -87,7 +87,12 @@ fn sweep(profiles: &[String]) -> bool {
         }
     }
     changed |= match crate::session::trash::reconcile_trashed_profiles(&storages) {
-        Ok(healed) => !healed.is_empty(),
+        Ok(result) => {
+            if let Some(error) = result.failure {
+                tracing::warn!(target: "tui.home", "trash reconciliation stopped after committed progress: {error:#}");
+            }
+            !result.committed.is_empty()
+        }
         Err(error) => {
             tracing::warn!(target: "tui.home", "trash reconciliation skipped: {error}");
             false

@@ -35,7 +35,7 @@ pub(super) fn heal_rows(
     let mut document = match crate::session::raw_document::RawDocument::parse(content) {
         Ok(document) => document,
         Err(error) => {
-            debug!("failed to parse {}: {error}, skipping", path.display());
+            debug!(target: "migrations", "failed to parse {}: {error}, skipping", path.display());
             return Ok(0);
         }
     };
@@ -54,7 +54,7 @@ pub(super) fn heal_rows(
                 healed += 1;
             }
             Ok(crate::session::raw_document::Emission::Original(_)) => {}
-            Err(error) => debug!(
+            Err(error) => debug!(target: "migrations",
                 "ambiguous row in {}: {error}, retaining original",
                 path.display()
             ),

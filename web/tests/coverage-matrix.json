@@ -3130,7 +3130,13 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/read-only-mode.spec.ts"],
-      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
+      "components": [
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "src/server/api/plugins.rs",
+        "src/server/api/acp/worker.rs",
+        "src/server/api/sessions/delete.rs",
+        "src/server/api/sessions/lifecycle.rs"
+      ]
     },
     {
       "id": "ensure-session-restart",

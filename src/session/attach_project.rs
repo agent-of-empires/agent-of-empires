@@ -640,7 +640,7 @@ fn release_unstarted_claims(scope: &super::runner_journal::OwnedStop, paths: &[P
         )
     });
     if let Err(error) = result {
-        tracing::debug!(session = %scope.session_id(), %error, "changed attach scope was preserved during release");
+        tracing::debug!(target: "session.attach", session = %scope.session_id(), %error, "changed attach scope was preserved during release");
     }
 }
 

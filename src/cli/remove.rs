@@ -90,9 +90,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                     anyhow::anyhow!("failed to acquire instance trash lock: {error}")
                 })?;
             let snapshot = storage
-                .load_strict_for_worktree_ownership_locked()?
-                .into_iter()
-                .find(|row| row.id == removed_id)
+                .load_worktree_owner_locked(&removed_id)?
                 .ok_or_else(|| {
                     anyhow::anyhow!("Session {removed_title} disappeared before trash")
                 })?;
@@ -131,9 +129,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         let _identity_lock = acquire_session_identity_lock()?;
         let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&removed_id)?;
         let snapshot = storage
-            .load_strict_for_worktree_ownership_locked()?
-            .into_iter()
-            .find(|row| row.id == removed_id)
+            .load_worktree_owner_locked(&removed_id)?
             .ok_or_else(|| anyhow::anyhow!("Session {removed_title} disappeared during trash"))?;
         anyhow::ensure!(
             snapshot.is_trashed()

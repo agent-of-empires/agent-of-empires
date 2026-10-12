@@ -408,29 +408,8 @@ impl HomeView {
         {
             return false;
         }
-        // Whole-object re-insert is safe: the TUI loop is single-threaded, so the snapshot can't go stale.
-        let mut snapshot: Vec<Instance> = self.cloned_instances();
-        let outcome =
-            crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &self.file_watch);
-        if !outcome.touched() {
-            return false;
-        }
-        let touched: HashSet<&str> = outcome
-            .applied
-            .iter()
-            .chain(outcome.rolled_back.iter())
-            .chain(outcome.lifecycle_advanced.iter())
-            .map(String::as_str)
-            .collect();
-        for inst in snapshot
-            .into_iter()
-            .filter(|i| touched.contains(i.id.as_str()))
-        {
-            self.instances.insert(inst.id.clone(), inst);
-        }
-        !outcome.applied.is_empty()
-            || !outcome.rolled_back.is_empty()
-            || !outcome.lifecycle_advanced.is_empty()
+        self.request_session_id_drain();
+        false
     }
 
     pub fn repair_session_id_pollers(&mut self) {

@@ -610,7 +610,12 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
-        let stop = match crate::session::runner_journal::reserve_stop_from_origin(original, false) {
+        let stop = match tokio::task::spawn_blocking(move || {
+            crate::session::runner_journal::reserve_stop_from_origin(original, false)
+        })
+        .await
+        .unwrap_or_else(|error| Err(error.into()))
+        {
             Ok(stop) => stop,
             Err(error) => {
                 tracing::debug!(target: "acp.supervisor", %id, %error, "stale worker source changed before retirement");
@@ -618,18 +623,28 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             }
         };
         if let Some(identity) = identity {
-            if stop
-                .with_scope(|_| {
-                    worker_registry::mark_restart_pending(&id, identity.generation);
+            let owner = stop.clone();
+            let marker_id = id.clone();
+            if !matches!(
+                tokio::task::spawn_blocking(move || owner.with_scope(|_| {
+                    worker_registry::mark_restart_pending(&marker_id, identity.generation);
                     Ok(())
-                })
-                .is_err()
-            {
+                }))
+                .await,
+                Ok(Ok(()))
+            ) {
                 continue;
             }
         }
-        let stopped = state.acp_supervisor.shutdown(stop.clone()).await.is_ok()
-            && crate::session::runner_journal::release_owned_stop(&stop).is_ok();
+        let stopped = if state.acp_supervisor.shutdown(stop.clone()).await.is_ok() {
+            tokio::task::spawn_blocking(move || {
+                crate::session::runner_journal::release_owned_stop(&stop)
+            })
+            .await
+            .is_ok_and(|result| result.is_ok())
+        } else {
+            false
+        };
         if !stopped {
             continue;
         }

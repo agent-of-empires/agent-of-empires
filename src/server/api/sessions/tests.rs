@@ -2555,7 +2555,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
             delete_session(
                 State(state),
                 Path("sess-3650-direct".to_string()),
-                Some(Json(DeleteSessionBody::default())),
+                Ok(Some(Json(DeleteSessionBody::default()))),
             )
             .await
             .into_response()
@@ -2722,7 +2722,7 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     ) -> axum::response::Response {
         match which {
             "stop" => stop_session(State(state), Path(id)).await.into_response(),
-            "trash" => trash_session(State(state), Path(id), None)
+            "trash" => trash_session(State(state), Path(id), Ok(None))
                 .await
                 .into_response(),
             "archive" => update_session_archive(
@@ -3160,7 +3160,7 @@ async fn delete_session_notifies_plugins_that_the_session_is_deleting() {
     delete_session(
         State(std::sync::Arc::clone(&state)),
         Path("sess-delete-notify".to_string()),
-        Some(Json(DeleteSessionBody::default())),
+        Ok(Some(Json(DeleteSessionBody::default()))),
     )
     .await;
 
@@ -3219,7 +3219,7 @@ async fn a_trash_stop_does_not_hold_the_identity_lock() {
         let state = Arc::clone(&state);
         let id = id.clone();
         async move {
-            trash_session(State(state), Path(id), None)
+            trash_session(State(state), Path(id), Ok(None))
                 .await
                 .into_response()
         }
@@ -5035,12 +5035,12 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
         let resp = if workspace_endpoint {
             delete_workspace(
                 State(state.clone()),
-                Some(Json(DeleteWorkspaceBody {
+                Ok(Some(Json(DeleteWorkspaceBody {
                     session_ids,
                     delete_worktree: true,
                     delete_branch: true,
                     ..Default::default()
-                })),
+                }))),
             )
             .await
             .into_response()
@@ -5048,11 +5048,11 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             delete_session(
                 State(state.clone()),
                 Path(owner.id.clone()),
-                Some(Json(DeleteSessionBody {
+                Ok(Some(Json(DeleteSessionBody {
                     delete_worktree: true,
                     delete_branch: true,
                     ..Default::default()
-                })),
+                }))),
             )
             .await
             .into_response()

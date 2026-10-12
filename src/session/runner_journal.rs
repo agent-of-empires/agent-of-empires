@@ -122,9 +122,7 @@ fn retire_original_no_target(
     })?;
     sync_parent_directory(storage.sessions_path())?;
     let acknowledged = storage
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == original.session_id())
+        .load_worktree_owner_locked(original.session_id())?
         .context("original no-target writer lost its acknowledged owner")?;
     let derived = original.derive_no_target_successor(receipt.launch(), receipt.identity())?;
     derived.validate_row(&written)?;
@@ -599,9 +597,7 @@ pub(crate) fn with_current_execution_row<T>(
     let _lifecycle = storage.acquire_instance_lifecycle_lock(id)?;
     ensure_unique_owner(storage, id)?;
     let row = storage
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == id)
+        .load_worktree_owner_locked(id)?
         .context("deferred execution owner disappeared")?;
     anyhow::ensure!(
         row.lifecycle_generation == generation && row.active_execution.as_ref() == execution,
@@ -627,10 +623,7 @@ fn ensure_unique_owner(storage: &Storage, id: &str) -> Result<()> {
             continue;
         }
         anyhow::ensure!(
-            !other
-                .load_strict_for_worktree_ownership_locked()?
-                .iter()
-                .any(|row| row.id == id),
+            !other.has_worktree_owner_locked(id)?,
             "session id {id} has owners in distinct profiles; runner routing is ambiguous"
         );
     }
@@ -787,8 +780,7 @@ fn prepare_locked<'a>(
                     .context("retaining original preparation after uncertain durable ACK")?;
                 return Err(error);
             }
-            let row = original.load_strict_for_worktree_ownership_locked()?.into_iter()
-                .find(|row| row.id == session_id)
+            let row = original.load_worktree_owner_locked(&session_id)?
                 .context("original preparation writer lost its acknowledged row")?;
             validate(&row)?;
             anyhow::ensure!(!row.runner_journal.preparations.iter().any(|ticket|
@@ -1437,9 +1429,7 @@ impl LaunchOrigin {
         let row = self
             .plan
             .storage
-            .load_strict_for_worktree_ownership_locked()?
-            .into_iter()
-            .find(|row| row.id == self.plan.session_id)
+            .load_worktree_owner_locked(&self.plan.session_id)?
             .ok_or_else(|| LaunchSessionGone(self.plan.session_id.clone()))?;
         self.validate_row(&row)?;
         effect(&self.plan.storage, row)
@@ -1797,9 +1787,7 @@ impl OwnedStop {
         let _lifecycle = storage.acquire_instance_lifecycle_lock(self.session_id())?;
         ensure_unique_owner(storage, self.session_id())?;
         let row = storage
-            .load_strict_for_worktree_ownership_locked()?
-            .into_iter()
-            .find(|row| row.id == self.session_id())
+            .load_worktree_owner_locked(self.session_id())?
             .context("original session disappeared during stop")?;
         self.current_projection()
             .validate_baseline_at(&row, self.generation)?;
@@ -1950,9 +1938,7 @@ fn release_stop_claim(original: &LaunchOrigin, generation: u64) -> Result<()> {
     storage.verify_profile_identity()?;
     let _lifecycle = storage.acquire_instance_lifecycle_lock(original.session_id())?;
     let row = storage
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == original.session_id())
+        .load_worktree_owner_locked(original.session_id())?
         .context("session disappeared during stop retirement")?;
     if !row.lifecycle_reservation_is_owned(LifecycleOperation::Stop, generation) {
         return Ok(());
@@ -2801,9 +2787,7 @@ pub(crate) fn admit_runner_prompt<T>(
     let _lifecycle = storage.acquire_instance_lifecycle_lock(id)?;
     ensure_unique_owner(storage, id)?;
     let row = storage
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == id)
+        .load_worktree_owner_locked(id)?
         .context("runner session disappeared before prompt admission")?;
     startable(&row)?;
     anyhow::ensure!(
@@ -2949,9 +2933,7 @@ pub(crate) fn capture_unique_origin(id: &str) -> Result<std::sync::Arc<LaunchOri
     storage.verify_profile_identity()?;
     let _lifecycle = storage.acquire_instance_lifecycle_lock(id)?;
     let mut row = storage
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == id)
+        .load_worktree_owner_locked(id)?
         .context("original runner owner disappeared during capture")?;
     row.storage_origin = Some(std::sync::Arc::new(storage));
     LaunchOrigin::capture(&row)
@@ -2961,11 +2943,7 @@ fn find_stored_owner_locked(id: &str) -> Result<Option<Storage>> {
     let mut found: Option<(Storage, std::fs::Metadata)> = None;
     for profile in super::list_profiles_for_worktree_inventory()? {
         let storage = Storage::open_unwatched(&profile)?;
-        if !storage
-            .load_strict_for_worktree_ownership_locked()?
-            .iter()
-            .any(|row| row.id == id)
-        {
+        if !storage.has_worktree_owner_locked(id)? {
             continue;
         }
         let metadata = std::fs::metadata(
@@ -3084,9 +3062,7 @@ fn snapshot(scope: &JournalScope, _nonce: Option<[u8; 16]>) -> Result<RunnerExec
     let _lifecycle = storage.acquire_instance_lifecycle_lock(id)?;
     ensure_unique_owner(storage, id)?;
     let row = storage
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == id)
+        .load_worktree_owner_locked(id)?
         .context("runner's stored owner disappeared without original retirement acknowledgement")?;
     scope.validate(&row)?;
     validate_launch_snapshots(row.runner_journal.launches())?;
@@ -3222,9 +3198,7 @@ pub(crate) fn verify_published_runner(
     let _lifecycle = storage.acquire_instance_lifecycle_lock(id)?;
     ensure_unique_owner(storage, id)?;
     let row = storage
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|row| row.id == id)
+        .load_worktree_owner_locked(id)?
         .context("runner stored owner disappeared")?;
     anyhow::ensure!(
         row.runner_journal

@@ -476,14 +476,11 @@ impl CreateNativeCustody {
         let _lifecycle = owner
             .storage()
             .acquire_instance_lifecycle_lock(owner.session_id())?;
-        let rows = owner
+        let row = owner
             .storage()
-            .load_strict_for_worktree_ownership_locked()?;
-        let row = rows
-            .iter()
-            .find(|row| row.id == owner.session_id())
+            .load_worktree_owner_locked(owner.session_id())?
             .context("original Create disappeared")?;
-        original.validate_baseline_at(row, owner.generation())?;
+        original.validate_baseline_at(&row, owner.generation())?;
         anyhow::ensure!(
             row.runner_journal.create_coverage == super::CreationCoverage::Owned
                 && row.runner_journal.creations.len() == receipts.len()
@@ -968,9 +965,7 @@ fn drive(
     let original = owner.current_projection();
     let row = owner
         .storage()
-        .load_strict_for_worktree_ownership_locked()?
-        .into_iter()
-        .find(|r| r.id == owner.session_id())
+        .load_worktree_owner_locked(owner.session_id())?
         .context("original native Create disappeared")?;
     original.validate_baseline_at(&row, owner.generation())?;
     validate_goal(owner.storage(), &row, &record, &receipt.spec)?;
@@ -1057,9 +1052,7 @@ fn drive(
         );
         let row = owner
             .storage()
-            .load_strict_for_worktree_ownership_locked()?
-            .into_iter()
-            .find(|r| r.id == owner.session_id())
+            .load_worktree_owner_locked(owner.session_id())?
             .context("producer ACK row disappeared")?;
         original.validate_plan_at(&row, owner.generation(), original.plan.trashed)?;
         anyhow::ensure!(

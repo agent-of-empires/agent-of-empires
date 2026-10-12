@@ -308,11 +308,11 @@ mod tests {
                         switch_acp_agent(
                             State(state),
                             Path(id),
-                            Json(crate::acp::protocol::SwitchAgentRequest {
+                            Ok(Json(crate::acp::protocol::SwitchAgentRequest {
                                 target: "codex".to_string(),
                                 model: None,
                                 reason: None,
-                            }),
+                            })),
                         )
                         .await
                         .into_response()
@@ -379,11 +379,11 @@ mod tests {
                         "switch" => switch_acp_agent(
                             state,
                             id,
-                            Json(crate::acp::protocol::SwitchAgentRequest {
+                            Ok(Json(crate::acp::protocol::SwitchAgentRequest {
                                 target: "codex".to_string(),
                                 model: None,
                                 reason: None,
-                            }),
+                            })),
                         )
                         .await
                         .into_response(),

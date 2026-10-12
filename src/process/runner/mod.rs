@@ -210,43 +210,60 @@ pub async fn run(args: AcpRunnerArgs, natal: RunnerNatalGuard) -> Result<()> {
     let startup = match startup {
         Ok(outcome) => outcome,
         Err(error) => {
-            return match owner.retire().await {
+            return match owner.retire_startup(bootstrap).await {
                 Ok(true) => Err(error),
                 Ok(false) => {
-                    Err(error.context("published native record retirement remains unproven"))
+                    Err(error.context("original startup registry retirement remains unproven"))
                 }
                 Err(retirement) => Err(error.context(format!(
-                    "published native record retirement failed: {retirement:#}"
+                    "original startup registry retirement failed: {retirement:#}"
                 ))),
             };
         }
     };
     if let Some(mut accepted) = startup {
+        #[cfg(debug_assertions)]
         if !accepted.forced() {
-            #[cfg(debug_assertions)]
             let gate = accepted.isolated_retirement_gate();
-            let retirement = async {
-                #[cfg(debug_assertions)]
-                gate.await?;
-                owner.retire().await
-            };
-            tokio::pin!(retirement);
-            if accepted.can_upgrade() {
+            tokio::pin!(gate);
+            let gate_result = if accepted.can_upgrade() {
                 tokio::select! {
                     biased;
-                    upgrade = accepted.accept_force_upgrade() => {
-                        if let Err(error) = upgrade {
-                            warn!(target: "acp.runner", session = %args.session_id, %error, "early original Stop upgrade refused");
-                            let _ = retirement.await;
-                        }
-                    }
-                    _ = &mut retirement => {}
+                    upgrade = accepted.accept_force_upgrade() => upgrade,
+                    result = &mut gate => result,
                 }
             } else {
-                let _ = retirement.await;
+                gate.await
+            };
+            if let Err(error) = gate_result {
+                warn!(target: "acp.runner", session = %args.session_id, %error, "early original Stop gate or upgrade refused");
             }
         }
-        drain_registry_before_exit(&args.session_id, &owner).await;
+        let retirement = owner.retire_startup(bootstrap);
+        tokio::pin!(retirement);
+        let result = if accepted.can_upgrade() {
+            tokio::select! {
+                biased;
+                upgrade = accepted.accept_force_upgrade() => {
+                    if let Err(error) = upgrade {
+                        warn!(target: "acp.runner", session = %args.session_id, %error, "early original Stop upgrade refused");
+                    }
+                    retirement.await
+                }
+                result = &mut retirement => result,
+            }
+        } else {
+            retirement.await
+        };
+        match result {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(target: "acp.runner", session = %args.session_id, "original startup registry retirement remains unproven")
+            }
+            Err(error) => {
+                warn!(target: "acp.runner", session = %args.session_id, "original startup registry retirement failed: {error:#}")
+            }
+        }
         anyhow::ensure!(
             crate::process::worker::kill_own_process_group_if_leader(our_pid),
             "early Stop could not retire its original native group"

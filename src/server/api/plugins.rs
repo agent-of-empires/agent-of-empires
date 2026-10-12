@@ -337,7 +337,7 @@ pub struct InvokeCommandBody {
 pub async fn invoke_plugin_command(
     State(state): State<std::sync::Arc<AppState>>,
     Path(fqid): Path<String>,
-    Json(body): Json<InvokeCommandBody>,
+    body: Result<Json<InvokeCommandBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if state.read_only {
         return api_error(
@@ -350,6 +350,10 @@ pub async fn invoke_plugin_command(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     // Plugin ids contain dots, so resolve fqid against the registry rather
     // than string-splitting it.
     let mut resolved: Option<(String, bool)> = None;
@@ -470,11 +474,15 @@ pub async fn apply_plugin_update(
     session: Option<axum::Extension<AuthenticatedSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
-    Json(body): Json<ApplyUpdateBody>,
+    body: Result<Json<ApplyUpdateBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let plugin_id = id.clone();
     let fingerprint = body.expected_fingerprint;
     let host = state.plugin_host.clone();
@@ -501,11 +509,15 @@ pub async fn dismiss_plugin_update(
     session: Option<axum::Extension<AuthenticatedSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
-    Json(body): Json<DismissUpdateBody>,
+    body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let result = tokio::task::spawn_blocking(move || {
         plugin::install::dismiss_update(&id, &body.fingerprint)
     })
@@ -528,11 +540,15 @@ pub async fn set_plugin_enabled(
     session: Option<axum::Extension<AuthenticatedSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
-    Json(body): Json<SetEnabledBody>,
+    body: Result<Json<SetEnabledBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let result =
         tokio::task::spawn_blocking(move || plugin::install::set_enabled(&id, body.enabled)).await;
     match result {
@@ -750,7 +766,7 @@ pub struct InstallPreviewBody {
 /// NOT elevation: it mutates nothing and powers the approval UI.
 pub async fn preview_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
-    Json(body): Json<InstallPreviewBody>,
+    body: Result<Json<InstallPreviewBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if state.read_only {
         return api_error(
@@ -763,6 +779,10 @@ pub async fn preview_plugin_install(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     match plugin::install::preview_install(&body.source).await {
         Ok(consent) => Json(consent).into_response(),
         Err(e) => api_error(StatusCode::BAD_GATEWAY, "preview_failed", format!("{e:#}")),
@@ -784,11 +804,15 @@ pub async fn start_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
-    Json(body): Json<StartInstallBody>,
+    body: Result<Json<StartInstallBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
         return resp;
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let source = body.source.clone();
     let fingerprint = body.expected_fingerprint;
     start_job(

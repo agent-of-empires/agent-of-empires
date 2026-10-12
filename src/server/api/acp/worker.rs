@@ -492,7 +492,7 @@ async fn persist_agent_switch(
 pub async fn switch_acp_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<SwitchAgentRequest>,
+    req: Result<Json<SwitchAgentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
@@ -500,6 +500,10 @@ pub async fn switch_acp_agent(
     if let Some(resp) = cityhall_block(&state) {
         return resp;
     }
+    let Json(req) = match req {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let target = req.target.trim().to_string();
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();

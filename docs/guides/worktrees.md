@@ -98,7 +98,7 @@ An externally placed `git worktree lock` is not a deletion guard: aoe locks ever
 
 An upgrade adds an explicit unknown journal only when the old journal is absent or null. Existing non-null journals and native history are preserved, including partial evidence that the current decoder cannot accept. The migration does not invent missing births or seed an observed boot baseline. Use [metadata-only retirement](#abandoning-unresolved-intent-metadata) for eligible unknown or unresolved owners; their resources and exclusions remain protected.
 
-A different host boot can establish runner execution coverage only when a real observed baseline was already durably recorded. With no baseline, restarting or rebooting does not establish that proof. Execution coverage never reconstructs original endpoint custody, retires an unknown Create domain, or clears Pending/Unknown filesystem intents.
+Unknown execution coverage does not become complete after a restart or host reboot, even if its journal contains a boot baseline. Metadata-only retirement does not reconstruct original endpoint custody, retire an unknown Create domain, or clear Pending/Unknown filesystem intents.
 
 ## Warnings during create
 

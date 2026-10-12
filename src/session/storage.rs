@@ -1713,6 +1713,25 @@ impl Storage {
         Ok(instances)
     }
 
+    pub(crate) fn load_worktree_owner_locked(&self, id: &str) -> Result<Option<Instance>> {
+        let raw = self.load_raw_document_locked(&self.sessions_path)?;
+        let Some(owner) = raw.unique_owner(id)? else {
+            return Ok(None);
+        };
+        let mut instance: Instance = serde_json::from_str(owner.get())?;
+        instance.source_profile = self.profile.clone();
+        instance.storage_origin = Some(Arc::new(self.clone()));
+        instance.set_file_watch(self.file_watch.clone());
+        Ok(Some(instance))
+    }
+
+    pub(crate) fn has_worktree_owner_locked(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .load_raw_document_locked(&self.sessions_path)?
+            .unique_owner(id)?
+            .is_some())
+    }
+
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
         let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
         Self::write_corrupt_rows_quarantine(&path, rows, "session");
@@ -1873,10 +1892,8 @@ impl Storage {
     ) -> Result<()> {
         self.verify_profile_identity()?;
         let claims = super::deletion::PathClaimIndex::load_for_writer(std::slice::from_ref(self))?;
-        let rows = self.load_strict_for_worktree_ownership_locked()?;
-        let row = rows
-            .iter()
-            .find(|row| row.id == id)
+        let row = self
+            .load_worktree_owner_locked(id)?
             .context("worktree owner disappeared")?;
         anyhow::ensure!(
             Path::new(&row.project_path) == current,
@@ -4669,8 +4686,113 @@ mod tests {
         Ok(())
     }
 
-    /// The fail-closed guarantee the sidecar check used to imply still holds where it
-    /// counts: a row still sitting in `sessions.json` that will not deserialize.
+    #[test]
+    #[serial]
+    fn targeted_owner_admission_ignores_display_corruption_but_refuses_identity_ambiguity(
+    ) -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        let target = Instance::new("selected", "/selected");
+        let target_json = serde_json::to_string(&target)?;
+        let mut peer = serde_json::to_value(Instance::new("peer", "/peer"))?;
+        let peer_id = peer["id"].as_str().unwrap().to_owned();
+        peer["title"] = serde_json::json!({"opaque": true});
+        let peer = serde_json::to_string(&peer)?.replacen("\"id\":", "\"i\\u0064\":", 1);
+        let bytes = format!("[ {target_json}, {peer} ]");
+        fs::write(storage.sessions_path(), &bytes)?;
+        assert!(storage.load_strict_for_worktree_ownership_locked().is_err());
+        let selected = storage.load_worktree_owner_locked(&target.id)?.unwrap();
+        assert_eq!(selected.title, target.title);
+        assert_eq!(selected.created_at, target.created_at);
+        assert!(selected.original_storage()?.same_origin_as(&storage));
+        assert!(storage.has_worktree_owner_locked(&peer_id)?);
+        assert!(storage.load_worktree_owner_locked(&peer_id).is_err());
+        assert!(!storage.has_worktree_owner_locked("absent")?);
+        assert_eq!(fs::read_to_string(storage.sessions_path())?, bytes);
+        let duplicated = format!("[{target_json},{target_json}]");
+        fs::write(storage.sessions_path(), &duplicated)?;
+        assert!(storage.load_worktree_owner_locked(&target.id).is_err());
+        assert!(storage.has_worktree_owner_locked(&target.id).is_err());
+        assert_eq!(fs::read_to_string(storage.sessions_path())?, duplicated);
+        for ambiguous in [
+            r#"{"title":"missing id"}"#,
+            r#"{"id":null}"#,
+            r#"{"id":"peer","i\u0064":"different"}"#,
+            "null",
+        ] {
+            let bytes = format!("[{target_json},{ambiguous}]");
+            fs::write(storage.sessions_path(), &bytes)?;
+            assert!(storage.load_worktree_owner_locked(&target.id).is_err());
+            assert!(storage.has_worktree_owner_locked("absent").is_err());
+            assert_eq!(fs::read_to_string(storage.sessions_path())?, bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn trash_reconciliation_retains_committed_progress_before_later_lock_failure() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        let mut rows = Vec::new();
+        let mut holdings = Vec::new();
+        for id in ["0000000000000001", "0000000000000002"] {
+            let mut row = Instance::new("trashed", temp.path().join(id).to_str().unwrap());
+            row.id = id.into();
+            row.worktree_info = Some(crate::session::WorktreeInfo {
+                managed_by_aoe: true,
+                branch: "feature".into(),
+                main_repo_path: temp.path().to_string_lossy().into_owned(),
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            row.trash();
+            let holding =
+                super::super::trash::trash_holding_path(Path::new(&row.project_path), id).unwrap();
+            fs::create_dir_all(&holding)?;
+            holdings.push(holding);
+            rows.push(row);
+        }
+        storage.update(|stored, _| {
+            *stored = rows.clone();
+            Ok(())
+        })?;
+        let bad_lock = storage.sessions_path().parent().unwrap().join(format!(
+            "{INSTANCE_LIFECYCLE_LOCK_PREFIX}{}.lock",
+            rows[1].id
+        ));
+        fs::create_dir(&bad_lock)?;
+        let result =
+            super::super::trash::reconcile_trashed_profiles(std::slice::from_ref(&storage))?;
+        assert!(result.failure.is_some());
+        let acknowledged = &result.committed[0].1;
+        assert_eq!(
+            acknowledged
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            [rows[0].id.as_str()]
+        );
+        assert!(result.committed[0].0.same_origin_as(&storage));
+        let stored = storage.load()?;
+        assert_eq!(stored[0].project_path, holdings[0].to_string_lossy());
+        assert_eq!(acknowledged[0].project_path, stored[0].project_path);
+        assert_eq!(stored[1].project_path, rows[1].project_path);
+        assert!(stored[1].lifecycle_reservation.is_some());
+        fs::remove_dir(bad_lock)?;
+        let continued =
+            super::super::trash::reconcile_trashed_profiles(std::slice::from_ref(&storage))?;
+        assert!(continued.failure.is_none());
+        assert_eq!(
+            storage.load()?[0].project_path,
+            holdings[0].to_string_lossy()
+        );
+        Ok(())
+    }
+
+    /// An opaque canonical row still prevents a full native owner inventory.
     #[test]
     #[serial]
     fn ownership_inventory_still_refuses_a_corrupt_row_in_sessions_json() -> Result<()> {

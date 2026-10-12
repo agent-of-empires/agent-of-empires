@@ -577,17 +577,17 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
             }
         }
         let reconciled = crate::session::trash::reconcile_trashed_profiles(&storages)?;
-        if reconciled.is_empty() {
-            return Ok(());
+        if reconciled.committed.is_empty() {
+            return reconciled.failure.map_or(Ok(()), Err);
         }
         let _workspace = crate::session::acquire_session_workspace_claim_lock()?;
         let _identity = crate::session::acquire_session_identity_lock()?;
-        for (storage, _) in &reconciled {
+        for (storage, _) in &reconciled.committed {
             storage.verify_profile_identity()?;
         }
         let mut instances = work_state.instances.blocking_write();
         let mut changed = false;
-        for (storage, rows) in reconciled {
+        for (storage, rows) in reconciled.committed {
             for moved in rows {
                 let Some(snapshot) = snapshots
                     .iter()
@@ -626,7 +626,7 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
                 .mutation_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        Ok(())
+        reconciled.failure.map_or(Ok(()), Err)
     })
     .await;
     match reconciled {
@@ -752,7 +752,7 @@ pub(crate) fn trash_sweep_interval() -> std::time::Duration {
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Option<Json<DeleteSessionBody>>,
+    body: Result<Option<Json<DeleteSessionBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
@@ -761,6 +761,10 @@ pub async fn delete_session(
         return crate::server::api::read_only_response();
     }
 
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
     // Serialize concurrent mutations, prompt submission first: a queue drain
@@ -1092,12 +1096,16 @@ pub(super) async fn purge_workspace_artifacts(
 /// cannot leave it half-removed (#2536).
 pub async fn delete_workspace(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<DeleteWorkspaceBody>>,
+    body: Result<Option<Json<DeleteWorkspaceBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
     }
 
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let body = body.map(|Json(b)| b).unwrap_or_default();
     // Dedupe up front so a repeated id cannot have the owner deleted with
     // sibling flags and then skipped (#2536 review).
@@ -1444,7 +1452,7 @@ mod tests {
         let response = super::delete_session(
             axum::extract::State(state.clone()),
             axum::extract::Path(id.clone()),
-            Some(axum::Json(super::DeleteSessionBody::default())),
+            Ok(Some(axum::Json(super::DeleteSessionBody::default()))),
         )
         .await;
         assert!(

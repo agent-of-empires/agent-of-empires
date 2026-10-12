@@ -287,7 +287,7 @@ impl BoundEndpoint {
         if let Err(error) = with_registry_lock(&self.session_id, || {
             remove_endpoint_unlocked(&self.path, &identity)
         }) {
-            warn!(session_id = %self.session_id, %error, "retaining endpoint after failed cleanup");
+            warn!(target: "acp.registry", session_id = %self.session_id, %error, "retaining endpoint after failed cleanup");
         }
     }
 }

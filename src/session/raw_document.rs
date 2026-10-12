@@ -9,24 +9,24 @@ use std::collections::HashMap;
 use std::fmt;
 
 use super::runner_journal::{NativeBirthKey, NativeLaunchPhase};
-struct FieldName<'a>(Cow<'a, str>);
+struct JsonString<'a>(Cow<'a, str>);
 
-impl<'de> Deserialize<'de> for FieldName<'de> {
+impl<'de> Deserialize<'de> for JsonString<'de> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         struct NameVisitor;
         impl<'de> Visitor<'de> for NameVisitor {
-            type Value = FieldName<'de>;
+            type Value = JsonString<'de>;
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an object field name")
+                formatter.write_str("a JSON string")
             }
             fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E> {
-                Ok(FieldName(Cow::Borrowed(value)))
+                Ok(JsonString(Cow::Borrowed(value)))
             }
             fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
-                Ok(FieldName(Cow::Owned(value.to_owned())))
+                Ok(JsonString(Cow::Owned(value.to_owned())))
             }
             fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
-                Ok(FieldName(Cow::Owned(value)))
+                Ok(JsonString(Cow::Owned(value)))
             }
         }
         deserializer.deserialize_identifier(NameVisitor)
@@ -34,7 +34,7 @@ impl<'de> Deserialize<'de> for FieldName<'de> {
 }
 
 pub(crate) struct RawObject<'a> {
-    fields: Vec<(FieldName<'a>, &'a RawValue)>,
+    fields: Vec<(JsonString<'a>, &'a RawValue)>,
 }
 
 impl<'de> Deserialize<'de> for RawObject<'de> {
@@ -561,6 +561,24 @@ impl RawDocument {
         };
         Ok(Self { rows })
     }
+    pub(crate) fn unique_owner(&self, id: &str) -> Result<Option<&RawValue>> {
+        let mut selected = None;
+        for raw in &self.rows {
+            let object = RawObject::parse(raw)?;
+            let key: JsonString<'_> = serde_json::from_str(
+                object
+                    .unique("id")?
+                    .context("canonical owner lacks id")?
+                    .get(),
+            )?;
+            if key.0 == id {
+                anyhow::ensure!(selected.is_none(), "canonical owner {id} is duplicated");
+                selected = Some(raw.as_ref());
+            }
+        }
+        Ok(selected)
+    }
+
     pub(crate) fn render_value_changes(
         &self,
         changes: &[(usize, &Value, Value)],
@@ -629,7 +647,7 @@ impl RowDocument {
         for (index, row) in raw.rows.iter().enumerate() {
             let value = (|| -> Result<Option<T>> {
                 let object = RawObject::parse(row)?;
-                let key: FieldName<'_> = serde_json::from_str(
+                let key: JsonString<'_> = serde_json::from_str(
                     object
                         .unique(field)?
                         .context("missing owner identity")?

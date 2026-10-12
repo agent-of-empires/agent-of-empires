@@ -49,7 +49,7 @@ Invariants worth knowing before touching this code:
 
 TUI restart and recovery callbacks retire only their original physical request. Rejected authority produces a visible error without merging stale worker fields, persisting them or attaching to a replacement row. A newer request keeps its own in-flight marker.
 
-TUI mutations use one ordered persistence lane. Row requests capture their original storage and visible lifecycle before enqueueing; the worker acquires flocks and returns durable ACKs before native or UI continuations. Sort/group preferences and quit confirmation use that lane too. Quit closes only after its accepted saves settle; a failed save cancels closing and preserves input admission.
+TUI mutations and session-ID capture use one ordered persistence lane. Row requests capture their original storage and visible lifecycle before enqueueing; the worker acquires flocks and returns durable ACKs before native or UI continuations. Session-ID results merge only conversation fields into the unchanged original row. Quit acknowledges its final capture batch before saving and closing; a failed save cancels closing and preserves input admission.
 
 ## Session deletion
 

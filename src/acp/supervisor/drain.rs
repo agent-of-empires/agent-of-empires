@@ -428,7 +428,7 @@ impl<S: BroadcastSink> Drain<S> {
         })
         .await;
         if !matches!(prepared, Ok(Ok(()))) {
-            warn!(session = %session_id, ?prepared, "respawn preparation refused");
+            warn!(target: "acp.supervisor", session = %session_id, ?prepared, "respawn preparation refused");
             return None;
         }
         config.generation = reservation.issued.origin()?.generation();

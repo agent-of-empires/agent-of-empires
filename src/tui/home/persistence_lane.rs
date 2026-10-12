@@ -4,6 +4,7 @@ use crate::session::Status;
 use std::collections::VecDeque;
 
 pub(super) enum PersistenceIntent {
+    SessionIds,
     Save(Option<Box<crate::tui::stop_poller::StopRequest>>),
     Reload(ReloadKind),
     ReloadAfter(ReloadKind, ReloadContinuation),
@@ -16,6 +17,7 @@ struct ActivePersistence {
     id: u64,
     view_epoch: u64,
     revisions: HashMap<String, u64>,
+
     stop: Option<crate::tui::stop_poller::StopRequest>,
     reload_kind: Option<ReloadKind>,
     continuation: Option<ReloadContinuation>,
@@ -214,6 +216,23 @@ impl HomeView {
         token
     }
 
+    pub(super) fn request_session_id_drain(&mut self) {
+        if self.persistence.closing || self.persistence.closed || self.persistence.failed {
+            return;
+        }
+        if !self
+            .persistence
+            .queue
+            .iter()
+            .any(|intent| matches!(intent, PersistenceIntent::SessionIds))
+        {
+            self.persistence
+                .queue
+                .push_back(PersistenceIntent::SessionIds);
+        }
+        self.dispatch_persistence();
+    }
+
     pub(in crate::tui) fn request_save(&mut self) {
         if !matches!(
             self.persistence.queue.back(),
@@ -264,6 +283,12 @@ impl HomeView {
             return;
         }
 
+        self.persistence
+            .queue
+            .retain(|intent| !matches!(intent, PersistenceIntent::SessionIds));
+        self.persistence
+            .queue
+            .push_back(PersistenceIntent::SessionIds);
         self.persistence.quit_error = None;
         self.persistence.closing = true;
         self.request_save();
@@ -435,10 +460,10 @@ impl HomeView {
         continuation: ReloadContinuation,
     ) {
         if self.persistence.closing || self.persistence.closed || self.persistence.failed {
-            self.info_dialog = Some(InfoDialog::new(
-                "Persistence unavailable",
-                "The requested continuation was not acknowledged.",
-            ));
+            self.reject_reload_continuation(
+                continuation,
+                "Persistence is unavailable; the continuation was not acknowledged",
+            );
             return;
         }
         self.persistence
@@ -537,8 +562,10 @@ impl HomeView {
         let mut continuation = None;
         let mut transaction_rows = Vec::new();
         let mut transaction_failure = None;
+
         let mut active_epoch = self.persistence.view_epoch;
         let job = match intent {
+            PersistenceIntent::SessionIds => PersistenceJob::SessionIds(self.cloned_instances()),
             PersistenceIntent::Save(after) => {
                 stop = after.map(|request| *request);
                 PersistenceJob::Save(self.capture_save_snapshot())
@@ -610,6 +637,7 @@ impl HomeView {
             id,
             view_epoch: active_epoch,
             revisions: self.persistence.revisions.clone(),
+
             stop,
             reload_kind,
             continuation,
@@ -623,6 +651,12 @@ impl HomeView {
             .is_err()
         {
             if let Some(active) = self.persistence.active.take() {
+                if let Some(after) = active.continuation {
+                    self.reject_reload_continuation(
+                        after,
+                        "Persistence worker rejected the continuation before acknowledgement",
+                    );
+                }
                 self.reject_transaction(
                     active.transaction_failure.as_ref(),
                     "Persistence worker rejected the request before acknowledgement",
@@ -685,6 +719,30 @@ impl HomeView {
             self.persistence.acknowledgements.push_back(result);
         }
         match done.result {
+            PersistenceResult::SessionIds(updates) => {
+                if active.view_epoch == self.persistence.view_epoch {
+                    for update in updates {
+                        let Some(row) = self.instances.get_mut(&update.id) else {
+                            continue;
+                        };
+                        if !update.before.matches(row) {
+                            continue;
+                        }
+                        row.agent_session_id = update.conversation.session_id;
+                        row.agent_session_binding = update.conversation.binding;
+                        row.resume_intent = update.conversation.intent;
+                        row.resume_binding = update.conversation.resume_binding;
+                        row.active_execution = update.conversation.active;
+                        row.pi_session_path = update.conversation.pi_session_path;
+                        row.resume_probe_failed_sid = update.failed_sid;
+                        row.omp_capture_generation = update.capture_generation;
+                        if let Some(generation) = update.released_generation {
+                            row.lifecycle_generation = generation;
+                            row.lifecycle_reservation = None;
+                        }
+                    }
+                }
+            }
             PersistenceResult::Save(profiles) => self.apply_save_ack(profiles, &active),
             PersistenceResult::Reload(result) => match result {
                 Ok(snapshot) if active.view_epoch == self.persistence.view_epoch => {
@@ -988,7 +1046,7 @@ impl HomeView {
                 self.confirm_before_quit = false;
             }
             TransactionEffect::Restart {
-                request,
+                mut request,
                 origin,
                 attach,
             } => {
@@ -1001,6 +1059,8 @@ impl HomeView {
                     self.info_dialog=Some(InfoDialog::new("Restart Failed","The original row advanced before launch acknowledgement. No native request was submitted."));
                     return;
                 }
+                let starting_at = std::time::Instant::now();
+                request.instance.last_start_time = Some(starting_at);
                 if self.restart_poller.request_restart(*request).is_ok() {
                     self.restart_in_flight.insert(id.clone(), origin);
                     if attach {
@@ -1009,7 +1069,7 @@ impl HomeView {
                     if let Some(row) = self.instances.get_mut(&id) {
                         row.status = Status::Starting;
                         row.last_error = None;
-                        row.last_start_time = Some(std::time::Instant::now());
+                        row.last_start_time = Some(starting_at);
                     }
                 } else {
                     self.info_dialog=Some(InfoDialog::new("Restart Failed","The native restart worker rejected the saved request. The row was not marked Starting."));
@@ -1320,13 +1380,44 @@ impl HomeView {
         self.info_dialog=Some(InfoDialog::new("Original creation undone",&format!("{id}: the actual same-Create native/resource withdrawal was acknowledged. No force Purge or replacement generation was used.")));
     }
     fn reject_reload_continuation(&mut self, after: ReloadContinuation, message: &str) {
-        if let ReloadContinuation::AttachProject { id, .. } = after {
-            self.attach_project_in_flight.remove(&id);
+        match after {
+            ReloadContinuation::Restart { result, .. } => {
+                self.reject_starting_overlay(&result.before)
+            }
+            ReloadContinuation::Recovery(update) => self.reject_starting_overlay(&update.before),
+            ReloadContinuation::AttachProject { id, .. } => {
+                self.attach_project_in_flight.remove(&id);
+            }
+            _ => {}
         }
         self.info_dialog = Some(InfoDialog::new(
             "Reload Failed",
             &format!("{message}. The dependent action was not resumed."),
         ));
+    }
+
+    fn reject_starting_overlay(&mut self, before: &Instance) {
+        if self.restart_in_flight.contains_key(&before.id)
+            || self.recovery_in_flight.contains_key(&before.id)
+            || self.transaction_is_pending(&before.id)
+        {
+            return;
+        }
+        let Some(row) = self.instances.get_mut(&before.id) else {
+            return;
+        };
+        if row.status == Status::Starting
+            && row.created_at == before.created_at
+            && row.same_storage_origin(before)
+            && row.lifecycle_generation == before.lifecycle_generation
+            && row.tool == before.tool
+            && row.last_start_time == before.last_start_time
+            && before.conversation_state().matches(row)
+            && row.resume_probe_failed_sid == before.resume_probe_failed_sid
+            && row.omp_capture_generation == before.omp_capture_generation
+        {
+            row.status = Status::Error;
+        }
     }
     fn apply_reload_continuation(&mut self, after: ReloadContinuation) {
         match after {

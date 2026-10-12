@@ -82,7 +82,100 @@ pub(super) struct WatchPass {
     pub config_error: Option<WatcherInitError>,
 }
 
+pub(super) struct SessionIdBaseline {
+    created_at: chrono::DateTime<chrono::Utc>,
+    storage: Option<Arc<Storage>>,
+    generation: u64,
+    conversation: crate::session::ConversationState,
+    failed_sid: Option<String>,
+    capture_generation: Option<String>,
+    tool: String,
+    started_at: Option<std::time::Instant>,
+}
+
+impl SessionIdBaseline {
+    fn capture(row: &Instance) -> Self {
+        Self {
+            created_at: row.created_at,
+            storage: row.storage_origin.clone(),
+            generation: row.lifecycle_generation,
+            conversation: row.conversation_state(),
+            failed_sid: row.resume_probe_failed_sid.clone(),
+            capture_generation: row.omp_capture_generation.clone(),
+            tool: row.tool.clone(),
+            started_at: row.last_start_time,
+        }
+    }
+
+    pub(super) fn matches(&self, row: &Instance) -> bool {
+        row.created_at == self.created_at
+            && self.storage.as_ref().is_some_and(|original| {
+                row.storage_origin
+                    .as_ref()
+                    .is_some_and(|current| original.same_origin_as(current))
+            })
+            && row.lifecycle_generation == self.generation
+            && row.tool == self.tool
+            && row.last_start_time == self.started_at
+            && self.conversation.matches(row)
+            && row.resume_probe_failed_sid == self.failed_sid
+            && row.omp_capture_generation == self.capture_generation
+    }
+}
+
+pub(super) struct SessionIdUpdate {
+    pub id: String,
+    pub before: SessionIdBaseline,
+    pub conversation: crate::session::ConversationState,
+    pub failed_sid: Option<String>,
+    pub capture_generation: Option<String>,
+    pub released_generation: Option<u64>,
+}
+
+fn drain_session_ids(
+    mut instances: Vec<Instance>,
+    file_watch: &Arc<crate::file_watch::FileWatchService>,
+) -> Vec<SessionIdUpdate> {
+    let before: Vec<_> = instances.iter().map(SessionIdBaseline::capture).collect();
+    let outcome = crate::session::sync::drain_and_persist_session_ids(&mut instances, file_watch);
+    let touched: HashMap<&str, bool> = outcome
+        .applied
+        .iter()
+        .chain(&outcome.rolled_back)
+        .map(|id| (id.as_str(), false))
+        .chain(
+            outcome
+                .lifecycle_advanced
+                .iter()
+                .map(|id| (id.as_str(), true)),
+        )
+        .collect();
+    instances
+        .into_iter()
+        .zip(before)
+        .filter_map(|(row, before)| {
+            let released = *touched.get(row.id.as_str())?;
+            Some(SessionIdUpdate {
+                id: row.id,
+                before,
+                conversation: crate::session::ConversationState {
+                    session_id: row.agent_session_id,
+                    binding: row.agent_session_binding,
+                    intent: row.resume_intent,
+                    resume_binding: row.resume_binding,
+                    active: row.active_execution,
+                    pi_session_path: row.pi_session_path,
+                },
+                failed_sid: row.resume_probe_failed_sid,
+                capture_generation: row.omp_capture_generation,
+                released_generation: released.then_some(row.lifecycle_generation),
+            })
+        })
+        .collect()
+}
+
 pub(super) enum PersistenceJob {
+    SessionIds(Vec<Instance>),
     Save(SaveSnapshot),
     Reload(ReloadContext),
     Rewire(WatchTargets),
@@ -100,6 +193,7 @@ pub(super) struct PersistenceRequest {
 }
 
 pub(super) enum PersistenceResult {
+    SessionIds(Vec<SessionIdUpdate>),
     Save(Vec<ProfileSaveDone>),
     Reload(anyhow::Result<ReloadSnapshot>),
     Rewired(WatchPass),
@@ -153,6 +247,9 @@ pub(super) fn spawn(
     let worker = Worker::spawn("tui.persistence", move |request: PersistenceRequest| {
         let _entered = runtime.as_ref().map(tokio::runtime::Handle::enter);
         let result = match request.job {
+            PersistenceJob::SessionIds(instances) => {
+                PersistenceResult::SessionIds(drain_session_ids(instances, &state.file_watch))
+            }
             PersistenceJob::Save(snapshot) => PersistenceResult::Save(persist_snapshot(snapshot)),
             PersistenceJob::Reload(mut context) => {
                 PersistenceResult::Reload(state.reload(&mut context))

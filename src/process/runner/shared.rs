@@ -99,6 +99,23 @@ impl RegistryOwner {
         .await
         .context("owned native metadata retirement job")?
     }
+    pub(super) async fn retire_startup(
+        self: &Arc<Self>,
+        bootstrap: crate::session::runner_journal::LaunchBootstrap,
+    ) -> anyhow::Result<bool> {
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            owner.retiring.store(true, Ordering::Release);
+            let record = owner
+                .record
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            bootstrap.retire_startup_registry(&owner.original, &record)
+        })
+        .await
+        .context("original startup registry retirement job")?
+    }
 }
 
 pub(crate) struct RunnerShared {
