@@ -148,6 +148,10 @@ pub(super) fn processes_matching(
     found
 }
 
+fn process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
     use std::io::Read as _;
     let mut bytes = [0u8; 1024];
@@ -160,12 +164,7 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
             .and_then(|mut file| file.read(&mut bytes))
         {
             Ok(size) => size,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                continue
-            }
+            Err(error) if process_disappeared(&error) => continue,
             Err(error) => return Err(error).context("runner group census unavailable"),
         };
         let offset = bytes[..size]
@@ -210,9 +209,7 @@ pub(super) fn prime_processes(
         }
         let mut path = entry.path().join("stat");
         if let Err(error) = read(&path, &mut bytes) {
-            if error.kind() != std::io::ErrorKind::NotFound
-                && known.iter().any(|identity| identity.pid == pid)
-            {
+            if !process_disappeared(&error) && known.iter().any(|identity| identity.pid == pid) {
                 return Err(error).with_context(|| format!("inspecting owned Prime process {pid}"));
             }
             continue;
@@ -266,7 +263,7 @@ pub(super) fn prime_processes(
                     "owned Prime process {} omitted from census",
                     identity.pid
                 ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if process_disappeared(&error) => {}
                 Err(error) => {
                     return Err(error).with_context(|| {
                         format!("inspecting owned Prime process {}", identity.pid)
@@ -577,6 +574,32 @@ impl super::SleepInhibit for SystemdInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaped_prime_stat_is_absence_but_other_read_errors_are_not() {
+        use std::io::Read as _;
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stat = fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert!(process_disappeared(&error));
+        for (errno, gone) in [
+            (libc::ENOENT, true),
+            (libc::EACCES, false),
+            (libc::EIO, false),
+        ] {
+            assert_eq!(
+                process_disappeared(&std::io::Error::from_raw_os_error(errno)),
+                gone
+            );
+        }
+    }
 
     #[test]
     #[serial_test::serial]

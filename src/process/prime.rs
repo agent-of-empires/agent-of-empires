@@ -345,7 +345,7 @@ impl PrimeRuntime {
 
     pub(crate) fn observe(&self, fresh: bool) -> Option<Arc<PrimeObservation>> {
         self.validate().ok()?;
-        let mut cache = self.observation.lock().ok()?;
+        let mut cache = self.observation.try_lock().ok()?;
         if cache.cleaned {
             return None;
         }
@@ -960,157 +960,174 @@ pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
     let runtime: PrimeRuntime = serde_json::from_str(&args.runtime)?;
     runtime.prepare()?;
     let mut guard = PrimeCleanupGuard(Some(runtime.clone()), None);
-    let mut daemon = if let Some(command) = &args.daemon_command {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(["-c", command]);
-        cmd
-    } else if let Some(container) = &runtime.container {
-        let index = args
-            .command
-            .iter()
-            .position(|word| word == &container.id)
-            .context("Prime frontend has no pinned container")?;
-        let mut cmd = tokio::process::Command::from(container.transport.command(&[]));
-        cmd.args(&args.command[1..=index]);
-        cmd.arg("env")
-            .arg(format!("TMPDIR={}", runtime.directory.display()));
-        cmd.args(["bash", "-c", RECORDED_LAUNCH, "sh"])
-            .arg(runtime.launch_identity_path(true))
-            .arg(&runtime.program)
-            .args(["--mode", "daemon", "--daemon-socket"])
-            .arg(runtime.socket());
-        cmd
-    } else {
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.args(["-c", RECORDED_LAUNCH, "sh"])
-            .arg(runtime.launch_identity_path(true))
-            .arg(&runtime.program)
-            .args(["--mode", "daemon", "--daemon-socket"])
-            .arg(runtime.socket());
-        cmd
-    };
-    daemon
-        .env("TMPDIR", &runtime.directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    daemon.process_group(0);
-    let mut daemon = daemon.spawn().context("starting owned Prime daemon")?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if daemon.try_wait()?.is_some() {
-            anyhow::bail!("Prime daemon exited during startup");
-        }
-        let mut probe = runtime.command(false);
-        probe
-            .args(["list", "--json", "--socket"])
-            .arg(runtime.socket());
-        let ready = tokio::task::spawn_blocking(move || {
-            crate::session::capture::run_with_timeout_limit(
-                probe,
-                Duration::from_millis(500),
-                "Prime daemon readiness",
-                256 * 1024,
-            )
-            .is_ok()
-        })
-        .await?;
-        if ready {
-            break;
-        }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "Prime daemon startup timed out"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    if args.rewind_container_env {
-        // Darwin /dev/fd opens share the daemon client's consumed offset.
-        let offset = unsafe {
-            libc::lseek(
-                i32::from(crate::session::environment::CONTAINER_EXEC_ENV_FD),
-                0,
-                libc::SEEK_SET,
-            )
-        };
-        if offset == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("rewinding protected Prime container environment");
-        }
-    }
-    let mut argv = args.command;
-    if let Some(container) = &runtime.container {
-        let index = argv.iter().position(|word| word == &container.id);
-        if let Some(index) = index {
-            argv.splice(
-                index + 1..index + 1,
-                [
-                    "bash".into(),
-                    "-c".into(),
-                    RECORDED_LAUNCH.into(),
-                    "sh".into(),
-                    runtime
-                        .launch_identity_path(false)
-                        .to_string_lossy()
-                        .into_owned(),
-                ],
-            );
-            argv.splice(
-                index..index,
-                [
-                    "--env".into(),
-                    format!("TMPDIR={}", runtime.directory.display()),
-                ],
-            );
-        }
-    }
-    let mut frontend = match &runtime.container {
-        Some(container) if argv.iter().any(|arg| arg == &container.id) => {
-            tokio::process::Command::from(container.transport.command(&[]))
-        }
-        Some(_) => tokio::process::Command::new(&argv[0]),
-        None => {
-            let mut command = tokio::process::Command::new("bash");
-            command
-                .args(["-c", RECORDED_LAUNCH, "sh"])
-                .arg(runtime.launch_identity_path(false));
-            command
-        }
-    };
-    frontend
-        .args(if runtime.container.is_none() {
-            &argv[..]
+    let mut owned_daemon = None;
+    let result: Result<()> = async {
+        let mut daemon = if let Some(command) = &args.daemon_command {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.args(["-c", command]);
+            cmd
+        } else if let Some(container) = &runtime.container {
+            let index = args
+                .command
+                .iter()
+                .position(|word| word == &container.id)
+                .context("Prime frontend has no pinned container")?;
+            let mut cmd = tokio::process::Command::from(container.transport.command(&[]));
+            cmd.args(&args.command[1..=index]);
+            cmd.arg("env")
+                .arg(format!("TMPDIR={}", runtime.directory.display()));
+            cmd.args(["bash", "-c", RECORDED_LAUNCH, "sh"])
+                .arg(runtime.launch_identity_path(true))
+                .arg(&runtime.program)
+                .args(["--mode", "daemon", "--daemon-socket"])
+                .arg(runtime.socket());
+            cmd
         } else {
-            &argv[1..]
-        })
-        .env("TMPDIR", &runtime.directory)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-    let mut frontend = frontend.spawn().context("starting Prime frontend")?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut hangup = signal(SignalKind::hangup())?;
-    let status = tokio::select! {
-        status = frontend.wait() => Some(status?),
-        _ = daemon.wait() => None,
-        _ = terminate.recv() => None,
-        _ = hangup.recv() => None,
-    };
-    frontend.start_kill().ok();
-    frontend.wait().await.ok();
-    let owned = runtime.clone();
-    tokio::task::spawn_blocking(move || owned.cleanup()).await??;
-
-    daemon.start_kill().ok();
-    daemon.wait().await.ok();
-    guard.0.take();
-    if let Some(status) = status {
-        anyhow::ensure!(status.success(), "Prime frontend exited with {status}");
+            let mut cmd = tokio::process::Command::new("bash");
+            cmd.args(["-c", RECORDED_LAUNCH, "sh"])
+                .arg(runtime.launch_identity_path(true))
+                .arg(&runtime.program)
+                .args(["--mode", "daemon", "--daemon-socket"])
+                .arg(runtime.socket());
+            cmd
+        };
+        daemon
+            .env("TMPDIR", &runtime.directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        daemon.process_group(0);
+        let daemon = owned_daemon.insert(daemon.spawn().context("starting owned Prime daemon")?);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if daemon.try_wait()?.is_some() {
+                anyhow::bail!("Prime daemon exited during startup");
+            }
+            let mut probe = runtime.command(false);
+            probe
+                .args(["list", "--json", "--socket"])
+                .arg(runtime.socket());
+            let ready = tokio::task::spawn_blocking(move || {
+                crate::session::capture::run_with_timeout_limit(
+                    probe,
+                    Duration::from_millis(500),
+                    "Prime daemon readiness",
+                    256 * 1024,
+                )
+                .is_ok()
+            })
+            .await?;
+            if ready {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Prime daemon startup timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if args.rewind_container_env {
+            // Darwin /dev/fd opens share the daemon client's consumed offset.
+            let offset = unsafe {
+                libc::lseek(
+                    i32::from(crate::session::environment::CONTAINER_EXEC_ENV_FD),
+                    0,
+                    libc::SEEK_SET,
+                )
+            };
+            if offset == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("rewinding protected Prime container environment");
+            }
+        }
+        let mut argv = args.command;
+        if let Some(container) = &runtime.container {
+            let index = argv.iter().position(|word| word == &container.id);
+            if let Some(index) = index {
+                argv.splice(
+                    index + 1..index + 1,
+                    [
+                        "bash".into(),
+                        "-c".into(),
+                        RECORDED_LAUNCH.into(),
+                        "sh".into(),
+                        runtime
+                            .launch_identity_path(false)
+                            .to_string_lossy()
+                            .into_owned(),
+                    ],
+                );
+                argv.splice(
+                    index..index,
+                    [
+                        "--env".into(),
+                        format!("TMPDIR={}", runtime.directory.display()),
+                    ],
+                );
+            }
+        }
+        let mut frontend = match &runtime.container {
+            Some(container) if argv.iter().any(|arg| arg == &container.id) => {
+                tokio::process::Command::from(container.transport.command(&[]))
+            }
+            Some(_) => tokio::process::Command::new(&argv[0]),
+            None => {
+                let mut command = tokio::process::Command::new("bash");
+                command
+                    .args(["-c", RECORDED_LAUNCH, "sh"])
+                    .arg(runtime.launch_identity_path(false));
+                command
+            }
+        };
+        frontend
+            .args(if runtime.container.is_none() {
+                &argv[..]
+            } else {
+                &argv[1..]
+            })
+            .env("TMPDIR", &runtime.directory)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut frontend = frontend.spawn().context("starting Prime frontend")?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        let status = tokio::select! {
+            status = frontend.wait() => Some(status?),
+            _ = daemon.wait() => None,
+            _ = terminate.recv() => None,
+            _ = hangup.recv() => None,
+        };
+        frontend.start_kill().ok();
+        frontend.wait().await.ok();
+        if let Some(status) = status {
+            anyhow::ensure!(status.success(), "Prime frontend exited with {status}");
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    let owned = runtime.clone();
+    let cleanup = match tokio::task::spawn_blocking(move || owned.cleanup()).await {
+        Ok(result) => result,
+        Err(error) => Err(error.into()),
+    };
+    if cleanup.is_ok() {
+        guard.0.take();
+    }
+    if let Some(mut daemon) = owned_daemon {
+        daemon.start_kill().ok();
+        daemon.wait().await.ok();
+    }
+    match (result, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("Prime cleanup also failed: {cleanup:#}")))
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1176,6 +1193,95 @@ mod tests {
             "Drop blocked the async executor behind cleanup"
         );
         drop(runtime);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn observation_does_not_wait_for_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let prime = PrimeRuntime::new("/bin/false".into(), root.path().into(), None).unwrap();
+        for fresh in [false, true] {
+            let observation = prime.observation.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                let _state = observation.lock().unwrap();
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+            });
+            ready_rx.recv().unwrap();
+            assert!(prime.observe(fresh).is_none());
+            let responsive = release_tx.send(()).is_ok();
+            assert!(
+                owner.join().unwrap() && responsive,
+                "observation waited for cleanup"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_error_waits_for_cleanup_and_retains_unsettled_ownership() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        for cleanup_fails in [false, true] {
+            let program = root.path().join(format!("native-{cleanup_fails}"));
+            std::fs::write(&program, format!(
+                "#!/bin/sh\ncase $1 in\nlist) exit 1;;\nshutdown) : > \"$0.started\"; while [ ! -f \"$0.release\" ]; do sleep 0.01; done; {};;\nesac\n",
+                if cleanup_fails { "exit 42" } else { "printf \"%s\" '{\"failed\":[]}'" }
+            )).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let started = program.with_file_name(format!("native-{cleanup_fails}.started"));
+            let release = program.with_file_name(format!("native-{cleanup_fails}.release"));
+            struct Release(std::path::PathBuf);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    let _ = std::fs::write(&self.0, b"");
+                }
+            }
+            let prime = PrimeRuntime::new(program, root.path().into(), None).unwrap();
+            struct PrivateRoot(std::path::PathBuf);
+            impl Drop for PrivateRoot {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let _private_root = PrivateRoot(prime.directory.clone());
+            let args = PrimeRunnerArgs {
+                runtime: serde_json::to_string(&prime).unwrap(),
+                daemon_command: Some("exit 1".into()),
+                rewind_container_env: false,
+                command: vec!["/bin/false".into()],
+            };
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async {
+                let _release_on_drop = Release(release.clone());
+                let running = tokio::spawn(run(args));
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while !started.exists() {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "cleanup did not start"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                let returned_before_cleanup = running.is_finished();
+                std::fs::write(&release, b"").unwrap();
+                assert!(running.await.unwrap().is_err());
+                assert!(
+                    !returned_before_cleanup,
+                    "startup error returned before native cleanup finished"
+                );
+                assert_eq!(prime.directory.exists(), cleanup_fails);
+                assert_eq!(prime.read_proof().unwrap().settled, !cleanup_fails);
+            });
+            drop(executor);
+        }
     }
 
     #[test]
