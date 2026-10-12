@@ -448,7 +448,12 @@ async fn self_terminate_agent_tree(
         match tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&route)).await {
             Ok(Ok(())) => break,
             result => {
-                warn!(target: "acp.runner", ?result, "native cleanup unproven; retaining in-memory ownership route")
+                warn!(target: "acp.runner", ?result, "native cleanup unproven; retaining ownership evidence");
+                if cleanup_record.agent_key == "prime-agent"
+                    && cleanup_record.prime_runtime.is_none()
+                {
+                    break;
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -456,7 +461,7 @@ async fn self_terminate_agent_tree(
     // As group leader this SIGKILLs the whole agent tree and the runner itself.
     if !crate::process::worker::kill_own_process_group_if_leader(own_pid) {
         let _ = agent_child.start_kill();
-        let _ = agent_child.wait().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
     }
 }
 

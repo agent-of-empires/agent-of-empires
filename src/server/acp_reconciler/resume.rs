@@ -213,7 +213,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach failed; terminating the worker and falling back to fresh spawn: {e}");
-                        if worker_registry::terminate_record_and_wait(record)
+                        if worker_registry::terminate_record_and_wait(record, ())
                             .await
                             .is_err()
                         {
@@ -222,7 +222,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     }
                     Err(_) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach timed out after 3s; terminating the worker and falling back to fresh spawn");
-                        if worker_registry::terminate_record_and_wait(record)
+                        if worker_registry::terminate_record_and_wait(record, ())
                             .await
                             .is_err()
                         {
@@ -245,7 +245,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_runner_version = worker_registry::RUNNER_VERSION,
                     "replacing incompatible structured view runner"
                 );
-                if worker_registry::terminate_record_and_wait(record)
+                if worker_registry::terminate_record_and_wait(record, ())
                     .await
                     .is_err()
                 {
@@ -260,7 +260,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_build = crate::build_info::BUILD_VERSION,
                     "respawning idle build-stale structured view worker on current binary"
                 );
-                if worker_registry::terminate_record_and_wait(record)
+                if worker_registry::terminate_record_and_wait(record, ())
                     .await
                     .is_err()
                 {
@@ -269,7 +269,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
             }
             // A dead record can still hold a live pid whose socket vanished.
             AdoptDecision::FreshSpawn => {
-                if worker_registry::terminate_record_and_wait(record)
+                if worker_registry::terminate_record_and_wait(record, ())
                     .await
                     .is_err()
                 {

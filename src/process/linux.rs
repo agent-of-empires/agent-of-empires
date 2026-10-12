@@ -1,6 +1,7 @@
 //! Linux-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -145,6 +146,99 @@ pub(super) fn processes_matching(
         }
     }
     found
+}
+
+pub(super) fn prime_processes(
+    marker: &str,
+    socket: &Path,
+    known: &[super::PrimeProcessIdentity],
+) -> anyhow::Result<Vec<super::PrimeProcessIdentity>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    let mut samples = Vec::new();
+    let socket = socket.as_os_str().as_encoded_bytes();
+    let read = |path: &Path, bytes: &mut Vec<u8>| -> std::io::Result<()> {
+        bytes.clear();
+        fs::File::open(path)?.read_to_end(bytes)?;
+        Ok(())
+    };
+    fs::metadata("/proc/self/stat").context("checking the Prime process census")?;
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let mut path = entry.path().join("stat");
+        if let Err(error) = read(&path, &mut bytes) {
+            if error.kind() != std::io::ErrorKind::NotFound
+                && known.iter().any(|identity| identity.pid == pid)
+            {
+                return Err(error).with_context(|| format!("inspecting owned Prime process {pid}"));
+            }
+            continue;
+        }
+        let offset = bytes
+            .windows(2)
+            .rposition(|pair| pair == b") ")
+            .context("invalid process stat")?;
+        let tail = std::str::from_utf8(&bytes[offset + 2..])?;
+        let mut fields = tail.split_ascii_whitespace();
+        let state = fields.next().context("missing process state")?;
+        let parent = fields.next().context("missing process parent")?.parse()?;
+        let start = fields.nth(17).context("missing process start identity")?;
+        if state == "Z" {
+            continue;
+        }
+        let identity = super::PrimeProcessIdentity {
+            pid,
+            start_id: format!("proc:{start}"),
+        };
+        path.set_file_name("environ");
+        let mut marked = read(&path, &mut bytes).is_ok()
+            && bytes
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == marker.as_bytes());
+        if !marked {
+            path.set_file_name("cmdline");
+            marked = read(&path, &mut bytes).is_ok()
+                && bytes.split(|byte| *byte == 0).any(|entry| entry == socket);
+        }
+        samples.push(super::PrimeProcessSample {
+            identity,
+            parent,
+            marked,
+        });
+    }
+    for identity in known {
+        if !samples
+            .iter()
+            .any(|sample| sample.identity.pid == identity.pid)
+        {
+            let path = Path::new("/proc")
+                .join(identity.pid.to_string())
+                .join("stat");
+            match read(&path, &mut bytes) {
+                Ok(()) => anyhow::ensure!(
+                    bytes
+                        .windows(2)
+                        .rposition(|pair| pair == b") ")
+                        .is_some_and(|offset| bytes[offset + 2..].starts_with(b"Z ")),
+                    "owned Prime process {} omitted from census",
+                    identity.pid
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspecting owned Prime process {}", identity.pid)
+                    })
+                }
+            }
+        }
+    }
+    Ok(super::select_prime_processes(samples, known))
 }
 
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
@@ -446,6 +540,138 @@ impl super::SleepInhibit for SystemdInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn prime_quiescence_never_declares_an_uninspectable_owned_process_absent() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::env::var_os("AOE_PRIME_CENSUS_CHILD").is_some() {
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_NAME, b"\xffowned\0".as_ptr(), 0, 0, 0) },
+                0
+            );
+            let signal = |message: &[u8]| {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(message).unwrap();
+                stdout.flush().unwrap();
+            };
+            signal(b"warm-ready\n");
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            signal(b"census-ready\n");
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            return;
+        }
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct OwnedRuntime(crate::process::prime::PrimeRuntime);
+        impl Drop for OwnedRuntime {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0.directory);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let program = root.path().join("native-shutdown");
+        fs::write(&program, "#!/bin/sh\nprintf '%s' '{\"failed\":[]}'\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = OwnedRuntime(crate::process::prime::PrimeRuntime::new(
+            program,
+            root.path().join("agent"),
+            None,
+        ));
+        runtime.0.prepare().unwrap();
+        let cleanup = runtime.0.directory.join("cleanup");
+        let original = runtime.0.directory.join("cleanup.original");
+        fs::rename(&cleanup, &original).unwrap();
+        std::os::unix::fs::symlink(root.path(), &cleanup).unwrap();
+        assert!(runtime.0.cleanup().is_err());
+        assert!(runtime.0.directory.is_dir());
+        fs::remove_file(&cleanup).unwrap();
+        fs::rename(original, cleanup).unwrap();
+        let route = serde_json::to_string(&runtime.0).unwrap();
+        let proof_path = crate::process::worker_registry::workers_dir()
+            .unwrap()
+            .join(format!(
+                ".{}.prime-proof",
+                runtime.0.directory.file_name().unwrap().to_str().unwrap()
+            ));
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&proof_path).unwrap()).unwrap();
+        receipt["settled"] = serde_json::json!(true);
+        fs::write(&proof_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let name = format!(
+            "{}::prime_quiescence_never_declares_an_uninspectable_owned_process_absent",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut child = OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("AOE_PRIME_CENSUS_CHILD", "1")
+                .env("TMPDIR", &runtime.0.directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut reader = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let mut ready = |expected: &str| {
+            let mut line = String::new();
+            loop {
+                assert!(
+                    reader.read_line(&mut line).unwrap() != 0,
+                    "owned probe exited before readiness"
+                );
+                if line.trim() == expected {
+                    break;
+                }
+                line.clear();
+            }
+        };
+        ready("warm-ready");
+        let stat = fs::read(format!("/proc/{}/stat", child.0.id())).unwrap();
+        let offset = stat.windows(2).rposition(|pair| pair == b") ").unwrap();
+        let start = std::str::from_utf8(&stat[offset + 2..])
+            .unwrap()
+            .split_ascii_whitespace()
+            .nth(19)
+            .unwrap();
+        let known = super::super::PrimeProcessIdentity {
+            pid: child.0.id(),
+            start_id: format!("proc:{start}"),
+        };
+        assert!(runtime.0.cleanup().is_err());
+        child.0.stdin.as_mut().unwrap().write_all(&[0]).unwrap();
+        ready("census-ready");
+        assert!(child.0.try_wait().unwrap().is_none());
+        let marker = format!("TMPDIR={}", runtime.0.directory.display());
+        let unbound = prime_processes(&marker, &runtime.0.socket(), &[]).unwrap();
+        assert!(
+            !unbound.iter().any(|identity| identity.pid == child.0.id()),
+            "UID alone assigned foreign ownership"
+        );
+        let owned =
+            prime_processes(&marker, &runtime.0.socket(), std::slice::from_ref(&known)).unwrap();
+        assert!(
+            owned.contains(&known),
+            "unreadable owned environment was treated as absence"
+        );
+        let fresh: crate::process::prime::PrimeRuntime = serde_json::from_str(&route).unwrap();
+        assert!(fresh.cleanup().is_err());
+        assert!(runtime.0.directory.is_dir());
+        assert!(child.0.try_wait().unwrap().is_none());
+        child.0.stdin.as_mut().unwrap().write_all(&[0]).unwrap();
+        assert!(child.0.wait().unwrap().success());
+        let fresh: crate::process::prime::PrimeRuntime = serde_json::from_str(&route).unwrap();
+        fresh.cleanup().unwrap();
+        assert!(!runtime.0.directory.exists());
+    }
 
     #[test]
     fn test_parse_stat_field() {

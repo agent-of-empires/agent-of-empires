@@ -706,6 +706,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         telemetry_session_creates,
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
+        acp_orphan_cleanups: std::sync::Mutex::new(std::collections::HashSet::new()),
         shutdown: CancellationToken::new(),
         file_watch: Arc::clone(&file_watch),
         disk_changed: Arc::new(tokio::sync::Notify::new()),

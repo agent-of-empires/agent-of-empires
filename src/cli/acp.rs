@@ -60,6 +60,15 @@ pub enum AcpCommands {
         #[arg(long, default_value = "5")]
         timeout_secs: u64,
     },
+    /// Retire an untracked Prime record after externally stopping its native processes.
+    Recover {
+        /// Session whose missing-route Prime ownership record to retire.
+        session: String,
+        /// Confirm every native worker and service in the original host/container scope is stopped.
+        /// AoE cannot verify this for a record without a native route.
+        #[arg(long, required = true)]
+        confirm_prime_stopped: bool,
+    },
     /// SIGKILL the runner, then settle its native workers.
     Kill {
         /// Session id to kill.
@@ -195,6 +204,10 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             all,
             timeout_secs,
         } => stop(session, all, timeout_secs).await,
+        AcpCommands::Recover {
+            session,
+            confirm_prime_stopped,
+        } => recover(&session, confirm_prime_stopped),
         AcpCommands::Kill { session } => kill_now(&session),
         AcpCommands::Logs { session, follow } => logs(session, follow),
         AcpCommands::Restart { session } => restart(&session).await,
@@ -782,17 +795,49 @@ async fn stop_worker_records(
     timeout_secs: u64,
 ) -> Result<()> {
     use crate::process::worker_registry;
+    let mut failures = Vec::new();
     for record in targets {
-        signal_and_wait(record, timeout_secs).await?;
-        anyhow::ensure!(
-            worker_registry::delete_if_owned_by(&record.session_id, record.pid, record.generation),
-            "worker record could not be retired"
-        );
-        println!(
-            "Stopped agent worker for {} (PID {}).",
-            record.session_id, record.pid
-        );
+        let result = async {
+            signal_and_wait(record, timeout_secs).await?;
+            anyhow::ensure!(
+                worker_registry::delete_if_owned_by(
+                    &record.session_id,
+                    record.pid,
+                    record.generation
+                ),
+                "worker record could not be retired"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => println!(
+                "Stopped agent worker for {} (PID {}).",
+                record.session_id, record.pid
+            ),
+            Err(error) => failures.push(format!("{}: {error:#}", record.session_id)),
+        }
     }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "Worker shutdown failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+fn recover(session: &str, confirm_prime_stopped: bool) -> Result<()> {
+    anyhow::ensure!(
+        confirm_prime_stopped,
+        "external Prime shutdown must be confirmed"
+    );
+    let record = crate::process::worker_registry::load(session)?
+        .ok_or_else(|| anyhow::anyhow!("No agent worker registry entry for session {session}"))?;
+    crate::process::worker_registry::recover_untracked_prime(&record)?;
+    println!(
+        "Retired untracked Prime record for {} (PID {}, generation {}) on operator confirmation; AoE did not verify native shutdown.",
+        record.session_id, record.pid, record.generation
+    );
     Ok(())
 }
 
@@ -891,7 +936,7 @@ async fn restart(session: &str) -> Result<()> {
     };
     worker_registry::mark_restart_pending(session, record.generation);
     let pid = record.pid;
-    worker_registry::terminate_record_and_wait(record).await?;
+    worker_registry::terminate_record_and_wait(record, ()).await?;
 
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
@@ -1157,6 +1202,45 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bulk_stop_settles_later_workers_after_native_failure() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        let _app = crate::session::test_support::isolate_app_dir();
+        let make = |id: &str, key: &str| {
+            WorkerRecord::new(
+                id.into(),
+                i32::MAX as u32,
+                worker_registry::socket_path_for(id).unwrap(),
+                key.into(),
+                key.into(),
+                "/tmp".into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+        };
+        let failed = make("untracked-prime", "prime-agent");
+        let healthy = make("healthy-worker", "aoe-agent");
+        for record in [&failed, &healthy] {
+            worker_registry::save(record).unwrap();
+        }
+        let error = stop_worker_records(&[failed.clone(), healthy], 0)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("untracked-prime"));
+        assert_eq!(
+            worker_registry::load(&failed.session_id)
+                .unwrap()
+                .unwrap()
+                .pid,
+            failed.pid
+        );
+        assert!(worker_registry::load("healthy-worker").unwrap().is_none());
+    }
 
     #[test]
     fn registry_lifecycle_mirrors_agents_registry() {

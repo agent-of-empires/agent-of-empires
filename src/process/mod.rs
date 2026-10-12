@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -304,6 +305,78 @@ pub fn processes_matching(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PrimeProcessIdentity {
+    pub pid: u32,
+    pub start_id: String,
+}
+
+pub(super) struct PrimeProcessSample {
+    pub identity: PrimeProcessIdentity,
+    pub parent: u32,
+    pub marked: bool,
+}
+
+pub(crate) fn select_prime_processes(
+    samples: Vec<PrimeProcessSample>,
+    known: &[PrimeProcessIdentity],
+) -> Vec<PrimeProcessIdentity> {
+    use std::collections::HashMap;
+    let known: HashMap<_, _> = known
+        .iter()
+        .map(|identity| (identity.pid, &identity.start_id))
+        .collect();
+    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut selected = vec![false; samples.len()];
+    let mut pending = Vec::new();
+    for (index, sample) in samples.iter().enumerate() {
+        children.entry(sample.parent).or_default().push(index);
+        if sample.marked
+            || known
+                .get(&sample.identity.pid)
+                .is_some_and(|start| **start == sample.identity.start_id)
+        {
+            selected[index] = true;
+            pending.push(index);
+        }
+    }
+    while let Some(index) = pending.pop() {
+        if let Some(descendants) = children.get(&samples[index].identity.pid) {
+            for &child in descendants {
+                if !selected[child] {
+                    selected[child] = true;
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    samples
+        .into_iter()
+        .zip(selected)
+        .filter_map(|(sample, selected)| selected.then_some(sample.identity))
+        .collect()
+}
+
+pub(crate) fn prime_processes(
+    marker: &str,
+    socket: &Path,
+    known: &[PrimeProcessIdentity],
+) -> anyhow::Result<Vec<PrimeProcessIdentity>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::prime_processes(marker, socket, known)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::prime_processes(marker, socket, known)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (marker, socket, known);
+        anyhow::bail!("Prime process proof unsupported on this platform")
+    }
+}
+
 pub fn boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -592,6 +665,55 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prime_process_selection_preserves_scope_across_pid_reuse() {
+        let sample = |pid, parent, start: &str, marked| PrimeProcessSample {
+            identity: PrimeProcessIdentity {
+                pid,
+                start_id: start.into(),
+            },
+            parent,
+            marked,
+        };
+        let known = PrimeProcessIdentity {
+            pid: 10,
+            start_id: "proc:100".into(),
+        };
+        for (start, expected) in [("proc:100", vec![10, 11, 12]), ("proc:200", vec![])] {
+            let selected = select_prime_processes(
+                vec![
+                    sample(10, 1, start, false),
+                    sample(11, 10, "proc:101", false),
+                    sample(12, 11, "proc:102", false),
+                    sample(20, 1, "proc:103", false),
+                ],
+                std::slice::from_ref(&known),
+            );
+            assert_eq!(
+                selected
+                    .into_iter()
+                    .map(|identity| identity.pid)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let selected = select_prime_processes(
+            vec![
+                sample(10, 1, "proc:200", false),
+                sample(30, 1, "proc:300", true),
+                sample(31, 30, "proc:301", false),
+            ],
+            &[known],
+        );
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            [30, 31]
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

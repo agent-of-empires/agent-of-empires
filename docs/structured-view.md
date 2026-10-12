@@ -54,7 +54,15 @@ Each built-in adapter receives only the provider variables it is known to read, 
 
 Native Prime Agent 0.10.x uses a daemon owned by each structured execution. The daemon and frontend receive the same effective environment and use the original agent directory for credentials, settings, skills, and history. AoE does not reuse a daemon launched with another session's credentials.
 
-Stopping or restarting the session settles its runner and native workers before replacement. Container images must provide Bash and GNU grep for the scoped remote frontend fence. Stopping `aoe serve` only detaches; an admitted turn continues and the next daemon reattaches to the same worker. Native termination that cannot be proved retains the ownership record and blocks replacement, including older records without a native cleanup route.
+Stopping or restarting the session requires native shutdown and observed process settlement before replacement. AoE records daemon/frontend incarnations at launch and retains native worker and positively scoped auxiliary identities before shutdown can retire their metadata. Unrelated process opacity is not ownership. A known live or uninspectable incarnation retains the ownership record and blocks replacement; this is not a containment guarantee for arbitrary tools that erase all ownership markers before observation.
+
+Successful cleanup removes the private runtime directory and retains a compact termination receipt in the AoE worker directory for deserialized retries. Container images must provide Bash and GNU grep for scoped process inspection. Stopping `aoe serve` only detaches; an admitted turn continues and the next daemon reattaches to the same worker.
+
+For a tracked runtime that still has auxiliary processes, settle only that execution on its original host or pinned container, then retry `aoe acp stop <id>`. Retain its ownership record meanwhile; `recover` does not bypass tracked-runtime shutdown.
+
+A legacy Prime record without a native cleanup route cannot be retired automatically. First identify its original host or container and externally stop every native worker and service belonging to that execution. If that scope cannot be identified or its shutdown cannot be confirmed, retain the record. Do not use a global Prime shutdown that would affect unrelated executions.
+
+After confirming native shutdown and verifying the recorded runner is dead, run `aoe acp recover <id> --confirm-prime-stopped` on the original worker host. The flag is an operator attestation, not proof obtained by AoE. Recovery refuses live runners, records with a native route, non-Prime records, and a changed PID or generation; it retires only the selected ownership record and runner sockets, not conversation history.
 
 Prime 0.10.0 does not advertise ACP `session/load`: reattachment preserves a live session, but a cold ACP start creates a new native context and reports a context reset.
 
@@ -147,7 +155,7 @@ AOE_DAEMON_URL=https://aoe.example.com AOE_DAEMON_TOKEN=… aoe   # remote sessi
 aoe acp attach <session_id> --daemon-url https://aoe.example.com
 ```
 
-With `AOE_DAEMON_URL` set, the TUI swaps its home view for a remote session picker and `aoe serve --status` and the `aoe acp *` verbs retarget to the remote. Local-only operations (tmux attach, `aoe stop`, file edit) are not available against a remote; use the dashboard or SSH. The session list is read with a bearer token only over HTTPS or a loopback URL, so a token plus a plaintext remote URL is refused; the other daemon requests do not apply that check yet, so use HTTPS or a tunnel.
+With `AOE_DAEMON_URL` set, the TUI swaps its home view for a remote session picker and `aoe serve --status` and daemon-backed `aoe acp` verbs retarget to the remote. Local-only operations (tmux attach, `aoe stop`, file edit, worker recovery) are not available against a remote; use the dashboard or SSH. The session list is read with a bearer token only over HTTPS or a loopback URL, so a token plus a plaintext remote URL is refused; the other daemon requests do not apply that check yet, so use HTTPS or a tunnel.
 
 A remote daemon running `--auth=passphrase` never mints a bearer token, so `AOE_DAEMON_TOKEN` has nothing to carry. Set `AOE_DAEMON_PASSPHRASE` instead; the CLI logs in via the same `/api/login` handshake the web dashboard uses and caches the resulting session for the process. A local daemon needs neither: the CLI already reads its own `serve.passphrase` file (the same one `aoe serve --restart` recalls from) to log in automatically.
 
@@ -165,6 +173,7 @@ Every structured-view operation has a matching verb against the same daemon:
 | `aoe acp tail <id>` | Stream broadcast frames as JSON lines |
 | `aoe acp attach <id>` | Open the TUI structured view |
 | `aoe acp stop` / `kill` / `restart` / `logs` / `switch-agent` | Worker management |
+| `aoe acp recover <id> --confirm-prime-stopped` | Retire a dead legacy Prime record after operator-confirmed native shutdown |
 | `aoe ps --acp` | List workers with their ACP columns; `--dead` includes dead and orphaned ones |
 
-Every verb needs a running `aoe serve` and exits with a hint if none is found. The CLI never spawns a daemon on your behalf, so the localhost-versus-tunnel choice stays explicit.
+Daemon-backed verbs need a running `aoe serve` and exit with a hint if none is found. The CLI never spawns a daemon on your behalf. Recovery operates on the local worker registry, so run it on the original worker host, using SSH for a remote host.

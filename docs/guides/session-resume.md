@@ -15,7 +15,7 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 | OMP | Yes | Yes | Pane-scoped routed terminal store |
 | OpenCode | Opt-in | No | AoE-preassigned native id |
 | Gemini CLI, Hermes, Kimi CLI | No | Yes | Isolated managed store |
-| Prime Agent | No | Yes | Root-only publication and isolated managed store |
+| Prime Agent | No | Yes | Native daemon root observation and isolated managed store |
 | Vibe, Droid, Copilot CLI, Settl, Qwen Code, Kiro CLI, Antigravity | No | No | None verified |
 
 `No` means automatic discovery is unsupported there, not that resume is: a user-provided exact id stays authoritative for any agent with a verified resume contract, and agents with no such contract reject automatic resume entirely. OpenCode host capture also needs `session.opencode_preassign_session_id = true`. AoE never scans a shared store or infers an identity from recency. [Importing](#importing-an-existing-conversation) is different: you pick the conversation, and its recency only drives a warning.

@@ -2,6 +2,16 @@
 
 use super::*;
 
+fn combine_teardown_results(pane: Result<()>, native: Result<()>) -> Result<()> {
+    match (pane, native) {
+        (Err(pane), Err(native)) => {
+            Err(native.context(format!("tmux teardown also failed: {pane:#}")))
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 impl Instance {
     pub(super) fn flush_published_if_present(&mut self) {
         if !self.uses_pi_session_sidecar()
@@ -136,37 +146,26 @@ impl Instance {
         }
     }
 
-    /// Tear down the current tmux session cleanly so a fresh `start_with_size_opts` can recreate
-    /// it.
     pub(super) fn kill_clean_locked(&self) -> Result<()> {
-        let session = self.tmux_session()?;
-        // The poller watches this pane, so it goes before the pane does, whether or not the pane
-        // is still there to kill.
         self.stop_poller();
-        if let Some(runtime) = self.prime_runtime() {
-            runtime.cleanup()?;
-        }
-        if !session.exists() {
-            return Ok(());
-        }
-        if session.is_pane_dead() {
-            tracing::info!(target: "session.store",
-                "restart: pane dead for session {} (remain-on-exit), \
-                 respawning shell before recreate",
-                session.name()
-            );
-            let shell = crate::session::environment::user_shell();
-            if let Err(e) = session.respawn_dead_pane(&self.project_path, Some(&shell)) {
-                tracing::warn!(target: "session.store",
-                    "respawn_dead_pane failed for {}: {}; falling back to kill+start",
-                    session.name(),
-                    e
-                );
+        let pane = self.tmux_session().and_then(|session| {
+            if !session.exists() {
+                return Ok(());
             }
-        }
-        session.kill()?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        Ok(())
+            if session.is_pane_dead() {
+                let shell = crate::session::environment::user_shell();
+                if let Err(error) = session.respawn_dead_pane(&self.project_path, Some(&shell)) {
+                    tracing::warn!(target: "session.store", %error, "respawn_dead_pane failed before teardown");
+                }
+            }
+            session.kill()?;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(())
+        });
+        let native = self
+            .prime_runtime()
+            .map_or(Ok(()), |runtime| runtime.cleanup());
+        combine_teardown_results(pane, native)
     }
 
     pub(crate) fn kill_clean(&self) -> Result<()> {
@@ -197,14 +196,16 @@ impl Instance {
 
     pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
-        if let Some(runtime) = self.prime_runtime() {
-            runtime.cleanup()?;
-        }
-        let session = self.tmux_session()?;
-        if session.exists() {
-            session.kill()?;
-        }
-        Ok(())
+        let pane = self.tmux_session().and_then(|session| {
+            if session.exists() {
+                session.kill()?;
+            }
+            Ok(())
+        });
+        let native = self
+            .prime_runtime()
+            .map_or(Ok(()), |runtime| runtime.cleanup());
+        combine_teardown_results(pane, native)
     }
 
     pub fn kill(&self) -> Result<()> {
@@ -445,6 +446,91 @@ impl Instance {
 mod tests {
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn prime_cleanup_failure_still_tears_down_the_pane_and_retains_ownership() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let profile = "prime-pane-cleanup-failure";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        for clean in [false, true] {
+            let mut inst = Instance::new("Prime cleanup failure", root.path().to_str().unwrap());
+            inst.source_profile = profile.into();
+            let runtime = crate::process::prime::PrimeRuntime::new(
+                "/bin/false".into(),
+                root.path().into(),
+                None,
+            );
+            runtime.prepare().unwrap();
+            inst.active_execution = Some(super::super::execution::ActiveExecution {
+                launch_id: "failed-cleanup".into(),
+                binding: super::super::execution::ExecutionBinding {
+                    agent: "prime-agent".into(),
+                    stores: vec![],
+                    configuration: vec![],
+                    cwd: root.path().into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: None,
+                },
+                capture: Some(CaptureContext::PrimeStatus(runtime.clone())),
+                container: None,
+            });
+            storage
+                .update(|instances, _| {
+                    instances.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            struct Pane(String);
+            impl Drop for Pane {
+                fn drop(&mut self) {
+                    let _ = crate::tmux::tmux_command()
+                        .args(["kill-session", "-t", &self.0])
+                        .output();
+                }
+            }
+            let _pane = Pane(name.clone());
+            assert!(crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &name, "sleep 60"])
+                .status()
+                .unwrap()
+                .success());
+            crate::tmux::refresh_session_cache();
+            let result = if clean {
+                inst.kill_clean()
+            } else {
+                inst.kill()
+            };
+            crate::tmux::refresh_session_cache();
+            assert!(result.is_err());
+            assert!(
+                !crate::tmux::session_exists(&name),
+                "cleanup error left the pane running"
+            );
+            let persisted = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == inst.id)
+                .unwrap();
+            assert_eq!(persisted.status, Status::Error);
+            assert_eq!(
+                persisted.prime_runtime().unwrap().directory,
+                runtime.directory
+            );
+            assert!(
+                runtime.directory.exists(),
+                "unproven native route must remain recoverable"
+            );
+            std::fs::remove_dir_all(&runtime.directory).unwrap();
+        }
+    }
 
     /// Real-tmux integration for #3157.
     // Serialized for the same reason as its neighbours: it creates and kills a

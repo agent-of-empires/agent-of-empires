@@ -828,10 +828,11 @@ impl Instance {
                 Some(runtime) => format!(
                     "env TMPDIR={} {}",
                     shell_escape(&runtime.directory.to_string_lossy()),
-                    tool_cmd
+                    runtime.recorded_launch_command(&tool_cmd, false)
                 ),
                 None => tool_cmd,
             };
+
             let raw_command =
                 exec_command(&wrap_native_container_command(&tool_cmd, execution)?, true);
             let daemon_command = prime_runtime
@@ -842,6 +843,7 @@ impl Instance {
                         shell_escape(&runtime.program.to_string_lossy()),
                         shell_escape(&runtime.socket().to_string_lossy())
                     );
+                    let daemon = runtime.recorded_launch_command(&daemon, true);
                     wrap_native_container_command(&daemon, execution)
                         .map(|command| exec_command(&command, false))
                 })

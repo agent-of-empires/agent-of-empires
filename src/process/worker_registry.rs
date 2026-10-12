@@ -496,14 +496,18 @@ pub fn terminate(session_id: &str) {
 /// Settles the selected generation before replacement.
 pub async fn terminate_and_wait(session_id: &str) -> anyhow::Result<()> {
     if let Some(record) = load(session_id)? {
-        terminate_record_and_wait(record).await
+        terminate_record_and_wait(record, ()).await
     } else {
         delete_if_absent(session_id)?;
         Ok(())
     }
 }
 
-pub(crate) async fn terminate_record_and_wait(record: WorkerRecord) -> anyhow::Result<()> {
+/// Holds the cleanup claim in both the async owner and any uncancellable blocking operation.
+pub(crate) async fn terminate_record_and_wait(
+    record: WorkerRecord,
+    cleanup_guard: impl Clone + Send + 'static,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         load(&record.session_id)?.is_some_and(
             |current| current.pid == record.pid && current.generation == record.generation
@@ -524,7 +528,9 @@ pub(crate) async fn terminate_record_and_wait(record: WorkerRecord) -> anyhow::R
         }
         anyhow::ensure!(!is_pid_alive(record.pid), "runner termination unproven");
     }
+    let blocking_guard = cleanup_guard.clone();
     let record = tokio::task::spawn_blocking(move || {
+        let _guard = blocking_guard;
         cleanup_runtime(&record)?;
         Ok::<_, anyhow::Error>(record)
     })
@@ -533,6 +539,7 @@ pub(crate) async fn terminate_record_and_wait(record: WorkerRecord) -> anyhow::R
         delete_if_owned_by(&record.session_id, record.pid, record.generation),
         "worker registry cleanup unproven"
     );
+    drop(cleanup_guard);
     Ok(())
 }
 
@@ -545,6 +552,29 @@ pub(crate) fn cleanup_runtime(record: &WorkerRecord) -> anyhow::Result<()> {
         runtime.cleanup()?;
     }
     Ok(())
+}
+
+/// Retires only missing-route Prime evidence after the caller confirms external native shutdown.
+pub(crate) fn recover_untracked_prime(selected: &WorkerRecord) -> Result<()> {
+    with_registry_lock(&selected.session_id, || {
+        let current = load_strict_unlocked(&selected.session_id)?
+            .ok_or_else(|| anyhow::anyhow!("worker record disappeared before recovery"))?;
+        anyhow::ensure!(
+            current.pid == selected.pid && current.generation == selected.generation,
+            "worker generation changed before recovery"
+        );
+        anyhow::ensure!(
+            current.agent_key == "prime-agent" && current.prime_runtime.is_none(),
+            "recovery is only for Prime records without a native ownership route"
+        );
+        anyhow::ensure!(
+            !is_pid_alive(current.pid),
+            "runner is still alive; recovery refused"
+        );
+        std::fs::remove_file(record_path(&selected.session_id)?)
+            .context("retiring externally settled Prime ownership record")?;
+        delete_unlocked(&selected.session_id)
+    })
 }
 
 pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
@@ -584,6 +614,50 @@ mod tests {
         let tmp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
         f();
+    }
+
+    #[test]
+    #[serial]
+    fn prime_recovery_requires_untracked_dead_exact_generation() {
+        with_temp_home(|| {
+            let mut selected = new_record("recovery-prime", i32::MAX as u32, "/tmp/unused.sock");
+            selected.agent_key = "prime-agent".into();
+            selected.generation = 7;
+            for case in ["live", "tracked", "non-prime", "superseded", "legacy"] {
+                let mut current = selected.clone();
+                match case {
+                    "live" => current.pid = std::process::id(),
+                    "tracked" => {
+                        current.prime_runtime = Some(crate::process::prime::PrimeRuntime::new(
+                            "/bin/false".into(),
+                            "/tmp/store".into(),
+                            None,
+                        ))
+                    }
+                    "non-prime" => current.agent_key = "aoe-agent".into(),
+                    "superseded" => current.generation += 1,
+                    _ => {}
+                }
+                save(&current).unwrap();
+                let snapshot = if case == "superseded" {
+                    &selected
+                } else {
+                    &current
+                };
+                let result = recover_untracked_prime(snapshot);
+                if case == "legacy" {
+                    result.unwrap();
+                    assert!(load(&current.session_id).unwrap().is_none());
+                } else {
+                    assert!(result.is_err(), "{case}");
+                    let retained = load(&current.session_id).unwrap().unwrap();
+                    assert_eq!(
+                        (retained.pid, retained.generation),
+                        (current.pid, current.generation)
+                    );
+                }
+            }
+        });
     }
 
     /// A minimal record; tests that care about other fields set them on the result.
@@ -1048,7 +1122,7 @@ mod tests {
                 .build()
                 .unwrap();
             assert!(runtime
-                .block_on(terminate_record_and_wait(original))
+                .block_on(terminate_record_and_wait(original, ()))
                 .is_err());
             assert!(victim.0.try_wait().unwrap().is_none());
             assert_eq!(load("deferred").unwrap().unwrap().generation, 2);

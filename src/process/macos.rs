@@ -1,6 +1,7 @@
 //! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -137,6 +138,152 @@ pub(super) fn processes_matching(
         }
     }
     found
+}
+
+pub(super) fn prime_processes(
+    marker: &str,
+    socket: &std::path::Path,
+    known: &[super::PrimeProcessIdentity],
+) -> anyhow::Result<Vec<super::PrimeProcessIdentity>> {
+    let mut command = Command::new("ps");
+    command
+        .args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
+        .env("LC_ALL", "C")
+        .env("LC_TIME", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC");
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "Prime process census",
+        1024 * 1024,
+    )?;
+    let mut samples = Vec::new();
+    let mut bytes = Vec::new();
+    let mut known_zombies = Vec::new();
+    for line in std::str::from_utf8(&output)?.lines() {
+        let mut rest = line;
+        let mut take = || -> anyhow::Result<&str> {
+            let (value, tail) = rest
+                .trim_start()
+                .split_once(char::is_whitespace)
+                .context("incomplete process census row")?;
+            rest = tail;
+            Ok(value)
+        };
+        let pid = take()?.parse::<u32>()?;
+        let parent = take()?.parse()?;
+        let zombie = take()?.starts_with('Z');
+        if zombie && known.iter().any(|identity| identity.pid == pid) {
+            known_zombies.push(pid);
+        }
+        if zombie || pid == std::process::id() {
+            continue;
+        }
+        let start = rest.trim();
+        anyhow::ensure!(!start.is_empty(), "missing process start identity");
+        let marked = prime_launch_marker(pid, marker, socket, &mut bytes).unwrap_or(false);
+        samples.push(super::PrimeProcessSample {
+            identity: super::PrimeProcessIdentity {
+                pid,
+                start_id: format!("ps:{start}"),
+            },
+            parent,
+            marked,
+        });
+    }
+    for identity in known {
+        if !samples
+            .iter()
+            .any(|sample| sample.identity.pid == identity.pid)
+        {
+            anyhow::ensure!(
+                known_zombies.contains(&identity.pid) || !super::worker::is_pid_alive(identity.pid),
+                "owned Prime process {} omitted from census",
+                identity.pid
+            );
+        }
+    }
+    Ok(super::select_prime_processes(samples, known))
+}
+
+fn prime_launch_marker(
+    pid: u32,
+    marker: &str,
+    socket: &std::path::Path,
+    bytes: &mut Vec<u8>,
+) -> anyhow::Result<bool> {
+    let pid = i32::try_from(pid)?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut length = 0usize;
+    let queried = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if queried != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading process argument size");
+    }
+    anyhow::ensure!(
+        (4..=256 * 1024).contains(&length),
+        "invalid process argument size"
+    );
+    bytes.clear();
+    bytes.reserve(length);
+    let capacity = bytes.capacity();
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading process arguments");
+    }
+    anyhow::ensure!(
+        (4..=capacity).contains(&length),
+        "invalid process argument result"
+    );
+    // sysctl initialized exactly length bytes on success.
+    unsafe {
+        bytes.set_len(length);
+    }
+    let count = i32::from_ne_bytes(bytes[..4].try_into()?);
+    anyhow::ensure!(
+        (0..=4096).contains(&count),
+        "invalid process argument count"
+    );
+    let mut tail = &bytes[4..];
+    let executable_end = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("unterminated process executable")?;
+    tail = &tail[executable_end + 1..];
+    while tail.first() == Some(&0) {
+        tail = &tail[1..];
+    }
+    let mut routed = false;
+    for _ in 0..count {
+        let end = tail
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("unterminated process argument")?;
+        routed |= &tail[..end] == socket.as_os_str().as_encoded_bytes();
+        tail = &tail[end + 1..];
+    }
+    Ok(routed
+        || tail
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == marker.as_bytes()))
 }
 
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
@@ -553,5 +700,68 @@ impl super::SleepInhibit for CaffeinateInhibitor {
             &mut self.child,
             "caffeinate exited unexpectedly; OS sleep will not be inhibited on this host",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prime_quiescence_accepts_observed_owned_zombies() {
+        use std::io::{BufRead as _, Write as _};
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("TMPDIR={}", root.path().display());
+        let socket = root.path().join("daemon.sock");
+        let mut child = OwnedChild(
+            Command::new("sh")
+                .args(["-c", "printf 'ready\n'; IFS= read -r line"])
+                .env("TMPDIR", root.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let owned = prime_processes(&marker, &socket, &[])
+            .unwrap()
+            .into_iter()
+            .find(|identity| identity.pid == child.0.id())
+            .unwrap();
+        child.0.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let mut probe = Command::new("ps");
+            probe.args(["-p", &child.0.id().to_string(), "-o", "stat="]);
+            let state = crate::session::capture::run_with_timeout_limit(
+                probe,
+                std::time::Duration::from_secs(1),
+                "owned zombie observation",
+                1024,
+            )
+            .unwrap();
+            if std::str::from_utf8(&state).unwrap().trim().starts_with('Z') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned child did not become a zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let remaining = prime_processes(&marker, &socket, std::slice::from_ref(&owned)).unwrap();
+        assert!(!remaining.contains(&owned));
+        assert!(child.0.wait().unwrap().success());
     }
 }

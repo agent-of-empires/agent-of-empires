@@ -112,6 +112,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp doctor`↴](#aoe-acp-doctor)
 * [`aoe acp agents`↴](#aoe-acp-agents)
 * [`aoe acp stop`↴](#aoe-acp-stop)
+* [`aoe acp recover`↴](#aoe-acp-recover)
 * [`aoe acp kill`↴](#aoe-acp-kill)
 * [`aoe acp logs`↴](#aoe-acp-logs)
 * [`aoe acp restart`↴](#aoe-acp-restart)
@@ -1659,6 +1660,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
 * `stop` — Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
+* `recover` — Retire an untracked Prime record after externally stopping its native processes
 * `kill` — SIGKILL the runner, then settle its native workers
 * `logs` — Tail the runner's log file for an agent session
 * `restart` — Restart a wedged worker after its runner and native workers have stopped
@@ -1716,6 +1718,22 @@ Stop an agent worker and settle its owned native processes. Unlike `aoe serve --
 * `--timeout-secs <TIMEOUT_SECS>` — Seconds to wait after SIGTERM before escalating to SIGKILL
 
   Default value: `5`
+
+
+
+## `aoe acp recover`
+
+Retire an untracked Prime record after externally stopping its native processes
+
+**Usage:** `aoe acp recover --confirm-prime-stopped <SESSION>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Session whose missing-route Prime ownership record to retire
+
+###### **Options:**
+
+* `--confirm-prime-stopped` — Confirm every native worker and service in the original host/container scope is stopped. AoE cannot verify this for a record without a native route
 
 
 
