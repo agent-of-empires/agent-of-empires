@@ -603,7 +603,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         let context_reset = if sandbox.as_ref().is_some_and(|info| info.enabled) {
             let profile = record.source_profile.clone().unwrap_or_default();
             let id = session_id.clone();
-            let native_agent = crate::acp::agent_profiles::resolve(&agent_key).native_config_agent;
+            let native_agent = if record.prime_runtime.is_some() {
+                Some("prime-agent")
+            } else {
+                crate::acp::agent_profiles::resolve(&agent_key).native_config_agent
+            };
             let generation = reservation.lease().epoch();
             let context = tokio::task::spawn_blocking(move || {
                 crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(

@@ -317,6 +317,11 @@ impl Instance {
             && identity_publisher_mount_matches(container, config)?
             && identity_publisher_dependencies_available(container)
             && self.hook_session_publisher_allowed_by_argv();
+        if let Some(sandbox) = self.sandbox_info.as_mut() {
+            if sandbox.container_id.is_none() {
+                sandbox.container_id = Some(container.id()?);
+            }
+        }
         self.backfill_container_workdir(container);
         container_config::ensure_folder_trust_config_for_active_agent(
             &self.tool,

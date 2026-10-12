@@ -71,6 +71,16 @@ pub struct SpawnConfig {
     pub provider_routing: Vec<(String, String)>,
 }
 
+impl SpawnConfig {
+    pub(crate) fn uses_native_prime(&self) -> bool {
+        self.wrapper_substitution
+            .as_ref()
+            .map(|(_, base)| base.as_str())
+            .unwrap_or(&self.agent_key)
+            == "prime-agent"
+    }
+}
+
 /// Request-sourced keys may not redirect infrastructure the operator env
 /// controls or hook the dynamic linker. Provider auth keys are allowed.
 pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
@@ -363,10 +373,10 @@ pub(super) fn prime_runtime_for_spawn(
     overrides: &[(String, String)],
     sandbox_argv: Option<&super::session_sandbox::SandboxArgv>,
 ) -> Result<Option<crate::process::prime::PrimeRuntime>, AcpError> {
-    if config.tool != "prime-agent" {
+    if !config.uses_native_prime() {
         return Ok(None);
     }
-    if let (Some(sandbox), Some(_)) = (&config.sandbox_info, sandbox_argv) {
+    if let (Some(sandbox), Some(argv)) = (&config.sandbox_info, sandbox_argv) {
         let id = sandbox.container_id.as_ref().ok_or_else(|| {
             AcpError::Spawn("Prime requires a pinned sandbox container ID".into())
         })?;
@@ -379,7 +389,10 @@ pub(super) fn prime_runtime_for_spawn(
         )
         .map_err(|e| AcpError::Spawn(e.to_string()))?;
         let mut probe = transport.command(&[]);
-        probe.args(["exec", id, "sh", "-c", &script]);
+        probe
+            .args(&argv.docker_args[..argv.exec_prefix_len])
+            .args(["sh", "-c", &script])
+            .envs(argv.inherit_env.iter().map(|(key, value)| (key, value)));
         let bytes = crate::session::capture::run_with_timeout_limit(
             probe,
             std::time::Duration::from_secs(5),

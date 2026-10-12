@@ -195,7 +195,7 @@ impl ContainerRuntime {
             })
     }
 
-    fn inspect_container_id(&self, name: &str) -> Result<String> {
+    pub(super) fn inspect_container_id(&self, name: &str) -> Result<String> {
         let mut cmd = self.base.command();
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {

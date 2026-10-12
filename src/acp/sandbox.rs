@@ -131,15 +131,14 @@ async fn record_built_sandbox(
     else {
         return;
     };
-    if sb.container_id.is_none() {
-        sb.container_id = info.container_id.clone();
+    let id_changed = sb.container_id != info.container_id;
+    if id_changed {
+        sb.container_id.clone_from(&info.container_id);
     }
     sb.before_start_env = info.before_start_env.clone();
-    // A disk snapshot read before the rebuild would restore the old stamp, and
-    // the next ensure would discard this container. The watcher may already
-    // have applied the new stamp, so a rebuild invalidates even when it matches.
-    if rebuilt || sb.provider != info.provider {
-        sb.provider = info.provider.clone();
+    // Reject snapshots read before a changed container identity or provider.
+    if rebuilt || id_changed || sb.provider != info.provider {
+        sb.provider.clone_from(&info.provider);
         mutation_epoch.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -263,6 +262,44 @@ mod tests {
             .as_ref()
             .and_then(|s| s.provider.clone());
         assert_eq!(stamp.as_deref(), Some("vertex"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn changed_container_identity_survives_a_stale_disk_snapshot() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        let mut old = sandboxed(None);
+        old.sandbox_info.as_mut().unwrap().container_id = Some("retired".to_string());
+        let state = crate::server::test_support::build_test_app_state(vec![old.clone()]);
+        let stale_epoch = state.mutation_epoch.load(Ordering::SeqCst);
+        let mut current = old.sandbox_info.as_ref().unwrap().clone();
+        current.container_id = Some("current".to_string());
+        record_built_sandbox(
+            &state.instances,
+            &state.mutation_epoch,
+            &old.id,
+            &current,
+            false,
+        )
+        .await;
+        crate::server::reload::reload_state_instances_from_disk(
+            &state,
+            vec![old],
+            Vec::new(),
+            crate::server::state::StatusSource::DiskOnly,
+            stale_epoch,
+        )
+        .await;
+        let instances = state.instances.read().await;
+        assert_eq!(
+            instances[0]
+                .sandbox_info
+                .as_ref()
+                .unwrap()
+                .container_id
+                .as_deref(),
+            Some("current")
+        );
     }
 
     /// The path every resume takes, not only a switch: a rebuild survives a

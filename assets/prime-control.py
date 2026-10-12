@@ -4,6 +4,8 @@ import shutil
 import signal
 import sys
 import time
+import stat
+import tarfile
 
 
 def fence(pid, expected):
@@ -83,6 +85,15 @@ def rollback(root, token):
         raise RuntimeError("Prime preparation ownership mismatch")
     shutil.rmtree(root)
 
+def descriptor_archive(directory):
+    if not stat.S_ISDIR(os.lstat(directory).st_mode):
+        raise ValueError("Prime descriptor namespace is not a directory")
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", dereference=False) as archive:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.endswith(".json"):
+                    archive.add(entry.path, arcname=entry.name, recursive=False)
+
 
 if sys.argv[1] == "fence":
     fence(int(sys.argv[2]), sys.argv[3])
@@ -91,5 +102,7 @@ elif sys.argv[1] == "prepare":
     prepare(*sys.argv[2:])
 elif sys.argv[1] == "rollback":
     rollback(*sys.argv[2:])
+elif sys.argv[1] == "descriptor-archive":
+    descriptor_archive(sys.argv[2])
 else:
     raise ValueError("Unknown Prime control operation")

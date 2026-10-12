@@ -282,7 +282,7 @@ impl<S: BroadcastSink> Drain<S> {
                 record.agent_key == "prime-agent" || record.prime_runtime.is_some()
             });
         let mut guard = self.workers.lock().await;
-        let native = native_record || guard.get(&self.session_id).is_some_and(|handle| matches!(&handle.kind, WorkerKind::Runner { spawn_config } if spawn_config.agent_key == "prime-agent"));
+        let native = native_record || guard.get(&self.session_id).is_some_and(|handle| matches!(&handle.kind, WorkerKind::Runner { spawn_config } if spawn_config.uses_native_prime()));
         let dropped = if native {
             let decision = {
                 let mut lifecycle = lock_recover(&self.lifecycle);
@@ -416,7 +416,7 @@ impl<S: BroadcastSink> Drain<S> {
             return None;
         }
 
-        if config.agent_key == "prime-agent" {
+        if config.uses_native_prime() {
             let settlement = tear_down_runner(&*self.process_control, session_id, previous).await;
             if !matches!(settlement, crate::acp::runner_lifecycle::Settlement::Proven) {
                 if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {

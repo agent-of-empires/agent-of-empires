@@ -119,29 +119,32 @@ impl PrimeAgentLaunchOptions {
     }
 }
 
-fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunchOptions> {
-    const VALUE_OPTIONS: &[&str] = &[
-        "--autonomous-gate",
-        "--autonomous-gate-retries",
-        "--autonomous-gate-timeout-ms",
-        "--autonomous-max-continuations",
-        "--autonomous-max-turns",
-        "--autonomous-max-tokens",
-        "--autonomous-timeout-ms",
-        "--daemon-socket",
-        "--provider",
-        "--model",
-        "--api-key",
-        "--system-prompt",
-        "--append-system-prompt",
-        "--fork",
-        "--models",
-        "-m",
-        "--thinking",
-        "--goal",
-        "--goal-token-budget",
-    ];
+pub(super) const PRIME_VALUE_OPTIONS: &[&str] = &[
+    "--model",
+    "--provider",
+    "--api-key",
+    "--models",
+    "--thinking",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--goal",
+    "--goal-token-budget",
+    "--autonomous-gate",
+    "--autonomous-gate-retries",
+    "--autonomous-gate-timeout-ms",
+    "--autonomous-max-continuations",
+    "--autonomous-max-turns",
+    "--autonomous-max-tokens",
+    "--autonomous-timeout-ms",
+    "--skill",
+    "--prompt-template",
+    "--theme",
+    "--session-dir",
+    "--cwd",
+    "--mode",
+];
 
+fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunchOptions> {
     let mut options = PrimeAgentLaunchOptions::default();
     let mut index = 1;
     while let Some(argument) = words.get(index).map(String::as_str) {
@@ -161,7 +164,9 @@ fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunch
                 }
                 index += 1;
             }
-            _ if VALUE_OPTIONS.contains(&argument) => {
+            _ if PRIME_VALUE_OPTIONS.contains(&argument)
+                || matches!(argument, "--daemon-socket" | "--fork") =>
+            {
                 words.get(index + 1)?;
                 index += 1;
             }

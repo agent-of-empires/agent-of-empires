@@ -52,13 +52,15 @@ Each built-in adapter receives only the provider variables it is known to read, 
 
 ### Prime runtime ownership
 
-Native Prime Agent 0.10.x uses a daemon owned by each structured execution. The daemon and frontend receive the same effective environment, including the complete protected channel in sandboxed terminal launches, and use the original agent directory for credentials, settings, skills, and history. AoE does not reuse a daemon launched with another session's credentials.
+Native Prime Agent 0.10.x uses a daemon owned by each structured execution. Ownership follows the resolved ACP backend, including inherited custom agents, rather than the session tool label. The daemon and frontend receive the same effective environment and use the original agent directory for credentials, settings, skills, and history. Sandboxed preparation resolves Prime with the frontend’s executable, environment, working directory, and pinned container ID. AoE does not reuse a daemon launched with another session’s credentials.
 
 Stopping or restarting the session requires native shutdown and observed process settlement before replacement. Startup and frontend errors also await cleanup; a failed cleanup retains ownership. Status polling treats a busy cleanup observation as unavailable instead of waiting for it. An unreaped zombie has finished execution, but live runner-group members and native workers still have to settle. AoE records daemon/frontend incarnations at launch and retains native worker and positively scoped auxiliary identities before shutdown can retire their metadata. Unrelated process opacity is not ownership. A known live or uninspectable incarnation retains the ownership record and blocks replacement; this is not a containment guarantee for arbitrary tools that erase all ownership markers before observation.
 
 Successful cleanup removes the private runtime directory and retains a compact termination receipt in the AoE worker directory for deserialized retries. Its absolute host path is pinned before applying the agent environment, so `HOME` or `XDG_CONFIG_HOME` overrides cannot redirect ownership evidence. Preparation must commit that receipt before launching native processes; failure rolls back only the directory created by that attempt.
 
 Container images must provide Bash and GNU grep for scoped process inspection, plus Python 3.9 or newer with `os.pidfd_open` and `signal.pidfd_send_signal` on the guest kernel. AoE probes pidfd signalling during preparation and binds guest signals to the recorded incarnation, without a numeric PID fallback. Missing capabilities refuse launch. Stopping `aoe serve` only detaches; an admitted turn continues and the next daemon reattaches to the same worker.
+
+On Apple Container, worker descriptor snapshots are streamed as a tar archive by the guest Python helper. Symlinks and non-regular descriptors are refused; no host copy destination is used.
 
 For a tracked runtime that still has auxiliary processes, settle only that execution on its original host or pinned container, then retry `aoe acp stop <id>`. Retain its ownership record meanwhile; `recover` does not bypass tracked-runtime shutdown.
 

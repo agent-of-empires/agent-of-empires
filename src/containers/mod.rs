@@ -150,6 +150,10 @@ impl DockerContainer {
         self.runtime.container_working_dir(&self.name)
     }
 
+    pub(crate) fn id(&self) -> Result<String> {
+        self.runtime.inspect_container_id(&self.name)
+    }
+
     pub fn sandbox_store_generation_matches(&self) -> Result<Option<bool>> {
         self.runtime.sandbox_store_generation_matches(&self.name)
     }

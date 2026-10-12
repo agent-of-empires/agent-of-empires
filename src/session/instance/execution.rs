@@ -2225,25 +2225,20 @@ pub(super) fn validate_managed_arguments(
                 &["--yolo", "--dangerously-skip-permissions", "--verbose"],
             ),
             "prime-agent" => (
+                super::prime_capture::PRIME_VALUE_OPTIONS,
                 &[
-                    "--model",
-                    "-m",
-                    "--system-prompt",
-                    "--append-system-prompt",
-                    "--agent",
-                    "--session-dir",
-                    "--cwd",
-                    "--mode",
-                ],
-                &[
-                    "--yolo",
-                    "--dangerously-skip-permissions",
-                    "--allow-all-tools",
-                    "--trust-all-tools",
-                    "--verbose",
                     "--offline",
+                    "--verbose",
                     "--print",
                     "-p",
+                    "--autonomous",
+                    "--no-skills",
+                    "-ns",
+                    "--no-prompt-templates",
+                    "-np",
+                    "--no-themes",
+                    "--no-context-files",
+                    "-nc",
                 ],
             ),
             _ => (
@@ -2266,10 +2261,8 @@ pub(super) fn validate_managed_arguments(
         };
         if values.contains(&key) {
             anyhow::ensure!(
-                agent.name != "prime-agent"
-                    || !matches!(key, "--cwd" | "--session-dir")
-                    || inline.is_none(),
-                "Prime namespace options require a separate value"
+                agent.name != "prime-agent" || inline.is_none(),
+                "Prime options require a separate value"
             );
             let value = if let Some(value) = inline {
                 value
@@ -2279,6 +2272,24 @@ pub(super) fn validate_managed_arguments(
                     .get(index)
                     .context("managed command option is missing its value")?
             };
+            if agent.name == "prime-agent" {
+                let option_text = matches!(key, "--system-prompt" | "--append-system-prompt");
+                let dash_text = matches!(key, "--goal" | "--autonomous-gate");
+                anyhow::ensure!(
+                    value != "--"
+                        && (option_text
+                            || if dash_text {
+                                !value.starts_with("--")
+                            } else {
+                                !value.starts_with('-')
+                            }),
+                    "Prime option {key} is missing its value"
+                );
+                anyhow::ensure!(
+                    key != "--mode" || matches!(value, "text" | "json"),
+                    "Prime terminal mode is not supported for a managed conversation"
+                );
+            }
             if key == "--session-dir" {
                 anyhow::ensure!(
                     matches!(agent.name, "pi" | "omp" | "prime-agent"),
@@ -2601,6 +2612,51 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prime_native_options_preserve_managed_namespace_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut instance = Instance::new("prime options", temp.path().to_str().unwrap());
+        instance.tool = "prime-agent".into();
+        let agent = crate::agents::get_agent("prime-agent").unwrap();
+        for args in [
+            "--thinking high",
+            "--provider openai",
+            "--autonomous",
+            "--no-context-files",
+            "--model example --api-key isolated --models example,other",
+            "--goal '-finish the task' --autonomous-gate '-check it'",
+            "--skill local --prompt-template local --theme local",
+            "--append-system-prompt '--resume' --system-prompt '--mode'",
+            "--mode json --no-skills --no-prompt-templates --no-themes",
+        ] {
+            instance.extra_args = format!("{args} --session-dir managed");
+            assert_eq!(
+                instance.managed_user_argv(agent).unwrap(),
+                Some("managed".into()),
+                "{args}"
+            );
+        }
+        for args in [
+            "--thinking",
+            "--thinking=high",
+            "--model --resume victim",
+            "--provider --session-dir elsewhere",
+            "--goal --session-dir",
+            "--resume victim",
+            "--continue",
+            "--fork victim",
+            "--daemon-socket /tmp/other",
+            "--no-session",
+            "--mode acp",
+            "--mode daemon",
+            "--yolo",
+            "-m example",
+        ] {
+            instance.extra_args = args.into();
+            assert!(instance.managed_user_argv(agent).is_err(), "{args}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

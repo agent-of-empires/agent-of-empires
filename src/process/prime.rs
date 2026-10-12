@@ -517,11 +517,20 @@ impl PrimeRuntime {
                 presence == b"present",
                 "invalid Prime descriptor presence result"
             );
-            let mut command = container.transport.command(&[]);
-            command
-                .arg("cp")
-                .arg(format!("{}:{}/.", container.id, directory.display()))
-                .arg("-");
+            let command = if container.transport.kind
+                == crate::session::ContainerRuntimeName::AppleContainer
+            {
+                let mut command = self.guest_control("descriptor-archive")?;
+                command.arg(&directory);
+                command
+            } else {
+                let mut command = container.transport.command(&[]);
+                command
+                    .arg("cp")
+                    .arg(format!("{}:{}/.", container.id, directory.display()))
+                    .arg("-");
+                command
+            };
             let bytes = crate::session::capture::run_with_timeout_limit(
                 command,
                 Duration::from_secs(5),
@@ -1132,6 +1141,72 @@ pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn apple_descriptor_snapshot_keeps_namespace_and_file_type_guards() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let transport = root.path().join("apple-exec");
+        std::fs::write(&transport, "#!/bin/sh\n[ \"$1\" = exec ] || exit 84\nshift\n[ \"$1\" != -i ] || shift\n[ \"$1\" = pinned ] || exit 85\nshift\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let prime = PrimeRuntime::new(
+            "/bin/false".into(),
+            root.path().join("agent"),
+            Some(PrimeContainer {
+                transport: crate::containers::RuntimeExecutionSnapshot {
+                    kind: crate::session::ContainerRuntimeName::AppleContainer,
+                    program: transport,
+                    cwd: root.path().into(),
+                    endpoint: "apple-contract".into(),
+                    local_mounts: false,
+                    routing: Vec::new(),
+                    global_arguments: Vec::new(),
+                },
+                id: "pinned".into(),
+                cwd: root.path().into(),
+            }),
+        )
+        .unwrap();
+        let directory = prime.worker_descriptor_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+        let descriptor = directory.join("worker.json");
+        let own = serde_json::json!({"pid":42,"processStartId":"proc:100", "supervisorSocketPath":prime.socket()});
+        std::fs::write(&descriptor, serde_json::to_vec(&own).unwrap()).unwrap();
+        let identities = prime.worker_identities().unwrap();
+        assert_eq!(
+            identities,
+            vec![crate::process::PrimeProcessIdentity {
+                pid: 42,
+                start_id: "proc:100".into()
+            }]
+        );
+        for invalid in [
+            serde_json::json!({"pid":42,"processStartId":"proc:100", "supervisorSocketPath":"/tmp/foreign.sock"}),
+            serde_json::json!({"pid":u32::MAX,"processStartId":"proc:100", "supervisorSocketPath":prime.socket()}),
+            serde_json::json!({"pid":42,"supervisorSocketPath":prime.socket()}),
+        ] {
+            std::fs::write(&descriptor, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(prime.worker_identities().is_err(), "{invalid}");
+        }
+        std::fs::remove_file(&descriptor).unwrap();
+        let foreign = root.path().join("foreign.json");
+        std::fs::write(&foreign, serde_json::to_vec(&own).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&foreign, &descriptor).unwrap();
+        assert!(prime.worker_identities().is_err());
+        std::fs::remove_file(&descriptor).unwrap();
+        std::fs::create_dir(&descriptor).unwrap();
+        std::fs::write(
+            descriptor.join("nested.json"),
+            serde_json::to_vec(&own).unwrap(),
+        )
+        .unwrap();
+        assert!(prime.worker_identities().is_err());
+        std::fs::remove_dir_all(&descriptor).unwrap();
+        assert_eq!(prime.worker_identities().unwrap(), Vec::new());
+        assert!(!root.path().join("-").exists());
+    }
 
     #[test]
     #[serial_test::serial]

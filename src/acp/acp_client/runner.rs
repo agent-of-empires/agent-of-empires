@@ -226,7 +226,7 @@ pub(super) fn spawn_runner_detached(
         // fixed container mount in build_sandbox_docker_argv (#2587).
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
-    if config.tool == "prime-agent" {
+    if config.uses_native_prime() {
         let mut snapshot = std::process::Command::new(&spawn_command);
         snapshot.envs(
             cmd.as_std()
