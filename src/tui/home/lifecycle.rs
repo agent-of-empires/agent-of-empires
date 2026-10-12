@@ -220,6 +220,8 @@ impl HomeView {
             last_prompt_cache: None,
             last_prompt_slot: last_prompt::new_slot(),
             last_prompt_in_flight: false,
+            todo_panel: None,
+            session_todos: todo::load_store().unwrap_or_default(),
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,

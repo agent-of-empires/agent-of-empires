@@ -2519,10 +2519,19 @@ impl HomeView {
             return None;
         }
 
-        // Ctrl+L toggles the last-prompt footer. Routed here, after the live-send
-        // relay and every dialog above, and gated on `!is_live_send_capturing()`
-        // with exact modifiers, so a configured `C-l` exit/leader still reaches
-        // the agent and a distinct Ctrl+Alt+L is not consumed.
+        // The TODO panel is a modal overlay (registered in
+        // `has_non_live_send_overlay`), so it is routed here, after every dialog
+        // above and after the live-send relay: while open it owns the keyboard.
+        if self.todo_panel.is_some() {
+            self.handle_todo_key(key);
+            return None;
+        }
+
+        // Ctrl+L toggles the last-prompt footer; Ctrl+Y opens the TODO panel.
+        // Both are routed after the live-send relay and gated on
+        // `!is_live_send_capturing()` with exact modifiers, so a configured
+        // `C-l` / `C-y` exit/leader still reaches the agent and Ctrl+Alt+* is not
+        // consumed.
         if key.code == KeyCode::Char('l')
             && key.modifiers == KeyModifiers::CONTROL
             && !self.is_live_send_capturing()
@@ -2531,6 +2540,13 @@ impl HomeView {
             if !self.show_last_prompt {
                 self.last_prompt_cache = None;
             }
+            return None;
+        }
+        if key.code == KeyCode::Char('y')
+            && key.modifiers == KeyModifiers::CONTROL
+            && !self.is_live_send_capturing()
+        {
+            self.toggle_todo_panel();
             return None;
         }
 
@@ -5885,6 +5901,12 @@ impl HomeView {
         // underneath can change. Doing it here covers the drag-select -> right-click ->
         // paste-into-dialog sequence, which never goes through `handle_key`.
         self.clear_preview_selection();
+        // The TODO panel is modal while open: a paste goes into its add field (or
+        // is dropped in navigation mode), never to the pane or a dialog behind it.
+        if self.todo_panel.is_some() {
+            self.todo_panel_handle_paste(text);
+            return;
+        }
         if !self.has_non_live_send_overlay() {
             if let Some(state) = self.live_send.clone() {
                 if let Some(worker) = &self.live_send_worker {

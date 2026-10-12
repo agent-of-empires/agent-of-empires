@@ -30,6 +30,7 @@ mod status;
 mod store_move;
 #[cfg(test)]
 mod tests;
+mod todo;
 mod user_action;
 mod watchers;
 
@@ -164,6 +165,10 @@ pub struct HomeView {
     last_prompt_slot: last_prompt::LastPromptSlot,
     /// Whether a background last-prompt scrape is currently running.
     last_prompt_in_flight: bool,
+    /// Open TODO panel (toggled with `Ctrl+Y`), or `None`. Module-private.
+    todo_panel: Option<todo::TodoPanel>,
+    /// Per-session TODO items, loaded from disk and saved on change.
+    session_todos: HashMap<String, Vec<todo::TodoItem>>,
     pub(super) sort_order: SortOrder,
     pub(super) group_by: GroupByMode,
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
