@@ -133,3 +133,17 @@ Read `DESIGN.md` before visual changes.
 ## Skills
 
 When an available skill matches the request, invoke it before doing the work.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues for `agent-of-empires/agent-of-empires`, via `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `CONTEXT.md` plus `docs/adr/`. See `docs/agents/domain.md`.

@@ -935,11 +935,10 @@ impl NativeLaunchInputs {
             }
         }
         if let Some(bytes) = self.read_native_file(&root.join("config.yaml"))? {
-            let mut config: serde_yaml::Value =
-                serde_yaml::from_slice(&bytes).context("Hermes config.yaml cannot be resolved")?;
-            config
-                .apply_merge()
-                .context("Hermes YAML merges cannot be resolved")?;
+            let mut options = crate::yaml::options();
+            options.merge_keys = serde_saphyr::MergeKeyPolicy::Merge;
+            let config: serde_json::Value = serde_saphyr::from_slice_with_options(&bytes, options)
+                .context("Hermes config.yaml cannot be resolved")?;
             if let Some(terminal) = config.get("terminal") {
                 if let Some(backend) = terminal.get("backend") {
                     anyhow::ensure!(
@@ -954,14 +953,11 @@ impl NativeLaunchInputs {
                     )?;
                 }
             }
-            if let Some(secrets) = config
-                .get("secrets")
-                .and_then(serde_yaml::Value::as_mapping)
-            {
+            if let Some(secrets) = config.get("secrets").and_then(serde_json::Value::as_object) {
                 anyhow::ensure!(
                     !secrets.values().any(|value| value
                         .get("enabled")
-                        .and_then(serde_yaml::Value::as_bool)
+                        .and_then(serde_json::Value::as_bool)
                         == Some(true)),
                     "Hermes external secret sources can redirect the declared namespace"
                 );
