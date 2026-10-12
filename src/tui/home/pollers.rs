@@ -33,6 +33,7 @@ impl HomeView {
                             current.lifecycle_generation = retained.lifecycle_generation;
                             current.status = retained.status;
                             current.trashed_at = retained.trashed_at;
+                            current.trash_lifecycle_id = retained.trash_lifecycle_id;
                             current.project_path = retained.project_path;
                             current.pre_trash_project_path = retained.pre_trash_project_path;
                             current.lifecycle_reservation = retained.lifecycle_reservation;

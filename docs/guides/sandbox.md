@@ -29,7 +29,7 @@ environment = ["ANTHROPIC_API_KEY"]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `enabled_by_default` | `false` | Auto-enable the sandbox for new sessions |
+| `enabled_by_default` | `false` | Auto-enable the sandbox for new sessions. Overridable per project. |
 | `default_image` | `aoe-sandbox:latest` | Image to run |
 | `container_runtime` | `docker` | `docker`, `podman`, or `apple_container`. Global only; a profile or repo override is ignored |
 | `auto_cleanup` | `true` | Remove the container when the session is deleted |

@@ -120,6 +120,7 @@ impl Instance {
     pub fn trash(&mut self) {
         if self.trashed_at.is_none() {
             self.trashed_at = Some(Utc::now());
+            self.trash_lifecycle_id = Some(Uuid::new_v4().to_string());
         }
     }
 
@@ -127,6 +128,15 @@ impl Instance {
     /// archived, depending on the preserved sibling flags). Idempotent.
     pub fn untrash(&mut self) {
         self.trashed_at = None;
+        self.trash_lifecycle_id = None;
+    }
+
+    /// Match a durable trash lifecycle independently of clock resolution.
+    pub(crate) fn same_trash_lifecycle(&self, other: &Self) -> bool {
+        self.trashed_at.is_some()
+            && self.trashed_at == other.trashed_at
+            && self.trash_lifecycle_id.is_some()
+            && self.trash_lifecycle_id == other.trash_lifecycle_id
     }
 
     pub fn is_trashed(&self) -> bool {
@@ -510,10 +520,20 @@ mod tests {
         assert!(inst.is_favorited() && inst.is_pinned());
         let back: Instance = serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
         assert!(back.is_trashed());
+        assert!(inst.same_trash_lifecycle(&back));
+        inst.trash();
+        assert!(
+            inst.same_trash_lifecycle(&back),
+            "repeated trash is idempotent"
+        );
         inst.untrash();
+        assert!(inst.trash_lifecycle_id.is_none());
         assert!(!inst.is_trashed());
         assert_eq!(inst.effective_bucket(), SessionBucket::Active);
         assert!(inst.is_favorited() && inst.is_pinned());
+        inst.trash();
+        inst.trashed_at = back.trashed_at;
+        assert!(!inst.same_trash_lifecycle(&back));
 
         let mut archived = self::inst();
         archived.archive();

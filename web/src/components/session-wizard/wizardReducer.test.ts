@@ -168,8 +168,11 @@ it("SUBMIT_CANCEL re-enables submit without an error", () => {
   expect(cancelled.error).toBeNull();
 });
 
-describe("SEED_PROJECT_WORKTREE_OVERRIDE", () => {
-  const seed = (override: boolean | undefined): Action => ({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override });
+describe("SEED_PROJECT_OVERRIDES", () => {
+  const seed = (override: boolean | undefined): Action => ({
+    type: "SEED_PROJECT_OVERRIDES",
+    overrides: override === undefined ? undefined : { worktree_enabled: override },
+  });
 
   it("applies an override and reverts to the profile default without one", () => {
     const overridden = run(makeState(), defaults({ worktreeEnabled: false }), seed(true));
@@ -196,9 +199,16 @@ describe("SEED_PROJECT_WORKTREE_OVERRIDE", () => {
 
   it("drops a path-scoped seed once the selected path has changed", () => {
     const state = makeState({ path: "/repo/b" });
-    const seedFor = (path: string): Action => ({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override: true, path });
+    const seedFor = (path: string): Action => ({
+      type: "SEED_PROJECT_OVERRIDES",
+      overrides: { worktree_enabled: true },
+      path,
+    });
     expect(reducer(state, seedFor("/repo/a"))).toBe(state);
     expect(reducer(state, seedFor("/repo/b")).data.useWorktree).toBe(true);
+    // A trailing slash does not make a different project.
+    expect(reducer(state, seedFor("/repo/b/")).data.useWorktree).toBe(true);
+    expect(reducer(makeState({ path: "/repo/b/" }), seedFor("/repo/b")).data.useWorktree).toBe(true);
   });
 
   it("tracks the latest project while dirty, so a profile switch resolves from it", () => {
@@ -206,5 +216,67 @@ describe("SEED_PROJECT_WORKTREE_OVERRIDE", () => {
     expect(withB.data).toMatchObject({ useWorktree: false, projectWorktreeOverride: false });
     const switched = reducer(withB, defaults({ worktreeEnabled: true, skipIfDirty: false }));
     expect(switched.data).toMatchObject({ useWorktree: false, worktreeDirty: false });
+  });
+});
+
+describe("SEED_PROJECT_OVERRIDES sandbox", () => {
+  const seed = (sandbox: boolean | undefined): Action => ({
+    type: "SEED_PROJECT_OVERRIDES",
+    overrides: sandbox === undefined ? undefined : { sandbox_enabled: sandbox },
+  });
+
+  it("applies an override and reverts to the profile default without one", () => {
+    const overridden = run(makeState(), defaults({ sandboxEnabled: false }), seed(true));
+    expect(overridden.data.sandboxEnabled).toBe(true);
+    expect(reducer(overridden, seed(undefined)).data.sandboxEnabled).toBe(false);
+    const forcedOff = run(makeState(), defaults({ sandboxEnabled: true }), seed(false));
+    expect(forcedOff.data.sandboxEnabled).toBe(false);
+  });
+
+  it("outranks a profile-defaults response in either order", () => {
+    const late = run(makeState(), seed(true), defaults({ sandboxEnabled: false }));
+    expect(late.data).toMatchObject({ sandboxEnabled: true, profileSandboxDefault: false });
+    const dirtyProfile = run(makeState(), set("tool", "codex"), seed(true), defaults({ sandboxEnabled: false }));
+    expect(dirtyProfile.data).toMatchObject({ sandboxEnabled: true, profileSandboxDefault: false });
+  });
+
+  it("keeps a manual sandbox choice when late profile defaults arrive past other edits", () => {
+    const manual = run(makeState(), seed(true), set("sandboxEnabled", false));
+    const late = reducer(manual, defaults({ sandboxEnabled: true, skipIfDirty: true }));
+    expect(late.data).toMatchObject({ sandboxEnabled: false, profileSandboxDefault: true });
+  });
+
+  it("does not clobber a manual sandbox toggle, but does apply after an unrelated edit", () => {
+    expect(run(makeState(), set("sandboxEnabled", true), seed(false)).data.sandboxEnabled).toBe(true);
+    const toolChanged = reducer(makeState(), set("tool", "codex"));
+    expect(toolChanged.data.sandboxDirty).toBe(false);
+    expect(reducer(toolChanged, seed(true)).data.sandboxEnabled).toBe(true);
+  });
+
+  it("drops the project's overrides when leaving it for scratch, so the next profile's default applies", () => {
+    const off = run(makeState(), defaults({ sandboxEnabled: true, worktreeEnabled: true }), seed(false));
+    expect(off.data.sandboxEnabled).toBe(false);
+
+    const scratch = reducer(off, set("scratch", true));
+    expect(scratch.data).toMatchObject({
+      sandboxEnabled: true,
+      projectSandboxOverride: undefined,
+      projectWorktreeOverride: undefined,
+    });
+    const switched = reducer(scratch, defaults({ sandboxEnabled: true, skipIfDirty: false }));
+    expect(switched.data.sandboxEnabled).toBe(true);
+  });
+
+  it("keeps a manual sandbox choice across the move to scratch", () => {
+    const manual = run(makeState(), defaults({ sandboxEnabled: true }), seed(true), set("sandboxEnabled", false));
+    const scratch = reducer(manual, set("scratch", true));
+    expect(scratch.data).toMatchObject({ sandboxEnabled: false, projectSandboxOverride: undefined });
+  });
+
+  it("tracks the latest project while dirty, so a profile switch resolves from it", () => {
+    const withB = run(makeState(), seed(true), set("sandboxEnabled", false), seed(false));
+    expect(withB.data).toMatchObject({ sandboxEnabled: false, projectSandboxOverride: false });
+    const switched = reducer(withB, defaults({ sandboxEnabled: true, skipIfDirty: false }));
+    expect(switched.data).toMatchObject({ sandboxEnabled: false, sandboxDirty: false });
   });
 });

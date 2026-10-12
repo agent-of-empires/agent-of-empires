@@ -85,10 +85,11 @@ pub(super) enum DragKind {
 }
 
 /// A deletion's force level and the trash lifecycle it ran in.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct DeleteAttempt {
     pub(super) forced: bool,
     pub(super) trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(super) trash_lifecycle_id: Option<String>,
 }
 
 pub(super) struct GroupRenameContext {

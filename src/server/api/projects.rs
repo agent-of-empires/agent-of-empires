@@ -15,7 +15,7 @@ use crate::session::projects::{self, RegistryError};
 use crate::session::{Project, ProjectOverrides, ProjectScope};
 
 use super::AppState;
-use super::{api_error, read_only_response};
+use super::{api_error, read_only_response, validate_profile_name};
 
 #[derive(Serialize)]
 pub struct ProjectResponse {
@@ -49,6 +49,9 @@ pub struct ListQuery {
     /// Optional scope filter: "global", "profile", or omitted (= all).
     #[serde(default)]
     pub scope: Option<String>,
+    /// Profile whose registry entries to resolve; defaults to the served profile.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 #[tracing::instrument(target = "http.api.projects", skip_all, fields(scope = q.scope.as_deref().unwrap_or("merged")))]
@@ -56,9 +59,18 @@ pub async fn list_projects(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> impl IntoResponse {
+    let profile = match q.profile.as_deref() {
+        Some(name) => {
+            if let Err(e) = validate_profile_name(name) {
+                return api_error(StatusCode::BAD_REQUEST, "bad_profile", e);
+            }
+            name
+        }
+        None => state.profile.as_str(),
+    };
     let result: anyhow::Result<Vec<Project>> = match q.scope.as_deref() {
         Some("global") => projects::load_global(),
-        Some("profile") => projects::load_profile(&state.profile),
+        Some("profile") => projects::load_profile(profile),
         Some(other) => {
             tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
             return api_error(
@@ -70,7 +82,9 @@ pub async fn list_projects(
                 ),
             );
         }
-        None => projects::load_merged(&state.profile),
+        // The wizard derives sandbox and worktree defaults from this, so an unreadable registry must
+        // fail the request instead of reading as "no overrides".
+        None => projects::load_merged_strict(profile),
     };
 
     match result {
@@ -301,11 +315,14 @@ struct ProjectPatch {
 struct OverridesPatch {
     worktree_enabled: Option<Option<bool>>,
     smart_rename: Option<Option<bool>>,
+    sandbox_enabled: Option<Option<bool>>,
 }
 
 impl OverridesPatch {
     fn is_empty(&self) -> bool {
-        self.worktree_enabled.is_none() && self.smart_rename.is_none()
+        self.worktree_enabled.is_none()
+            && self.smart_rename.is_none()
+            && self.sandbox_enabled.is_none()
     }
 }
 
@@ -334,9 +351,21 @@ fn parse_overrides_patch(
             ))
         }
     };
+    let sandbox_enabled = match body.get("sandbox_enabled") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::Bool(b)) => Some(Some(*b)),
+        Some(_) => {
+            return Err((
+                "bad_field",
+                "overrides.sandbox_enabled must be a boolean or null",
+            ))
+        }
+    };
     Ok(OverridesPatch {
         worktree_enabled,
         smart_rename,
+        sandbox_enabled,
     })
 }
 
@@ -453,6 +482,9 @@ pub async fn update_project(
                     if let Some(s) = overrides.smart_rename {
                         ov.smart_rename = s;
                     }
+                    if let Some(c) = overrides.sandbox_enabled {
+                        ov.sandbox_enabled = c;
+                    }
                 },
             ));
         }
@@ -544,6 +576,7 @@ mod tests {
                 overrides: Some(OverridesPatch {
                     worktree_enabled: Some(Some(true)),
                     smart_rename: None,
+                    sandbox_enabled: None,
                 }),
             })
         );
@@ -555,8 +588,28 @@ mod tests {
                 overrides: Some(OverridesPatch {
                     worktree_enabled: None,
                     smart_rename: Some(None),
+                    sandbox_enabled: None,
                 }),
             })
+        );
+        assert_eq!(
+            parse_project_patch(&json!({"overrides": {"sandbox_enabled": false}})),
+            Ok(ProjectPatch {
+                base_branch: None,
+                pinned: None,
+                overrides: Some(OverridesPatch {
+                    worktree_enabled: None,
+                    smart_rename: None,
+                    sandbox_enabled: Some(Some(false)),
+                }),
+            })
+        );
+        assert_eq!(
+            parse_project_patch(&json!({"overrides": {"sandbox_enabled": 1}})),
+            Err((
+                "bad_field",
+                "overrides.sandbox_enabled must be a boolean or null"
+            ))
         );
         assert_eq!(
             parse_project_patch(&json!({"overrides": {}})),
