@@ -437,9 +437,12 @@ mod tests {
 
         run_in(&home, &app_dir).unwrap();
 
-        let yaml = fs::read_to_string(&cfg).unwrap();
+        let yaml: Value = serde_saphyr::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(
-            yaml.contains("case \"$AOE_INSTANCE_ID\""),
+            yaml["hooks"]["pre_tool_call"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("case \"$AOE_INSTANCE_ID\""),
             "Hermes YAML must be rewritten to hardened form"
         );
         let allow = home.join(".hermes/shell-hooks-allowlist.json");
