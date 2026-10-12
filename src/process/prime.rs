@@ -373,28 +373,31 @@ impl PrimeRuntime {
         observation
     }
 
-    fn proof_paths(&self) -> Result<(PathBuf, PathBuf)> {
+    fn control_path(&self) -> Result<&Path> {
         let path = self
             .proof_path
-            .as_ref()
+            .as_deref()
             .context("Prime control path is unattested")?;
         anyhow::ensure!(path.is_absolute(), "Prime control path must be absolute");
         let name = self
             .directory
             .file_name()
-            .context("missing Prime runtime name")?
-            .to_string_lossy();
+            .context("missing Prime runtime name")?;
+        let actual = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix('.'))
+            .and_then(|name| name.strip_suffix(".prime-proof"));
         anyhow::ensure!(
-            path.file_name()
-                .is_some_and(|actual| actual == format!(".{name}.prime-proof").as_str()),
+            actual.is_some_and(|actual| std::ffi::OsStr::new(actual) == name),
             "Prime control path does not match the runtime"
         );
-        Ok((path.with_extension("prime-lock"), path.clone()))
+        Ok(path)
     }
 
     fn lock_proof(&self) -> Result<std::fs::File> {
         use fs2::FileExt as _;
-        let (path, _) = self.proof_paths()?;
+        let path = self.control_path()?.with_extension("prime-lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -425,7 +428,7 @@ impl PrimeRuntime {
     }
 
     fn read_proof(&self) -> Result<PrimeCleanupProof> {
-        let (_, path) = self.proof_paths()?;
+        let path = self.control_path()?;
         let proof: PrimeCleanupProof = serde_json::from_slice(
             &std::fs::read(path).context("Prime cleanup ownership ledger unavailable")?,
         )?;
@@ -455,8 +458,8 @@ impl PrimeRuntime {
     }
 
     fn write_proof(&self, proof: &PrimeCleanupProof) -> Result<()> {
-        let (_, path) = self.proof_paths()?;
-        crate::session::atomic_write(&path, &serde_json::to_vec(proof)?)
+        let path = self.control_path()?;
+        crate::session::atomic_write(path, &serde_json::to_vec(proof)?)
     }
 
     fn worker_descriptor_dir(&self) -> PathBuf {
