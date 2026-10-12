@@ -55,6 +55,30 @@ fn no_revive_refused() -> Response {
         .into_response()
 }
 
+/// The queue row a "Send now" named is gone: the drain or another tab already delivered it.
+fn queued_prompt_gone() -> Response {
+    (StatusCode::CONFLICT, "queued_prompt_gone").into_response()
+}
+
+/// A queued row is sent as stored: other text would be accepted for, or credited to, a row
+/// that holds something else.
+fn queued_prompt_changed() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "queued_prompt_changed: the queued row differs from the request",
+    )
+        .into_response()
+}
+
+/// The row's attachment bytes expired; sending it now would drop them.
+fn queued_attachments_missing() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "queued_attachments_missing: the row's attachment bytes are no longer stored",
+    )
+        .into_response()
+}
+
 pub async fn acp_prompt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -87,10 +111,39 @@ pub async fn acp_prompt(
     };
     // Validated before publishing or resuming, so a rejected prompt leaves no
     // trace in the transcript and spawns no worker.
-    let attachments = match validate_attachments(&state, &id, &req.attachments) {
+    // A named queue row is delivered with its stored bytes, so request uploads are not read.
+    let uploads: &[_] = if req.queued_prompt_id.is_some() {
+        &[]
+    } else {
+        &req.attachments
+    };
+    let attachments = match validate_attachments(&state, &id, uploads) {
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    // "Send now" delivers a stored row under its stored sender. The row is only consumed
+    // once the turn is accepted, so any refusal leaves it for a retry.
+    let queued_row = match &req.queued_prompt_id {
+        Some(queued_id) => {
+            let row = state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .into_iter()
+                .find(|r| &r.id == queued_id);
+            match row {
+                Some(row) => Some(row),
+                None => return queued_prompt_gone(),
+            }
+        }
+        None => None,
+    };
+    if let Some(row) = &queued_row {
+        if row.text != req.text {
+            return queued_prompt_changed();
+        }
+    }
+    let origin_plugin = queued_row.as_ref().and_then(|r| r.origin_plugin.clone());
     // Decided under the guard so the decision and its dispatch are atomic
     // (#3621). The wake already cleared the dormant marker, hence the flag.
     let dispatch = state
@@ -114,6 +167,17 @@ pub async fn acp_prompt(
         // Only once queueing is certain: a `no_revive` refusal above must
         // leave it in place (#4081 review).
         state.session_service.clear_pending_initial_turn(&id).await;
+        // The named row is already the parked copy; queueing again would duplicate it.
+        if let Some(row) = &queued_row {
+            return (
+                StatusCode::ACCEPTED,
+                Json(PromptDispatchResponse {
+                    dispatch,
+                    queued_id: Some(row.id.clone()),
+                }),
+            )
+                .into_response();
+        }
         let prompt_id = req
             .prompt_id
             .clone()
@@ -125,6 +189,7 @@ pub async fn acp_prompt(
             req.text.clone(),
             &attachments,
             None,
+            origin_plugin.clone(),
         )
         .await
         {
@@ -147,10 +212,31 @@ pub async fn acp_prompt(
             }
         };
     }
+    // A named row is delivered with the bytes the daemon stored for it, never the request's.
+    let attachments = match &queued_row {
+        Some(row) => {
+            let store = Arc::clone(&state.acp_event_store);
+            let (session_id, row_id) = (id.clone(), row.id.clone());
+            let stored = tokio::task::spawn_blocking(move || {
+                store.load_pending_attachments_for_ref(&session_id, &row_id)
+            })
+            .await
+            .unwrap_or_default();
+            if stored.len() != row.attachments.len() {
+                return queued_attachments_missing();
+            }
+            stored
+        }
+        None => attachments,
+    };
+    let caller = match origin_plugin {
+        Some(plugin_id) => SessionCaller::PluginMessage { plugin_id },
+        None => SessionCaller::User,
+    };
     let outcome = state
         .session_service
         .send_turn(
-            &SessionCaller::User,
+            &caller,
             &id,
             SendTurnRequest {
                 text: &req.text,
@@ -169,14 +255,22 @@ pub async fn acp_prompt(
         state.session_service.clear_pending_initial_turn(&id).await;
     }
     match outcome {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(PromptDispatchResponse {
-                dispatch,
-                queued_id: None,
-            }),
-        )
-            .into_response(),
+        Ok(()) => {
+            if let Some(row) = &queued_row {
+                state
+                    .session_service
+                    .take_queued_prompt(&id, row.id.clone())
+                    .await;
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(PromptDispatchResponse {
+                    dispatch,
+                    queued_id: None,
+                }),
+            )
+                .into_response()
+        }
         Err(SendTurnError::SessionNotFound) => session_not_found(),
         Err(SendTurnError::ResumeFailed(e)) => resume_failed_response(&e),
         Err(SendTurnError::WorkerNotReady) => worker_not_ready(),

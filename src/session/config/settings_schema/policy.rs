@@ -284,6 +284,30 @@ mod tests {
     }
 
     #[test]
+    fn systemd_global_patches_validate_each_leaf() {
+        let valid = json!({"systemd": {
+            "enabled": false,
+            "slice": "aoe-{profile}.slice",
+            "survive_daemon_restart": false,
+            "memory_max": "4G",
+            "tasks_max": 512,
+        }});
+        assert!(validate_patch(&valid, Scope::Global, true).is_ok());
+        for (field, value) in [
+            ("slice", json!("aoe.service")),
+            ("memory_max", json!("4GB")),
+            ("tasks_max", json!(4194305)),
+        ] {
+            let err = validate_patch(&json!({"systemd": {field: value}}), Scope::Global, true)
+                .unwrap_err();
+            assert!(
+                matches!(err, PatchRejection::Invalid { ref path, .. } if *path == format!("systemd.{field}")),
+                "{field}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn profile_scope_rejects_global_only_fields_including_resets() {
         for field in schema().iter().filter(|field| !field.profile_overridable) {
             let body = json!({&field.section: {&field.field: null}});

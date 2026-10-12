@@ -42,6 +42,7 @@ export type TabId =
   | "diff"
   | "sound"
   | "tmux"
+  | "systemd"
   | "updates"
   | "telemetry"
   | "notifications"
@@ -103,6 +104,7 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
     { kind: "tab", id: "tmux", label: "Tmux" },
+    { kind: "tab", id: "systemd", label: "Systemd" },
     { kind: "tab", id: "sound", label: "Sound" },
     { kind: "divider", label: "System" },
     { kind: "tab", id: "updates", label: "Updates" },
@@ -181,6 +183,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "diff",
   "sound",
   "tmux",
+  "systemd",
   "updates",
   "telemetry",
   "notifications",
@@ -212,6 +215,7 @@ const SCHEMA_BACKED_TABS = new Set<TabId>([
   "theme",
   "sound",
   "tmux",
+  "systemd",
   "updates",
   "logging",
   "notifications",
@@ -625,6 +629,17 @@ export function SettingsView({
             focusRequest={focusRequest}
             values={(settings?.tmux ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
+          />
+        );
+      case "systemd":
+        return (
+          <SchemaSection
+            section="systemd"
+            schema={schema}
+            focusRequest={focusRequest}
+            values={(settings?.systemd ?? {}) as Record<string, unknown>}
+            onSaveField={saveSubField}
+            advancedSubtitle="Per-session memory and task limits."
           />
         );
       case "updates":

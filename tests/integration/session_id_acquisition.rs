@@ -6,7 +6,7 @@ use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use crate::common::{setup_temp_home, tmux_socket};
+use crate::common::{disable_systemd_scopes, setup_temp_home, tmux_socket, TestHome};
 
 const VALID_CLAUDE_UUID: &str = "019342ab-1234-7def-8901-abcdef012345";
 
@@ -42,6 +42,35 @@ impl Drop for EnvRestore {
     }
 }
 
+/// A temp home whose aoe, in process or spawned, never reaches the
+/// developer's systemd user manager: scopes are off in its config, and the
+/// runtime dir and bus point nowhere, because the in-process settings are
+/// cached by whichever test reads them first.
+struct IsolatedHome {
+    _bus: EnvRestore,
+    _runtime: EnvRestore,
+    _runtime_dir: tempfile::TempDir,
+    home: TestHome,
+}
+
+impl IsolatedHome {
+    fn new() -> Self {
+        let home = setup_temp_home();
+        disable_systemd_scopes(&agent_of_empires::session::get_app_dir().unwrap());
+        let runtime_dir = tempfile::tempdir().unwrap();
+        Self {
+            _runtime: EnvRestore::set("XDG_RUNTIME_DIR", runtime_dir.path()),
+            _bus: EnvRestore::set("DBUS_SESSION_BUS_ADDRESS", ""),
+            _runtime_dir: runtime_dir,
+            home,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.home.path()
+    }
+}
+
 fn acknowledge_agent_hooks() {
     agent_of_empires::session::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
@@ -64,7 +93,7 @@ fn start_with_size_opts_returns_skipped_when_pane_preexists() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let _temp = setup_temp_home();
+    let _temp = IsolatedHome::new();
     let mut inst = Instance::new("F1Regression", "/tmp/aoe-f1-regression");
     inst.tool = "claude".to_string();
     // Make is_existing=true the path acquire would take if reached, so any
@@ -111,7 +140,7 @@ fn start_with_size_opts_relaunches_a_dead_pane() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let temp = setup_temp_home();
+    let temp = IsolatedHome::new();
     acknowledge_agent_hooks();
     let workdir = temp.path().join("workdir");
     std::fs::create_dir_all(&workdir).expect("create workdir");
@@ -180,7 +209,7 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let temp = setup_temp_home();
+    let temp = IsolatedHome::new();
     acknowledge_agent_hooks();
     // The transcript probe reads this dir; an empty one is what makes the
     // stored sid launch fresh-pinned rather than with `--resume`. Restored on
@@ -273,7 +302,7 @@ fn fork_child_publication_confirms_preallocated_identity() {
     if !tmux_available() {
         return;
     }
-    let temp = setup_temp_home();
+    let temp = IsolatedHome::new();
     acknowledge_agent_hooks();
     let project = temp.path().join("project");
     let bin = temp.path().join("bin");
@@ -392,7 +421,7 @@ fn wait_until(check: impl Fn() -> bool) -> bool {
 #[test]
 #[serial]
 fn extract_session_id_refuses_a_different_agents_publisher() {
-    let _temp = setup_temp_home();
+    let _temp = IsolatedHome::new();
     let aoe = env!("CARGO_BIN_EXE_aoe");
     let euid = Command::new("id").arg("-u").output().unwrap();
     let base = std::path::PathBuf::from(format!(
@@ -446,7 +475,7 @@ fn extract_session_id_refuses_a_nested_agent_under_a_renamed_launch() {
     if !std::path::Path::new("/proc/self/cmdline").exists() {
         return;
     }
-    let temp = setup_temp_home();
+    let temp = IsolatedHome::new();
     let aoe = env!("CARGO_BIN_EXE_aoe");
     let bin = temp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();

@@ -121,6 +121,12 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
                 .ok_or_else(|| ValidationError::new("expected a string"))?;
             crate::session::validate_network_format(s).map_err(ValidationError::new)
         }
+        ValidationKind::SystemdSlice => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| ValidationError::new("expected a string"))?;
+            crate::session::validate_systemd_slice(s).map_err(ValidationError::new)
+        }
         ValidationKind::OneOf { options } => {
             let s = value
                 .as_str()
@@ -397,6 +403,34 @@ mod tests {
             (&K::Network, json!("egress-proxy"), true),
             (&K::Network, json!("host"), false),
             (&K::Network, json!(42), false),
+            (&K::SystemdSlice, json!("background-aoe.slice"), true),
+            (&K::SystemdSlice, json!("aoe.slice"), true),
+            (&K::SystemdSlice, json!(".slice"), false),
+            (&K::SystemdSlice, json!("aoe"), false),
+            (&K::SystemdSlice, json!("a b.slice"), false),
+            (&K::SystemdSlice, json!("x.service"), false),
+            (
+                &K::SystemdSlice,
+                json!("background-aoe-{profile}.slice"),
+                true,
+            ),
+            (&K::SystemdSlice, json!("{profile}"), false),
+            (&K::SystemdSlice, json!("a-{profile}-b.slice"), true),
+            (&K::SystemdSlice, json!("{prof}.slice"), false),
+            (&K::SystemdSlice, json!("-a.slice"), false),
+            (&K::SystemdSlice, json!("a-.slice"), false),
+            (&K::SystemdSlice, json!("a--b.slice"), false),
+            (&K::SystemdSlice, json!("-{profile}.slice"), false),
+            (
+                &K::SystemdSlice,
+                json!(format!("{}.slice", "a".repeat(250))),
+                false,
+            ),
+            (
+                &K::SystemdSlice,
+                json!(format!("{}.slice", "a".repeat(249))),
+                true,
+            ),
             (&K::MemoryLimit, json!("512m"), true),
             (&K::MemoryLimit, json!(""), true),
             (&K::MemoryLimit, json!("512mb"), false),

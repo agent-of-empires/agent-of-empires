@@ -29,6 +29,9 @@ pub struct TranscriptRow {
     /// Attachment metadata on a `user_prompt` row; bytes are fetched lazily.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<PromptAttachmentRef>,
+    /// Plugin that sent a `user_prompt` row; absent when the user typed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_plugin: Option<String>,
     /// Structured payload on a `user_diff_comments` row; `text` holds the markdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_comments: Option<DiffCommentsPayload>,
@@ -158,6 +161,7 @@ impl TranscriptModel {
                 attachments,
                 prompt_id,
                 synthesized,
+                origin_plugin,
             } => {
                 self.begin_turn();
                 // A rate-limit resume continuation replays a prompt the user
@@ -173,6 +177,7 @@ impl TranscriptModel {
                     };
                     let mut row = self.grouped_row(id, TranscriptRowKind::UserPrompt, text.clone());
                     row.attachments = attachments.clone();
+                    row.origin_plugin = origin_plugin.clone();
                     vec![self.append(row)]
                 }
             }
@@ -632,6 +637,7 @@ impl TranscriptRow {
             tool: None,
             output: Vec::new(),
             attachments: Vec::new(),
+            origin_plugin: None,
             diff_comments: None,
             elicitation_answers: Vec::new(),
             async_subagent: false,
@@ -1014,6 +1020,7 @@ mod tests {
             }],
             prompt_id: None,
             synthesized: false,
+            origin_plugin: None,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(3, &with_attachment);
@@ -1035,6 +1042,7 @@ mod tests {
                     attachments: Vec::new(),
                     prompt_id: prompt_id.map(Into::into),
                     synthesized: false,
+                    origin_plugin: None,
                 },
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
@@ -1079,6 +1087,7 @@ mod tests {
             attachments: Vec::new(),
             prompt_id: None,
             synthesized: true,
+            origin_plugin: None,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(1, &ev);
@@ -1086,6 +1095,18 @@ mod tests {
         assert!(m.rows().is_empty());
         assert!(m.turn_active);
         assert!(!m.turn_has_output);
+
+        // A plugin-sent message keeps its sender on the row.
+        let ev = Event::UserPromptSent {
+            text: "PR #7 was merged".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: Some("cron".into()),
+        };
+        let mut m = TranscriptModel::new();
+        m.apply_event(1, &ev);
+        assert_eq!(m.rows()[0].origin_plugin.as_deref(), Some("cron"));
     }
 
     #[test]

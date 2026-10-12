@@ -30,6 +30,7 @@ pub enum SettingsCategory {
     Worktree,
     Sandbox,
     Tmux,
+    Systemd,
     Session,
     Agents,
     Interaction,
@@ -52,6 +53,7 @@ impl SettingsCategory {
             Self::Worktree => "Worktree",
             Self::Sandbox => "Sandbox",
             Self::Tmux => "Tmux",
+            Self::Systemd => "Systemd",
             Self::Session => "Session",
             Self::Agents => "Agents",
             Self::Interaction => "Interaction",
@@ -75,6 +77,7 @@ impl SettingsCategory {
             Self::Worktree => "Worktree",
             Self::Sandbox => "Sandbox",
             Self::Tmux => "Tmux",
+            Self::Systemd => "Systemd",
             Self::Session => "Session",
             Self::Agents => "Agents",
             Self::Interaction => "Interaction",
@@ -1190,6 +1193,32 @@ mod tests {
         ] {
             f.value = FieldValue::OptionalText(value.map(str::to_string));
             assert_eq!(f.validate().is_ok(), ok, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn systemd_tab_lists_its_global_only_fields_under_global_scope_only() {
+        let profile = ProfileConfig::default();
+        assert_eq!(
+            idents(&build(
+                SettingsCategory::Systemd,
+                SettingsScope::Global,
+                &profile
+            )),
+            [
+                "systemd.enabled",
+                "systemd.slice",
+                "systemd.survive_daemon_restart",
+                "__section.Advanced",
+                "systemd.memory_max",
+                "systemd.tasks_max",
+            ]
+        );
+        for scope in [SettingsScope::Profile, SettingsScope::Repo] {
+            assert!(
+                build(SettingsCategory::Systemd, scope, &profile).is_empty(),
+                "{scope:?}"
+            );
         }
     }
 

@@ -239,6 +239,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         extra_allowed_origins,
     } = config;
 
+    // Before anything can create a session scope.
+    crate::process::systemd::mark_daemon();
     raise_fd_limit();
 
     // Single live `FileWatchService` per daemon.
@@ -849,6 +851,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         },
     );
 
+    super::systemd_reconcile::spawn(state.clone());
+
     // File-watch wire-up.
     init_disk_watch_subscriptions(state.clone()).await;
     {
@@ -979,6 +983,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     };
 
     notify_ready(&addr);
+    super::systemd_reconcile::push_status(&state).await;
 
     axum::serve(
         listener,

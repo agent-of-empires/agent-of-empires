@@ -31,6 +31,9 @@ const __dirname = dirname(__filename);
 
 const DEFAULT_PASSPHRASE = "aoe-e2e-fixed-passphrase";
 
+/** Seeded into every config.toml a spec writes, so no spec creates real systemd scopes. */
+export const SYSTEMD_OFF = "[systemd]\nenabled = false\n";
+
 export type AuthMode = "none" | "passphrase" | "token";
 
 export interface SpawnOptions {
@@ -551,7 +554,8 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   const appDir = appDirFor(home, xdg, aoeBinary);
   mkdirSync(appDir, { recursive: true, mode: 0o700 });
   // General live tests exercise launches, not the one-time TUI approval flow.
-  writeFileSync(join(appDir, "config.toml"), "[app_state]\nhas_acknowledged_agent_hooks = true\n");
+  // Scopes stay off so specs never reach the host's systemd user manager.
+  writeFileSync(join(appDir, "config.toml"), `[app_state]\nhas_acknowledged_agent_hooks = true\n\n${SYSTEMD_OFF}`);
   const fakeAcpDebugLog = join(home, "fake-acp.log");
   if (opts.acp) {
     let script = opts.fakeAcpScript;

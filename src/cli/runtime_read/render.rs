@@ -289,6 +289,13 @@ fn session_json(session: &SessionRead, profile: &str) -> Result<SessionJson, Rea
             base_branch: worktree.base_branch.clone(),
         }),
         parent_session_id: session.parent_session_id.clone(),
+        systemd_unit: (list::systemd_scopes_active()
+            && session.state.as_str() == "live"
+            && !matches!(
+                session.status.as_str(),
+                "Stopped" | "Deleting" | "Creating" | "Error"
+            ))
+        .then(|| crate::process::systemd::unit_glob(&session.id)),
     })
 }
 

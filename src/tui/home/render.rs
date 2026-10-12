@@ -800,7 +800,7 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
 /// Where the right-aligned activity column lives on a session row.
 ///
 /// `prefix_width` is the display width of the spans already pushed, `list_width` the inner
-/// width of the list pane, `slot_width` 0 when the age is hidden, `badge_width` 0 when no
+/// width of the list pane, `slot_width` 0 when the age is empty, `badge_width` 0 when no
 /// terminal-mode badge follows. `Some(pad)` is the padding to push between prefix and
 /// column when it fits with the slot, the badge and `LAST_ACTIVITY_RIGHT_MARGIN`; `None`
 /// means the row is too wide and the title wins.
@@ -1945,11 +1945,10 @@ impl HomeView {
         } else {
             String::new()
         };
-        // A blank age keeps its slot only to line the badge up with the rows around it.
-        let slot_width = if self.show_activity_age && (!age.is_empty() || badge_text.is_some()) {
-            LAST_ACTIVITY_SLOT
-        } else {
+        let slot_width = if age.is_empty() {
             0
+        } else {
+            LAST_ACTIVITY_SLOT
         };
 
         let (title_width, keep_tag) = title_width_for_column(

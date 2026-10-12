@@ -107,6 +107,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             eprintln!("Warning: failed to kill agent tmux session: {error}");
         }
         inst.kill_ancillary_tmux_sessions_locked();
+        inst.release_scope();
 
         let mut inst = inst;
         inst.trash();
