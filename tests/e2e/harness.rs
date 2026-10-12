@@ -276,6 +276,8 @@ pub struct TuiTestHarness {
     cast_path: Option<PathBuf>,
     /// Exported on every spawned process (tmux session and `run_cli`).
     extra_env: Vec<(String, String)>,
+    /// Removed from commands built by `isolated()` after `extra_env` is applied.
+    extra_env_remove: Vec<String>,
     /// Prepended to PATH ahead of the `claude` stub.
     extra_path_dirs: Vec<PathBuf>,
     stop_daemon_on_drop: bool,
@@ -361,6 +363,7 @@ last_seen_version = "{}"
             cast_path: None,
             // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
             extra_env: vec![("AOE_TMUX_SOCKET".to_string(), tmux_socket_env)],
+            extra_env_remove: Vec::new(),
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
             acp_fork_fail: false,
@@ -396,6 +399,9 @@ last_seen_version = "{}"
             cmd.env_remove(key);
         }
         cmd.envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        for key in &self.extra_env_remove {
+            cmd.env_remove(key);
+        }
         cmd
     }
 
@@ -436,7 +442,15 @@ last_seen_version = "{}"
     }
 
     pub fn set_env(&mut self, key: &str, value: &str) {
+        self.extra_env_remove.retain(|removed| removed != key);
         self.extra_env.push((key.to_string(), value.to_string()));
+    }
+
+    pub fn remove_env(&mut self, key: &str) {
+        self.extra_env.retain(|(existing, _)| existing != key);
+        if !self.extra_env_remove.iter().any(|removed| removed == key) {
+            self.extra_env_remove.push(key.to_string());
+        }
     }
 
     pub fn add_path_dir(&mut self, dir: &Path) {

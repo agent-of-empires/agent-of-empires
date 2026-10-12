@@ -25,6 +25,11 @@ impl HomeView {
                 if let Some(inst) = self.get_instance(id).cloned() {
                     self.handle_status_transition(&inst, old, status, false, true);
                 }
+                if (old == crate::session::Status::Stopped)
+                    != (status == crate::session::Status::Stopped)
+                {
+                    self.rows_after_stopped_change(id);
+                }
             }
         }
     }

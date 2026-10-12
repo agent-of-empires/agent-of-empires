@@ -128,7 +128,7 @@ fn filtered_profile_switch_rewires_disk_watch_to_new_profile() {
 
     let svc: Arc<FileWatchService> = FileWatchService::noop();
     let storage = Storage::new("beta", svc).expect("storage for beta profile");
-    let title = "filewatch-filtered-switch-row";
+    let title = "fw-switch-row";
     storage
         .update(|i, _g| {
             let mut inst = Instance::new(title, "/tmp/filewatch-filtered-switch");

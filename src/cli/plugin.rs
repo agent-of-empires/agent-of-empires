@@ -40,6 +40,9 @@ pub enum PluginCommands {
     Update {
         /// Plugin id
         id: String,
+        /// Re-approve a changed capability set without prompting
+        #[arg(long)]
+        yes: bool,
     },
     /// Uninstall an external plugin, removing its files and capability grant
     Uninstall {
@@ -68,7 +71,7 @@ pub async fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Enable { id } => run_set_enabled(&id, true).await,
         PluginCommands::Disable { id } => run_set_enabled(&id, false).await,
         PluginCommands::Install { source, yes } => run_install(&source, yes).await,
-        PluginCommands::Update { id } => run_update(&id).await,
+        PluginCommands::Update { id, yes } => run_update(&id, yes).await,
         PluginCommands::Uninstall { id } => run_uninstall(&id),
         PluginCommands::Hash { path } => run_hash(&path),
         PluginCommands::Discover { query } => run_discover(query.as_deref()).await,
@@ -205,9 +208,9 @@ async fn run_install(source: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_update(id: &str) -> Result<()> {
+async fn run_update(id: &str, yes: bool) -> Result<()> {
     use crate::plugin::install::LiveRestart;
-    let report = crate::plugin::install::update(id).await?;
+    let report = crate::plugin::install::update(id, yes).await?;
     print_report(&report, "Updated");
     match crate::plugin::install::restart_worker_live(id).await {
         LiveRestart::Daemon => println!("  the running daemon reloaded the plugin."),

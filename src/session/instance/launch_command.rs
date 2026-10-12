@@ -43,6 +43,45 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
     }
 }
 
+/// Append the agent's session-name flag with the title typed in the New Session dialog, on the
+/// first launch only and when `session.name_agent_session` is on.
+fn apply_first_launch_agent_name(
+    cmd: &mut String,
+    agent: Option<&crate::agents::AgentDef>,
+    inst: &Instance,
+    execution: Option<&super::execution::NativeExecution>,
+    resumes: bool,
+) {
+    // A resumed conversation may carry a name the user gave it inside the agent.
+    let Some(agent) = agent.filter(|_| inst.first_launch_names_agent && !resumes) else {
+        return;
+    };
+    let title = inst.title.trim();
+    // A leading hyphen reads as another flag to the agent's parser, which rejects the launch.
+    if title.is_empty() || title.starts_with('-') {
+        return;
+    }
+    if !crate::session::config::profile_config::resolve_config_or_warn(&inst.effective_profile())
+        .session
+        .name_agent_session
+    {
+        return;
+    }
+    // The probe vouches only for the binary AoE's PATH finds. An attested execution also admits
+    // only allowlisted arguments, so a wrapper, a `--` or the user's own `-n`/`--name` never
+    // reaches this point.
+    let Some(execution) = execution.filter(|execution| {
+        execution
+            .inputs
+            .runs_host_path_binary(agent.binary, &execution.program)
+    }) else {
+        return;
+    };
+    if let Some(flag) = agent.supported_session_name_flag(&execution.program) {
+        cmd.push_str(&format!(" {} {}", flag, shell_escape(title)));
+    }
+}
+
 /// Write the Pi session-id extension into the app dir and return its path.
 pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
     const SOURCE: &str = crate::session::instance::SESSION_IDENTITY_EXTENSION;
@@ -123,6 +162,7 @@ pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> S
         ForkStrategy::ClaudeFork => {
             format!("--resume {parent_id} --fork-session --session-id {child_id}")
         }
+        ForkStrategy::PiFork => format!("--fork {parent_id} --session-id {child_id}"),
         ForkStrategy::CodexFork => {
             // Codex mints its own forked id; child_id is unused. The subcommand
             // is inserted after the binary by apply_session_flags.
@@ -868,6 +908,7 @@ impl Instance {
                     }
                     let is_existing =
                         self.apply_session_flags(&mut cmd, "host agent", agent, execution)?;
+                    apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!("{}{}", env_prefix, cmd);
                     let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -904,6 +945,7 @@ impl Instance {
             }
             let is_existing =
                 self.apply_session_flags(&mut cmd, "host custom", agent, execution)?;
+            apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!("{}{}", env_prefix, cmd);
             let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -935,6 +977,48 @@ mod tests {
     fn host_command(inst: &mut Instance) -> String {
         let agent = crate::agents::get_agent(&inst.tool);
         inst.build_host_command(agent, None).unwrap().0.unwrap()
+    }
+
+    fn attested_host_command(inst: &mut Instance) -> String {
+        let agent = crate::agents::get_agent(&inst.tool);
+        let execution = inst.resolve_native_execution(None).ok();
+        inst.build_host_command(agent, execution.as_ref())
+            .unwrap()
+            .0
+            .unwrap()
+    }
+
+    const CLAUDE_HELP_WITH_NAME: &str = "  -n, --name <name>  Set a display name";
+
+    /// A `claude` on PATH whose `--help` prints `help` and leaves a mark in `probed`.
+    fn install_claude_help_stub(
+        root: &std::path::Path,
+        help: &str,
+        probed: &std::path::Path,
+    ) -> crate::session::test_support::EnvGuard {
+        crate::agents::forget_agent_help_for_test();
+        crate::session::test_support::install_login_shell_path_command(
+            root,
+            "claude",
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in --help) : > {}; printf '%s\\n' {};; esac\nexit 0\n",
+                shell_escape(probed.to_str().unwrap()),
+                shell_escape(help),
+            ),
+        )
+    }
+
+    fn set_name_agent_session(inst: &Instance, on: bool) {
+        let mut config = crate::session::config::profile_config::ProfileConfig::default();
+        config.overrides.insert(
+            "session".to_string(),
+            serde_json::json!({ "name_agent_session": on }),
+        );
+        crate::session::config::profile_config::save_profile_config(
+            &inst.effective_profile(),
+            &config,
+        )
+        .unwrap();
     }
 
     // The sidecar env var has to survive into the docker argv; no CI container would catch it.
@@ -1171,6 +1255,14 @@ mod tests {
             ("cursor", "parent", "child", ""),
             ("claude", "$(rm -rf /)", "child", ""),
             ("claude", "parent", "; echo pwned", ""),
+            (
+                "pi",
+                "parent-id",
+                "child-id",
+                "--fork parent-id --session-id child-id",
+            ),
+            ("pi", "$(rm -rf /)", "child", ""),
+            ("pi", "parent", "; echo pwned", ""),
         ] {
             assert_eq!(build_fork_flags(tool, parent, child), expected, "{tool}");
         }
@@ -1200,6 +1292,21 @@ mod tests {
                 .unwrap();
             assert_eq!(cmd, expected);
         }
+    }
+
+    #[test]
+    fn pi_fork_refuses_an_unpinnable_launch() {
+        let mut inst = tool_instance("pi", "/tmp/x");
+        inst.agent_session_id = Some("child-5678".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1234".to_string(),
+        };
+        let mut cmd = "pi".to_string();
+        let error = inst
+            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .expect_err("an unpinnable Pi fork must be refused");
+        assert!(error.to_string().contains("Pi fork needs"), "{error}");
+        assert_eq!(cmd, "pi", "nothing may be appended to a refused launch");
     }
 
     #[test]
@@ -1646,6 +1753,7 @@ mod tests {
         inst.command = "claude".into();
         inst.source_profile = profile.into();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "fixture".into(),
@@ -2177,5 +2285,176 @@ mod tests {
             )),
             "with no declaration and no environment the default store is the source"
         );
+    }
+
+    /// A typed title rides the first launch as the agent's own session name, quoted, and only
+    /// once the setting is on: with it off the agent is not even probed for the flag.
+    #[test]
+    #[serial_test::serial]
+    fn a_typed_title_names_the_agent_only_when_the_setting_is_on() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let probed = temp_home.path().join("probed");
+        let _claude = install_claude_help_stub(temp_home.path(), CLAUDE_HELP_WITH_NAME, &probed);
+
+        let mut claude = tool_instance("claude", project.to_str().unwrap());
+        claude.title = "O'Brien's plan".to_string();
+        claude.first_launch_names_agent = true;
+        let command = attested_host_command(&mut claude);
+        assert!(!command.contains("--name"), "off by default: {command}");
+        assert!(
+            !probed.exists(),
+            "the agent was probed with the setting off"
+        );
+
+        set_name_agent_session(&claude, true);
+        let command = attested_host_command(&mut claude);
+        let expected = format!("--name {}", shell_escape("O'Brien's plan"));
+        assert!(
+            command.contains(&expected),
+            "want: {expected}\ngot:  {command}"
+        );
+        assert!(probed.exists(), "the setting on probes the agent");
+    }
+
+    /// Each case starts from a launch that is named, then changes one thing that must keep the
+    /// title off the launch line.
+    #[test]
+    #[serial_test::serial]
+    fn the_agent_name_is_withheld_where_it_would_not_land_as_a_name() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let probed = temp_home.path().join("probed");
+        let _claude = install_claude_help_stub(temp_home.path(), CLAUDE_HELP_WITH_NAME, &probed);
+
+        type Case = (&'static str, fn(&mut Instance));
+        let cases: &[Case] = &[
+            ("a generated title", |inst| {
+                inst.first_launch_names_agent = false
+            }),
+            ("a resumed conversation", |inst| {
+                let sid = inst
+                    .agent_session_id
+                    .clone()
+                    .expect("the baseline pinned an id");
+                seed_claude_transcript(inst, &sid)
+            }),
+            ("a command override", |inst| {
+                inst.command = "ssh -t host claude".into()
+            }),
+            ("an argument terminator", |inst| {
+                inst.extra_args = "--".into()
+            }),
+            ("-n in the arguments", |inst| {
+                inst.extra_args = "-n mine".into()
+            }),
+            ("--name in the arguments", |inst| {
+                inst.extra_args = "--name mine".into()
+            }),
+            ("--name= in the arguments", |inst| {
+                inst.extra_args = "--name=mine".into()
+            }),
+            ("a flag-shaped title", |inst| {
+                inst.title = "--dry-run notes".into()
+            }),
+        ];
+        for (case, change) in cases {
+            let mut claude = tool_instance("claude", project.to_str().unwrap());
+            claude.title = "night shift".to_string();
+            claude.first_launch_names_agent = true;
+            set_name_agent_session(&claude, true);
+            assert!(
+                attested_host_command(&mut claude).contains("--name"),
+                "{case}: the baseline is named"
+            );
+            change(&mut claude);
+            let command = attested_host_command(&mut claude);
+            if *case == "a resumed conversation" {
+                assert!(command.contains("--resume"), "{case}: {command}");
+            }
+            assert_eq!(
+                command.matches("--name").count(),
+                claude.extra_args.matches("--name").count(),
+                "{case}: only the user's own --name may remain: {command}"
+            );
+        }
+
+        let mut claude = tool_instance("claude", project.to_str().unwrap());
+        claude.title = "night shift".to_string();
+        claude.first_launch_names_agent = true;
+        let command = host_command(&mut claude);
+        assert!(
+            !command.contains("--name"),
+            "without an attested execution the pane may run another install: {command}"
+        );
+
+        let _older =
+            install_claude_help_stub(temp_home.path(), "  -r, --resume [value]  Resume", &probed);
+        let command = attested_host_command(&mut claude);
+        assert!(
+            !command.contains("--name"),
+            "an install whose --help lacks the flag would reject it: {command}"
+        );
+    }
+
+    /// A sandboxed launch execs the container's agent, which the host probe does not speak for.
+    #[test]
+    #[serial_test::serial]
+    fn a_sandboxed_launch_carries_no_agent_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = "sandbox-agent-name";
+        super::super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("claude", "claude")],
+            temp.path(),
+        );
+        let mut inst = Instance::new("claude-sandbox", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = profile.into();
+        inst.title = "night shift".into();
+        inst.first_launch_names_agent = true;
+        set_name_agent_session(&inst, true);
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "claude-sandbox".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/project".into()),
+            before_start_env: Vec::new(),
+        });
+        let config = inst.build_container_config().unwrap();
+        let _transport = super::super::test_helpers::install_container_transport(
+            temp.path(),
+            "claude-sandbox",
+            &config.volumes,
+        );
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/claude"),
+        )
+        .unwrap();
+
+        let command = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap()
+            .command
+            .expect("a sandboxed launch command");
+        assert!(
+            command.contains("--session-id"),
+            "the session flags were applied, so the launch line was really built: {command}"
+        );
+        assert!(!command.contains("--name"), "{command}");
     }
 }

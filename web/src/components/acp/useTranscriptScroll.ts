@@ -6,6 +6,7 @@ import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/a
 import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
 import { promptRepinDecision } from "../../lib/promptRepin";
 import { repinOnResize } from "../../lib/repinOnResize";
+import { resampleToolAnchors, sampleToolAnchors, toolAnchorDelta, type ToolAnchor } from "../../lib/toolAnchor";
 
 /** Stick-to-bottom, earlier-history auto-load, and PWA-reopen scroll restore
  *  for the transcript viewport. These observers own bottom-following; the
@@ -40,6 +41,10 @@ export function useTranscriptScroll({
   // Last time we sampled at the bottom. iOS fires an interim scroll during a
   // keyboard resize that clears `wasAtBottomRef` but cannot clear this.
   const lastAtBottomAtRef = useRef(0);
+  const toolAnchorsRef = useRef<readonly ToolAnchor[]>([]);
+  // The pin intent when the anchors were last fresh. A fold shrinks the layout under the
+  // reader and the browser clamps the scroll, which would otherwise read as a re-pin.
+  const anchorIntentRef = useRef(true);
   const didRestoreScrollRef = useRef(false);
   const [atBottom, setAtBottom] = useState(true);
   const { keyboardOpen } = useMobileKeyboard();
@@ -160,7 +165,12 @@ export function useTranscriptScroll({
       autoLoadArmedRef.current = decision.armed;
       if (decision.fire) requestEarlierHistory();
     };
-    const onScroll = () => sample();
+    const onScroll = () => {
+      sample();
+      const previous = toolAnchorsRef.current;
+      toolAnchorsRef.current = resampleToolAnchors(vp, previous);
+      if (toolAnchorsRef.current !== previous) anchorIntentRef.current = wasAtBottomRef.current;
+    };
     sample(true);
     vp.addEventListener("scroll", onScroll, { passive: true });
     vp.addEventListener("wheel", markGesture, { passive: true });
@@ -210,16 +220,32 @@ export function useTranscriptScroll({
     // Growth with a pending anchor came from older rows at the top: keep the
     // read position. Otherwise it grew at the bottom: follow if pinned.
     const contentRo = new ResizeObserver(() => {
+      // Every exit resamples: anchors left holding folded-away cards would
+      // otherwise outlive the fold and misplace a later correction.
+      const resample = () => {
+        toolAnchorsRef.current = sampleToolAnchors(vp);
+        anchorIntentRef.current = wasAtBottomRef.current;
+      };
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
         const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
         if (delta > 0) vp.scrollTop += delta;
         pendingScrollAnchorRef.current = null;
+        resample();
         return;
       }
-      if (wasAtBottomRef.current) {
+      // Mid-fold the pin flag may come from the clamp, so go by the intent from before it.
+      const folding = toolAnchorsRef.current.some(({ el }) => !el.isConnected);
+      if (folding ? anchorIntentRef.current : wasAtBottomRef.current) {
         vp.scrollTop = vp.scrollHeight;
+        resample();
+        return;
       }
+      // A card remounted elsewhere in the tree (a run folding into a group)
+      // loses the browser's own anchoring; hold the reader's place by id.
+      vp.scrollTop += toolAnchorDelta(vp, toolAnchorsRef.current);
+      sample();
+      resample();
     });
     if (content) contentRo.observe(content);
     return () => {

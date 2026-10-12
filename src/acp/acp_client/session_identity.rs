@@ -13,6 +13,7 @@ use super::errors::acp_internal_error;
 use crate::acp::control_protocol::{
     PromptCompletedMarker, SessionReplayed, MAX_CONTROL_QUEUE_BYTES, MAX_CONTROL_QUEUE_FRAMES,
 };
+use crate::acp::state::{AuthStatus, AUTH_STATUS_UPDATE_METHOD};
 
 // The replayed backlog a reattach flushes is exactly the runner's detached
 // control queue, so this buffer is sized against the same contract: a
@@ -41,6 +42,17 @@ pub(super) enum SessionIngressNotification {
     Replayed(SessionReplayed),
     /// Daemon-minted barrier releasing a local prompt's outcome.
     PromptCompleted(PromptCompletedMarker),
+    /// `_auth/status_update`: the agent's own identity. Connection-scoped, so
+    /// it carries no session id and never passes the ingress fence (#4241).
+    AuthStatus(AuthStatus),
+}
+
+/// Params of `_auth/status_update`. Unknown fields, including the upstream
+/// `vendor` bag, are dropped here rather than persisted.
+#[derive(serde::Deserialize)]
+struct AuthStatusParams {
+    #[serde(rename = "authStatus")]
+    auth_status: AuthStatus,
 }
 
 impl JsonRpcMessage for SessionIngressNotification {
@@ -48,6 +60,7 @@ impl JsonRpcMessage for SessionIngressNotification {
         SessionNotification::matches_method(method)
             || SessionReplayed::matches_method(method)
             || PromptCompletedMarker::matches_method(method)
+            || method == AUTH_STATUS_UPDATE_METHOD
     }
 
     fn method(&self) -> &str {
@@ -55,6 +68,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Update(_) => "session/update",
             Self::Replayed(marker) => marker.method(),
             Self::PromptCompleted(marker) => marker.method(),
+            Self::AuthStatus(_) => AUTH_STATUS_UPDATE_METHOD,
         }
     }
 
@@ -63,6 +77,9 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Update(params) => UntypedMessage::new(self.method(), params),
             Self::Replayed(marker) => marker.to_untyped_message(),
             Self::PromptCompleted(marker) => marker.to_untyped_message(),
+            Self::AuthStatus(status) => {
+                UntypedMessage::new(self.method(), serde_json::json!({ "authStatus": status }))
+            }
         }
     }
 
@@ -79,6 +96,10 @@ impl JsonRpcMessage for SessionIngressNotification {
             return Ok(Self::PromptCompleted(PromptCompletedMarker::parse_message(
                 method, params,
             )?));
+        }
+        if method == AUTH_STATUS_UPDATE_METHOD {
+            let parsed: AuthStatusParams = serde_json::from_value(serde_json::to_value(params)?)?;
+            return Ok(Self::AuthStatus(parsed.auth_status));
         }
         if !SessionNotification::matches_method(method) {
             return Err(agent_client_protocol::Error::method_not_found());
@@ -399,9 +420,64 @@ where
 mod tests {
     use super::*;
     use crate::acp::acp_client::test_helpers::text_chunk;
+    use crate::acp::state::AuthStatusKind;
 
     fn notif(id: &str) -> SessionNotification {
         SessionNotification::new(id.to_string(), text_chunk("x", None))
+    }
+
+    #[test]
+    fn auth_status_update_parses_without_a_session_id() {
+        // Table: the wire payloads the extension can send, including a kind
+        // added after this code was written and the vendor bag it drops.
+        let cases = [
+            (
+                "subscription",
+                serde_json::json!({"authStatus": {
+                    "kind": "account",
+                    "label": "Claude Max",
+                    "account": {"email": "a@b.co", "organization": "Acme", "plan": "max"},
+                }}),
+                AuthStatusKind::Account,
+                "Claude Max",
+            ),
+            (
+                "api key, vendor bag dropped",
+                serde_json::json!({"authStatus": {
+                    "kind": "api_key",
+                    "label": "Anthropic API key",
+                    "detail": "apiKeyHelper",
+                    "vendor": {"claudeCode": {"anything": [1, 2, 3]}},
+                }}),
+                AuthStatusKind::ApiKey,
+                "Anthropic API key",
+            ),
+            (
+                "logged out",
+                serde_json::json!({"authStatus": {"kind": "none", "label": "Not logged in"}}),
+                AuthStatusKind::None,
+                "Not logged in",
+            ),
+            (
+                "kind added upstream later",
+                serde_json::json!({"authStatus": {"kind": "quantum", "label": "Future Auth"}}),
+                AuthStatusKind::Unknown,
+                "Future Auth",
+            ),
+        ];
+        for (name, params, kind, label) in cases {
+            let parsed =
+                SessionIngressNotification::parse_message(AUTH_STATUS_UPDATE_METHOD, &params)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let SessionIngressNotification::AuthStatus(status) = parsed else {
+                panic!("{name}: expected AuthStatus");
+            };
+            assert_eq!(status.kind, kind, "{name}");
+            assert_eq!(status.label, label, "{name}");
+        }
+        assert!(SessionIngressNotification::matches_method(
+            AUTH_STATUS_UPDATE_METHOD
+        ));
     }
 
     #[tokio::test]

@@ -86,7 +86,8 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push fix commit (same-repo PRs only)
+      - name: Prepare fix commit (same-repo PRs only)
+        id: fix
         if: steps.hash.outputs.changed == 'true' && steps.pr.outputs.is_fork == 'false'
         env:
           # RELEASE_TOKEN is a PAT; PAT pushes (unlike GITHUB_TOKEN)
@@ -128,11 +129,30 @@ jobs:
             -m "Co-authored-by: ${PR_AUTHOR} <${PR_AUTHOR_ID}+${PR_AUTHOR}@users.noreply.github.com>" \
             flake.nix
 
-          # --force-with-lease anchored to the SHA we read above so a
-          # racing force-push from the contributor cannot be clobbered.
+          FIX_SHA=$(git -C pr-checkout rev-parse HEAD)
+          echo "sha=$FIX_SHA" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$FIX_SHA" > "$RUNNER_TEMP/nix-npm-hash-fix-sha"
+
+      # Publish provenance before the PAT push can start the auto-merge check.
+      - name: Record trusted hash-fix provenance
+        if: steps.fix.outputs.sha != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nix-npm-hash-fix-${{ github.event.pull_request.number }}-${{ steps.fix.outputs.sha }}
+          path: ${{ runner.temp }}/nix-npm-hash-fix-sha
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Push recorded fix commit
+        if: steps.fix.outputs.sha != ''
+        env:
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
           git -C pr-checkout push \
-            --force-with-lease="${HEAD_REF}:${HEAD_SHA}" \
-            origin "HEAD:${HEAD_REF}"
+            --force-with-lease="refs/heads/${HEAD_REF}:${HEAD_SHA}" \
+            origin "HEAD:refs/heads/${HEAD_REF}"
 
       - name: Comment on fork PRs
         if: steps.pr.outputs.is_fork == 'true'

@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { resolvePluginOptions } from "../../lib/api";
 import type { SettingsObjectField, SettingsOptionSource } from "../../lib/types";
 import { validateCron } from "./cronValidation";
-import { NumberField, SelectField, TextField, ToggleField } from "./FormFields";
+import { ListField, NumberField, SelectField, TextField, ToggleField } from "./FormFields";
 
 type Option = { value: string; label: string };
 type Item = Record<string, unknown>;
@@ -204,6 +204,15 @@ function renderItemField(section: string, field: SettingsObjectField, item: Item
           multiline={widget.multiline}
         />
       );
+    case "list":
+      return (
+        <ListField
+          key={field.field}
+          {...common}
+          items={Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : []}
+          onChange={setField}
+        />
+      );
   }
 }
 
@@ -243,6 +252,7 @@ export function ObjectListField({
     fields.every((f) => {
       if (!f.required) return true;
       const v = it[f.field];
+      if (Array.isArray(v)) return v.length > 0;
       return typeof v === "string" ? v.trim() !== "" : v !== undefined && v !== null;
     });
   const commit = (next: Item[]) => {

@@ -1,7 +1,8 @@
 name: Open Release PR
 
-# Weekly release-staging PR (#1140). Runs every Wednesday at 08:17 UTC,
-# computes the next-patch version from the latest `v*` tag, bumps
+# Weekly release-staging PR (#1140). Runs every Wednesday at 03:23 UTC,
+# computes the next version from the latest `v*` tag (minor if any `feat`
+# commit landed since it, else patch), bumps
 # `Cargo.toml` + `Cargo.lock`, and opens a PR labeled `release-staging`
 # with a plain newest-first commit list in the body. Merging that PR
 # fires `tag-release-pr.yml`, which tags the merge commit and triggers
@@ -16,24 +17,23 @@ name: Open Release PR
 # maintainer review; #1387 tracks unifying it with the git-cliff render.
 #
 # The maintainer's only manual step is (optionally) editing the version
-# bump in the PR (patch -> minor/major) before clicking merge.
+# bump in the PR (for example to a major) before clicking merge.
 
 on:
   schedule:
-    # Every Wednesday at 08:17 UTC. Cron strings are interpreted in UTC
-    # regardless of repo timezone, so this stays stable across DST shifts.
-    # The off-hour minute (:17, not :00) avoids GitHub's top-of-hour
-    # scheduled-run congestion, which was dropping or heavily delaying
-    # the previous 09:00 trigger.
-    - cron: '17 8 * * 3'
+    # Every Wednesday at 03:23 UTC. 08:17 still started 4.5 to 6.5 hours
+    # late under GitHub's daytime scheduler load; the early-UTC hour and an
+    # off-quarter minute stay clear of both peaks.
+    - cron: '23 3 * * 3'
   workflow_dispatch:
     inputs:
       bump:
-        description: 'Semver bump to stage'
+        description: 'Semver bump to stage (auto: minor if any feat commit since the last tag, else patch)'
         required: false
-        default: 'patch'
+        default: 'auto'
         type: choice
         options:
+          - auto
           - patch
           - minor
           - major
@@ -72,9 +72,19 @@ jobs:
       - name: Compute next version
         id: next
         env:
-          BUMP: ${{ github.event.inputs.bump || 'patch' }}
+          BUMP: ${{ github.event.inputs.bump || 'auto' }}
         run: |
           set -euo pipefail
+          if [ "$BUMP" = auto ]; then
+            LAST_TAG="$(git describe --tags --abbrev=0 --match 'v*')"
+            if git log "${LAST_TAG}..HEAD" --no-merges --format=%s \
+                 | grep -E '^feat(\(.*\))?!?:' >/dev/null; then
+              BUMP="minor"
+            else
+              BUMP="patch"
+            fi
+            echo "auto bump since ${LAST_TAG}: ${BUMP}"
+          fi
           CURRENT="${{ steps.current.outputs.version }}"
           BASE="${CURRENT%%-*}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
@@ -84,9 +94,12 @@ jobs:
             patch|*) PATCH=$((PATCH + 1)) ;;
           esac
           NEXT="${MAJOR}.${MINOR}.${PATCH}"
-          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
-          echo "tag=v${NEXT}" >> "$GITHUB_OUTPUT"
-          echo "branch=release-staging/v${NEXT}" >> "$GITHUB_OUTPUT"
+          {
+            echo "bump=$BUMP"
+            echo "version=$NEXT"
+            echo "tag=v${NEXT}"
+            echo "branch=release-staging/v${NEXT}"
+          } >> "$GITHUB_OUTPUT"
           echo "Bumping ${CURRENT} -> ${NEXT} (${BUMP})"
 
       - name: Abort if tag already exists
@@ -196,10 +209,11 @@ jobs:
 
       - name: Build PR body
         id: body
+        env:
+          BUMP: ${{ steps.next.outputs.bump }}
         run: |
           VERSION="${{ steps.next.outputs.version }}"
           CURRENT="${{ steps.current.outputs.version }}"
-          BUMP="${{ github.event.inputs.bump || 'patch' }}"
           {
             echo "<!-- release-version: ${VERSION} -->"
             echo
@@ -312,7 +326,7 @@ jobs:
                   ``,
                   `Failed run: ${runUrl}`,
                   ``,
-                  `Re-run it with \`gh workflow run open-release-pr.yml --ref main -f bump=patch\` once the cause is addressed.`,
+                  `Re-run it with \`gh workflow run open-release-pr.yml --ref main -f bump=auto\` once the cause is addressed.`,
                 ].join('\n'),
               });
             }

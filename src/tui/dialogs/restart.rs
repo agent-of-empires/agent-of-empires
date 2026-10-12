@@ -483,10 +483,9 @@ impl RestartDialog {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// AI-engine picker, rendered via the shared `tool_cycler_spans` so the
-    /// label reads "Tool:" and the cycler matches the New dialog exactly. The
-    /// Restart dialog appends the same "(configured)" summary and Ctrl+P hint
-    /// the New dialog does, so the tool-config overlay is discoverable inline.
+    /// AI-engine picker via the shared `tool_cycler_spans`. Restart has no
+    /// digit hotkeys, so it keeps the `[n/m]` badge; the "(configured)" summary
+    /// and Ctrl+P hint make the tool-config overlay discoverable inline.
     fn render_tool_selector(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let value = self
             .available_tools
@@ -498,6 +497,7 @@ impl RestartDialog {
             value,
             self.tool_index,
             self.available_tools.len(),
+            false,
             self.is_tool_field(),
             theme,
         );

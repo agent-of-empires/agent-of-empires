@@ -74,6 +74,7 @@ fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData 
     crate::tui::dialogs::NewSessionData {
         profile: "test".to_string(),
         title: "sync-path-test".to_string(),
+        title_typed: false,
         path: project.to_string(),
         group: String::new(),
         tool: "claude".to_string(),

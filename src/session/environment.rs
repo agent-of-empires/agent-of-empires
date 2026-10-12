@@ -24,6 +24,40 @@ pub(crate) fn host_vertex_enabled() -> bool {
         .is_some_and(|v| !v.is_empty())
 }
 
+/// The LLM backends a session can be pinned to. `None` on a session means the
+/// host environment decides, which is the behavior before a pick is made.
+pub(crate) const AGENT_PROVIDERS: &[&str] = &["api", "bedrock", "vertex"];
+
+/// The Claude routing flags that pin a session to `provider`, or `None` when
+/// the name is not one of [`AGENT_PROVIDERS`].
+///
+/// Both flags are written for every pick, because the override has to beat an
+/// inherited host value rather than merely be absent. Off is the empty string,
+/// never `"0"`: the adapter reads these with a JavaScript truthiness test, for
+/// which `"0"` is on. Credentials are not touched; they stay wherever the host
+/// put them.
+pub(crate) fn provider_override_env(provider: &str) -> Option<Vec<(String, String)>> {
+    let (bedrock, vertex) = match provider {
+        "api" => ("", ""),
+        "bedrock" => ("1", ""),
+        "vertex" => ("", "1"),
+        _ => return None,
+    };
+    Some(vec![
+        ("CLAUDE_CODE_USE_BEDROCK".to_string(), bedrock.to_string()),
+        ("CLAUDE_CODE_USE_VERTEX".to_string(), vertex.to_string()),
+    ])
+}
+
+/// Whether Vertex is in effect: a session's pick wins, and without one the
+/// host flag decides.
+pub(crate) fn vertex_enabled(provider: Option<&str>) -> bool {
+    match provider {
+        Some(pick) if AGENT_PROVIDERS.contains(&pick) => pick == "vertex",
+        _ => host_vertex_enabled(),
+    }
+}
+
 /// Returns the user's preferred shell from `$SHELL`, falling back to `bash`.
 pub(crate) fn user_shell() -> String {
     std::env::var("SHELL")
@@ -425,9 +459,19 @@ pub(crate) fn collect_environment(
         .as_deref()
         .unwrap_or(&sandbox_config.environment);
 
-    // Terminal defaults, plus Vertex provider vars when Vertex is enabled on the host. A key is
-    // claimed even when unset on the host, so later entries cannot supply it.
-    let vertex: &[&str] = if host_vertex_enabled() {
+    // A session's provider pick is claimed before everything else: this list wins a shared key
+    // against both the request auth payload and the per-adapter allowlist, so the routing flags
+    // have to be set here to beat whatever the host exported.
+    let provider = sandbox_info.provider.as_deref();
+    for (key, value) in provider.and_then(provider_override_env).unwrap_or_default() {
+        if seen_keys.insert(key.clone()) {
+            result.push(EnvEntry::Literal { key, value });
+        }
+    }
+
+    // Terminal defaults, plus Vertex provider vars when Vertex is in effect. A key is claimed
+    // even when unset on the host, so later entries cannot supply it.
+    let vertex: &[&str] = if vertex_enabled(provider) {
         AUTO_FORWARD_VERTEX_ENV_VARS
     } else {
         &[]
@@ -628,6 +672,14 @@ mod tests {
             custom_instruction: None,
             before_start_env: Vec::new(),
             container_workdir: None,
+            provider: None,
+        }
+    }
+
+    fn sandbox_for(provider: &str) -> SandboxInfo {
+        SandboxInfo {
+            provider: Some(provider.to_string()),
+            ..sandbox(None)
         }
     }
 
@@ -979,6 +1031,131 @@ mod tests {
         assert_eq!(
             session_host_env_pairs("any-profile", tmp.path(), &info),
             owned(&[("TEST_VAR", "foo"), ("OTHER", "bar")])
+        );
+    }
+
+    /// Every pick writes both flags, so the override beats whatever the host
+    /// exported rather than merely failing to set it. Off is empty, never "0":
+    /// the adapter reads these with a JavaScript truthiness test.
+    #[test]
+    fn provider_override_env_sets_both_flags() {
+        let cases = [("api", "", ""), ("bedrock", "1", ""), ("vertex", "", "1")];
+        for (provider, bedrock, vertex) in cases {
+            assert_eq!(
+                provider_override_env(provider),
+                Some(owned(&[
+                    ("CLAUDE_CODE_USE_BEDROCK", bedrock),
+                    ("CLAUDE_CODE_USE_VERTEX", vertex),
+                ])),
+                "{provider}"
+            );
+        }
+        assert_eq!(provider_override_env("gateway"), None);
+        assert_eq!(provider_override_env(""), None);
+    }
+
+    /// A pick decides Vertex routing on its own; only an unpinned session
+    /// falls back to the host flag, which is the behavior before any pick.
+    #[test]
+    #[serial]
+    fn vertex_enabled_prefers_the_session_pick() {
+        for (host, cases) in [
+            (
+                "1",
+                [(None, true), (Some("api"), false), (Some("vertex"), true)],
+            ),
+            (
+                "",
+                [(None, false), (Some("api"), false), (Some("vertex"), true)],
+            ),
+        ] {
+            let _env = EnvGuard::set(&[("CLAUDE_CODE_USE_VERTEX", host)]);
+            for (pick, expected) in cases {
+                assert_eq!(
+                    vertex_enabled(pick),
+                    expected,
+                    "host={host:?} pick={pick:?}"
+                );
+            }
+            // An unrecognized stored value must not silently mean "not vertex".
+            assert_eq!(vertex_enabled(Some("gateway")), !host.is_empty());
+        }
+    }
+
+    /// The sandbox path claims the first entry for a key, so the pick has to
+    /// land here to outrank the request auth payload and the adapter
+    /// allowlist. A Vertex pick also pulls in the credential vars the host
+    /// flag would otherwise gate.
+    #[test]
+    #[serial]
+    fn collect_environment_applies_the_provider_pick() {
+        let _env = EnvGuard::set(&[
+            ("CLAUDE_CODE_USE_VERTEX", "1"),
+            ("ANTHROPIC_VERTEX_PROJECT_ID", "proj"),
+            ("CLOUD_ML_REGION", "europe-west1"),
+        ]);
+        let config = config(&[]);
+
+        let api = collect_environment(&config, &sandbox_for("api"));
+        assert_eq!(
+            lookup(&api, "CLAUDE_CODE_USE_VERTEX"),
+            vec![(String::new(), false)]
+        );
+        assert_eq!(
+            lookup(&api, "CLAUDE_CODE_USE_BEDROCK"),
+            vec![(String::new(), false)]
+        );
+        assert!(
+            lookup(&api, "ANTHROPIC_VERTEX_PROJECT_ID").is_empty(),
+            "an api pick must not carry the host's vertex credentials"
+        );
+
+        let bedrock = collect_environment(&config, &sandbox_for("bedrock"));
+        assert_eq!(
+            lookup(&bedrock, "CLAUDE_CODE_USE_BEDROCK"),
+            vec![("1".to_string(), false)]
+        );
+        assert_eq!(
+            lookup(&bedrock, "CLAUDE_CODE_USE_VERTEX"),
+            vec![(String::new(), false)]
+        );
+
+        let vertex = collect_environment(&config, &sandbox_for("vertex"));
+        assert_eq!(
+            lookup(&vertex, "CLAUDE_CODE_USE_VERTEX"),
+            vec![("1".to_string(), false)]
+        );
+        assert_eq!(
+            lookup(&vertex, "ANTHROPIC_VERTEX_PROJECT_ID"),
+            vec![("proj".to_string(), true)]
+        );
+
+        // Unpinned keeps the host-driven behavior.
+        let unpinned = collect_environment(&config, &sandbox(None));
+        assert_eq!(
+            lookup(&unpinned, "CLAUDE_CODE_USE_VERTEX"),
+            vec![("1".to_string(), true)]
+        );
+        assert!(lookup(&unpinned, "CLAUDE_CODE_USE_BEDROCK").is_empty());
+    }
+
+    /// A Vertex pick reaches a host that never exported the flag, which is the
+    /// whole point of switching: the credential vars travel with it.
+    #[test]
+    #[serial]
+    fn collect_environment_forwards_vertex_vars_without_the_host_flag() {
+        let _env = EnvGuard::set(&[
+            ("CLAUDE_CODE_USE_VERTEX", ""),
+            ("ANTHROPIC_VERTEX_PROJECT_ID", "proj"),
+        ]);
+        let entries = collect_environment(&config(&[]), &sandbox_for("vertex"));
+        assert_eq!(
+            lookup(&entries, "CLAUDE_CODE_USE_VERTEX"),
+            vec![("1".to_string(), false)]
+        );
+        assert_eq!(
+            lookup(&entries, "ANTHROPIC_VERTEX_PROJECT_ID"),
+            vec![("proj".to_string(), true)]
         );
     }
 

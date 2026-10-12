@@ -1,8 +1,8 @@
-// Wizard project picker (#1219): Recent / Browse / Clone tabs, extra repos, and scratch sessions (#1324).
+// Wizard project picker (#1219): Recent / Browse / Clone / Import tabs, extra repos, and scratch sessions (#1324).
 
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
-import { mockWizardApis, openPanel, openWizard, sessionStub, startWizard, wizard } from "./helpers/wizard";
+import { launch, mockWizardApis, openPanel, openWizard, sessionStub, startWizard, wizard } from "./helpers/wizard";
 
 const option = (page: Page, text: string) => page.getByRole("option").filter({ hasText: text });
 
@@ -153,5 +153,53 @@ test.describe("scratch sessions", () => {
     await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(3);
     for (const title of ["alpha-session", "scratch-one", "scratch-two"])
       await expect(page.getByText(title)).toBeVisible();
+  });
+});
+
+test.describe("import session", () => {
+  const builtin = (name: string, acp_command: string) => ({
+    name,
+    kind: "builtin",
+    binary: name,
+    host_only: false,
+    installed: true,
+    install_hint: "",
+    acp_capable: true,
+    acp_installed: true,
+    acp_command,
+  });
+
+  test("imports a pi session through the generic tab", async ({ page }) => {
+    await page.route("**/api/importable-sessions**", (r) => {
+      const agent = new URL(r.request().url()).searchParams.get("agent");
+      const sessions =
+        agent === "pi"
+          ? [
+              {
+                session_id: "pi-1",
+                cwd: "/home/user/pi-project",
+                title: "Refactor the parser",
+                updated_at: "2026-01-01T00:00:00Z",
+                cwd_exists: true,
+              },
+            ]
+          : [];
+      return r.fulfill({ json: { sessions, truncated: false } });
+    });
+    const created = await startWizard(page, {
+      project: false,
+      agents: [builtin("claude", "claude-agent-acp"), builtin("pi", "pi-acp")],
+    });
+    await openWizard(page);
+    const w = wizard(page);
+    await w.getByRole("button", { name: "Import session", exact: true }).click();
+    const agent = w.getByLabel("Agent to import from");
+    await expect(agent).toHaveValue("claude");
+    await agent.selectOption("pi");
+    await w.getByRole("button").filter({ hasText: "Refactor the parser" }).click();
+    await expectSelected(page, "/home/user/pi-project");
+    await launch(page);
+    await expect.poll(() => created[0]?.import_acp_session_id).toBe("pi-1");
+    expect(created[0]).toMatchObject({ tool: "pi", path: "/home/user/pi-project", sandbox: false });
   });
 });

@@ -60,7 +60,8 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
     FieldHelp {
         name: "Tool",
-        description: "Which AI tool to use (Ctrl+P to configure command and extra args)",
+        description:
+            "Which AI tool to use (1-9 to pick, Ctrl+P to configure command and extra args)",
     },
     FieldHelp {
         name: "Structured",
@@ -119,6 +120,8 @@ pub struct NewSessionData {
     /// exclusive with worktree mode.
     pub scratch: bool,
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// The user typed `title` rather than leaving it empty or as suggested.
+    pub title_typed: bool,
     /// Create in the structured (ACP) view instead of a tmux terminal. Only
     /// true for ACP-capable tools; `validate_structured_choice` enforces it.
     pub structured: bool,
@@ -133,6 +136,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
     fn from(data: NewSessionData) -> Self {
         Self {
             title: data.title,
+            title_typed: data.title_typed,
             path: data.path,
             group: data.group,
             tool: data.tool,
@@ -172,6 +176,14 @@ pub struct NewSessionDialog {
     pub(super) worktree_enabled: bool,
     /// Set by a direct worktree toggle, so a later path pick keeps the user's choice.
     pub(super) worktree_dirty: bool,
+    /// Set by a direct sandbox toggle, so a later path pick keeps the user's choice.
+    pub(super) sandbox_dirty: bool,
+    /// The project registry could not be read for the form's path, so its sandbox and worktree
+    /// defaults are unknown and submission waits for a successful lookup.
+    pub(super) overrides_unresolved: bool,
+    /// The path key the overrides were last read for successfully, which an unreadable registry
+    /// does not invalidate.
+    pub(super) overrides_resolved_for: Option<String>,
     pub(super) worktree_branch: Input,
     pub(super) create_new_branch: bool,
     /// Base branch input in the worktree config overlay; empty means the
@@ -247,6 +259,8 @@ pub struct NewSessionDialog {
     /// provisions the scratch directory. Mutually exclusive with worktree mode.
     pub(super) scratch: bool,
     pub(super) fork_seed: Option<crate::session::ForkSeed>,
+    /// The title the dialog was opened with, which the user did not type.
+    pub(super) suggested_title: String,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
     /// frame and empty while an overlay is up, so a click during one cannot
     /// snap focus to the field that used to sit there.
@@ -348,11 +362,33 @@ fn handle_editable_list_key(
     }
 }
 
-/// The registered project's `worktree.enabled` override for `path`, if any.
-fn project_worktree_override(profile: &str, path: &str) -> Option<bool> {
-    crate::session::projects::find_by_canonical_path(profile, std::path::Path::new(path.trim()))
-        .and_then(|p| p.overrides.worktree_enabled)
+/// The registered project's overrides for a typed `path`; `~` is expanded the way submit does.
+/// An unreadable registry is an error, so a broken file never reads as "no overrides".
+fn project_overrides(
+    profile: &str,
+    path: &str,
+) -> anyhow::Result<Option<crate::session::ProjectOverrides>> {
+    let expanded = path_input::expand_tilde(path.trim());
+    Ok(crate::session::projects::find_by_canonical_path_strict(
+        profile,
+        std::path::Path::new(&expanded),
+    )?
+    .map(|p| p.overrides))
 }
+
+/// Key identifying a typed path the way the registry lookup does.
+fn path_key(path: &str) -> String {
+    crate::session::projects::canonical_key(&path_input::expand_tilde(path.trim()))
+}
+
+/// What the registry says about the form's project.
+enum ProjectOverridesLookup {
+    Known(Option<crate::session::ProjectOverrides>),
+    /// The registry could not be read, so the project's overrides are not known.
+    Unknown,
+}
+
+const OVERRIDES_UNRESOLVED_ERROR: &str = "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Re-enter the path to retry.";
 
 /// Whether `tool` can back a structured-view (ACP) session, judged against
 /// the resolved config.
@@ -445,9 +481,22 @@ impl NewSessionDialog {
             .get(tool_index)
             .and_then(|t| crate::agents::get_agent(t))
             .is_some_and(|a| a.host_only);
-        let sandbox_enabled =
-            docker_available && config.sandbox.enabled_by_default && !is_default_tool_host_only;
-        let worktree_enabled = project_worktree_override(profile, &current_dir)
+        let (initial_overrides, overrides_unresolved, overrides_resolved_for) =
+            match project_overrides(profile, &current_dir) {
+                Ok(overrides) => (overrides, false, Some(path_key(&current_dir))),
+                Err(e) => {
+                    tracing::warn!("Failed to read the project registry: {e}");
+                    (None, true, None)
+                }
+            };
+        let sandbox_enabled = docker_available
+            && initial_overrides
+                .as_ref()
+                .and_then(|o| o.sandbox_enabled)
+                .unwrap_or(config.sandbox.enabled_by_default)
+            && !is_default_tool_host_only;
+        let worktree_enabled = initial_overrides
+            .and_then(|o| o.worktree_enabled)
             .unwrap_or(config.worktree.enabled)
             && !is_default_tool_host_only;
         let yolo_mode = config.session.yolo_mode_default;
@@ -510,6 +559,9 @@ impl NewSessionDialog {
             dir_picker: DirPicker::new(),
             worktree_enabled,
             worktree_dirty: false,
+            sandbox_dirty: false,
+            overrides_unresolved,
+            overrides_resolved_for,
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
@@ -556,6 +608,7 @@ impl NewSessionDialog {
             confirm_create_dir: None,
             scratch: false,
             fork_seed: None,
+            suggested_title: String::new(),
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -579,7 +632,8 @@ impl NewSessionDialog {
     }
 
     pub fn set_title(&mut self, title: String) {
-        self.title = Input::new(title);
+        self.title = Input::new(title.clone());
+        self.suggested_title = title;
     }
 
     pub fn set_fork_from(&mut self, seed: crate::session::ForkSeed) {
@@ -599,12 +653,19 @@ impl NewSessionDialog {
         )
     }
 
-    /// Preselect a tool by name, applying the same per-tool side effects as
-    /// cycling the tool field. No-op when the tool is not available.
+    /// Preselect a tool by name. No-op when the tool is not available.
     pub fn set_tool(&mut self, tool: &str) {
-        let Some(index) = self.available_tools.iter().position(|t| t == tool) else {
+        if let Some(index) = self.available_tools.iter().position(|t| t == tool) {
+            self.select_tool_index(index);
+        }
+    }
+
+    /// Switch tools and reset the per-tool YOLO, sandbox and Ctrl+P fields.
+    /// Reselecting the current tool keeps the user's edits.
+    fn select_tool_index(&mut self, index: usize) {
+        if index == self.tool_index {
             return;
-        };
+        }
         self.tool_index = index;
         if self.selected_tool_always_yolo() {
             self.yolo_mode = true;
@@ -617,6 +678,45 @@ impl NewSessionDialog {
             self.worktree_branch.reset();
         }
         self.reload_tool_config();
+    }
+
+    /// Carry a session's agent, view and sandbox, each only as far as this form allows.
+    /// Yolo stays a choice made for each new session.
+    pub fn inherit_session(&mut self, source: &crate::session::Instance) {
+        if !self.available_tools.contains(&source.tool) {
+            return;
+        }
+        self.set_tool(&source.tool);
+        self.inherit_modes(source.is_structured(), source.is_sandboxed());
+    }
+
+    fn inherit_modes(&mut self, structured: bool, sandboxed: bool) {
+        if self.structured_capable {
+            self.structured_enabled = structured;
+            self.structured_choice = Some(structured);
+        }
+        if sandboxed && self.docker_available && !self.selected_tool_host_only() {
+            self.set_sandbox_enabled(true);
+            self.sandbox_dirty = true;
+        }
+    }
+
+    /// Switch the sandbox, loading or dropping the environment that goes with it.
+    fn set_sandbox_enabled(&mut self, enabled: bool) {
+        self.sandbox_enabled = enabled;
+        if enabled {
+            let config = self.resolve_config_for_path(&self.profile);
+            self.extra_env = config.sandbox.environment.clone();
+            self.inherited_settings = build_inherited_settings(&config.sandbox);
+            self.extra_env_overridden = false;
+        } else {
+            self.extra_env.clear();
+            self.extra_env_overridden = false;
+            self.env_list_expanded = false;
+            self.env_editing_input = None;
+            self.inherited_settings.clear();
+            self.sandbox_config_mode = false;
+        }
     }
 
     /// Move focus to the title field, for "new from selection" where the path
@@ -633,6 +733,11 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn group_value(&self) -> &str {
         self.group.value()
+    }
+
+    #[cfg(test)]
+    pub fn yolo_value(&self) -> bool {
+        self.yolo_mode
     }
 
     #[cfg(test)]
@@ -724,26 +829,94 @@ impl NewSessionDialog {
         self.available_profiles.len() > 1
     }
 
-    /// Only the worktree toggle follows a picked or typed path, so other edits survive. A direct
-    /// toggle or scratch mode keeps the current value.
-    fn seed_worktree_for_path(&mut self) {
-        if self.worktree_dirty || self.scratch {
+    /// Only the worktree and sandbox toggles follow a picked or typed path, so other edits survive.
+    /// A direct toggle or scratch mode keeps the current value.
+    fn seed_defaults_for_path(&mut self) {
+        if self.scratch {
             return;
         }
         let profile = self.selected_profile().to_string();
-        let on = project_worktree_override(&profile, self.path.value())
-            .unwrap_or_else(|| self.resolve_config_for_path(&profile).worktree.enabled);
-        self.worktree_enabled = on && !self.selected_tool_host_only();
+        // Unknown overrides leave the toggles alone: a guess could disable a sandbox the project asks for.
+        let ProjectOverridesLookup::Known(overrides) = self.resolve_overrides(&profile) else {
+            return;
+        };
+        let host_only = self.selected_tool_host_only();
+        let config = self.resolve_config_for_path(&profile);
+        if !self.worktree_dirty {
+            let on = overrides
+                .as_ref()
+                .and_then(|o| o.worktree_enabled)
+                .unwrap_or(config.worktree.enabled);
+            self.worktree_enabled = on && !host_only;
+        }
+        self.seed_sandbox(&config, overrides.and_then(|o| o.sandbox_enabled));
+    }
+
+    /// The registered project's overrides for the form's path. An unreadable registry leaves them
+    /// unknown: a resolution already held for this very path stands, any other path blocks
+    /// submission until a lookup succeeds. A scratch session has no project.
+    fn resolve_overrides(&mut self, profile: &str) -> ProjectOverridesLookup {
+        if self.scratch || self.path.value().trim().is_empty() {
+            return ProjectOverridesLookup::Known(None);
+        }
+        match project_overrides(profile, self.path.value()) {
+            Ok(overrides) => {
+                self.overrides_unresolved = false;
+                self.overrides_resolved_for = Some(path_key(self.path.value()));
+                ProjectOverridesLookup::Known(overrides)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read the project registry: {e}");
+                if self.overrides_resolved_for.as_deref()
+                    != Some(path_key(self.path.value()).as_str())
+                {
+                    self.overrides_unresolved = true;
+                }
+                ProjectOverridesLookup::Unknown
+            }
+        }
+    }
+
+    /// Whether submission must wait because the project's defaults could not be resolved. Retries
+    /// the lookup first, so fixing the registry and submitting again recovers.
+    fn submission_blocked_by_unresolved_overrides(&mut self) -> bool {
+        if self.scratch || !self.overrides_unresolved {
+            return false;
+        }
+        self.seed_defaults_for_path();
+        if self.overrides_unresolved {
+            self.error_message = Some(OVERRIDES_UNRESOLVED_ERROR.to_string());
+            return true;
+        }
+        false
+    }
+
+    /// Seeds the sandbox toggle unless the user, or an inherited session, already chose it. A scratch
+    /// session belongs to no project, so it passes no override and takes the resolved default.
+    fn seed_sandbox(&mut self, config: &crate::session::Config, overridden: Option<bool>) {
+        if self.sandbox_dirty {
+            return;
+        }
+        let on = overridden.unwrap_or(config.sandbox.enabled_by_default)
+            && self.docker_available
+            && !self.selected_tool_host_only();
+        if on != self.sandbox_enabled {
+            self.set_sandbox_enabled(on);
+        }
     }
 
     fn resolve_config_for_path(&self, profile: &str) -> crate::session::Config {
-        let path = self.path.value().trim();
+        let path = if self.scratch {
+            String::new()
+        } else {
+            path_input::expand_tilde(self.path.value().trim())
+        };
         if path.is_empty() {
             resolve_config_or_warn(profile)
         } else {
             crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 profile,
-                std::path::Path::new(path),
+                std::path::Path::new(&path),
             )
         }
     }
@@ -829,13 +1002,25 @@ impl NewSessionDialog {
         self.yolo_mode = self.yolo_mode_default;
         self.structured_default = config.acp.default_new_session_view
             == crate::session::config::NewSessionView::Structured;
+        // Each profile has its own registry, so an earlier resolution says nothing about this one. A
+        // scratch session belongs to no project, so a retained path's overrides do not apply.
+        self.overrides_resolved_for = None;
+        let overrides = match self.resolve_overrides(&profile) {
+            ProjectOverridesLookup::Known(overrides) => overrides,
+            ProjectOverridesLookup::Unknown => None,
+        };
         self.sandbox_enabled = self.docker_available
-            && config.sandbox.enabled_by_default
+            && overrides
+                .as_ref()
+                .and_then(|o| o.sandbox_enabled)
+                .unwrap_or(config.sandbox.enabled_by_default)
             && !self.selected_tool_host_only();
-        self.worktree_enabled = project_worktree_override(&profile, self.path.value())
+        self.worktree_enabled = overrides
+            .and_then(|o| o.worktree_enabled)
             .unwrap_or(config.worktree.enabled)
             && !self.selected_tool_host_only();
         self.worktree_dirty = false;
+        self.sandbox_dirty = false;
 
         self.sandbox_image = Input::new(config.sandbox.default_image.clone());
 
@@ -905,6 +1090,9 @@ impl NewSessionDialog {
             dir_picker: DirPicker::new(),
             worktree_enabled: config.worktree.enabled,
             worktree_dirty: false,
+            sandbox_dirty: false,
+            overrides_unresolved: false,
+            overrides_resolved_for: None,
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
@@ -951,6 +1139,7 @@ impl NewSessionDialog {
             confirm_create_dir: None,
             scratch: false,
             fork_seed: None,
+            suggested_title: String::new(),
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -983,6 +1172,9 @@ impl NewSessionDialog {
             dir_picker: DirPicker::new(),
             worktree_enabled: false,
             worktree_dirty: false,
+            sandbox_dirty: false,
+            overrides_unresolved: false,
+            overrides_resolved_for: None,
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
@@ -1031,6 +1223,7 @@ impl NewSessionDialog {
             confirm_create_dir: None,
             scratch: false,
             fork_seed: None,
+            suggested_title: String::new(),
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1115,7 +1308,7 @@ impl NewSessionDialog {
 
         let hit_field = super::hit(&self.focusable_rects, col, row)?;
         if self.focused_field == self.path_field() && hit_field != self.focused_field {
-            self.seed_worktree_for_path();
+            self.seed_defaults_for_path();
         }
         self.focused_field = hit_field;
         self.activate_focused_field();
@@ -1195,20 +1388,7 @@ impl NewSessionDialog {
                 self.reload_config_defaults();
             }
         } else if self.focused_field == fields.tool {
-            if self.available_tools.len() > 1 {
-                self.tool_index = (self.tool_index + 1) % self.available_tools.len();
-                if self.selected_tool_always_yolo() {
-                    self.yolo_mode = true;
-                } else {
-                    self.yolo_mode = self.yolo_mode_default;
-                }
-                if self.selected_tool_host_only() {
-                    self.sandbox_enabled = false;
-                    self.worktree_enabled = false;
-                    self.worktree_branch.reset();
-                }
-                self.reload_tool_config();
-            }
+            self.select_tool_index((self.tool_index + 1) % self.available_tools.len());
         } else if self.focused_field == fields.structured {
             self.structured_enabled = !self.structured_enabled;
             self.structured_choice = Some(self.structured_enabled);
@@ -1230,20 +1410,8 @@ impl NewSessionDialog {
                 }
             }
         } else if self.focused_field == fields.sandbox {
-            self.sandbox_enabled = !self.sandbox_enabled;
-            if self.sandbox_enabled {
-                let config = self.resolve_config_for_path(&self.profile);
-                self.extra_env = config.sandbox.environment.clone();
-                self.inherited_settings = build_inherited_settings(&config.sandbox);
-                self.extra_env_overridden = false;
-            } else {
-                self.extra_env.clear();
-                self.extra_env_overridden = false;
-                self.env_list_expanded = false;
-                self.env_editing_input = None;
-                self.inherited_settings.clear();
-                self.sandbox_config_mode = false;
-            }
+            self.set_sandbox_enabled(!self.sandbox_enabled);
+            self.sandbox_dirty = true;
         }
     }
 
@@ -1310,6 +1478,13 @@ impl NewSessionDialog {
                 self.worktree_enabled = false;
                 self.workspace_repos.clear();
                 self.workspace_repos_expanded = false;
+                // Scratch replaces the project's defaults, so the resolution no longer describes them.
+                self.overrides_resolved_for = None;
+                let profile = self.selected_profile().to_string();
+                let config = self.resolve_config_for_path(&profile);
+                self.seed_sandbox(&config, None);
+            } else {
+                self.seed_defaults_for_path();
             }
             self.error_message = None;
             return DialogResult::Continue;
@@ -1371,7 +1546,7 @@ impl NewSessionDialog {
             KeyCode::Enter => {
                 self.error_message = None;
                 if self.focused_field == self.path_field() {
-                    self.seed_worktree_for_path();
+                    self.seed_defaults_for_path();
                 }
                 // The server provisions the scratch dir, so no path check.
                 if !self.scratch {
@@ -1382,7 +1557,8 @@ impl NewSessionDialog {
                         return DialogResult::Continue;
                     }
                 }
-                if !self.validate_structured() {
+                if !self.validate_structured() || self.submission_blocked_by_unresolved_overrides()
+                {
                     return DialogResult::Continue;
                 }
                 self.build_submit_result()
@@ -1390,7 +1566,7 @@ impl NewSessionDialog {
             KeyCode::Tab | KeyCode::Down => {
                 if self.focused_field == self.path_field() {
                     self.clear_path_ghost();
-                    self.seed_worktree_for_path();
+                    self.seed_defaults_for_path();
                 }
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
@@ -1407,7 +1583,7 @@ impl NewSessionDialog {
             KeyCode::BackTab | KeyCode::Up => {
                 if self.focused_field == self.path_field() {
                     self.clear_path_ghost();
-                    self.seed_worktree_for_path();
+                    self.seed_defaults_for_path();
                 }
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
@@ -1446,26 +1622,22 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.tool =>
             {
-                if key.code == KeyCode::Left {
-                    self.tool_index = if self.tool_index == 0 {
-                        self.available_tools.len() - 1
-                    } else {
-                        self.tool_index - 1
-                    };
+                let len = self.available_tools.len();
+                let index = if key.code == KeyCode::Left {
+                    (self.tool_index + len - 1) % len
                 } else {
-                    self.tool_index = (self.tool_index + 1) % self.available_tools.len();
+                    (self.tool_index + 1) % len
+                };
+                self.select_tool_index(index);
+                DialogResult::Continue
+            }
+            KeyCode::Char(c @ '1'..='9')
+                if self.focused_field == fields.tool && key.modifiers.is_empty() =>
+            {
+                let index = c as usize - '1' as usize;
+                if index < self.available_tools.len() {
+                    self.select_tool_index(index);
                 }
-                if self.selected_tool_always_yolo() {
-                    self.yolo_mode = true;
-                } else {
-                    self.yolo_mode = self.yolo_mode_default;
-                }
-                if self.selected_tool_host_only() {
-                    self.sandbox_enabled = false;
-                    self.worktree_enabled = false;
-                    self.worktree_branch.reset();
-                }
-                self.reload_tool_config();
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -1489,20 +1661,8 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.sandbox =>
             {
-                self.sandbox_enabled = !self.sandbox_enabled;
-                if self.sandbox_enabled {
-                    let config = self.resolve_config_for_path(&self.profile);
-                    self.extra_env = config.sandbox.environment.clone();
-                    self.inherited_settings = build_inherited_settings(&config.sandbox);
-                    self.extra_env_overridden = false;
-                } else {
-                    self.extra_env.clear();
-                    self.extra_env_overridden = false;
-                    self.env_list_expanded = false;
-                    self.env_editing_input = None;
-                    self.inherited_settings.clear();
-                    self.sandbox_config_mode = false;
-                }
+                self.set_sandbox_enabled(!self.sandbox_enabled);
+                self.sandbox_dirty = true;
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -1623,7 +1783,7 @@ impl NewSessionDialog {
                     self.workspace_repo_dir_picker_active = false;
                 } else {
                     self.path = Input::new(path);
-                    self.seed_worktree_for_path();
+                    self.seed_defaults_for_path();
                     self.recompute_path_ghost();
                 }
             }
@@ -1942,7 +2102,7 @@ impl NewSessionDialog {
 
     fn reload_tool_config(&mut self) {
         let profile = self.selected_profile().to_string();
-        let config = resolve_config_or_warn(&profile);
+        let config = self.resolve_config_for_path(&profile);
         let tool = self
             .available_tools
             .get(self.tool_index)
@@ -2017,6 +2177,7 @@ impl NewSessionDialog {
     fn build_submit_result(&self) -> DialogResult<NewSessionData> {
         let title_value = self.title.value().trim();
         let final_title = title_value.to_string();
+        let title_typed = !title_value.is_empty() && title_value != self.suggested_title.trim();
         let worktree_value = self.worktree_branch.value().trim();
         let worktree_branch = if self.worktree_enabled && !worktree_value.is_empty() {
             Some(worktree_value.to_string())
@@ -2033,6 +2194,7 @@ impl NewSessionDialog {
         DialogResult::Submit(NewSessionData {
             profile: self.selected_profile().to_string(),
             title: final_title,
+            title_typed,
             // Scratch sends an empty path; the server provisions the dir.
             path: if self.scratch {
                 String::new()
@@ -2105,7 +2267,7 @@ impl NewSessionDialog {
     }
 
     fn try_create_dir_and_submit(&mut self) -> DialogResult<NewSessionData> {
-        if !self.validate_structured() {
+        if !self.validate_structured() || self.submission_blocked_by_unresolved_overrides() {
             return DialogResult::Continue;
         }
         let path_str = self.path.value().trim().to_string();

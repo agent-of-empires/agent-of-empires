@@ -452,3 +452,194 @@ test("a read-only server sends no telemetry seen-ping", async ({ page }) => {
     expect(mock.telemetryPings).toEqual([]);
   });
 });
+
+// ───────────────────── tool run folding keeps the reader's place ─────────────────────
+// A run folds into a group once text follows it. A card the reader has open must
+// stay open, and neither it nor the scroll offset may move. Browser-only: jsdom has no layout.
+test.describe("tool run folding", () => {
+  test.use({ viewport: { width: 1200, height: 700 }, hasTouch: false });
+
+  // Scrolls away from the bottom and waits for it to hold. The transcript samples its anchor on the
+  // scroll event, a frame after a programmatic scroll, and a late height change can re-pin it first.
+  const scrollAwayFromBottom = (page: Page, px: number) =>
+    expect
+      .poll(async () => {
+        const distance = await acpViewport(page).evaluate((el, away) => {
+          el.scrollTop = el.scrollHeight - el.clientHeight - away;
+          return new Promise<number>((resolve) =>
+            requestAnimationFrame(() =>
+              requestAnimationFrame(() => resolve(el.scrollHeight - el.clientHeight - el.scrollTop)),
+            ),
+          );
+        }, px);
+        return Math.round(distance);
+      })
+      .toBe(px);
+
+  // An unfinished turn: the agent is busy, so its trailing run may still grow.
+  const liveTurn = { UserPromptSent: { text: "go", prompt_id: "p-fold" } };
+
+  const readTool = (n: number) => ({
+    id: `fold-${n}`,
+    name: "Read",
+    kind: "read",
+    args_preview: JSON.stringify({ file_path: `/tmp/fold-${n}.rs` }),
+  });
+  const completed = (n: number) => ({
+    ToolCallCompleted: { tool_call_id: `fold-${n}`, content: `OUTPUT-${n}` },
+  });
+
+  test("an opened card stays open and in place while its run folds", async ({ page }) => {
+    const filler = Array.from({ length: 40 }, (_, i) => `Filler paragraph ${i + 1}.`).join("\n\n");
+    const mock = await mockAcpSession(page, {
+      title: "story-fold-in-place",
+      initialEvents: [
+        liveTurn,
+        agentMessageChunk(filler),
+        ...[1, 2, 3, 4].flatMap((n) => [toolCallStarted(readTool(n)), completed(n)]),
+      ],
+    });
+    await openStructuredSession(page, mock);
+
+    const viewport = acpViewport(page);
+    const card = page.locator('[data-tool-id="fold-2"]');
+    await expect(card).toBeVisible({ timeout: 10_000 });
+    // Still growing, so the run has not folded.
+    await expect(page.getByText("4 actions")).toHaveCount(0);
+
+    await card.getByRole("button").first().click();
+    await expect(page.getByText("OUTPUT-2")).toBeVisible();
+    // Read mid-transcript, away from the bottom pin.
+    await scrollAwayFromBottom(page, 120);
+    const before = await card.boundingBox();
+    const scrollBefore = await viewport.evaluate((el) => el.scrollTop);
+
+    mock.pushEvents([agentMessageChunk("Moving on.")]);
+    await expect(page.getByText("4 actions")).toBeVisible();
+
+    await expect(page.getByText("OUTPUT-2")).toBeVisible();
+    await expect(page.getByText("OUTPUT-1")).toHaveCount(0);
+    const after = await card.boundingBox();
+    expect(Math.abs(after!.y - before!.y)).toBeLessThanOrEqual(1);
+    const scrollAfter = await viewport.evaluate((el) => el.scrollTop);
+    // The group header sits above the card, so the offset moves by the header height to hold it.
+    expect(scrollAfter).toBeGreaterThan(scrollBefore);
+  });
+
+  // 13 calls fold into chunks of 10 and 3. The first visible card is a header the
+  // fold swallows; the reader's open card sits in the other chunk and must hold.
+  test("an opened card holds its place when a run spanning two chunks folds", async ({ page }) => {
+    const output = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
+    const calls = Array.from({ length: 13 }, (_, i) => i + 1);
+    const mock = await mockAcpSession(page, {
+      title: "story-fold-two-chunks",
+      initialEvents: [
+        liveTurn,
+        agentMessageChunk(Array.from({ length: 20 }, (_, i) => `Filler paragraph ${i + 1}.`).join("\n\n")),
+        ...calls.flatMap((n) => [
+          toolCallStarted(readTool(n)),
+          { ToolCallCompleted: { tool_call_id: `fold-${n}`, content: n === 11 ? output : `OUTPUT-${n}` } },
+        ]),
+      ],
+    });
+    await openStructuredSession(page, mock);
+
+    const viewport = acpViewport(page);
+    const opened = page.locator('[data-tool-id="fold-11"]');
+    await expect(opened).toBeVisible({ timeout: 10_000 });
+    await opened.getByRole("button").first().click();
+    await expect(opened).toContainText("line 1");
+
+    // Unpinned (the bottom pin would follow the new text), with a collapsed header of the first chunk first in view.
+    await scrollAwayFromBottom(page, 200);
+    const firstVisible = await viewport.evaluate((el) => {
+      const top = el.getBoundingClientRect().top;
+      const card = [...el.querySelectorAll("[data-tool-id]")].find((c) => c.getBoundingClientRect().bottom > top);
+      return Number(card?.getAttribute("data-tool-id")?.replace("fold-", ""));
+    });
+    expect(firstVisible).toBeLessThanOrEqual(10);
+    await expect(opened).toBeInViewport();
+    const before = await opened.boundingBox();
+
+    // Enough text that the transcript can still scroll after the fold.
+    mock.pushEvents([agentMessageChunk(Array.from({ length: 60 }, (_, i) => `After ${i + 1}.`).join("\n\n"))]);
+    await expect(page.getByText("10 actions")).toBeVisible();
+    await expect(page.getByText("3 actions")).toBeVisible();
+
+    await expect(opened).toContainText("line 1");
+    const after = await opened.boundingBox();
+    expect(Math.abs(after!.y - before!.y)).toBeLessThanOrEqual(1);
+  });
+
+  // The fold lands while following the bottom. Anchors it left behind must not
+  // shift the view when the reader later scrolls up and more text streams in.
+  test("a fold while pinned leaves no stale anchors behind", async ({ page }) => {
+    const filler = Array.from({ length: 40 }, (_, i) => `Filler paragraph ${i + 1}.`).join("\n\n");
+    const mock = await mockAcpSession(page, {
+      title: "story-fold-pinned",
+      initialEvents: [
+        liveTurn,
+        agentMessageChunk(filler),
+        ...[1, 2, 3, 4].flatMap((n) => [toolCallStarted(readTool(n)), completed(n)]),
+      ],
+    });
+    await openStructuredSession(page, mock);
+
+    const card = page.locator('[data-tool-id="fold-2"]');
+    await expect(card).toBeVisible({ timeout: 10_000 });
+    await card.getByRole("button").first().click();
+    await expect(page.getByText("OUTPUT-2")).toBeVisible();
+
+    mock.pushEvents([agentMessageChunk("Moving on.")]);
+    const header = page.getByText("4 actions");
+    await expect(header).toBeVisible();
+
+    await scrollAwayFromBottom(page, 250);
+    const before = (await header.boundingBox())!.y;
+    mock.pushEvents([agentMessageChunk(Array.from({ length: 30 }, (_, i) => `After ${i + 1}.`).join("\n\n"))]);
+    await expect(page.getByText("After 30.")).toBeAttached();
+    expect(Math.abs((await header.boundingBox())!.y - before)).toBeLessThanOrEqual(1);
+  });
+
+  // A turn ending on tool calls has no closing text, so the end of the turn folds the run.
+  test("a run folds when the turn ends, keeping an opened card in place", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-fold-turn-end",
+      initialEvents: [
+        liveTurn,
+        agentMessageChunk(Array.from({ length: 40 }, (_, i) => `Filler paragraph ${i + 1}.`).join("\n\n")),
+        ...[1, 2, 3, 4].flatMap((n) => [toolCallStarted(readTool(n)), completed(n)]),
+      ],
+    });
+    await openStructuredSession(page, mock);
+
+    const card = page.locator('[data-tool-id="fold-2"]');
+    await expect(card).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("4 actions")).toHaveCount(0);
+    await card.getByRole("button").first().click();
+    await expect(page.getByText("OUTPUT-2")).toBeVisible();
+    // A reader following the bottom follows it through the fold; this one reads above it.
+    await scrollAwayFromBottom(page, 120);
+    const before = await card.boundingBox();
+
+    mock.pushEvents([stopped()]);
+    await expect(page.getByText("4 actions")).toBeVisible();
+    await expect(page.getByText("OUTPUT-2")).toBeVisible();
+    expect(Math.abs((await card.boundingBox())!.y - before!.y)).toBeLessThanOrEqual(1);
+  });
+
+  test("a run nothing was opened in folds collapsed once text follows", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-fold-collapsed",
+      initialEvents: [liveTurn, ...[1, 2, 3].flatMap((n) => [toolCallStarted(readTool(n)), completed(n)])],
+    });
+    await openStructuredSession(page, mock);
+
+    await expect(page.locator('[data-tool-id="fold-3"]')).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("3 actions")).toHaveCount(0);
+
+    mock.pushEvents([agentMessageChunk("Done.")]);
+    await expect(page.getByText("3 actions")).toBeVisible();
+    await expect(page.locator('[data-tool-id="fold-1"]')).toHaveCount(0);
+  });
+});

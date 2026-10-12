@@ -493,6 +493,7 @@ mod tests {
             text: "look at this".into(),
             attachments: vec![attachment.clone()],
             synthesized: false,
+            origin_plugin: None,
         };
         // (events, expected prompt)
         let cases = [

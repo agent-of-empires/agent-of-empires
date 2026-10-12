@@ -312,23 +312,23 @@ fn hermes_config_has_aoe_marker(content: &str) -> bool {
     if content.trim().is_empty() {
         return false;
     }
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+    let Ok(value) =
+        serde_saphyr::from_str_with_options::<serde_json::Value>(content, crate::yaml::options())
+    else {
         return false;
     };
     value
-        .as_mapping()
-        .and_then(|m| m.get(serde_yaml::Value::String("hooks".into())))
-        .and_then(serde_yaml::Value::as_mapping)
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
         .is_some_and(|hooks| {
             hooks
                 .values()
-                .filter_map(serde_yaml::Value::as_sequence)
+                .filter_map(serde_json::Value::as_array)
                 .flatten()
                 .any(|entry| {
                     entry
-                        .as_mapping()
-                        .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
-                        .and_then(serde_yaml::Value::as_str)
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
                         .is_some_and(is_aoe_hook_command)
                 })
         })

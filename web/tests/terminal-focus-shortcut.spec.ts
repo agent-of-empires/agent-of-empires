@@ -1,5 +1,5 @@
 import { makePatch } from "./helpers/patch";
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
@@ -164,6 +164,30 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect(agent).toBeVisible();
     await expect(backToTerminal).toBeHidden();
   });
+
+  test("Ctrl+Q returns focus from the terminal to the active sidebar row", async ({ page }) => {
+    await mockTerminalApis(page);
+    await page.goto("/");
+    await openSession(page);
+    await focusKind(page, "agent");
+
+    const sidebar = page.getByRole("navigation", { name: "Sessions sidebar" });
+    const activeRow = sidebar.locator("[aria-current=page]");
+    await page.keyboard.press("Control+q");
+    await expect(activeRow).toBeFocused();
+
+    await focusKind(page, "paired");
+    await page.keyboard.press("Control+q");
+    await expect(activeRow).toBeFocused();
+
+    await activeRow.evaluate((row) => ((row as HTMLElement).style.display = "none"));
+    await focusKind(page, "agent");
+    await page.keyboard.press("Control+q");
+    await expect(sidebar).toBeFocused();
+  });
+  // (The xterm-only `term-focused` panel CSS ring was removed with the xterm
+  // renderer; focus correctness is covered by the focusedKind() assertions
+  // above.)
 });
 
 // ────────────────────────────────────────────────────────────────────
@@ -188,5 +212,26 @@ test.describe("Cmd/Ctrl+` mobile", () => {
 
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("paired");
+  });
+  test("Ctrl+Q returns from the mobile keyboard proxy without sending a terminal control byte", async ({ page }) => {
+    const terminal = await mockTerminalApis(page);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Toggle sidebar" }).click();
+    await openSession(page);
+    await terminal.waitForLiveReady();
+
+    const proxy = page.locator("[data-keyboard-proxy]");
+    await expect(proxy).toHaveAttribute("data-session-input", "");
+    await proxy.focus();
+    await expect(proxy).toBeFocused();
+    await page.keyboard.press("Control+a");
+    await expect.poll(() => terminal.liveInput.some((input) => input.equals(Buffer.from([0x01])))).toBe(true);
+
+    await page.keyboard.press("Control+q");
+    const sidebar = page.getByRole("navigation", { name: "Sessions sidebar" });
+    await expect(sidebar.locator("[data-active-session-row]")).toBeFocused();
+    await observeFor(page, 250, async () => {
+      expect(terminal.liveInput.some((input) => input.includes(0x11))).toBe(false);
+    });
   });
 });

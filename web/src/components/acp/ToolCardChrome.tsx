@@ -1,17 +1,27 @@
 /* eslint-disable react-refresh/only-export-components */
 // Shared header, body blocks, and helpers for the per-kind tool cards.
 
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type SetStateAction } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+  type SetStateAction,
+} from "react";
 import { ArrowUpRight, ChevronDown, Copy as CopyIcon } from "lucide-react";
 
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseJsonObject } from "../../lib/acpArgs";
 import { useAcpPrefs } from "../../lib/acpPrefs";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
-import { hasAnsi, parseAnsi, type AnsiStyle } from "../../lib/ansi";
+import { hasAnsi, parseAnsi, type AnsiSegment, type AnsiStyle } from "../../lib/ansi";
 import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { useAcpFileRef } from "./AcpFileRefContext";
-import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
+import { useToolExpansionStore, useToolId, type ExpansionOverride } from "./ToolExpansion";
+import { useToolDisplayMode } from "./ToolDisplayMode";
+import { WrapBar, WrapLines, WrapToggle, useWrapState } from "./WrapToggle";
 
 export interface ToolCardProps {
   tool: ToolCall;
@@ -66,25 +76,42 @@ export function spanTimes(items: { tool: ToolCall; result?: ActivityRow }[]) {
 }
 
 /** Expand state. Failed cards open by default and compact density closes the
- *  rest; a user toggle overrides the baseline only for the density it was made in. */
-export function useToolCardExpansion(status: Status, defaultOpen = false) {
+ *  rest; a user toggle overrides the baseline only for the density it was made in.
+ *  Inside a `ToolIdProvider` the toggle lives in the shared store, so it outlives
+ *  a remount. `seed` starts a local card at that state in the current density, as a
+ *  group that absorbs its children's open state. */
+export function useToolCardExpansion(status: Status, defaultOpen = false, seed?: boolean) {
   const density = useToolDisplayMode();
   const baseline = status === "err" ? true : density === "compact" ? false : defaultOpen;
-  const [override, setOverride] = useState<{ density: ToolDensity; open: boolean } | null>(null);
+  const store = useToolExpansionStore();
+  const id = useToolId();
+  const shared = store !== null && id !== null;
+  const [local, setLocal] = useState<ExpansionOverride | null>(() =>
+    seed === undefined ? null : { density, open: seed },
+  );
+  const stored = useSyncExternalStore(
+    store?.subscribe ?? noopSubscribe,
+    () => (shared ? store.get(id) : null),
+    () => null,
+  );
+  const override = shared ? stored : local;
   const active = override && override.density === density ? override.open : null;
   const open = active ?? baseline;
   const setOpen = useCallback(
     (action: SetStateAction<boolean>) => {
-      setOverride((prev) => {
+      const next = (prev: ExpansionOverride | null): ExpansionOverride => {
         const current = prev && prev.density === density ? prev.open : baseline;
-        const next = typeof action === "function" ? action(current) : action;
-        return { density, open: next };
-      });
+        return { density, open: typeof action === "function" ? action(current) : action };
+      };
+      if (shared) store.update(id, next);
+      else setLocal(next);
     },
-    [density, baseline],
+    [density, baseline, shared, store, id],
   );
   return [open, setOpen] as const;
 }
+
+const noopSubscribe = () => () => {};
 
 function StatusDot({ status, neutral }: { status: Status; neutral?: boolean }) {
   const cls =
@@ -152,8 +179,12 @@ export function CardChrome({
   const { showToolDurations } = useAcpPrefs();
   const Header = onToggle ? "button" : "div";
   const showNeutral = neutralOnDone === true && status !== "running";
+  const toolId = useToolId();
   return (
-    <div className="my-1 overflow-hidden rounded-md border border-surface-700 bg-surface-800/50 text-sm">
+    <div
+      data-tool-id={toolId ?? undefined}
+      className="my-1 overflow-hidden rounded-md border border-surface-700 bg-surface-800/50 text-sm"
+    >
       <Header
         type={onToggle ? "button" : undefined}
         onClick={onToggle}
@@ -245,16 +276,20 @@ function CopyButton({ text }: { text: string }) {
 
 /** Labelled, copyable raw text block ("input" / "output"). */
 export function RawBlock({ label, text }: { label: "input" | "output"; text: string }) {
+  const [wrapped, toggleWrap] = useWrapState();
   return (
     <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
       <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
         <span>{label}</span>
-        <CopyButton text={text} />
+        <span className="flex items-center">
+          <WrapToggle wrapped={wrapped} onToggle={toggleWrap} />
+          <CopyButton text={text} />
+        </span>
       </div>
       <pre
-        className={`overflow-x-auto font-mono text-[11px] ${label === "input" ? "text-text-muted" : "text-text-secondary"} whitespace-pre-wrap break-all`}
+        className={`font-mono text-[11px] ${label === "input" ? "text-text-muted" : "text-text-secondary"} ${wrapped ? "wrap-lines" : "overflow-x-auto whitespace-pre"}`}
       >
-        {text}
+        {wrapped ? <WrapLines text={text} /> : text}
       </pre>
     </div>
   );
@@ -304,6 +339,7 @@ export function HighlightedBlock({
   // treat the file as binary) so field concatenations cannot collide.
   const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
+  const [wrapped, toggleWrap] = useWrapState();
   const shiki = useShikiTheme();
   const unwrapped = unwrapMarkdownFence(text);
   const effectiveLang = unwrapped.lang ?? language;
@@ -341,16 +377,19 @@ export function HighlightedBlock({
 
   return (
     <div className="border-t border-surface-800 bg-surface-950">
+      <WrapBar wrapped={wrapped} onToggle={toggleWrap} />
       {ansi ? (
-        <AnsiBlock text={shown} />
+        <AnsiBlock text={shown} wrapped={wrapped} />
       ) : html ? (
         <div
-          className="overflow-x-auto px-3 py-2 text-xs [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0"
+          className={`px-3 py-2 text-xs [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0 ${wrapped ? "wrap-lines" : "overflow-x-auto"}`}
           dangerouslySetInnerHTML={{ __html: html }}
         />
       ) : (
-        <pre className="overflow-x-auto px-3 py-2 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all">
-          {shown}
+        <pre
+          className={`px-3 py-2 text-xs font-mono text-text-secondary ${wrapped ? "wrap-lines" : "overflow-x-auto whitespace-pre"}`}
+        >
+          {wrapped ? <WrapLines text={shown} /> : shown}
         </pre>
       )}
       {truncated > 0 && (
@@ -366,30 +405,53 @@ export function HighlightedBlock({
   );
 }
 
-/** Terminal output is column-sensitive, so no wrapping. */
-function AnsiBlock({ text }: { text: string }) {
+/** Splits styled segments at newlines so each source line can be its own element. */
+export function splitAnsiLines(segments: AnsiSegment[]): AnsiSegment[][] {
+  const lines: AnsiSegment[][] = [[]];
+  for (const seg of segments) {
+    seg.text.split("\n").forEach((part, i) => {
+      if (i > 0) lines.push([]);
+      if (part) lines[lines.length - 1]!.push({ ...seg, text: part });
+    });
+  }
+  return lines;
+}
+
+/** Terminal output is column-sensitive, so it scrolls unless the block is wrapped. */
+function AnsiBlock({ text, wrapped }: { text: string; wrapped: boolean }) {
   const segments = useMemo(() => parseAnsi(text), [text]);
+  const lines = useMemo(() => (wrapped ? splitAnsiLines(segments) : null), [wrapped, segments]);
+  const renderSegments = (segs: AnsiSegment[]) =>
+    segs.map((seg, i) => {
+      const href = seg.url ? safeUri(seg.url, SAFE_LINK_SCHEMES) : null;
+      return href ? (
+        <a
+          key={i}
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={ansiSegmentStyle(seg.style)}
+          className="underline"
+        >
+          {seg.text}
+        </a>
+      ) : (
+        <span key={i} style={ansiSegmentStyle(seg.style)}>
+          {seg.text}
+        </span>
+      );
+    });
   return (
-    <pre className="overflow-x-auto px-3 py-2 text-xs font-mono text-text-primary whitespace-pre">
-      {segments.map((seg, i) => {
-        const href = seg.url ? safeUri(seg.url, SAFE_LINK_SCHEMES) : null;
-        return href ? (
-          <a
-            key={i}
-            href={href}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={ansiSegmentStyle(seg.style)}
-            className="underline"
-          >
-            {seg.text}
-          </a>
-        ) : (
-          <span key={i} style={ansiSegmentStyle(seg.style)}>
-            {seg.text}
-          </span>
-        );
-      })}
+    <pre
+      className={`px-3 py-2 text-xs font-mono text-text-primary ${wrapped ? "wrap-lines" : "overflow-x-auto whitespace-pre"}`}
+    >
+      {lines
+        ? lines.map((segs, i) => (
+            <span key={i} className="wrap-line">
+              {renderSegments(segs)}
+            </span>
+          ))
+        : renderSegments(segments)}
     </pre>
   );
 }

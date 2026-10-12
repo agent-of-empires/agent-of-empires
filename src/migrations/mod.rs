@@ -42,6 +42,8 @@ mod v032_bound_capture_exclusions;
 pub(crate) mod v033_isolate_sandbox_content;
 mod v034_trash_retention_minutes;
 mod v035_custom_sort_order;
+mod v036_session_creation_count;
+mod v037_trash_lifecycle_id;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -87,7 +89,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 35;
+const CURRENT_VERSION: u32 = 37;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -217,6 +219,12 @@ const MIGRATIONS: &[Migration] = &[
         v034_trash_retention_minutes::run,
     ),
     (35, "custom_sort_order", v035_custom_sort_order::run),
+    (
+        36,
+        "session_creation_count",
+        v036_session_creation_count::run,
+    ),
+    (37, "trash_lifecycle_id", v037_trash_lifecycle_id::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -381,9 +389,7 @@ mod tests {
         assert!(error.contains("refusing to downgrade"));
     }
 
-    /// v035 is a schema step and nothing more: an install on the previous version with a
-    /// non-default sort order comes out on a newer version with `state.toml` byte for byte
-    /// as it was, and running the migrations again changes neither.
+    /// Upgrading preserves the sort order, and a second run leaves state untouched.
     #[test]
     #[serial_test::serial]
     fn schema_34_advances_and_keeps_its_sort_order() {
@@ -407,16 +413,18 @@ mod tests {
         assert!(advanced > 34, "the version advances past 34, to {advanced}");
         assert_eq!(advanced, CURRENT_VERSION);
         assert_eq!(
-            fs::read_to_string(app.join("state.toml")).unwrap(),
-            state,
-            "the state is not rewritten"
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sort_order,
+            Some(crate::session::config::SortOrder::Oldest)
         );
+        let migrated_state = fs::read_to_string(app.join("state.toml")).unwrap();
 
         run_migrations().unwrap();
         assert_eq!(get_current_version(), advanced, "a second run stays put");
         assert_eq!(
             fs::read_to_string(app.join("state.toml")).unwrap(),
-            state,
+            migrated_state,
             "and leaves the state alone"
         );
     }

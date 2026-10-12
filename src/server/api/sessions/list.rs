@@ -566,6 +566,7 @@ mod workspace_ordering_tests {
 
     fn mock_response(id: &str, project_path: &str, branch: Option<&str>) -> SessionResponse {
         SessionResponse {
+            acp_provider: None,
             id: id.to_string(),
             title: id.to_string(),
             project_path: project_path.to_string(),

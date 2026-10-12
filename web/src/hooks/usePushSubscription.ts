@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { isIOS, isStandalone } from "../lib/platform";
 import {
   classifyPushHealth,
+  hasFreshGoneFailure,
   readPushWanted,
   writePushWanted,
   type PushHealth,
@@ -70,11 +71,11 @@ interface PushStatus {
   subscription?: ServerSubscriptionStatus;
 }
 
-/** Null when the status endpoint is unreachable; callers then assume push is on. */
-async function fetchStatus(endpoint: string | undefined): Promise<PushStatus | null> {
+async function fetchStatus(endpoint: string | undefined): Promise<PushStatus> {
   const query = endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : "";
   const resp = await fetch(`/api/push/status${query}`);
-  return resp.ok ? ((await resp.json()) as PushStatus) : null;
+  if (!resp.ok) throw new Error(`Could not fetch push status (${resp.status})`);
+  return (await resp.json()) as PushStatus;
 }
 
 /** Null when the browser does not expose the key the subscription was made with. */
@@ -125,8 +126,17 @@ export function usePushSubscription() {
     try {
       const perm = Notification.permission;
       const sub = await currentSubscription();
-      const status = await fetchStatus(sub?.endpoint);
-      if (status && !status.enabled) {
+      let status: PushStatus;
+      try {
+        status = await fetchStatus(sub?.endpoint);
+      } catch {
+        if (busy.current) return;
+        if (perm === "granted" && sub) writePushWanted(true);
+        if (perm === "denied") setState({ kind: "denied" });
+        else setState(perm === "granted" && sub ? { kind: "enabled" } : { kind: "off" });
+        return;
+      }
+      if (!status.enabled) {
         setHealth("unknown");
         return setState({ kind: "disabled-by-server" });
       }
@@ -137,11 +147,11 @@ export function usePushSubscription() {
         wanted,
         permission: perm,
         subscribed: !!sub,
-        keyMatches: sub && status?.public_key ? keyMatches(sub, status.public_key) : null,
-        server: status?.subscription ?? null,
+        keyMatches: sub && status.public_key ? keyMatches(sub, status.public_key) : null,
+        server: status.subscription ?? null,
       });
       // Re-binds the sub to the current token (#3386) or restores one the server dropped.
-      if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status?.subscription))) {
+      if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status.subscription))) {
         const resp = await postPush("subscribe", subscribeBody(sub)).catch(() => null);
         if (resp?.ok) next = "healthy";
       }
@@ -188,9 +198,19 @@ export function usePushSubscription() {
       const { public_key } = (await vapidResp.json()) as { public_key: string };
       const reg = await navigator.serviceWorker.ready;
       let sub = await reg.pushManager.getSubscription();
-      if (sub && keyMatches(sub, public_key) !== true) {
+      // A 404/410 permanently retires a browser endpoint. Re-subscribing the same
+      // endpoint only stores a dead subscription again, so renew it before posting.
+      const status = sub ? await fetchStatus(sub.endpoint) : null;
+      const keyMismatch = sub && keyMatches(sub, public_key) !== true;
+      const gone = hasFreshGoneFailure(status?.subscription ?? null);
+      if (sub && (keyMismatch || gone)) {
         const stale = sub.endpoint;
-        await sub.unsubscribe().catch(() => {});
+        const unsubscribed = await sub.unsubscribe().catch(() => false);
+        if (!unsubscribed && (await reg.pushManager.getSubscription())?.endpoint === stale) {
+          throw new Error("Could not unsubscribe the expired notification subscription");
+        }
+        // Browser ownership is already retired; a failed server cleanup must
+        // not block registering the replacement endpoint.
         await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
         sub = null;
       }

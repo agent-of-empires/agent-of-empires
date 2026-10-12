@@ -104,8 +104,10 @@ pub async fn ensure_session(
     {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            let old_status = inst.status;
             inst.status = crate::session::Status::Starting;
             inst.last_error = None;
+            publish_status_change(&state.status_tx, inst, old_status);
         }
     }
 
@@ -134,7 +136,7 @@ pub async fn ensure_session(
         Ok(Ok((started, outcome))) => {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &sync_base, &started);
+                sync_live_after_restart(&state.status_tx, inst, &sync_base, &started);
             }
             let resume_outcome = match &outcome {
                 crate::session::StartOutcome::Resumed => "resumed",
@@ -174,9 +176,13 @@ pub async fn ensure_session(
             tracing::warn!(target: "http.api.sessions", "ensure_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                if apply_post_restart_sync(inst, &sync_base, &started) && blocked.is_none() {
+                if sync_live_after_restart(&state.status_tx, inst, &sync_base, &started)
+                    && blocked.is_none()
+                {
+                    let synced_status = inst.status;
                     inst.status = crate::session::Status::Error;
                     inst.last_error = Some(msg.clone());
+                    publish_status_change(&state.status_tx, inst, synced_status);
                 }
             }
             if let Some(blocked) = blocked {

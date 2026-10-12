@@ -23,11 +23,13 @@ pub struct DeleteSessionBody {
 /// Flip a session out of `Status::Deleting` into `Status::Error` so a
 /// bookkeeping failure after teardown does not strand it greyed-out and
 /// unclickable, the state this detached-task delete exists to prevent.
-async fn mark_delete_error(state: &AppState, id: &str, message: String) {
+pub(super) async fn mark_delete_error(state: &AppState, id: &str, message: String) {
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        let old_status = inst.status;
         inst.status = Status::Error;
         inst.last_error = Some(message);
+        publish_status_change(&state.status_tx, inst, old_status);
     }
 }
 
@@ -510,7 +512,9 @@ pub async fn delete_session(
         {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                let old_status = inst.status;
                 inst.status = Status::Deleting;
+                publish_status_change(&state.status_tx, inst, old_status);
             }
         }
 
@@ -746,7 +750,9 @@ pub(super) async fn purge_workspace_artifacts(
         {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                let old_status = inst.status;
                 inst.status = Status::Deleting;
+                publish_status_change(&state.status_tx, inst, old_status);
             }
         }
 

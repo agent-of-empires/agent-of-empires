@@ -61,7 +61,7 @@ describe("webRendersServerRow", () => {
       text: "x",
     });
     expect(webRendersServerRow(row("notice"))).toBe(false);
-    for (const kind of ["message", "user_prompt", "tool_start", "context_reset", "summary"]) {
+    for (const kind of ["message", "user_prompt", "tool_start", "context_reset", "summary", "advisory"]) {
       expect(webRendersServerRow(row(kind))).toBe(true);
     }
   });
@@ -316,6 +316,12 @@ describe("transcriptRowToActivity (Tier 4 wire mapping)", () => {
     expect(row.toolCallId).toBe("t-1");
     expect(row.output).toEqual([{ kind: "text", text: "hi" }]);
     expect(row.asyncSubagent).toBe(true);
+  });
+
+  it("carries the sending plugin of a user prompt and omits it otherwise", () => {
+    const base = { id: "u-1", group_id: "g-1", kind: "user_prompt" as const, at: "2026-01-01T00:00:00Z", text: "hi" };
+    expect(transcriptRowToActivity({ ...base, origin_plugin: "cron" }, "s-1").originPlugin).toBe("cron");
+    expect("originPlugin" in transcriptRowToActivity(base, "s-1")).toBe(false);
   });
 
   it("builds the replay-GET url for attachments and seeds raw_name from name", () => {

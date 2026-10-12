@@ -146,6 +146,8 @@ pub enum ObjectFieldWidget {
         depends_on: Vec<String>,
     },
     Cron,
+    /// A freeform, per-line-validated list of user-typed strings.
+    List,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

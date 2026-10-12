@@ -49,6 +49,19 @@ Each built-in adapter receives only the provider variables it is known to read, 
 
 `vibe`, `pi`, `omp`, `kimi`, and custom adapters have no ambient allowlist yet: give them auth through the session's `extra_env`, the `environment` list, or `session.inherit_host_environment` for host sessions. In a sandboxed session the per-adapter keys above still cross the container boundary, but `inherit_host_environment` does not, so use `sandbox.environment` there. Allowlist entries naming a file or directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`, the AWS file variables) are host-only and never cross, since each agent's config dir is already bind-mounted at its canonical container location; each drop is logged under the `acp` target with the key and the reason.
 
+### Switching provider
+
+A Claude session can be moved between the direct API, Bedrock, and Vertex without losing its transcript, from the provider picker next to the model picker or with `aoe acp switch-provider <session> <api|bedrock|vertex>`.
+
+The pick only sets `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, and it outranks both the host environment and the `environment` list. Credentials are not provisioned by it: the target provider's own variables (`ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for Vertex, the AWS credential chain for Bedrock) must already be present where `aoe serve` runs, or the next turn fails on authentication.
+
+Two further effects are worth knowing before you switch:
+
+- The model is reset to the new provider's default, because model ids differ between providers and a resumed conversation would otherwise stay on the model it last ran. Pick a model again afterwards if you had one pinned.
+- A sandboxed session's container is recreated, since the GCP credential mount is decided when the container is built. Anything written inside the container but outside the workspace volume is lost.
+
+The switch is refused while a turn or a background agent is running, since it restarts the worker. Once idle, the worker restarts and resumes the same conversation.
+
 ### Feature matrix
 
 | Feature | Claude | Codex | OpenCode | Gemini | Other ACP |
@@ -108,7 +121,7 @@ aoe acp doctor --fix --all-adapters       # every bundled adapter
 
 `aoe add` names a session from `--title`, else the worktree branch, else a generated name (`-i` prompts like the TUI and wizard do). A structured session still carrying a generated name is auto-renamed once its first turn finishes, by a one-shot call to the session's own agent, so the title reflects both your prompt and the response. See `session.smart_rename` in the [configuration reference](guides/configuration.md#session).
 
-If the rename never lands, right-click the session and pick **Auto-name now** (TUI: `v` or the command palette), which works even with `smart_rename` off and regenerates the title even over one you picked yourself (the automatic rename never does). The sidebar shows an `Auto-name` chip while a session is still default-named and a `Naming…` chip while the call is in flight. Two more chips flag a session that parked itself but is still alive: a `⏰` countdown to a scheduled wakeup, and a `👁 monitoring` badge while an armed `Monitor` keeps re-invoking the agent, which clears when you send a new prompt.
+If the rename never lands, right-click the session and pick **Auto-name now** (TUI: `v` or the command palette), which works even with `smart_rename` off and regenerates the title even over one you picked yourself (the automatic rename never does). If the agent's one-shot fails (for example an expired login or an unsupported model), its error is shown instead of a new title. The sidebar shows an `Auto-name` chip while a session is still default-named and a `Naming…` chip while the call is in flight. Two more chips flag a session that parked itself but is still alive: a `⏰` countdown to a scheduled wakeup, and a `👁 monitoring` badge while an armed `Monitor` keeps re-invoking the agent, which clears when you send a new prompt.
 
 Per-agent startup defaults live under `[acp.acp_defaults.<agent>]` (model, effort, mode, `effort_by_model`, `pin_model`) and are editable from the web settings; see [Configuration](guides/configuration.md#session). The rest of `[acp]` is in [Structured View Internals](development/internals/structured-view.md#global-tuning-acp).
 

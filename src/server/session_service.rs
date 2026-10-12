@@ -74,6 +74,19 @@ struct MirroredFields {
     last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// The blocking writer owns completion and ordering even if its caller is cancelled.
+struct PersistedMutation {
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    _ordered: tokio::sync::OwnedMutexGuard<()>,
+    _reload: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl Drop for PersistedMutation {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Result of `SessionService::edit_queued_prompt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditQueuedOutcome {
@@ -94,16 +107,19 @@ fn queue_drain_batch<'a>(
     if queue.is_empty() {
         return (&[], String::new());
     }
-    let batch_end = if profile.clear_aliases.is_empty() {
-        queue.len()
-    } else if profile.is_clear_command(&queue[0].text) {
+    let batch_end = if profile.is_solo_command(&queue[0].text) {
         1
     } else {
         queue
             .iter()
-            .position(|e| profile.is_clear_command(&e.text))
+            .position(|e| profile.is_solo_command(&e.text))
             .unwrap_or(queue.len())
     };
+    // One turn has one origin, so a plugin's message never merges into another sender's.
+    let batch_end = queue[..batch_end]
+        .iter()
+        .position(|e| e.origin_plugin != queue[0].origin_plugin)
+        .unwrap_or(batch_end);
     let sub = &queue[..batch_end];
     let combined = sub
         .iter()
@@ -123,9 +139,8 @@ pub struct SessionService {
     pub file_watch: Arc<crate::file_watch::FileWatchService>,
     /// Opt-in telemetry create counter, shared with `AppState.telemetry_session_creates`.
     pub telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
-    /// Shared with `AppState.mutation_epoch`. Bumped under the `instances` write lock by
-    /// any change a disk snapshot read earlier would not carry, so that reload drops
-    /// itself instead of overwriting the change.
+    /// Shared with AppState.mutation_epoch; invalidates snapshots at memory mutation
+    /// and at the completion of a mirrored persistence transaction.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Owns the per-session ACP agent subprocesses, shared with `AppState.acp_supervisor`.
     pub acp_supervisor:
@@ -146,6 +161,8 @@ pub struct SessionService {
     /// Per-session persist locks for `mutate_instance_persisted`, held across snapshot AND
     /// disk write so the two cannot be reordered.
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Shared by queue transactions, exclusive for disk sampling and reload application.
+    reload_gate: Arc<RwLock<()>>,
     /// Per-session prompt-submission locks.
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Test-only tap on [`SessionService::prompt_submission`], fired before it
@@ -174,6 +191,18 @@ pub(crate) enum SessionCaller {
     User,
     /// A plugin worker, identified by its connection's plugin id.
     Plugin { plugin_id: String },
+    /// A plugin delivering through `sessions.message.send`: any session, but the turn is
+    /// marked as plugin-originated instead of passing for the user's.
+    PluginMessage { plugin_id: String },
+}
+
+impl SessionCaller {
+    fn message_origin(&self) -> Option<&str> {
+        match self {
+            Self::PluginMessage { plugin_id } => Some(plugin_id),
+            Self::User | Self::Plugin { .. } => None,
+        }
+    }
 }
 
 /// Why a caller may not open a turn on a session.
@@ -306,6 +335,7 @@ impl SessionService {
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
+            reload_gate: Arc::new(RwLock::new(())),
             prompt_locks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             submission_claims: std::sync::OnceLock::new(),
@@ -566,7 +596,10 @@ impl SessionService {
             };
         }
         // A plugin-delivered turn must run under the session's persisted explicit mode.
-        if matches!(caller, SessionCaller::Plugin { .. }) {
+        if matches!(
+            caller,
+            SessionCaller::Plugin { .. } | SessionCaller::PluginMessage { .. }
+        ) {
             if let Some(mode_id) = &acp_mode_id {
                 if let Err(e) = self.acp_supervisor.set_mode(id, mode_id).await {
                     return Err(SendTurnError::ModeApplication(e));
@@ -583,6 +616,7 @@ impl SessionService {
                 attachments,
                 prompt_id,
                 synthesized,
+                caller.message_origin().map(str::to_string),
             )
             .await;
         let outcome = match disposition {
@@ -835,11 +869,15 @@ impl SessionService {
         }
     }
 
-    /// Drop any disk reload that read `sessions.json` before this in-memory change. Call
-    /// under the `instances` write lock; the persist that follows schedules a fresh reload.
+    /// Invalidate earlier disk snapshots under instances.write() or reload_gate.
     fn invalidate_disk_snapshots(&self) {
         self.mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Hold through epoch sampling and disk load, or through reload application.
+    pub(super) async fn disk_reload_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.reload_gate).write_owned().await
     }
 
     /// Apply `mutate` to a session's in-memory `Instance`, then mirror the resulting state
@@ -850,10 +888,16 @@ impl SessionService {
         F: FnOnce(&mut crate::session::Instance) -> T,
     {
         let persist_lock = self.persist_lock(id).await;
-        let _ordered = persist_lock.lock().await;
-        let (profile, result, mirrored) = {
+        let ordered = persist_lock.lock_owned().await;
+        let reload = Arc::clone(&self.reload_gate).read_owned().await;
+        let (profile, result, mirrored, transaction) = {
             let mut instances = self.instances.write().await;
             let inst = instances.iter_mut().find(|i| i.id == id)?;
+            let transaction = PersistedMutation {
+                epoch: Arc::clone(&self.mutation_epoch),
+                _ordered: ordered,
+                _reload: reload,
+            };
             let r = mutate(inst);
             self.invalidate_disk_snapshots();
             (
@@ -865,12 +909,14 @@ impl SessionService {
                     idle_dormant_since: inst.idle_dormant_since,
                     last_accessed_at: inst.last_accessed_at,
                 },
+                transaction,
             )
         };
         match crate::session::Storage::new(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
+                    let _transaction = transaction;
                     storage.update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.queued_prompts = mirrored.queued_prompts;
@@ -885,7 +931,7 @@ impl SessionService {
                 })
                 .await;
                 if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(target: "acp.queue", session = %id, "failed to persist queue mutation; it holds this daemon life");
+                    tracing::warn!(target: "acp.queue", session = %id, "queue mutation was not persisted; a later reload may discard it");
                 }
             }
             Err(e) => {
@@ -904,10 +950,16 @@ impl SessionService {
         text: String,
         attachments: Vec<crate::daemon::PromptAttachmentRef>,
         origin_device: Option<String>,
+        origin_plugin: Option<String>,
     ) -> Option<crate::daemon::QueuedPromptEntry> {
         self.mutate_instance_persisted(id, move |inst| {
             inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
             if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
+                // A repost of unchanged content (a client restoring its cache) keeps the
+                // sender; other content is the poster's.
+                if existing.text != text || existing.attachments != attachments {
+                    existing.origin_plugin = origin_plugin.clone();
+                }
                 existing.text = text.clone();
                 existing.attachments = attachments.clone();
                 return existing.clone();
@@ -924,6 +976,7 @@ impl SessionService {
                 // resume admission can order rows against the park (#4092).
                 created_at: chrono::Utc::now().to_rfc3339(),
                 origin_device: origin_device.clone(),
+                origin_plugin: origin_plugin.clone(),
             };
             inst.queued_prompts.push(entry.clone());
             entry
@@ -948,6 +1001,7 @@ impl SessionService {
                 }
                 Some(q) => {
                     q.text = text.clone();
+                    q.origin_plugin = None;
                     EditQueuedOutcome::Updated
                 }
                 None => EditQueuedOutcome::NotFound,
@@ -966,20 +1020,29 @@ impl SessionService {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return false;
         };
+        self.take_queued_prompt(id, prompt_id).await.is_some()
+    }
+
+    /// Remove a queued prompt and its buffered attachments, returning the row. The caller
+    /// holds the session's submission guard.
+    pub(crate) async fn take_queued_prompt(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+    ) -> Option<crate::daemon::QueuedPromptEntry> {
         let prompt_id_cleanup = prompt_id.clone();
-        let removed = self
+        let taken = self
             .mutate_instance_persisted(id, move |inst| {
-                let before = inst.queued_prompts.len();
-                inst.queued_prompts.retain(|q| q.id != prompt_id);
-                inst.queued_prompts.len() != before
+                let at = inst.queued_prompts.iter().position(|q| q.id == prompt_id)?;
+                Some(inst.queued_prompts.remove(at))
             })
             .await
-            .unwrap_or(false);
-        if removed {
+            .flatten();
+        if taken.is_some() {
             self.acp_event_store
                 .delete_pending_attachments_for_ref(id, &prompt_id_cleanup);
         }
-        removed
+        taken
     }
 
     /// Drop every queued prompt for a session, plus every attachment blob buffered for
@@ -1118,9 +1181,15 @@ impl SessionService {
             return;
         }
 
-        // Leading batch up to a clear boundary (mirrors the client's split).
+        // Leading batch up to a clear or compact boundary.
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
+        let caller = match &sub[0].origin_plugin {
+            Some(plugin_id) => SessionCaller::PluginMessage {
+                plugin_id: plugin_id.clone(),
+            },
+            None => caller,
+        };
         let sent_ids: Vec<String> = sub.iter().map(|e| e.id.clone()).collect();
         // Reload every buffered attachment blob for the batch, in queue order, so a queued
         // screenshot/file is forwarded with the text (matches the client's old
@@ -1201,8 +1270,7 @@ impl SessionService {
         .await;
     }
 
-    /// Same lazy per-instance mutex registry as `AppState::instance_lock`; both operate on
-    /// the shared map, so a lock taken through either handle excludes the other.
+    /// Per-session ordering for mirrored queue writes.
     async fn persist_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         {
             let guard = self.persist_locks.read().await;
@@ -1308,7 +1376,7 @@ impl SessionService {
             return Err(TurnAdmissionError::SessionNotFound);
         };
         match caller {
-            SessionCaller::User => Ok(()),
+            SessionCaller::User | SessionCaller::PluginMessage { .. } => Ok(()),
             SessionCaller::Plugin { plugin_id } => {
                 if inst.created_by_plugin.as_deref() == Some(plugin_id.as_str()) {
                     Ok(())
@@ -1336,6 +1404,7 @@ impl SessionService {
     pub(crate) async fn prompt_dispatch_under_submission(
         &self,
         id: &str,
+        text: &str,
         idle_dormant: bool,
         no_revive: bool,
     ) -> crate::acp::dispatch::PromptDispatch {
@@ -1353,7 +1422,16 @@ impl SessionService {
             idle_dormant,
             rate_limit_parked,
         };
-        crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness)
+        let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
+        crate::acp::dispatch::hold_solo_command(dispatch, self.is_solo_command(id, text).await)
+    }
+
+    async fn is_solo_command(&self, id: &str, text: &str) -> bool {
+        let instances = self.instances.read().await;
+        instances.iter().find(|i| i.id == id).is_some_and(|inst| {
+            let agent_key = inst.agent_name.as_deref().unwrap_or(&inst.tool);
+            crate::acp::agent_profiles::resolve(agent_key).is_solo_command(text)
+        })
     }
 
     /// See [`crate::acp::dispatch::WorkerLiveness::rate_limit_parked`].
@@ -1916,6 +1994,7 @@ mod tests {
                     attachments: Vec::new(),
                     prompt_id: None,
                     synthesized: false,
+                    origin_plugin: None,
                 },
             ),
             "publish must reach the event store"
@@ -1934,6 +2013,7 @@ mod tests {
                         name: Some("shot.png".into()),
                         size: 9,
                     }],
+                    None,
                     None,
                 )
                 .await
@@ -1972,7 +2052,14 @@ mod tests {
         // Deliverable text, so the drain reaches `send_turn` rather than
         // retiring an undeliverable husk on the way.
         service
-            .enqueue_prompt("sess-3621", "q1".into(), "follow-up".into(), vec![], None)
+            .enqueue_prompt(
+                "sess-3621",
+                "q1".into(),
+                "follow-up".into(),
+                vec![],
+                None,
+                None,
+            )
             .await
             .expect("session exists");
 
@@ -2025,6 +2112,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn editing_a_queued_prompt_drops_the_plugin_sender() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("edit-origin", "/tmp/aoe-edit-origin");
+        inst.id = "sess-edit-origin".to_string();
+        inst.view = crate::session::View::Structured;
+        let service = service_for(vec![inst]);
+        service
+            .enqueue_prompt(
+                "sess-edit-origin",
+                "q1".into(),
+                "from the plugin".into(),
+                vec![],
+                None,
+                Some("cron".into()),
+            )
+            .await
+            .expect("session exists");
+        let outcome = service
+            .edit_queued_prompt("sess-edit-origin", "q1".into(), "typed by the user".into())
+            .await;
+        assert!(matches!(outcome, EditQueuedOutcome::Updated));
+        let queue = service.queued_prompts_snapshot("sess-edit-origin").await;
+        assert_eq!(queue[0].text, "typed by the user");
+        assert_eq!(queue[0].origin_plugin, None);
+    }
+
+    /// A client restoring its cached queue reposts every row; unchanged ones keep their sender.
+    #[tokio::test]
+    async fn re_enqueueing_unchanged_content_keeps_the_plugin_sender() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("requeue-same", "/tmp/aoe-requeue-same");
+        inst.id = "sess-requeue-same".to_string();
+        inst.view = crate::session::View::Structured;
+        let service = service_for(vec![inst]);
+        let enqueue = |origin: Option<&str>| {
+            service.enqueue_prompt(
+                "sess-requeue-same",
+                "q1".into(),
+                "from the plugin".into(),
+                vec![],
+                None,
+                origin.map(str::to_string),
+            )
+        };
+        enqueue(Some("cron")).await.unwrap();
+        let repost = enqueue(None).await.unwrap();
+        assert_eq!(repost.origin_plugin.as_deref(), Some("cron"));
+    }
+
+    #[tokio::test]
+    async fn re_enqueueing_a_prompt_takes_the_new_sender_not_the_old_one() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("requeue", "/tmp/aoe-requeue-origin");
+        inst.id = "sess-requeue".to_string();
+        inst.view = crate::session::View::Structured;
+        let service = service_for(vec![inst]);
+        let enqueue = |text: &str, origin: Option<&str>| {
+            service.enqueue_prompt(
+                "sess-requeue",
+                "q1".into(),
+                text.into(),
+                vec![],
+                None,
+                origin.map(str::to_string),
+            )
+        };
+        enqueue("from the plugin", Some("cron")).await.unwrap();
+        let replaced = enqueue("typed in the dashboard", None).await.unwrap();
+        assert_eq!(replaced.text, "typed in the dashboard");
+        assert_eq!(replaced.origin_plugin, None);
+        let queue = service.queued_prompts_snapshot("sess-requeue").await;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].origin_plugin, None);
+    }
+
     /// Every queue mutation that can race a delivery waits for it.
     #[tokio::test]
     async fn queue_mutations_wait_for_an_in_flight_delivery() {
@@ -2037,7 +2200,14 @@ mod tests {
         inst.status = crate::session::Status::Idle;
         let service = service_for(vec![inst]);
         service
-            .enqueue_prompt("sess-mut", "q1".into(), "original".into(), vec![], None)
+            .enqueue_prompt(
+                "sess-mut",
+                "q1".into(),
+                "original".into(),
+                vec![],
+                None,
+                None,
+            )
             .await
             .expect("session exists");
 
@@ -2215,6 +2385,7 @@ mod tests {
                 "follow-up behind a live turn".into(),
                 vec![],
                 None,
+                None,
             )
             .await
             .expect("session exists");
@@ -2277,6 +2448,7 @@ mod tests {
                     format!("prompt {i}"),
                     vec![],
                     None,
+                    None,
                 )
                 .await
             }));
@@ -2310,6 +2482,183 @@ mod tests {
         assert_eq!(disk_seqs.len(), 32, "no two persisted rows share a seq");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn queue_persistence_cancellation_and_failure_keep_reload_ordered() {
+        use std::{future::Future, task::Poll, time::Duration};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let ids = |queue: &[crate::daemon::QueuedPromptEntry]| {
+                    queue.iter().map(|q| q.id.clone()).collect::<Vec<_>>()
+                };
+                for cancel in [true, false] {
+                    let mut inst = Instance::new("queue", "/tmp/aoe-queue-terminal");
+                    inst.source_profile = "default".into();
+                    inst.view = crate::session::View::Structured;
+                    let id = inst.id.clone();
+                    let mut seed = inst.clone();
+                    seed.title = "disk title".into();
+                    let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+                    storage.update(|rows, _| {
+                        *rows = vec![seed];
+                        Ok(())
+                    }).unwrap();
+                    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+                    let service = &state.session_service;
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let holder = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    });
+                    entered_rx.await.unwrap();
+                    let mut enqueue = Some(Box::pin(service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None, None)));
+                    std::future::poll_fn(|cx| {
+                        assert!(enqueue.as_mut().unwrap().as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    let read_epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    let stale = storage.load().unwrap();
+                    assert!(stale[0].queued_prompts.is_empty());
+                    let saved_path = storage.sessions_path().with_extension("saved");
+                    let mut successor = if cancel {
+                        drop(enqueue.take());
+                        let mut b = Box::pin(service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None));
+                        std::future::poll_fn(|cx| {
+                            assert!(b.as_mut().poll(cx).is_pending());
+                            Poll::Ready(())
+                        }).await;
+                        Some(b)
+                    } else {
+                        std::fs::rename(storage.sessions_path(), &saved_path).unwrap();
+                        std::fs::create_dir(storage.sessions_path()).unwrap();
+                        None
+                    };
+                    assert_eq!(ids(&service.queued_prompts_snapshot(&id).await), ["A"], "before release, cancel={cancel}");
+                    let mut sampler = Box::pin(service.disk_reload_guard());
+                    std::future::poll_fn(|cx| {
+                        assert!(sampler.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    // Remove the exclusive waiter before polling the successor's shared claim.
+                    drop(sampler);
+                    release_tx.send(()).unwrap();
+                    holder.await.unwrap();
+                    if let Some(a) = enqueue.take() {
+                        assert_eq!(tokio::time::timeout(Duration::from_secs(10), a).await.unwrap().unwrap().id, "A");
+                        std::fs::remove_dir(storage.sessions_path()).unwrap();
+                        std::fs::rename(&saved_path, storage.sessions_path()).unwrap();
+                    }
+                    crate::server::reload::reload_state_instances_from_disk(
+                        &state, stale, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
+                    ).await;
+                    assert_eq!(ids(&service.queued_prompts_snapshot(&id).await), ["A"], "stale reload, cancel={cancel}");
+                    let b = match successor.take() {
+                        Some(b) => tokio::time::timeout(Duration::from_secs(10), b).await.unwrap(),
+                        None => service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None).await,
+                    }.unwrap();
+                    assert_eq!(b.seq, 1);
+                    let guard = tokio::time::timeout(Duration::from_secs(10), service.disk_reload_guard()).await.unwrap();
+                    let epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    let fresh = storage.load().unwrap();
+                    assert_eq!(ids(&fresh[0].queued_prompts), ["A", "B"]);
+                    drop(guard);
+                    crate::server::reload::reload_state_instances_from_disk(
+                        &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, epoch,
+                    ).await;
+                    let memory = state.instances.read().await;
+                    assert_eq!(ids(&memory[0].queued_prompts), ["A", "B"]);
+                    assert_eq!(memory[0].title, "disk title", "fresh reload must apply, cancel={cancel}");
+                    eprintln!("cancel={cancel}: pending sampler excluded; stale reload rejected; fresh reload applied; memory/disk=[A,B]");
+                }
+            });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reload_during_queue_persistence_keeps_acknowledged_prompts() {
+        use std::{future::Future, task::Poll, time::Duration};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let contents = |queue: &[crate::daemon::QueuedPromptEntry]| {
+                    queue.iter().map(|q| (q.id.clone(), q.seq)).collect::<Vec<_>>()
+                };
+                let mut outcomes = Vec::new();
+                for apply_before_completion in [true, false] {
+                    let mut inst = Instance::new("reload-queue", "/tmp/aoe-reload-queue");
+                    inst.source_profile = "default".into();
+                    inst.view = crate::session::View::Structured;
+                    let id = inst.id.clone();
+                    let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+                    storage.update(|rows, _| {
+                        *rows = vec![inst.clone()];
+                        Ok(())
+                    }).unwrap();
+                    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+                    let service = &state.session_service;
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    // Occupy the only blocking thread before the queue writer can run.
+                    let holder = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    });
+                    entered_rx.await.unwrap();
+                    let submission = service.prompt_submission(&id).await;
+                    let mut enqueue = Box::pin(service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None, None));
+                    std::future::poll_fn(|cx| {
+                        assert!(enqueue.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    let read_epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    let fresh = storage.load().unwrap();
+                    assert_eq!(contents(&service.queued_prompts_snapshot(&id).await), [("A".into(), 0)]);
+                    assert!(fresh[0].queued_prompts.is_empty());
+                    let mut reload = Box::pin(crate::server::reload::reload_state_instances_from_disk(
+                        &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
+                    ));
+                    let applied = if apply_before_completion {
+                        std::future::poll_fn(|cx| Poll::Ready(reload.as_mut().poll(cx).is_ready())).await
+                    } else {
+                        false
+                    };
+                    let during = contents(&service.queued_prompts_snapshot(&id).await);
+                    release_tx.send(()).unwrap();
+                    holder.await.unwrap();
+                    let a = tokio::time::timeout(Duration::from_secs(10), enqueue).await.unwrap().unwrap();
+                    assert_eq!(a.id, "A");
+                    assert_eq!(contents(&storage.load().unwrap()[0].queued_prompts), [("A".into(), 0)]);
+                    drop(submission);
+                    if !applied {
+                        tokio::time::timeout(Duration::from_secs(10), reload).await.unwrap();
+                    }
+                    let _submission = service.prompt_submission(&id).await;
+                    service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None).await.unwrap();
+                    let memory = contents(&service.queued_prompts_snapshot(&id).await);
+                    let disk = contents(&storage.load().unwrap()[0].queued_prompts);
+                    eprintln!("apply_before_completion={apply_before_completion}, captured_epoch={read_epoch}, during={during:?}, memory={memory:?}, disk={disk:?}");
+                    outcomes.push((apply_before_completion, during, memory, disk));
+                }
+                for (before, during, memory, disk) in outcomes {
+                    assert_eq!(during, [("A".into(), 0)], "during persistence, before={before}");
+                    assert_eq!(memory, [("A".into(), 0), ("B".into(), 1)], "memory, before={before}");
+                    assert_eq!(disk, [("A".into(), 0), ("B".into(), 1)], "disk, before={before}");
+                }
+            });
+    }
+
     /// A disk reload whose snapshot predates an in-memory row change must not
     /// replace that change with the stale disk row.
     #[tokio::test]
@@ -2330,7 +2679,7 @@ mod tests {
                 false,
                 |s| {
                     Box::pin(async move {
-                        s.enqueue_prompt("s", "p".into(), "t".into(), vec![], None)
+                        s.enqueue_prompt("s", "p".into(), "t".into(), vec![], None, None)
                             .await;
                     })
                 },
@@ -2401,11 +2750,11 @@ mod tests {
 
         // Enqueue two.
         let a = service
-            .enqueue_prompt("sess-q", "a".into(), "first".into(), vec![], None)
+            .enqueue_prompt("sess-q", "a".into(), "first".into(), vec![], None, None)
             .await
             .expect("session exists");
         let b = service
-            .enqueue_prompt("sess-q", "b".into(), "second".into(), vec![], None)
+            .enqueue_prompt("sess-q", "b".into(), "second".into(), vec![], None, None)
             .await
             .expect("session exists");
         assert_eq!((a.seq, b.seq), (0, 1));
@@ -2417,7 +2766,14 @@ mod tests {
 
         // Re-enqueue by the same id is an idempotent update, not a duplicate.
         let a2 = service
-            .enqueue_prompt("sess-q", "a".into(), "first edited".into(), vec![], None)
+            .enqueue_prompt(
+                "sess-q",
+                "a".into(),
+                "first edited".into(),
+                vec![],
+                None,
+                None,
+            )
             .await
             .expect("session exists");
         assert_eq!(a2.seq, 0, "re-enqueue keeps the original seq");
@@ -2466,7 +2822,7 @@ mod tests {
 
         // A gone session is a None/no-op, never a panic.
         assert!(service
-            .enqueue_prompt("sess-gone", "z".into(), "x".into(), vec![], None)
+            .enqueue_prompt("sess-gone", "z".into(), "x".into(), vec![], None, None)
             .await
             .is_none());
     }
@@ -2481,6 +2837,7 @@ mod tests {
             attachments: vec![],
             created_at: "t".into(),
             origin_device: None,
+            origin_plugin: None,
         };
         // claude's profile clears with "/clear".
         let claude = crate::acp::agent_profiles::resolve("claude");
@@ -2510,6 +2867,15 @@ mod tests {
         assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["c"]);
         assert_eq!(combined, "/clear");
 
+        // A compact command splits the batch the same way.
+        let q = vec![entry("a", 0, "one"), entry("c", 1, "/compact focus")];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(combined, "one");
+        let q = vec![entry("c", 0, "/compact"), entry("a", 1, "one")];
+        let (sub, _) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.len(), 1);
+
         // No clear anywhere.
         let q = vec![
             entry("a", 0, "one"),
@@ -2519,5 +2885,52 @@ mod tests {
         let (sub, combined) = queue_drain_batch(&q, claude);
         assert_eq!(sub.len(), 3);
         assert_eq!(combined, "one\n\nthree");
+    }
+
+    #[test]
+    fn queue_drain_batch_never_merges_across_an_origin_boundary() {
+        use crate::daemon::QueuedPromptEntry;
+        let entry = |id: &str, seq: u64, origin: Option<&str>| QueuedPromptEntry {
+            id: id.into(),
+            seq,
+            text: id.into(),
+            attachments: vec![],
+            created_at: "t".into(),
+            origin_device: None,
+            origin_plugin: origin.map(str::to_string),
+        };
+        let profile = crate::acp::agent_profiles::resolve("claude");
+        let q = vec![
+            entry("a", 0, None),
+            entry("b", 1, Some("cron")),
+            entry("c", 2, Some("cron")),
+            entry("d", 3, Some("other")),
+        ];
+        let ids = |sub: &[QueuedPromptEntry]| sub.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(queue_drain_batch(&q, profile).0), ["a"]);
+        assert_eq!(ids(queue_drain_batch(&q[1..], profile).0), ["b", "c"]);
+        assert_eq!(ids(queue_drain_batch(&q[3..], profile).0), ["d"]);
+    }
+
+    #[tokio::test]
+    async fn plugin_message_caller_reaches_any_session_but_a_plugin_caller_stays_owner_gated() {
+        let mut foreign = Instance::new("user-owned", "/tmp/aoe-msg-caller");
+        foreign.id = "sess-foreign".to_string();
+        let service = service_for(vec![foreign]);
+        let message = SessionCaller::PluginMessage {
+            plugin_id: "cron".to_string(),
+        };
+        let owner = SessionCaller::Plugin {
+            plugin_id: "cron".to_string(),
+        };
+        assert_eq!(service.admits_turn(&message, "sess-foreign").await, Ok(()));
+        assert_eq!(
+            service.admits_turn(&owner, "sess-foreign").await,
+            Err(TurnAdmissionError::NotOwner)
+        );
+        assert_eq!(
+            service.admits_turn(&message, "missing").await,
+            Err(TurnAdmissionError::SessionNotFound)
+        );
     }
 }

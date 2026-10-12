@@ -38,11 +38,24 @@ pub fn session_entries<'a>(
         .filter(move |e| e.slot == slot && e.session_id.as_deref() == Some(session_id))
 }
 
+/// The object a badge renders from. With `items` (web shows those instead of
+/// the top-level fields) it is the first item with text, since the TUI cannot
+/// cycle; otherwise the payload itself.
+fn badge_source(entry: &UiEntry) -> Option<&Value> {
+    match entry.payload.get("items").and_then(Value::as_array) {
+        Some(items) => items.iter().find(|i| {
+            i.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.trim().is_empty())
+        }),
+        None => Some(&entry.payload),
+    }
+}
+
 /// The renderable `text` of a `StatusBar` / `DetailBadge` entry. Defensive: the
 /// daemon validates payloads, but a skewed entry must not panic the renderer.
 pub fn entry_text(entry: &UiEntry) -> Option<&str> {
-    entry
-        .payload
+    badge_source(entry)?
         .get("text")
         .and_then(|v| v.as_str())
         .map(str::trim)
@@ -51,8 +64,7 @@ pub fn entry_text(entry: &UiEntry) -> Option<&str> {
 
 /// The entry's tone, if it carries a valid one.
 pub fn entry_tone(entry: &UiEntry) -> Option<Tone> {
-    entry
-        .payload
+    badge_source(entry)?
         .get("tone")
         .and_then(|v| serde_json::from_value::<Tone>(v.clone()).ok())
 }
@@ -265,6 +277,15 @@ fn block_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>
             )],
             None => vec![],
         },
+        // The TUI cannot render rich markdown: show the source, markers kept.
+        Some("markdown") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_end()
+            .lines()
+            .map(|l| indented_line(indent, l.to_string(), tone_style(block_tone(block), theme)))
+            .collect(),
         Some("divider") => vec![indented_line(
             indent,
             "─".repeat(DIVIDER_WIDTH),
@@ -769,6 +790,24 @@ mod tests {
     }
 
     #[test]
+    fn items_only_badge_renders_its_first_item() {
+        let snap = snapshot(
+            json!([
+                {"plugin_id": "p", "slot": "status-bar", "id": "u", "payload": {"items": [
+                    {"icon": "gauge"},
+                    {"text": "5h 40%", "tone": "warn", "group": "usage"},
+                    {"text": "7d 12%", "group": "usage"}
+                ]}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "t", "payload": {"text": "top", "items": [{"text": "item"}]}}
+            ]),
+            json!([]),
+        );
+        let texts: Vec<Option<&str>> = snap.entries.iter().map(entry_text).collect();
+        assert_eq!(texts, vec![Some("5h 40%"), Some("item")]);
+        assert_eq!(entry_tone(&snap.entries[0]), Some(Tone::Warn));
+    }
+
+    #[test]
     fn new_notifications_filters_by_seq_and_session_in_order() {
         assert_eq!(max_notification_seq(&snapshot(json!([]), json!([]))), 0);
         let snap = snapshot(
@@ -937,6 +976,14 @@ mod tests {
                     &divider,
                     "[action] Refresh",
                 ],
+            ),
+            (
+                "markdown keeps its source markers, one line per source line",
+                pane_entry(json!({"blocks": [
+                    {"kind": "markdown", "text": "# Title\n\n- [x] done\n- `code`\n\n", "tone": "info"},
+                    {"kind": "markdown"}
+                ]})),
+                vec!["p", "# Title", "", "- [x] done", "- `code`"],
             ),
             (
                 "nested section indents",

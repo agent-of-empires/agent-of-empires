@@ -125,7 +125,7 @@ mod tests {
         }
     }
 
-    /// Emits the `/compact` start marker then goes silent, as
+    /// Opens a typed `/compact` compaction then goes silent, as
     /// claude-agent-acp does while summarizing. It answers
     /// `_session/steering` with a normal success, so a daemon that DID steer
     /// would look like it worked; the test proves nothing was sent.
@@ -152,7 +152,7 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"outcome":"injected"}}\n' "$id"
       ;;
     *'"method":"session/prompt"'*)
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting..."}}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"compaction_update","compactionId":"c-1","status":"in_progress"}}}\n'
       while [ -d "__DIR__" ] && [ ! -f "$CAPTURE.prompt-release" ]; do sleep 0.01; done
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       ;;

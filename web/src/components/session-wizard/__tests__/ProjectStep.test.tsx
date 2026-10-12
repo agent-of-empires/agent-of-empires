@@ -5,33 +5,33 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 
 import { ProjectStep } from "../steps/ProjectStep";
 import { initialData, type WizardData } from "../wizardReducer";
-import type { AgentInfo, ClaudeSessionSummary, ProjectInfo } from "../../../lib/types";
+import type { AgentInfo, ImportableSession, ProjectInfo } from "../../../lib/types";
 import type { RecentProjectEntry } from "../../../lib/api";
 import { agent, mockSession } from "./fixtures";
 
 vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn(),
   fetchRecentProjects: vi.fn(),
-  fetchProjects: vi.fn(),
+  fetchProjectRegistry: vi.fn(),
   cloneRepo: vi.fn(),
   getHomePath: vi.fn(),
   browseFilesystem: vi.fn(),
-  listClaudeSessions: vi.fn(),
+  listImportableSessions: vi.fn(),
 }));
 
 import {
   browseFilesystem,
-  fetchProjects,
+  fetchProjectRegistry,
   fetchRecentProjects,
   fetchSessions,
   getHomePath,
-  listClaudeSessions,
+  listImportableSessions,
 } from "../../../lib/api";
 
 beforeEach(() => {
   vi.mocked(fetchSessions).mockResolvedValue({ sessions: [], workspace_ordering: [] });
   vi.mocked(fetchRecentProjects).mockResolvedValue({ projects: [] });
-  vi.mocked(fetchProjects).mockResolvedValue([]);
+  vi.mocked(fetchProjectRegistry).mockResolvedValue([]);
   vi.mocked(getHomePath).mockResolvedValue(null);
   vi.mocked(browseFilesystem).mockResolvedValue({ ok: false, entries: [] } as never);
 });
@@ -44,15 +44,18 @@ afterEach(() => {
 function renderStep(data: Partial<WizardData> = {}, props: { initialTab?: "import"; agents?: AgentInfo[] } = {}) {
   const onChange = vi.fn();
   const onPicked = vi.fn();
-  render(<ProjectStep data={{ ...initialData, ...data }} onChange={onChange} onPicked={onPicked} {...props} />);
-  return { onChange, onPicked };
+  const step = (d: Partial<WizardData>) => (
+    <ProjectStep data={{ ...initialData, ...d }} onChange={onChange} onPicked={onPicked} {...props} />
+  );
+  const { rerender } = render(step(data));
+  return { onChange, onPicked, rerender: (d: Partial<WizardData>) => rerender(step(d)) };
 }
 
 const sessions = (...list: ReturnType<typeof mockSession>[]) =>
   vi.mocked(fetchSessions).mockResolvedValue({ sessions: list, workspace_ordering: [] });
 const savedProjects = (...paths: string[]) =>
   vi
-    .mocked(fetchProjects)
+    .mocked(fetchProjectRegistry)
     .mockResolvedValue(
       paths.map((path) => ({ name: path.split("/").pop()!, path, scope: "global", pinned: false }) as ProjectInfo),
     );
@@ -119,8 +122,8 @@ describe("recent and saved projects", () => {
     expect(onPicked).toHaveBeenCalledTimes(1);
   });
 
-  it("reports each selection's saved worktree override, undefined when there is none", async () => {
-    vi.mocked(fetchProjects).mockResolvedValue([
+  it("reports each selection's saved overrides, undefined when there are none", async () => {
+    vi.mocked(fetchProjectRegistry).mockResolvedValue([
       { name: "alpha", path: "/repo/alpha", scope: "global", pinned: false, overrides: { worktree_enabled: true } },
       { name: "beta", path: "/repo/beta", scope: "global", pinned: false },
     ] as ProjectInfo[]);
@@ -128,7 +131,21 @@ describe("recent and saved projects", () => {
     render(<ProjectStep data={initialData} onChange={vi.fn()} onSelectSavedProject={onSelectSavedProject} />);
     fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
     fireEvent.click((await screen.findByText("/repo/beta")).closest("button")!);
-    expect(onSelectSavedProject.mock.calls).toEqual([[true], [undefined]]);
+    expect(onSelectSavedProject.mock.calls).toEqual([
+      [{ worktree_enabled: true }, "/repo/alpha"],
+      [undefined, "/repo/beta"],
+    ]);
+  });
+
+  it("reports null, not undefined, when the registry could not be loaded", async () => {
+    vi.mocked(fetchRecentProjects).mockResolvedValue({
+      projects: [{ path: "/repo/alpha", display_name: "alpha", last_used_at: null, tool: "claude" }],
+    } as Awaited<ReturnType<typeof fetchRecentProjects>>);
+    vi.mocked(fetchProjectRegistry).mockResolvedValue(null);
+    const onSelectSavedProject = vi.fn();
+    render(<ProjectStep data={initialData} onChange={vi.fn()} onSelectSavedProject={onSelectSavedProject} />);
+    fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
+    expect(onSelectSavedProject.mock.calls).toEqual([[null, "/repo/alpha"]]);
   });
 
   it("falls back to the Browse tab with nothing to pick", async () => {
@@ -180,30 +197,39 @@ describe("project search", () => {
   });
 });
 
-describe("Import from Claude tab", () => {
-  const SESSIONS: ClaudeSessionSummary[] = [
+describe("Import session tab", () => {
+  const SESSIONS: ImportableSession[] = [
     {
       session_id: "713b",
       cwd: "/Users/me/alpha",
       title: "Fix the spinner bug",
-      last_modified_ms: 1_700_000_000_000,
+      updated_at: "2023-11-14T22:13:20.000Z",
       cwd_exists: true,
     },
     {
       session_id: "dead",
       cwd: "/Users/me/gone",
       title: "Old work",
-      last_modified_ms: 1_600_000_000_000,
+      updated_at: "2020-09-13T12:26:40.000Z",
       cwd_exists: false,
     },
   ];
   const CLAUDE = agent("claude", { acp_installed: true, acp_command: "claude-agent-acp" });
+  const PI = agent("pi", { acp_installed: true, acp_command: "pi-acp" });
   const renderImport = (importAcpSessionId = "", agents = [CLAUDE]) =>
     renderStep({ importAcpSessionId }, { initialTab: "import", agents });
   const row = async (title: string) => (await screen.findByText(title)).closest("button") as HTMLButtonElement;
+  const listed = (sessions: ImportableSession[], truncated = false) =>
+    vi.mocked(listImportableSessions).mockResolvedValue({ ok: true, sessions, truncated });
+  const agentSelect = () => screen.getByLabelText("Agent to import from") as HTMLSelectElement;
 
   beforeEach(() => {
-    vi.mocked(listClaudeSessions).mockResolvedValue(SESSIONS);
+    localStorage.clear();
+    listed(SESSIONS);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("hides missing-cwd sessions until toggled, then shows them disabled", async () => {
@@ -215,7 +241,7 @@ describe("Import from Claude tab", () => {
     expect((await row("Old work")).disabled).toBe(true);
   });
 
-  it("selecting a session prefills a structured claude import", async () => {
+  it("selecting a session prefills a structured import for the chosen agent", async () => {
     const { onChange } = renderImport();
     fireEvent.click(await row("Fix the spinner bug"));
     expect(Object.fromEntries(onChange.mock.calls)).toMatchObject({
@@ -224,19 +250,90 @@ describe("Import from Claude tab", () => {
       tool: "claude",
       useStructuredView: true,
       useWorktree: false,
+      sandboxEnabled: false,
     });
   });
 
   it("highlights the selected session and filters by title", async () => {
     renderImport("713b");
     expect((await row("Fix the spinner bug")).getAttribute("aria-pressed")).toBe("true");
-    fireEvent.change(screen.getByLabelText("Filter Claude sessions"), { target: { value: "zzznomatch" } });
+    fireEvent.change(screen.getByLabelText("Filter sessions"), { target: { value: "zzznomatch" } });
     await waitFor(() => expect(screen.queryByText("Fix the spinner bug")).toBeNull());
   });
 
-  it("is not offered without claude-agent-acp", async () => {
+  it("is not offered without an installed ACP adapter", async () => {
     renderImport("", [{ ...CLAUDE, acp_installed: false }]);
     await Promise.resolve();
-    expect(screen.queryByLabelText("Filter Claude sessions")).toBeNull();
+    expect(screen.queryByText("Import session")).toBeNull();
+    expect(screen.queryByLabelText("Agent to import from")).toBeNull();
+  });
+
+  it("preselects claude, else the first agent, and remembers the last pick", async () => {
+    renderImport("", [PI, CLAUDE]);
+    await screen.findByText("Fix the spinner bug");
+    expect(agentSelect().value).toBe("claude");
+    expect(listImportableSessions).toHaveBeenLastCalledWith("claude", undefined);
+
+    fireEvent.change(agentSelect(), { target: { value: "pi" } });
+    await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("pi", undefined));
+    cleanup();
+
+    renderImport("", [PI, CLAUDE]);
+    await screen.findByText("Fix the spinner bug");
+    expect(agentSelect().value).toBe("pi");
+    cleanup();
+
+    localStorage.clear();
+    renderImport("", [PI]);
+    await screen.findByText("Fix the spinner bug");
+    expect(agentSelect().value).toBe("pi");
+  });
+
+  it("lists from the selected profile and relists when it changes", async () => {
+    const { rerender } = renderStep({ profile: "work" }, { initialTab: "import", agents: [CLAUDE] });
+    await screen.findByText("Fix the spinner bug");
+    expect(listImportableSessions).toHaveBeenLastCalledWith("claude", "work");
+    rerender({ profile: "home" });
+    await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("claude", "home"));
+  });
+
+  it("says when the agent cannot list or the list was cut", async () => {
+    vi.mocked(listImportableSessions).mockResolvedValue({
+      ok: false,
+      error: "list_unsupported",
+      message: "agent does not advertise session/list and session/load",
+    });
+    renderImport();
+    expect(await screen.findByText("This agent can't list sessions.")).toBeTruthy();
+    cleanup();
+
+    listed(SESSIONS, true);
+    renderImport();
+    expect(await screen.findByText("Showing newest 200.")).toBeTruthy();
+  });
+
+  it("asks before importing a recent session or one with unknown activity", async () => {
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    listed([
+      { session_id: "recent", cwd: "/p", title: "Recent work", updated_at: recent, cwd_exists: true },
+      { session_id: "unknown", cwd: "/p", title: "Unknown work", updated_at: null, cwd_exists: true },
+    ]);
+    const confirm = vi.spyOn(window, "confirm");
+    for (const title of ["Recent work", "Unknown work"]) {
+      cleanup();
+      const { onChange } = renderImport();
+      confirm.mockReturnValueOnce(false);
+      fireEvent.click(await row(title));
+      expect(onChange).not.toHaveBeenCalled();
+      confirm.mockReturnValueOnce(true);
+      fireEvent.click(await row(title));
+      expect(Object.fromEntries(onChange.mock.calls)).toMatchObject({ path: "/p" });
+    }
+    expect(confirm.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringMatching(/^This session may still be open elsewhere\. /),
+      expect.stringMatching(/^This session may still be open elsewhere\. /),
+      expect.stringMatching(/^This session's last activity is unknown\. /),
+      expect.stringMatching(/^This session's last activity is unknown\. /),
+    ]);
   });
 });

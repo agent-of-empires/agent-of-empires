@@ -52,6 +52,7 @@ mod dialog_mouse;
 mod divider_drag;
 mod footer_toolbar;
 mod fork_rename_dialogs;
+mod hide_stopped;
 mod keys_and_nav;
 mod live_send_boot_size_tests;
 mod live_send_mode;
@@ -68,6 +69,7 @@ mod scroll_pane_isolation;
 mod search;
 mod session_feed_tests;
 mod settings_scroll_wiring;
+mod shortcut_bar;
 mod sidebar_position;
 mod stacked_single_seam;
 mod status_rows_menu;
@@ -279,6 +281,7 @@ fn earn_tip(env: &mut TestEnv) {
 fn create_test_env_with_group_sessions() -> TestEnv {
     let mut sandboxed = instance_in("work-session-2", "/tmp/work2", "work");
     sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
         enabled: true,
         container_id: None,
         image: "ubuntu:latest".to_string(),
@@ -338,7 +341,7 @@ fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
 /// Flatten a rendered row into its plain text, dropping styling.
 fn rendered_row_text(view: &HomeView, item: &Item) -> String {
     let theme = crate::tui::styles::Theme::default();
-    view.render_item_line(item, false, false, &theme, 200)
+    view.render_item_line(item, false, false, &theme, 200, view.favorite_gutter())
         .spans
         .iter()
         .map(|s| s.content.as_ref())
@@ -409,6 +412,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
     NewSessionData {
         profile: "default".to_string(),
         title: title.to_string(),
+        title_typed: false,
         path: project_dir.to_str().unwrap().to_string(),
         group: group.to_string(),
         tool: "claude".to_string(),

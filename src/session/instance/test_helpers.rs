@@ -236,6 +236,7 @@ pub(super) const SIDECAR_TEST_FRESH_UUID: &str = "11111111-2222-4333-8444-555555
 
 pub(super) fn test_sandbox(name: &str, workdir: Option<&str>) -> SandboxInfo {
     SandboxInfo {
+        provider: None,
         enabled: true,
         container_id: None,
         image: "test-image".to_string(),
@@ -264,4 +265,68 @@ pub(super) fn admit_sandbox_fixture(inst: &Instance) {
         )
         .unwrap();
     }
+}
+
+/// A live host Claude row under `root` whose launch reserved `sid` and whose
+/// sidecar never confirmed it.
+pub(super) fn reserved_claude_instance(root: &std::path::Path, sid: &str) -> Instance {
+    let cwd = root.join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let execution = ExecutionBinding {
+        agent: "claude".into(),
+        stores: vec![root.join("claude-store")],
+        configuration: Vec::new(),
+        cwd: cwd.clone(),
+        cwd_filesystem: "host".into(),
+        filesystem: "host".into(),
+        exported_default_store: None,
+    };
+    let mut instance = Instance::new("reserved-claude", cwd.to_str().unwrap());
+    instance.tool = "claude".into();
+    instance.active_execution = Some(ActiveExecution {
+        launch_id: uuid::Uuid::new_v4().to_string(),
+        binding: execution.clone(),
+        capture: None,
+        container: None,
+    });
+    instance.set_agent_conversation(
+        Some(sid.into()),
+        Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(execution),
+            provenance: ConversationProvenance::Preallocated,
+            transcript_path: None,
+        }),
+        None,
+    );
+    instance
+}
+
+/// Write `sid`'s transcript into the store and cwd `instance` was launched with.
+pub(super) fn write_reserved_claude_transcript(instance: &Instance, sid: &str) {
+    let execution = &instance.active_execution.as_ref().unwrap().binding;
+    let dir = execution.stores[0].join("projects").join(
+        crate::session::capture::encode_claude_project_path(&execution.cwd.to_string_lossy()),
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+}
+
+/// Seed a resumable Claude conversation in the isolated native store.
+pub(super) fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
+    let home = std::env::var("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| dirs::home_dir().expect("home dir").join(".claude"));
+    let canonical = std::fs::canonicalize(&instance.project_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&instance.project_path));
+    let dir = home
+        .join("projects")
+        .join(crate::session::capture::encode_claude_project_path(
+            &canonical.to_string_lossy(),
+        ));
+    std::fs::create_dir_all(&dir).expect("create claude project dir");
+    std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
+    let binding = instance.asserted_resume_binding(sid, None).unwrap();
+    instance.set_agent_conversation(Some(sid.into()), Some(binding), None);
 }

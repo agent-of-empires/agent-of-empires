@@ -5,7 +5,6 @@ import type { Workspace } from "../../lib/types";
 import {
   attachSessionProject,
   createSession,
-  fetchProjects,
   renameSession,
   setSessionColor,
   setSessionNotifications,
@@ -90,7 +89,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   };
 
   const [modal, setModal] = useState<Modal>(null);
-  const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
@@ -133,12 +131,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     notify: setNotify,
     color: setColor,
   };
-  const openAddProject = () => {
-    actions.addProject();
-    void fetchProjects().then((projects) =>
-      setAddProjectOptions(projects.map((p) => ({ name: p.name, path: p.path }))),
-    );
-  };
 
   if (renaming) {
     return (
@@ -169,14 +161,17 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         ? "text-text-primary"
         : "text-text-secondary";
   const navigationSessionId = navigationSession?.id ?? null;
+  const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
 
   return (
     <>
       <a
         ref={rowRef}
-        href={navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/"}
+        href={sessionPath}
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
+        aria-current={isActive && sessionPath === window.location.pathname ? "page" : undefined}
+        data-active-session-row={isActive || undefined}
         data-testid="sidebar-session-row"
         title={model.needsAttention ? `${label} · ${model.attentionHint}` : label}
         draggable={false}
@@ -196,7 +191,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-6 pr-3" : "px-3"
-        } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
+        } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500`}
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
@@ -222,7 +217,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           </span>
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.isFavorited || model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}
+              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
               {sessionColorsEnabled && model.sessionColorDot && (
                 <span
@@ -239,8 +234,8 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 </span>
               )}
               {!compact && model.isFavorited && (
-                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-amber-300">
-                  *
+                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-favorite">
+                  ✦
                 </span>
               )}
               <span className="truncate" title={label}>
@@ -291,7 +286,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
               readOnly={readOnly}
               colorsEnabled={sessionColorsEnabled}
               unreadEnabled={unreadIndicatorEnabled}
-              actions={{ ...actions, addProject: openAddProject }}
+              actions={actions}
             />
           )}
         </ContextMenu>
@@ -300,7 +295,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         modal={modal}
         setModal={setModal}
         model={model}
-        addProjectOptions={addProjectOptions}
         onSnooze={(minutes) => {
           closeMenu();
           setModal(null);
@@ -381,13 +375,11 @@ function RowModals({
   modal,
   setModal,
   model,
-  addProjectOptions,
   onSnooze,
 }: {
   modal: Modal;
   setModal: (m: Modal) => void;
   model: RowModel;
-  addProjectOptions: { name: string; path: string }[];
   onSnooze: (minutes: number) => void;
 }) {
   const { label, sessionId } = model;
@@ -426,7 +418,6 @@ function RowModals({
     return createPortal(
       <AddProjectModal
         title={label}
-        projects={addProjectOptions}
         onCancel={close}
         onDone={close}
         onSubmit={(project, attachExistingBranch) => attachSessionProject(sessionId, project, { attachExistingBranch })}

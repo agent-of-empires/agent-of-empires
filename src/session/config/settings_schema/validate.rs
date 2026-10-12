@@ -202,9 +202,20 @@ fn validate_object_list(
         }
         for field in fields {
             match obj.get(&field.field) {
-                Some(v) => validate_value(&field.validation, v).map_err(|e| {
-                    ValidationError::new(format!("item {i} field {:?}: {}", field.field, e.reason))
-                })?,
+                Some(v) => {
+                    validate_value(&field.validation, v).map_err(|e| {
+                        ValidationError::new(format!(
+                            "item {i} field {:?}: {}",
+                            field.field, e.reason
+                        ))
+                    })?;
+                    if field.required && v.as_array().is_some_and(Vec::is_empty) {
+                        return Err(ValidationError::new(format!(
+                            "item {i} required field {:?} must not be empty",
+                            field.field
+                        )));
+                    }
+                }
                 None if field.required => {
                     return Err(ValidationError::new(format!(
                         "item {i} is missing required field {:?}",
@@ -457,5 +468,29 @@ mod tests {
         for (kind, value, ok) in cases {
             assert_eq!(validate_value(kind, &value).is_ok(), ok, "{kind:?} {value}");
         }
+    }
+
+    #[test]
+    fn object_list_rejects_empty_array_only_for_required_fields() {
+        let list_field = |required| ObjectFieldDescriptor {
+            field: "match".into(),
+            label: "Match".into(),
+            description: String::new(),
+            required,
+            widget: super::super::ObjectFieldWidget::List,
+            validation: ValidationKind::StringListValue,
+            default: None,
+        };
+        let validation = |required| ValidationKind::ObjectList {
+            id_field: "id".into(),
+            fields: vec![list_field(required)],
+            min_items: None,
+            max_items: None,
+        };
+        let empty = json!([{"id": "a", "match": []}]);
+        let filled = json!([{"id": "a", "match": ["x"]}]);
+        assert!(validate_value(&validation(true), &empty).is_err());
+        assert!(validate_value(&validation(true), &filled).is_ok());
+        assert!(validate_value(&validation(false), &empty).is_ok());
     }
 }

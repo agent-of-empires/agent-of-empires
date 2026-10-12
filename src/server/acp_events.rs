@@ -1,6 +1,6 @@
 //! The ACP event listener.
 
-use crate::server::push::StatusChange;
+use crate::server::push::{publish_status_change, StatusChange};
 use crate::session::Instance;
 use crate::session::Status;
 use std::sync::Arc;
@@ -223,7 +223,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     &agent_prose,
                 );
                 tokio::spawn(async move {
-                    crate::session::smart_rename::try_smart_rename(
+                    // Failures are logged in run_oneshot and retried on a later turn.
+                    let _ = crate::session::smart_rename::try_smart_rename(
                         state_for_rename,
                         session_id,
                         crate::session::smart_rename::SmartRenameInput {
@@ -578,13 +579,7 @@ pub(crate) fn apply_status_intent(
     } else {
         None
     };
-    let _ = status_tx.send(StatusChange {
-        instance_id: inst.id.clone(),
-        instance_title: inst.title.clone(),
-        old: prev,
-        new: target,
-        at: now,
-    });
+    publish_status_change(status_tx, inst, prev);
 }
 
 /// Whether a structured row whose ACP status just moved should take the automatic unread
@@ -1236,6 +1231,7 @@ mod tests {
             attachments: Vec::new(),
             prompt_id: None,
             synthesized: false,
+            origin_plugin: None,
         };
         let stopped = || Event::Stopped {
             reason: "prompt_complete".into(),
@@ -1642,6 +1638,7 @@ mod tests {
                     attachments: Vec::new(),
                     prompt_id: None,
                     synthesized: false,
+                    origin_plugin: None,
                 },
                 Event::BackgroundAgentLaunched {
                     agent_id: "bg-1".into(),
@@ -1898,6 +1895,7 @@ mod tests {
                     text: "hi".into(),
                     attachments: Vec::new(),
                     synthesized: false,
+                    origin_plugin: None,
                 },
                 set(Status::Running),
             ),
@@ -2051,6 +2049,7 @@ mod tests {
                 text: "spawn and go".into(),
                 attachments: Vec::new(),
                 synthesized: false,
+                origin_plugin: None,
             })
             .unwrap();
         state
@@ -2117,6 +2116,18 @@ mod tests {
     fn apply(inst: &mut Instance, intent: StatusIntent) {
         let tx = broadcast::channel(8).0;
         apply_status_intent(inst, Some(intent), &tx);
+    }
+
+    /// Consumers scope a change by profile after the row may be gone, so the published change
+    /// carries the profile it was made under.
+    #[test]
+    fn apply_status_intent_publishes_the_effective_profile() {
+        let mut inst = stopped_structured_instance();
+        inst.source_profile = "work".to_string();
+        inst.status = Status::Idle;
+        let (tx, mut rx) = broadcast::channel(8);
+        apply_status_intent(&mut inst, Some(StatusIntent::Set(Status::Running)), &tx);
+        assert_eq!(rx.try_recv().unwrap().effective_profile, "work");
     }
 
     /// A `sessions.turn.send` revival marks the row pending before the wake; `HealError`'s
@@ -2250,6 +2261,7 @@ mod tests {
                     text: "go".into(),
                     attachments: Vec::new(),
                     synthesized: false,
+                    origin_plugin: None,
                 },
                 Status::Running,
             ),

@@ -61,7 +61,7 @@ impl ForkDenied {
     pub fn user_message(&self, title: &str, id: &str, profile: &str) -> String {
         match self {
             Self::AgentCannotFork { agent } => format!(
-                "Nothing to fork: session '{title}' runs agent '{agent}', which has no native fork capability. Forkable agents: claude, codex, opencode."
+                "Nothing to fork: session '{title}' runs agent '{agent}', which has no native fork capability. Forkable agents: claude, codex, opencode, pi."
             ),
             Self::NoParentSession => format!(
                 "Nothing to fork: session '{title}' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
@@ -336,13 +336,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pi_forks_terminal_conversations_but_not_structured_sessions() {
+        let mut parent = bound(ConversationProvenance::Observed);
+        parent.execution.as_mut().unwrap().agent = "pi".into();
+        let seed = terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into())
+            .expect("a qualified Pi conversation can fork");
+        assert_eq!(
+            seed,
+            ForkSeed::Terminal {
+                parent: Box::new(parent.clone()),
+                child_session_id: "child-uuid".into(),
+                unattributed_parent_agent: None,
+            }
+        );
+        assert!(!structured_fork_capable("pi", None));
+        assert!(!structured_fork_capable("custom", Some("pi")));
+        assert!(structured_fork_capable("claude", None));
+    }
+
     /// A binding a migration left unattributed forks when the row's own agent
     /// can, and is refused naming that agent when it cannot; the binding is
     /// carried through untouched, so the child still launches unattributed.
     #[test]
     fn an_unattributed_parent_forks_on_the_rows_own_agent() {
         let binding = ConversationBinding::unknown("parent-uuid");
-        for (agent, forked) in [("claude", true), ("gemini", false)] {
+        for (agent, forked) in [("claude", true), ("pi", true), ("gemini", false)] {
             let seed = terminal_fork_seed(
                 Some(ForkParentRef::Unattributed {
                     binding: &binding,

@@ -101,6 +101,7 @@ fn with_workspace(mut inst: Instance) -> Instance {
 
 fn with_sandbox(mut inst: Instance) -> Instance {
     inst.sandbox_info = Some(SandboxInfo {
+        provider: None,
         enabled: true,
         container_id: None,
         image: "secret-internal-image:latest".to_string(),

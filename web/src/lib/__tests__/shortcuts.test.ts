@@ -5,11 +5,12 @@ import {
   type ShortcutDef,
   type ShortcutKeyEvent,
   formatHelpShortcut,
-  formatTourShortcut,
   matchShortcut,
+  formatTourShortcut,
 } from "../shortcuts";
 import { TOUR_STEPS } from "../tourSteps";
 
+// Ctrl+Q matches only while an embedded terminal or structured composer owns focus; bare keys remain textless.
 const ev = (partial: Partial<ShortcutKeyEvent>): ShortcutKeyEvent => ({
   key: "",
   code: "",
@@ -25,79 +26,287 @@ describe("SHORTCUTS registry", () => {
     expect(new Set(SHORTCUTS.map((s) => s.id)).size).toBe(SHORTCUTS.length);
     for (const s of SHORTCUTS) expect(SHORTCUTS_BY_ID[s.id]).toBe(s);
   });
+});
 
-  it("every tour shortcut hint resolves to a registered shortcut", () => {
+describe("label formatting (locked byte-for-byte against pre-refactor output)", () => {
+  const helpMac: Record<string, string> = {
+    palette: "⌘K",
+    sidebar: "⌘B",
+    sidebarFocus: "⌃Q",
+    rightPanel: "⌘⌥B",
+    terminalFocus: "⌘`",
+    new: "n",
+    newScratch: "⌘⇧N",
+    jumpAttention: "a",
+    diff: "D",
+    settings: "s",
+    escape: "Esc",
+    help: "?",
+  };
+  const helpOther: Record<string, string> = {
+    palette: "CtrlK",
+    sidebar: "CtrlB",
+    sidebarFocus: "CtrlQ",
+    rightPanel: "CtrlAltB",
+    terminalFocus: "Ctrl`",
+    new: "n",
+    newScratch: "CtrlShiftN",
+    jumpAttention: "a",
+    diff: "D",
+    settings: "s",
+    escape: "Esc",
+    help: "?",
+  };
+  const tour: Record<string, string> = {
+    palette: "⌘K / Ctrl+K",
+    sidebar: "⌘B / Ctrl+B",
+    sidebarFocus: "⌃Q / Ctrl+Q",
+    rightPanel: "⌘⌥B / Ctrl+Alt+B",
+    terminalFocus: "⌘` / Ctrl+`",
+    new: "n",
+    newScratch: "⌘⇧N / Ctrl+Shift+N",
+    jumpAttention: "a",
+    diff: "D",
+    settings: "s",
+    escape: "Esc",
+    help: "?",
+  };
+
+  for (const s of SHORTCUTS) {
+    it(`${s.id} renders the expected help (mac/other) and tour strings`, () => {
+      expect(formatHelpShortcut(s.chord, true)).toBe(helpMac[s.id]);
+      expect(formatHelpShortcut(s.chord, false)).toBe(helpOther[s.id]);
+      expect(formatTourShortcut(s.chord)).toBe(tour[s.id]);
+    });
+  }
+});
+
+describe("matchShortcut behavior", () => {
+  const cases: Array<{
+    name: string;
+    event: ShortcutKeyEvent;
+    mac: boolean;
+    isInput?: boolean;
+    expected: ShortcutDef["id"] | null;
+    isSessionInput?: boolean;
+  }> = [
+    {
+      name: "mac Meta+K -> palette",
+      event: ev({ key: "k", metaKey: true }),
+      mac: true,
+      expected: "palette",
+    },
+    {
+      name: "mac Ctrl+K -> no match",
+      event: ev({ key: "k", ctrlKey: true }),
+      mac: true,
+      expected: null,
+    },
+    {
+      name: "other Ctrl+K -> palette",
+      event: ev({ key: "k", ctrlKey: true }),
+      mac: false,
+      expected: "palette",
+    },
+    {
+      name: "other Meta+K -> palette",
+      event: ev({ key: "k", metaKey: true }),
+      mac: false,
+      expected: "palette",
+    },
+    {
+      name: "palette fires inside an input",
+      event: ev({ key: "k", metaKey: true }),
+      mac: true,
+      isInput: true,
+      expected: "palette",
+    },
+    {
+      name: "Meta+Backquote -> terminalFocus",
+      event: ev({ key: "`", code: "Backquote", metaKey: true }),
+      mac: true,
+      expected: "terminalFocus",
+    },
+    {
+      name: "Meta+Alt+B (KeyB) -> rightPanel",
+      event: ev({ key: "b", code: "KeyB", metaKey: true, altKey: true }),
+      mac: true,
+      expected: "rightPanel",
+    },
+    {
+      name: "Meta+B (KeyB) -> sidebar",
+      event: ev({ key: "b", code: "KeyB", metaKey: true }),
+      mac: true,
+      expected: "sidebar",
+    },
+    {
+      name: "Ctrl+Q returns focus to the sidebar from the session input on Mac",
+      event: ev({ key: "q", code: "KeyQ", ctrlKey: true }),
+      mac: true,
+      isInput: true,
+      isSessionInput: true,
+      expected: "sidebarFocus",
+    },
+    {
+      name: "Ctrl+Q returns focus to the sidebar from the session input on other platforms",
+      event: ev({ key: "q", code: "KeyQ", ctrlKey: true }),
+      mac: false,
+      isInput: true,
+      isSessionInput: true,
+      expected: "sidebarFocus",
+    },
+    {
+      name: "Ctrl+Q outside a session input is left to the browser",
+      event: ev({ key: "q", code: "KeyQ", ctrlKey: true }),
+      mac: false,
+      isInput: true,
+      expected: null,
+    },
+    {
+      name: "Cmd+Q remains the browser shortcut",
+      event: ev({ key: "q", code: "KeyQ", metaKey: true }),
+      mac: true,
+      isSessionInput: true,
+      expected: null,
+    },
+    {
+      name: "Mac Option+B (key '∫', code KeyB) still -> rightPanel",
+      event: ev({ key: "∫", code: "KeyB", metaKey: true, altKey: true }),
+      mac: true,
+      expected: "rightPanel",
+    },
+    {
+      name: "Meta+Shift+N -> newScratch",
+      event: ev({ key: "N", code: "KeyN", metaKey: true, shiftKey: true }),
+      mac: true,
+      expected: "newScratch",
+    },
+    {
+      name: "newScratch fires inside an input",
+      event: ev({ key: "N", code: "KeyN", metaKey: true, shiftKey: true }),
+      mac: true,
+      isInput: true,
+      expected: "newScratch",
+    },
+    {
+      name: "Escape -> escape (no modifiers)",
+      event: ev({ key: "Escape" }),
+      mac: true,
+      expected: "escape",
+    },
+    {
+      name: "Escape fires inside an input",
+      event: ev({ key: "Escape" }),
+      mac: true,
+      isInput: true,
+      expected: "escape",
+    },
+    {
+      name: "Escape fires even with a modifier",
+      event: ev({ key: "Escape", metaKey: true }),
+      mac: true,
+      expected: "escape",
+    },
+    { name: "n -> new", event: ev({ key: "n" }), mac: true, expected: "new" },
+    {
+      name: "a -> jumpAttention",
+      event: ev({ key: "a" }),
+      mac: true,
+      expected: "jumpAttention",
+    },
+    {
+      name: "N (no mod) -> no match (case sensitive)",
+      event: ev({ key: "N" }),
+      mac: true,
+      expected: null,
+    },
+    { name: "D -> diff", event: ev({ key: "D" }), mac: true, expected: "diff" },
+    {
+      name: "d -> no match (case sensitive)",
+      event: ev({ key: "d" }),
+      mac: true,
+      expected: null,
+    },
+    {
+      name: "s -> settings",
+      event: ev({ key: "s" }),
+      mac: true,
+      expected: "settings",
+    },
+    {
+      name: "S -> no match (case sensitive)",
+      event: ev({ key: "S" }),
+      mac: true,
+      expected: null,
+    },
+    { name: "? -> help", event: ev({ key: "?" }), mac: true, expected: "help" },
+    {
+      name: "single-key blocked inside an input",
+      event: ev({ key: "n" }),
+      mac: true,
+      isInput: true,
+      expected: null,
+    },
+    {
+      name: "single-key blocked when Ctrl held",
+      event: ev({ key: "n", ctrlKey: true }),
+      mac: true,
+      expected: null,
+    },
+    {
+      name: "single-key blocked when Alt held",
+      event: ev({ key: "n", altKey: true }),
+      mac: true,
+      expected: null,
+    },
+  ];
+
+  for (const c of cases) {
+    it(c.name, () => {
+      const matched = matchShortcut(c.event, {
+        mac: c.mac,
+        isInput: c.isInput ?? false,
+        isSessionInput: c.isSessionInput ?? false,
+      });
+      expect(matched?.shortcut.id ?? null).toBe(c.expected);
+    });
+  }
+
+  it("propagates the per-shortcut preventDefault / stopPropagation flags", () => {
+    const palette = matchShortcut(ev({ key: "k", metaKey: true }), {
+      mac: true,
+      isInput: false,
+    });
+    expect(palette).toMatchObject({
+      preventDefault: true,
+      stopPropagation: true,
+    });
+
+    // terminalFocus deliberately does not stopPropagation.
+    const term = matchShortcut(ev({ key: "`", code: "Backquote", metaKey: true }), { mac: true, isInput: false });
+    expect(term).toMatchObject({
+      preventDefault: true,
+      stopPropagation: false,
+    });
+
+    // escape neither prevents nor stops.
+    const esc = matchShortcut(ev({ key: "Escape" }), {
+      mac: true,
+      isInput: false,
+    });
+    expect(esc).toMatchObject({
+      preventDefault: false,
+      stopPropagation: false,
+    });
+  });
+});
+
+describe("tour drift guard", () => {
+  it("every tour shortcut hint id resolves to a registered shortcut", () => {
     for (const step of TOUR_STEPS) {
       for (const hint of step.shortcutHints ?? []) {
         expect(SHORTCUTS_BY_ID[hint.id], `step "${step.id}" hint "${hint.id}"`).toBeDefined();
       }
     }
-  });
-});
-
-it.each<[ShortcutDef["id"], string, string, string]>([
-  ["palette", "⌘K", "CtrlK", "⌘K / Ctrl+K"],
-  ["rightPanel", "⌘⌥B", "CtrlAltB", "⌘⌥B / Ctrl+Alt+B"],
-  ["terminalFocus", "⌘`", "Ctrl`", "⌘` / Ctrl+`"],
-  ["new", "n", "n", "n"],
-  ["newScratch", "⌘⇧N", "CtrlShiftN", "⌘⇧N / Ctrl+Shift+N"],
-  ["escape", "Esc", "Esc", "Esc"],
-])("%s renders as %s (mac), %s (other), and %s (tour)", (id, mac, other, tour) => {
-  const { chord } = SHORTCUTS_BY_ID[id]!;
-  expect([formatHelpShortcut(chord, true), formatHelpShortcut(chord, false), formatTourShortcut(chord)]).toEqual([
-    mac,
-    other,
-    tour,
-  ]);
-});
-
-describe("matchShortcut", () => {
-  const metaK = ev({ key: "k", metaKey: true });
-  const scratch = ev({ key: "N", code: "KeyN", metaKey: true, shiftKey: true });
-
-  it.each<[string, ShortcutKeyEvent, boolean, boolean, ShortcutDef["id"] | null]>([
-    ["mac Ctrl+K", ev({ key: "k", ctrlKey: true }), true, false, null],
-    ["other Ctrl+K", ev({ key: "k", ctrlKey: true }), false, false, "palette"],
-    ["other Meta+K", metaK, false, false, "palette"],
-    ["Meta+K in an input", metaK, true, true, "palette"],
-    [
-      "Mac Option+B producing ∫",
-      ev({ key: "∫", code: "KeyB", metaKey: true, altKey: true }),
-      true,
-      false,
-      "rightPanel",
-    ],
-    ["Meta+Shift+N", scratch, true, false, "newScratch"],
-    ["Escape in an input", ev({ key: "Escape" }), true, true, "escape"],
-    ["Meta+Escape", ev({ key: "Escape", metaKey: true }), true, false, "escape"],
-    ["N", ev({ key: "N" }), true, false, null],
-    ["n in an input", ev({ key: "n" }), true, true, null],
-    ["Ctrl+n", ev({ key: "n", ctrlKey: true }), true, false, null],
-    ["Alt+n", ev({ key: "n", altKey: true }), true, false, null],
-  ])("%s", (_name, event, mac, isInput, expected) => {
-    expect(matchShortcut(event, { mac, isInput })?.shortcut.id ?? null).toBe(expected);
-  });
-
-  it.each(SHORTCUTS)("no earlier shortcut shadows $id", (s) => {
-    const t = s.trigger;
-    const event =
-      t.scope === "global"
-        ? ev({
-            metaKey: !!t.mod,
-            shiftKey: !!t.shift,
-            altKey: !!t.alt,
-            code: t.code ?? "",
-            key: t.key ?? (t.code === "Backquote" ? "`" : (t.code ?? "").replace(/^Key/, "").toLowerCase()),
-          })
-        : ev({ key: t.key ?? "" });
-    expect(matchShortcut(event, { mac: true, isInput: false })?.shortcut.id).toBe(s.id);
-  });
-
-  it.each<[ShortcutKeyEvent, boolean, boolean]>([
-    [metaK, true, true],
-    [ev({ key: "`", code: "Backquote", metaKey: true }), true, false],
-    [ev({ key: "Escape" }), false, false],
-  ])("propagates preventDefault/stopPropagation flags (%#)", (event, preventDefault, stopPropagation) => {
-    expect(matchShortcut(event, { mac: true, isInput: false })).toMatchObject({ preventDefault, stopPropagation });
   });
 });

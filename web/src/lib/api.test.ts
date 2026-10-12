@@ -245,7 +245,16 @@ const requestCases: RequestCase[] = [
   ["GET /api/groups", () => api.fetchGroups()],
   ["GET /api/projects", () => api.fetchProjects()],
   ["GET /api/projects?scope=profile", () => api.fetchProjects("profile")],
-  ["GET /api/claude-sessions", () => api.listClaudeSessions()],
+  ["GET /api/projects?profile=work", () => api.fetchProjects(undefined, "work")],
+  ["GET /api/projects?scope=global&profile=work", () => api.fetchProjects("global", "work")],
+  [
+    "GET /api/importable-sessions?agent=pi&profile=work",
+    () => api.listImportableSessions("pi", "work"),
+    {
+      respond: json({ sessions: [{ session_id: "s" }], truncated: true }),
+      result: { ok: true, sessions: [{ session_id: "s" }], truncated: true },
+    },
+  ],
   [
     "GET /api/docker/status",
     () => api.fetchDockerStatus(),
@@ -578,6 +587,8 @@ describe("settings saves", () => {
 
 const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchSessions", () => api.fetchSessions(), null],
+  ["fetchProjects", () => api.fetchProjects(), []],
+  ["fetchProjectRegistry", () => api.fetchProjectRegistry(undefined, "work"), null],
   ["searchConversations", () => api.searchConversations("q"), []],
   ["updateWorkspaceOrdering", () => api.updateWorkspaceOrdering([]), false],
   ["getSessionFileContents", () => api.getSessionFileContents("s1", "a"), null],
@@ -891,6 +902,23 @@ describe("login", () => {
     expect(await call("bad")).toEqual({ ok: false, error: statusMessage });
     offline();
     expect(await call("x")).toEqual({ ok: false, error: "Network error" });
+  });
+
+  it("listImportableSessions maps server and network errors", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ error: "agent_not_allowed", message: "denied" }, 403));
+    expect(await api.listImportableSessions("pi")).toEqual({
+      ok: false,
+      error: "agent_not_allowed",
+      message: "denied",
+    });
+    fetchSpy.mockResolvedValueOnce(empty(502));
+    expect(await api.listImportableSessions("pi")).toEqual({
+      ok: false,
+      error: "server_error",
+      message: "Server error (502)",
+    });
+    offline();
+    expect(await api.listImportableSessions("pi")).toEqual({ ok: false, error: "network", message: "Network error" });
   });
 
   it("logout POSTs and resolves even when the request fails", async () => {

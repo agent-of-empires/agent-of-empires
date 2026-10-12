@@ -29,6 +29,10 @@ use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
 
+/// Empty Trash checkbox keys.
+const EMPTY_TRASH_FORCE_FAILED: &str = "force_failed";
+const EMPTY_TRASH_DROP_FAILED: &str = "drop_failed";
+
 /// Longest gap between two left-clicks on one row that still counts as a double-click;
 /// 400ms matches most desktop environments.
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
@@ -1046,7 +1050,11 @@ impl HomeView {
                 None
             }
             "empty_trash" => {
-                self.empty_trash_all();
+                let checked = std::mem::take(&mut self.confirm_checked);
+                self.empty_trash_all(
+                    checked.contains(&EMPTY_TRASH_FORCE_FAILED),
+                    checked.contains(&EMPTY_TRASH_DROP_FAILED),
+                );
                 None
             }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
@@ -1086,9 +1094,20 @@ impl HomeView {
 
     /// Confirm before permanently purging every trashed session. The purge is
     /// irreversible, so it keeps the destructive red tone; an already-empty trash gets an
-    /// info dialog instead of a confirm that would delete nothing.
+    /// info dialog instead of a confirm that would delete nothing. Rows whose last delete
+    /// failed get an opt-in escalation: forced delete, then removal from aoe.
     pub(super) fn prompt_empty_trash(&mut self) {
-        let count = self.instances.values().filter(|i| i.is_trashed()).count();
+        let mut count = 0;
+        let mut failed = 0;
+        let mut failed_forced = 0;
+        for inst in self.instances.values().filter(|i| i.is_trashed()) {
+            count += 1;
+            match self.failed_delete_forced(inst) {
+                Some(false) => failed += 1,
+                Some(true) => failed_forced += 1,
+                None => {}
+            }
+        }
         if count == 0 {
             self.info_dialog = Some(InfoDialog::new(
                 "Trash is empty",
@@ -1097,11 +1116,27 @@ impl HomeView {
             return;
         }
         let noun = if count == 1 { "session" } else { "sessions" };
-        self.confirm_dialog = Some(ConfirmDialog::new(
-            "Empty Trash",
-            &format!("Permanently delete {count} trashed {noun}? This cannot be undone."),
-            "empty_trash",
-        ));
+        let mut message =
+            format!("Permanently delete {count} trashed {noun}? This cannot be undone.");
+        if failed_forced > 0 {
+            message.push_str(
+                "\n\nRemoving from aoe skips cleanup: worktrees and branches stay on disk.",
+            );
+        }
+        let mut dialog = ConfirmDialog::new("Empty Trash", &message, "empty_trash");
+        if failed > 0 {
+            dialog = dialog.checkbox(
+                EMPTY_TRASH_FORCE_FAILED,
+                &format!("Force delete {failed} that failed before"),
+            );
+        }
+        if failed_forced > 0 {
+            dialog = dialog.checkbox(
+                EMPTY_TRASH_DROP_FAILED,
+                &format!("Remove {failed_forced} from aoe that failed a forced delete"),
+            );
+        }
+        self.confirm_dialog = Some(dialog);
     }
 
     /// Confirm before archiving every active session under the focused group: a whole
@@ -1350,6 +1385,7 @@ impl HomeView {
                     }
                     DialogResult::Submit(()) => {
                         let dont_ask_again = dialog.dont_ask_again();
+                        self.confirm_checked = dialog.checked_keys();
                         self.confirm_dialog = None;
                         if self.settings_close_confirm {
                             // Discard runs the keyboard path's exact sequence, theme
@@ -2138,6 +2174,7 @@ impl HomeView {
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
                     let dont_ask_again = dialog.dont_ask_again();
+                    self.confirm_checked = dialog.checked_keys();
                     self.confirm_dialog = None;
                     if dont_ask_again {
                         self.apply_confirm_dont_ask_again(&action);
@@ -2482,10 +2519,30 @@ impl HomeView {
             return None;
         }
 
+        // Ctrl+L toggles the last-prompt footer. Routed here, after the live-send
+        // relay and every dialog above, and gated on `!is_live_send_capturing()`
+        // with exact modifiers, so a configured `C-l` exit/leader still reaches
+        // the agent and a distinct Ctrl+Alt+L is not consumed.
+        if key.code == KeyCode::Char('l')
+            && key.modifiers == KeyModifiers::CONTROL
+            && !self.is_live_send_capturing()
+        {
+            self.show_last_prompt = !self.show_last_prompt;
+            if !self.show_last_prompt {
+                self.last_prompt_cache = None;
+            }
+            return None;
+        }
+
         // Drain a queued earned-tip pop now that the home view is idle: every
         // overlay-routing block above has returned. Skipped while searching so it can't
         // interrupt a query, and opening it consumes the keystroke. #2262
-        if !self.search_active && self.pending_tip_pop.is_some() && self.drain_pending_tip_pop() {
+        if !self.search_active
+            && self
+                .pending_tip_pop
+                .is_some_and(|tip| tip.id != crate::tips::SHORTCUT_BAR_TIP_ID)
+            && self.drain_pending_tip_pop()
+        {
             return None;
         }
 
@@ -2833,6 +2890,7 @@ impl HomeView {
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
+            ActionId::ToggleHideStopped => self.toggle_hide_stopped_in_groups(),
             ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
             ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
@@ -2841,6 +2899,7 @@ impl HomeView {
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
+            ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
         }
         None
@@ -2913,6 +2972,14 @@ impl HomeView {
             }
             if let Some(group) = prefill_group {
                 dialog.set_group(group);
+            }
+            // After the path: setting it re-resolves the defaults these replace.
+            if let Some(inst) = self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+            {
+                dialog.inherit_session(inst);
             }
             // Skip to the title whenever the path is genuinely prefilled, inherited or
             // borrowed, so the user lands on naming. Only an empty group leaves focus on
@@ -3292,9 +3359,44 @@ impl HomeView {
                 }
                 let message = format!("Are you sure you want to stop '{}'?", inst.title);
                 self.pending_stop_session = Some(session_id.clone());
-                self.confirm_dialog =
-                    Some(ConfirmDialog::new("Stop Session", &message, "stop_session"));
+                self.confirm_dialog = Some(
+                    self.confirm_by_repeating(
+                        ActionId::Stop,
+                        "Stop Session",
+                        &message,
+                        "stop_session",
+                    )
+                    .buttons("Stop", "Cancel"),
+                );
             }
+        }
+    }
+
+    /// A confirm the hotkey that opened it also accepts, so the deliberate gesture is two
+    /// taps of one key while a stray keystroke is harmless. The key is read off the binding
+    /// table so the hint can't drift from it; a chord that isn't a bare character falls
+    /// back to the dialog's own y/Enter.
+    fn confirm_by_repeating(
+        &self,
+        opener: ActionId,
+        title: &str,
+        message: &str,
+        action: &str,
+    ) -> ConfirmDialog {
+        let label = bindings::label(opener, self.strict_hotkeys);
+        let mut chars = label.chars();
+        let accept_char = match (chars.next(), chars.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        };
+        let hint = match accept_char {
+            Some(_) => format!("Press {label} again to confirm, Esc to cancel."),
+            None => "Press y to confirm, Esc to cancel.".to_string(),
+        };
+        let dialog = ConfirmDialog::new(title, &format!("{message}\n{hint}"), action);
+        match accept_char {
+            Some(c) => dialog.confirmed_by(c),
+            None => dialog,
         }
     }
 
@@ -3327,11 +3429,10 @@ impl HomeView {
             inst.title
         );
         self.pending_stop_terminal = Some((session_id, mode));
-        self.confirm_dialog = Some(ConfirmDialog::new(
-            "Kill Terminal",
-            &message,
-            "stop_terminal",
-        ));
+        self.confirm_dialog = Some(
+            self.confirm_by_repeating(ActionId::Stop, "Kill Terminal", &message, "stop_terminal")
+                .buttons("Kill", "Cancel"),
+        );
     }
 
     /// Kill the paired terminal for `session_id` (host or container per `mode`) and
@@ -3370,7 +3471,10 @@ impl HomeView {
             tool_name, inst.title
         );
         self.pending_stop_tool = Some((session_id, tool_name.to_string()));
-        self.confirm_dialog = Some(ConfirmDialog::new("Kill Tool", &message, "stop_tool"));
+        self.confirm_dialog = Some(
+            self.confirm_by_repeating(ActionId::Stop, "Kill Tool", &message, "stop_tool")
+                .buttons("Kill", "Cancel"),
+        );
     }
 
     /// Kill the tool session for `session_id`, then refresh so the Tool-view
@@ -3889,6 +3993,7 @@ impl HomeView {
                 if visible_sessions.contains(&inst.id)
                     || current_session.as_deref() == Some(inst.id.as_str())
                     || inst.is_dismissed()
+                    || self.hidden_by_filter(inst)
                 {
                     return false;
                 }
@@ -4134,6 +4239,12 @@ impl HomeView {
                     }
                 }
             }
+            if let Some(header) = self.header_row_for_hidden_session(&sid) {
+                self.cursor = header;
+                self.update_selected();
+                self.context_menu = None;
+                return;
+            }
         }
         if self.flat_items.is_empty() {
             self.cursor = 0;
@@ -4149,7 +4260,7 @@ impl HomeView {
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
-            self.flat_items = self.build_flat_items();
+            self.refresh_flat_items();
             self.update_search();
         } else {
             self.rebuild_flat_items();
@@ -4163,7 +4274,7 @@ impl HomeView {
         }
     }
 
-    fn apply_group_by(&mut self, new_mode: GroupByMode) {
+    pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
@@ -4847,12 +4958,7 @@ impl HomeView {
     /// gives an empty state rather than silence.
     pub(super) fn open_tips_dialog(&mut self) {
         let config = load_config().ok().flatten().unwrap_or_default();
-        let signals = crate::tips::TipSignals {
-            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
-            used_new_from_selection: config.app_state.used_new_from_selection,
-            system_health_tip_earned: config.app_state.system_health_tip_earned,
-            used_system_health: config.app_state.used_system_health,
-        };
+        let signals = crate::tips::TipSignals::from(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
             eligible,
@@ -4931,9 +5037,47 @@ impl HomeView {
         }
     }
 
-    /// After the new-session dialog closes, queue an earned tip if one just became
-    /// eligible and tips aren't disabled. `drain_pending_tip_pop` shows it on the next
-    /// keystroke, so it never interrupts an in-flight action.
+    /// Refresh on startup and the storage heartbeat, including creates in other profiles.
+    pub(super) fn refresh_shortcut_bar_tip(&mut self) {
+        if let Ok(Some(config)) = load_config() {
+            self.tips_unseen = super::tips_unseen_count(&config);
+            self.queue_shortcut_bar_tip(&config);
+        }
+    }
+
+    pub(super) fn queue_shortcut_bar_tip(&mut self, config: &crate::session::Config) {
+        if !config.session.show_tips || self.pending_tip_pop.is_some() {
+            return;
+        }
+        self.pending_tip_pop = crate::tips::eligible_unseen(
+            crate::tips::TipSurface::Tui,
+            &config.app_state.tips_seen,
+            &crate::tips::TipSignals::from(config),
+        )
+        .into_iter()
+        .find(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID);
+    }
+
+    /// Present without consuming a key or interrupting agent input or another action.
+    pub(in crate::tui) fn try_present_shortcut_bar_tip(&mut self) -> bool {
+        if !self
+            .pending_tip_pop
+            .is_some_and(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID)
+            || self.has_dialog()
+            || self.is_creation_pending()
+            || self.structured_preview_pending
+            || self
+                .structured_preview
+                .as_ref()
+                .is_some_and(|view| view.is_active())
+            || self.pending_paste.is_some()
+        {
+            return false;
+        }
+        self.drain_pending_tip_pop()
+    }
+
+    /// Queue an earned tip after an action closes its dialog.
     pub(super) fn queue_earned_tip_pop(&mut self) {
         if self.pending_tip_pop.is_some() {
             return;
@@ -4942,12 +5086,7 @@ impl HomeView {
         if !config.session.show_tips {
             return;
         }
-        let signals = crate::tips::TipSignals {
-            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
-            used_new_from_selection: config.app_state.used_new_from_selection,
-            system_health_tip_earned: config.app_state.system_health_tip_earned,
-            used_system_health: config.app_state.used_system_health,
-        };
+        let signals = crate::tips::TipSignals::from(&config);
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
             &config.app_state.tips_seen,
@@ -4963,9 +5102,33 @@ impl HomeView {
             return false;
         };
         let config = load_config().ok().flatten().unwrap_or_default();
-        // Re-check: the user may have disabled tips between queueing and now.
-        if !config.session.show_tips {
+        if !config.session.show_tips
+            || !crate::tips::eligible_unseen(
+                crate::tips::TipSurface::Tui,
+                &config.app_state.tips_seen,
+                &crate::tips::TipSignals::from(&config),
+            )
+            .iter()
+            .any(|eligible| eligible.id == tip.id)
+        {
             return false;
+        }
+        if tip.id == crate::tips::SHORTCUT_BAR_TIP_ID {
+            // Claim before opening so concurrent TUIs and interrupted dialogs cannot repeat it.
+            match update_app_state(|state| {
+                if state.tips_seen.iter().any(|seen| seen == tip.id) {
+                    return false;
+                }
+                state.tips_seen.push(tip.id.to_owned());
+                true
+            }) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    tracing::warn!(target: "tui.input", %error, "Failed to persist shortcut bar tip state");
+                    return false;
+                }
+            }
         }
         self.tips_dialog = Some(TipsDialog::new(
             vec![tip],
@@ -5138,8 +5301,9 @@ impl HomeView {
     /// Open the delete dialog (or a force-remove confirm, or the group delete-options
     /// dialog) for the current selection, mirroring the `'d'` / `'D'` gating: Terminal
     /// view rejects deletion with an info dialog, Creating sessions are inert,
-    /// stuck-Deleting sessions get a force-remove confirm, and Project and organization
-    /// groups can't be deleted. Shared by the keys and the context menu.
+    /// stuck-Deleting sessions get a force-remove confirm, Project and organization
+    /// groups can't be deleted, and the Trash header offers to empty the trash. Shared by
+    /// the keys and the context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
         // Deletion only allowed in Structured View.
         if self.view_mode == ViewMode::Terminal {
@@ -5190,35 +5354,21 @@ impl HomeView {
                     // while a stray keystroke is harmless; the accept path runs the same
                     // trash_session_by_id.
                     if session_cfg.confirm_delete {
-                        // Read the accept key off the binding table so relocating Delete
-                        // can't drift the hint from the key that opened the dialog. A
-                        // chord that isn't a bare character can't be a confirm char, so it
-                        // falls back to the dialog's own y/Enter.
-                        let delete_key = bindings::label(ActionId::Delete, self.strict_hotkeys);
-                        let mut key_chars = delete_key.chars();
-                        let accept_char = match (key_chars.next(), key_chars.next()) {
-                            (Some(c), None) => Some(c),
-                            _ => None,
-                        };
-                        let hint = match accept_char {
-                            Some(_) => {
-                                format!("Press {delete_key} again to confirm, Esc to cancel.")
-                            }
-                            None => "Press y to confirm, Esc to cancel.".to_string(),
-                        };
-                        let message = format!("Move '{}' to the trash?\n{hint}", inst.title);
+                        let message = format!("Move '{}' to the trash?", inst.title);
                         self.pending_trash_session = Some(sid);
                         // Offer the same in-dialog opt-out the quit confirm has: the
                         // guard is on by default, so a user who wants one-keystroke trash
                         // back shouldn't have to find the setting. Ticking it persists
                         // confirm_delete = false.
-                        let mut dialog =
-                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
-                                .buttons("Delete", "Cancel")
-                                .offering_dont_ask_again();
-                        if let Some(c) = accept_char {
-                            dialog = dialog.confirmed_by(c);
-                        }
+                        let dialog = self
+                            .confirm_by_repeating(
+                                ActionId::Delete,
+                                "Confirm Delete",
+                                &message,
+                                "trash_session",
+                            )
+                            .buttons("Delete", "Cancel")
+                            .offering_dont_ask_again();
                         self.confirm_dialog = Some(dialog);
                         return;
                     }
@@ -5292,6 +5442,8 @@ impl HomeView {
                 self.confirm_dialog =
                     Some(ConfirmDialog::new("Delete Group", &message, "delete_group"));
             }
+        } else if matches!(self.section_at_cursor(), Some(SidebarSection::Trash)) {
+            self.prompt_empty_trash();
         }
     }
 
@@ -6026,6 +6178,36 @@ impl HomeView {
         }
     }
 
+    /// End live-send when a rebuild has left its target hidden by the `y` filter, whatever
+    /// changed (its status, the sort, the grouping, its group): a stopped session's terminal
+    /// can outlive its agent, and keys must not reach a pane the list no longer shows. The
+    /// selection is left for the caller's rebuild to settle.
+    pub(super) fn end_live_send_if_hidden(&mut self) {
+        let Some(state) = self.live_send.clone() else {
+            return;
+        };
+        if !self
+            .get_instance(&state.session_id)
+            .is_some_and(|inst| self.hidden_by_filter(inst))
+        {
+            return;
+        }
+        let selection = (
+            self.cursor,
+            self.selected_session.clone(),
+            self.selected_group.clone(),
+            self.selected_group_profile.clone(),
+        );
+        self.exit_live_send_and_restore_sizing(&state);
+        (
+            self.cursor,
+            self.selected_session,
+            self.selected_group,
+            self.selected_group_profile,
+        ) = selection;
+        self.flash_status("Live send ended: its session is hidden (y to show)");
+    }
+
     /// Tear down live-send state and restore the tmux window's automatic sizing:
     /// live-send's resize loop forces manual sizing, which would leave the next attach
     /// from a full-size terminal cramped at the preview dimensions. Re-setting
@@ -6350,7 +6532,7 @@ impl HomeView {
     /// `search_matches` keeps stale indices, and `n`/`N` jumps to the wrong sessions
     /// (#2676).
     pub(super) fn rebuild_flat_items(&mut self) {
-        self.flat_items = self.build_flat_items();
+        self.refresh_flat_items();
         if !self.search_matches.is_empty() {
             self.refresh_search_matches();
         }
@@ -7073,6 +7255,7 @@ mod tests {
         NewSessionData {
             profile: String::new(),
             title: String::new(),
+            title_typed: false,
             path: path.to_string(),
             group: String::new(),
             tool: "claude".to_string(),

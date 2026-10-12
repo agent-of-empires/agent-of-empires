@@ -16,8 +16,16 @@ import { TodoGroupCard } from "./TodoCards";
 import { ToolCard } from "./ToolCards";
 
 export function UserMessage() {
+  const originPlugin = useAuiState(
+    (s) => (s.message.metadata?.custom as { originPlugin?: unknown } | undefined)?.originPlugin,
+  );
   return (
     <MessagePrimitive.Root className="group mt-4 flex flex-col items-end gap-1">
+      {typeof originPlugin === "string" && (
+        <div data-testid="user-message-origin" className="text-xs text-text-dim">
+          Sent by plugin {originPlugin}
+        </div>
+      )}
       <MessagePrimitive.Parts components={{ Text: UserText, Image: UserImage }} />
     </MessagePrimitive.Root>
   );
@@ -69,7 +77,22 @@ export function AssistantMessage() {
 function AssistantText({ text }: { text: string }) {
   // Only the live streaming message smooth-reveals; history renders at once.
   const isRunning = useAuiState((s) => s.message.status?.type === "running");
+  const compactionSummary = useAuiState(
+    (s) => (s.message.metadata?.custom as { compactionSummary?: unknown } | undefined)?.compactionSummary === true,
+  );
   if (!text) return null;
+  if (compactionSummary) {
+    return (
+      <details className="rounded border border-surface-800 bg-surface-900/40">
+        <summary className="cursor-pointer select-none px-3 py-1 text-text-dim hover:text-text-secondary">
+          📝 Compaction summary
+        </summary>
+        <div className="px-3 pb-2">
+          <Markdown text={text} smooth={false} />
+        </div>
+      </details>
+    );
+  }
   return <Markdown text={text} smooth={isRunning} />;
 }
 

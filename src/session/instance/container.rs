@@ -649,6 +649,7 @@ mod tests {
 
         let mut inst = Instance::new("contexec", worktree.to_str().unwrap());
         inst.sandbox_info = Some(SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "img".to_string(),
@@ -742,6 +743,7 @@ claude-personal = "~/.claude-global"
         instance.tool = "claude-personal".to_string();
         instance.source_profile = profile.to_string();
         instance.sandbox_info = Some(SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -916,6 +918,7 @@ claude-personal = "~/.claude-global"
             instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -992,6 +995,7 @@ claude-personal = "~/.claude-global"
             instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),

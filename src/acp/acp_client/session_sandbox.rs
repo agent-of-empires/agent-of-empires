@@ -214,6 +214,7 @@ mod tests {
 
     fn sandbox(container_name: &str, container_workdir: Option<&str>) -> SandboxInfo {
         SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "alpine:latest".into(),

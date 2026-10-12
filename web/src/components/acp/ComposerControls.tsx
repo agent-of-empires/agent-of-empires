@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { ComposerPrimitive, useAui } from "@assistant-ui/react";
-import { ChevronUp, Paperclip, Square, X } from "lucide-react";
+import { ChevronUp, Paperclip, ShieldCheck, Square, X } from "lucide-react";
 
 import type { AcpState, PromptAttachmentInput } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -280,6 +280,41 @@ function formatCost(amount: number, currency: string): string {
   } catch {
     return `${amount.toFixed(amount < 1 ? 4 : 2)} ${currency}`;
   }
+}
+
+/** The agent's own auth identity. Reporting only: the extension says which
+ *  identity is in use, never whether its credentials still work, so a healthy
+ *  looking chip is not a claim that the key is valid. */
+export function AuthStatusHint({ authStatus }: { authStatus: AcpState["authStatus"] }) {
+  // Silence means "not reported", which is not the same as logged out.
+  if (!authStatus) return null;
+  const loggedOut = authStatus.kind === "none";
+  // Account details stay in the tooltip: this chip is on screen during every
+  // screen share and recording.
+  const details = [
+    authStatus.detail,
+    authStatus.account?.email,
+    authStatus.account?.organization,
+    authStatus.account?.plan,
+  ].filter((d): d is string => !!d);
+  const explanation = loggedOut
+    ? `The agent reports it is not logged in. Prompts will fail until you authenticate.${details.length ? ` ${details.join(" · ")}` : ""}`
+    : `This session runs under ${authStatus.label}.${details.length ? ` ${details.join(" · ")}` : ""} Reported by the agent; it does not confirm the credentials are still valid.`;
+  return (
+    <Tooltip text={explanation} multiline>
+      <span
+        data-testid="composer-auth-status"
+        data-auth-kind={authStatus.kind}
+        role="img"
+        tabIndex={0}
+        className={`inline-flex max-w-[12rem] items-center gap-1 truncate text-[11px] ${loggedOut ? "text-status-error-text" : "text-text-dim"}`}
+        aria-label={explanation}
+      >
+        <ShieldCheck className="size-3 shrink-0 opacity-70" aria-hidden />
+        <span className="truncate">{authStatus.label}</span>
+      </span>
+    </Tooltip>
+  );
 }
 
 export function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {

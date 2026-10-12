@@ -17,6 +17,7 @@ pub(crate) mod ip_discovery;
 pub mod live_ws;
 pub mod login;
 mod pane;
+pub mod plugin_status;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;

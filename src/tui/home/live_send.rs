@@ -211,6 +211,7 @@ pub(super) fn display_chord(spec: (KeyCode, KeyModifiers)) -> String {
         out.push_str("Shift+");
     }
     match code {
+        KeyCode::Char(' ') => out.push_str("Space"),
         KeyCode::Char(c) => out.push(c.to_ascii_uppercase()),
         KeyCode::Esc => out.push_str("Esc"),
         KeyCode::Tab => out.push_str("Tab"),
@@ -2722,9 +2723,19 @@ mod tests {
             );
         }
         assert_eq!(display_chord_list(&chords), "Ctrl+Q / Ctrl+]");
-        for (chord, shown) in [("F12", "F12"), ("Ctrl+Alt+Shift+x", "Ctrl+Alt+Shift+X")] {
-            assert_eq!(display_chord(parse_chord(chord).unwrap()), shown);
+        for (chord, shown) in [
+            ("F12", "F12"),
+            ("Ctrl+Alt+Shift+x", "Ctrl+Alt+Shift+X"),
+            ("Space", "Space"),
+            ("C-Space", "Ctrl+Space"),
+            ("M-Space", "Alt+Space"),
+        ] {
+            assert_eq!(display_chord(parse_chord(chord).unwrap()), shown, "{chord}");
         }
+        assert_eq!(
+            display_chord_list(&parse_chord_list("C-Space,C-q")),
+            "Ctrl+Space / Ctrl+Q"
+        );
 
         // An all-invalid list must not trap the user in live mode with no exit.
         let fallback = parse_chord_list("not-a-chord, also-bad");

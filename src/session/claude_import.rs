@@ -5,20 +5,14 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
-
 /// Cap how many lines we read per file when extracting metadata.
 const MAX_SCAN_LINES: usize = 400;
 
-/// Cap how many sessions the picker shows.
-pub const MAX_SESSIONS: usize = 200;
-
 /// A discovered Claude Code session, summarized for the import picker.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeSessionSummary {
     /// The on-disk session id (filename stem). Fed to `session/load`.
     pub session_id: String,
-    #[serde(skip)]
     pub config_dir: PathBuf,
     /// The working directory recorded in the transcript. The structured
     /// session must run here for `claude --resume` to resolve the file.
@@ -45,67 +39,8 @@ fn claude_config_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude"))
 }
 
-/// Literal directory tokens derived from the worktree path templates, e.g. `"-worktrees"` from
-/// `"../{repo-name}-worktrees/{branch}"` and `"-workspace-"` from
-/// `"../{branch}-workspace-{session-id}"`.
-fn worktree_dir_markers() -> Vec<String> {
-    let cfg = crate::session::Config::load_or_warn();
-    let mut markers = Vec::new();
-    for tmpl in [
-        cfg.worktree.path_template.as_str(),
-        cfg.worktree.workspace_path_template.as_str(),
-    ] {
-        for seg in tmpl.split('/') {
-            let lit = strip_placeholders(seg);
-            if lit.len() >= 3 && lit != ".." && !markers.contains(&lit) {
-                markers.push(lit);
-            }
-        }
-    }
-    markers
-}
-
-/// Remove `{placeholder}` spans from a template path segment, leaving the
-/// literal text (e.g. `"{repo-name}-worktrees"` -> `"-worktrees"`).
-fn strip_placeholders(seg: &str) -> String {
-    let mut out = String::new();
-    let mut depth = 0u32;
-    for c in seg.chars() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => out.push(c),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// True when `cwd` is an AoE scratch directory (`<app_dir>/scratch/<id>`), regardless of namespace.
-fn cwd_is_aoe_scratch(cwd: &str) -> bool {
-    let comps: Vec<&str> = Path::new(cwd)
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
-    comps
-        .windows(2)
-        .any(|w| w[0].contains("agent-of-empires") && w[1] == "scratch")
-}
-
-/// True when any directory component of `cwd` contains a worktree marker.
-fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
-    if markers.is_empty() {
-        return false;
-    }
-    Path::new(cwd).components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|name| markers.iter().any(|m| name.contains(m.as_str())))
-    })
-}
-
-/// Scan all discoverable Claude Code sessions, newest first (uncapped; the endpoint applies
-/// `MAX_SESSIONS` after ownership filtering).
+/// Scan all discoverable Claude Code sessions, newest first and unfiltered; callers drop owned
+/// ones with [`crate::session::import::Owned`].
 pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
     let Some(config_dir) = claude_config_dir() else {
         return Vec::new();
@@ -119,7 +54,6 @@ pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
     let Ok(project_dirs) = fs::read_dir(&projects) else {
         return Vec::new();
     };
-    let worktree_markers = worktree_dir_markers();
 
     let mut out = Vec::new();
     for project in project_dirs.flatten() {
@@ -136,15 +70,6 @@ pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
                 continue;
             }
             if let Some(summary) = summarize_file(&fpath, config_dir) {
-                // Scratch sessions live under `<app_dir>/scratch/<id>`.
-                if cwd_is_aoe_scratch(&summary.cwd) {
-                    continue;
-                }
-                // AoE creates session worktrees under a directory named by the worktree path
-                // template (e.g. "<repo>-worktrees").
-                if cwd_under_worktree(&summary.cwd, &worktree_markers) {
-                    continue;
-                }
                 out.push(summary);
             }
         }
@@ -166,6 +91,22 @@ pub fn sessions_under_paths(
             roots.iter().any(|r| cwd.starts_with(r))
         })
         .collect()
+}
+
+impl From<ClaudeSessionSummary> for crate::session::import::ImportableSession {
+    fn from(s: ClaudeSessionSummary) -> Self {
+        let updated_at = (s.last_modified_ms > 0)
+            .then(|| chrono::DateTime::from_timestamp_millis(s.last_modified_ms as i64))
+            .flatten()
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        Self {
+            session_id: s.session_id,
+            cwd: s.cwd,
+            title: s.title,
+            updated_at,
+            cwd_exists: s.cwd_exists,
+        }
+    }
 }
 
 /// Build a summary for one `.jsonl` file. Returns `None` when the file has no
@@ -340,43 +281,6 @@ mod tests {
             extract_user_title(&record).as_deref(),
             Some("Actually fix the bug")
         );
-    }
-
-    #[test]
-    fn cwd_under_worktree_matches_worktree_and_workspace_dirs() {
-        assert_eq!(strip_placeholders("{repo-name}-worktrees"), "-worktrees");
-        assert_eq!(strip_placeholders("{branch}"), "");
-        assert_eq!(strip_placeholders(".."), "..");
-        let markers = vec!["-worktrees".to_string(), "-workspace-".to_string()];
-        assert!(cwd_under_worktree(
-            "/Users/me/aoe/agent-of-empires-worktrees/Saracens",
-            &markers
-        ));
-        assert!(cwd_under_worktree(
-            "/Users/me/aoe/agent-of-empires-worktrees/Saracens/sub",
-            &markers
-        ));
-        assert!(cwd_under_worktree(
-            "/Users/me/aoe/soft-close-grace-window-workspace-55406399",
-            &markers
-        ));
-        assert!(!cwd_under_worktree("/Users/me/projects/alpha", &markers));
-        assert!(!cwd_under_worktree("/Users/me/projects/alpha", &[]));
-    }
-
-    #[test]
-    fn aoe_scratch_detected_in_both_namespaces() {
-        assert!(cwd_is_aoe_scratch(
-            "/Users/me/.agent-of-empires/scratch/5c8d250f60ec4328"
-        ));
-        assert!(cwd_is_aoe_scratch(
-            "/Users/me/.agent-of-empires-dev/scratch/abcd"
-        ));
-        assert!(cwd_is_aoe_scratch(
-            "/home/me/.config/agent-of-empires/scratch/abcd"
-        ));
-        assert!(!cwd_is_aoe_scratch("/Users/me/projects/scratch"));
-        assert!(!cwd_is_aoe_scratch("/Users/me/projects/alpha"));
     }
 
     fn summary(id: &str, cwd: &str) -> ClaudeSessionSummary {

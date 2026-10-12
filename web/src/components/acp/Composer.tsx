@@ -30,6 +30,7 @@ import {
   SendButton,
   StopButton,
   ToolbarButton,
+  AuthStatusHint,
   UsageHint,
 } from "./ComposerControls";
 import {
@@ -58,10 +59,13 @@ import {
   type ComposerClient,
 } from "./useComposerHooks";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
+import { useProviderSwitch } from "./useProviderSwitch";
 
 interface Props {
   sessionId: string;
   currentAgent: AcpState["agent"];
+  /** Pinned LLM backend, or null when the host environment decides. */
+  currentProvider: string | null;
   availableModes: AcpState["availableModes"];
   currentModeId: AcpState["currentModeId"];
   /** Fallback when the agent advertises no modes. */
@@ -70,6 +74,7 @@ interface Props {
   pendingConfigOption: AcpState["pendingConfigOption"];
   setConfigOption: (configId: string, value: string) => void | Promise<void>;
   sessionUsage: AcpState["sessionUsage"];
+  authStatus: AcpState["authStatus"];
   availableCommands: AcpState["availableCommands"];
   /** WS open and worker healthy. Sends still work when false; they queue until resume. */
   connected: boolean;
@@ -106,6 +111,7 @@ export function Composer(props: Props) {
   const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
   const recall = useQueueRecall(queuedPrompts, client, loadText);
   const canSend = composerText.trim().length > 0 || attachments.supported.length > 0;
+  const provider = useProviderSwitch(sessionId, props.currentAgent, props.currentProvider);
 
   const submitComposer = useCallback(() => {
     const cur = recall.recallRef.current;
@@ -178,6 +184,7 @@ export function Composer(props: Props) {
   return (
     <div className={wrapperLayout.className} style={wrapperLayout.style}>
       <div
+        data-session-composer
         {...tourAnchor(TOUR_ANCHORS.composer)}
         className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
         onDragOver={(e) => {
@@ -339,7 +346,12 @@ export function Composer(props: Props) {
                   configOptions={props.configOptions}
                   pendingConfigOption={props.pendingConfigOption}
                   onSetConfigOption={props.setConfigOption}
+                  provider={provider.current}
+                  providerPending={provider.pending}
+                  onSetProvider={provider.set}
+                  providerLockedReason={turnActive ? "Switch providers once the turn finishes" : null}
                 />
+                <AuthStatusHint authStatus={props.authStatus} />
                 <UsageHint usage={props.sessionUsage} />
               </div>
 

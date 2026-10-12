@@ -5,10 +5,25 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
-use crate::tui::components::buttons::render_buttons;
+use crate::tui::components::buttons::{render_buttons_with_focus, ButtonFocus};
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
+
+const DONT_ASK_AGAIN: &str = "dont_ask_again";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Focus {
+    Checkbox(usize),
+    Yes,
+    No,
+}
+
+struct Checkbox {
+    key: &'static str,
+    label: String,
+    checked: bool,
+}
 
 /// The dialog's emphasis color: destructive prompts alarm in red, routine
 /// ones use a calmer amber so they do not read as data loss.
@@ -22,11 +37,11 @@ pub struct ConfirmDialog {
     title: String,
     message: String,
     action: String,
-    selected: bool, // true = Yes, false = No
     tone: Tone,
-    /// When set, a "don't warn me again" checkbox the caller reads back with
-    /// `dont_ask_again()` on Submit.
-    dont_ask_again: Option<bool>,
+    /// Optional checkboxes the caller reads back by key on Submit.
+    checkboxes: Vec<Checkbox>,
+    /// Up/Down cycle through the checkboxes, then Yes, then No.
+    focus: Focus,
     /// An extra confirm key beside `y` and Enter, so the hotkey that opened
     /// the dialog also accepts it. Unset elsewhere, so no stray keystroke can
     /// fire an unrelated destructive confirm.
@@ -35,8 +50,8 @@ pub struct ConfirmDialog {
     buttons: (String, String),
     yes_button_area: Rect,
     no_button_area: Rect,
-    checkbox_area: Rect,
-    /// The hovered target. Visual only; never changes `selected`.
+    checkbox_areas: Vec<Rect>,
+    /// The hovered target. Visual only; never changes the focus.
     hover: HoverState,
 }
 
@@ -46,14 +61,14 @@ impl ConfirmDialog {
             title: title.to_string(),
             message: message.to_string(),
             action: action.to_string(),
-            selected: false,
             tone: Tone::Destructive,
-            dont_ask_again: None,
+            checkboxes: Vec::new(),
+            focus: Focus::No,
             confirm_char: None,
             buttons: ("Yes".to_string(), "No".to_string()),
             yes_button_area: Rect::default(),
             no_button_area: Rect::default(),
-            checkbox_area: Rect::default(),
+            checkbox_areas: Vec::new(),
             hover: HoverState::default(),
         }
     }
@@ -78,24 +93,45 @@ impl ConfirmDialog {
     }
 
     /// Offer a "don't warn me again" checkbox, unchecked to start.
-    pub fn offering_dont_ask_again(mut self) -> Self {
-        self.dont_ask_again = Some(false);
+    pub fn offering_dont_ask_again(self) -> Self {
+        self.checkbox(DONT_ASK_AGAIN, "Don't warn me again")
+    }
+
+    /// Add a checkbox, unchecked to start, that `is_checked(key)` reads back.
+    pub fn checkbox(mut self, key: &'static str, label: &str) -> Self {
+        self.checkboxes.push(Checkbox {
+            key,
+            label: label.to_string(),
+            checked: false,
+        });
         self
     }
 
+    pub fn is_checked(&self, key: &str) -> bool {
+        self.checkboxes.iter().any(|c| c.key == key && c.checked)
+    }
+
     pub fn dont_ask_again(&self) -> bool {
-        self.dont_ask_again.unwrap_or(false)
+        self.is_checked(DONT_ASK_AGAIN)
+    }
+
+    /// Keys of the checked boxes, for a caller that reads them after the dialog closes.
+    pub fn checked_keys(&self) -> Vec<&'static str> {
+        self.checkboxes
+            .iter()
+            .filter(|c| c.checked)
+            .map(|c| c.key)
+            .collect()
     }
 
     /// Route a left-click: `Submit` on `[Yes]`, `Cancel` on `[No]`, a toggle
     /// on the "don't warn me again" checkbox, `None` anywhere else.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<()>> {
         let pos = ratatui::layout::Position::from((col, row));
-        if let Some(checked) = self.dont_ask_again.as_mut() {
-            if self.checkbox_area.contains(pos) {
-                *checked = !*checked;
-                return Some(DialogResult::Continue);
-            }
+        if let Some(i) = self.checkbox_areas.iter().position(|a| a.contains(pos)) {
+            self.focus = Focus::Checkbox(i);
+            self.checkboxes[i].checked = !self.checkboxes[i].checked;
+            return Some(DialogResult::Continue);
         }
         if self.yes_button_area.contains(pos) {
             return Some(DialogResult::Submit(()));
@@ -106,19 +142,13 @@ impl ConfirmDialog {
         None
     }
 
-    /// Highlight the button under the cursor without changing `selected`:
+    /// Highlight the button under the cursor without changing the focus:
     /// a drift between reading the prompt and pressing Enter must not flip
     /// which action fires. True when the highlight changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
-        self.hover.update(
-            col,
-            row,
-            &[
-                self.yes_button_area,
-                self.no_button_area,
-                self.checkbox_area,
-            ],
-        )
+        let mut targets = vec![self.yes_button_area, self.no_button_area];
+        targets.extend_from_slice(&self.checkbox_areas);
+        self.hover.update(col, row, &targets)
     }
 
     pub fn action(&self) -> &str {
@@ -132,38 +162,73 @@ impl ConfirmDialog {
         self.yes_button_area
     }
 
+    #[cfg(test)]
+    pub(crate) fn checkbox_labels_for_test(&self) -> Vec<&str> {
+        self.checkboxes.iter().map(|c| c.label.as_str()).collect()
+    }
+
     /// Whether `c` is the opt-in confirm key, ignoring ASCII case.
     fn is_confirm_char(&self, c: char) -> bool {
         self.confirm_char
             .is_some_and(|k| k.eq_ignore_ascii_case(&c))
     }
 
+    /// Focus order: checkboxes top to bottom, then Yes, then No.
+    fn focus_order(&self) -> Vec<Focus> {
+        (0..self.checkboxes.len())
+            .map(Focus::Checkbox)
+            .chain([Focus::Yes, Focus::No])
+            .collect()
+    }
+
+    fn move_focus(&mut self, forward: bool) {
+        let order = self.focus_order();
+        let i = order.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let n = order.len();
+        self.focus = order[if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        }];
+    }
+
+    fn toggle_focused_checkbox(&mut self) {
+        if let Focus::Checkbox(i) = self.focus {
+            self.checkboxes[i].checked = !self.checkboxes[i].checked;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => DialogResult::Cancel,
-            KeyCode::Enter => {
-                if self.selected {
-                    DialogResult::Submit(())
-                } else {
-                    DialogResult::Cancel
+            KeyCode::Enter => match self.focus {
+                Focus::Yes => DialogResult::Submit(()),
+                Focus::No => DialogResult::Cancel,
+                Focus::Checkbox(_) => {
+                    self.toggle_focused_checkbox();
+                    DialogResult::Continue
                 }
-            }
+            },
             KeyCode::Char('y') | KeyCode::Char('Y') => DialogResult::Submit(()),
             KeyCode::Char(c) if self.is_confirm_char(c) => DialogResult::Submit(()),
-            KeyCode::Char(' ') if self.dont_ask_again.is_some() => {
-                self.dont_ask_again = Some(!self.dont_ask_again.unwrap_or(false));
+            KeyCode::Char(' ') => {
+                self.toggle_focused_checkbox();
+                DialogResult::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                self.move_focus(false);
+                DialogResult::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.move_focus(true);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.selected = true;
+                self.focus = Focus::Yes;
                 DialogResult::Continue
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.selected = false;
-                DialogResult::Continue
-            }
-            KeyCode::Tab => {
-                self.selected = !self.selected;
+                self.focus = Focus::No;
                 DialogResult::Continue
             }
             _ => DialogResult::Continue,
@@ -173,16 +238,19 @@ impl ConfirmDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // The height follows the wrapped message so a multi-sentence body is
         // never clipped, with a minimum that keeps routine confirms compact.
-        let width: u16 = if self.dont_ask_again.is_some() {
-            56
-        } else {
-            50
-        };
+        let rows = self.checkboxes.len() as u16;
+        // Widen for the longest checkbox row: "[x] " + label + " (space)" + border and margin.
+        let widest_checkbox = self
+            .checkboxes
+            .iter()
+            .map(|c| unicode_width::UnicodeWidthStr::width(c.label.as_str()) as u16 + 16)
+            .max();
+        let width: u16 = widest_checkbox.map_or(50, |w| w.max(56)).min(area.width);
         let text_width = width.saturating_sub(4).max(1);
         let message_rows = wrapped_line_count(&self.message, text_width as usize);
-        // Border, margin and buttons, plus the checkbox row and its spacers.
-        let chrome: u16 = if self.dont_ask_again.is_some() { 9 } else { 6 };
-        let min_height: u16 = if self.dont_ask_again.is_some() { 11 } else { 8 };
+        // Border, margin and buttons, plus the checkbox rows and their spacers.
+        let chrome: u16 = if rows > 0 { 8 + rows } else { 6 };
+        let min_height: u16 = if rows > 0 { 10 + rows } else { 8 };
         let height = (message_rows as u16)
             .saturating_add(chrome)
             .max(min_height)
@@ -200,67 +268,65 @@ impl ConfirmDialog {
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
-        if let Some(checked) = self.dont_ask_again {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Min(1),    // message
-                    Constraint::Length(1), // spacer
-                    Constraint::Length(1), // checkbox
-                    Constraint::Length(1), // spacer
-                    Constraint::Length(2), // buttons
-                ])
-                .split(inner);
+        let constraints: &[Constraint] = if rows > 0 {
+            &[
+                Constraint::Min(1),       // message
+                Constraint::Length(1),    // spacer
+                Constraint::Length(rows), // checkboxes
+                Constraint::Length(1),    // spacer
+                Constraint::Length(2),    // buttons
+            ]
+        } else {
+            &[Constraint::Min(1), Constraint::Length(2)]
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints(constraints)
+            .split(inner);
 
-            self.render_message(frame, chunks[0], theme);
-            let line = checkbox_line(
-                theme,
-                "Don't warn me again",
-                Some("space"),
-                0,
-                checked,
-                false,
-                CheckboxStyle::confirm(theme),
-            );
-            self.checkbox_area = Rect {
-                width: (line.width() as u16).min(chunks[2].width),
-                ..chunks[2]
-            };
-            frame.render_widget(Paragraph::new(line), chunks[2]);
-            if let Some(rect) = self.hover.current_in(&[self.checkbox_area]) {
+        self.render_message(frame, chunks[0], theme);
+        self.checkbox_areas.clear();
+        if rows > 0 {
+            for (i, c) in self.checkboxes.iter().enumerate() {
+                let focused = self.focus == Focus::Checkbox(i);
+                let line = checkbox_line(
+                    theme,
+                    &c.label,
+                    focused.then_some("space"),
+                    0,
+                    c.checked,
+                    focused,
+                    CheckboxStyle::confirm(theme),
+                );
+                let row = Rect {
+                    y: chunks[2].y + i as u16,
+                    height: 1,
+                    width: (line.width() as u16).min(chunks[2].width),
+                    ..chunks[2]
+                };
+                frame.render_widget(Paragraph::new(line), row);
+                self.checkbox_areas.push(row);
+            }
+            if let Some(rect) = self.hover.current_in(&self.checkbox_areas) {
                 paint_hover_bg(frame, rect, theme.selection);
             }
-            let (yes, no) = render_buttons(
-                frame,
-                chunks[4],
-                theme,
-                (&self.buttons.0, &self.buttons.1),
-                self.selected,
-                self.hover.current(),
-            );
-            self.yes_button_area = yes;
-            self.no_button_area = no;
-        } else {
-            self.checkbox_area = Rect::default();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([Constraint::Min(1), Constraint::Length(2)])
-                .split(inner);
-
-            self.render_message(frame, chunks[0], theme);
-            let (yes, no) = render_buttons(
-                frame,
-                chunks[1],
-                theme,
-                (&self.buttons.0, &self.buttons.1),
-                self.selected,
-                self.hover.current(),
-            );
-            self.yes_button_area = yes;
-            self.no_button_area = no;
         }
+        let button_focus = match self.focus {
+            Focus::Yes => ButtonFocus::Yes,
+            Focus::No => ButtonFocus::No,
+            Focus::Checkbox(_) => ButtonFocus::Neither,
+        };
+        let (yes, no) = render_buttons_with_focus(
+            frame,
+            chunks[chunks.len() - 1],
+            theme,
+            (&self.buttons.0, &self.buttons.1),
+            button_focus,
+            self.hover.current(),
+        );
+        self.yes_button_area = yes;
+        self.no_button_area = no;
     }
 
     fn render_message(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -347,7 +413,7 @@ mod tests {
     #[test]
     fn keys_decide_the_dialog_and_move_the_selection() {
         assert_eq!(dialog().action(), "action");
-        assert!(!dialog().selected, "No is the default");
+        assert_eq!(dialog().focus, Focus::No, "No is the default");
 
         for code in [
             KeyCode::Esc,
@@ -372,28 +438,40 @@ mod tests {
         ));
 
         let mut d = dialog();
-        d.selected = true;
+        d.focus = Focus::Yes;
         assert!(matches!(
             d.handle_key(key(KeyCode::Enter)),
             DialogResult::Submit(())
         ));
 
-        // Left / h select Yes, Right / l select No, Tab flips.
+        // Left / h select Yes, Right / l select No.
         for (code, want) in [
-            (KeyCode::Left, true),
-            (KeyCode::Right, false),
-            (KeyCode::Char('h'), true),
-            (KeyCode::Char('l'), false),
+            (KeyCode::Left, Focus::Yes),
+            (KeyCode::Right, Focus::No),
+            (KeyCode::Char('h'), Focus::Yes),
+            (KeyCode::Char('l'), Focus::No),
         ] {
             let mut d = dialog();
-            d.selected = !want;
+            d.focus = if want == Focus::Yes {
+                Focus::No
+            } else {
+                Focus::Yes
+            };
             d.handle_key(key(code));
-            assert_eq!(d.selected, want, "{code:?}");
+            assert_eq!(d.focus, want, "{code:?}");
         }
-        let mut d = dialog();
-        for want in [true, false] {
-            d.handle_key(key(KeyCode::Tab));
-            assert_eq!(d.selected, want);
+        // Up/Down, j/k and Tab cycle checkboxes, then Yes, then No, wrapping.
+        let mut d = dialog().checkbox("a", "A").checkbox("b", "B");
+        for (code, want) in [
+            (KeyCode::Down, Focus::Checkbox(0)),
+            (KeyCode::Char('j'), Focus::Checkbox(1)),
+            (KeyCode::Tab, Focus::Yes),
+            (KeyCode::Up, Focus::Checkbox(1)),
+            (KeyCode::Char('k'), Focus::Checkbox(0)),
+            (KeyCode::BackTab, Focus::No),
+        ] {
+            d.handle_key(key(code));
+            assert_eq!(d.focus, want, "{code:?}");
         }
     }
 
@@ -426,31 +504,75 @@ mod tests {
     }
 
     #[test]
-    fn the_dont_ask_again_checkbox_toggles_only_when_offered() {
+    fn space_and_enter_toggle_only_the_focused_checkbox() {
         let mut d = dialog();
-        assert!(!d.dont_ask_again());
-        assert!(matches!(
-            d.handle_key(key(KeyCode::Char(' '))),
-            DialogResult::Continue
-        ));
+        d.handle_key(key(KeyCode::Char(' ')));
         assert!(!d.dont_ask_again(), "space is inert without the checkbox");
 
+        // Space is inert until the checkbox is focused.
         let mut d = ConfirmDialog::new("Quit", "Quit?", "quit").offering_dont_ask_again();
-        for want in [true, false] {
-            assert!(matches!(
-                d.handle_key(key(KeyCode::Char(' '))),
-                DialogResult::Continue
-            ));
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert!(!d.dont_ask_again(), "space on No must not toggle");
+        d.handle_key(key(KeyCode::Down));
+        for want in [true, false, true] {
+            d.handle_key(key(KeyCode::Char(' ')));
             assert_eq!(d.dont_ask_again(), want);
         }
+        // Enter on a checkbox toggles rather than submitting.
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Continue
+        ));
+        assert!(!d.dont_ask_again());
+        d.handle_key(key(KeyCode::Enter));
 
         // And it survives into the submit the caller reads it on.
-        d.handle_key(key(KeyCode::Char(' ')));
         assert!(matches!(
             d.handle_key(key(KeyCode::Char('y'))),
             DialogResult::Submit(())
         ));
         assert!(d.dont_ask_again());
+
+        // With several, Space toggles only the focused one.
+        let mut d = dialog().checkbox("a", "A").checkbox("b", "B");
+        d.handle_key(key(KeyCode::Up));
+        d.handle_key(key(KeyCode::Up));
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(d.checked_keys(), vec!["b"]);
+    }
+
+    #[test]
+    fn only_the_focused_button_renders_focused() {
+        // (focus, Yes emphasized, No emphasized)
+        for (focus, yes_lit, no_lit) in [
+            (Focus::Checkbox(0), false, false),
+            (Focus::Yes, true, false),
+            (Focus::No, false, true),
+        ] {
+            let mut d = dialog().checkbox("a", "A");
+            d.focus = focus;
+            let (_screen, buf, theme) = render_to(&mut d, 70, 14);
+            let fg = |rect: Rect| buf[(rect.x, rect.y)].fg;
+            assert_eq!(fg(d.yes_button_area) == theme.error, yes_lit, "{focus:?}");
+            assert_eq!(fg(d.no_button_area) == theme.running, no_lit, "{focus:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_checkbox_label_widens_the_dialog_instead_of_clipping() {
+        // Wide characters take two cells each, so sizing must use display width.
+        for label in [
+            "Remove 1 from aoe that failed a forced delete",
+            "削除削除削除削除削除削除削除削除削除削除削除削除",
+        ] {
+            let mut d = dialog().checkbox("drop", label);
+            d.handle_key(key(KeyCode::Down));
+            let (screen, _buf, _theme) = render_to(&mut d, 120, 20);
+            assert!(
+                screen.contains("(space)"),
+                "label and hint must fit:\n{screen}"
+            );
+        }
     }
 
     #[test]
@@ -466,7 +588,7 @@ mod tests {
         let y = y as u16;
 
         assert!(d.handle_hover(x, y));
-        assert_eq!(d.hover.current(), Some(d.checkbox_area));
+        assert_eq!(d.hover.current(), Some(d.checkbox_areas[0]));
         for want in [true, false] {
             assert!(matches!(d.handle_click(x, y), Some(DialogResult::Continue)));
             assert_eq!(d.dont_ask_again(), want);

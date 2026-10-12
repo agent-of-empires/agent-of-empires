@@ -1,6 +1,5 @@
 //! The status poll loop and the passive transitions it decides and writes.
 
-use crate::server::push::StatusChange;
 use crate::session::Instance;
 use crate::session::Status;
 use std::sync::Arc;
@@ -184,12 +183,13 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
         // true previous-tick live status) rather than letting `update_status_with_metadata`
         // fall back to comparing against its own possibly-stale disk-loaded `status`.
         let prev_for_poll = prev.clone();
-        // Invariant 8.
+        let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
+            drop(snapshot_guard);
             seed_tick_tracking(&mut instances, &prev_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata();
@@ -212,7 +212,6 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
 
         if let Ok((mut instances, live_worker_records)) = updated {
             // Diff BEFORE `reload_state_instances_from_disk`.
-            let now = chrono::Utc::now();
             let unread_enabled = crate::session::unread_enabled();
             // Passive status transitions observed this tick, batched per profile so one
             // `Storage::update` flock covers every transitioned session on that profile
@@ -225,13 +224,9 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                 if old == Status::Running && inst.status == Status::Idle {
                     crate::session::smart_rename::maybe_spawn_terminal_smart_rename(inst);
                 }
-                let _ = state.status_tx.send(StatusChange {
-                    instance_id: inst.id.clone(),
-                    instance_title: inst.title.clone(),
-                    old,
-                    new: inst.status,
-                    at: now,
-                });
+                // The status move itself is published when the reload below applies it, from the
+                // live status at that moment, so a handler's move made during this tick is not
+                // repeated from this tick's stale snapshot.
                 let decision = decide_passive_transition(inst, old, unread_enabled);
                 if decision.patch.is_none() && !decision.mark_unread {
                     continue;

@@ -322,6 +322,7 @@ function isInsideEditable(target: EventTarget | null): boolean {
   return false;
 }
 
+/** Composes the authenticated dashboard and synchronizes its user-scoped UI state. */
 function AppContent({
   loginRequired,
   onLogout,
@@ -820,23 +821,24 @@ function AppContent({
     refresh: refreshDiffFiles,
   } = useDiffFiles(activeSessionId, diffPanelActive);
 
-  // Diff-viewer comments (#928). Acp-only and session-scoped. The
+  // Diff-viewer comments (#928). Session-scoped. The
   // banner lives in the diff pane while the inline UI lives inside
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
-  const commentsEnabled = activeSession?.view === "structured";
-  // Sending does not require a live worker: the diff-comments handler runs the
-  // same auto-wake as a plain composer prompt, so a snoozed or idle-dormant
-  // session respawns its worker on send. Archived and trashed sessions never
-  // start on a prompt (#4116); they must be unarchived or restored first.
-  const commentSendEnabled = commentsEnabled && !activeSession?.trashed_at && !activeSession?.archived_at;
-  // Every disabled state names its cause and what the user can do about it: a
-  // tooltip that only says "unavailable" leaves them staring at a dead button.
-  const commentSendDisabledReason = !commentsEnabled
-    ? "Diff comments can only be sent from the agent view. Switch this session to the agent view first."
+  const commentsEnabled = !!activeSession;
+  // A dormant structured worker wakes on send; archived and trashed sessions cannot start.
+  const commentSendEnabled =
+    commentsEnabled &&
+    !activeSession?.trashed_at &&
+    !activeSession?.archived_at &&
+    (activeSession?.view === "structured" || !serverAbout?.read_only);
+  const commentSendDisabledReason = !activeSession
+    ? "Select a session to send comments to the agent."
     : activeSession?.trashed_at
       ? "This session is in the trash. Restore it to send comments to the agent."
-      : "This session is archived. Unarchive it to send comments to the agent.";
+      : activeSession?.archived_at
+        ? "This session is archived. Unarchive it to send comments to the agent."
+        : "Terminal input is blocked in read-only mode.";
   const commentsIsMultiRepo = (activeSession?.workspace_repos.length ?? 0) > 0;
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
 
@@ -1701,11 +1703,22 @@ function AppContent({
     if (next) handleSelectSession(next);
   }, [attentionJump, activeSessionId, handleSelectSession]);
 
+  const handleFocusSidebar = useCallback(() => {
+    setSidebarOpen(true);
+    requestAnimationFrame(() => {
+      const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+      const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
+      const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
+      target?.focus();
+    });
+  }, []);
+
   useKeyboardShortcuts(
     useCallback(
       () => ({
         onNew: handleNewSession,
         onJumpToAttention: handleJumpToAttention,
+        onFocusSidebar: handleFocusSidebar,
         onNewScratch: handleNewScratch,
         onDiff: () => toggleDiff(),
         // Escape closes local UI surfaces only (dialogs, palette,
@@ -1757,6 +1770,7 @@ function AppContent({
         handleNewSession,
         handleNewScratch,
         handleJumpToAttention,
+        handleFocusSidebar,
       ],
     ),
   );
@@ -2001,6 +2015,7 @@ function AppContent({
                         rateLimitAutoResume={activeSession.rate_limit_auto_resume}
                         tool={activeSession.tool}
                         acpAgent={activeSession.acp_agent ?? null}
+                        acpProvider={activeSession.acp_provider ?? null}
                         clearAliases={activeSession.clear_aliases}
                         archivedAt={activeSession.archived_at ?? null}
                         snoozedUntil={activeSession.snoozed_until ?? null}
@@ -2078,6 +2093,7 @@ function AppContent({
         {sendDialogOpen && commentsEnabled && activeSessionId && (
           <SendCommentsDialog
             sessionId={activeSessionId}
+            delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
             comments={diffComments.comments}
             isMultiRepo={commentsIsMultiRepo}
             sendEnabled={commentSendEnabled}
@@ -2096,10 +2112,8 @@ function AppContent({
                 diffComments.setOutroDraft("");
               }
               setSendDialogOpen(false);
-              // Close the diff viewer so the acp transcript is in
-              // view: the user just dispatched feedback and wants to
-              // see the agent's response. They can re-open any file
-              // from the right-panel list afterwards.
+              // Close the diff viewer to show the agent transcript or terminal
+              // after dispatching feedback. The file remains in the diff list.
               setSelectedFile(null);
               toastBus.handler?.info("Comments sent to agent");
             }}
@@ -2118,12 +2132,14 @@ function AppContent({
   const acpPrefs = useMemo(
     () => ({
       showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
+      wrapToolOutput: serverAbout?.acp_wrap_tool_output ?? false,
       replayEvents: serverAbout?.acp_replay_events ?? 0,
       compactionReminder: serverAbout?.acp_compaction_reminder ?? false,
       compactionReminderPercent: serverAbout?.acp_compaction_reminder_percent ?? 75,
     }),
     [
       serverAbout?.acp_show_tool_durations,
+      serverAbout?.acp_wrap_tool_output,
       serverAbout?.acp_replay_events,
       serverAbout?.acp_compaction_reminder,
       serverAbout?.acp_compaction_reminder_percent,
@@ -2531,6 +2547,11 @@ function AppContent({
         <textarea
           ref={setKeyboardProxyRef}
           data-keyboard-proxy
+          data-session-input={
+            activeSession && !showSettings && (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
+              ? ""
+              : undefined
+          }
           aria-hidden="true"
           tabIndex={-1}
           // Keep the element in the visual viewport. Focusing a zero-size

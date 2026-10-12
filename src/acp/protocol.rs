@@ -99,6 +99,11 @@ pub struct PromptRequest {
     /// callers never set it and keep the default revive-as-needed behavior.
     #[serde(default)]
     pub no_revive: bool,
+    /// The queue row this prompt delivers ("Send now"). The daemon consumes the
+    /// row and keeps the sender it stored, so a plugin message is not
+    /// re-attributed to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_prompt_id: Option<String>,
 }
 
 /// `POST /api/sessions/{id}/acp/prompt/diff-comments` body.
@@ -262,6 +267,24 @@ pub struct SwitchAgentResponse {
     pub switch_seq: u64,
     /// Owned so the client side can deserialize the response (a
     /// `&'static str` field is not `DeserializeOwned`).
+    pub status: String,
+}
+
+/// `POST /api/sessions/{id}/acp/switch-provider` body.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SwitchProviderRequest {
+    /// One of `crate::session::environment::AGENT_PROVIDERS`.
+    pub provider: String,
+}
+
+/// `POST /api/sessions/{id}/acp/switch-provider` response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SwitchProviderResponse {
+    pub session_id: String,
+    pub provider: String,
+    /// Whether a model pick was replaced. The switch resets the model to the
+    /// new provider's default, because model ids are provider-specific.
+    pub model_cleared: bool,
     pub status: String,
 }
 

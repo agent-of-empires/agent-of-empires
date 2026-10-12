@@ -14,7 +14,7 @@ use crate::plugin::ui_state::{Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
 
 const CAP_WORKER: &str = "runtime.worker";
-const CAP_SESSION_READ: &str = "session.read";
+pub(crate) const CAP_SESSION_READ: &str = "session.read";
 const CAP_SESSION_WRITE: &str = "session.write";
 const CAP_NOTIFICATIONS: &str = "notifications";
 const CAP_COMPOSER_WRITE: &str = "composer.write";
@@ -63,6 +63,10 @@ impl HostApiState {
 
     fn storage(&self) -> anyhow::Result<Storage> {
         Storage::new_unwatched(&self.profile)
+    }
+
+    pub(crate) fn profile(&self) -> &str {
+        &self.profile
     }
 
     pub fn bump_settings_revision(&self) -> u64 {
@@ -457,19 +461,37 @@ fn sessions_list(state: &HostApiState, params: &Value) -> Result<Value, Dispatch
                 || (exclude.snoozed && i.is_snoozed())
                 || (exclude.trashed && i.is_trashed()))
         })
-        .map(|i| {
-            json!({
-                "id": i.id,
-                "title": i.title,
-                "project_path": i.project_path,
-                "tool": i.tool,
-                "status": format!("{:?}", i.status),
-                "archived": i.is_archived(),
-                "snoozed": i.is_snoozed(),
-            })
-        })
+        .map(session_summary)
         .collect();
     Ok(json!({ "sessions": sessions }))
+}
+
+/// Per-session summary shared by `sessions.list` and any plugin event that
+/// describes a session, so the two payloads cannot drift.
+pub(crate) fn session_summary(i: &crate::session::Instance) -> Value {
+    let mut row = json!({
+        "id": i.id,
+        "title": i.title,
+        "project_path": i.project_path,
+        "tool": i.tool,
+        "status": format!("{:?}", i.status),
+        "archived": i.is_archived(),
+        "snoozed": i.is_snoozed(),
+        "trashed": i.is_trashed(),
+        "workspace_repos": i
+            .all_repos()
+            .iter()
+            .map(|r| json!({ "source_path": r.source_path, "branch": r.branch }))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(w) = &i.worktree_info {
+        row["worktree"] = json!({
+            "branch": w.branch,
+            "main_repo_path": w.main_repo_path,
+            "managed_by_aoe": w.managed_by_aoe,
+        });
+    }
+    row
 }
 
 fn config_get(
@@ -1040,6 +1062,33 @@ mod tests {
         let snoozed_id = seed("future-snooze", &|i| i.snoozed_until = Some(now + hour));
         let woken_id = seed("past-snooze", &|i| i.snoozed_until = Some(now - hour));
         let trashed_id = seed("trashed", &|i| i.trashed_at = Some(now));
+        let multi_id = seed("multi", &|i| {
+            let repo = |name: &str| crate::session::WorkspaceRepo {
+                name: name.into(),
+                source_path: format!("/src/{name}"),
+                branch: "feat/x".into(),
+                worktree_path: format!("/ws/{name}"),
+                main_repo_path: format!("/src/{name}"),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            };
+            i.workspace_info = Some(crate::session::WorkspaceInfo {
+                branch: "feat/x".into(),
+                workspace_dir: "/ws".into(),
+                repos: vec![repo("api"), repo("web")],
+                created_at: now,
+                cleanup_on_delete: true,
+            });
+            i.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "feat/x".into(),
+                main_repo_path: "/src/api".into(),
+                managed_by_aoe: true,
+                created_at: now,
+                base_branch: None,
+            });
+        });
 
         let storage = Storage::new_unwatched("default").unwrap();
         storage
@@ -1123,6 +1172,26 @@ mod tests {
             assert_eq!(row["snoozed"], json!(snoozed), "{label}");
         }
         assert!(all_ids.contains(&trashed_id));
+        let trashed = entry(&all, &trashed_id);
+        assert_eq!(trashed["trashed"], json!(true));
+        assert_eq!(trashed["archived"], json!(false));
+        assert_eq!(entry(&all, &active_id)["trashed"], json!(false));
+
+        let plain = entry(&all, &active_id);
+        assert_eq!(plain["workspace_repos"], json!([]));
+        assert!(plain.get("worktree").is_none());
+        let multi = entry(&all, &multi_id);
+        assert_eq!(
+            multi["workspace_repos"],
+            json!([
+                {"source_path": "/src/api", "branch": "feat/x"},
+                {"source_path": "/src/web", "branch": "feat/x"},
+            ])
+        );
+        assert_eq!(
+            multi["worktree"],
+            json!({"branch": "feat/x", "main_repo_path": "/src/api", "managed_by_aoe": true})
+        );
 
         let no_trash = list(json!({ "exclude": ["trashed"] }));
         let no_trash_ids = ids(&no_trash);

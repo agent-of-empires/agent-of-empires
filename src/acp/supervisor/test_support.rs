@@ -33,6 +33,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.startup_failures).insert(session_id.to_string());
     }
 
+    /// Leave the session mid-teardown, where an unproven settlement parks it.
+    pub(crate) fn test_hold_stopping(&self, session_id: &str) {
+        lock_recover(&self.lifecycle).adopt_for_stop(session_id);
+    }
+
     /// Reports each session a `wait_for_worker` call starts parking on.
     pub(crate) fn watch_worker_waits(&self) -> broadcast::Receiver<String> {
         self.worker_waits.subscribe()
@@ -245,6 +250,7 @@ pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, temp
 
 pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
     SpawnRequest {
+        provider: None,
         session_id: session_id.into(),
         agent: "claude-code".into(),
         tool: "claude-code".into(),
@@ -269,6 +275,7 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
 
 pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
     SpawnConfig {
+        provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),

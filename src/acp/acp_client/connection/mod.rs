@@ -222,6 +222,16 @@ pub(super) async fn run_connection_task<W, R>(
                                 }
                                 return Ok(());
                             }
+                            // No session id to fence on, and a refused session
+                            // still reports the account it was refused for.
+                            SessionIngressNotification::AuthStatus(status) => {
+                                shared
+                                    .emit(Event::AuthStatusUpdated {
+                                        status: Some(status),
+                                    })
+                                    .await;
+                                return Ok(());
+                            }
                             SessionIngressNotification::Update(params) => params,
                         };
                         let (notification, wire_bytes) = SessionIngressNotification::decode_update(

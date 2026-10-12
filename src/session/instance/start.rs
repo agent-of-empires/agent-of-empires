@@ -352,10 +352,7 @@ impl Instance {
             let native_mints_child = matches!(
                 prepared.expected_conversation.intent,
                 ResumeIntent::Fork { .. }
-            ) && !matches!(
-                execution.agent.fork_strategy,
-                crate::agents::ForkStrategy::ClaudeFork
-            );
+            ) && !execution.agent.fork_strategy.preassigns_child_id();
             if native_mints_child {
                 self.set_agent_conversation(None, None, None);
             } else if let Some(sid) = self.agent_session_id.clone() {
@@ -381,6 +378,11 @@ impl Instance {
                         provenance: ConversationProvenance::Preallocated,
                         transcript_path: None,
                     });
+                if matches!(prepared.expected_conversation.intent, ResumeIntent::Default)
+                    && super::execution::transcript_confirms_reserved_claude_conversation(&binding)
+                {
+                    binding.provenance = ConversationProvenance::Observed;
+                }
                 // #4127: a legacy binding adopts the route this launch
                 // attested, so the marker stops being derived from the
                 // configuration as it stands the moment a launch settles it.

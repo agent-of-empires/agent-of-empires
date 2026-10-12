@@ -4,7 +4,13 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginPaneBody } from "../PluginPane";
-import { PluginComposerActions, PluginHomePanes, PluginRowBadges } from "../PluginSlots";
+import {
+  PluginComposerActions,
+  PluginDetailBadges,
+  PluginHomePanes,
+  PluginRowBadges,
+  PluginStatusBarSegments,
+} from "../PluginSlots";
 import { composerDraftOperation } from "../composerDraftOperation";
 
 const { entriesRef, refreshingRef, revisionRef, pokeMock, invokeMock } = vi.hoisted(() => ({
@@ -104,6 +110,153 @@ describe("plugin slots", () => {
     entriesRef.current = [rowBadge({ items: [] })];
     const { container } = render(<PluginRowBadges sessionId="s1" />);
     expect(container.querySelector("a, span")).toBeNull();
+  });
+
+  describe("grouped badge items", () => {
+    const usage = (text: string, extra: Record<string, unknown> = {}) => ({ text, group: "usage", ...extra });
+    const statusBar = (payload: Record<string, unknown>): PluginUiEntry => ({
+      plugin_id: "acme.kit",
+      slot: "status-bar",
+      id: "u",
+      payload,
+    });
+
+    it("collapses a group into one chip that cycles on click and wraps", () => {
+      entriesRef.current = [statusBar({ items: [usage("5h 40%"), usage("7d 12%"), usage("opus 3%")] })];
+      render(<PluginStatusBarSegments />);
+      const chip = () => screen.getByRole("button");
+      expect(chip().textContent).toContain("5h 40%");
+      expect(screen.queryByText("7d 12%")).toBeNull();
+      fireEvent.click(chip());
+      expect(chip().textContent).toContain("7d 12%");
+      fireEvent.click(chip());
+      fireEvent.click(chip());
+      expect(chip().textContent).toContain("5h 40%");
+    });
+
+    it("renders ungrouped items as separate chips beside a cycling group", () => {
+      entriesRef.current = [rowBadge({ items: [{ text: "stale" }, usage("5h 40%"), usage("7d 12%"), { text: "ci" }] })];
+      render(<PluginRowBadges sessionId="s1" />);
+      expect(screen.getByText("stale")).toBeTruthy();
+      expect(screen.getByText("ci")).toBeTruthy();
+      expect(screen.getAllByRole("button")).toHaveLength(1);
+    });
+
+    it("keeps independent groups independent", () => {
+      entriesRef.current = [
+        rowBadge({
+          items: [usage("5h"), usage("7d"), { text: "a1", group: "ci" }, { text: "a2", group: "ci" }],
+        }),
+      ];
+      render(<PluginRowBadges sessionId="s1" />);
+      const [first] = screen.getAllByRole("button");
+      fireEvent.click(first);
+      expect(screen.getByText("7d")).toBeTruthy();
+      expect(screen.getByText("a1")).toBeTruthy();
+    });
+
+    it("a single-member group is a plain chip, and a cycling chip ignores href", () => {
+      entriesRef.current = [
+        rowBadge({
+          items: [
+            { text: "solo", group: "one", href: "https://x/solo" },
+            usage("5h", { href: "https://x/5h" }),
+            usage("7d"),
+          ],
+        }),
+      ];
+      render(<PluginRowBadges sessionId="s1" />);
+      expect(screen.getByRole("link", { name: "solo" })).toBeTruthy();
+      expect(screen.getAllByRole("button")).toHaveLength(1);
+      expect(screen.getAllByRole("link")).toHaveLength(1);
+    });
+
+    it("clamps the position when a re-push shrinks the group and does not bubble the click", () => {
+      entriesRef.current = [rowBadge({ items: [usage("a"), usage("b"), usage("c")] })];
+      const rowClick = vi.fn();
+      const view = render(
+        <div onClick={rowClick}>
+          <PluginRowBadges sessionId="s1" />
+        </div>,
+      );
+      // fireEvent returns false when the click default action (an enclosing row link navigation) was prevented.
+      expect(fireEvent.click(screen.getByRole("button"))).toBe(false);
+      fireEvent.click(screen.getByRole("button"));
+      expect(screen.getByRole("button").textContent).toContain("c");
+      expect(rowClick).not.toHaveBeenCalled();
+      entriesRef.current = [rowBadge({ items: [usage("a"), usage("b")] })];
+      view.rerender(
+        <div onClick={rowClick}>
+          <PluginRowBadges sessionId="s1" />
+        </div>,
+      );
+      expect(screen.getByRole("button").textContent).toBe("a");
+    });
+
+    it("skips members that render nothing so the group keeps a working control", () => {
+      const cases: [string, Record<string, unknown>[]][] = [
+        ["empty first", [{ group: "usage" }, usage("a"), usage("b")]],
+        ["empty middle", [usage("a"), { group: "usage" }, usage("b")]],
+        ["unknown icon without text", [usage("a"), { icon: "not-a-real-icon", group: "usage" }, usage("b")]],
+        ["whitespace-only text", [usage("a"), { text: "   ", group: "usage" }, usage("b")]],
+      ];
+      for (const [name, items] of cases) {
+        entriesRef.current = [rowBadge({ items })];
+        const { unmount } = render(<PluginRowBadges sessionId="s1" />);
+        const seen: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          const button = screen.getByRole("button", { name: undefined });
+          seen.push(button.textContent ?? "");
+          fireEvent.click(button);
+        }
+        expect(seen, name).toEqual(["a", "b", "a"]);
+        unmount();
+      }
+    });
+
+    it("a group left with one renderable member is a plain chip", () => {
+      entriesRef.current = [rowBadge({ items: [{ group: "usage" }, usage("only")] })];
+      render(<PluginRowBadges sessionId="s1" />);
+      expect(screen.queryByRole("button")).toBeNull();
+      expect(screen.getByText("only")).toBeTruthy();
+    });
+
+    it("names an icon-only cycling button by its group and position", () => {
+      entriesRef.current = [
+        rowBadge({
+          items: [
+            { icon: "gauge", group: "usage" },
+            { icon: "clock", group: "usage" },
+          ],
+        }),
+      ];
+      render(<PluginRowBadges sessionId="s1" />);
+      const button = screen.getByRole("button", { name: "usage (1/2)" });
+      fireEvent.click(button);
+      expect(screen.getByRole("button", { name: "usage (2/2)" })).toBeTruthy();
+    });
+
+    it("status-bar explicit empty items hides the badge even with top-level text", () => {
+      entriesRef.current = [statusBar({ text: "fallback", items: [] })];
+      const { container } = render(<PluginStatusBarSegments />);
+      expect(screen.queryByText("fallback")).toBeNull();
+      expect(container.querySelector("button, span")).toBeNull();
+    });
+
+    it("detail-badge accepts grouped items too", () => {
+      entriesRef.current = [
+        {
+          plugin_id: "acme.kit",
+          slot: "detail-badge",
+          id: "d",
+          session_id: "s1",
+          payload: { items: [usage("x"), usage("y")] },
+        },
+      ];
+      render(<PluginDetailBadges sessionId="s1" />);
+      fireEvent.click(screen.getByRole("button"));
+      expect(screen.getByRole("button").textContent).toContain("y");
+    });
   });
 
   it("home-pane renders blocks, and the simple form's title only once", () => {
@@ -350,6 +503,104 @@ describe("pane blocks", () => {
     expect(lines).toHaveLength(2);
     expect(lines[0]!.getAttribute("class")).toContain("text-status-waiting");
     expect(lines[1]!.getAttribute("class")).toContain("text-status-error");
+  });
+
+  describe("markdown block", () => {
+    const md = (text: string, extra: Record<string, unknown> = {}) =>
+      renderBlocks({ kind: "markdown", text, ...extra });
+
+    it("renders GitHub-flavoured syntax", () => {
+      const { container } = md(
+        [
+          "# Title",
+          "",
+          "some *em* and **strong** and `inline`",
+          "",
+          "- [x] done",
+          "- [ ] todo",
+          "",
+          "1. one",
+          "",
+          "> quoted",
+          "",
+          "```rs",
+          "let x = 1;",
+          "```",
+          "",
+          "| a | b |",
+          "|---|---|",
+          "| 1 | 2 |",
+        ].join("\n"),
+      );
+      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Title");
+      expect(container.querySelector("em")?.textContent).toBe("em");
+      expect(container.querySelector("strong")?.textContent).toBe("strong");
+      expect(container.querySelector("p code")?.textContent).toBe("inline");
+      expect(container.querySelectorAll("ul li")).toHaveLength(2);
+      expect(container.querySelectorAll("input[type=checkbox]")).toHaveLength(2);
+      expect(container.querySelector("ol li")?.textContent).toBe("one");
+      expect(container.querySelector("blockquote")?.textContent).toContain("quoted");
+      expect(container.querySelector("pre code")?.textContent).toContain("let x = 1;");
+      expect(container.querySelectorAll("table td")).toHaveLength(2);
+    });
+
+    it("links follow the row href policy", () => {
+      const { container } = md(
+        "[ext](https://example.com/x) [int](/session/abc) [js](javascript:alert(1)) [proto](//evil.com) [data](data:text/html,x)",
+      );
+      const ext = screen.getByText("ext").closest("a")!;
+      expect(ext.getAttribute("href")).toBe("https://example.com/x");
+      expect(ext.getAttribute("target")).toBe("_blank");
+      expect(ext.getAttribute("rel")).toBe("noopener noreferrer");
+      const int = screen.getByText("int").closest("a")!;
+      expect(int.getAttribute("href")).toBe("/session/abc");
+      expect(int.getAttribute("target")).toBeNull();
+      // The rejected links survive as plain text, not anchors.
+      expect(container.textContent).toContain("js proto data");
+      expect(container.querySelectorAll("a")).toHaveLength(2);
+    });
+
+    it("strips raw HTML, comments and details, keeping inner markdown", () => {
+      const { container } = md(
+        '<script>alert(1)</script>\n\n<!-- hidden note -->\n\n<details><summary>sum</summary>\n\n**inner**\n\n</details>\n\nx <b onclick="y()">bold</b> <img src="https://evil.test/p.png">',
+      );
+      expect(container.querySelector("script, details, summary, b, img")).toBeNull();
+      expect(container.innerHTML).not.toContain("hidden note");
+      expect(container.innerHTML).not.toContain("alert(1)");
+      expect(container.innerHTML).not.toContain("onclick");
+      expect(container.querySelector("strong")?.textContent).toBe("inner");
+    });
+
+    it("drops details content that has no blank line after the tag, as one HTML block", () => {
+      const { container } = md("<details>\n**inner**\n</details>\n\nafter");
+      expect(container.querySelector("details, strong")).toBeNull();
+      expect(container.textContent?.trim()).toBe("after");
+    });
+
+    it("renders a markdown image as its alt text, never loading the URL", () => {
+      const { container } = md("![the logo](https://evil.test/p.png)");
+      expect(container.querySelector("img")).toBeNull();
+      expect(screen.getByText("the logo")).toBeTruthy();
+    });
+
+    it("renders a markdown image without alt text as nothing", () => {
+      const { container } = md("before ![](https://evil.test/p.png) after");
+      expect(container.querySelector("img")).toBeNull();
+      expect(container.textContent).toBe("before  after");
+    });
+
+    it("tints with tone and drops a block without text", () => {
+      const { container } = md("warned", { tone: "warn" });
+      expect(container.querySelector("[data-testid='plugin-pane-markdown']")?.className).toContain(
+        "text-status-waiting",
+      );
+      // The conversation-sized `acp-markdown-body` would override the pane's compact `text-xs`.
+      expect(container.querySelector("[data-testid='plugin-pane-markdown']")?.className).not.toContain(
+        "acp-markdown-body",
+      );
+      const empty = renderBlocks({ kind: "markdown" }, { kind: "markdown", text: 7 });
+      expect(empty.container.querySelector("[data-testid='plugin-pane-markdown']")).toBeNull();
+    });
   });
 
   it("a bar sizes segments proportionally and drops non-positive values", () => {

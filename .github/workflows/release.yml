@@ -132,9 +132,30 @@ jobs:
       - name: Build web frontend
         run: cd web && npm install && npm run build
 
+      - name: Read release toolchain
+        id: toolchain
+        shell: bash
+        env:
+          PYTHON: ${{ matrix.container != '' && '/opt/python/cp312-cp312/bin/python3' || 'python3' }}
+        run: |
+          set -euo pipefail
+          channel="$("$PYTHON" - <<'PY'
+          import re
+          import tomllib
+          with open("rust-toolchain.toml", "rb") as f:
+              channel = tomllib.load(f)["toolchain"]["channel"]
+          # Historical tags predate the local helper and numeric pin.
+          if not isinstance(channel, str) or not re.fullmatch(r"stable|[0-9]+\.[0-9]+\.[0-9]+", channel):
+              raise SystemExit(f"::error::Unexpected release toolchain {channel!r}")
+          print(channel)
+          PY
+          )"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
 
       - name: Build

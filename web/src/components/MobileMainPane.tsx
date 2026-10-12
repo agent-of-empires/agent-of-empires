@@ -126,6 +126,7 @@ export function MobileMainPane({
                 rateLimitAutoResume={activeSession.rate_limit_auto_resume}
                 tool={activeSession.tool}
                 acpAgent={activeSession.acp_agent ?? null}
+                acpProvider={activeSession.acp_provider ?? null}
                 clearAliases={activeSession.clear_aliases}
                 archivedAt={activeSession.archived_at ?? null}
                 snoozedUntil={activeSession.snoozed_until ?? null}
@@ -241,6 +242,7 @@ export function MobileMainPane({
       {sendDialogOpen && commentsEnabled && activeSessionId && (
         <SendCommentsDialog
           sessionId={activeSessionId}
+          delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
           comments={diffComments.comments}
           isMultiRepo={commentsIsMultiRepo}
           sendEnabled={commentSendEnabled}
@@ -260,6 +262,7 @@ export function MobileMainPane({
             }
             onCloseSendDialog();
             onClearSelectedFile();
+            if (activeSession?.view !== "structured") onBackToAgent();
           }}
         />
       )}

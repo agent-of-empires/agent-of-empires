@@ -177,6 +177,7 @@ mod tests {
             instance.source_profile = profile.to_string();
             instance.tool = "codex".to_string();
             instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "ubuntu:latest".to_string(),

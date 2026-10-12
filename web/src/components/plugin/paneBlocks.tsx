@@ -7,6 +7,7 @@ import { invokePluginAction, type PluginUiTone } from "../../lib/api";
 import { usePluginUiPoke, usePluginUiRevision } from "../../lib/pluginUiContext";
 import { accentStyle, lucideIcon, toneTextClass, validTone } from "../../lib/pluginUi";
 import { isInternalHref } from "../../lib/pluginHref";
+import { BlockMarkdown } from "./BlockMarkdown";
 import { BadgeChip, Spinner } from "./SlotChrome";
 import { isObject, objectList, pluginLinkProps, renderIcon, safeHref, str, type Obj } from "./slotPayload";
 
@@ -536,6 +537,7 @@ const KINDS: Record<string, (p: BlockProps) => ReactNode> = {
     const text = str(block, "text");
     return text ? <p className={`text-xs ${toneTextClass(validTone(block.tone))}`}>{text}</p> : null;
   },
+  markdown: ({ block }) => <BlockMarkdown block={block} />,
   divider: () => <hr className="border-surface-700/60" />,
   row: (p) => <BlockRow {...p} />,
   comment: ({ block }) => <BlockComment block={block} />,

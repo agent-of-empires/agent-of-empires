@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::{merge_configs, Config, ProfileConfig};
+use crate::session::{merge_configs, Config, Instance, ProfileConfig, SandboxInfo, View};
 use crate::tui::dialogs::test_keys::{alt_key, ctrl_key, key, shift_key};
 use crate::tui::dialogs::test_render::find;
 use std::fs;
@@ -319,6 +319,16 @@ fn the_tool_row_cycles_and_submits_the_picked_tool() {
         assert_eq!(dialog.tool_index, expected);
     }
 
+    // Digits jump straight to a tool; out-of-range digits are ignored.
+    for (c, expected) in [('3', 2), ('1', 0), ('9', 0), ('2', 1)] {
+        dialog.handle_key(key(KeyCode::Char(c)));
+        assert_eq!(dialog.tool_index, expected);
+    }
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).tool,
+        "opencode"
+    );
+
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2;
     dialog.handle_key(key(KeyCode::Char(' ')));
@@ -328,17 +338,45 @@ fn the_tool_row_cycles_and_submits_the_picked_tool() {
         "opencode"
     );
 
-    // Space is ordinary text on a text field, and a lone tool never cycles.
+    // Space and digits are ordinary text on a text field, and a lone tool never cycles.
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 1;
     dialog.handle_key(key(KeyCode::Char(' ')));
-    assert_eq!(dialog.title.value(), " ");
+    dialog.handle_key(key(KeyCode::Char('2')));
+    assert_eq!(dialog.title.value(), " 2");
     assert_eq!(dialog.tool_index, 0);
 
     let mut dialog = single_tool_dialog();
     dialog.focused_field = 2;
     dialog.handle_key(key(KeyCode::Left));
     assert_eq!(dialog.tool_index, 0);
+}
+
+#[test]
+#[serial_test::serial]
+fn reselecting_the_current_tool_keeps_its_edits() {
+    let mut dialog = NewSessionDialog::new_with_tools(
+        vec!["claude", "opencode", "codex"],
+        TEST_PATH.to_string(),
+    );
+    dialog.focused_field = 2;
+    dialog.handle_key(key(KeyCode::Char('2')));
+    dialog.extra_args = Input::new("--model fast".to_string());
+    dialog.command_override = Input::new("wrapper".to_string());
+    dialog.yolo_mode = !dialog.yolo_mode_default;
+
+    dialog.handle_key(key(KeyCode::Char('2')));
+    // Alt+digit is not a pick.
+    dialog.handle_key(alt_key(KeyCode::Char('3')));
+    assert_eq!(dialog.tool_index, 1);
+    assert_eq!(dialog.extra_args.value(), "--model fast");
+    assert_eq!(dialog.command_override.value(), "wrapper");
+    assert_ne!(dialog.yolo_mode, dialog.yolo_mode_default);
+
+    // The footer and row advertise the digits while the Tool row has focus.
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("[2] opencode  →"), "{screen}");
+    assert!(screen.contains("1-3 pick"), "{screen}");
 }
 
 #[test]
@@ -373,6 +411,7 @@ fn yolo_toggles_on_its_own_row_independently_of_the_sandbox() {
     for sandbox in [true, false] {
         let mut dialog = sandboxed_dialog();
         dialog.sandbox_enabled = sandbox;
+        dialog.sandbox_dirty = true;
         dialog.yolo_mode = true;
         let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
         assert_eq!(data.sandbox, sandbox);
@@ -401,6 +440,7 @@ fn the_sandbox_image_always_submits_whatever_the_field_holds() {
     for (sandbox, image, want) in cases {
         let mut dialog = sandboxed_dialog();
         dialog.sandbox_enabled = *sandbox;
+        dialog.sandbox_dirty = true;
         if let Some(image) = image {
             dialog.sandbox_image = Input::new(image.to_string());
         }
@@ -1290,6 +1330,290 @@ fn test_reload_config_defaults_uses_project_worktree_override() {
 }
 
 #[test]
+#[serial_test::serial]
+fn test_project_sandbox_override_seeds_and_keeps_direct_toggle() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        ),
+        false,
+    )
+    .expect("register project");
+    crate::session::projects::update_overrides(
+        "default",
+        crate::session::ProjectScope::Global,
+        "demo",
+        |ov| ov.sandbox_enabled = Some(true),
+    )
+    .expect("set override");
+
+    // Global sandbox.enabled_by_default is false; the project's override wins.
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    dialog.reload_config_defaults();
+    assert!(dialog.sandbox_enabled);
+
+    // A typed path applies the override once focus leaves the field.
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    assert!(dialog.sandbox_enabled);
+
+    // Without docker the override cannot turn the sandbox on.
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = false;
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    assert!(!dialog.sandbox_enabled);
+
+    // A direct toggle survives later path changes.
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    dialog.focused_field = dialog.field_indices().sandbox;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(!dialog.sandbox_enabled);
+    dialog.focused_field = 0;
+    dialog.handle_key(key(KeyCode::Tab));
+    assert!(!dialog.sandbox_enabled);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_scratch_ignores_the_retained_projects_sandbox_override() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        "default_profile = \"default\"\n\n[sandbox]\nenabled_by_default = true\n",
+    )
+    .expect("global config");
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        )
+        .with_overrides(crate::session::ProjectOverrides {
+            sandbox_enabled: Some(false),
+            ..Default::default()
+        }),
+        false,
+    )
+    .expect("register project");
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    dialog.reload_config_defaults();
+    assert!(
+        !dialog.sandbox_enabled,
+        "the project's off override wins over the on default"
+    );
+
+    // Scratch belongs to no project: the profile default applies on entry and after a profile switch.
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert!(
+        dialog.sandbox_enabled,
+        "profile default on entering scratch"
+    );
+    dialog.reload_config_defaults();
+    assert!(dialog.sandbox_enabled, "profile switch while scratch");
+
+    // Leaving scratch brings the project's override back.
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert!(
+        !dialog.sandbox_enabled,
+        "project override after leaving scratch"
+    );
+
+    // A direct choice owns the toggle across the move to scratch.
+    dialog.sandbox_dirty = true;
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert!(!dialog.sandbox_enabled, "manual choice survives scratch");
+}
+
+/// Registers a repo whose project asks for the sandbox, with the global default off, and returns the
+/// repo plus the registry file's valid content so a test can break and repair it.
+fn sandbox_project_with_broken_registry_helper() -> (tempfile::TempDir, std::path::PathBuf, String)
+{
+    let repo = tempfile::tempdir().expect("temp repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        )
+        .with_overrides(crate::session::ProjectOverrides {
+            sandbox_enabled: Some(true),
+            ..Default::default()
+        }),
+        false,
+    )
+    .expect("register project");
+    let registry = crate::session::get_app_dir()
+        .expect("app dir")
+        .join("projects.json");
+    let valid = fs::read_to_string(&registry).expect("registry content");
+    (repo, registry, valid)
+}
+
+#[test]
+#[serial_test::serial]
+fn test_unreadable_registry_keeps_a_held_resolution_for_the_same_path() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let (repo, registry, _valid) = sandbox_project_with_broken_registry_helper();
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    dialog.reload_config_defaults();
+    assert!(dialog.sandbox_enabled, "the project's override resolved");
+
+    fs::write(&registry, "{ not json").expect("break registry");
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(
+        data.sandbox,
+        "a resolution held for this path survives an unreadable registry"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_scratch_round_trip_does_not_count_an_unreadable_registry_as_resolved() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let (repo, registry, valid) = sandbox_project_with_broken_registry_helper();
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    dialog.reload_config_defaults();
+    assert!(dialog.sandbox_enabled, "the project's override resolved");
+
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert!(!dialog.sandbox_enabled, "scratch takes the profile default");
+
+    // Back to the project while its registry is unreadable: the scratch default must not stand in
+    // for the project's override.
+    fs::write(&registry, "{ not json").expect("break registry");
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    let result = dialog.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(result, DialogResult::Continue),
+        "a project whose defaults were replaced by scratch must not submit them"
+    );
+
+    fs::write(&registry, valid).expect("repair registry");
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(
+        data.sandbox,
+        "the repaired registry's override applies on retry"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_unreadable_registry_blocks_submission_until_the_path_resolves() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let (repo, registry, valid) = sandbox_project_with_broken_registry_helper();
+    fs::write(&registry, "{ not json").expect("break registry");
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    let result = dialog.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(result, DialogResult::Continue),
+        "an unresolved project must not submit a guessed sandbox default"
+    );
+    assert!(dialog
+        .error_message
+        .as_deref()
+        .is_some_and(|m| m.contains("Could not load this project's settings")));
+
+    // A missing registry file is genuinely empty, and a repaired one resolves the override.
+    fs::write(&registry, valid).expect("repair registry");
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(
+        data.sandbox,
+        "the repaired registry's override applies on retry"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_typed_tilde_path_finds_the_registered_projects_overrides() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+
+    let repo = temp_home.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        )
+        .with_overrides(crate::session::ProjectOverrides {
+            worktree_enabled: Some(true),
+            sandbox_enabled: Some(true),
+            ..Default::default()
+        }),
+        false,
+    )
+    .expect("register project");
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::default();
+    type_str(&mut dialog, "~/repo");
+    dialog.handle_key(key(KeyCode::Tab));
+
+    assert!(dialog.sandbox_enabled, "sandbox override via ~ path");
+    assert!(dialog.worktree_enabled, "worktree override via ~ path");
+}
+
+#[test]
 fn terminal_fork_hides_structured_despite_structured_default() {
     let mut dialog = single_tool_dialog();
     dialog.structured_default = true;
@@ -1316,4 +1640,208 @@ fn terminal_fork_hides_structured_despite_structured_default() {
     });
     assert!(!dialog.structured_capable);
     assert!(!dialog.structured_enabled);
+}
+
+#[test]
+fn only_a_title_the_user_typed_is_marked_typed() {
+    let mut dialog = single_tool_dialog();
+    assert!(!submitted(dialog.build_submit_result()).title_typed);
+
+    dialog.focused_field = dialog.title_field();
+    type_str(&mut dialog, "night shift");
+    let data = submitted(dialog.build_submit_result());
+    assert_eq!(data.title, "night shift");
+    assert!(data.title_typed);
+
+    let mut fork = single_tool_dialog();
+    fork.set_title("plan (fork)".to_string());
+    assert!(
+        !submitted(fork.build_submit_result()).title_typed,
+        "a suggested title left as it is"
+    );
+    fork.focused_field = fork.title_field();
+    type_str(&mut fork, " b");
+    let data = submitted(fork.build_submit_result());
+    assert_eq!(data.title, "plan (fork) b");
+    assert!(data.title_typed, "an edited suggestion is typed");
+}
+
+/// A session on `tool`, sandboxed and in yolo as asked.
+fn source_session(tool: &str, sandboxed: bool, yolo: bool) -> Instance {
+    let mut inst = Instance::new("source", TEST_PATH);
+    inst.tool = tool.to_string();
+    inst.yolo_mode = yolo;
+    if sandboxed {
+        inst.sandbox_info = Some(SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "ubuntu:latest".to_string(),
+            container_name: "source".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+    }
+    inst
+}
+
+/// "New from selection" on a session carries its agent and sandbox into the form. Yolo
+/// follows the configured default whatever the source ran with.
+#[test]
+#[serial_test::serial]
+fn a_selected_session_carries_its_agent_and_modes() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = true;
+    assert_eq!(dialog.selected_tool(), "claude");
+    assert!(!dialog.sandbox_enabled);
+
+    dialog.inherit_session(&source_session("opencode", true, true));
+    assert_eq!(dialog.selected_tool(), "opencode");
+    assert!(dialog.sandbox_enabled);
+    assert!(!dialog.yolo_mode, "a yolo source does not turn yolo on");
+
+    // An unsandboxed source never switches a profile's sandbox off: with yolo on by
+    // default that would launch an unsandboxed yolo agent on the host.
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = true;
+    dialog.sandbox_enabled = true;
+    dialog.yolo_mode_default = true;
+    dialog.inherit_session(&source_session("opencode", false, false));
+    assert_eq!(dialog.selected_tool(), "opencode");
+    assert!(dialog.sandbox_enabled, "the sandbox default stays on");
+    assert!(
+        dialog.yolo_mode,
+        "nor does a cautious source turn the yolo default off"
+    );
+}
+
+/// The view follows the source session where the agent can back a structured one, over the
+/// configured default in either direction.
+#[test]
+#[serial_test::serial]
+fn a_selected_session_carries_its_view() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        "[acp]\noffer_structured_in_new_session = true\n",
+    )
+    .expect("global config");
+
+    for (default_structured, source_view) in [(true, View::Terminal), (false, View::Structured)] {
+        let mut dialog = multi_tool_dialog();
+        dialog.reload_tool_config();
+        dialog.structured_default = default_structured;
+        let mut source = source_session("claude", false, false);
+        source.view = source_view;
+        dialog.inherit_session(&source);
+        assert!(
+            dialog.structured_capable,
+            "claude can back a structured view"
+        );
+        let structured = source_view == View::Structured;
+        assert_eq!(dialog.structured_enabled, structured, "{source_view:?}");
+        assert_eq!(
+            dialog.structured_choice,
+            Some(structured),
+            "{source_view:?}"
+        );
+    }
+}
+
+/// The carried agent's structured capability comes from the repo config at the form's path,
+/// as it does for the agent the form opened on, so a repo's `agent_detect_as` still counts.
+#[test]
+#[serial_test::serial]
+fn a_carried_agent_is_judged_by_the_repo_config() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        "[acp]\noffer_structured_in_new_session = true\n",
+    )
+    .expect("global config");
+    let repo = tempfile::tempdir().expect("repo");
+    fs::create_dir_all(repo.path().join(".agent-of-empires")).expect("repo config dir");
+    fs::write(
+        repo.path().join(".agent-of-empires").join("config.toml"),
+        "[session]\nagent_detect_as = { my-agent = \"claude\" }\n",
+    )
+    .expect("repo config");
+
+    let mut dialog =
+        NewSessionDialog::new_with_tools(vec!["claude", "my-agent"], TEST_PATH.to_string());
+    dialog.set_path(repo.path().to_string_lossy().to_string());
+    let mut source = source_session("my-agent", false, false);
+    source.view = View::Structured;
+    dialog.inherit_session(&source);
+
+    assert_eq!(dialog.selected_tool(), "my-agent");
+    assert!(
+        dialog.structured_capable,
+        "the repo maps my-agent onto claude"
+    );
+    assert!(dialog.structured_enabled);
+}
+
+/// A session whose agent is not offered here leaves the form on its defaults: its modes
+/// belong to that agent.
+#[test]
+#[serial_test::serial]
+fn a_session_on_an_agent_not_offered_here_carries_nothing() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = true;
+
+    dialog.inherit_session(&source_session("codex", true, false));
+    assert_eq!(dialog.selected_tool(), "claude");
+    assert!(!dialog.sandbox_enabled);
+}
+
+/// Each mode lands only as the form would let the user pick it.
+#[test]
+#[serial_test::serial]
+fn inherited_modes_stop_where_the_form_does() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+
+    let mut dialog = multi_tool_dialog();
+    dialog.set_structured_capable(true);
+    dialog.inherit_modes(true, false);
+    assert!(dialog.structured_enabled);
+    assert_eq!(dialog.structured_choice, Some(true));
+    dialog.set_structured_capable(false);
+    dialog.inherit_modes(true, false);
+    assert!(
+        !dialog.structured_enabled,
+        "no structured view for this agent"
+    );
+
+    let mut dialog =
+        NewSessionDialog::new_with_tools(vec!["claude", "settl"], TEST_PATH.to_string());
+    dialog.docker_available = true;
+    dialog.inherit_session(&source_session("settl", true, false));
+    assert_eq!(dialog.selected_tool(), "settl");
+    assert!(
+        !dialog.sandbox_enabled,
+        "a host-only agent is never sandboxed"
+    );
+
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = false;
+    dialog.inherit_session(&source_session("opencode", true, false));
+    assert_eq!(dialog.selected_tool(), "opencode");
+    assert!(
+        !dialog.sandbox_enabled,
+        "no container runtime to sandbox in"
+    );
 }

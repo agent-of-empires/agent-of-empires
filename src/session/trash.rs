@@ -1523,6 +1523,7 @@ mod tests {
     fn trash_prep_passes_sandbox_flag_to_container_stop() {
         let mut inst = Instance::new("sandboxed", "/tmp/sandboxed");
         inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "ubuntu:latest".to_string(),

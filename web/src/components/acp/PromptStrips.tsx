@@ -2,7 +2,7 @@ import { Fragment, useState } from "react";
 import { AlertTriangle, Check, Clock, Info, Paperclip, RotateCcw, SendHorizontal, X } from "lucide-react";
 
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
-import type { QueuedPrompt, RejectedPrompt } from "../../lib/acpTypes";
+import type { QueuedPrompt, RejectedPrompt, SessionNotice } from "../../lib/acpTypes";
 import { useClearAliases } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
@@ -77,6 +77,93 @@ export function RejectedPromptsStrip({
             </button>
           </li>
         ))}
+      </ul>
+    </Strip>
+  );
+}
+
+interface NoticeTone {
+  strip: string;
+  row: string;
+  icon: string;
+  dismiss: string;
+}
+
+// Solid theme surfaces: a translucent severity wash darkens a light theme's
+// surface below AA for the text on it, so severity rides on border and icon.
+const NOTICE_ROW = "flex items-start gap-2 rounded-lg border bg-surface-850 px-2.5 py-1.5";
+const NOTICE_DISMISS =
+  "inline-flex shrink-0 items-center justify-center rounded-md border border-surface-700 p-1 text-text-primary hover:bg-surface-800";
+
+const ERROR_TONE: NoticeTone = {
+  strip: "border-red-700/40 bg-surface-900",
+  row: `${NOTICE_ROW} border-red-700/40`,
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-status-error",
+  dismiss: NOTICE_DISMISS,
+};
+
+const WARNING_TONE: NoticeTone = {
+  strip: "border-amber-700/40 bg-surface-900",
+  row: `${NOTICE_ROW} border-amber-700/40`,
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-status-warning",
+  dismiss: NOTICE_DISMISS,
+};
+
+const INFO_TONE: NoticeTone = {
+  strip: "border-sky-700/40 bg-surface-900",
+  row: `${NOTICE_ROW} border-sky-700/40`,
+  icon: "mt-0.5 h-4 w-4 shrink-0 text-accent-500",
+  dismiss: NOTICE_DISMISS,
+};
+
+/** An unknown future ACP level reads as advisory rather than alarming. */
+function noticeTone(severity: string): NoticeTone {
+  if (severity === "error") return ERROR_TONE;
+  if (severity === "warning") return WARNING_TONE;
+  return INFO_TONE;
+}
+
+/** Live advisories the agent pushed outside the turn flow (an approaching rate
+ *  limit, a model fallback). Dismissal is local to this tab. */
+export function SessionNoticesStrip({
+  notices,
+  onDismiss,
+}: {
+  notices: SessionNotice[];
+  onDismiss: (id: string) => void;
+}) {
+  if (notices.length === 0) return null;
+  const strongest = notices.some((n) => n.severity === "error")
+    ? "error"
+    : notices.some((n) => n.severity === "warning")
+      ? "warning"
+      : "info";
+  return (
+    <Strip tone={noticeTone(strongest).strip}>
+      <ul className="space-y-1">
+        {notices.map((notice) => {
+          const tone = noticeTone(notice.severity);
+          const Icon = notice.severity === "error" ? AlertTriangle : Info;
+          return (
+            <li key={notice.id} className={tone.row}>
+              <Icon className={tone.icon} />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs leading-5 text-text-primary">{notice.title}</p>
+                {notice.description ? (
+                  <p className="mt-0.5 text-[11px] leading-4 text-text-primary">{notice.description}</p>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onClick={() => onDismiss(notice.id)}
+                className={tone.dismiss}
+                aria-label={`Dismiss notice: ${notice.title}`}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </li>
+          );
+        })}
       </ul>
     </Strip>
   );

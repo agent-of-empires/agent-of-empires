@@ -265,6 +265,40 @@ test("global settings migrate from profiles and reject stale profile writes", as
   expect(persisted.session.sidebar_position).toBe("right");
 });
 
+test("shortcut bar toggle persists globally from Terminal UI settings", async ({ serve, page }) => {
+  const profile = await defaultProfile(serve);
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  const machineUrl = `${settingsUrl}?layer=machine`;
+  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`;
+  const toggle = page.getByText("Show shortcut bar", { exact: true }).locator("../..").getByRole("switch");
+
+  await page.goto(`${serve.baseUrl}/settings/session`);
+  await page.getByRole("button", { name: /Terminal UI/ }).click();
+  await expect(toggle).toBeChecked();
+  const [saved] = await Promise.all([
+    page.waitForResponse(
+      (response) => response.url().startsWith(settingsUrl) && response.request().method() === "PATCH",
+    ),
+    toggle.click(),
+  ]);
+  expect(saved.ok()).toBe(true);
+  expect((await getJson(machineUrl)).session.show_shortcut_bar).toBe(false);
+  expect((await getJson(profileUrl)).session?.show_shortcut_bar).toBeUndefined();
+  const rejected = await fetch(profileUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { show_shortcut_bar: true } }),
+  });
+  expect(rejected.status).toBe(400);
+
+  await serve.restart();
+  await page.reload();
+  await page.getByRole("button", { name: /Terminal UI/ }).click();
+  await expect(toggle).not.toBeChecked();
+  await toggle.click();
+  await expect.poll(async () => (await getJson(machineUrl)).session.show_shortcut_bar).toBe(true);
+});
+
 test("clearing a logging target removes its global override", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/settings/logging`);
   const target = labelledSelect(page, /^acp\.protocol$/);
