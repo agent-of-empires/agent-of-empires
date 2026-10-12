@@ -604,6 +604,21 @@ fn kill_with_fallback(pids: &[u32]) {
     }
 }
 
+pub(crate) fn runner_group_executing(pid: u32) -> anyhow::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::runner_group_executing(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::runner_group_executing(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        anyhow::bail!("runner settlement unsupported for PID {pid}")
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn process_exists(pid: u32) -> bool {
     match kill(Pid::from_raw(pid as i32), None) {

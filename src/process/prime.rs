@@ -39,33 +39,7 @@ fi
 (umask 077; printf '%s\t%s\n' "$$" "$start" > "$identity") || exit 1
 exec "$@""#;
 
-// The recorded launch incarnation is checked again before each guest signal.
-const CONTAINER_PROCESS_FENCE: &str = r#"pid=$1
-expected=${2#proc:}
-identity_alive() {
-    local stat fields
-    [[ -d /proc/$pid ]] || return 1
-    IFS= read -r stat < /proc/$pid/stat || { [[ ! -d /proc/$pid ]] && return 1; return 2; }
-    read -r -a fields <<< "${stat##*) }"
-    [[ ${fields[0]} != Z ]] || return 1
-    [[ -n ${fields[19]} ]] || return 2
-    [[ ${fields[19]} == "$expected" ]] || return 1
-}
-for signal in TERM KILL; do
-    identity_alive; code=$?
-    [[ $code != 2 ]] || exit 1
-    [[ $code != 1 ]] || { printf settled; exit 0; }
-    if ! kill -"$signal" "$pid"; then
-        identity_alive; [[ $? == 1 ]] || exit 1
-    fi
-    for ((attempt=0; attempt<10; attempt++)); do
-        identity_alive; code=$?
-        [[ $code != 2 ]] || exit 1
-        [[ $code != 1 ]] || { printf settled; exit 0; }
-        sleep 0.05
-    done
-done
-exit 1"#;
+const PRIME_GUEST_CONTROL: &str = include_str!("../../assets/prime-control.py");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrimeContainer {
@@ -80,6 +54,8 @@ pub struct PrimeRuntime {
     pub program: PathBuf,
     pub agent_dir: PathBuf,
     pub container: Option<PrimeContainer>,
+    #[serde(default)]
+    pub(crate) proof_path: Option<PathBuf>,
     #[serde(skip)]
     observation: Arc<Mutex<PrimeRuntimeState>>,
 }
@@ -103,6 +79,7 @@ impl PartialEq for PrimeRuntime {
             && self.program == other.program
             && self.agent_dir == other.agent_dir
             && self.container == other.container
+            && self.proof_path == other.proof_path
     }
 }
 impl Eq for PrimeRuntime {}
@@ -170,15 +147,22 @@ pub(crate) fn foreground_observation(bytes: &[u8]) -> Option<PrimeObservation> {
 }
 
 impl PrimeRuntime {
-    pub fn new(program: PathBuf, agent_dir: PathBuf, container: Option<PrimeContainer>) -> Self {
+    pub fn new(
+        program: PathBuf,
+        agent_dir: PathBuf,
+        container: Option<PrimeContainer>,
+    ) -> Result<Self> {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        Self {
-            directory: PathBuf::from(format!("/tmp/aoe-prime-{}", &id[..12])),
+        let name = format!("aoe-prime-{}", &id[..12]);
+        let workers = crate::process::worker_registry::workers_dir()?.canonicalize()?;
+        Ok(Self {
+            directory: PathBuf::from("/tmp").join(&name),
             program,
             agent_dir,
             container,
+            proof_path: Some(workers.join(format!(".{name}.prime-proof"))),
             observation: Arc::default(),
-        }
+        })
     }
 
     pub fn socket(&self) -> PathBuf {
@@ -237,39 +221,125 @@ impl PrimeRuntime {
 
     pub(crate) fn prepare(&self) -> Result<()> {
         self.validate()?;
-        let cleanup = self.directory.join("cleanup");
-        let workers = self.agent_dir.join("daemon-workers");
-        if let Some(container) = &self.container {
-            let script = format!(
-                "umask 077; mkdir {} && mkdir {} && ln -s {} {}",
-                crate::session::environment::shell_escape(&self.directory.to_string_lossy()),
-                crate::session::environment::shell_escape(&cleanup.to_string_lossy()),
-                crate::session::environment::shell_escape(&workers.to_string_lossy()),
-                crate::session::environment::shell_escape(
-                    &cleanup.join("daemon-workers").to_string_lossy()
-                ),
-            );
-            let mut cmd = container.transport.command(&[]);
-            cmd.args(["exec", &container.id, "sh", "-c", &script]);
-            crate::session::capture::run_with_timeout_limit(
-                cmd,
-                Duration::from_secs(5),
-                "Prime runtime setup",
-                8192,
-            )?;
-        } else {
-            use std::os::unix::fs::{symlink, DirBuilderExt};
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700).create(&self.directory)?;
-            builder.create(&cleanup)?;
-            symlink(workers, cleanup.join("daemon-workers"))?;
-        }
         let _lock = self.lock_proof()?;
-        self.write_proof(&PrimeCleanupProof {
+        let proof = PrimeCleanupProof {
             route: self.proof_route()?,
             processes: Vec::new(),
             settled: false,
-        })?;
+        };
+        if self.container.is_some() {
+            return self.prepare_guest(&proof);
+        }
+        use std::os::unix::fs::{symlink, DirBuilderExt};
+        let cleanup = self.directory.join("cleanup");
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700).create(&self.directory)?;
+        let result = (|| {
+            builder.create(&cleanup)?;
+            symlink(
+                self.agent_dir.join("daemon-workers"),
+                cleanup.join("daemon-workers"),
+            )?;
+            self.write_proof(&proof)
+        })();
+        if let Err(error) = result {
+            return match std::fs::remove_dir_all(&self.directory) {
+                Ok(()) => Err(error),
+                Err(rollback) => {
+                    Err(error.context(format!("Prime setup rollback failed: {rollback}")))
+                }
+            };
+        }
+        Ok(())
+    }
+
+    fn guest_control(&self, action: &str) -> Result<Command> {
+        let container = self
+            .container
+            .as_ref()
+            .context("Prime guest route missing")?;
+        let mut command = container.transport.command(&[]);
+        command.args([
+            "exec",
+            "-i",
+            &container.id,
+            "python3",
+            "-c",
+            PRIME_GUEST_CONTROL,
+            action,
+        ]);
+        Ok(command)
+    }
+
+    fn prepare_guest(&self, proof: &PrimeCleanupProof) -> Result<()> {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let mut command = self.guest_control("prepare")?;
+        command
+            .arg(&self.directory)
+            .arg(self.agent_dir.join("daemon-workers"))
+            .arg(&token)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().context("Prime guest setup spawn failed")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Prime guest setup output missing")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout.take(1024));
+            for _ in 0..2 {
+                let mut line = String::new();
+                let result = reader.read_line(&mut line).map(|_| line);
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ready = false;
+        let result = (|| {
+            let line = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))??;
+            anyhow::ensure!(line == "ready\n", "Prime guest setup readiness unproven");
+            ready = true;
+            self.write_proof(proof)?;
+            let mut stdin = child
+                .stdin
+                .take()
+                .context("Prime guest commit input missing")?;
+            writeln!(stdin, "{token}")?;
+            drop(stdin);
+            let line = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))??;
+            anyhow::ensure!(line == "committed\n", "Prime guest setup commit unproven");
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    anyhow::ensure!(status.success(), "Prime guest setup failed");
+                    return Ok(());
+                }
+                anyhow::ensure!(Instant::now() < deadline, "Prime guest setup timed out");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        })();
+        if let Err(error) = result {
+            drop(child.stdin.take());
+            let _ = child.kill();
+            let _ = child.wait();
+            if ready {
+                let mut rollback = self.guest_control("rollback")?;
+                rollback.arg(&self.directory).arg(&token);
+                if let Err(rollback) = crate::session::capture::run_with_timeout_limit(
+                    rollback,
+                    Duration::from_secs(5),
+                    "Prime guest setup rollback",
+                    1024,
+                ) {
+                    return Err(error.context(format!("Prime setup rollback unproven: {rollback}")));
+                }
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -304,16 +374,22 @@ impl PrimeRuntime {
     }
 
     fn proof_paths(&self) -> Result<(PathBuf, PathBuf)> {
-        let directory = crate::process::worker_registry::workers_dir()?;
+        let path = self
+            .proof_path
+            .as_ref()
+            .context("Prime control path is unattested")?;
+        anyhow::ensure!(path.is_absolute(), "Prime control path must be absolute");
         let name = self
             .directory
             .file_name()
             .context("missing Prime runtime name")?
             .to_string_lossy();
-        Ok((
-            directory.join(format!(".{name}.prime-lock")),
-            directory.join(format!(".{name}.prime-proof")),
-        ))
+        anyhow::ensure!(
+            path.file_name()
+                .is_some_and(|actual| actual == format!(".{name}.prime-proof").as_str()),
+            "Prime control path does not match the runtime"
+        );
+        Ok((path.with_extension("prime-lock"), path.clone()))
     }
 
     fn lock_proof(&self) -> Result<std::fs::File> {
@@ -329,8 +405,23 @@ impl PrimeRuntime {
         Ok(file)
     }
 
-    fn proof_route(&self) -> Result<String> {
-        Ok(sha256_prefix(&serde_json::to_vec(self)?, 32))
+    pub(crate) fn proof_route(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct NativeRoute<'a> {
+            directory: &'a Path,
+            program: &'a Path,
+            agent_dir: &'a Path,
+            container: &'a Option<PrimeContainer>,
+        }
+        Ok(sha256_prefix(
+            &serde_json::to_vec(&NativeRoute {
+                directory: &self.directory,
+                program: &self.program,
+                agent_dir: &self.agent_dir,
+                container: &self.container,
+            })?,
+            32,
+        ))
     }
 
     fn read_proof(&self) -> Result<PrimeCleanupProof> {
@@ -343,6 +434,24 @@ impl PrimeRuntime {
             "Prime cleanup ledger belongs to another execution route"
         );
         Ok(proof)
+    }
+
+    pub(crate) fn attest_control_path(&mut self, workers: &Path) -> Result<()> {
+        self.validate()?;
+        let name = self
+            .directory
+            .file_name()
+            .context("missing Prime runtime name")?
+            .to_string_lossy();
+        self.proof_path = Some(workers.join(format!(".{name}.prime-proof")));
+        let result = (|| {
+            let _lock = self.lock_proof()?;
+            self.read_proof().map(|_| ())
+        })();
+        if result.is_err() {
+            self.proof_path = None;
+        }
+        result
     }
 
     fn write_proof(&self, proof: &PrimeCleanupProof) -> Result<()> {
@@ -608,22 +717,14 @@ done <<< "$known""#;
     }
 
     fn fence_container_processes(&self, daemon: bool) -> Result<()> {
-        let Some(container) = &self.container else {
+        if self.container.is_none() {
             return Ok(());
-        };
+        }
         let Some(identity) = self.launch_identity(daemon)? else {
             return Ok(());
         };
-        let mut command = container.transport.command(&[]);
+        let mut command = self.guest_control("fence")?;
         command
-            .args([
-                "exec",
-                &container.id,
-                "bash",
-                "-c",
-                CONTAINER_PROCESS_FENCE,
-                "sh",
-            ])
             .arg(identity.pid.to_string())
             .arg(&identity.start_id);
         let result = crate::session::capture::run_with_timeout_limit(
@@ -1014,10 +1115,42 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn restored_control_path_survives_agent_environment_and_failed_setup_rolls_back_only_its_root()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let runtime = PrimeRuntime::new("/bin/false".into(), root.path().into(), None).unwrap();
+        let saved = serde_json::to_vec(&runtime).unwrap();
+        let invalid_config = root.path().join("not-a-directory");
+        std::fs::write(&invalid_config, b"occupied").unwrap();
+        let _environment =
+            crate::session::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", &invalid_config)]);
+        let restored: PrimeRuntime = serde_json::from_slice(&saved).unwrap();
+        restored.prepare().unwrap();
+        assert_eq!(
+            restored.read_proof().unwrap().route,
+            restored.proof_route().unwrap()
+        );
+        std::fs::remove_dir_all(&restored.directory).unwrap();
+        let proof = restored.proof_path.as_ref().unwrap();
+        std::fs::remove_file(proof).unwrap();
+        std::fs::create_dir(proof).unwrap();
+        assert!(restored.prepare().is_err());
+        assert!(!restored.directory.exists());
+        std::fs::create_dir(&restored.directory).unwrap();
+        let marker = restored.directory.join("existing-owner");
+        std::fs::write(&marker, b"retained").unwrap();
+        assert!(restored.prepare().is_err());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"retained");
+        std::fs::remove_dir_all(&restored.directory).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn guard_drop_does_not_wait_for_concurrent_cleanup() {
         let root = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(root.path());
-        let prime = PrimeRuntime::new("/bin/false".into(), root.path().into(), None);
+        let prime = PrimeRuntime::new("/bin/false".into(), root.path().into(), None).unwrap();
         let observation = prime.observation.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1088,6 +1221,7 @@ mod tests {
     }
     #[test]
     #[cfg(target_os = "linux")]
+    #[serial_test::serial]
     fn remote_frontend_fence_preserves_daemons_and_foreign_routes() {
         use std::io::BufRead as _;
         struct Waiter(std::process::Child);
@@ -1098,7 +1232,8 @@ mod tests {
             }
         }
         let root = tempfile::tempdir().unwrap();
-        let mut runtime = PrimeRuntime::new("/bin/false".into(), root.path().into(), None);
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut runtime = PrimeRuntime::new("/bin/false".into(), root.path().into(), None).unwrap();
         runtime.directory = root.path().into();
         let payload = format!(
             "bash -c {}",
@@ -1131,9 +1266,9 @@ mod tests {
         let mut daemon = spawn(Some(true));
         let mut foreign = spawn(None);
         let fence = |identity: &crate::process::PrimeProcessIdentity| {
-            let mut command = Command::new("bash");
+            let mut command = Command::new("python3");
             command
-                .args(["-c", CONTAINER_PROCESS_FENCE, "sh"])
+                .args(["-c", PRIME_GUEST_CONTROL, "fence"])
                 .arg(identity.pid.to_string())
                 .arg(&identity.start_id);
             crate::session::capture::run_with_timeout_limit(

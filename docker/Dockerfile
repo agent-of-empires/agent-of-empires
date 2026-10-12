@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     gnupg \
     jq \
+    python3 \
     openssh-client \
     ripgrep \
     fzf \

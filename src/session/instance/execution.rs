@@ -1707,7 +1707,7 @@ impl Instance {
                         id: snapshot.id.clone(),
                         cwd: PathBuf::from(&plan.container_cwd),
                     });
-                    let runtime = crate::process::prime::PrimeRuntime::new(program.clone(), root.clone(), container);
+                    let runtime = crate::process::prime::PrimeRuntime::new(program.clone(), root.clone(), container)?;
                     namespace_arguments.extend(["--daemon-socket".into(), runtime.socket().to_string_lossy().into_owned()]);
                     prime_runtime = Some(runtime);
                 }

@@ -450,7 +450,10 @@ async fn self_terminate_agent_tree(
             result => {
                 warn!(target: "acp.runner", ?result, "native cleanup unproven; retaining ownership evidence");
                 if cleanup_record.agent_key == "prime-agent"
-                    && cleanup_record.prime_runtime.is_none()
+                    && cleanup_record
+                        .prime_runtime
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.proof_path.is_none())
                 {
                     break;
                 }

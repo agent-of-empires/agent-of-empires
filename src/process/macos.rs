@@ -140,6 +140,35 @@ pub(super) fn processes_matching(
     found
 }
 
+pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
+    let mut command = Command::new("ps");
+    command
+        .args(["-A", "-o", "pid=,pgid=,stat="])
+        .env("LC_ALL", "C");
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "runner group census",
+        1024 * 1024,
+    )?;
+    for line in std::str::from_utf8(&output)?.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let pid = fields
+            .next()
+            .context("missing process PID")?
+            .parse::<u32>()?;
+        let process_group = fields
+            .next()
+            .context("missing process group")?
+            .parse::<u32>()?;
+        let state = fields.next().context("missing process state")?;
+        if (pid == group || process_group == group) && !state.starts_with('Z') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn prime_processes(
     marker: &str,
     socket: &std::path::Path,

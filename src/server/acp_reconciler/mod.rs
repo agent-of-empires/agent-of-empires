@@ -526,7 +526,8 @@ mod tests {
             .unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
             let native =
-                crate::process::prime::PrimeRuntime::new(program, project.path().into(), None);
+                crate::process::prime::PrimeRuntime::new(program, project.path().into(), None)
+                    .unwrap();
             native.prepare().unwrap();
             struct RuntimeDirectory(std::path::PathBuf);
             impl Drop for RuntimeDirectory {

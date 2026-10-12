@@ -468,7 +468,8 @@ mod tests {
                 "/bin/false".into(),
                 root.path().into(),
                 None,
-            );
+            )
+            .unwrap();
             runtime.prepare().unwrap();
             inst.active_execution = Some(super::super::execution::ActiveExecution {
                 launch_id: "failed-cleanup".into(),

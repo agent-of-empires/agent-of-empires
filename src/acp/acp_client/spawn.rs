@@ -401,15 +401,18 @@ pub(super) fn prime_runtime_for_spawn(
             .container_workdir
             .clone()
             .ok_or_else(|| AcpError::Spawn("Prime sandbox workdir is not pinned".into()))?;
-        return Ok(Some(crate::process::prime::PrimeRuntime::new(
-            native_program.into(),
-            root.into(),
-            Some(crate::process::prime::PrimeContainer {
-                transport,
-                id: id.clone(),
-                cwd: cwd.into(),
-            }),
-        )));
+        return Ok(Some(
+            crate::process::prime::PrimeRuntime::new(
+                native_program.into(),
+                root.into(),
+                Some(crate::process::prime::PrimeContainer {
+                    transport,
+                    id: id.clone(),
+                    cwd: cwd.into(),
+                }),
+            )
+            .map_err(|error| AcpError::Spawn(error.to_string()))?,
+        ));
     }
     let env = |key: &str| {
         overrides
@@ -435,11 +438,10 @@ pub(super) fn prime_runtime_for_spawn(
     } else {
         config.cwd.join(root)
     };
-    Ok(Some(crate::process::prime::PrimeRuntime::new(
-        program.into(),
-        root,
-        None,
-    )))
+    Ok(Some(
+        crate::process::prime::PrimeRuntime::new(program.into(), root, None)
+            .map_err(|error| AcpError::Spawn(error.to_string()))?,
+    ))
 }
 
 pub(super) fn spawn_subprocess(

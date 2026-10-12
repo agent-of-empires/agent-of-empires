@@ -861,17 +861,8 @@ async fn signal_and_wait(
     timeout_secs: u64,
 ) -> Result<()> {
     use crate::process::worker_registry;
-    crate::process::worker::terminate_process_group(record.pid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if !worker_registry::is_pid_alive(record.pid) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    if worker_registry::is_pid_alive(record.pid) {
-        crate::process::worker::kill_process_group(record.pid);
-    }
+    worker_registry::settle_runner(record.pid, std::time::Duration::from_secs(timeout_secs))
+        .await?;
     let record = record.clone();
     tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&record)).await??;
     Ok(())

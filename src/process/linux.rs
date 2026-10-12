@@ -148,6 +148,43 @@ pub(super) fn processes_matching(
     found
 }
 
+pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 1024];
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let size = match fs::File::open(entry.path().join("stat"))
+            .and_then(|mut file| file.read(&mut bytes))
+        {
+            Ok(size) => size,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error).context("runner group census unavailable"),
+        };
+        let offset = bytes[..size]
+            .windows(2)
+            .rposition(|pair| pair == b") ")
+            .context("invalid process stat")?;
+        let mut fields = std::str::from_utf8(&bytes[offset + 2..size])?.split_ascii_whitespace();
+        let state = fields.next().context("missing process state")?;
+        let process_group = fields
+            .nth(1)
+            .context("missing process group")?
+            .parse::<u32>()?;
+        if (pid == group || process_group == group) && state != "Z" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn prime_processes(
     marker: &str,
     socket: &Path,
@@ -581,11 +618,10 @@ mod tests {
         let program = root.path().join("native-shutdown");
         fs::write(&program, "#!/bin/sh\nprintf '%s' '{\"failed\":[]}'\n").unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
-        let runtime = OwnedRuntime(crate::process::prime::PrimeRuntime::new(
-            program,
-            root.path().join("agent"),
-            None,
-        ));
+        let runtime = OwnedRuntime(
+            crate::process::prime::PrimeRuntime::new(program, root.path().join("agent"), None)
+                .unwrap(),
+        );
         runtime.0.prepare().unwrap();
         let cleanup = runtime.0.directory.join("cleanup");
         let original = runtime.0.directory.join("cleanup.original");

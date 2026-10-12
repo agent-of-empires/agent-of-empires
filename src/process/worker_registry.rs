@@ -13,9 +13,8 @@ use crate::util::now_secs;
 
 pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_id};
 
-/// Runner generation 5 records ownership of detached native Prime workers.
-/// The control wire version stays 3; stale runners must settle before replacement.
-pub const RUNNER_VERSION: u32 = 5;
+/// Generation 6 persists the host control path independently of the agent environment.
+pub const RUNNER_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -182,7 +181,10 @@ fn save_unlocked(record: &WorkerRecord) -> Result<()> {
     Ok(())
 }
 
-fn with_registry_lock<T>(session_id: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(crate) fn with_registry_lock<T>(
+    session_id: &str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     validate_session_id(session_id)?;
     let lock_path = workers_dir()?.join(format!("{session_id}.lock"));
     let lock_file = std::fs::OpenOptions::new()
@@ -493,6 +495,30 @@ pub fn terminate(session_id: &str) {
         delete_if_absent(session_id).ok();
     }
 }
+pub(crate) async fn settle_runner(pid: u32, grace: std::time::Duration) -> Result<()> {
+    if !crate::process::runner_group_executing(pid)? {
+        return Ok(());
+    }
+    crate::process::worker::terminate_process_group(pid);
+    let deadline = tokio::time::Instant::now() + grace;
+    while crate::process::runner_group_executing(pid)? && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    if crate::process::runner_group_executing(pid)? {
+        crate::process::worker::kill_process_group(pid);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::process::runner_group_executing(pid)? && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+    anyhow::ensure!(
+        !crate::process::runner_group_executing(pid)?,
+        "runner termination unproven"
+    );
+    Ok(())
+}
+
 /// Settles the selected generation before replacement.
 pub async fn terminate_and_wait(session_id: &str) -> anyhow::Result<()> {
     if let Some(record) = load(session_id)? {
@@ -514,20 +540,7 @@ pub(crate) async fn terminate_record_and_wait(
         ),
         "worker generation changed before termination"
     );
-    crate::process::worker::terminate_process_group(record.pid);
-    #[cfg(unix)]
-    {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while is_pid_alive(record.pid) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        crate::process::worker::kill_process_group(record.pid);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while is_pid_alive(record.pid) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        anyhow::ensure!(!is_pid_alive(record.pid), "runner termination unproven");
-    }
+    settle_runner(record.pid, std::time::Duration::from_secs(2)).await?;
     let blocking_guard = cleanup_guard.clone();
     let record = tokio::task::spawn_blocking(move || {
         let _guard = blocking_guard;
@@ -564,7 +577,11 @@ pub(crate) fn recover_untracked_prime(selected: &WorkerRecord) -> Result<()> {
             "worker generation changed before recovery"
         );
         anyhow::ensure!(
-            current.agent_key == "prime-agent" && current.prime_runtime.is_none(),
+            current.agent_key == "prime-agent"
+                && current
+                    .prime_runtime
+                    .as_ref()
+                    .is_none_or(|runtime| runtime.proof_path.is_none()),
             "recovery is only for Prime records without a native ownership route"
         );
         anyhow::ensure!(
@@ -600,6 +617,61 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn runner_settlement_accepts_unreaped_leaders_but_still_terminates_live_group_members() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+        struct OwnedGroup(std::process::Child);
+        impl Drop for OwnedGroup {
+            fn drop(&mut self) {
+                crate::process::worker::kill_process_group(self.0.id());
+                let _ = self.0.wait();
+            }
+        }
+        for member in [false, true] {
+            let script = if member {
+                "sleep 600 & printf 'ready\n'; read -r ignored"
+            } else {
+                "printf 'ready\n'; read -r ignored"
+            };
+            let mut leader = OwnedGroup(
+                std::process::Command::new("bash")
+                    .args(["-c", script])
+                    .process_group(0)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let pid = leader.0.id();
+            let mut line = String::new();
+            std::io::BufReader::new(leader.0.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "ready\n");
+            drop(leader.0.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let stat = std::fs::read(format!("/proc/{pid}/stat")).unwrap();
+                let offset = stat.windows(2).rposition(|pair| pair == b") ").unwrap();
+                if stat[offset + 2] == b'Z' {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "leader did not exit");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(is_pid_alive(pid));
+            assert_eq!(crate::process::runner_group_executing(pid).unwrap(), member);
+            settle_runner(pid, Duration::from_millis(100))
+                .await
+                .unwrap();
+            assert!(!crate::process::runner_group_executing(pid).unwrap());
+            assert!(is_pid_alive(pid));
+        }
+    }
+
     struct KillOnDrop(std::process::Child);
 
     impl Drop for KillOnDrop {
@@ -623,16 +695,36 @@ mod tests {
             let mut selected = new_record("recovery-prime", i32::MAX as u32, "/tmp/unused.sock");
             selected.agent_key = "prime-agent".into();
             selected.generation = 7;
-            for case in ["live", "tracked", "non-prime", "superseded", "legacy"] {
+            for case in [
+                "live",
+                "tracked",
+                "unattested",
+                "non-prime",
+                "superseded",
+                "legacy",
+            ] {
                 let mut current = selected.clone();
                 match case {
                     "live" => current.pid = std::process::id(),
                     "tracked" => {
-                        current.prime_runtime = Some(crate::process::prime::PrimeRuntime::new(
+                        current.prime_runtime = Some(
+                            crate::process::prime::PrimeRuntime::new(
+                                "/bin/false".into(),
+                                "/tmp/store".into(),
+                                None,
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    "unattested" => {
+                        let mut runtime = crate::process::prime::PrimeRuntime::new(
                             "/bin/false".into(),
                             "/tmp/store".into(),
                             None,
-                        ))
+                        )
+                        .unwrap();
+                        runtime.proof_path = None;
+                        current.prime_runtime = Some(runtime);
                     }
                     "non-prime" => current.agent_key = "aoe-agent".into(),
                     "superseded" => current.generation += 1,
@@ -645,7 +737,7 @@ mod tests {
                     &current
                 };
                 let result = recover_untracked_prime(snapshot);
-                if case == "legacy" {
+                if case == "legacy" || case == "unattested" {
                     result.unwrap();
                     assert!(load(&current.session_id).unwrap().is_none());
                 } else {
