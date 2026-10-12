@@ -21,6 +21,8 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 
 `No` means automatic discovery is unsupported there, not that resume is: a user-provided exact id stays authoritative for any agent with a verified resume contract, and agents with no such contract reject automatic resume entirely. OpenCode host capture also needs `session.opencode_preassign_session_id = true`. AoE never scans a shared store or infers an identity from recency. [Importing](#importing-an-existing-conversation) is different: you pick the conversation, and its recency only drives a warning.
 
+Hermes host identity hooks validate the complete JSON payload while retaining only the foreground identity, not the conversation history. Payloads up to 64 MiB are accepted. Larger or malformed payloads do not update the stored identity; the previous identity remains unchanged. This transport limit bounds input processing and temporary token storage, not exact process memory usage.
+
 Sandbox config and conversation stores are staged per AoE instance, including custom `agent_config_dir` roots, and a cross-process lease guards each managed store, so two sessions in the same directory cannot claim each other's conversation.
 
 `agent_detect_as` controls status detection and ACP adapter inheritance, not terminal execution identity. Direct built-in commands identify their native agent independently. Opaque wrappers need the explicit contract described below for explicit resume or fork and capture from shared stores.
