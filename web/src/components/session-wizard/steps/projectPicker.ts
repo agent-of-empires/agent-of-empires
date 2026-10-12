@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchSessions, fetchRecentProjects, fetchProjects } from "../../../lib/api";
+import { fetchSessions, fetchRecentProjects, fetchProjectRegistry } from "../../../lib/api";
 import type { RecentProjectEntry } from "../../../lib/api";
 import type { ProjectInfo, SessionResponse } from "../../../lib/types";
 
@@ -76,29 +76,34 @@ export function splitSavedAndRecent(
 }
 
 /** Saved and recent project lists with search, shared by ProjectStep and ExtraReposPicker. */
-export function useProjectPicker(excludePaths: string[] = []) {
+export function useProjectPicker(excludePaths: string[] = [], profile?: string) {
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [saved, setSaved] = useState<ProjectInfo[]>([]);
-  const [loading, setLoading] = useState(true);
+  // The profile the lists were loaded for, so a profile change reads as loading, not as stale data.
+  const [loadedFor, setLoadedFor] = useState<{ profile: string | undefined } | null>(null);
+  const loading = loadedFor === null || loadedFor.profile !== profile;
+  // False when the registry request failed: an empty `saved` then means unknown, not unregistered.
+  const [registryAvailable, setRegistryAvailable] = useState(true);
   const [query, setQuery] = useState("");
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects()]).then(
+    Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjectRegistry(undefined, profile)]).then(
       ([envelope, recentEnvelope, savedProjects]) => {
         if (cancelled) return;
         const sessionDerived = envelope ? collectRecentProjects(envelope.sessions) : [];
         const merged = mergeRecentProjects(sessionDerived, recentEnvelope?.projects ?? []);
-        const split = splitSavedAndRecent(savedProjects, merged);
+        const split = splitSavedAndRecent(savedProjects ?? [], merged);
         setSaved(split.saved);
         setRecent(split.recent);
-        setLoading(false);
+        setRegistryAvailable(savedProjects !== null);
+        setLoadedFor({ profile });
       },
     );
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [profile]);
 
   const excluded = useMemo(() => new Set(excludePaths.map(normalizePath)), [excludePaths]);
   const visibleSaved = useMemo(() => saved.filter((s) => !excluded.has(normalizePath(s.path))), [saved, excluded]);
@@ -118,6 +123,7 @@ export function useProjectPicker(excludePaths: string[] = []) {
 
   return {
     loading,
+    registryAvailable,
     saved: visibleSaved,
     recent: visibleRecent,
     query,

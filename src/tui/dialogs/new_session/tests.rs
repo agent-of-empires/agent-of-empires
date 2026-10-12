@@ -411,6 +411,7 @@ fn yolo_toggles_on_its_own_row_independently_of_the_sandbox() {
     for sandbox in [true, false] {
         let mut dialog = sandboxed_dialog();
         dialog.sandbox_enabled = sandbox;
+        dialog.sandbox_dirty = true;
         dialog.yolo_mode = true;
         let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
         assert_eq!(data.sandbox, sandbox);
@@ -439,6 +440,7 @@ fn the_sandbox_image_always_submits_whatever_the_field_holds() {
     for (sandbox, image, want) in cases {
         let mut dialog = sandboxed_dialog();
         dialog.sandbox_enabled = *sandbox;
+        dialog.sandbox_dirty = true;
         if let Some(image) = image {
             dialog.sandbox_image = Input::new(image.to_string());
         }
@@ -1325,6 +1327,290 @@ fn test_reload_config_defaults_uses_project_worktree_override() {
     dialog.path = Input::default();
     type_str(&mut dialog, &repo.path().to_string_lossy());
     assert!(submitted(dialog.handle_key(key(KeyCode::Enter))).worktree_enabled);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_project_sandbox_override_seeds_and_keeps_direct_toggle() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        ),
+        false,
+    )
+    .expect("register project");
+    crate::session::projects::update_overrides(
+        "default",
+        crate::session::ProjectScope::Global,
+        "demo",
+        |ov| ov.sandbox_enabled = Some(true),
+    )
+    .expect("set override");
+
+    // Global sandbox.enabled_by_default is false; the project's override wins.
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    dialog.reload_config_defaults();
+    assert!(dialog.sandbox_enabled);
+
+    // A typed path applies the override once focus leaves the field.
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    assert!(dialog.sandbox_enabled);
+
+    // Without docker the override cannot turn the sandbox on.
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = false;
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    assert!(!dialog.sandbox_enabled);
+
+    // A direct toggle survives later path changes.
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    dialog.focused_field = dialog.field_indices().sandbox;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(!dialog.sandbox_enabled);
+    dialog.focused_field = 0;
+    dialog.handle_key(key(KeyCode::Tab));
+    assert!(!dialog.sandbox_enabled);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_scratch_ignores_the_retained_projects_sandbox_override() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        "default_profile = \"default\"\n\n[sandbox]\nenabled_by_default = true\n",
+    )
+    .expect("global config");
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        )
+        .with_overrides(crate::session::ProjectOverrides {
+            sandbox_enabled: Some(false),
+            ..Default::default()
+        }),
+        false,
+    )
+    .expect("register project");
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    dialog.reload_config_defaults();
+    assert!(
+        !dialog.sandbox_enabled,
+        "the project's off override wins over the on default"
+    );
+
+    // Scratch belongs to no project: the profile default applies on entry and after a profile switch.
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert!(
+        dialog.sandbox_enabled,
+        "profile default on entering scratch"
+    );
+    dialog.reload_config_defaults();
+    assert!(dialog.sandbox_enabled, "profile switch while scratch");
+
+    // Leaving scratch brings the project's override back.
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert!(
+        !dialog.sandbox_enabled,
+        "project override after leaving scratch"
+    );
+
+    // A direct choice owns the toggle across the move to scratch.
+    dialog.sandbox_dirty = true;
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert!(!dialog.sandbox_enabled, "manual choice survives scratch");
+}
+
+/// Registers a repo whose project asks for the sandbox, with the global default off, and returns the
+/// repo plus the registry file's valid content so a test can break and repair it.
+fn sandbox_project_with_broken_registry_helper() -> (tempfile::TempDir, std::path::PathBuf, String)
+{
+    let repo = tempfile::tempdir().expect("temp repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        )
+        .with_overrides(crate::session::ProjectOverrides {
+            sandbox_enabled: Some(true),
+            ..Default::default()
+        }),
+        false,
+    )
+    .expect("register project");
+    let registry = crate::session::get_app_dir()
+        .expect("app dir")
+        .join("projects.json");
+    let valid = fs::read_to_string(&registry).expect("registry content");
+    (repo, registry, valid)
+}
+
+#[test]
+#[serial_test::serial]
+fn test_unreadable_registry_keeps_a_held_resolution_for_the_same_path() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let (repo, registry, _valid) = sandbox_project_with_broken_registry_helper();
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    dialog.reload_config_defaults();
+    assert!(dialog.sandbox_enabled, "the project's override resolved");
+
+    fs::write(&registry, "{ not json").expect("break registry");
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(
+        data.sandbox,
+        "a resolution held for this path survives an unreadable registry"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_scratch_round_trip_does_not_count_an_unreadable_registry_as_resolved() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let (repo, registry, valid) = sandbox_project_with_broken_registry_helper();
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    dialog.reload_config_defaults();
+    assert!(dialog.sandbox_enabled, "the project's override resolved");
+
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert!(!dialog.sandbox_enabled, "scratch takes the profile default");
+
+    // Back to the project while its registry is unreadable: the scratch default must not stand in
+    // for the project's override.
+    fs::write(&registry, "{ not json").expect("break registry");
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    let result = dialog.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(result, DialogResult::Continue),
+        "a project whose defaults were replaced by scratch must not submit them"
+    );
+
+    fs::write(&registry, valid).expect("repair registry");
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(
+        data.sandbox,
+        "the repaired registry's override applies on retry"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_unreadable_registry_blocks_submission_until_the_path_resolves() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let (repo, registry, valid) = sandbox_project_with_broken_registry_helper();
+    fs::write(&registry, "{ not json").expect("break registry");
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    let result = dialog.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(result, DialogResult::Continue),
+        "an unresolved project must not submit a guessed sandbox default"
+    );
+    assert!(dialog
+        .error_message
+        .as_deref()
+        .is_some_and(|m| m.contains("Could not load this project's settings")));
+
+    // A missing registry file is genuinely empty, and a repaired one resolves the override.
+    fs::write(&registry, valid).expect("repair registry");
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(
+        data.sandbox,
+        "the repaired registry's override applies on retry"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_typed_tilde_path_finds_the_registered_projects_overrides() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+
+    let repo = temp_home.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        )
+        .with_overrides(crate::session::ProjectOverrides {
+            worktree_enabled: Some(true),
+            sandbox_enabled: Some(true),
+            ..Default::default()
+        }),
+        false,
+    )
+    .expect("register project");
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.path = Input::default();
+    type_str(&mut dialog, "~/repo");
+    dialog.handle_key(key(KeyCode::Tab));
+
+    assert!(dialog.sandbox_enabled, "sandbox override via ~ path");
+    assert!(dialog.worktree_enabled, "worktree override via ~ path");
 }
 
 #[test]
