@@ -1728,7 +1728,10 @@ fn read_document(
     };
     let text = text.trim_start_matches('\u{feff}');
     let parsed = if yaml {
-        serde_yaml::from_str::<serde_json::Value>(text).map_err(anyhow::Error::from)
+        let mut options = crate::yaml::options();
+        options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::LastWins;
+        serde_saphyr::from_str_with_options::<serde_json::Value>(text, options)
+            .map_err(anyhow::Error::from)
     } else {
         serde_json::from_str(text).map_err(anyhow::Error::from)
     };

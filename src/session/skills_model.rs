@@ -208,7 +208,7 @@ pub fn parse_skill_md(content: &str) -> Result<ParsedSkill> {
         .context("SKILL.md must begin with a \"---\" frontmatter fence")?;
     let (frontmatter, body) = split_closing_fence(after_open)
         .context("SKILL.md frontmatter is not closed by a \"---\" line")?;
-    let fm: Frontmatter = serde_yaml::from_str(frontmatter)
+    let fm: Frontmatter = serde_saphyr::from_str_with_options(frontmatter, crate::yaml::options())
         .context("failed to parse SKILL.md frontmatter as YAML")?;
     if fm.name.trim().is_empty() {
         bail!("SKILL.md frontmatter \"name\" is empty");
@@ -1236,10 +1236,10 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), SkillError> {
     }
 }
 
-/// Build a scaffolded `SKILL.md` with the frontmatter emitted by `serde_yaml`
+/// Build a scaffolded `SKILL.md` with the frontmatter emitted by `crate::yaml`
 /// (so a `description` with YAML-significant characters is quoted correctly).
 fn scaffold(directory: &str, description: &str) -> Result<String> {
-    let fm = serde_yaml::to_string(&Frontmatter {
+    let fm = crate::yaml::to_string(&Frontmatter {
         name: directory.to_string(),
         description: description.to_string(),
     })?;
