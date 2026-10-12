@@ -845,6 +845,8 @@ pub struct PrimeRunnerArgs {
     pub runtime: String,
     #[arg(long)]
     pub daemon_command: Option<String>,
+    #[arg(long)]
+    pub rewind_container_env: bool,
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -919,6 +921,20 @@ pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
             "Prime daemon startup timed out"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if args.rewind_container_env {
+        // Darwin /dev/fd opens share the daemon client's consumed offset.
+        let offset = unsafe {
+            libc::lseek(
+                i32::from(crate::session::environment::CONTAINER_EXEC_ENV_FD),
+                0,
+                libc::SEEK_SET,
+            )
+        };
+        if offset == -1 {
+            return Err(std::io::Error::last_os_error())
+                .context("rewinding protected Prime container environment");
+        }
     }
     let mut argv = args.command;
     if let Some(container) = &runtime.container {

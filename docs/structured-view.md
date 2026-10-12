@@ -52,7 +52,7 @@ Each built-in adapter receives only the provider variables it is known to read, 
 
 ### Prime runtime ownership
 
-Native Prime Agent 0.10.x uses a daemon owned by each structured execution. The daemon and frontend receive the same effective environment and use the original agent directory for credentials, settings, skills, and history. AoE does not reuse a daemon launched with another session's credentials.
+Native Prime Agent 0.10.x uses a daemon owned by each structured execution. The daemon and frontend receive the same effective environment, including the complete protected channel in sandboxed terminal launches, and use the original agent directory for credentials, settings, skills, and history. AoE does not reuse a daemon launched with another session's credentials.
 
 Stopping or restarting the session requires native shutdown and observed process settlement before replacement. AoE records daemon/frontend incarnations at launch and retains native worker and positively scoped auxiliary identities before shutdown can retire their metadata. Unrelated process opacity is not ownership. A known live or uninspectable incarnation retains the ownership record and blocks replacement; this is not a containment guarantee for arbitrary tools that erase all ownership markers before observation.
 

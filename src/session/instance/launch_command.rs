@@ -44,6 +44,7 @@ fn wrap_prime_launch(
     command: &str,
     execution: Option<&super::execution::NativeExecution>,
     daemon_command: Option<&str>,
+    rewind_container_env: bool,
 ) -> Result<String> {
     let Some(runtime) =
         execution.and_then(|execution| prime_runtime_for_capture(execution.capture.as_ref()))
@@ -60,8 +61,13 @@ fn wrap_prime_launch(
             )
         })
         .unwrap_or_default();
+    let rewind = if rewind_container_env {
+        " --rewind-container-env"
+    } else {
+        ""
+    };
     Ok(format!(
-        "{} __prime-agent --runtime {}{} -- sh -c {}",
+        "{} __prime-agent --runtime {}{}{rewind} -- sh -c {}",
         shell_escape(&exe.to_string_lossy()),
         shell_escape(&encoded),
         daemon,
@@ -848,8 +854,12 @@ impl Instance {
                         .map(|command| exec_command(&command, false))
                 })
                 .transpose()?;
-            let raw_command =
-                wrap_prime_launch(&raw_command, execution, daemon_command.as_deref())?;
+            let raw_command = wrap_prime_launch(
+                &raw_command,
+                execution,
+                daemon_command.as_deref(),
+                !env_info.env.is_empty(),
+            )?;
             let launch_command = if let Some(plan) = omp_capture_plan.as_ref() {
                 let marked_tool_cmd = wrap_omp_launch(&tool_cmd, plan);
                 let marked_command = exec_command(
@@ -991,7 +1001,7 @@ impl Instance {
                     let raw_command = format!(
                         "{}{}",
                         env_prefix,
-                        wrap_prime_launch(&cmd, execution, None)?
+                        wrap_prime_launch(&cmd, execution, None, false)?
                     );
                     let command = if let Some(plan) = omp_capture_plan.as_ref() {
                         let marked_command = wrap_omp_host_launch(&env_prefix, &cmd, plan);
@@ -1032,7 +1042,7 @@ impl Instance {
             let raw_command = format!(
                 "{}{}",
                 env_prefix,
-                wrap_prime_launch(&cmd, execution, None)?
+                wrap_prime_launch(&cmd, execution, None, false)?
             );
             let command = if let Some(plan) = omp_capture_plan.as_ref() {
                 let marked_command = wrap_omp_host_launch(&env_prefix, &cmd, plan);
