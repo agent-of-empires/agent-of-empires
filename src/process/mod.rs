@@ -576,17 +576,21 @@ impl RunnerProcessGuard {
                 }
             }
         }
-        if root_attested {
+        let stable = if root_attested {
+            let after = process_birth_identity(self.pid)?;
             anyhow::ensure!(
-                process_birth_identity(self.pid)? == before,
+                after.is_none() || after == before,
                 "runner incarnation changed during group capture"
             );
+            after == before
         } else if let Some(index) = anchor {
             let (identity, handle) = &members[index];
-            anyhow::ensure!(
-                !handle.exited()? && platform::process_group_id(identity.pid)? == Some(self.pid),
-                "group anchor changed during capture"
-            );
+            !handle.exited()? && platform::process_group_id(identity.pid)? == Some(self.pid)
+        } else {
+            false
+        };
+        if !stable {
+            return Ok(());
         }
         members.extend(added);
         Ok(())

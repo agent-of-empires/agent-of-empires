@@ -705,10 +705,10 @@ pub(crate) async fn terminate_record_and_wait(
         load(&record.session_id)?.is_some_and(|current| same_runner(&current, &record)),
         "worker generation changed before termination"
     );
-    settle_runner(&record, std::time::Duration::from_secs(2)).await?;
     let blocking_guard = cleanup_guard.clone();
     let record = tokio::task::spawn_blocking(move || {
         let _guard = blocking_guard;
+        settle_runner_sync(&record, std::time::Duration::from_secs(2))?;
         cleanup_runtime(&record)?;
         Ok::<_, anyhow::Error>(record)
     })

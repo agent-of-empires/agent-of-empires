@@ -191,23 +191,14 @@ fn audit_token(pid: u32) -> anyhow::Result<Option<AuditToken>> {
     let pid = i32::try_from(pid)?;
     anyhow::ensure!(pid > 0, "invalid owned process PID");
     let mut port = 0;
-    let task = unsafe { libc::mach_task_self() };
+    let task = unsafe { libc::mach_task_self_ };
     let result = unsafe { task_name_for_pid(task, pid, &mut port) };
     if result != 0 {
         if !super::worker::is_pid_alive(pid as u32) {
             return Ok(None);
         }
-        let mut command = Command::new("ps");
-        command.args(["-p", &pid.to_string(), "-o", "stat="]);
-        if let Ok(bytes) = crate::session::capture::run_with_timeout_limit(
-            command,
-            std::time::Duration::from_secs(2),
-            "owned process exit state",
-            1024,
-        ) {
-            if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'Z') {
-                return Ok(None);
-            }
+        if process_membership(pid)?.is_none_or(|info| info.pbi_status == 5) {
+            return Ok(None);
         }
         anyhow::bail!("process audit token unavailable: Mach error {result}");
     }
@@ -401,7 +392,7 @@ pub(super) fn prime_processes(
             Ok(value)
         };
         let pid = take()?.parse::<u32>()?;
-        let _parent = take()?.parse::<u32>()?;
+        let parent = take()?.parse::<u32>()?;
         let zombie = take()?.starts_with('Z');
         if zombie && known.iter().any(|identity| identity.pid == pid) {
             known_zombies.push(pid);
@@ -411,44 +402,60 @@ pub(super) fn prime_processes(
         }
         let start = rest.trim();
         anyhow::ensure!(!start.is_empty(), "missing process start identity");
-        let token = match audit_token(pid) {
-            Ok(Some(token)) => token,
-            Ok(None) => continue,
-            Err(error) if known.iter().any(|identity| identity.pid == pid) => return Err(error),
-            Err(_) => continue,
-        };
         let marked = match prime_launch_marker(pid, marker, socket, &mut bytes) {
             Ok(marked) => marked,
             Err(error) if known.iter().any(|identity| identity.pid == pid) => return Err(error),
             Err(_) => false,
         };
-        let membership = match process_membership(pid) {
-            Ok(Some(info)) => info,
-            Ok(None) => continue,
-            Err(error) if known.iter().any(|identity| identity.pid == pid) => return Err(error),
-            Err(_) => continue,
-        };
-        anyhow::ensure!(
-            audit_token(pid)?.is_none_or(|after| after.values[7] == token.values[7]),
-            "process incarnation changed during census"
-        );
-        let identity = super::PrimeProcessIdentity {
-            pid,
-            start_id: audit_start_id(&token),
-        };
-        if !marked
-            && known
-                .iter()
-                .any(|known| known.pid == pid && known.start_id.strip_prefix("ps:") == Some(start))
-        {
-            legacy_observed.push(identity.clone());
-        }
         samples.push(super::PrimeProcessSample {
-            identity,
-            parent: membership.pbi_ppid,
+            identity: super::PrimeProcessIdentity {
+                pid,
+                start_id: format!("ps:{start}"),
+            },
+            parent,
             marked,
         });
     }
+    let candidate_known: Vec<_> = samples
+        .iter()
+        .filter(|sample| {
+            known
+                .iter()
+                .any(|identity| identity.pid == sample.identity.pid)
+        })
+        .map(|sample| sample.identity.clone())
+        .collect();
+    let candidates = super::prime_selection_mask(&samples, &candidate_known);
+    let mut attested = Vec::new();
+    for (mut sample, candidate) in samples.into_iter().zip(candidates) {
+        if !candidate {
+            continue;
+        }
+        let pid = sample.identity.pid;
+        let Some(token) = audit_token(pid)? else {
+            continue;
+        };
+        let Some(membership) = process_membership(pid)? else {
+            continue;
+        };
+        let Some(after) = audit_token(pid)? else {
+            continue;
+        };
+        anyhow::ensure!(
+            after == token,
+            "owned process incarnation changed during census"
+        );
+        if !sample.marked && known.iter().any(|known| known == &sample.identity) {
+            legacy_observed.push(super::PrimeProcessIdentity {
+                pid,
+                start_id: audit_start_id(&token),
+            });
+        }
+        sample.identity.start_id = audit_start_id(&token);
+        sample.parent = membership.pbi_ppid;
+        attested.push(sample);
+    }
+    let samples = attested;
     for identity in known {
         if !samples
             .iter()

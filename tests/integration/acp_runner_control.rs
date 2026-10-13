@@ -634,7 +634,7 @@ fn find_python3() -> Option<PathBuf> {
 
 #[tokio::test]
 #[serial_test::parallel]
-async fn cancelled_attach_reaps_runner_and_replacement_survives_load_fallback() {
+async fn cancelled_attach_reaps_runner_before_replacement_load_fallback() {
     if cfg!(not(unix)) {
         return;
     }
@@ -732,41 +732,21 @@ for line in sys.stdin:
     );
     let old_agent_pid = wait_for_u32(&agent_pid_file, "old agent pid");
 
-    let attach = async {
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            AcpClient::attach(
-                socket.clone(),
-                home.clone(),
-                vec![],
-                "stored-codex-thread".into(),
-                false,
-                AcpSessionId(session_id.into()),
-                None,
-                "fake-agent".into(),
-                None,
-            ),
-        )
-        .await
-    };
-    let spawn_replacement = async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !std::fs::read_to_string(&agent_log)
-            .unwrap_or_default()
-            .lines()
-            .any(|method| method == "initialize")
-        {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "old runner never began initialize"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let replacement = KillOnDrop(spawn_runner("750", true));
-        wait_for_record_pid(&record, replacement.0.id());
-        replacement
-    };
-    let (attach, mut replacement) = tokio::join!(attach, spawn_replacement);
+    let attach = tokio::time::timeout(
+        Duration::from_millis(500),
+        AcpClient::attach(
+            socket.clone(),
+            home.clone(),
+            vec![],
+            "stored-codex-thread".into(),
+            false,
+            AcpSessionId(session_id.into()),
+            None,
+            "fake-agent".into(),
+            None,
+        ),
+    )
+    .await;
     assert!(
         attach.is_err(),
         "delayed initialize must exceed the attach budget"
@@ -776,6 +756,23 @@ for line in sys.stdin:
         !agent_of_empires::process::worker_registry::is_pid_alive(old_agent_pid),
         "timed-out agent {old_agent_pid} stayed live"
     );
+    let retired = Command::new(bin)
+        .args(["acp", "restart", session_id])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .expect("retire cancelled runner before replacement");
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    assert!(
+        !record.exists() && !control.exists(),
+        "restart did not retire old ownership"
+    );
+    let mut replacement = KillOnDrop(spawn_runner("750", true));
+    wait_for_record_pid(&record, replacement.0.id());
     assert!(
         replacement
             .0
@@ -784,7 +781,7 @@ for line in sys.stdin:
             .is_none()
             && record.exists()
             && control.exists(),
-        "old runner teardown removed the replacement runner's files"
+        "admitted replacement did not publish its ownership files"
     );
 
     let baseline = std::fs::read_to_string(&agent_log)
