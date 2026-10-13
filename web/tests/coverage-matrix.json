@@ -92,6 +92,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
+      "id": "terminal.live-scroll-anchor",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/live-terminal-scroll-anchor.spec.ts", "src/components/live-terminal/pacing.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/live-terminal/pacing.ts"]
+    },
+    {
       "id": "terminal.mobile-ime-syllable-rewrite",
       "kind": "mocked-playwright",
       "risk": "medium",

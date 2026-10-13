@@ -109,3 +109,61 @@ export function mountedBlocks(
   const bottomPadLines = blocks.length === 0 ? spacerLines + visibleRowCount : visibleRowCount - nextStart;
   return { blocks, bottomPadLines };
 }
+
+/** Rendered rows: the loaded lines, each visual row's source line and wrap offset, and each line's first row. */
+export interface RowLayout {
+  lines: readonly unknown[];
+  lineStartRow: number[];
+  source: Array<{ line: number; wrap: number }>;
+}
+
+/** Lines compared to find the anchor again after the oldest scrollback is trimmed. */
+const ANCHOR_CONTEXT_LINES = 8;
+
+/** A scroll position as a pane line, its wrap row, and the fraction of a row above the scroller top. Pane
+ *  lines count from the top of the scrollback and the spacer holds one row per line. `context` is the loaded
+ *  line and those after it, which keep their parsed identity across frames. */
+export interface ScrollAnchor {
+  line: number;
+  wrap: number;
+  fraction: number;
+  context: readonly unknown[];
+}
+
+export function scrollAnchor(top: number, spacerLines: number, layout: RowLayout, lineH: number): ScrollAnchor | null {
+  const abs = Math.floor(top / lineH);
+  const fraction = top / lineH - abs;
+  const row = abs - spacerLines;
+  if (row < 0) return { line: abs, wrap: 0, fraction, context: [] };
+  const src = layout.source[row];
+  if (!src) return null;
+  const context = layout.lines.slice(src.line, src.line + ANCHOR_CONTEXT_LINES);
+  return { line: spacerLines + src.line, wrap: src.wrap, fraction, context };
+}
+
+/** Local index of the anchor's line: where its pane line now falls or, when trimming the oldest scrollback has
+ *  renumbered every line, the nearest earlier index whose lines match its context. */
+function anchorLine(anchor: ScrollAnchor, spacerLines: number, lines: readonly unknown[]): number {
+  const expected = anchor.line - spacerLines;
+  const { context } = anchor;
+  if (context.length === 0) return expected;
+  const matches = (at: number) =>
+    at < lines.length && context.every((line, k) => at + k >= lines.length || lines[at + k] === line);
+  for (let at = Math.min(expected, lines.length - 1); at >= 0; at--) if (matches(at)) return at;
+  return expected;
+}
+
+/** The scrollTop that puts `anchor` back where it was, or null when its line is not in this layout. */
+export function anchoredScrollTop(
+  anchor: ScrollAnchor,
+  spacerLines: number,
+  layout: RowLayout,
+  lineH: number,
+): number | null {
+  const local = anchorLine(anchor, spacerLines, layout.lines);
+  if (local < 0) return (anchor.line + anchor.fraction) * lineH;
+  const first = layout.lineStartRow[local];
+  if (first == null) return null;
+  const rows = (layout.lineStartRow[local + 1] ?? layout.source.length) - first;
+  return (spacerLines + first + Math.min(anchor.wrap, rows - 1) + anchor.fraction) * lineH;
+}
