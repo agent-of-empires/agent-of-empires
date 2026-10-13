@@ -182,25 +182,22 @@ impl ContainerRuntime {
         parts.join(" ")
     }
 
+    /// Pulls only a missing image; returns the image to run, see
+    /// `sandbox_image::ensure_sandbox_image`. `automatic` says the user chose no image.
     pub fn ensure_image(
         &self,
         image: &str,
+        automatic: bool,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        if self.base.image_exists_locally(image) {
-            tracing::info!(target: "containers.runtime", "Using local {} image '{}'", self.base.name, image);
-            return Ok(());
-        }
-        tracing::info!(target: "containers.runtime", "Pulling {} image '{}'", self.base.name, image);
-        self.pull_image_until_cancelled(image, cancel)
-    }
-
-    pub fn default_sandbox_image(&self) -> &'static str {
-        self.base.default_sandbox_image()
-    }
-
-    pub fn effective_default_image(&self) -> String {
-        self.base.effective_default_image()
+    ) -> anyhow::Result<String> {
+        super::sandbox_image::ensure_sandbox_image(
+            &RuntimeImages {
+                runtime: self,
+                cancel,
+            },
+            image,
+            automatic,
+        )
     }
 
     pub fn does_container_exist(&self, name: &str) -> Result<bool> {
@@ -962,6 +959,29 @@ fn parse_batch_states(stdout: &str, prefix: &str) -> HashMap<String, ContainerSt
         .collect()
 }
 
+/// The runtime as an [`super::sandbox_image::ImageSource`]: a pull joins the one running for
+/// the same runtime and image.
+struct RuntimeImages<'a> {
+    runtime: &'a ContainerRuntime,
+    cancel: &'a tokio_util::sync::CancellationToken,
+}
+
+impl super::sandbox_image::ImageSource for RuntimeImages<'_> {
+    fn exists_locally(&self, image: &str) -> bool {
+        let base = self.runtime.base;
+        let exists = base.image_exists_locally(image);
+        if exists {
+            tracing::info!(target: "containers.runtime", "Using local {} image '{}'", base.name, image);
+        }
+        exists
+    }
+
+    fn pull(&self, image: &str) -> Result<()> {
+        tracing::info!(target: "containers.runtime", "Pulling {} image '{}'", self.runtime.base.name, image);
+        self.runtime.pull_image_until_cancelled(image, self.cancel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,7 +1198,9 @@ mod tests {
         let (_env, runtimes) = available_runtimes();
         for rt in runtimes {
             assert!(!rt.image_exists_locally(MISSING_IMAGE));
-            assert!(rt.ensure_image(MISSING_IMAGE, &Default::default()).is_err());
+            assert!(rt
+                .ensure_image(MISSING_IMAGE, false, &Default::default())
+                .is_err());
         }
     }
 

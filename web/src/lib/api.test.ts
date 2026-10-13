@@ -1210,6 +1210,12 @@ describe("fetchSandboxImageStatus", () => {
       { fresh: true },
       "/api/sandbox/image-status?image=ghcr.io%2Fx%2Fsb%3A1&fresh=true",
     ],
+    [
+      "the launching profile's automatic image",
+      undefined,
+      { profile: "work" },
+      "/api/sandbox/image-status?profile=work",
+    ],
   ] as const)("asks for %s", async (_name, image, opts, url) => {
     fetchSpy.mockResolvedValueOnce(json({ state: "current" }));
     await api.fetchSandboxImageStatus(image, opts);

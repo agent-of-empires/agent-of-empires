@@ -421,7 +421,7 @@ See [Git Worktrees](worktrees.md) for the remaining keys and path templates.
 ```toml
 [sandbox]
 enabled_by_default = false                                    # auto-enable sandbox for new sessions
-default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest" # container image
+# default_image unset: the aoe-sandbox image tagged with your AoE version
 environment = ["GH_TOKEN=$AOE_GH_TOKEN"]                      # env vars forwarded into the container
 ```
 

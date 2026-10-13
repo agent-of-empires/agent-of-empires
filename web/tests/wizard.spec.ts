@@ -721,8 +721,8 @@ test.describe("Sandbox row", () => {
         const row = wizard(page).getByTestId("wizard-sandbox-row");
         const status = row.getByTestId("sandbox-image-status");
         await expect(status).toContainText(label);
-        // The banner polls the default image too; the wizard asks for its own, fresh.
-        expect(asked).toContain(`?${new URLSearchParams({ image, fresh: "true" })}`);
+        // The banner polls the default image too; the wizard asks for its own, fresh, for its profile.
+        expect(asked).toContain(`?${new URLSearchParams({ image, profile: "default", fresh: "true" })}`);
         const fit = await status.evaluate((el) => {
           // SwitchRow's summary truncates, so its box clips whatever overflows it.
           let clip = el.parentElement;

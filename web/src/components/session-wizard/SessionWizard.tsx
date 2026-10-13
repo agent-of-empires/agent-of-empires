@@ -987,7 +987,11 @@ export function SessionWizard({
     : !state.dockerAvailable
       ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
       : null;
-  const imageStatus = useSandboxImageRowStatus(d.sandboxImage, defaultsReady && d.sandboxEnabled && !sandboxBlocked);
+  const imageStatus = useSandboxImageRowStatus(
+    d.sandboxImage,
+    defaultsReady && d.sandboxEnabled && !sandboxBlocked,
+    d.profile || servedProfile,
+  );
   const pullOffer = pullLatestOffer(imageStatus?.reply, {
     sandbox: d.sandboxEnabled && !sandboxBlocked,
     structured: structuredOn,

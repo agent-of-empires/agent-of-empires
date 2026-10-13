@@ -454,6 +454,19 @@ impl SettingsView {
                     let text = input.value().to_string();
                     let field = &mut self.fields[self.selected_field];
 
+                    // An unchanged commit is a no-op: re-parsing the text could
+                    // still alter the value, e.g. an optional `""` to unset.
+                    let unchanged = match &field.value {
+                        FieldValue::Text(v) => *v == text,
+                        FieldValue::OptionalText(v) => v.as_deref().unwrap_or_default() == text,
+                        FieldValue::Number(v) => v.to_string() == text,
+                        _ => false,
+                    };
+                    if unchanged {
+                        self.error_message = None;
+                        return SettingsAction::Continue;
+                    }
+
                     match &mut field.value {
                         FieldValue::Text(ref mut v) => {
                             *v = text;
@@ -1211,6 +1224,67 @@ mod tests {
                     .map(|i| i.value().to_string());
                 assert_eq!(value.as_deref(), Some("FOO=bar"), "paste={paste}");
             }
+        }
+    }
+
+    mod text_edit {
+        use super::*;
+        use crate::session::config::profile_config::{
+            load_profile_config, merge_configs, save_profile_config, ProfileConfig,
+        };
+        use crate::tui::settings::{SettingsFocus, SettingsScope};
+        use serial_test::serial;
+
+        /// Enter on a text row without editing it must not rewrite the value:
+        /// a profile's `default_image = ""` (automatic) would otherwise turn
+        /// into "inherit" and pick up a custom global image.
+        #[test]
+        #[serial]
+        fn committing_an_unchanged_value_keeps_the_override() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let _ = crate::session::Storage::new_unwatched("test").unwrap();
+            crate::session::config::update_config(|c| {
+                c.sandbox.default_image = Some("ghcr.io/example/custom:1".into());
+            })
+            .unwrap();
+            let profile: ProfileConfig =
+                toml::from_str("[sandbox]\ndefault_image = \"\"\n").unwrap();
+            save_profile_config("test", &profile).unwrap();
+
+            let mut view = SettingsView::new("test", None).unwrap();
+            view.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+            assert_eq!(view.scope, SettingsScope::Profile);
+            view.open_search();
+            view.search_selected = view
+                .search_hits
+                .iter()
+                .position(|h| h.field_ident == "sandbox.default_image")
+                .expect("default image is searchable in profile scope");
+            view.jump_to_selected_search_hit();
+            view.focus = SettingsFocus::Fields;
+            assert_eq!(
+                view.fields[view.selected_field].ident(),
+                "sandbox.default_image"
+            );
+
+            for _ in 0..2 {
+                view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            assert!(view.editing_input.is_none(), "the second Enter commits");
+            view.save().unwrap();
+
+            let saved = load_profile_config("test").unwrap();
+            assert_eq!(
+                saved.overrides["sandbox"]["default_image"],
+                serde_json::json!(""),
+                "{saved:?}"
+            );
+            let global = crate::session::Config::load().unwrap();
+            assert_eq!(
+                merge_configs(global, &saved).sandbox.effective_image(),
+                crate::containers::sandbox_image::automatic_sandbox_image()
+            );
         }
     }
 
