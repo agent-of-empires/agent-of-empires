@@ -41,7 +41,7 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
             .unwrap_or(0);
         AtomicI64::new(n)
     });
-    // `try_update` needs Rust 1.99; this keeps the 1.85 MSRV and the Nix toolchain building.
+    // `try_update` needs Rust 1.99, newer than the MSRV and the Nix toolchain.
     #[allow(deprecated)]
     let claimed = remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         (n > 0).then_some(n - 1)

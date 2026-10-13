@@ -170,6 +170,7 @@ pub(crate) fn identity_field_name(field: HookIdentityField) -> &'static str {
     match field {
         HookIdentityField::SessionId => "session-id",
         HookIdentityField::ConversationIdOrSessionId => "conversation-id-or-session-id",
+        HookIdentityField::HermesForegroundSessionId => "hermes-foreground-session-id",
     }
 }
 
@@ -207,6 +208,9 @@ fn hook_command_session_id_sandbox(
         }
         HookIdentityField::ConversationIdOrSessionId => {
             r#"if (.conversation_id|type)=="string" then .conversation_id elif (.session_id|type)=="string" then .session_id else empty end"#
+        }
+        HookIdentityField::HermesForegroundSessionId => {
+            r#"if (.extra.platform=="cli" or .extra.platform=="tui") and (.session_id|type)=="string" and (.session_id|test("^[0-9]{8}_[0-9]{6}_[0-9a-f]+$")) then .session_id else empty end"#
         }
     };
     format!(
@@ -707,6 +711,26 @@ mod tests {
                 HookIdentityField::SessionId,
                 None,
             );
+            run_hook("sh", &cmd, "sid", &payload, |_| {});
+            let got = std::fs::read_to_string(tmp.path().join("sid/session_id")).ok();
+            assert_eq!(got.as_deref(), want, "{payload}");
+        }
+
+        // Hermes: the same foreground rule as `aoe __extract-session-id`.
+        let foreground = "20261001_231100_a1b2c3";
+        for (sid, platform, want) in [
+            (foreground, "cli", Some(foreground)),
+            (foreground, "subagent", None),
+            ("bg_231100_a1b2c3", "cli", None),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let cmd = hook_command_session_id_sandbox(
+                tmp.path().to_str().unwrap(),
+                HookIdentityField::HermesForegroundSessionId,
+                None,
+            );
+            let payload =
+                format!(r#"{{"session_id":"{sid}","extra":{{"platform":"{platform}"}}}}"#);
             run_hook("sh", &cmd, "sid", &payload, |_| {});
             let got = std::fs::read_to_string(tmp.path().join("sid/session_id")).ok();
             assert_eq!(got.as_deref(), want, "{payload}");

@@ -158,8 +158,8 @@ impl PollerRepairBackoff {
         self.next_attempt = Some(now + delay);
         self.deferrals += 1;
         let escalated = previous != Some(delay);
-        let reminder =
-            delay == POLLER_REPAIR_MAX_DELAY && self.deferrals % POLLER_REPAIR_REMIND_EVERY == 0;
+        let reminder = delay == POLLER_REPAIR_MAX_DELAY
+            && self.deferrals.is_multiple_of(POLLER_REPAIR_REMIND_EVERY);
         (escalated || reminder).then_some(delay)
     }
 
