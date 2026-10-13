@@ -569,6 +569,7 @@ done
                 attachments: Vec::new(),
                 prompt_id: None,
                 synthesized: false,
+                origin_plugin: None,
             },
             Event::AgentMessageChunk { text: "hi".into() },
             Event::AgentMessageChunk {

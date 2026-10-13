@@ -4,12 +4,12 @@ Maintainer reference for how `agent-of-empires` ships: a weekly automated cadenc
 
 ## Weekly cadence
 
-At least one release per week. Every Wednesday at 09:00 UTC, `.github/workflows/open-release-pr.yml` opens a release-staging PR with a patch bump by default. Review it, edit the bump if the diff deserves more, and merge. Merging fires `tag-release-pr.yml`, which tags the merge commit, and the tag push triggers `release.yml`, which builds the platform binaries and publishes the GitHub release and the ClawHub artifact.
+At least one release per week. Every Wednesday at 03:23 UTC, `.github/workflows/open-release-pr.yml` opens a release-staging PR using the [automatic versioning policy](#versioning). Review it, adjust the bump if needed, and merge. Merging fires `tag-release-pr.yml`, which tags the merge commit, and the tag push triggers `release.yml`, which builds the platform binaries and publishes the GitHub release and the ClawHub artifact.
 
 You can trigger the staging PR by hand:
 
 ```bash
-gh workflow run open-release-pr.yml            # default: patch
+gh workflow run open-release-pr.yml            # default: auto
 gh workflow run open-release-pr.yml -f bump=minor
 ```
 
@@ -33,9 +33,19 @@ Tagging the merge SHA rather than `origin/main` is what dissolves the race: a PR
 gh workflow run prepare-release.yml -f version=1.7.2
 ```
 
+## Rebuilding an existing tag
+
+Dispatch the release workflow with the existing tag, subject to the same release-environment approval:
+
+```bash
+gh workflow run release.yml -f tag=v1.18.0
+```
+
+The build checks out the requested tag and reads `[toolchain].channel` from its `rust-toolchain.toml`. Numeric pins are preserved. Historical tags using `stable` install the current stable compiler through the external setup action, without requiring helper files in the old tree. Such rebuilds do not reproduce the original compiler version.
+
 ## Versioning
 
-Semver, with patch as the autopick. Go **minor** for user-visible features, new CLI subcommands, new config sections, anything behind a `feat:` commit. Go **major** for breaking config changes, removed CLI subcommands, or on-disk breakage needing maintainer attention beyond a migration. When uncertain, take the bigger bump.
+Semver. The weekly workflow automatically picks minor when any scoped or unscoped `feat` commit landed since the last `v*` tag, otherwise patch. Override the bump for user-visible features without a `feat` prefix, new CLI subcommands, or new config sections. Choose **major** explicitly for breaking config changes, removed CLI subcommands, or on-disk breakage needing maintainer attention beyond a migration. When uncertain, take the bigger bump.
 
 ## Skill hubs
 

@@ -265,6 +265,40 @@ test("global settings migrate from profiles and reject stale profile writes", as
   expect(persisted.session.sidebar_position).toBe("right");
 });
 
+test("shortcut bar toggle persists globally from Terminal UI settings", async ({ serve, page }) => {
+  const profile = await defaultProfile(serve);
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  const machineUrl = `${settingsUrl}?layer=machine`;
+  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`;
+  const toggle = page.getByText("Show shortcut bar", { exact: true }).locator("../..").getByRole("switch");
+
+  await page.goto(`${serve.baseUrl}/settings/session`);
+  await page.getByRole("button", { name: /Terminal UI/ }).click();
+  await expect(toggle).toBeChecked();
+  const [saved] = await Promise.all([
+    page.waitForResponse(
+      (response) => response.url().startsWith(settingsUrl) && response.request().method() === "PATCH",
+    ),
+    toggle.click(),
+  ]);
+  expect(saved.ok()).toBe(true);
+  expect((await getJson(machineUrl)).session.show_shortcut_bar).toBe(false);
+  expect((await getJson(profileUrl)).session?.show_shortcut_bar).toBeUndefined();
+  const rejected = await fetch(profileUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { show_shortcut_bar: true } }),
+  });
+  expect(rejected.status).toBe(400);
+
+  await serve.restart();
+  await page.reload();
+  await page.getByRole("button", { name: /Terminal UI/ }).click();
+  await expect(toggle).not.toBeChecked();
+  await toggle.click();
+  await expect.poll(async () => (await getJson(machineUrl)).session.show_shortcut_bar).toBe(true);
+});
+
 test("clearing a logging target removes its global override", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/settings/logging`);
   const target = labelledSelect(page, /^acp\.protocol$/);
@@ -283,4 +317,48 @@ test("clearing a logging target removes its global override", async ({ serve, pa
   }).toPass({ timeout: 5_000 });
   await page.reload();
   await expect(target).toHaveValue("");
+});
+
+test("systemd settings save machine-wide and refuse an invalid slice", async ({ serve, page }) => {
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  const machineUrl = `${settingsUrl}?layer=machine`;
+  const savePatch = () =>
+    page.waitForResponse(
+      (response) => response.url().startsWith(settingsUrl) && response.request().method() === "PATCH",
+    );
+  const slice = page
+    .locator("label", { hasText: /^Systemd slice$/ })
+    .locator("..")
+    .locator("input");
+  const toggle = (label: string) => page.getByText(label, { exact: true }).locator("../..").getByRole("switch");
+  // The harness seeds `enabled = false`, so the spec never turns real scopes on.
+  const enabled = toggle("Use systemd scopes");
+  const survive = toggle("Sessions survive daemon restart");
+
+  await page.goto(`${serve.baseUrl}/settings/systemd`);
+  await expect(enabled).not.toBeChecked();
+  await expect(slice).toHaveValue("background-aoe-{profile}.slice");
+  await slice.fill("aoe-{profile}.slice");
+  const [sliceSaved] = await Promise.all([savePatch(), slice.press("Enter")]);
+  expect(sliceSaved.ok()).toBe(true);
+  await expect(survive).toBeChecked();
+  const [toggleSaved] = await Promise.all([savePatch(), survive.click()]);
+  expect(toggleSaved.ok()).toBe(true);
+  const saved = (await getJson(machineUrl)).systemd;
+  expect(saved.slice).toBe("aoe-{profile}.slice");
+  expect(saved.survive_daemon_restart).toBe(false);
+  expect(saved.enabled).toBe(false);
+
+  await slice.fill("aoe.service");
+  const [rejected] = await Promise.all([savePatch(), slice.press("Enter")]);
+  expect(rejected.status()).toBe(400);
+  expect((await rejected.json()).message).toContain("systemd.slice");
+  await expect(page.getByTestId("settings-header-save-error")).toBeVisible();
+  await expect(slice).toHaveValue("aoe-{profile}.slice");
+  expect((await getJson(machineUrl)).systemd.slice).toBe("aoe-{profile}.slice");
+
+  await serve.restart();
+  await page.reload();
+  await expect(slice).toHaveValue("aoe-{profile}.slice");
+  await expect(survive).not.toBeChecked();
 });

@@ -31,6 +31,7 @@ import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { RateLimitRecoverySection, SystemNotices } from "./SystemNotices";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
+import { ToolExpansionProvider } from "./ToolExpansion";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { useTranscriptScroll } from "./useTranscriptScroll";
 import { WorkingSpinner } from "./WorkingSpinner";
@@ -77,28 +78,30 @@ export function StructuredView(props: Props) {
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
       <AgentProfileProvider toolKey={tool} clearAliases={clearAliases}>
         <ToolDisplayModeProvider density={toolDensity}>
-          <AcpRuntime
-            sessionId={sessionId}
-            acpWorkerState={acpWorkerState}
-            archivedAt={archivedAt}
-            snoozedUntil={snoozedUntil}
-            showClearedTurns={showClearedTurns}
-          >
-            {(ctx) => (
-              <BackgroundAgentsContext.Provider
-                value={{ agents: ctx.state.backgroundAgents, openPane: props.onOpenAgentsPane }}
-              >
-                <AcpChrome
-                  view={props}
-                  ctx={ctx}
-                  showClearedTurns={showClearedTurns}
-                  onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-                  toolDensity={toolDensity}
-                  onToggleToolDensity={toggleToolDensity}
-                />
-              </BackgroundAgentsContext.Provider>
-            )}
-          </AcpRuntime>
+          <ToolExpansionProvider>
+            <AcpRuntime
+              sessionId={sessionId}
+              acpWorkerState={acpWorkerState}
+              archivedAt={archivedAt}
+              snoozedUntil={snoozedUntil}
+              showClearedTurns={showClearedTurns}
+            >
+              {(ctx) => (
+                <BackgroundAgentsContext.Provider
+                  value={{ agents: ctx.state.backgroundAgents, openPane: props.onOpenAgentsPane }}
+                >
+                  <AcpChrome
+                    view={props}
+                    ctx={ctx}
+                    showClearedTurns={showClearedTurns}
+                    onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+                    toolDensity={toolDensity}
+                    onToggleToolDensity={toggleToolDensity}
+                  />
+                </BackgroundAgentsContext.Provider>
+              )}
+            </AcpRuntime>
+          </ToolExpansionProvider>
         </ToolDisplayModeProvider>
       </AgentProfileProvider>
     </AcpFileRefContext.Provider>

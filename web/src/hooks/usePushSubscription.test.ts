@@ -12,12 +12,17 @@ const SERVER_KEY = "QUJD";
 const keyBytes = (s: string) => new TextEncoder().encode(s).buffer;
 
 function makeSubscription(endpoint = "https://push.example/abc", key: ArrayBuffer | null = null) {
-  return {
+  const sub = {
     endpoint,
     options: { applicationServerKey: key },
     toJSON: () => ({ endpoint, keys: { p256dh: "key", auth: "auth" } }),
     unsubscribe: vi.fn(async () => true),
   };
+  sub.unsubscribe.mockImplementation(async () => {
+    if (currentSub === sub) currentSub = null;
+    return true;
+  });
+  return sub;
 }
 type FakeSubscription = ReturnType<typeof makeSubscription>;
 
@@ -27,6 +32,9 @@ let calls: string[];
 
 const IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)";
 const DISABLED_BY_SERVER = { status: { ok: true, body: { enabled: false } } };
+
+type StubStatusResponse = { ok: boolean; body: unknown } | Error;
+type StubUnsubscribeResponse = number | Error;
 
 function setServiceWorkerReady(ready: Promise<unknown>) {
   Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { ready } });
@@ -40,21 +48,31 @@ function rejectServiceWorker(message: string) {
 
 interface FetchOverrides {
   status?: { ok: boolean; body: unknown };
+  statusResponses?: StubStatusResponse[] | (() => StubStatusResponse);
+  statusError?: Error;
   vapid?: number;
   subscribe?: number;
+  unsubscribe?: number;
+  unsubscribeResponses?: StubUnsubscribeResponse[] | (() => StubUnsubscribeResponse);
   test?: number;
   testBody?: unknown;
 }
 
 function installFetch(overrides: FetchOverrides = {}) {
   calls = [];
+  let statusIndex = 0;
+  let unsubscribeIndex = 0;
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       calls.push(url);
       if (url.includes("/status")) {
-        const o = overrides.status ?? { ok: true, body: { enabled: true } };
+        const responses = overrides.statusResponses;
+        const response = typeof responses === "function" ? responses() : responses?.[statusIndex++];
+        if (response instanceof Error) throw response;
+        if (overrides.statusError) throw overrides.statusError;
+        const o = response ?? overrides.status ?? { ok: true, body: { enabled: true } };
         return new Response(JSON.stringify(o.body), { status: o.ok ? 200 : 500 });
       }
       if (url.includes("/vapid-public-key")) {
@@ -62,6 +80,12 @@ function installFetch(overrides: FetchOverrides = {}) {
       }
       if (url.includes("/test")) {
         return new Response(JSON.stringify(overrides.testBody ?? {}), { status: overrides.test ?? 200 });
+      }
+      if (url.includes("/unsubscribe")) {
+        const responses = overrides.unsubscribeResponses;
+        const response = typeof responses === "function" ? responses() : responses?.[unsubscribeIndex++];
+        if (response instanceof Error) throw response;
+        return new Response("{}", { status: response ?? overrides.unsubscribe ?? 200 });
       }
       const status = url.includes("/subscribe") ? overrides.subscribe : 200;
       return new Response("{}", { status: status ?? 200 });
@@ -163,6 +187,52 @@ describe("usePushSubscription initial refresh", () => {
     await mountAndSettle();
     expect(called("/api/push/subscribe")).toBe(true);
   });
+
+  it.each<[string, FetchOverrides]>([
+    ["a non-OK response", { status: { ok: false, body: {} } }],
+    ["a network error", { statusError: new Error("status unavailable") }],
+  ])("keeps the local enabled state after %s during refresh", async (_label, overrides) => {
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    const health = result.current.health;
+
+    installFetch(overrides);
+    await act_(result, "refresh");
+
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    expect(result.current.health).toBe(health);
+    expect(calls).toEqual(["/api/push/status?endpoint=https%3A%2F%2Fpush.example%2Fabc"]);
+  });
+
+  it("retains existing subscription intent when the initial status request fails", async () => {
+    installFetch({ statusError: new Error("status unavailable") });
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    expect(result.current.health).toBe("unknown");
+    expect(localStorage.getItem("aoe.push.wanted")).toBe("1");
+    expect(called("/api/push/subscribe")).toBe(false);
+
+    noSubscription();
+    installFetch(statusWith(serverSub({ registered: false, owned: false })));
+    await act_(result, "refresh");
+    expect(result.current.state).toEqual({ kind: "off" });
+    expect(result.current.health).toBe("revoked");
+    expect(called("/api/push/subscribe")).toBe(false);
+  });
+
+  it.each<[NotificationPermission, PushState]>([
+    ["granted", { kind: "off" }],
+    ["denied", { kind: "denied" }],
+  ])("retains %s permission without a subscription when status fails", async (permission, expected) => {
+    noSubscription();
+    setPermission(permission);
+    installFetch({ status: { ok: false, body: {} } });
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual(expected);
+    expect(result.current.health).toBe("unknown");
+    expect(localStorage.getItem("aoe.push.wanted")).toBeNull();
+    expect(calls).toEqual(["/api/push/status"]);
+  });
 });
 
 async function act_(result: { current: Hook }, action: keyof Omit<Hook, "state">) {
@@ -206,6 +276,22 @@ describe("usePushSubscription enable()", () => {
     const { result } = await mountAndSettle();
     arrange();
     expect(await act_(result, "enable")).toEqual(expected);
+  });
+
+  it.each<[string, FetchOverrides, PushState]>([
+    ["the status request fails", { statusError: new Error("status unavailable") }, error("status unavailable")],
+    ["the status response is not OK", { status: { ok: false, body: {} } }, error("Could not fetch push status (500)")],
+  ])("does not renew a subscription when %s", async (_label, overrides, expected) => {
+    const existing = currentSub!;
+    const subscribe = vi.fn(async () => makeSubscription("https://push.example/new", keyBytes("ABC")));
+    subscribeImpl = subscribe;
+    const { result } = await mountAndSettle();
+    installFetch(overrides);
+
+    expect(await act_(result, "enable")).toEqual(expected);
+    expect(existing.unsubscribe).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(currentSub).toBe(existing);
   });
 
   it("rolls back the browser subscription when the server rejects it", async () => {
@@ -266,6 +352,159 @@ describe("usePushSubscription enable() with an existing subscription", () => {
     const { result } = await mountAndSettle();
     await act_(result, "enable");
     expect(Notification.requestPermission).not.toHaveBeenCalled();
+  });
+
+  it("renews an endpoint after a newer gone delivery failure", async () => {
+    const existing = makeSubscription("https://push.example/old", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/new", keyBytes("ABC"));
+    currentSub = existing;
+    subscribeImpl = async () => (currentSub = replacement);
+    installFetch(
+      statusWith(
+        serverSub({
+          registered: false,
+          owned: false,
+          last_failure: "gone",
+          last_failure_at: "2026-09-02T10:00:00Z",
+        }),
+      ),
+    );
+    const { result } = await mountAndSettle();
+    expect(result.current.health).toBe("delivery-failed");
+    calls.length = 0;
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(replacement.unsubscribe).not.toHaveBeenCalled();
+    expect(currentSub?.endpoint).toBe("https://push.example/new");
+    expect(called("/api/push/subscribe")).toBe(true);
+  });
+
+  it("keeps a healthy same-key endpoint", async () => {
+    const existing = makeSubscription("https://push.example/healthy", keyBytes("ABC"));
+    currentSub = existing;
+    installFetch(statusWith(serverSub()));
+    const { result } = await mountAndSettle();
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).not.toHaveBeenCalled();
+    expect(currentSub).toBe(existing);
+  });
+
+  it.each<[string, boolean]>([
+    ["a server error", false],
+    ["a lost response after server removal", true],
+  ])("continues renewal after %s during best-effort cleanup", async (_label, removed) => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
+    currentSub = existing;
+    const subscribe = vi.fn(async () => (currentSub = replacement));
+    subscribeImpl = subscribe;
+    let serverRegistered = true;
+    installFetch({
+      ...statusWith(
+        serverSub({
+          registered: true,
+          owned: true,
+          last_failure: "gone",
+          last_failure_at: "2026-09-02T10:00:00Z",
+        }),
+      ),
+      unsubscribeResponses: () => {
+        if (removed) serverRegistered = false;
+        return removed ? new Error("removal response lost") : 500;
+      },
+    });
+    const { result } = await mountAndSettle();
+    calls.length = 0;
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(currentSub).toBe(replacement);
+    const removalIndex = calls.findLastIndex((url) => url.includes("/api/push/unsubscribe"));
+    const registrationIndex = calls.findIndex((url) => url.includes("/api/push/subscribe"));
+    expect(removalIndex).toBeGreaterThanOrEqual(0);
+    expect(registrationIndex).toBeGreaterThan(removalIndex);
+    expect(serverRegistered).toBe(!removed);
+  });
+
+  it("does not let a forbidden best-effort cleanup block renewal", async () => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
+    currentSub = existing;
+    subscribeImpl = vi.fn(async () => (currentSub = replacement));
+    const expiredStatus = statusWith(
+      serverSub({
+        last_failure: "gone",
+        last_failure_at: "2026-09-02T10:00:00Z",
+      }),
+    );
+    installFetch({
+      statusResponses: [expiredStatus.status, expiredStatus.status],
+      unsubscribeResponses: [403],
+    });
+    const { result } = await mountAndSettle();
+    calls.length = 0;
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(subscribeImpl).toHaveBeenCalledTimes(1);
+    expect(currentSub).toBe(replacement);
+    expect(calls.filter((url) => url.includes("/api/push/unsubscribe"))).toHaveLength(1);
+    expect(calls.filter((url) => url.includes("/api/push/status?endpoint="))).toHaveLength(1);
+    expect(calls.at(-1)).toContain("/api/push/subscribe");
+  });
+
+  it("does not replace an endpoint when browser unsubscribe fails", async () => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    existing.unsubscribe.mockResolvedValue(false);
+    currentSub = existing;
+    subscribeImpl = vi.fn(async () => makeSubscription("https://push.example/should-not-exist", keyBytes("ABC")));
+    installFetch(
+      statusWith(
+        serverSub({
+          registered: false,
+          owned: false,
+          last_failure: "gone",
+          last_failure_at: "2026-09-02T10:00:00Z",
+        }),
+      ),
+    );
+    const { result } = await mountAndSettle();
+
+    expect(await act_(result, "enable")).toEqual({
+      kind: "error",
+      message: "Could not unsubscribe the expired notification subscription",
+    });
+    expect(subscribeImpl).not.toHaveBeenCalled();
+  });
+
+  it("replaces an endpoint when unsubscribe reports it was already inactive", async () => {
+    const existing = makeSubscription("https://push.example/expired", keyBytes("ABC"));
+    const replacement = makeSubscription("https://push.example/replacement", keyBytes("ABC"));
+    existing.unsubscribe.mockImplementation(async () => {
+      currentSub = null;
+      return false;
+    });
+    currentSub = existing;
+    subscribeImpl = vi.fn(async () => (currentSub = replacement));
+    installFetch(
+      statusWith(
+        serverSub({
+          registered: false,
+          owned: false,
+          last_failure: "gone",
+          last_failure_at: "2026-09-02T10:00:00Z",
+        }),
+      ),
+    );
+    const { result } = await mountAndSettle();
+
+    expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
+    expect(existing.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(subscribeImpl).toHaveBeenCalledTimes(1);
+    expect(currentSub).toBe(replacement);
   });
 });
 

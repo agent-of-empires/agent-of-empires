@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyAcpState } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
-import { ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
+import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
   flushAsync,
@@ -105,6 +105,63 @@ describe("reconnect (#1130)", () => {
     expect(result.current.retryCount).toBe(0);
   });
 
+  it("dials anyway when the replay fetch hangs", async () => {
+    calls = installAcpFakes((call) => (call.url.includes("/acp/replay") ? new Promise<Response>(() => {}) : undefined));
+    FakeWebSocket.closeFiresOnClose = true;
+    render("sess-hung-replay");
+    await flushAsync();
+    expect(sockets).toHaveLength(0);
+    await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("drops a replay response that lands after the dial timeout and a newer socket row", async () => {
+    const row = { id: "row-1", kind: "user_prompt", at: "t" };
+    const pending: Array<() => void> = [];
+    calls = installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      const rows = url.includes("view=rows") ? [{ ...row, text: "stale" }] : [];
+      return new Promise<Response>((resolve) => {
+        pending.push(() => resolve(json({ frames: [], rows, lost: false, highest_seq: 1, next_cursor: 1 })));
+      });
+    });
+    const { result } = render("sess-late-replay");
+    await flushAsync();
+    await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    sockets[0]!.open();
+    sockets[0]!.message({ kind: "transcript_delta", delta: { Append: { ...row, text: "fresh" } } });
+    expect(result.current.state.activity).toMatchObject([{ id: "row-1", text: "fresh" }]);
+
+    pending.forEach((release) => release());
+    await flushAsync();
+    expect(result.current.state.activity).toMatchObject([{ id: "row-1", text: "fresh" }]);
+  });
+
+  it("abandons a socket stuck connecting and backs off", async () => {
+    const { result } = render("sess-hung-connect");
+    await flushAsync();
+    await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
+    expect(sockets[0]!.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(result.current).toMatchObject({ reconnecting: true, retryCount: 1 });
+    await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    await flushAsync();
+    expect(sockets).toHaveLength(2);
+  });
+
+  it("does not show a stale retry count while redialing after resume", async () => {
+    const { result } = render("sess-resume");
+    await flushAsync();
+    sockets[0]!.drop();
+    expect(result.current.reconnecting).toBe(true);
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(result.current).toMatchObject({ reconnecting: false, retryCount: 0, status: "connecting" });
+  });
+
   it("dials without an elevation preflight", async () => {
     render("sess-no-preflight");
     await flushAsync();
@@ -135,10 +192,10 @@ describe("liveness watchdog (#2287)", () => {
     expect(sockets[0]!.readyState).toBe(FakeWebSocket.OPEN);
   });
 
-  it("never redials a socket that is not OPEN", async () => {
+  it("never redials a socket that is still connecting within the dial deadline", async () => {
     render("sess-connecting");
     await flushAsync();
-    await act(() => vi.advanceTimersByTimeAsync(ACP_WS_STALE_MS + 30000));
+    await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS - 1000));
     await flushAsync();
     expect(sockets).toHaveLength(1);
   });
@@ -365,6 +422,7 @@ describe("sendPrompt outcomes", () => {
 describe("server queue", () => {
   let serverQueue: Map<string, ServerQueuedPrompt>;
   let serverBusy: boolean;
+  let workerDown: boolean;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -376,6 +434,7 @@ describe("server queue", () => {
   beforeEach(() => {
     serverQueue = new Map();
     serverBusy = false;
+    workerDown = false;
     vi.mocked(reportAcpInteraction).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
       if (url.includes("/queue")) {
@@ -391,6 +450,12 @@ describe("server queue", () => {
         }
         if (method === "DELETE" && !item) serverQueue.clear();
         return new Response(null, { status: 204 });
+      }
+      if (url.includes("/acp/prompt") && workerDown) return new Response("worker_not_ready", { status: 503 });
+      if (url.includes("/acp/prompt") && body && JSON.parse(body).queued_prompt_id) {
+        // The daemon consumes the named row, or reports it already delivered.
+        const consumed = serverQueue.delete(JSON.parse(body).queued_prompt_id);
+        return consumed ? json({ disposition: "sent" }, 202) : new Response("queued_prompt_gone", { status: 409 });
       }
       if (url.includes("/acp/prompt") && serverBusy) {
         const parsed = JSON.parse(body!) as { prompt_id: string; text: string };
@@ -463,11 +528,13 @@ describe("server queue", () => {
     }
     const deletes = () => calls.filter((c) => c.method === "DELETE");
 
-    it("removes a row server-side, then sends it", async () => {
+    it("names the row in the send so the daemon consumes it and keeps its sender", async () => {
       serverQueue.set("t1", row("t1", "text only"));
       await sendNow("t1");
-      expect(deletes()).toHaveLength(1);
-      expect(posts("/acp/prompt")).toHaveLength(1);
+      expect(deletes()).toHaveLength(0);
+      const sent = posts("/acp/prompt");
+      expect(sent).toHaveLength(1);
+      expect(JSON.parse(sent[0]!.body!)).toMatchObject({ text: "text only", queued_prompt_id: "t1" });
       expect(serverQueue.has("t1")).toBe(false);
     });
 
@@ -479,10 +546,20 @@ describe("server queue", () => {
       expect(result.current.state.queuedPrompts.map((q) => q.id)).toContain("img");
     });
 
-    it("sends nothing when the drain claimed the row first", async () => {
+    it("keeps the one server row when the send is refused, instead of queueing a copy", async () => {
+      serverQueue.set("w1", row("w1", "waiting"));
+      const result = await sendNow("w1", () => (workerDown = true));
+      expect(posts("/queue")).toHaveLength(0);
+      expect(serverQueue.has("w1")).toBe(true);
+      expect(result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["w1"]);
+    });
+
+    it("drops the row quietly when the drain claimed it first", async () => {
       serverQueue.set("r1", row("r1", "raced"));
-      await sendNow("r1", () => serverQueue.delete("r1"));
-      expect(posts("/acp/prompt")).toHaveLength(0);
+      const result = await sendNow("r1", () => serverQueue.delete("r1"));
+      expect(posts("/queue")).toHaveLength(0);
+      expect(result.current.state.queuedPrompts.map((q) => q.id)).not.toContain("r1");
+      expect(result.current.state.lastError).toBeNull();
     });
   });
 });

@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { CreateProgress, CreateSessionRequest, SessionResponse } from "../../lib/types";
+import type { CreateProgress, CreateSessionRequest, ProjectOverrides, SessionResponse } from "../../lib/types";
 import {
   fetchAgents,
   fetchGroups,
   fetchDockerStatus,
   fetchProfiles,
-  fetchProjects,
+  fetchProjectRegistry,
   fetchSettings,
   createSession,
   fetchCreateBootId,
@@ -22,7 +22,7 @@ import { HooksTrustDialog } from "./HooksTrustDialog";
 import { ACP_CAPABLE_TOOLS, isAcpEligible } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
-import { normalizeProjectPathKey } from "../../lib/registeredProjects";
+import { normalizeProjectPathKey, overridesForPath } from "../../lib/registeredProjects";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import {
   claimPendingCreate,
@@ -122,6 +122,8 @@ const NETWORK_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 30_000;
 const UNKNOWN_OUTCOME_ERROR =
   "Lost connection while creating. The session may still be created; Launch retries the same request.";
+const REGISTRY_UNRESOLVED_ERROR =
+  "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Select the project again to retry.";
 
 function newIdempotencyKey(): string {
   // randomUUID needs a secure context, which a LAN or tunnel dashboard may not be.
@@ -210,20 +212,54 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   // the defaults below rather than sending initialData's sandbox/worktree/yolo.
   // Set on every outcome, so a failed fetch still leaves the form usable.
   const [defaultsReady, setDefaultsReady] = useState(false);
+  // Counts profile switches so a late response for a superseded one is ignored.
+  const profileSwitchRef = useRef(0);
+  const [profileSwitching, setProfileSwitching] = useState(false);
+  // The selected project's overrides could not be loaded, so Launch would guess its sandbox and worktree defaults.
+  const [registryUnresolved, setRegistryUnresolved] = useState(false);
+  // Bumped whenever a project or profile selection resolves its own overrides, so a slower earlier
+  // lookup that fails afterwards cannot mark the newer, known resolution as unresolved.
+  const resolutionRef = useRef(0);
+  // The project whose overrides were last read successfully for the committed profile. A failed
+  // lookup only preserves a resolution that actually exists, and only for that same project.
+  const knownResolutionRef = useRef<string | null>(null);
+  // The latest form data, for an async profile switch that commits after the user kept editing.
+  const dataRef = useRef(state.data);
+  useEffect(() => {
+    dataRef.current = state.data;
+  }, [state.data]);
+  // Set where a switch commits, not on render, so a response arriving in the same tick already sees it.
+  const committedProfileRef = useRef(state.data.profile);
 
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
-    fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
+    // Part of the readiness barrier: a seeded sandbox is only submittable once Docker has answered.
+    const dockerSeed = fetchDockerStatus()
+      .then((d) => dispatch({ type: "SET_DOCKER", available: d.available }))
+      .catch(() => {});
     // A remembered or prefilled path is never selected in ProjectStep, so seed its override here.
     const initialPath = state.data.path;
+    const initialProfile = state.data.profile;
+    const initialResolution = resolutionRef.current;
     const projectSeed = initialPath
-      ? fetchProjects()
+      ? fetchProjectRegistry(undefined, initialProfile || undefined)
           .then((projects) => {
-            const key = normalizeProjectPathKey(initialPath);
-            const override = projects.find((p) => normalizeProjectPathKey(p.path) === key)?.overrides?.worktree_enabled;
-            if (override !== undefined) {
-              dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
+            // The profile only changes when a switch commits, and a committed one owns the overrides now.
+            // A failed or pending switch leaves this profile current, so its answer still applies.
+            if (committedProfileRef.current !== initialProfile) return;
+            if (!projects) {
+              if (resolutionRef.current === initialResolution) setRegistryUnresolved(true);
+              return;
+            }
+            const overrides = overridesForPath(projects, initialPath);
+            if (overrides?.worktree_enabled !== undefined || overrides?.sandbox_enabled !== undefined) {
+              dispatch({ type: "SEED_PROJECT_OVERRIDES", overrides, path: initialPath });
+            }
+            // Still the selected project: its settings are known now, even if a picker lookup failed meanwhile.
+            if (normalizeProjectPathKey(dataRef.current.path) === normalizeProjectPathKey(initialPath)) {
+              knownResolutionRef.current = normalizeProjectPathKey(initialPath);
+              setRegistryUnresolved(false);
             }
           })
           .catch(() => {})
@@ -239,7 +275,8 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
         return fetchSettings(effectiveProfile || undefined);
       })
       .then((s) => {
-        if (!s) return;
+        // A committed switch owns the settings now; applying these late would overwrite its defaults.
+        if (!s || committedProfileRef.current !== initialProfile) return;
         setCommandMaps(commandMapsFromSettings(s));
         const img = ((s.sandbox as Obj)?.default_image as string) || "";
         if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
@@ -254,7 +291,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
         });
       })
       .catch(() => {});
-    void Promise.all([settingsSeed, projectSeed]).then(() => setDefaultsReady(true));
+    void Promise.all([settingsSeed, projectSeed, dockerSeed]).then(() => setDefaultsReady(true));
     // Seed once; a re-render with a new prefill object must not stomp user edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -309,20 +346,49 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
       const ok = window.confirm("Selecting a profile will reset your settings to that profile's defaults. Continue?");
       if (!ok) return;
     }
-    handleChange("profile", profileName);
     setPanel(null);
-    if (!profileName) return;
+    // Launch waits for this switch, and a response for a superseded profile is dropped.
+    const switchId = ++profileSwitchRef.current;
+    const isCurrent = () => profileSwitchRef.current === switchId;
+    setProfileSwitching(true);
     try {
-      const settings = await fetchSettings(profileName);
+      // The profile, its defaults and the selected project's per-profile overrides commit together once all
+      // of them are known, so a failed or superseded switch leaves the last complete state untouched. The
+      // whole registry is read, because the project can change while this is pending.
+      const [projects, settings] = await Promise.all([
+        fetchProjectRegistry(undefined, profileName || undefined),
+        profileName ? fetchSettings(profileName).catch(() => null) : Promise.resolve(null),
+      ]);
+      if (!isCurrent()) return;
+      const latest = dataRef.current;
+      let seed: { overrides: ProjectOverrides | undefined; path: string } | null = null;
+      if (latest.path && !latest.scratch) {
+        if (!projects) {
+          dispatch({
+            type: "SUBMIT_ERROR",
+            error: `Could not load project settings for profile ${profileName || "default"}. The profile was not changed.`,
+          });
+          return;
+        }
+        seed = { overrides: overridesForPath(projects, latest.path), path: latest.path };
+      }
+      committedProfileRef.current = profileName;
+      handleChange("profile", profileName);
+      knownResolutionRef.current = seed ? normalizeProjectPathKey(seed.path) : null;
+      if (seed) {
+        resolutionRef.current += 1;
+        dispatch({ type: "SEED_PROJECT_OVERRIDES", ...seed });
+        setRegistryUnresolved(false);
+      }
       if (settings) {
         handleApplyProfileDefaults({
-          ...profileDefaults(settings, "", d.tool),
+          ...profileDefaults(settings, "", latest.tool),
           resetStructuredViewDirty: true,
           commandMaps: commandMapsFromSettings(settings),
         });
       }
-    } catch {
-      // Keep just the profile name.
+    } finally {
+      if (isCurrent()) setProfileSwitching(false);
     }
   };
 
@@ -406,6 +472,11 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
       return;
     }
     const d = state.data;
+    // A seeded default can leave the sandbox on while it is unavailable; the server would reject it.
+    if (d.sandboxEnabled && sandboxBlocked) {
+      dispatch({ type: "SUBMIT_ERROR", error: `Sandbox unavailable: ${sandboxBlocked}. Turn it off to launch.` });
+      return;
+    }
     const body = {
       ...buildCreateRequest(
         d,
@@ -481,6 +552,8 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   };
 
   const d = state.data;
+  // A scratch session has no project whose overrides could be unknown.
+  const projectUnresolved = registryUnresolved && !d.scratch;
   const selectedAgent = state.agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);
   const isHostOnly = selectedAgent?.host_only ?? false;
@@ -505,7 +578,23 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
             onChange={handleChange}
             initialTab={prefill?.initialTab}
             agents={state.agents}
-            onSelectSavedProject={(override) => dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override })}
+            onSelectSavedProject={(overrides, path) => {
+              const key = normalizeProjectPathKey(path);
+              if (overrides === null) {
+                // Unknown, not "none": a resolution that exists for this very project stays. Otherwise
+                // another project's overrides are dropped and Launch waits for this one to load.
+                if (key === normalizeProjectPathKey(d.path) && knownResolutionRef.current === key) return;
+                knownResolutionRef.current = null;
+                dispatch({ type: "SEED_PROJECT_OVERRIDES", overrides: undefined });
+                setRegistryUnresolved(true);
+                return;
+              }
+              // Only a successful lookup replaces what an earlier, slower one may still report.
+              resolutionRef.current += 1;
+              knownResolutionRef.current = key;
+              setRegistryUnresolved(false);
+              dispatch({ type: "SEED_PROJECT_OVERRIDES", overrides });
+            }}
             onPicked={() => setPanel(null)}
           />
         );
@@ -711,10 +800,14 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
             <LaunchFooter
               data={d}
               isSubmitting={state.isSubmitting}
-              error={state.error ?? (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)}
+              error={
+                state.error ??
+                (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
+                (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
+              }
               onSubmit={handleSubmit}
               nameOnly={nameOnly}
-              defaultsReady={defaultsReady}
+              defaultsReady={defaultsReady && !profileSwitching && !projectUnresolved}
               onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
             />
           </div>

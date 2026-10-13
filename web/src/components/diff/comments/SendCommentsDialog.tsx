@@ -7,9 +7,10 @@ import { reportTelemetrySeen } from "../../../lib/api";
 
 interface Props {
   sessionId: string;
+  delivery: "structured" | "terminal";
   comments: DiffComment[];
   isMultiRepo: boolean;
-  /** False when the session cannot drain a prompt (not structured view, or trashed). */
+  /** False when the session cannot accept a diff-comment prompt. */
   sendEnabled: boolean;
   /** Cause plus remedy. */
   sendDisabledReason: string;
@@ -26,6 +27,7 @@ interface Props {
 /** Intro, read-only comments preview, and outro; the prompt is built at send time. */
 export function SendCommentsDialog({
   sessionId,
+  delivery,
   comments,
   isMultiRepo,
   sendEnabled,
@@ -62,6 +64,7 @@ export function SendCommentsDialog({
         ? "Sending your comments to the agent..."
         : "Send comments to agent";
 
+  /** Sends the assembled prompt through the selected session transport; failures keep the draft editable. */
   const send = useCallback(async () => {
     if (busy || comments.length === 0 || !sendEnabled) return;
     setBusy(true);
@@ -70,11 +73,16 @@ export function SendCommentsDialog({
       isMultiRepo,
     });
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/prompt/diff-comments`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(built),
-      });
+      const res = await fetch(
+        delivery === "structured"
+          ? `/api/sessions/${encodeURIComponent(sessionId)}/acp/prompt/diff-comments`
+          : `/api/sessions/${encodeURIComponent(sessionId)}/send`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(delivery === "structured" ? built : { message: built.assembledMarkdown }),
+        },
+      );
       if (!res.ok) {
         const text = (await res.text().catch(() => "")).slice(0, 500);
         if (mountedRef.current) {
@@ -95,7 +103,7 @@ export function SendCommentsDialog({
         setBusy(false);
       }
     }
-  }, [busy, comments, introDraft, outroDraft, isMultiRepo, sendEnabled, sessionId, onSent]);
+  }, [busy, comments, introDraft, outroDraft, isMultiRepo, sendEnabled, sessionId, delivery, onSent]);
 
   // Document-level so textareas do not swallow the hotkeys; Esc is ignored mid-send.
   useEffect(() => {

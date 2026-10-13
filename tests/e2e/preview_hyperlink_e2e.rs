@@ -97,8 +97,10 @@ has_acknowledged_agent_hooks = true
 
 [session]
 default_attach_mode = "live_send"
-"#,
+
+{systemd_off}"#,
         version = env!("CARGO_PKG_VERSION"),
+        systemd_off = crate::harness::SYSTEMD_OFF,
     );
     std::fs::write(config_dir.join("config.toml"), config_content).expect("write live-send config");
 }
@@ -281,8 +283,10 @@ has_acknowledged_agent_hooks = true
 [session]
 default_attach_mode = "live_send"
 custom_agents = {{ "{LINK_AGENT}" = "{LINK_AGENT}" }}
-"#,
+
+{systemd_off}"#,
             version = env!("CARGO_PKG_VERSION"),
+            systemd_off = crate::harness::SYSTEMD_OFF,
         ),
     )
     .expect("write config");

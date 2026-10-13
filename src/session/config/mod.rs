@@ -42,6 +42,9 @@ pub struct Config {
     pub tmux: TmuxConfig,
 
     #[serde(default)]
+    pub systemd: SystemdSettings,
+
+    #[serde(default)]
     pub session: SessionConfig,
 
     #[serde(default)]
@@ -913,6 +916,14 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tips_seen: Vec<String>,
 
+    /// Successful session creations across all profiles, independent of telemetry.
+    #[serde(default)]
+    pub sessions_created: u64,
+
+    /// Stops concurrent upgrade migrations from seeding the counter twice.
+    #[serde(default)]
+    pub sessions_created_seeded: bool,
+
     /// How many times the new-session dialog has been opened while a project or
     /// session was selected. Once this passes
     /// [`crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD`], the "new from
@@ -1651,6 +1662,18 @@ pub struct SessionConfig {
     )]
     pub show_tips: bool,
 
+    /// Show the bottom shortcut bar, including the LIVE banner. Hiding it frees
+    /// one row; shortcuts, help, and temporary notifications remain available.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Show shortcut bar",
+        widget = "toggle",
+        category = "Interaction",
+        global_only,
+        tui_only
+    )]
+    pub show_shortcut_bar: bool,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -1942,6 +1965,7 @@ impl Default for SessionConfig {
             show_session_colors: true,
             favorites_first: true,
             show_tips: true,
+            show_shortcut_bar: true,
             tie_workdir_to_name: true,
         }
     }
@@ -2986,6 +3010,76 @@ pub struct TmuxConfig {
     #[serde(default = "default_true")]
     #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
     pub vt_live: bool,
+}
+
+pub fn default_systemd_slice() -> String {
+    crate::process::systemd::DEFAULT_SLICE_TEMPLATE.to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "systemd", category = "Systemd")]
+pub struct SystemdSettings {
+    /// Place every new session in its own transient systemd scope. No-op when
+    /// the systemd user manager is unreachable. Existing scopes are still
+    /// stopped with their sessions when off. Applies after an aoe restart.
+    #[serde(default = "default_true")]
+    #[setting(label = "Use systemd scopes", widget = "toggle", global_only)]
+    pub enabled: bool,
+
+    /// Slice for the session scopes; must end in `.slice`. `{profile}` expands to the escaped profile name. Applies after an aoe restart.
+    #[serde(default = "default_systemd_slice")]
+    #[setting(
+        label = "Systemd slice",
+        widget = "text",
+        validate = "systemd_slice",
+        global_only
+    )]
+    pub slice: String,
+
+    /// Keep sessions running when the aoe daemon service stops. Applies after an aoe restart.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Sessions survive daemon restart",
+        widget = "toggle",
+        global_only
+    )]
+    pub survive_daemon_restart: bool,
+
+    /// Per-session memory cap (e.g. `4G`, `512M`). Empty means unlimited. Applies after an aoe restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Session memory limit",
+        widget = "optional_text",
+        validate = "memory_limit",
+        global_only,
+        advanced
+    )]
+    pub memory_max: Option<String>,
+
+    /// Per-session task cap. 0 means unlimited. Applies after an aoe restart.
+    #[serde(default)]
+    #[setting(
+        label = "Session task limit",
+        widget = "number",
+        min = 0,
+        max = 4194304,
+        validate = "range:0:4194304",
+        global_only,
+        advanced
+    )]
+    pub tasks_max: u32,
+}
+
+impl Default for SystemdSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            slice: default_systemd_slice(),
+            survive_daemon_restart: true,
+            memory_max: None,
+            tasks_max: 0,
+        }
+    }
 }
 
 impl Default for TmuxConfig {
@@ -4574,5 +4668,15 @@ mod tests {
 
         update_app_state(|state| state.has_seen_welcome = true).unwrap();
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
+    }
+
+    #[test]
+    fn systemd_settings_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.systemd.enabled);
+        assert_eq!(cfg.systemd.slice, "background-aoe-{profile}.slice");
+        assert!(cfg.systemd.survive_daemon_restart);
+        assert_eq!(cfg.systemd.memory_max, None);
+        assert_eq!(cfg.systemd.tasks_max, 0);
     }
 }

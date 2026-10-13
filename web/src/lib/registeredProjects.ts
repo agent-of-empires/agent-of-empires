@@ -8,6 +8,12 @@ export function normalizeProjectPathKey(path: string): string {
   return path.trim().replace(/[\\/]+$/g, "");
 }
 
+/** The registered project's per-project overrides for `path`, if it is registered. */
+export function overridesForPath(projects: ProjectInfo[], path: string): ProjectInfo["overrides"] {
+  const key = normalizeProjectPathKey(path);
+  return projects.find((p) => normalizeProjectPathKey(p.path) === key)?.overrides;
+}
+
 function isSyntheticRepoGroup(id: string): boolean {
   return id === MULTI_REPO_GROUP_ID || id === SCRATCH_GROUP_ID;
 }

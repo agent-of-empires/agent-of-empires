@@ -84,6 +84,8 @@ impl HomeView {
             || self.info_dialog.is_some()
             || self.snooze_duration_dialog.is_some()
             || self.profile_picker_dialog.is_some()
+            || self.group_picker_dialog.is_some()
+            || self.sort_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.attach_project_dialog.is_some()

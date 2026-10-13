@@ -224,6 +224,8 @@ pub enum ValidationKind {
     SecurityOptList,
     /// Empty, `none`, `bridge`, or a named network; `host` would defeat isolation.
     Network,
+    /// A systemd slice unit name ending in `.slice`.
+    SystemdSlice,
     /// A closed set, for plugin selects (core selects carry options in the widget).
     OneOf {
         options: Vec<String>,

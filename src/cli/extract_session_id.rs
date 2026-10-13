@@ -129,15 +129,122 @@ fn walk_reaches_single_agent(
     false
 }
 
+const HERMES_STDIN_BYTE_CAP: u64 = 64 << 20;
+
+#[derive(Clone, Copy)]
+enum IdentityPart {
+    Root,
+    Extra,
+    String,
+    Discard,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for IdentityPart {
+    type Value = serde_json::Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for IdentityPart {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(if matches!(self, Self::String) && value.len() <= 256 {
+            serde_json::Value::String(value.to_owned())
+        } else {
+            serde_json::Value::Null
+        })
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        while seq.next_element_seed(Self::Discard)?.is_some() {}
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut selected = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let part = match (self, key.as_str()) {
+                (Self::Root, "session_id") | (Self::Extra, "platform") => Self::String,
+                (Self::Root, "extra") => Self::Extra,
+                _ => Self::Discard,
+            };
+            let value = map.next_value_seed(part)?;
+            if !matches!(part, Self::Discard) {
+                selected.insert(key, value);
+            }
+        }
+        Ok(if matches!(self, Self::Root | Self::Extra) {
+            serde_json::Value::Object(selected)
+        } else {
+            serde_json::Value::Null
+        })
+    }
+}
+
+fn read_hermes_identity<R: Read>(stdin: R) -> Result<serde_json::Value> {
+    use serde::de::DeserializeSeed;
+    let mut limited = stdin.take(HERMES_STDIN_BYTE_CAP + 1);
+    let value = {
+        let mut parser =
+            serde_json::Deserializer::from_reader(std::io::BufReader::new(&mut limited));
+        let value = IdentityPart::Root.deserialize(&mut parser)?;
+        parser.end()?;
+        value
+    };
+    if limited.limit() == 0 {
+        return Err(anyhow!("Hermes hook payload exceeds 64 MiB"));
+    }
+    Ok(value)
+}
+
 fn run_inner<R: Read>(
     stdin: R,
     instance_id: &str,
     field: crate::agents::HookIdentityField,
     source: Option<&str>,
 ) -> Result<()> {
-    let mut buf = String::new();
-    stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
-    let value: serde_json::Value = serde_json::from_str(&buf)?;
+    let value = if matches!(
+        field,
+        crate::agents::HookIdentityField::HermesForegroundSessionId
+    ) {
+        read_hermes_identity(stdin)?
+    } else {
+        let mut buf = String::new();
+        stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
+        serde_json::from_str(&buf)?
+    };
     let sid = match field {
         crate::agents::HookIdentityField::SessionId => value
             .get("session_id")
@@ -150,6 +257,10 @@ fn run_inner<R: Read>(
             .ok_or_else(|| {
                 anyhow!("payload has no top-level string conversation_id or session_id")
             })?,
+        crate::agents::HookIdentityField::HermesForegroundSessionId => {
+            hermes_foreground_session_id(&value)
+                .ok_or_else(|| anyhow!("payload is not from the Hermes foreground agent"))?
+        }
     };
     if !crate::session::capture::is_valid_session_id(sid) {
         return Err(anyhow!("payload contains an unsafe native session id"));
@@ -157,10 +268,118 @@ fn run_inner<R: Read>(
     crate::hooks::write_session_id_via_guard(instance_id, sid, source)
 }
 
+/// The CLI or TUI foreground agent reports `platform: cli` or `tui` and a `YYYYMMDD_HHMMSS_<hex>`
+/// id. Subagents report `subagent` and side tasks use `bg_` or `preview_` ids; any other shape is
+/// refused, so a Hermes change stops capture instead of adopting a foreign conversation.
+fn hermes_foreground_session_id(value: &serde_json::Value) -> Option<&str> {
+    let platform = value.pointer("/extra/platform").and_then(|v| v.as_str());
+    if !matches!(platform, Some("cli" | "tui")) {
+        return None;
+    }
+    let sid = value.get("session_id")?.as_str()?;
+    let mut parts = sid.splitn(3, '_');
+    let (date, time, hex) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());
+    let lower_hex = !hex.is_empty()
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (digits(date, 8) && digits(time, 6) && lower_hex).then_some(sid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hooks::test_support::BaseGuard;
+
+    #[test]
+    fn hermes_stream_validates_ignored_values_and_last_members() {
+        let valid = r#"{"session_id":"20261002_231100_d4e5f6","extra":{"platform":"cli""#;
+        for (suffix, accepted) in [
+            (
+                r#", "unused": {"session_id":"foreign","platform":"subagent"}}}"#,
+                true,
+            ),
+            (r#"},"session_id":null}"#, false),
+            (r#"},"session_id":[]}"#, false),
+            (r#"},"extra":{}}"#, false),
+            (r#"},"extra":null}"#, false),
+            (r#", "platform":null}}"#, false),
+            (r#"},"unused":"\uD800"}"#, false),
+            (r#"},"unused":1e999}"#, false),
+            (r#"}} {}"#, false),
+            (r#"}} garbage"#, false),
+        ] {
+            let payload = format!("{valid}{suffix}");
+            let result = read_hermes_identity(payload.as_bytes());
+            let identity = result.as_ref().ok().and_then(hermes_foreground_session_id);
+            assert_eq!(
+                identity,
+                accepted.then_some("20261002_231100_d4e5f6"),
+                "{payload}: {result:?}"
+            );
+        }
+        let mut invalid_utf8 = format!("{valid}}},\"unused\":\"").into_bytes();
+        invalid_utf8.push(0xff);
+        invalid_utf8.extend_from_slice(b"\"}");
+        assert!(read_hermes_identity(invalid_utf8.as_slice()).is_err());
+        let deep = format!(
+            "{valid}}},\"unused\":{}0{}}}",
+            "[".repeat(150),
+            "]".repeat(150)
+        );
+        assert!(read_hermes_identity(deep.as_bytes()).is_err());
+        let duplicate = br#"{"session_id":null,"session_id":"20261002_231100_d4e5f6","extra":null,"extra":{"platform":null,"platform":"tui"}}"#;
+        let value = read_hermes_identity(duplicate.as_slice()).unwrap();
+        assert_eq!(
+            hermes_foreground_session_id(&value),
+            Some("20261002_231100_d4e5f6")
+        );
+    }
+
+    #[test]
+    fn hermes_transport_boundary_and_infinite_whitespace() {
+        let prefix = br#"{"session_id":"20261002_231100_d4e5f6","extra":{"platform":"cli"}}"#;
+        for extra in [0, 1] {
+            let padding = HERMES_STDIN_BYTE_CAP - prefix.len() as u64 + extra;
+            let input = prefix.as_slice().chain(std::io::repeat(b' ').take(padding));
+            let result = read_hermes_identity(input);
+            if extra == 0 {
+                assert_eq!(
+                    hermes_foreground_session_id(&result.unwrap()),
+                    Some("20261002_231100_d4e5f6")
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let mut input = prefix.as_slice().chain(std::io::repeat(b' '));
+        assert!(read_hermes_identity(&mut input).is_err());
+        let mut byte = [0];
+        assert_eq!(input.read(&mut byte).unwrap(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn hermes_large_history_replaces_existing_identity() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let field = crate::agents::HookIdentityField::HermesForegroundSessionId;
+        let old = "20261001_231100_a1b2c3";
+        let new = "20261002_231100_d4e5f6";
+        let source = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let small =
+            serde_json::json!({"session_id": old, "extra": {"platform": "cli"}}).to_string();
+        for source in [None, Some(source)] {
+            run_inner(small.as_bytes(), "large_hermes", field, source).unwrap();
+            let large = serde_json::json!({"session_id": new, "extra": {"platform": "cli", "conversation_history": [{"role": "user", "content": "x".repeat(1_200_000)}]}}).to_string();
+            run_inner(large.as_bytes(), "large_hermes", field, source).unwrap();
+            let actual = match source {
+                Some(source) => read_suffixed_sidecar(&base, "large_hermes", source),
+                None => read_sidecar(&base, "large_hermes"),
+            };
+            assert_eq!(actual.as_deref(), Some(new));
+        }
+    }
 
     #[test]
     fn a_named_publisher_only_writes_from_its_own_agents_pane() {
@@ -397,6 +616,53 @@ mod tests {
             read_sidecar(&base, "conversation_fallback").as_deref(),
             Some(OTHER)
         );
+    }
+
+    /// Hermes runs delegated subagents and side tasks in the pane's own process, firing the same
+    /// hooks with their own ids; only the foreground agent's id may be adopted.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn hermes_identity_accepts_only_the_cli_foreground_agent() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        const FOREGROUND: &str = "20261001_231100_a1b2c3";
+        let field = crate::agents::HookIdentityField::HermesForegroundSessionId;
+        for (name, sid, platform, accepted) in [
+            ("hermes_foreground", FOREGROUND, Some("cli"), true),
+            ("hermes_subagent", FOREGROUND, Some("subagent"), false),
+            ("hermes_background", "bg_231100_a1b2c3", Some("cli"), false),
+            ("hermes_tui", FOREGROUND, Some("tui"), true),
+            ("hermes_tui_preview", "preview_a1b2c3", Some("tui"), false),
+            ("hermes_no_platform", FOREGROUND, None, false),
+            (
+                "hermes_short_date",
+                "2026101_231100_a1b2c3",
+                Some("cli"),
+                false,
+            ),
+            (
+                "hermes_upper_hex",
+                "20261001_231100_A1B2C3",
+                Some("cli"),
+                false,
+            ),
+            ("hermes_no_hex", "20261001_231100_", Some("cli"), false),
+        ] {
+            let extra = platform.map_or_else(
+                || "{}".to_string(),
+                |platform| format!(r#"{{"platform":"{platform}"}}"#),
+            );
+            let payload = format!(r#"{{"session_id":"{sid}","extra":{extra}}}"#);
+            assert_eq!(
+                run_inner(payload.as_bytes(), name, field, None).is_ok(),
+                accepted,
+                "{name}"
+            );
+            assert_eq!(
+                read_sidecar(&base, name).as_deref(),
+                accepted.then_some(sid),
+                "{name}"
+            );
+        }
     }
 
     #[test]

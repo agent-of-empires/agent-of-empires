@@ -10,6 +10,8 @@ pub struct AgentProfile {
     pub parent_meta_namespaces: &'static [&'static str],
     /// Slash commands that reset the conversation.
     pub clear_aliases: &'static [&'static str],
+    /// Slash commands that compact the conversation.
+    pub compact_aliases: &'static [&'static str],
     pub clear_requires_driven_reset: bool,
     /// When true, the server synthesises a `PlanUpdated` event from a
     /// `kind: switch_mode` tool call (Claude's ExitPlanMode shape).
@@ -28,23 +30,33 @@ pub struct AgentProfile {
     pub native_config_agent: Option<&'static str>,
 }
 
+fn matches_alias(aliases: &[&str], text: &str) -> bool {
+    let trimmed = text.trim();
+    aliases.iter().any(|alias| {
+        trimmed == *alias
+            || trimmed
+                .strip_prefix(alias)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })
+}
+
 impl AgentProfile {
     /// True when `text` matches any of this profile's clear-conversation
     /// slash aliases, tolerating surrounding whitespace and a trailing
     /// argument cluster.
     pub fn is_clear_command(&self, text: &str) -> bool {
-        let trimmed = text.trim();
-        for alias in self.clear_aliases {
-            if trimmed == *alias {
-                return true;
-            }
-            if let Some(rest) = trimmed.strip_prefix(*alias) {
-                if rest.starts_with(char::is_whitespace) {
-                    return true;
-                }
-            }
-        }
-        false
+        matches_alias(self.clear_aliases, text)
+    }
+
+    /// Same matching for the compact-conversation aliases.
+    pub fn is_compact_command(&self, text: &str) -> bool {
+        matches_alias(self.compact_aliases, text)
+    }
+
+    /// Commands that must run as their own turn, never steered into a
+    /// running one or batched with neighbouring prompts.
+    pub fn is_solo_command(&self, text: &str) -> bool {
+        self.is_clear_command(text) || self.is_compact_command(text)
     }
 
     /// Read a parent tool-call id from an ACP `_meta` blob, trying each
@@ -81,6 +93,7 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     key: "default",
     parent_meta_namespaces: &[],
     clear_aliases: &[],
+    compact_aliases: &[],
     clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
     supports_wakeup_tools: false,
@@ -94,6 +107,7 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     key: "claude",
     parent_meta_namespaces: &["claudeCode"],
     clear_aliases: &["/clear"],
+    compact_aliases: &["/compact"],
     clear_requires_driven_reset: true,
     supports_exit_plan_mode: true,
     supports_wakeup_tools: true,

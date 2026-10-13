@@ -7,11 +7,39 @@ pub struct TipSignals {
     pub used_new_from_selection: bool,
     pub system_health_tip_earned: bool,
     pub used_system_health: bool,
+    pub sessions_created: u64,
+    pub shortcut_bar_hidden: bool,
+}
+
+impl From<&crate::session::Config> for TipSignals {
+    fn from(config: &crate::session::Config) -> Self {
+        Self {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
+            sessions_created: config.app_state.sessions_created,
+            shortcut_bar_hidden: !config.session.show_shortcut_bar,
+        }
+    }
+}
+
+/// Called only after a creation is committed, never for a restart or a placeholder.
+pub(crate) fn record_session_creations(count: usize) {
+    if count == 0 {
+        return;
+    }
+    if let Err(error) = crate::session::config::update_app_state(|state| {
+        state.sessions_created = state.sessions_created.saturating_add(count as u64);
+    }) {
+        tracing::warn!(%error, "Failed to persist session creation count for tips");
+    }
 }
 
 pub const NEW_FROM_SELECTION_TIP_THRESHOLD: u32 = 3;
 pub const SYSTEM_HEALTH_AGENT_THRESHOLD: usize = 6;
 pub const SYSTEM_HEALTH_SAMPLE_THRESHOLD: u8 = 3;
+pub const SHORTCUT_BAR_TIP_ID: &str = "hide-shortcut-bar";
 
 /// A tip shows only on the surfaces it lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,11 +85,26 @@ fn earned_system_health(signals: &TipSignals) -> bool {
     signals.system_health_tip_earned && !signals.used_system_health
 }
 
+fn earned_shortcut_bar(signals: &TipSignals) -> bool {
+    signals.sessions_created > 30 && !signals.shortcut_bar_hidden
+}
+
 pub fn catalog() -> &'static [Tip] {
     CATALOG
 }
 
 static CATALOG: &[Tip] = &[
+    Tip {
+        id: SHORTCUT_BAR_TIP_ID,
+        title: "More room for your sessions",
+        body: "Already know your shortcuts? Open Settings ({settings}) > Global > \
+               Interaction and turn off Show shortcut bar to hide the bottom row, \
+               including the LIVE banner.\n\n\
+               All shortcuts still work. Press {help} for help, or Ctrl+K > Show tips \
+               to browse tips again. You can turn the bar back on in the same setting.",
+        trigger: TipTrigger::Earned(earned_shortcut_bar),
+        surfaces: &[TipSurface::Tui],
+    },
     Tip {
         id: "new-from-selection",
         title: "Reuse the selected session's settings",
@@ -221,6 +264,59 @@ pub fn next_earned_pop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_bar_tip_requires_31_creates_and_an_unseen_visible_bar() {
+        for (count, hidden, seen, expected) in [
+            (0, false, false, false),
+            (30, false, false, false),
+            (31, false, false, true),
+            (32, false, false, true),
+            (31, true, false, false),
+            (31, false, true, false),
+        ] {
+            let signals = TipSignals {
+                sessions_created: count,
+                shortcut_bar_hidden: hidden,
+                ..TipSignals::default()
+            };
+            let seen = if seen {
+                vec![SHORTCUT_BAR_TIP_ID.into()]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                next_earned_pop(TipSurface::Tui, &seen, &signals).map(|tip| tip.id),
+                expected.then_some(SHORTCUT_BAR_TIP_ID),
+                "count={count}, hidden={hidden}, seen={seen:?}"
+            );
+            assert!(next_earned_pop(TipSurface::Web, &seen, &signals).is_none());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_count_merges_concurrent_writers_and_preserves_seen_state() {
+        use crate::session::config::{update_app_state, AppStateConfig};
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        update_app_state(|state| state.tips_seen.push("other-tip".into())).unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        record_session_creations(1);
+                    }
+                });
+            }
+        });
+        record_session_creations(0);
+        let state = AppStateConfig::load().unwrap();
+        assert_eq!(state.sessions_created, 32);
+        assert_eq!(state.tips_seen, ["other-tip"]);
+    }
 
     fn by_id(id: &str) -> Option<&'static Tip> {
         catalog().iter().find(|tip| tip.id == id)

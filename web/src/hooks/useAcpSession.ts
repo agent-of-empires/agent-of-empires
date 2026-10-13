@@ -34,6 +34,8 @@ type PromptSendResult =
   /** 503 `worker_not_ready`: the daemon resumed, the worker did not arrive, and nothing was
    *  published. The caller owns the text and must re-queue it. */
   | { kind: "worker_not_ready" }
+  /** 409 `queued_prompt_gone`: the drain or another tab already delivered the named queue row. */
+  | { kind: "queued_gone" }
   | { kind: "retryable_failure" }
   | { kind: "non_retryable_failure" };
 
@@ -165,7 +167,7 @@ export function useAcpSession(
 
   // POST a prompt behind an optimistic overlay row keyed by its prompt_id and report the outcome.
   const dispatchPromptNow = useCallback(
-    async (text: string, attachments?: PromptAttachmentInput[]): Promise<PromptSendResult> => {
+    async (text: string, attachments?: PromptAttachmentInput[], queuedPromptId?: string): Promise<PromptSendResult> => {
       if (!sessionId) return { kind: "retryable_failure" };
       const previews: AcpAttachment[] = (attachments ?? []).map((a, i) => ({
         id: `local-${Date.now()}-${i}`,
@@ -184,6 +186,7 @@ export function useAcpSession(
           jsonPost({
             text,
             prompt_id: promptId,
+            ...(queuedPromptId ? { queued_prompt_id: queuedPromptId } : {}),
             attachments: (attachments ?? []).map((a) => ({
               kind: a.kind,
               mime_type: a.mimeType,
@@ -194,6 +197,10 @@ export function useAcpSession(
         );
         if (!res.ok) {
           const detail = await safeText(res);
+          if (res.status === 409 && detail.startsWith("queued_prompt_gone")) {
+            dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
+            return { kind: "queued_gone" };
+          }
           const rejected = res.status >= 400 && res.status < 500;
           // The worker is not up yet (idle-stopped or parked): the caller re-queues it, so no banner.
           const workerNotReady = res.status === 503 && detail.startsWith("worker_not_ready");
@@ -355,17 +362,22 @@ export function useAcpSession(
       }
       // Removing a row whose bytes live only on the server would delete them before the send.
       if (prompt.attachments?.some((a) => !a.dataB64)) return;
-      // Remove server-side first so the drain can't also deliver it; a failed remove means it already did.
+      // The daemon consumes the row once it accepts the send, so the drain can't also deliver it
+      // and a plugin-sent row keeps the sender it stored.
       dispatch({ kind: "dequeue_prompt", id: prompt.id });
-      if (!(await removeServerQueuedPrompt(sid, prompt.id))) return;
-      const result = await dispatchPromptNow(prompt.text, prompt.attachments);
+      const result = await dispatchPromptNow(prompt.text, prompt.attachments, prompt.id);
+      // The daemon keeps the row until it accepts the send, so a refusal or a re-park leaves it queued.
       if (result.kind === "queued") {
         showServerQueued(result.queuedId, prompt.text, prompt.attachments);
-      } else if (result.kind === "retryable_failure" || result.kind === "worker_not_ready") {
-        enqueueServer(prompt.text, prompt.attachments);
+      } else if (
+        result.kind === "retryable_failure" ||
+        result.kind === "worker_not_ready" ||
+        result.kind === "non_retryable_failure"
+      ) {
+        showServerQueued(prompt.id, prompt.text, prompt.attachments);
       }
     },
-    [sessionIdRef, state.turnActive, steerable, cancelPrompt, dispatchPromptNow, enqueueServer, showServerQueued],
+    [sessionIdRef, state.turnActive, steerable, cancelPrompt, dispatchPromptNow, showServerQueued],
   );
 
   // Pessimistic: the value changes when the adapter confirms; pending only dims the clicked option.

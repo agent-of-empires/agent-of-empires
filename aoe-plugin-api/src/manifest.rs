@@ -1031,6 +1031,15 @@ impl PluginManifest {
                 "string_list settings require api_version >= 14".into(),
             );
         }
+        if self.api_version < 15 {
+            check(
+                !self
+                    .capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "session.message"),
+                "the session.message capability requires api_version >= 15".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1183,6 +1192,17 @@ mod tests {
             "{err}"
         );
         PluginManifest::from_toml_str(&home_pane_toml(13)).expect("home-pane parses from v13");
+    }
+
+    #[test]
+    fn session_message_capability_is_gated_on_v15() {
+        let toml = |v: u32| {
+            format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = {v}\ncapabilities = [\"runtime.worker\", \"session.message\"]\n"
+            )
+        };
+        rejects(&[("session.message below v15", toml(14), "api_version >= 15")]);
+        PluginManifest::from_toml_str(&toml(15)).expect("v15 parses");
     }
 
     #[test]

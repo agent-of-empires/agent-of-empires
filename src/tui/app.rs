@@ -1299,6 +1299,7 @@ impl App {
             full |= self.home.try_clear_recovered_reload_dialog();
             // Another surface took the size-owner lock: leave live mode.
             full |= self.home.poll_live_send_takeover();
+            full |= self.home.try_present_shortcut_bar_tip();
 
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 crate::session::write_tui_heartbeat();

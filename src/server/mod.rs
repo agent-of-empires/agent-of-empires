@@ -17,6 +17,7 @@ pub(crate) mod ip_discovery;
 pub mod live_ws;
 pub mod login;
 mod pane;
+pub mod plugin_status;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
@@ -32,6 +33,7 @@ pub(crate) mod startup_recovery;
 pub(crate) mod state;
 pub(crate) mod status_poll;
 pub(crate) mod structured_repair;
+mod systemd_reconcile;
 #[cfg(test)]
 mod test_helpers;
 #[cfg(any(test, debug_assertions))]

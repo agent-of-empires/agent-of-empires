@@ -12,7 +12,7 @@ import { agent, mockSession } from "./fixtures";
 vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn(),
   fetchRecentProjects: vi.fn(),
-  fetchProjects: vi.fn(),
+  fetchProjectRegistry: vi.fn(),
   cloneRepo: vi.fn(),
   getHomePath: vi.fn(),
   browseFilesystem: vi.fn(),
@@ -21,7 +21,7 @@ vi.mock("../../../lib/api", () => ({
 
 import {
   browseFilesystem,
-  fetchProjects,
+  fetchProjectRegistry,
   fetchRecentProjects,
   fetchSessions,
   getHomePath,
@@ -31,7 +31,7 @@ import {
 beforeEach(() => {
   vi.mocked(fetchSessions).mockResolvedValue({ sessions: [], workspace_ordering: [] });
   vi.mocked(fetchRecentProjects).mockResolvedValue({ projects: [] });
-  vi.mocked(fetchProjects).mockResolvedValue([]);
+  vi.mocked(fetchProjectRegistry).mockResolvedValue([]);
   vi.mocked(getHomePath).mockResolvedValue(null);
   vi.mocked(browseFilesystem).mockResolvedValue({ ok: false, entries: [] } as never);
 });
@@ -55,7 +55,7 @@ const sessions = (...list: ReturnType<typeof mockSession>[]) =>
   vi.mocked(fetchSessions).mockResolvedValue({ sessions: list, workspace_ordering: [] });
 const savedProjects = (...paths: string[]) =>
   vi
-    .mocked(fetchProjects)
+    .mocked(fetchProjectRegistry)
     .mockResolvedValue(
       paths.map((path) => ({ name: path.split("/").pop()!, path, scope: "global", pinned: false }) as ProjectInfo),
     );
@@ -122,8 +122,8 @@ describe("recent and saved projects", () => {
     expect(onPicked).toHaveBeenCalledTimes(1);
   });
 
-  it("reports each selection's saved worktree override, undefined when there is none", async () => {
-    vi.mocked(fetchProjects).mockResolvedValue([
+  it("reports each selection's saved overrides, undefined when there are none", async () => {
+    vi.mocked(fetchProjectRegistry).mockResolvedValue([
       { name: "alpha", path: "/repo/alpha", scope: "global", pinned: false, overrides: { worktree_enabled: true } },
       { name: "beta", path: "/repo/beta", scope: "global", pinned: false },
     ] as ProjectInfo[]);
@@ -131,7 +131,21 @@ describe("recent and saved projects", () => {
     render(<ProjectStep data={initialData} onChange={vi.fn()} onSelectSavedProject={onSelectSavedProject} />);
     fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
     fireEvent.click((await screen.findByText("/repo/beta")).closest("button")!);
-    expect(onSelectSavedProject.mock.calls).toEqual([[true], [undefined]]);
+    expect(onSelectSavedProject.mock.calls).toEqual([
+      [{ worktree_enabled: true }, "/repo/alpha"],
+      [undefined, "/repo/beta"],
+    ]);
+  });
+
+  it("reports null, not undefined, when the registry could not be loaded", async () => {
+    vi.mocked(fetchRecentProjects).mockResolvedValue({
+      projects: [{ path: "/repo/alpha", display_name: "alpha", last_used_at: null, tool: "claude" }],
+    } as Awaited<ReturnType<typeof fetchRecentProjects>>);
+    vi.mocked(fetchProjectRegistry).mockResolvedValue(null);
+    const onSelectSavedProject = vi.fn();
+    render(<ProjectStep data={initialData} onChange={vi.fn()} onSelectSavedProject={onSelectSavedProject} />);
+    fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
+    expect(onSelectSavedProject.mock.calls).toEqual([[null, "/repo/alpha"]]);
   });
 
   it("falls back to the Browse tab with nothing to pick", async () => {

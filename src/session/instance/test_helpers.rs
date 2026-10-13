@@ -267,6 +267,52 @@ pub(super) fn admit_sandbox_fixture(inst: &Instance) {
     }
 }
 
+/// A live host Claude row under `root` whose launch reserved `sid` and whose
+/// sidecar never confirmed it.
+pub(super) fn reserved_claude_instance(root: &std::path::Path, sid: &str) -> Instance {
+    let cwd = root.join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let execution = ExecutionBinding {
+        agent: "claude".into(),
+        stores: vec![root.join("claude-store")],
+        configuration: Vec::new(),
+        cwd: cwd.clone(),
+        cwd_filesystem: "host".into(),
+        filesystem: "host".into(),
+        exported_default_store: None,
+    };
+    let mut instance = Instance::new("reserved-claude", cwd.to_str().unwrap());
+    instance.tool = "claude".into();
+    instance.active_execution = Some(ActiveExecution {
+        launch_id: uuid::Uuid::new_v4().to_string(),
+        binding: execution.clone(),
+        capture: None,
+        container: None,
+    });
+    instance.set_agent_conversation(
+        Some(sid.into()),
+        Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(execution),
+            provenance: ConversationProvenance::Preallocated,
+            transcript_path: None,
+        }),
+        None,
+    );
+    instance
+}
+
+/// Write `sid`'s transcript into the store and cwd `instance` was launched with.
+pub(super) fn write_reserved_claude_transcript(instance: &Instance, sid: &str) {
+    let execution = &instance.active_execution.as_ref().unwrap().binding;
+    let dir = execution.stores[0].join("projects").join(
+        crate::session::capture::encode_claude_project_path(&execution.cwd.to_string_lossy()),
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+}
+
 /// Seed a resumable Claude conversation in the isolated native store.
 pub(super) fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
     let home = std::env::var("CLAUDE_CONFIG_DIR")

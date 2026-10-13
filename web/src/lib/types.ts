@@ -335,6 +335,7 @@ export interface GroupInfo {
 export interface ProjectOverrides {
   worktree_enabled?: boolean;
   smart_rename?: boolean;
+  sandbox_enabled?: boolean;
 }
 
 export interface ProjectInfo {
@@ -484,6 +485,7 @@ export type SettingsValidation =
   | { rule: "capability_list" }
   | { rule: "security_opt_list" }
   | { rule: "network" }
+  | { rule: "systemd_slice" }
   | { rule: "cron" }
   | {
       rule: "object_list";

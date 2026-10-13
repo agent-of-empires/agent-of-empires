@@ -32,6 +32,7 @@ import {
 } from "./NamedToolCards";
 import { classifyTodoWrite, TodoUpdateCard } from "./TodoCards";
 import { statusFor } from "./ToolCardChrome";
+import { ToolIdProvider } from "./ToolExpansion";
 import { ToolOutputMedia } from "./ToolOutputMedia";
 
 interface Props {
@@ -52,10 +53,13 @@ export function ToolCard({ tool, result, nested }: Props) {
   ) : (
     card
   );
-  if (!nested && pickStr(parseJsonObject(tool.args_preview), "_aoe_parent_tool_call_id")) {
-    return <SubagentChildWrap>{content}</SubagentChildWrap>;
-  }
-  return content;
+  const wrapped =
+    !nested && pickStr(parseJsonObject(tool.args_preview), "_aoe_parent_tool_call_id") ? (
+      <SubagentChildWrap>{content}</SubagentChildWrap>
+    ) : (
+      content
+    );
+  return <ToolIdProvider id={tool.id}>{wrapped}</ToolIdProvider>;
 }
 
 const KIND_CARDS: Record<string, (props: { tool: ToolCall; result?: ActivityRow }) => ReactNode> = {

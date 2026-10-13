@@ -242,6 +242,7 @@ export function MobileMainPane({
       {sendDialogOpen && commentsEnabled && activeSessionId && (
         <SendCommentsDialog
           sessionId={activeSessionId}
+          delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
           comments={diffComments.comments}
           isMultiRepo={commentsIsMultiRepo}
           sendEnabled={commentSendEnabled}
@@ -261,6 +262,7 @@ export function MobileMainPane({
             }
             onCloseSendDialog();
             onClearSelectedFile();
+            if (activeSession?.view !== "structured") onBackToAgent();
           }}
         />
       )}

@@ -48,8 +48,9 @@ Workers may create structured-view sessions and send turns, but the host keeps t
 - `session.create` and `session.prompt` grant the basic operations, while `session.unattended` is separately required for a host-classified bypass or auto-write mode, and unknown approval modes classify as unattended;
 - repository hooks still require repository trust, which a plugin cannot grant;
 - turns may target only sessions the calling plugin created;
+- `session.message` is the one exception: `sessions.message.send` reaches any session, so the capability grant is its only gate. It wakes stopped sessions but never archived or trashed ones, runs the same prompt path as the web composer for structured sessions, and refuses terminal targets in CityHall mode;
 - idempotency keys are scoped to the plugin and session lifetime;
-- per-plugin create, active-session, and turn limits survive daemon restarts in a private audit ledger;
+- per-plugin create, active-session, turn, and message limits survive daemon restarts in a private audit ledger;
 - disabling the plugin stops its worker and its automation.
 
 The create RPC accepts structured fields only: no raw agent arguments, no arbitrary environment variables, no trust bypass.

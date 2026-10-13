@@ -59,8 +59,15 @@ function assistantParts(rows: ActivityRow[], ...opts: [boolean?, boolean?]): Par
   const messages = activityToThreadMessages([user(), ...rows], false, ...opts);
   return messages.filter((m) => m.role === "assistant").flatMap((m) => m.content as Part[]);
 }
+/** A busy agent's trailing run may still grow, so it stays flat. */
+const openToolParts = (rows: ActivityRow[], ...opts: [boolean?, boolean?]) =>
+  activityToThreadMessages([user(), ...rows], true, ...opts)
+    .filter((m) => m.role === "assistant")
+    .flatMap((m) => m.content as Part[])
+    .filter((p) => p.type === "tool-call");
+/** Trailing text closes the final run, whether or not the agent is busy. */
 const toolParts = (rows: ActivityRow[], ...opts: [boolean?, boolean?]) =>
-  assistantParts(rows, ...opts).filter((p) => p.type === "tool-call");
+  assistantParts([...rows, message("Done.", "m-close")], ...opts).filter((p) => p.type === "tool-call");
 const names = (parts: Part[]) => parts.map((p) => p.toolName);
 const payload = (part: Part) => JSON.parse(part.argsText!);
 
@@ -112,6 +119,33 @@ describe("tool-call grouping", () => {
     ],
   ])("%s", (_label, rows, expected) => {
     expect(names(toolParts(rows))).toEqual(expected);
+  });
+
+  it.each<[string, ActivityRow[]]>([
+    ["generic", readRun("t", 12)],
+    ["todo", todoRun("td", 3)],
+  ])(
+    "keeps a still-growing trailing %s run flat until later content or the end of the turn closes it",
+    (_label, run) => {
+      expect(openToolParts(run)).toHaveLength(run.length);
+      expect(names(openToolParts(run)).every((n) => n !== TOOL_GROUP_NAME && n !== TODO_GROUP_NAME)).toBe(true);
+      expect(toolParts(run).length).toBeLessThan(run.length);
+      const finished = assistantParts(run).filter((p) => p.type === "tool-call");
+      expect(finished.length).toBeLessThan(run.length);
+    },
+  );
+
+  it.each([
+    ["busy, so it may still grow", true, ["read", "read", "read"]],
+    ["finished", false, [TOOL_GROUP_NAME]],
+  ])("folds an earlier run once the user prompts again, and the latest one only when %s", (_label, busy, latest) => {
+    const messages = activityToThreadMessages(
+      [user(), ...readRun("a", 3), user("next", "u2"), ...readRun("b", 3)],
+      busy,
+    );
+    const [first, second] = messages.filter((m) => m.role === "assistant").map((m) => names(m.content as Part[]));
+    expect(first).toEqual([TOOL_GROUP_NAME]);
+    expect(second).toEqual(latest);
   });
 
   it("uses the generic group for todo-shaped runs when todos are disabled", () => {
@@ -279,7 +313,13 @@ describe("subagents", () => {
       return apply(state, { Append: done });
     }
     const partsFor = (state: AcpState, toolKey: string) =>
-      activityToThreadMessages(state.activity, false, false, true, resolveAgentProfile(toolKey))
+      activityToThreadMessages(
+        [...state.activity, message("Done.", "m-close")],
+        false,
+        false,
+        true,
+        resolveAgentProfile(toolKey),
+      )
         .flatMap((m) => m.content as Part[])
         .filter((p) => p.type === "tool-call");
 

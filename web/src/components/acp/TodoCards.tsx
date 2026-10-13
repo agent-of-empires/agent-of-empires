@@ -14,7 +14,9 @@ import {
   type Status,
   type ToolCardProps,
 } from "./ToolCardChrome";
+import { useToolDisplayMode } from "./ToolDisplayMode";
 import { ToolErrorBody } from "./ToolErrorBody";
+import { ToolIdProvider, useToolExpansionStore } from "./ToolExpansion";
 
 type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
@@ -135,7 +137,11 @@ export function TodoUpdateCard({ tool, result, todos }: ToolCardProps & { todos:
  *  each update is behind the expand toggle. */
 export function TodoGroupCard({ items }: { items: ToolCardProps[] }) {
   const profile = useAgentProfile();
-  const [open, setOpen] = useState(false);
+  // Updates open by default (small lists) are not the reader's choice, and the
+  // latest list shows in the preview anyway, so only an explicit toggle seeds the group open.
+  const store = useToolExpansionStore();
+  const density = useToolDisplayMode();
+  const [open, setOpen] = useState(() => items.some((i) => store?.isOpen(i.tool.id, density, false)));
   const snapshots = useMemo(
     () =>
       items.flatMap((it) => {
@@ -174,7 +180,9 @@ export function TodoGroupCard({ items }: { items: ToolCardProps[] }) {
       body={
         <div className="border-t border-surface-800 bg-surface-900/30 px-2 py-1">
           {snapshots.map((s) => (
-            <TodoUpdateCard key={s.tool.id} tool={s.tool} result={s.result} todos={s.todos} />
+            <ToolIdProvider key={s.tool.id} id={s.tool.id}>
+              <TodoUpdateCard tool={s.tool} result={s.result} todos={s.todos} />
+            </ToolIdProvider>
           ))}
         </div>
       }

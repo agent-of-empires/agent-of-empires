@@ -42,12 +42,7 @@ pub(in crate::tui) fn tips_unseen_count(config: &crate::session::Config) -> usiz
     crate::tips::unseen_count(
         crate::tips::TipSurface::Tui,
         &config.app_state.tips_seen,
-        &crate::tips::TipSignals {
-            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
-            used_new_from_selection: config.app_state.used_new_from_selection,
-            system_health_tip_earned: config.app_state.system_health_tip_earned,
-            used_system_health: config.app_state.used_system_health,
-        },
+        &crate::tips::TipSignals::from(config),
     )
 }
 

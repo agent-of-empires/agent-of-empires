@@ -1370,11 +1370,13 @@ fn transcript_lines(
             }
             TranscriptRowKind::UserPrompt => {
                 // Note attachments so an image-only prompt doesn't look empty.
-                let text = if row.attachments.is_empty() {
-                    row.text.clone()
-                } else {
-                    format!("{} [{} attachment(s)]", row.text, row.attachments.len())
+                let mut text = match &row.origin_plugin {
+                    Some(plugin) => format!("[plugin {plugin}] {}", row.text),
+                    None => row.text.clone(),
                 };
+                if !row.attachments.is_empty() {
+                    text = format!("{text} [{} attachment(s)]", row.attachments.len());
+                }
                 out.extend(user_message_lines(&text, theme));
                 out.push(Line::default());
             }
@@ -1405,6 +1407,14 @@ fn transcript_lines(
                     }
                 }
                 out.push(Line::default());
+            }
+            // Empty until the summary arrives; the row only anchors its position.
+            TranscriptRowKind::CompactionSummary => {
+                if !row.text.is_empty() {
+                    out.push(note_line(NoteKind::Info, "Compaction summary"));
+                    out.extend(agent_message_lines(&row.text, theme));
+                    out.push(Line::default());
+                }
             }
             TranscriptRowKind::EmptyOutput
             | TranscriptRowKind::ContextReset
@@ -1920,6 +1930,7 @@ mod tests {
                 severity: "warning".into(),
                 title: "Model fallback".into(),
                 description: Some("Switched to Sonnet.".into()),
+                key: None,
             }]));
 
         // One strip row per undismissed notice, each with its own close target.
@@ -2326,9 +2337,24 @@ mod tests {
                 outcome: ElicitationOutcome::Accepted,
                 answers: vec![answer("Proceed?", "Yes"), answer("Mode", "Fast")],
             },
+            Event::ConversationCompactionSummary {
+                compaction_id: "c-1".into(),
+                text: "kept the codeword".into(),
+            },
+            Event::ConversationCompactionSummary {
+                compaction_id: "c-2".into(),
+                text: String::new(),
+            },
         ]);
         let out = joined(&transcript_lines(&t, &Theme::default(), None));
-        for want in ["working on it", "› Proceed?: Yes", "› Mode: Fast"] {
+        assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
+        for want in [
+            "working on it",
+            "› Proceed?: Yes",
+            "› Mode: Fast",
+            "· Compaction summary",
+            "kept the codeword",
+        ] {
             assert!(out.contains(want), "{out:?}");
         }
         assert!(
@@ -2656,6 +2682,7 @@ mod tests {
                 text: "Hello.".into(),
                 attachments: Vec::new(),
                 synthesized: false,
+                origin_plugin: None,
             },
             Event::AgentMessageChunk {
                 text: "What should we build?".into(),
@@ -2684,6 +2711,21 @@ mod tests {
         assert!(
             !prompt.starts_with('│') && !prompt.ends_with('│'),
             "{prompt:?}"
+        );
+
+        // A plugin-sent message names its sender; a typed one does not.
+        state.transcript.server_rows = server_rows(&[Event::UserPromptSent {
+            prompt_id: None,
+            text: "PR merged".into(),
+            attachments: Vec::new(),
+            synthesized: false,
+            origin_plugin: Some("cron".into()),
+        }]);
+        let rows = render_rows(&state, 80, 20, true);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("› [plugin cron] PR merged")),
+            "{rows:?}"
         );
     }
 }

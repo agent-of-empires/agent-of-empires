@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { classifyPushHealth, type PushHealth, type PushHealthInput, type ServerSubscriptionStatus } from "./pushHealth";
+import {
+  classifyPushHealth,
+  hasFreshGoneFailure,
+  type PushHealth,
+  type PushHealthInput,
+  type ServerSubscriptionStatus,
+} from "./pushHealth";
 
 const T1 = "2026-09-01T10:00:00Z";
 const T2 = "2026-09-01T11:00:00Z";
@@ -60,5 +66,20 @@ describe("classifyPushHealth", () => {
     ],
   ])("%s", (_label, over, expected) => {
     expect(classifyPushHealth({ ...base, ...over })).toBe(expected);
+  });
+});
+
+describe("hasFreshGoneFailure", () => {
+  it.each([
+    ["a current gone failure", server({ last_failure: "gone", last_failure_at: T2 }), true],
+    [
+      "a gone failure superseded by success",
+      server({ last_failure: "gone", last_failure_at: T1, last_success_at: T2 }),
+      false,
+    ],
+    ["a transient failure", server({ last_failure: "failed", last_failure_at: T2 }), false],
+    ["missing status", null, false],
+  ])("recognizes %s", (_label, status, expected) => {
+    expect(hasFreshGoneFailure(status)).toBe(expected);
   });
 });

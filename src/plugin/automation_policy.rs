@@ -17,6 +17,8 @@ use crate::plugin::protocol::codes;
 pub(crate) const MAX_PLUGIN_CREATES_PER_HOUR: u64 = 20;
 pub(crate) const MAX_ACTIVE_PLUGIN_SESSIONS: usize = 5;
 pub(crate) const MAX_PLUGIN_TURNS_PER_HOUR: u64 = 120;
+/// Separate from turns: a plugin pings sessions it did not create, one message per event.
+pub(crate) const MAX_PLUGIN_MESSAGES_PER_HOUR: u64 = 600;
 
 const ROLLING_WINDOW_MS: i64 = 60 * 60 * 1000;
 const LEDGER_RETENTION_PER_TOPIC: usize = 2000;
@@ -130,6 +132,10 @@ impl AutomationPolicy {
 
     pub(crate) fn admit_turn(&self, plugin_id: &str) -> Result<(), DispatchError> {
         self.admit_windowed("turn", plugin_id, MAX_PLUGIN_TURNS_PER_HOUR)
+    }
+
+    pub(crate) fn admit_message(&self, plugin_id: &str) -> Result<(), DispatchError> {
+        self.admit_windowed("message", plugin_id, MAX_PLUGIN_MESSAGES_PER_HOUR)
     }
 
     fn admit_windowed(
@@ -317,6 +323,17 @@ mod tests {
         assert_eq!(denied.code, codes::RATE_LIMITED);
         assert_eq!(denied.data.as_ref().unwrap()["kind"], "rate_limited");
         policy.admit_turn("other").expect("separate scope");
+
+        for _ in 0..MAX_PLUGIN_MESSAGES_PER_HOUR {
+            policy
+                .admit_message("cron")
+                .expect("under the message rate");
+        }
+        let denied = policy
+            .admit_message("cron")
+            .expect_err("message rate reached");
+        assert_eq!(denied.data.as_ref().unwrap()["kind"], "rate_limited");
+        policy.admit_message("other").expect("separate scope");
 
         drop(policy);
         let reopened = std::sync::Arc::new(

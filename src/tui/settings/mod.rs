@@ -364,6 +364,10 @@ impl SettingsView {
         if scope != SettingsScope::Repo {
             push_tab(&mut rows, SettingsCategory::Tmux);
         }
+        // Every systemd field is global-only, so other scopes would show an empty tab.
+        if scope == SettingsScope::Global {
+            push_tab(&mut rows, SettingsCategory::Systemd);
+        }
 
         push_section(&mut rows, "Notifications");
         if scope != SettingsScope::Repo {
@@ -1142,6 +1146,7 @@ mod categories_for_scope_tests {
 
     /// StatusHooks, Tmux and Sound are gated off Repo scope: their sections
     /// are not repo-overridable, so a Repo tab would strand edits at save.
+    /// Systemd holds only global-only fields, so it shows under Global alone.
     #[test]
     fn repo_scope_drops_non_repo_overridable_categories() {
         let has_tab = |rows: &[CategoryRow], cat| rows.iter().any(|r| r.as_tab() == Some(cat));
@@ -1162,6 +1167,10 @@ mod categories_for_scope_tests {
             has_tab(&repo, SettingsCategory::Sandbox),
             "repo-overridable"
         );
+        let profile = SettingsView::categories_for_scope(SettingsScope::Profile);
+        assert!(has_tab(&global, SettingsCategory::Systemd));
+        assert!(!has_tab(&profile, SettingsCategory::Systemd), "global-only");
+        assert!(!has_tab(&repo, SettingsCategory::Systemd), "global-only");
     }
 }
 

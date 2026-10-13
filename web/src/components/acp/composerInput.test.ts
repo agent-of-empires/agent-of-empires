@@ -6,6 +6,7 @@ import {
   decideArrowRecall,
   decideBeforeInputAction,
   decideEnterAction,
+  fitTextarea,
   insertAtCaret,
   insertNewlineAtCaret,
   insertSlashCommand,
@@ -152,5 +153,38 @@ describe("caret insertion", () => {
     expect(events[0]!.event.data).toBe("/help");
     // The primitive reads selectionStart in the same onChange that applies the text.
     expect(events[0]!.caret).toBe(10);
+  });
+});
+
+describe("fitTextarea", () => {
+  function measured(parent: HTMLElement) {
+    const ta = document.createElement("textarea");
+    const seen: { minHeight: string | null; height: string | null } = { minHeight: null, height: null };
+    Object.defineProperty(ta, "scrollHeight", {
+      get() {
+        seen.minHeight = parent.style.minHeight;
+        seen.height = ta.style.height;
+        return 120;
+      },
+    });
+    parent.appendChild(ta);
+    return { ta, seen };
+  }
+
+  it("holds the parent height while collapsed to measure, then releases it", () => {
+    const parent = document.createElement("div");
+    Object.defineProperty(parent, "offsetHeight", { value: 300 });
+    const { ta, seen } = measured(parent);
+    fitTextarea(ta);
+    expect(seen).toEqual({ minHeight: "300px", height: "auto" });
+    expect(parent.style.minHeight).toBe("");
+    expect(ta.style.height).toBe("120px");
+  });
+
+  it("caps the height at 200px and tolerates a detached textarea", () => {
+    const ta = document.createElement("textarea");
+    Object.defineProperty(ta, "scrollHeight", { value: 500 });
+    fitTextarea(ta);
+    expect(ta.style.height).toBe("200px");
   });
 });

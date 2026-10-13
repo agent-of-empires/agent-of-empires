@@ -339,12 +339,13 @@ export type AcpEvent =
   | "SessionCleared"
   | "ConversationCompactionStarted"
   | "ConversationCompacted"
+  | { ConversationCompactionSummary: { compaction_id: string; text: string } }
   | { DiffEmitted: { diff: DiffPreview } }
   | "ThinkingStarted"
   | "ThinkingEnded"
   | { RateLimit: { info: RateLimitInfo } }
   | { RateLimitAutoResumed: { resets_at: string; manual?: boolean } }
-  | { SessionNotice: { severity: string; title: string; description?: string | null } }
+  | { SessionNotice: { severity: string; title: string; description?: string | null; key?: string | null } }
   | { UsageUpdated: { usage: SessionUsage } }
   | { ModeChanged: { mode: SessionMode } }
   | {
@@ -685,6 +686,7 @@ export interface ActivityRow {
     | "advisory"
     | "session_cleared"
     | "compacted"
+    | "compaction_summary"
     | "summary";
   text: string;
   toolCallId?: string;
@@ -697,6 +699,8 @@ export interface ActivityRow {
     comments: DiffComment[];
   };
   attachments?: AcpAttachment[];
+  /** Plugin that sent a `user_prompt` row; unset when the user typed it. */
+  originPlugin?: string;
   output?: ToolOutputBlock[];
   elicitationAnswers?: ElicitationAnswer[];
   asyncSubagent?: boolean;
@@ -714,6 +718,7 @@ export interface TranscriptRow {
   tool?: ToolCall;
   output?: ToolOutputBlock[];
   attachments?: PromptAttachmentRefWire[];
+  origin_plugin?: string;
   diff_comments?: {
     intro: string;
     outro: string;
@@ -763,6 +768,7 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
     ...(tool ? { tool } : {}),
     ...(row.output && row.output.length > 0 ? { output: row.output } : {}),
     ...(attachments ? { attachments } : {}),
+    ...(row.origin_plugin ? { originPlugin: row.origin_plugin } : {}),
     ...(row.diff_comments
       ? {
           diffComments: {
@@ -983,20 +989,20 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("SessionNotice" in event) {
     const notice = event.SessionNotice;
     // Matches the id the daemon mints, so a replayed frame cannot double up on
-    // the same notice already adopted from a `reduced_state` snapshot.
-    const id = `notice-${frame.seq}`;
+    // the same notice already adopted from a `reduced_state` snapshot. A keyed
+    // notice replaces its earlier version in place.
+    const id = notice.key ? `notice-${notice.key}` : `notice-${frame.seq}`;
+    const entry = {
+      id,
+      severity: notice.severity,
+      title: notice.title,
+      description: notice.description ?? null,
+    };
     if (next.sessionNotices.some((n) => n.id === id)) {
+      next.sessionNotices = next.sessionNotices.map((n) => (n.id === id ? entry : n));
       return next;
     }
-    next.sessionNotices = [
-      ...next.sessionNotices,
-      {
-        id,
-        severity: notice.severity,
-        title: notice.title,
-        description: notice.description ?? null,
-      },
-    ].slice(-MAX_SESSION_NOTICES);
+    next.sessionNotices = [...next.sessionNotices, entry].slice(-MAX_SESSION_NOTICES);
     return next;
   }
   if ("AuthStatusUpdated" in event) {

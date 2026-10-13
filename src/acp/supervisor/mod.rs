@@ -41,7 +41,7 @@ const RESTART_WINDOW: Duration = Duration::from_secs(60);
 /// Backoff before respawning so an agent that crashes on startup cannot hot-loop.
 const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 /// How long a runner request path waits for a mid-resume worker to land.
-const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Builds the client for a spawn; swapped in tests to drive lifecycles without a runner.
 pub(crate) type Launcher = Arc<

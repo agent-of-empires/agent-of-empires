@@ -245,6 +245,8 @@ const requestCases: RequestCase[] = [
   ["GET /api/groups", () => api.fetchGroups()],
   ["GET /api/projects", () => api.fetchProjects()],
   ["GET /api/projects?scope=profile", () => api.fetchProjects("profile")],
+  ["GET /api/projects?profile=work", () => api.fetchProjects(undefined, "work")],
+  ["GET /api/projects?scope=global&profile=work", () => api.fetchProjects("global", "work")],
   [
     "GET /api/importable-sessions?agent=pi&profile=work",
     () => api.listImportableSessions("pi", "work"),
@@ -585,6 +587,8 @@ describe("settings saves", () => {
 
 const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchSessions", () => api.fetchSessions(), null],
+  ["fetchProjects", () => api.fetchProjects(), []],
+  ["fetchProjectRegistry", () => api.fetchProjectRegistry(undefined, "work"), null],
   ["searchConversations", () => api.searchConversations("q"), []],
   ["updateWorkspaceOrdering", () => api.updateWorkspaceOrdering([]), false],
   ["getSessionFileContents", () => api.getSessionFileContents("s1", "a"), null],
