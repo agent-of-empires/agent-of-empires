@@ -81,8 +81,8 @@ pub(crate) use instance::{
 };
 pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
-    host_hook_post_install_notes, resolved_agent_for, ConversationState, ResumeAttemptPolicy,
-    TerminalContextResume,
+    host_hook_disclosure_for_launch, host_hook_post_install_notes, resolved_agent_for,
+    ConversationState, HostHookDisclosure, ResumeAttemptPolicy, TerminalContextResume,
 };
 pub use instance::{
     is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,

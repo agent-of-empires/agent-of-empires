@@ -42,6 +42,9 @@ Add a `session_name_flag` arm only from documented argv: it names the agent's ow
 
 **4. Hooks**: for non-Claude formats add an installer in `src/hooks/mod.rs` (see `install_hermes_hooks_with_events`), wire it into `SidecarHooks::install`, and add the agent to `status_hook_env_prefix()` so `AOE_INSTANCE_ID` and `AOE_PROFILE` reach the hook. Without the instance id, hooks write nothing. Use `HookStatus` rather than raw strings, and keep installers pure file IO: any subprocess work belongs in a separate function so `cargo test` cannot mutate a developer's real environment.
 
+For a sidecar whose host config directory comes from an environment variable, declare `SidecarHooks::host_config_dir_override` so installation, target discovery, and uninstall resolve the same path.
+For launch-scoped roots, persist the resolved host configuration directory in `ExecutionBinding.configuration` and reuse it for hook installation and uninstall target discovery; never re-resolve it relative to home.
+
 **5. Container mount**: add an `AgentConfigMount` (`tool_name`, `host_rel`, `container_suffix`, `skip_entries`) so the resolved config store is mounted where the containerized binary reads it, and install hooks and session-id sidecars into that mounted store. Declare a sandbox capture context only after this path is proven.
 
 **6. Dockerfile**: install the agent and add its config dir to the `mkdir -p` block.

@@ -1722,11 +1722,25 @@ impl HomeView {
                         && crate::agents::hook_install_required(hook_agent, hooks_enabled)
                         && !acknowledged
                     {
-                        self.hooks_install_dialog = Some(HooksInstallDialog::new(
+                        let dialog = match HooksInstallDialog::new_for_launch(
                             &tool_name,
                             hook_agent,
                             &resolved_config,
-                        ));
+                            std::path::Path::new(&data.path),
+                            &command,
+                            &data.extra_args,
+                        ) {
+                            Ok(dialog) => dialog,
+                            Err(error) => {
+                                if let Some(new_dialog) = &mut self.new_dialog {
+                                    new_dialog.set_error(format!(
+                                        "Cannot resolve agent hook path: {error}"
+                                    ));
+                                }
+                                return None;
+                            }
+                        };
+                        self.hooks_install_dialog = Some(dialog);
                         self.pending_hooks_install_data = Some(data);
                         return None;
                     }

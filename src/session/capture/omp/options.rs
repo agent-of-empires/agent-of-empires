@@ -87,6 +87,18 @@ impl OmpCliCaptureOptions {
         }
         Ok(parsed)
     }
+
+    /// Parses the same argv slice OMP receives from a native AoE launch.
+    pub(crate) fn parse_launch(command_override: &str, extra_args: &str) -> Result<Self> {
+        let args = if command_override.is_empty() {
+            crate::session::config::quote_model_value_in_args(extra_args)
+        } else if extra_args.is_empty() {
+            command_override.to_owned()
+        } else {
+            format!("{command_override} {extra_args}")
+        };
+        Self::parse(&args)
+    }
 }
 
 /// Rejects `--api-key`, which would persist in the pane's start command and argv.
@@ -271,6 +283,19 @@ mod tests {
             OmpCliCaptureOptions::parse("-- --profile ignored --no-session").unwrap(),
             OmpCliCaptureOptions::default()
         );
+        for (command, extra, expected_profile, expected_cwd) in [
+            ("", "--profile from-extra", Some("from-extra"), None),
+            (
+                "omp --profile from-command",
+                "--cwd ./project",
+                Some("from-command"),
+                Some(Path::new("./project")),
+            ),
+        ] {
+            let parsed = OmpCliCaptureOptions::parse_launch(command, extra).unwrap();
+            assert_eq!(parsed.profile.as_deref(), expected_profile);
+            assert_eq!(parsed.cwd.as_deref(), expected_cwd);
+        }
         assert_eq!(
             OmpCliCaptureOptions::parse("--system-prompt --profile work")
                 .unwrap()

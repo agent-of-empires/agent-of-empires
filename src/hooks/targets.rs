@@ -81,11 +81,12 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                             }
                         }
                     } else if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-                        let relative: PathBuf = Path::new(sidecar.host_config_subpath)
-                            .components()
-                            .skip(1)
-                            .collect();
-                        let path = root.join(relative);
+                        let path = super::sidecar_host_config_path_in(
+                            &home,
+                            sidecar,
+                            Some(&root),
+                            &config.environment,
+                        );
                         if !targets.iter().any(|target| {
                             matches!(target.kind, HookTargetKind::Sidecar(_)) && target.path == path
                         }) {
@@ -136,29 +137,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                                     .and_then(|binding| binding.execution.as_ref())
                             });
                     for binding in bindings.into_iter().flatten().chain(prior_bindings) {
-                        if binding.agent != "claude" || binding.filesystem != "host" {
-                            continue;
-                        }
-                        for root in &binding.stores {
-                            let path = root.join("settings.json");
-                            if targets.iter().any(|target| {
-                                matches!(target.kind, HookTargetKind::JsonSettings)
-                                    && target.path == path
-                            }) {
-                                continue;
-                            }
-                            targets.push(HookTarget {
-                                agent_name: "claude",
-                                kind: HookTargetKind::JsonSettings,
-                                path,
-                                events: crate::agents::resolved_hook_events(
-                                    crate::agents::get_agent("claude")
-                                        .expect("built-in Claude agent"),
-                                    &crate::session::config::Config::default(),
-                                )
-                                .unwrap_or_default(),
-                            });
-                        }
+                        append_execution_binding_targets(&mut targets, binding, &config, &home);
                     }
                 }
             }
@@ -168,6 +147,63 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
         }
     }
     targets
+}
+
+fn append_execution_binding_targets(
+    targets: &mut Vec<HookTarget>,
+    binding: &crate::session::ExecutionBinding,
+    config: &crate::session::config::Config,
+    home: &Path,
+) {
+    if binding.filesystem != "host" {
+        return;
+    }
+    if binding.agent == "claude" {
+        for root in &binding.stores {
+            let path = root.join("settings.json");
+            if !targets.iter().any(|target| {
+                matches!(target.kind, HookTargetKind::JsonSettings) && target.path == path
+            }) {
+                targets.push(HookTarget {
+                    agent_name: "claude",
+                    kind: HookTargetKind::JsonSettings,
+                    path,
+                    events: crate::agents::resolved_hook_events(
+                        crate::agents::get_agent("claude").expect("built-in Claude agent"),
+                        &crate::session::config::Config::default(),
+                    )
+                    .unwrap_or_default(),
+                });
+            }
+        }
+        return;
+    }
+
+    let Some(agent) = crate::agents::get_agent(&binding.agent) else {
+        return;
+    };
+    let Some(sidecar) = agent.sidecar_hooks.as_ref() else {
+        return;
+    };
+    for location in binding
+        .configuration
+        .iter()
+        .filter(|location| location.filesystem == "host")
+    {
+        let path = super::sidecar_host_config_path_in(home, sidecar, Some(&location.path), &[]);
+        if targets
+            .iter()
+            .any(|target| matches!(target.kind, HookTargetKind::Sidecar(_)) && target.path == path)
+        {
+            continue;
+        }
+        targets.push(HookTarget {
+            agent_name: agent.name,
+            kind: HookTargetKind::Sidecar(sidecar),
+            path,
+            events: crate::agents::resolved_sidecar_hook_events(agent, config).unwrap_or_default(),
+        });
+    }
 }
 
 pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Vec<HookTarget> {
@@ -202,13 +238,30 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
             }
         }
         if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-            out.push(HookTarget {
-                agent_name: agent.name,
-                kind: HookTargetKind::Sidecar(sidecar),
-                path: home.join(sidecar.host_config_subpath),
-                events: crate::agents::resolved_sidecar_hook_events(agent, &defaults)
-                    .unwrap_or_default(),
-            });
+            let mut paths = Vec::new();
+            for path in
+                std::iter::once(super::sidecar_host_config_path_in(home, sidecar, None, &[])).chain(
+                    env_lists
+                        .iter()
+                        .map(|env| super::sidecar_host_config_path_in(home, sidecar, None, env)),
+                )
+            {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            for path in paths {
+                if out.iter().any(|target| target.path == path) {
+                    continue;
+                }
+                out.push(HookTarget {
+                    agent_name: agent.name,
+                    kind: HookTargetKind::Sidecar(sidecar),
+                    path,
+                    events: crate::agents::resolved_sidecar_hook_events(agent, &defaults)
+                        .unwrap_or_default(),
+                });
+            }
         }
     }
     out
@@ -260,6 +313,7 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
             }
             SidecarFormat::HermesYaml => hermes_config_has_aoe_marker(&content),
             SidecarFormat::KiroJson => json_hook_entries(&content).any(|e| json_command_is_aoe(&e)),
+            SidecarFormat::OmpTypescript => super::is_omp_hook(&content),
         },
     }
 }
@@ -339,6 +393,53 @@ mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
     use tempfile::TempDir;
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn iter_hook_targets_includes_sidecar_environment_override() {
+        let _env = EnvGuard::unset(&["PI_CODING_AGENT_DIR"]);
+        let home = Path::new("/home/test");
+        let paths =
+            iter_hook_targets_in(home, &[vec!["PI_CODING_AGENT_DIR=/custom/omp".to_string()]]);
+        let omp_paths: Vec<_> = paths
+            .iter()
+            .filter(|target| target.agent_name == "omp")
+            .map(|target| target.path.as_path())
+            .collect();
+        assert!(omp_paths.contains(&home.join(".omp/agent/hooks/pre/aoe-status.ts").as_path()));
+        assert!(omp_paths.contains(&Path::new("/custom/omp/hooks/pre/aoe-status.ts")));
+    }
+
+    #[test]
+    fn persisted_omp_binding_adds_its_host_hook_target() {
+        let home = Path::new("/home/test");
+        let root = Path::new("/profile/omp/agent");
+        let binding = crate::session::ExecutionBinding {
+            agent: "omp".into(),
+            stores: Vec::new(),
+            configuration: vec![crate::session::ExecutionLocation {
+                filesystem: "host".into(),
+                path: root.to_path_buf(),
+            }],
+            cwd: Path::new("/project").to_path_buf(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        };
+        let mut targets = iter_hook_targets_in(home, &[]);
+        append_execution_binding_targets(
+            &mut targets,
+            &binding,
+            &crate::session::config::Config::default(),
+            home,
+        );
+
+        let path = root.join("hooks/pre/aoe-status.ts");
+        assert_eq!(
+            targets.iter().filter(|target| target.path == path).count(),
+            1
+        );
+    }
 
     #[test]
     #[serial_test::serial]

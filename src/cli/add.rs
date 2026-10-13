@@ -1550,6 +1550,13 @@ mod tests {
         async fn add_refuses_a_fork_child_under_another_agent() {
             let root = tempfile::tempdir().unwrap();
             let _guard = crate::session::test_support::isolate_app_dir_at(root.path());
+            struct ClearAgentAvailability;
+            impl Drop for ClearAgentAvailability {
+                fn drop(&mut self) {
+                    crate::tmux::invalidate_agent_availability();
+                }
+            }
+            let _clear_agent_availability = ClearAgentAvailability;
             // The CLI resolves the requested tool's binary before the fork parent
             // check, so both agents need a command on the path.
             let _claude = crate::session::test_support::install_login_shell_path_command(
@@ -1562,6 +1569,7 @@ mod tests {
                 "codex",
                 "#!/bin/sh\nexit 1\n",
             );
+            crate::tmux::invalidate_agent_availability();
             let project = tempfile::tempdir().unwrap();
             let parent_id = "parent-session-uuid";
             crate::session::Storage::new_unwatched("real")
