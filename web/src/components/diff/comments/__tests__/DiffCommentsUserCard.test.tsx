@@ -8,15 +8,18 @@ import type { DiffCommentsCardPayload } from "../../comments/buildPrompt";
 import type { DiffComment } from "../../comments/types";
 import { renderWithLateResolution } from "../../../../__tests__/lateResolution";
 
-// `deferred` hands the next call a manually-settled promise, for the
-// superseded-request ordering test; otherwise `loaded` picks between the
-// resolved-HTML branch and the plain <pre> fallback.
-const highlighter = vi.hoisted(() => ({ loaded: false, deferred: null as Promise<string | null> | null }));
+// The deferred branch exposes the actual request-start boundary.
+const highlighter = vi.hoisted(() => ({
+  loaded: false,
+  deferred: null as Promise<string | null> | null,
+  pendingStarted: null as (() => void) | null,
+}));
 vi.mock("../../../../lib/snippetHighlighter", () => ({
   highlightSnippet: (code: string) => {
     const pending = highlighter.deferred;
     if (pending) {
       highlighter.deferred = null;
+      highlighter.pendingStarted?.();
       return pending;
     }
     return Promise.resolve(highlighter.loaded ? `<pre class="shiki"><code>${code}</code></pre>` : null);
@@ -45,6 +48,7 @@ afterEach(() => {
   cleanup();
   highlighter.loaded = false;
   highlighter.deferred = null;
+  highlighter.pendingStarted = null;
 });
 
 describe("DiffCommentsUserCard", () => {
@@ -107,10 +111,10 @@ describe("DiffCommentsUserCard", () => {
   });
 
   it("ignores a late resolution from a superseded request (pending A -> committed B -> late A)", async () => {
-    let resolveA!: (v: string | null) => void;
-    highlighter.deferred = new Promise<string | null>((res) => {
-      resolveA = res;
-    });
+    const pending = Promise.withResolvers<string | null>();
+    const started = Promise.withResolvers<void>();
+    highlighter.deferred = pending.promise;
+    highlighter.pendingStarted = started.resolve;
     const card = (over: Partial<DiffComment>) => (
       <DiffCommentsUserCard
         payload={{ intro: "", outro: "", isMultiRepo: false, comments: [comment({ id: "c1", ...over })] }}
@@ -120,8 +124,8 @@ describe("DiffCommentsUserCard", () => {
     const { html, text } = await renderWithLateResolution({
       a: card({ capturedSnippet: "const a = 1;", language: "typescript" }),
       b: card({ capturedSnippet: "plain b body", language: undefined, filePath: "NOTES" }),
-      bText: "plain b body",
-      resolveStale: () => resolveA('<pre class="shiki">OLD_A</pre>'),
+      requestStarted: started.promise,
+      resolveStale: () => pending.resolve('<pre class="shiki">OLD_A</pre>'),
     });
 
     expect(text).toContain("plain b body");
