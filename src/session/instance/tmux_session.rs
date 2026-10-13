@@ -111,15 +111,6 @@ impl Instance {
         }
     }
 
-    /// Whether this instance has a live tmux pane, answered from a snapshot the caller already
-    /// holds.
-    pub(crate) fn has_live_tmux_pane_in(
-        &self,
-        snapshot: &crate::tmux::LiveSessionSnapshot,
-    ) -> bool {
-        self.tmux_env_session_name_in(snapshot).is_some()
-    }
-
     /// Whether the AGENT pane specifically is live. Poller repair gates on this.
     pub(crate) fn has_live_agent_pane_in(
         &self,

@@ -437,7 +437,7 @@ mod tests {
 
         run_in(&home, &app_dir).unwrap();
 
-        let yaml: Value = serde_saphyr::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+        let yaml: Value = crate::yaml::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(
             yaml["hooks"]["pre_tool_call"][0]["command"]
                 .as_str()

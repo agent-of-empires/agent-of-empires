@@ -63,15 +63,17 @@ pub async fn resolve_option_source(
     source: OptionSource,
     depends: &[String],
 ) -> anyhow::Result<Vec<SelectOption>> {
+    let _namespace = state.profile_namespace.read().await;
+    let served = state.served_profile().to_string();
     match source {
-        OptionSource::AcpAgents => Ok(acp_agent_options(&state.profile).await),
+        OptionSource::AcpAgents => Ok(acp_agent_options(&served).await),
         OptionSource::AcpModels => {
             // A profile that pins the selected agent's model collapses the
             // picker to that entry. Enforcement lives at creation, so this is
             // presentation only: the wizard must not offer choices the create
             // call will refuse.
             if let Some(agent) = depends.first().filter(|a| !a.is_empty()) {
-                if let Some(model) = pinned_model_for_agent(&state.profile, agent).await {
+                if let Some(model) = pinned_model_for_agent(&served, agent).await {
                     let label = catalog_options(Some(agent), CatalogCategory::Model)
                         .into_iter()
                         .find(|opt| opt.value == model)
@@ -85,7 +87,7 @@ pub async fn resolve_option_source(
         OptionSource::AcpModes => {
             Ok(catalog_options_probing(depends.first(), CatalogCategory::Mode).await)
         }
-        OptionSource::Projects => project_options(&state.profile).await,
+        OptionSource::Projects => Ok(project_options(&served).await?),
         OptionSource::Groups => Ok(group_options(state).await),
     }
 }

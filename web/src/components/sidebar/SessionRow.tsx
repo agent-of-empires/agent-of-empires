@@ -12,6 +12,8 @@ import {
   smartRenameSession,
   summarizeSession,
   updateSessionGroup,
+  type RuntimeCursor,
+  type SessionMutation,
 } from "../../lib/api";
 import { isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
@@ -41,6 +43,9 @@ type Modal = "snooze" | "workdir" | "addProject" | "group" | null;
 
 export interface SessionRowProps {
   workspace: Workspace;
+  observedById: Record<string, RuntimeCursor>;
+  runtimeEpoch: string | null;
+  onSessionMutation: (mutation: SessionMutation) => void;
   isActive: boolean;
   isSelected: boolean;
   onActivate: RowActivate;
@@ -69,17 +74,39 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const compact = useSidebarCompact();
   const derived = deriveRowModel(workspace, props.optimistic, { idleDecayWindowMs, isActive, unreadIndicatorEnabled });
   const { label, sessionId, isDeleting, navigationSession } = derived;
+  const settingIdentity = `${workspace.id}:${props.runtimeEpoch ?? ""}:${workspace.sessions
+    .map((session) => session.id)
+    .sort()
+    .join(",")}`;
   const [notifyPreset, setNotify] = usePendingSetting(
     derived.notifyPreset,
-    (preset) => (sessionId ? setSessionNotifications(sessionId, preset) : Promise.resolve(false)),
+    async (preset) => {
+      if (!sessionId) return null;
+      const mutation = await setSessionNotifications(sessionId, preset);
+      if (!mutation) return null;
+      props.onSessionMutation(mutation);
+      return [{ id: sessionId, cursor: mutation.cursor }];
+    },
     () => reportError("Could not change notifications. Please try again."),
+    props.observedById,
+    settingIdentity,
   );
   const [sessionColor, setColor] = usePendingSetting(
     derived.sessionColor,
-    // The row shows any session's color, so every session must change for the pick to stick.
-    async (color) =>
-      (await Promise.all(workspace.sessions.map((s) => setSessionColor(s.id, color)))).every((r) => r != null),
+    async (color) => {
+      const ids = workspace.sessions.map((session) => session.id);
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          const mutation = await setSessionColor(id, color);
+          if (mutation) props.onSessionMutation(mutation);
+          return mutation ? { id, cursor: mutation.cursor } : null;
+        }),
+      );
+      return results.every((receipt) => receipt !== null) ? results : null;
+    },
     () => reportError("Could not change the session color. Please try again."),
+    props.observedById,
+    settingIdentity,
   );
   const model: RowModel = {
     ...derived,
@@ -89,6 +116,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   };
 
   const [modal, setModal] = useState<Modal>(null);
+
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
@@ -111,6 +139,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     if (!trimmed || trimmed === model.sessionTitle || !sessionId) return;
     const result = await renameSession(sessionId, trimmed);
     if (result.ok) {
+      props.onSessionMutation(result);
       // The title persisted; a tmux rekey warning is informational.
       result.warnings?.forEach((warning) => reportInfo(warning));
     } else {
@@ -295,6 +324,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         modal={modal}
         setModal={setModal}
         model={model}
+        onSessionMutation={props.onSessionMutation}
         onSnooze={(minutes) => {
           closeMenu();
           setModal(null);
@@ -376,11 +406,13 @@ function RowModals({
   setModal,
   model,
   onSnooze,
+  onSessionMutation,
 }: {
   modal: Modal;
   setModal: (m: Modal) => void;
   model: RowModel;
   onSnooze: (minutes: number) => void;
+  onSessionMutation: SessionRowProps["onSessionMutation"];
 }) {
   const { label, sessionId } = model;
   const close = () => setModal(null);
@@ -407,7 +439,11 @@ function RowModals({
         onCancel={close}
         onSubmit={async (name, renameBranch) => {
           const res = await setWorktreeName(sessionId, name, renameBranch);
-          if (res.ok) close();
+          if (res.ok) {
+            onSessionMutation(res);
+            res.warnings?.forEach((warning) => reportInfo(warning));
+            close();
+          }
           return res;
         }}
       />,
@@ -418,9 +454,16 @@ function RowModals({
     return createPortal(
       <AddProjectModal
         title={label}
+        profile={model.firstSession?.profile || undefined}
         onCancel={close}
         onDone={close}
-        onSubmit={(project, attachExistingBranch) => attachSessionProject(sessionId, project, { attachExistingBranch })}
+        onSubmit={async (project, attachExistingBranch) => {
+          const result = await attachSessionProject(sessionId, project, { attachExistingBranch });
+          if (result.ok && result.session && result.cursor) {
+            onSessionMutation({ session: result.session, cursor: result.cursor });
+          }
+          return result;
+        }}
       />,
       document.body,
     );

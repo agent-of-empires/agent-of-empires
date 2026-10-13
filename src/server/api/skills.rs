@@ -1,6 +1,8 @@
 //! Skills management REST API.
 
-use axum::extract::{FromRequestParts, Path};
+use std::sync::Arc;
+
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -8,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{api_error, AppState};
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 use crate::session::skills_model::{self, SkillError, SkillProvenance};
 
 fn skill_error(error: SkillError) -> Response {
@@ -42,7 +44,7 @@ fn task_error(error: tokio::task::JoinError) -> Response {
 async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
-    loopback_trusted: bool,
+    local: Option<&LocalAuthorization>,
 ) -> Result<(), Response> {
     if state.read_only {
         return Err(super::read_only_response());
@@ -50,7 +52,7 @@ async fn mutation_gate(
     if let Some(response) = super::cityhall_block(state) {
         return Err(response);
     }
-    if !handler_elevated(state, session, loopback_trusted).await {
+    if !handler_elevated(state, session, local.is_some()).await {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "elevation_required",
@@ -72,8 +74,8 @@ impl FromRequestParts<std::sync::Arc<AppState>> for SkillMutationGuard {
         state: &std::sync::Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let session = parts.extensions.get::<AuthenticatedSession>();
-        let loopback_trusted = parts.extensions.get::<LoopbackTrusted>().is_some();
-        mutation_gate(state, session, loopback_trusted).await?;
+        let local = parts.extensions.get::<LocalAuthorization>();
+        mutation_gate(state, session, local).await?;
         Ok(Self)
     }
 }
@@ -90,7 +92,10 @@ fn source_provenance(source: &str) -> Result<SkillProvenance, String> {
 }
 
 /// `GET /api/skills`: discover skills across every supported host root.
-pub async fn list_skills() -> Response {
+pub async fn list_skills(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match tokio::task::spawn_blocking(skills_model::discover_all).await {
         Ok(Ok(skills)) => Json(json!({
             "skills": skills.into_iter().map(|skill| {
@@ -118,7 +123,13 @@ pub async fn list_skills() -> Response {
 }
 
 /// `GET /api/skills/{source}/{directory}`: read one source-qualified skill.
-pub async fn read_skill(Path((source, directory)): Path<(String, String)>) -> Response {
+pub async fn read_skill(
+    State(state): State<Arc<AppState>>,
+    Path((source, directory)): Path<(String, String)>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_skill_source", message),
@@ -243,16 +254,19 @@ pub struct SyncSkillsBody {
     roots: Vec<String>,
     /// Skills the caller has explicitly asked AoE to take over, overwriting a
     /// skill AoE does not manage or a propagated copy edited in place. Empty
-    /// (the default, and what every automatic sync uses) overwrites nothing.
+    /// means overwrite nothing, which is the default and what every automatic
+    /// sync uses.
     #[serde(default)]
     replace: Vec<String>,
-    /// When non-empty, reconcile only these skills, so sharing a single skill
-    /// is a single-skill operation rather than a filtered full sync.
+    /// When non-empty, reconcile only these skills. This is what makes sharing
+    /// a single skill a single-skill operation rather than a full sync whose
+    /// report is filtered afterwards.
     #[serde(default)]
     directories: Vec<String>,
 }
 
 /// `POST /api/skills/sync`: reconcile the managed store into agent skills dirs.
+///
 /// Returns one outcome per skill per root rather than failing on the first
 /// conflict: a destination AoE does not own is a normal result the user needs to
 /// see, not an error that should abandon the remaining roots.

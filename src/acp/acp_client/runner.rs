@@ -196,6 +196,21 @@ pub(super) async fn spawn_runner_detached(
             (None, None) => (config.spec.command.clone(), Vec::new()),
         };
 
+    let prefix = {
+        let id = session_id.clone();
+        let profile = config.source_profile.clone().unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            crate::process::systemd::scope_prefix_for(&id, &profile)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+    .filter(|_| !current_exe.to_string_lossy().contains('='));
+    let scope = prefix.as_ref().map_or(
+        crate::process::worker_registry::ScopeOwnership::Unscoped,
+        |prefix| prefix.ownership(),
+    );
     let mut cmd = tokio::process::Command::new(&current_exe);
     cmd.arg("__acp-runner")
         .arg("--socket")
@@ -233,6 +248,9 @@ pub(super) async fn spawn_runner_detached(
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
     cmd.arg("--generation").arg(config.generation.to_string());
+    if let crate::process::worker_registry::ScopeOwnership::Owned { unit } = &scope {
+        cmd.arg("--systemd-scope").arg(unit);
+    }
     cmd.arg("--");
     if let Some(s) = &sandbox_argv {
         cmd.arg(&s.docker_binary);
@@ -307,16 +325,6 @@ pub(super) async fn spawn_runner_detached(
 
     // Reads the runner env, so it runs before the scope wrapper adds its own.
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
-    let prefix = {
-        let id = session_id.clone();
-        let profile = config.source_profile.clone().unwrap_or_default();
-        tokio::task::spawn_blocking(move || {
-            crate::process::systemd::scope_prefix_for(&id, &profile)
-        })
-        .await
-        .ok()
-        .flatten()
-    };
     let mut cmd = match &prefix {
         Some(prefix) => wrap_in_scope(cmd, prefix),
         None => cmd,
@@ -356,22 +364,41 @@ pub(super) async fn spawn_runner_detached(
         "spawning detached structured view runner"
     );
 
-    let mut child = cmd.spawn().map_err(|e| {
-        warn!(
-            target: "acp.protocol.spawn",
-            session = %session_id,
-            "runner spawn failed: {e}"
-        );
-        AcpError::Spawn(format!("spawn runner: {e}"))
-    })?;
-    let pid = child
-        .id()
-        .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
-    // Reap it, so a finished runner does not linger as a zombie that still
-    // answers `kill(pid, 0)` and keeps a teardown from proving it gone.
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
+    let lease = config.launch_lease.clone();
+    let admission = lease.as_ref().and_then(|lease| lease.admission());
+    let generation = config.generation;
+    let pid = crate::acp::supervisor::with_durable_launch(admission, session_id, move || {
+        let mut birth = lease.as_ref().map(|lease| lease.lock_birth());
+        if lease
+            .as_ref()
+            .is_some_and(|lease| lease.cancellation().is_cancelled())
+        {
+            return Err(AcpError::Spawn(
+                "launch cancelled before physical spawn".into(),
+            ));
+        }
+        if let Some(scopes) = birth.as_mut() {
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|error| AcpError::Spawn(format!("spawn runner: {error}")))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
+        if let Some(lease) = &lease {
+            lease.record_runner(crate::acp::runner_lifecycle::RunnerIdentity { pid, generation });
+        }
+        // The producer owns reaping even if the blocking-result waiter is dropped.
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        Ok(pid)
+    })
+    .await
+    .map_err(|error| AcpError::Spawn(error.to_string()))?;
     Ok((pid, native_store))
 }
 

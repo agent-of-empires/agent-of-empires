@@ -28,6 +28,11 @@ const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// intentional remove or move.
 const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
 
+#[derive(Default)]
+pub(crate) struct WorktreeCreation {
+    pub branch_created: bool,
+    pub checkout_created: bool,
+}
 pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,

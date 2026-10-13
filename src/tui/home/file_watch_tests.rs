@@ -52,8 +52,9 @@ fn env_seeded(profile: &str, seed_dirs: &[&str], seed: impl FnOnce(&Arc<FileWatc
     for dir in seed_dirs {
         crate::session::get_profile_dir(dir).expect("seed dir");
     }
+    crate::session::get_profile_dir(profile).expect("fixture profile");
     seed(&live);
-    let view = HomeView::new_for_test(
+    let view = HomeView::new(
         Some(profile.to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -312,6 +313,51 @@ async fn reload_storage_only_ends_live_send_when_active_row_is_removed() {
         Some("Live send ended")
     );
     assert_eq!(view.selected_session.as_deref(), Some(peer_id.as_str()));
+}
+
+/// Metadata-only refresh still terminates a live target whose pane identity changed,
+/// without requiring the runtime liveness probe used by input/render reconciliation.
+#[tokio::test]
+#[serial]
+async fn reload_storage_only_ends_live_send_when_active_row_is_renamed() {
+    let active = Instance::new("active-live", "/tmp/active-live");
+    let active_id = active.id.clone();
+    let mut e = env_seeded("live-refresh", &[], |live| {
+        Storage::new("live-refresh", live.clone())
+            .expect("writer")
+            .update(|instances, _| {
+                instances.push(active);
+                Ok(())
+            })
+            .expect("seed active row");
+    });
+    let writer = Storage::new("live-refresh", e.live.clone()).expect("writer");
+    let view = &mut e.view;
+    view.cursor = session_row(view, &active_id).expect("active row in flat items");
+    view.update_selected();
+    let tmux_name = crate::tmux::Session::resolve_name(&active_id, "active-live");
+    view.live_send = Some(live_send_state(&active_id, "active-live", &tmux_name));
+    writer
+        .update(|instances, _| {
+            instances
+                .iter_mut()
+                .find(|row| row.id == active_id)
+                .unwrap()
+                .title = "peer-renamed".into();
+            Ok(())
+        })
+        .expect("rename active row");
+    view.reload_storage_only().expect("storage-only reload");
+    assert_eq!(view.get_instance(&active_id).unwrap().title, "peer-renamed");
+    assert!(
+        view.live_send.is_none(),
+        "renamed target must end live-send"
+    );
+    assert_eq!(
+        view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Live send ended")
+    );
+    assert_eq!(view.selected_session.as_deref(), Some(active_id.as_str()));
 }
 
 #[tokio::test]

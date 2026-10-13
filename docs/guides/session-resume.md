@@ -105,7 +105,7 @@ The child gets its own AoE ID and native conversation. The parent row and transc
 
 Forking needs an agent that can branch a conversation: claude, codex, opencode, and pi in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
 
-Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Forking into a new worktree is not supported for Pi.
+Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Stopping the child saves its launch-scoped transcript before clearing publication evidence; later starts resume that exact child rather than forking the parent again. Forking into a new worktree is not supported for Pi.
 
 ## Swapping the engine on a restart
 
@@ -137,7 +137,7 @@ The list hides conversations not worth importing: ones AoE already owns, scratch
 
 ### Claude
 
-Claude conversations come from the Claude Code store on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`). The tab reads `CLAUDE_CONFIG_DIR` from AoE's own process environment and consults neither `agent_config_dir` nor a recorded store, so a conversation held in the store the entry points at is not listed.
+Claude conversations come from the Claude Code store on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`). The tab reads `CLAUDE_CONFIG_DIR` from AoE's own process environment and consults neither `agent_config_dir` nor a recorded store, so a conversation held in the store the entry points at is not listed. Imports bind the selected store for both terminal and structured resumes; later profile routing and hook output do not replace it.
 
 ### Other agents
 

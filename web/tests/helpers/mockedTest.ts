@@ -22,9 +22,11 @@ export const test = base.extend({
       const state = window as typeof window & {
         __mockedRequests: Array<{ path: string; method: string }>;
         __mockedBodies: string[];
+        __mockedFailures: string[];
       };
       state.__mockedRequests = [];
       state.__mockedBodies = [];
+      state.__mockedFailures = [];
       const originalFetch = window.fetch;
       window.fetch = async (...args) => {
         const [input, init] = args;
@@ -35,6 +37,7 @@ export const test = base.extend({
           method: init?.method ?? (input instanceof Request ? input.method : "GET"),
         });
         const response = await originalFetch(...args);
+        if (!response.ok) setTimeout(() => state.__mockedFailures.push(path), 0);
         const json = response.json.bind(response);
         response.json = async () => {
           const body = await json();

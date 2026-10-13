@@ -17,16 +17,19 @@ pub(crate) mod ip_discovery;
 pub mod live_ws;
 pub mod login;
 mod pane;
+pub(crate) mod peer;
 pub mod plugin_status;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
 pub(crate) mod reload;
 pub(crate) mod router;
+pub(crate) mod runtime;
 pub(crate) mod serve_snapshot;
 pub(crate) mod session_identity;
 pub(crate) mod session_service;
 pub(crate) mod session_spawn;
+pub(crate) mod session_store;
 pub(crate) mod sleep_inhibit;
 pub(crate) mod startup;
 pub(crate) mod startup_recovery;
@@ -64,7 +67,7 @@ pub(crate) use sleep_inhibit::{
     SLEEP_INHIBIT_SNAPSHOT_ENABLED, SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT,
 };
 pub(crate) use startup::resolve_auth_mode;
-pub use startup::{start_server, ServerConfig};
+pub(crate) use startup::{start_server, ServerConfig};
 pub use state::{AppState, CleanupDefaultsCache};
 pub(crate) use token::generate_token;
 pub use token::TokenManager;

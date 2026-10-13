@@ -51,7 +51,7 @@ export interface WizardData {
   structuredViewDirty: boolean;
   agentModel: string;
   agentEffort: string;
-  /** Existing Claude session id to import and resume. */
+  /** Existing native ACP session id to import and resume. */
   importAcpSessionId: string;
   [key: string]: unknown;
 }
@@ -136,7 +136,7 @@ const PROFILE_FIELDS = ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "ex
 
 function setField(data: WizardData, field: string, value: unknown): WizardData {
   const next = { ...data, [field]: value };
-  if (field === "title" && !data.worktreeBranchDirty) {
+  if (field === "title" && !data.worktreeBranchDirty && !data.importAcpSessionId) {
     next.worktreeBranch = slugifyBranch(String(value));
   }
   // Any branch edit, even clearing it, stops the title mirror.
@@ -163,6 +163,22 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
     // The import picker dispatches `importAcpSessionId` after `path`, so its own pick survives.
     next.importAcpSessionId = "";
   }
+  if (field === "importAcpSessionId" && value) {
+    Object.assign(next, {
+      scratch: false,
+      useWorktree: false,
+      sandboxEnabled: false,
+      attachExisting: false,
+      extraRepoPaths: [],
+      repoBases: {},
+      worktreeBranch: "",
+      baseBranch: "",
+      projectWorktreeOverride: undefined,
+      projectSandboxOverride: undefined,
+      worktreeDirty: false,
+      sandboxDirty: false,
+    });
+  }
   if (field === "path") next.pathIsGitRepo = true;
   if (field === "pathIsGitRepo" && value === false) next.useWorktree = false;
   if (PROFILE_FIELDS.includes(field)) next.profileDirty = true;
@@ -188,6 +204,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
     case "SET_FIELD":
       return { ...state, data: setField(state.data, action.field, action.value), error: null };
     case "SEED_PROJECT_OVERRIDES": {
+      if (state.data.importAcpSessionId || state.data.scratch) return state;
       // A manual toggle wins; still record the override for a later profile reset.
       // Same path identity as the registry lookup: `/repo/` and `/repo` are one project.
       if (
@@ -231,10 +248,13 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // A remembered or prefilled path can resolve its repo probe before this arrives, so the
       // seeded default must not flip a worktree back on for a scratch session or a non-repo path.
       const resolvedUseWorktree = () =>
-        state.data.scratch || state.data.pathIsGitRepo === false
+        state.data.importAcpSessionId || state.data.scratch || state.data.pathIsGitRepo === false
           ? false
           : (state.data.projectWorktreeOverride ?? action.worktreeEnabled);
       const useStructuredView = seededStructuredView(state.data, action);
+      const resolvedSandbox = state.data.importAcpSessionId
+        ? false
+        : (state.data.projectSandboxOverride ?? action.sandboxEnabled);
       if (action.skipIfDirty && state.data.profileDirty) {
         // Still record the real default, or a later project with no override falls back to `false`.
         // The view is not a profile-tracked field, so it seeds past other edits.
@@ -246,9 +266,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
             profileWorktreeDefault: action.worktreeEnabled,
             profileSandboxDefault: action.sandboxEnabled,
             useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
-            sandboxEnabled: state.data.sandboxDirty
-              ? state.data.sandboxEnabled
-              : (state.data.projectSandboxOverride ?? state.data.sandboxEnabled),
+            sandboxEnabled: state.data.sandboxDirty ? state.data.sandboxEnabled : resolvedSandbox,
           },
         };
       }
@@ -257,7 +275,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
         data: {
           ...state.data,
           yoloMode: action.yoloMode,
-          sandboxEnabled: state.data.projectSandboxOverride ?? action.sandboxEnabled,
+          sandboxEnabled: resolvedSandbox,
           profileSandboxDefault: action.sandboxEnabled,
           useWorktree: resolvedUseWorktree(),
           profileWorktreeDefault: action.worktreeEnabled,

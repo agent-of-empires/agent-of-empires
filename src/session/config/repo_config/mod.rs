@@ -85,10 +85,29 @@ fn resolved_repo_config_path(project_path: &Path) -> Option<PathBuf> {
 /// Loads `.agent-of-empires/config.toml`, falling back to the legacy
 /// `.aoe/config.toml`. `None` when absent, empty, or for the empty (scratch) path.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
-    let Some(config_path) = resolved_repo_config_path(project_path) else {
+    // An empty path would resolve relative to the launch directory.
+    if project_path.as_os_str().is_empty() {
         return Ok(None);
+    }
+    let config_path = project_path.join(REPO_CONFIG_PATH);
+    let (config_path, is_legacy) = match fs::symlink_metadata(&config_path) {
+        Ok(_) => (config_path, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let legacy_path = project_path.join(LEGACY_REPO_CONFIG_PATH);
+            match fs::symlink_metadata(&legacy_path) {
+                Ok(_) => (legacy_path, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to inspect {}", legacy_path.display()))
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect {}", config_path.display()))
+        }
     };
-    let is_legacy = config_path.ends_with(LEGACY_REPO_CONFIG_PATH);
 
     if resolves_to_global_config(&config_path) {
         tracing::debug!(target: "session.store",
@@ -179,6 +198,27 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
 
 pub fn merge_repo_config(config: Config, repo: &RepoConfig) -> Config {
     profile_config::merge_configs_generic(&config, &repo.allowed_overrides())
+}
+
+pub(crate) fn resolve_sandbox_config_with_repo(
+    base: &super::SandboxConfig,
+    project: &Path,
+) -> Result<Option<super::SandboxConfig>> {
+    let Some(repo) = load_repo_config(&repo_config_source_path(project))? else {
+        return Ok(None);
+    };
+    let overrides = repo.allowed_overrides();
+    let Some(sandbox) = overrides
+        .get("sandbox")
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+    else {
+        return Ok(None);
+    };
+    let mut merged = serde_json::to_value(base)?;
+    super::settings_schema::merge_json(&mut merged, sandbox);
+    serde_json::from_value(merged)
+        .map(Some)
+        .context("Invalid repository sandbox configuration")
 }
 
 /// Keeps only what a repo may set and returns the dropped dotted paths, sorted.

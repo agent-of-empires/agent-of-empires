@@ -14,7 +14,9 @@ use {std::fs, tracing::info};
 
 pub fn run() -> Result<()> {
     if cfg!(debug_assertions) {
-        debug!("Skipping v001 XDG migration in debug build (dev namespace is isolated from release data)");
+        debug!(
+            "Skipping v001 XDG migration in debug build (dev namespace is isolated from release data)"
+        );
         return Ok(());
     }
 

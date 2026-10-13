@@ -428,25 +428,31 @@ fn yolo_toggles_on_its_own_row_independently_of_the_sandbox() {
 }
 
 #[test]
+#[serial_test::serial]
 fn the_sandbox_image_always_submits_whatever_the_field_holds() {
-    let default_image = crate::containers::get_container_runtime().effective_default_image();
-    // (sandbox on?, image field, submitted image)
-    let cases: &[(bool, Option<&str>, &str)] = &[
-        (true, Some("custom/image:tag"), "custom/image:tag"),
-        (true, None, &default_image),
-        (true, Some(""), ""),
-        (false, Some("custom/image:tag"), "custom/image:tag"),
-    ];
-    for (sandbox, image, want) in cases {
-        let mut dialog = sandboxed_dialog();
-        dialog.sandbox_enabled = *sandbox;
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let project = temp_home.path().join("project");
+    fs::create_dir(&project).expect("project directory");
+    for (sandbox, image, want) in [
+        (true, "custom/image:tag", "custom/image:tag"),
+        (true, "  custom/image:tag  ", "custom/image:tag"),
+        (true, "", ""),
+        (false, "custom/image:tag", "custom/image:tag"),
+    ] {
+        let mut dialog = NewSessionDialog::new_with_config(
+            vec!["claude"],
+            project.display().to_string(),
+            Config::default(),
+        );
+        dialog.docker_available = true;
+        dialog.sandbox_enabled = sandbox;
         dialog.sandbox_dirty = true;
-        if let Some(image) = image {
-            dialog.sandbox_image = Input::new(image.to_string());
-        }
+        dialog.sandbox_image = Input::new(image.to_string());
         let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
-        assert_eq!(data.sandbox, *sandbox);
-        assert_eq!(data.sandbox_image, *want);
+        assert_eq!(data.path, project.display().to_string());
+        assert_eq!(data.sandbox, sandbox);
+        assert_eq!(data.sandbox_image, want);
     }
 }
 

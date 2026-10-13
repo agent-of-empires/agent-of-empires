@@ -82,6 +82,8 @@ pub(super) struct ConnectionParams {
     pub(super) default_model: Option<String>,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) runner: Option<RunnerLink>,
+    pub(super) cancellation: tokio_util::sync::CancellationToken,
+    pub(super) shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Handlers compute an answer without knowing whether the request arrived over
@@ -148,6 +150,8 @@ pub(super) async fn run_connection_task<W, R>(
         default_model,
         mcp_servers,
         runner,
+        cancellation,
+        shutdown,
     } = params;
     let label = resources.label.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
@@ -366,9 +370,16 @@ pub(super) async fn run_connection_task<W, R>(
             transport,
             move |connection: ConnectionTo<Agent>| async move {
                 tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => Ok(()),
                     error = ingress.failed() => Err(error),
                     result = async move {
-                        match establish::establish(connection, establish_ctx).await? {
+                        let session = tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => Ok(None),
+                            established = establish::establish(connection, establish_ctx) => established,
+                        }?;
+                        match session {
                             Some(session) => session.run().await,
                             None => Ok(()),
                         }

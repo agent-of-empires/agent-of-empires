@@ -28,20 +28,22 @@ vi.mock("../../../lib/api", () => ({
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: vi.fn().mockResolvedValue(true),
   fetchGroups: vi.fn().mockResolvedValue([]),
-  fetchDockerStatus: (...args: unknown[]) => fetchDockerStatus(...args),
   fetchProfiles: (...args: unknown[]) => fetchProfiles(...args),
   fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue({ acknowledged: true, globs: [] }),
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),
   fetchSessions: vi.fn().mockResolvedValue({ sessions: [] }),
-  fetchRecentProjects: (...args: unknown[]) => fetchRecentProjects(...args),
-  fetchProjects: (...args: unknown[]) => fetchProjects(...args),
-  fetchProjectRegistry: (...args: unknown[]) => fetchProjects(...args),
   getHomePath: vi.fn().mockResolvedValue(null),
+  browseFilesystem: vi.fn().mockResolvedValue({ entries: [], has_more: false, ok: false }),
+  cloneRepo: vi.fn(),
+  listImportableSessions: vi.fn().mockResolvedValue({ ok: true, sessions: [], truncated: false }),
+  fetchProjects: (...args: unknown[]) => fetchProjects(...args),
   createSession: (...args: unknown[]) => createSession(...args),
+  fetchDockerStatus: (...args: unknown[]) => fetchDockerStatus(...args),
+  fetchRecentProjects: (...args: unknown[]) => fetchRecentProjects(...args),
 }));
 
 function renderWizard(prefill?: WizardPrefill) {
-  return render(<SessionWizard onClose={() => {}} onCreated={() => {}} prefill={prefill} />);
+  return render(<SessionWizard servedProfile="default" onClose={() => {}} onCreated={() => {}} prefill={prefill} />);
 }
 
 afterEach(() => {
@@ -288,7 +290,7 @@ describe("project sandbox override on the remembered last-used path", () => {
       { name: "b", is_default: false },
     ]);
     // The same project is registered per profile: off for the served profile "a", on for "b".
-    fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+    fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
       Promise.resolve([
         {
           name: "alpha",
@@ -300,11 +302,11 @@ describe("project sandbox override on the remembered last-used path", () => {
       ]),
     );
     const { getByText, getByRole, findByText } = renderWizard();
-    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
 
     fireEvent.click(await findByText("Profile"));
     fireEvent.click(getByRole("radio", { name: /b/ }));
-    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, "b"));
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "b" }));
     await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("b"));
     await clickLaunch(getByText);
 
@@ -337,11 +339,11 @@ describe("project sandbox override on the remembered last-used path", () => {
 
     it("holds Launch until the picked profile's overrides have landed", async () => {
       const b = deferred();
-      fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
         profile === "b" ? b.promise : Promise.resolve(registry(false)),
       );
       const { getByText, findByText } = renderWizard();
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
       const launchButton = () => getByText(/Launch session/).closest("button") as HTMLButtonElement;
       await waitFor(() => expect(launchButton().disabled).toBe(false));
 
@@ -354,19 +356,46 @@ describe("project sandbox override on the remembered last-used path", () => {
       expect(createSession.mock.calls[0][0]).toMatchObject({ profile: "b", sandbox: true });
     });
 
+    it.each([
+      ["Run in a safe container", "sandbox"],
+      ["Create a worktree", "worktree_enabled"],
+    ])("keeps a manual %s choice made while the profile's defaults are pending", async (label, field) => {
+      const b = deferred();
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
+        profile === "b" ? b.promise : Promise.resolve([]),
+      );
+      fetchSettings.mockImplementation((profile: string) =>
+        Promise.resolve({
+          worktree: { enabled: profile === "b" },
+          sandbox: { enabled_by_default: profile === "b" },
+        }),
+      );
+      const { getByText, findByText } = renderWizard();
+      await waitFor(() => expect(getByText(/Launch session/).closest("button")!.disabled).toBe(false));
+      await pickProfile(findByText, /^b/);
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "b" }));
+      // Returning to the old value is still a deliberate edit, not permission to seed it later.
+      fireEvent.click(screen.getByRole("switch", { name: label }));
+      fireEvent.click(screen.getByRole("switch", { name: label }));
+      await act(async () => b.resolve([]));
+      await clickLaunch(getByText);
+      await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+      expect(createSession.mock.calls[0][0]).toMatchObject({ profile: "b", [field]: false });
+    });
+
     it("ignores the response of a profile that was superseded before it answered", async () => {
       const b = deferred();
       const c = deferred();
-      fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
         profile === "b" ? b.promise : profile === "c" ? c.promise : Promise.resolve(registry(false)),
       );
       const { getByText, findByText } = renderWizard();
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
 
       await pickProfile(findByText, /^b/);
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, "b"));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "b" }));
       await pickProfile(findByText, /^c/);
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, "c"));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "c" }));
       await act(async () => c.resolve(registry(true)));
       await act(async () => b.resolve(registry(false)));
       await clickLaunch(getByText);
@@ -377,11 +406,11 @@ describe("project sandbox override on the remembered last-used path", () => {
 
     it("ignores the mount-time registry response once a profile was picked", async () => {
       const initial = deferred();
-      fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
         profile === "b" ? Promise.resolve(registry(true)) : initial.promise,
       );
       const { getByText, findByText } = renderWizard();
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
 
       await pickProfile(findByText, /^b/);
       await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("b"));
@@ -395,14 +424,14 @@ describe("project sandbox override on the remembered last-used path", () => {
     it("keeps the previous profile whole when the new profile's project request fails", async () => {
       // Off for the served profile, and the failed profile would sandbox by default: a mix of the two
       // (profile b with a's off override) must never be submitted.
-      fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
         Promise.resolve(profile === "b" ? null : registry(false)),
       );
       fetchSettings.mockImplementation((profile?: string) =>
         Promise.resolve({ sandbox: { enabled_by_default: profile === "b" } }),
       );
       const { getByText, findByText } = renderWizard();
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
 
       await pickProfile(findByText, /^b/);
       await findByText(/Could not load project settings for profile b/);
@@ -446,7 +475,7 @@ describe("project sandbox override on the remembered last-used path", () => {
       let failServedProfile = false;
       beforeEach(() => {
         failServedProfile = false;
-        fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+        fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
           Promise.resolve(profile === "b" ? registry(true) : failServedProfile ? null : registry(false)),
         );
       });
@@ -458,13 +487,13 @@ describe("project sandbox override on the remembered last-used path", () => {
 
       it("re-reads the served profile's overrides", async () => {
         const { getByText, findByText } = renderWizard();
-        await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+        await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
         await pickProfile(findByText, /^b/);
         await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("b"));
         fetchProjects.mockClear();
 
         await pickServerDefault(findByText);
-        await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+        await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
         await clickLaunch(getByText);
 
         await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
@@ -475,7 +504,7 @@ describe("project sandbox override on the remembered last-used path", () => {
 
       it("names the default profile when its project request fails", async () => {
         const { findByText } = renderWizard();
-        await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+        await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
         await pickProfile(findByText, /^b/);
         await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("b"));
         failServedProfile = true;
@@ -486,14 +515,14 @@ describe("project sandbox override on the remembered last-used path", () => {
     });
 
     it("keeps just the profile name and its project override when the profile's settings fail to load", async () => {
-      fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
         Promise.resolve(registry(profile === "b")),
       );
       fetchSettings.mockImplementation((profile?: string) =>
         profile === "b" ? Promise.reject(new Error("settings down")) : Promise.resolve({}),
       );
       const { getByText, findByText } = renderWizard();
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
 
       await pickProfile(findByText, /^b/);
       await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("b"));
@@ -516,11 +545,11 @@ describe("project sandbox override on the remembered last-used path", () => {
 
     it("still applies the mount-time registry response after a switch to another profile failed", async () => {
       const initial = deferred();
-      fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
         profile === "b" ? Promise.resolve(null) : initial.promise,
       );
       const { getByText, findByText } = renderWizard();
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
 
       await pickProfile(findByText, /^b/);
       await findByText(/Could not load project settings for profile b/);
@@ -544,14 +573,14 @@ describe("project sandbox override on the remembered last-used path", () => {
           overrides: { sandbox_enabled: sandbox },
         }));
       // alpha is remembered; beta is picked while b is still loading. Off in the served profile, on in b.
-      fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
         profile === "b" ? b.promise : Promise.resolve(both(false)),
       );
       const { getByText, findByText } = renderWizard();
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
 
       await pickProfile(findByText, /^b/);
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, "b"));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "b" }));
       fireEvent.click(await findByText("Project"));
       fireEvent.click((await findByText("/repo/beta")).closest("button")!);
       await act(async () => b.resolve(both(true)));
@@ -563,17 +592,17 @@ describe("project sandbox override on the remembered last-used path", () => {
 
     it("rolls back to the last committed profile when a switch fails while an earlier one is still pending", async () => {
       const b = deferred();
-      fetchProjects.mockImplementation((_scope?: string, profile?: string) =>
+      fetchProjects.mockImplementation(({ profile }: { profile: string }) =>
         profile === "b" ? b.promise : Promise.resolve(profile === "c" ? null : registry(false)),
       );
       fetchSettings.mockImplementation((profile?: string) =>
         Promise.resolve({ sandbox: { enabled_by_default: profile === "b" } }),
       );
       const { getByText, findByText } = renderWizard();
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, undefined));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" }));
 
       await pickProfile(findByText, /^b/);
-      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith(undefined, "b"));
+      await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "b" }));
       await pickProfile(findByText, /^c/);
       await findByText(/Could not load project settings for profile c/);
       // b answers late, after c already failed: it must not become the profile either.

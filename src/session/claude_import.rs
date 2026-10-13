@@ -99,12 +99,27 @@ impl From<ClaudeSessionSummary> for crate::session::import::ImportableSession {
             .then(|| chrono::DateTime::from_timestamp_millis(s.last_modified_ms as i64))
             .flatten()
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let binding = crate::session::ConversationBinding {
+            session_id: s.session_id.clone(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![s.config_dir],
+                configuration: Vec::new(),
+                cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
+                filesystem: "host".into(),
+                cwd_filesystem: "host".into(),
+                exported_default_store: Some(true),
+            }),
+            provenance: crate::session::ConversationProvenance::Imported,
+            transcript_path: None,
+        };
         Self {
             session_id: s.session_id,
             cwd: s.cwd,
             title: s.title,
             updated_at,
             cwd_exists: s.cwd_exists,
+            conversation_binding: Some(binding),
         }
     }
 }
@@ -292,6 +307,38 @@ mod tests {
             last_modified_ms: 0,
             cwd_exists: true,
         }
+    }
+
+    #[test]
+    fn picker_keeps_the_import_store_identity_off_the_wire() {
+        let source = summary("same-opaque-id", "/original/cwd");
+        let store = source.config_dir.clone();
+        let listed: crate::session::import::ImportableSession = source.into();
+        let binding = listed.conversation_binding.as_ref().unwrap();
+        assert_eq!(binding.session_id, listed.session_id);
+        assert_eq!(
+            binding.provenance,
+            crate::session::ConversationProvenance::Imported
+        );
+        let execution = binding.execution.as_ref().unwrap();
+        assert_eq!(execution.stores, vec![store.clone()]);
+        assert_eq!(execution.agent, "claude");
+        assert_eq!(
+            execution.cwd,
+            crate::session::capture::canonicalize_or_raw(&listed.cwd)
+        );
+        let wire = serde_json::to_value(&listed).unwrap();
+        assert!(wire.get("conversation_binding").is_none());
+        assert!(wire.get("config_dir").is_none());
+        let mut instance = crate::session::Instance::new("import", &listed.cwd);
+        instance.set_agent_conversation(
+            Some(listed.session_id.clone()),
+            Some(binding.clone()),
+            None,
+        );
+        let pin = instance.selected_claude_store_pin().unwrap();
+        assert_eq!(pin.store, store);
+        assert_eq!(pin.exported_default_store, Some(true));
     }
 
     #[test]

@@ -21,6 +21,7 @@ use crate::session::Instance;
 #[derive(Clone)]
 pub(super) struct ResumeTarget {
     pub(super) id: String,
+    lifecycle_generation: u64,
     tool: String,
     agent_override: Option<String>,
     pub(super) project_path: String,
@@ -36,6 +37,7 @@ impl ResumeTarget {
     pub(super) fn from_instance(inst: &Instance) -> Self {
         Self {
             id: inst.id.clone(),
+            lifecycle_generation: inst.lifecycle_generation,
             tool: inst.tool.clone(),
             agent_override: inst.agent_name.clone(),
             project_path: inst.project_path.clone(),
@@ -154,9 +156,14 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         Ok(r) => r,
         Err(outcome) => return outcome,
     };
+    reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
     // The snapshot may predate an archive, snooze, trash or stop.
     if resume_target_for_session(&state.session_service, &id)
         .await
+        .filter(|fresh| {
+            fresh.lifecycle_generation == target.lifecycle_generation
+                && fresh.source_profile == target.source_profile
+        })
         .is_none()
     {
         tracing::debug!(target: "acp.supervisor", session = %id, "session left the resume set after the snapshot; not resuming");
@@ -311,8 +318,12 @@ async fn build_spawn_request(
     service: &Arc<SessionService>,
     target: &ResumeTarget,
 ) -> Result<SpawnRequest, ()> {
+    let state = service.native_state().map_err(|_| ())?;
+    let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &target.id, false)
+        .await
+        .map_err(|_| ())?;
     let supervisor = &service.acp_supervisor;
-    let inst_lock = service.instance_lock(&target.id).await;
+
     // Re-read under the session lock, for two reasons. A worktree rename holds
     // it across the move, so a snapshotted path could be stale (#2260); and the
     // persisted selectors can be re-picked after the tick snapshotted
@@ -327,12 +338,18 @@ async fn build_spawn_request(
         agent_model,
         agent_provider,
         claude_store_pin,
+        instance,
     ) = {
-        let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
             return Err(());
         };
+        if !inst.launch_is_finalized()
+            || inst.lifecycle_generation != target.lifecycle_generation
+            || inst.source_profile != target.source_profile
+        {
+            return Err(());
+        }
         (
             PathBuf::from(&inst.project_path),
             inst.import_pending == Some(true),
@@ -342,6 +359,7 @@ async fn build_spawn_request(
             inst.agent_model.clone(),
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
+            inst.clone(),
         )
     };
     let agent = supervisor
@@ -352,12 +370,17 @@ async fn build_spawn_request(
             &cwd,
         )
         .await;
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
-        &service.instances,
-        &service.mutation_epoch,
-        &inst_lock,
-        &target.id,
-        false,
+    let (native, exclusion) = crate::server::session_store::NativeSessionStore::open_for_launch(
+        state.clone(),
+        &instance,
+        exclusion,
+    )
+    .await
+    .map_err(|_| ())?;
+    let (sandbox_info, _exclusion) = match crate::acp::sandbox::ensure_container_for_session(
+        native.clone(),
+        instance,
+        exclusion,
     )
     .await
     {
@@ -371,6 +394,12 @@ async fn build_spawn_request(
     };
 
     Ok(SpawnRequest {
+        launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
+            store: native,
+            generation: target.lifecycle_generation,
+            namespace: Some(state.profile_namespace.clone()),
+        }),
+        expected_lifecycle_generation: target.lifecycle_generation,
         session_id: target.id.clone(),
         agent,
         tool: target.tool.clone(),
@@ -521,14 +550,22 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn build_spawn_request_reads_live_session_fields() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut moved = Instance::new("renamed", "/tmp/aoe-2260-after-rename");
         moved.id = "sess-moved".to_string();
+        moved.source_profile = "default".into();
         moved.view = crate::session::View::Structured;
         moved.acp_effort = Some("high".to_string());
         let mut unpinned = Instance::new("unpinned", "/tmp/aoe-effort-respawn");
         unpinned.id = "sess-unpinned".to_string();
+        unpinned.source_profile = "default".into();
         unpinned.view = crate::session::View::Structured;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![moved.clone(), unpinned.clone()],
+        );
         let state = crate::server::test_support::build_test_app_state(vec![
             moved.clone(),
             unpinned.clone(),

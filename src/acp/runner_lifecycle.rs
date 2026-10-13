@@ -1,7 +1,10 @@
 //! Per-session ownership of a structured-view runner.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// Exact identity of a runner process: its pid plus the generation stamped
 /// into its registry record at spawn. Generation 0 (older records) matches on pid alone.
@@ -27,12 +30,35 @@ pub enum ResumeKind {
 }
 
 /// Authority token for one epoch of one session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Lease {
     session_id: String,
     epoch: u64,
+    construction: Arc<Construction>,
 }
 
+#[derive(Default)]
+struct Construction {
+    cancellation: CancellationToken,
+    runner_pid: AtomicU32,
+    runner_generation: AtomicU64,
+    scopes: Mutex<Vec<crate::process::worker_registry::ScopeOwnership>>,
+    admission: Mutex<Option<crate::acp::supervisor::LaunchAdmission>>,
+}
+
+impl std::fmt::Debug for Construction {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("Construction").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Lease {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id && self.epoch == other.epoch
+    }
+}
+
+impl Eq for Lease {}
 impl Lease {
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -40,6 +66,73 @@ impl Lease {
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.construction.cancellation
+    }
+
+    pub(crate) fn set_admission(&self, admission: Option<crate::acp::supervisor::LaunchAdmission>) {
+        *self
+            .construction
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = admission;
+    }
+
+    pub(crate) fn admission(&self) -> Option<crate::acp::supervisor::LaunchAdmission> {
+        self.construction
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record_scope(&self, scope: crate::process::worker_registry::ScopeOwnership) {
+        let mut scopes = self
+            .construction
+            .scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+
+    pub(crate) fn scopes(&self) -> Vec<crate::process::worker_registry::ScopeOwnership> {
+        self.construction
+            .scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn lock_birth(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Vec<crate::process::worker_registry::ScopeOwnership>> {
+        self.construction
+            .scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// The producer records the exact detached child before its first post-spawn await.
+    pub(crate) fn record_runner(&self, identity: RunnerIdentity) {
+        self.construction
+            .runner_generation
+            .store(identity.generation, Ordering::Relaxed);
+        self.construction
+            .runner_pid
+            .store(identity.pid, Ordering::Release);
+    }
+
+    pub(crate) fn spawned_runner(&self) -> Option<RunnerIdentity> {
+        let _birth = self.lock_birth();
+        let pid = self.construction.runner_pid.load(Ordering::Acquire);
+        (pid != 0).then_some(RunnerIdentity {
+            pid,
+            generation: self.construction.runner_generation.load(Ordering::Relaxed),
+        })
     }
 }
 
@@ -72,7 +165,7 @@ enum Phase {
         since: Instant,
     },
     TeardownRetry {
-        identity: RunnerIdentity,
+        identity: Option<RunnerIdentity>,
         attempts: u32,
     },
 }
@@ -81,6 +174,8 @@ enum Phase {
 struct Entry {
     epoch: u64,
     phase: Phase,
+    delete_adapter_state: bool,
+    construction: Arc<Construction>,
     /// An explicit stop, or a failed first launch, owes a scope sweep before
     /// the settle. Kept through retries, so a reclaimed teardown sweeps too.
     sweep_owed: bool,
@@ -120,39 +215,57 @@ pub enum StopDecision {
     AlreadyStopping,
 }
 
-/// Process signalling and liveness, so teardown can be driven against a
-/// fake in tests without spawning anything.
+/// Runtime process-group signalling and exit proof.
 pub trait ProcessControl: Send + Sync + 'static {
     fn is_alive(&self, pid: u32) -> bool;
     fn terminate_group(&self, pid: u32);
     fn kill_group(&self, pid: u32);
-    /// Stops every systemd scope of the session, sweeping processes that
-    /// escaped the runner's group. Blocking and bounded.
-    fn release_scope(&self, session_id: &str);
+    /// Retire only captured scopes and prove them empty; failure retains the lease.
+    fn release_scope(
+        &self,
+        session_id: &str,
+        scopes: &[crate::process::worker_registry::ScopeOwnership],
+    ) -> bool;
+    fn scopes_stopped(
+        &self,
+        session_id: &str,
+        scopes: &[crate::process::worker_registry::ScopeOwnership],
+    ) -> bool;
 }
 
 pub struct SystemProcessControl;
 
 impl ProcessControl for SystemProcessControl {
-    /// pid 0 addresses the caller's own group and is never a runner.
     fn is_alive(&self, pid: u32) -> bool {
-        pid != 0 && crate::process::worker::is_pid_alive_and_ours(pid)
+        crate::process::worker::is_process_group_alive(pid)
     }
 
     fn terminate_group(&self, pid: u32) {
-        if pid != 0 {
-            crate::process::worker::terminate_process_group(pid);
-        }
+        crate::process::worker::terminate_process_group(pid);
     }
 
     fn kill_group(&self, pid: u32) {
-        if pid != 0 {
-            crate::process::worker::kill_process_group(pid);
-        }
+        crate::process::worker::kill_process_group(pid);
     }
 
-    fn release_scope(&self, session_id: &str) {
-        crate::process::systemd::release(session_id);
+    fn release_scope(
+        &self,
+        session_id: &str,
+        scopes: &[crate::process::worker_registry::ScopeOwnership],
+    ) -> bool {
+        scopes
+            .iter()
+            .all(|scope| crate::process::systemd::retire_scope(session_id, scope).is_ok())
+    }
+
+    fn scopes_stopped(
+        &self,
+        session_id: &str,
+        scopes: &[crate::process::worker_registry::ScopeOwnership],
+    ) -> bool {
+        scopes
+            .iter()
+            .all(|scope| crate::process::systemd::scope_stopped(session_id, scope).unwrap_or(false))
     }
 }
 
@@ -160,16 +273,15 @@ impl ProcessControl for SystemProcessControl {
 pub enum Settlement {
     /// Process-group exit and registry cleanup were proven.
     Proven,
-    /// The process survived escalation; keep ownership and retry.
-    Unproven(RunnerIdentity),
+    /// Exit or registry ownership is unproven; retain the lease and retry.
+    Unproven(Option<RunnerIdentity>),
 }
 
 /// Pending teardown a retry pass should drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryClaim {
     pub lease: Lease,
-    /// `None` for a reclaimed teardown whose driver never settled; the
-    /// registry record then names the runner.
+    /// `None` when the runner identity could not be read or recovered.
     pub identity: Option<RunnerIdentity>,
     pub attempts: u32,
 }
@@ -212,9 +324,15 @@ impl LifecycleTable {
         Lease {
             session_id: session_id.to_string(),
             epoch,
+            construction: Arc::clone(&self.entries[session_id].construction),
         }
     }
 
+    pub(crate) fn current_lease(&self, session_id: &str) -> Option<Lease> {
+        self.entries
+            .get(session_id)
+            .map(|entry| self.lease(session_id, entry.epoch))
+    }
     fn current(&mut self, lease: &Lease) -> Option<&mut Entry> {
         self.entries
             .get_mut(&lease.session_id)
@@ -235,10 +353,13 @@ impl LifecycleTable {
         self.stale_cancels.remove(session_id);
     }
 
-    pub fn forget(&mut self, session_id: &str) {
-        self.entries.remove(session_id);
+    pub fn forget(&mut self, session_id: &str) -> bool {
+        if self.entries.contains_key(session_id) {
+            return false;
+        }
         self.last_generation.remove(session_id);
         self.stale_cancels.remove(session_id);
+        true
     }
 
     pub fn last_generation(&self, session_id: &str) -> u64 {
@@ -263,6 +384,8 @@ impl LifecycleTable {
             Entry {
                 epoch,
                 phase: Phase::Starting { kind, cancel: None },
+                delete_adapter_state: false,
+                construction: Arc::new(Construction::default()),
                 sweep_owed: false,
             },
         );
@@ -292,6 +415,7 @@ impl LifecycleTable {
         }
         entry.phase = Phase::Running { identity };
         if let Some(identity) = identity {
+            lease.record_runner(identity);
             self.note_generation(&lease.session_id, identity.generation);
         }
         Ok(())
@@ -327,14 +451,21 @@ impl LifecycleTable {
     }
 
     /// Ask for the session's worker to stop.
-    pub fn begin_stop(&mut self, session_id: &str, reason: &str) -> StopDecision {
+    pub fn begin_stop(
+        &mut self,
+        session_id: &str,
+        reason: &str,
+        delete_adapter_state: bool,
+    ) -> StopDecision {
         let Some(entry) = self.entries.get_mut(session_id) else {
             return StopDecision::NotOwned;
         };
+        entry.delete_adapter_state |= delete_adapter_state;
         let epoch = entry.epoch;
         match &mut entry.phase {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => {
                 cancel.get_or_insert_with(|| reason.to_string());
+                entry.construction.cancellation.cancel();
                 StopDecision::CancelRequested
             }
             Phase::Running { identity } => {
@@ -366,6 +497,8 @@ impl LifecycleTable {
             session_id.to_string(),
             Entry {
                 epoch,
+                delete_adapter_state: false,
+                construction: Arc::new(Construction::default()),
                 phase: Phase::Stopping {
                     attempts: 0,
                     since: Instant::now(),
@@ -406,16 +539,10 @@ impl LifecycleTable {
         }
     }
 
-    /// `settle`, unless this epoch owes a sweep: then the debt is taken,
-    /// nothing else changes, and the caller sweeps the scope before settling.
-    pub fn settle_unless_sweep_owed(&mut self, lease: &Lease, settlement: Settlement) -> bool {
-        if let Some(entry) = self.current(lease) {
-            if std::mem::take(&mut entry.sweep_owed) {
-                return false;
-            }
-        }
-        self.settle(lease, settlement);
-        true
+    /// Take only this epoch's explicit stop debt, without settling prematurely.
+    pub fn take_sweep_owed(&mut self, lease: &Lease) -> Option<bool> {
+        self.current(lease)
+            .map(|entry| std::mem::take(&mut entry.sweep_owed))
     }
 
     /// Move a running worker into its respawn epoch.
@@ -430,6 +557,8 @@ impl LifecycleTable {
         let Phase::Running { identity } = entry.phase else {
             return Err(InstallError::Stale);
         };
+        let admission = lease.admission();
+        let scopes = lease.scopes();
         let epoch = self.mint(&session_id, true);
         let entry = self
             .entries
@@ -437,6 +566,17 @@ impl LifecycleTable {
             .expect("entry checked above");
         entry.epoch = epoch;
         entry.phase = Phase::Respawning { cancel: None };
+        entry.construction = Arc::new(Construction::default());
+        *entry
+            .construction
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = admission;
+        *entry
+            .construction
+            .scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = scopes;
         Ok((self.lease(&session_id, epoch), identity))
     }
 
@@ -480,6 +620,13 @@ impl LifecycleTable {
         }
     }
 
+    /// Permanent retirement applies only to the matching runner lease.
+    pub fn delete_adapter_state_requested(&self, lease: &Lease) -> bool {
+        self.entries
+            .get(&lease.session_id)
+            .is_some_and(|entry| entry.epoch == lease.epoch && entry.delete_adapter_state)
+    }
+
     /// Claim a parked teardown for another attempt, or one still marked
     /// `Stopping` after `orphaned_after`: its driver was dropped (a request
     /// future cancelled mid-teardown) and would otherwise never settle.
@@ -490,7 +637,7 @@ impl LifecycleTable {
     ) -> Option<RetryClaim> {
         let entry = self.entries.get_mut(session_id)?;
         let (identity, attempts) = match entry.phase {
-            Phase::TeardownRetry { identity, attempts } => (Some(identity), attempts),
+            Phase::TeardownRetry { identity, attempts } => (identity, attempts),
             Phase::Stopping { attempts, since } if since.elapsed() >= orphaned_after => {
                 (None, attempts)
             }
@@ -570,6 +717,16 @@ impl LifecycleTable {
         self.entries.contains_key(session_id)
     }
 
+    pub(crate) fn construction_is_pending(&self, lease: &Lease) -> bool {
+        self.entries.get(lease.session_id()).is_some_and(|entry| {
+            entry.epoch == lease.epoch()
+                && matches!(
+                    entry.phase,
+                    Phase::Starting { .. } | Phase::Respawning { .. }
+                )
+        })
+    }
+
     /// Worker slots this daemon holds: everything but an attach in
     /// flight, whose runner the registry already counts.
     pub fn occupied_slots(&self) -> usize {
@@ -623,6 +780,8 @@ pub(crate) mod test_support {
         terminated: tokio::sync::Notify,
         /// Each scope release, with the session's phase at that moment.
         releases: Mutex<Vec<(String, Option<WorkerPhase>)>>,
+        failed_scopes: Mutex<HashSet<String>>,
+        scope_units: Mutex<Vec<String>>,
         phase_probe: Mutex<Option<PhaseProbe>>,
     }
 
@@ -663,6 +822,16 @@ pub(crate) mod test_support {
         pub(crate) fn releases(&self) -> Vec<(String, Option<WorkerPhase>)> {
             self.releases.lock().unwrap().clone()
         }
+
+        pub(crate) fn fail_scope(&self, unit: &str) {
+            self.failed_scopes.lock().unwrap().insert(unit.to_owned());
+        }
+        pub(crate) fn exit_scope(&self, unit: &str) {
+            self.failed_scopes.lock().unwrap().remove(unit);
+        }
+        pub(crate) fn scope_units(&self) -> Vec<String> {
+            self.scope_units.lock().unwrap().clone()
+        }
     }
 
     impl ProcessControl for FakeProcessControl {
@@ -685,7 +854,11 @@ pub(crate) mod test_support {
             }
         }
 
-        fn release_scope(&self, session_id: &str) {
+        fn release_scope(
+            &self,
+            session_id: &str,
+            scopes: &[crate::process::worker_registry::ScopeOwnership],
+        ) -> bool {
             let phase = self
                 .phase_probe
                 .lock()
@@ -696,6 +869,28 @@ pub(crate) mod test_support {
                 .lock()
                 .unwrap()
                 .push((session_id.to_string(), phase));
+            scopes.iter().all(|scope| match scope {
+                crate::process::worker_registry::ScopeOwnership::Unscoped => true,
+                crate::process::worker_registry::ScopeOwnership::Unresolved => false,
+                crate::process::worker_registry::ScopeOwnership::Owned { unit } => {
+                    self.scope_units.lock().unwrap().push(unit.clone());
+                    !self.failed_scopes.lock().unwrap().contains(unit)
+                }
+            })
+        }
+
+        fn scopes_stopped(
+            &self,
+            _session_id: &str,
+            scopes: &[crate::process::worker_registry::ScopeOwnership],
+        ) -> bool {
+            scopes.iter().all(|scope| match scope {
+                crate::process::worker_registry::ScopeOwnership::Unscoped => true,
+                crate::process::worker_registry::ScopeOwnership::Unresolved => false,
+                crate::process::worker_registry::ScopeOwnership::Owned { unit } => {
+                    !self.failed_scopes.lock().unwrap().contains(unit)
+                }
+            })
         }
     }
 }
@@ -708,6 +903,94 @@ mod tests {
 
     fn identity(pid: u32, generation: u64) -> RunnerIdentity {
         RunnerIdentity { pid, generation }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_control_keeps_a_leaderless_group_alive() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut leader = Command::new("sleep")
+            .arg("120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = leader.id();
+        let mut member = None;
+        let observed = (|| -> std::io::Result<bool> {
+            member = Some(
+                Command::new("sleep")
+                    .arg("120")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(pid as i32)
+                    .spawn()?,
+            );
+            leader.kill()?;
+            leader.wait()?;
+            Ok(SystemProcessControl.is_alive(pid))
+        })();
+        if let Some(mut member) = member {
+            let _ = member.kill();
+            member.wait().unwrap();
+        }
+        let _ = leader.kill();
+        leader.wait().unwrap();
+        assert!(
+            observed.unwrap(),
+            "a surviving group member must prevent teardown settlement"
+        );
+        assert!(
+            !SystemProcessControl.is_alive(pid),
+            "a reaped group must permit settlement"
+        );
+    }
+
+    #[test]
+    fn forgetting_cannot_release_active_or_unproven_runner_ownership() {
+        let mut table = LifecycleTable::new(1);
+        let initial = table.admit(ID, ResumeKind::Spawn).unwrap();
+        assert!(!table.forget(ID));
+        assert_eq!(
+            table.admit(ID, ResumeKind::Spawn).unwrap_err(),
+            AdmitError::AlreadyPresent
+        );
+        table
+            .install(&initial, Some(identity(11, initial.epoch())))
+            .unwrap();
+        assert!(!table.forget(ID));
+        let (replacement, _) = table.begin_respawn(&initial).unwrap();
+        assert!(!table.forget(ID));
+        assert!(matches!(
+            table.begin_stop(ID, "user_stopped", false),
+            StopDecision::CancelRequested
+        ));
+        let runner = identity(12, replacement.epoch());
+        assert!(matches!(
+            table.install(&replacement, Some(runner)),
+            Err(InstallError::Cancelled { .. })
+        ));
+        assert!(!table.forget(ID));
+        table.settle(&replacement, Settlement::Unproven(Some(runner)));
+        assert!(!table.forget(ID));
+        assert_eq!(
+            table.admit(ID, ResumeKind::Spawn).unwrap_err(),
+            AdmitError::TeardownPending
+        );
+        let retry = table.claim_retry(ID, Duration::ZERO).unwrap();
+        assert!(!table.forget(ID));
+        table.settle(&retry.lease, Settlement::Proven);
+        assert!(table.forget(ID));
+        let next = table.admit(ID, ResumeKind::Spawn).unwrap();
+        assert!(next.epoch() > replacement.epoch());
+        assert!(matches!(
+            table.install(&replacement, Some(runner)),
+            Err(InstallError::Stale)
+        ));
     }
 
     #[test]
@@ -742,7 +1025,7 @@ mod tests {
         let StopDecision::TearDown {
             lease: stop,
             identity: id,
-        } = table.begin_stop(ID, "user_stopped")
+        } = table.begin_stop(ID, "user_stopped", false)
         else {
             panic!("running worker must hand teardown to the stopper");
         };
@@ -752,7 +1035,7 @@ mod tests {
         assert!(!table.is_running(ID));
         assert!(table.is_owned(ID));
         assert!(matches!(
-            table.begin_stop(ID, "again"),
+            table.begin_stop(ID, "again", false),
             StopDecision::AlreadyStopping
         ));
         assert_eq!(
@@ -770,12 +1053,12 @@ mod tests {
         let mut table = LifecycleTable::new(1);
         let lease = table.admit(ID, ResumeKind::Attach).unwrap();
         assert!(matches!(
-            table.begin_stop(ID, "archived"),
+            table.begin_stop(ID, "archived", false),
             StopDecision::CancelRequested
         ));
         assert_eq!(table.cancel_requested(&lease).as_deref(), Some("archived"));
         assert!(matches!(
-            table.begin_stop(ID, "later"),
+            table.begin_stop(ID, "later", false),
             StopDecision::CancelRequested
         ));
         assert_eq!(
@@ -791,7 +1074,7 @@ mod tests {
             })
         );
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
-        table.settle(&lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&lease, Settlement::Unproven(Some(identity(9, 1))));
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
 
         let grace = Duration::from_secs(15);
@@ -808,7 +1091,7 @@ mod tests {
             orphan.identity, None,
             "a stale claim is reclaimed without an identity"
         );
-        table.settle(&orphan.lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&orphan.lease, Settlement::Unproven(Some(identity(9, 1))));
         let again = table.claim_retry(ID, grace).unwrap();
         assert_eq!(again.attempts, 3, "attempts accumulate per settled retry");
         table.settle(&again.lease, Settlement::Proven);
@@ -851,7 +1134,7 @@ mod tests {
         assert!(table.begin_respawn(&first).is_err());
 
         assert!(matches!(
-            table.begin_stop(ID, "user_stopped"),
+            table.begin_stop(ID, "user_stopped", false),
             StopDecision::CancelRequested
         ));
         assert_eq!(
@@ -885,13 +1168,13 @@ mod tests {
         let lease = table.adopt_for_stop(ID).unwrap();
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert!(table.adopt_for_stop(ID).is_none());
-        table.settle(&lease, Settlement::Unproven(identity(3, 0)));
+        table.settle(&lease, Settlement::Unproven(Some(identity(3, 0))));
         assert_eq!(
             table.retry_ids_after(Duration::from_secs(15)),
             vec![ID.to_string()]
         );
         assert!(matches!(
-            table.begin_stop(ID, "x"),
+            table.begin_stop(ID, "x", false),
             StopDecision::AlreadyStopping
         ));
     }
@@ -927,7 +1210,7 @@ mod tests {
         let mut table = LifecycleTable::new(1);
         let lease = table.admit(ID, ResumeKind::Attach).unwrap();
         assert!(matches!(
-            table.begin_stop(ID, "user_stopped"),
+            table.begin_stop(ID, "user_stopped", false),
             StopDecision::CancelRequested
         ));
         assert!(table.abandon(&lease), "the attach failed before install");

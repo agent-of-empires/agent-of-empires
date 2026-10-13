@@ -2,6 +2,7 @@
 /// existing Structured-view row attaches to tmux or enters live-send.
 use super::*;
 use crate::session::config::{update_config, AttachMode};
+use crate::tui::home::TerminalMode;
 
 fn add_session(view: &mut HomeView, title: &str) -> String {
     let mut inst = Instance::new(title, "/tmp/test");
@@ -216,6 +217,56 @@ fn refresh_tool_preview_cache_resizes_live_pane_when_targeted() {
         Some((80, 24)),
         "resize_live_pane_if_target must fire for a targeted Tool pane"
     );
+}
+
+#[test]
+#[serial]
+fn structured_backend_auxiliary_views_honor_default_attach_mode() {
+    for mode in [AttachMode::Tmux, AttachMode::LiveSend] {
+        for pane in [ViewMode::Terminal, ViewMode::Tool("probe".into())] {
+            let mut env = create_test_env_empty();
+            write_global_default_attach_mode(mode);
+            let id = add_session(&mut env.view, "structured-row");
+            env.view.instances.get_mut(&id).unwrap().view = crate::session::View::Structured;
+            env.view.flat_items = env.view.build_flat_items();
+            env.view.cursor = 0;
+            env.view.update_selected();
+            env.view.view_mode = pane.clone();
+            assert_eq!(env.view.default_attach_mode(&id), Some(mode));
+            let expected = match (mode, &pane) {
+                (AttachMode::LiveSend, _) => Action::EnterLiveSend(id.clone()),
+                (AttachMode::Tmux, ViewMode::Terminal) => {
+                    Action::AttachTerminal(id.clone(), TerminalMode::Host)
+                }
+                (AttachMode::Tmux, ViewMode::Tool(name)) => {
+                    Action::AttachToolSession(id.clone(), name.clone())
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                env.view.handle_key(key(KeyCode::Enter), None),
+                Some(expected)
+            );
+            if mode == AttachMode::LiveSend {
+                let native_action = match &pane {
+                    ViewMode::Terminal => Action::AttachTerminal(id.clone(), TerminalMode::Host),
+                    ViewMode::Tool(name) => Action::AttachToolSession(id.clone(), name.clone()),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    env.view.handle_key(key(KeyCode::Tab), None),
+                    Some(native_action),
+                    "Tab retains the native attach escape hatch"
+                );
+                let expected_target = match pane {
+                    ViewMode::Terminal => crate::tui::home::live_send::LiveSendTarget::Terminal,
+                    ViewMode::Tool(name) => crate::tui::home::live_send::LiveSendTarget::Tool(name),
+                    _ => unreachable!(),
+                };
+                assert_eq!(env.view.take_live_send_target(), expected_target);
+            }
+        }
+    }
 }
 
 fn write_live_send_on_view_switch(mode: AttachMode, on_view_switch: bool) {

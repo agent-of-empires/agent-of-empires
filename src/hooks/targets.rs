@@ -312,23 +312,23 @@ fn hermes_config_has_aoe_marker(content: &str) -> bool {
     if content.trim().is_empty() {
         return false;
     }
-    let Ok(value) =
-        serde_saphyr::from_str_with_options::<serde_json::Value>(content, crate::yaml::options())
-    else {
+    let Ok(value) = crate::yaml::from_str::<yaml_serde::Value>(content) else {
         return false;
     };
     value
-        .get("hooks")
-        .and_then(serde_json::Value::as_object)
+        .as_mapping()
+        .and_then(|m| m.get(yaml_serde::Value::String("hooks".into())))
+        .and_then(yaml_serde::Value::as_mapping)
         .is_some_and(|hooks| {
             hooks
                 .values()
-                .filter_map(serde_json::Value::as_array)
+                .filter_map(yaml_serde::Value::as_sequence)
                 .flatten()
                 .any(|entry| {
                     entry
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
+                        .as_mapping()
+                        .and_then(|m| m.get(yaml_serde::Value::String("command".into())))
+                        .and_then(yaml_serde::Value::as_str)
                         .is_some_and(is_aoe_hook_command)
                 })
         })
@@ -339,6 +339,31 @@ mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
     use tempfile::TempDir;
+
+    #[test]
+    fn hermes_marker_requires_a_string_hook_command() {
+        for (yaml, installed) in [
+            (
+                "hooks:\n  pre_tool_call:\n    - command: 'exit 0 # aoe-hooks'\n",
+                true,
+            ),
+            (
+                "hooks:\n  pre_tool_call:\n    - command: echo user-hook\n",
+                false,
+            ),
+            ("model: 'exit 0 # aoe-hooks'\n", false),
+            (
+                "hooks:\n  pre_tool_call: {command: 'exit 0 # aoe-hooks'}\n",
+                false,
+            ),
+            ("hooks:\n  pre_tool_call: [{command: 17}]\n", false),
+            ("hooks: [", false),
+            ("scalar", false),
+            ("", false),
+        ] {
+            assert_eq!(hermes_config_has_aoe_marker(yaml), installed, "{yaml:?}");
+        }
+    }
 
     #[test]
     #[serial_test::serial]

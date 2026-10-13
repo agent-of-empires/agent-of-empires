@@ -12,7 +12,10 @@ use crate::plugin::host::PluginHost;
 /// Spawn the forwarder. The caller guarantees the plugin host exists.
 pub fn spawn_forwarder(state: Arc<AppState>, host: Arc<PluginHost>) {
     let rx = state.status_tx.subscribe();
-    tokio::spawn(run_forwarder(rx, host, state.shutdown.clone()));
+    state.runtime.work.spawn(
+        "plugin.status_forwarder",
+        run_forwarder(rx, host, state.shutdown.clone()),
+    );
 }
 
 pub(crate) async fn run_forwarder(
@@ -60,7 +63,13 @@ mod tests {
         tempfile::TempDir,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let host = PluginHost::new(tmp.path(), "default", None).unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
         let rx = host.register_test_worker("acme.watcher", Some(16)).await;
         (host, rx, tmp)
     }

@@ -28,6 +28,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         self
     }
 
+    pub(crate) fn test_cancel_requested(&self, lease: &Lease) -> bool {
+        lock_recover(&self.lifecycle)
+            .cancel_requested(lease)
+            .is_some()
+    }
+
     /// What the drain task records for a worker that failed before establishing a session.
     pub(crate) fn note_startup_failure(&self, session_id: &str) {
         lock_recover(&self.startup_failures).insert(session_id.to_string());
@@ -163,6 +169,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
                 kind,
+                launch_epoch: lease.epoch(),
                 lease: lease.clone(),
             },
         );
@@ -248,8 +255,10 @@ pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, temp
     (home, tmp)
 }
 
-pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
+pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
     SpawnRequest {
+        launch_admission: None,
+        expected_lifecycle_generation: 0,
         provider: None,
         session_id: session_id.into(),
         agent: "claude-code".into(),
@@ -275,6 +284,7 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
 
 pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
     SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -323,7 +333,7 @@ pub(super) fn worker_record(session_id: &str, pid: u32, socket: PathBuf) -> Work
     )
 }
 
-pub(super) fn save_record(session_id: &str, pid: u32, generation: u64) {
+pub(crate) fn save_record(session_id: &str, pid: u32, generation: u64) {
     let socket = worker_registry::socket_path_for(session_id).unwrap();
     worker_registry::save(&worker_record(session_id, pid, socket).with_generation(generation))
         .unwrap();
@@ -331,9 +341,9 @@ pub(super) fn save_record(session_id: &str, pid: u32, generation: u64) {
 
 /// Holds a gated launch until the test opens it.
 #[derive(Default)]
-pub(super) struct Gate {
-    pub(super) entered: Arc<tokio::sync::Notify>,
-    pub(super) open: Arc<tokio::sync::Notify>,
+pub(crate) struct Gate {
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) open: Arc<tokio::sync::Notify>,
 }
 
 /// A launcher that parks on `gate`, then records a runner with `pid` and the
@@ -355,6 +365,43 @@ pub(super) fn gated_launcher(gate: &Gate, pid: u32) -> Launcher {
             Ok(client.with_runner_pid(pid))
         })
     })
+}
+
+/// Park after the runner record exists but before the handshake returns.
+pub(crate) fn recording_gated_launcher(
+    gate: &Gate,
+    pid: u32,
+    session_id: &str,
+    native_id: &str,
+) -> (Launcher, Arc<std::sync::atomic::AtomicBool>) {
+    let (client, sender, deleted) =
+        AcpClient::fake_for_test_recording(AcpSessionId(session_id.into()));
+    let client = Arc::new(std::sync::Mutex::new(Some(client)));
+    let entered = gate.entered.clone();
+    let open = gate.open.clone();
+    let native_id = native_id.to_owned();
+    let launcher: Launcher = Arc::new(move |config, session_id| {
+        let client = client.clone();
+        let entered = entered.clone();
+        let open = open.clone();
+        let native_id = native_id.clone();
+        let sender = sender.clone();
+        Box::pin(async move {
+            let _sender = sender;
+            let socket = worker_registry::socket_path_for(&session_id.0).unwrap();
+            let mut record = worker_record(&session_id.0, pid, socket.clone())
+                .with_generation(config.generation);
+            record.stored_acp_session_id = Some(native_id);
+            record.source_profile = config.source_profile;
+            worker_registry::save(&record).unwrap();
+            worker_registry::touch_live_socket(&socket);
+            entered.notify_one();
+            open.notified().await;
+            let client = client.lock().unwrap().take().expect("one gated launch");
+            Ok(client.with_runner_pid(pid))
+        })
+    });
+    (launcher, deleted)
 }
 
 pub(super) fn reserve(

@@ -678,21 +678,26 @@ fn wizard_created_structured_session_opens_structured_view() {
     require_tmux!();
     require_node!();
     let mut h = structured_tui_harness("structured_wizard");
+    h.append_config("[session]\ndefault_tool = \"claude\"");
     let project = h.project_path();
 
     h.spawn_tui();
-    h.wait_for(" aoe ");
+    h.wait_for("Runtime ready");
     h.send_keys("n");
     h.wait_for(" New Session ");
     h.send_keys("C-u");
     h.type_text(project.to_str().unwrap());
     h.send_keys("Tab");
     h.type_text("wizstruct");
-    // The Tool row is focusable only with several tools, shown by `[1/N]`.
+    // Arrows mark the focused Tool row when several tools are installed.
     h.send_keys("Tab");
-    if h.capture_screen().contains("[1/") {
+    if h.capture_screen()
+        .lines()
+        .any(|line| line.contains("Tool:") && line.contains('←'))
+    {
         h.send_keys("Tab");
     }
+    h.assert_screen_contains("[ ] Structured view");
     h.send_keys("Space");
     h.assert_screen_contains("[x] Structured view");
     h.send_keys("Enter");

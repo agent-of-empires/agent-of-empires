@@ -40,7 +40,7 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    /// One entry per tool with a published ACP server, plus aoe's own `aoe-agent`.
+    /// One entry per tool with a published ACP server, plus the built-in agent.
     pub fn with_defaults() -> Self {
         let claude_install = install_hint_for("claude-agent-acp").unwrap_or("(see project docs)");
         let claude_description =

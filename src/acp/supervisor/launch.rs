@@ -10,7 +10,7 @@ use super::agents::{
     apply_agent_command_override, log_wrapper_substitution, wrapper_substitution_for,
 };
 use super::publish::collect_resumable_background_agent_launches;
-use super::teardown::{release_scope, tear_down_runner};
+use super::teardown::tear_down_runner;
 use super::{
     lock_recover, BroadcastSink, PendingContextReset, ResumeKind, ResumeReservation,
     ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError, WorkerHandle, WorkerKind,
@@ -26,13 +26,18 @@ use crate::session::SandboxInfo;
 impl<S: BroadcastSink> Supervisor<S> {
     /// Spawn a structured view worker for the given session.
     pub async fn spawn(&self, req: SpawnRequest) -> Result<(), SupervisorError> {
-        match self
-            .begin_resume(&req.session_id, ResumeKind::Spawn)
-            .await?
-        {
-            ResumeReservationOutcome::Reserved(r) => self.spawn_inner(req, r).await,
+        let reservation = self.reserve_spawn(&req.session_id).await?;
+        self.spawn_inner(req, reservation).await
+    }
+
+    pub(crate) async fn reserve_spawn(
+        &self,
+        id: &str,
+    ) -> Result<ResumeReservation, SupervisorError> {
+        match self.begin_resume(id, ResumeKind::Spawn).await? {
+            ResumeReservationOutcome::Reserved(reservation) => Ok(reservation),
             ResumeReservationOutcome::AlreadyPresent => {
-                Err(SupervisorError::AlreadyRunning(req.session_id))
+                Err(SupervisorError::AlreadyRunning(id.to_owned()))
             }
         }
     }
@@ -82,6 +87,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
             lease,
+            expected_lifecycle_generation: None,
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.worker_notify),
         }))
@@ -90,13 +96,24 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Spawn body, run under the reservation from `begin_resume`.
     pub(crate) async fn spawn_inner(
         &self,
-        req: SpawnRequest,
+        mut req: SpawnRequest,
         reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
         let lease = reservation.lease().clone();
+        if req.launch_admission.is_none() {
+            req.launch_admission = capture_durable_launch(
+                req.source_profile.as_deref(),
+                &req.session_id,
+                Some(req.expected_lifecycle_generation),
+            )
+            .await?;
+        }
+        admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await?;
         let session_id = req.session_id.as_str();
         let warmup_guard = self.warmup_guard(&req.agent).await;
-        let (config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
+        let (mut config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
+        lease.set_admission(req.launch_admission.clone());
+        config.launch_lease = Some(lease.clone());
         debug!(
             target: "acp.supervisor",
             session = %session_id,
@@ -104,7 +121,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             "spawning structured view worker"
         );
         // The hooks above may re-enter aoe, so the lifecycle lock is taken only for each check.
-        admit_durable_launch(&req).await?;
+        admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await?;
         // Clear a partial replay from a failed import before session/load re-emits it.
         if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
@@ -133,8 +150,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         };
 
+        let identity = client.runner_pid().map(|pid| RunnerIdentity {
+            pid,
+            generation: lease.epoch(),
+        });
         // A peer that archived or trashed the row during the handshake wins: retire the runner.
-        if let Err(refused) = admit_durable_launch(&req).await {
+        if let Err(refused) =
+            admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await
+        {
+            super::teardown::retire_client(&self.lifecycle, &lease, &client, identity).await;
             drop(client);
             self.reap_failed_launch(&lease).await;
             return Err(refused);
@@ -150,10 +174,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         let inbound = client
             .take_inbound()
             .expect("freshly spawned AcpClient always has inbound receiver");
-        let identity = client.runner_pid().map(|pid| RunnerIdentity {
-            pid,
-            generation: lease.epoch(),
-        });
         let kind = WorkerKind::Runner {
             spawn_config: Box::new(config),
         };
@@ -335,6 +355,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         Ok((
             SpawnConfig {
+                launch_lease: None,
                 agent_key: req.agent.clone(),
                 tool: req.tool.clone(),
                 spec,
@@ -386,7 +407,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let install = lock_recover(&self.lifecycle).install(&lease, identity);
         if let Err(refusal) = install {
             drop(workers);
-            let _ = client.shutdown().await;
+            super::teardown::retire_client(&self.lifecycle, &lease, &client, identity).await;
             drop(client);
             return Err(self.retire_refused_install(&lease, identity, refusal).await);
         }
@@ -423,6 +444,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 drain_task,
                 restart_history: vec![],
                 kind,
+                launch_epoch: lease.epoch(),
                 lease,
             },
         );
@@ -453,31 +475,25 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// stop the scope is released even when no runner of this generation exists.
     async fn reap_failed_launch(&self, lease: &Lease) {
         let session_id = lease.session_id();
-        let identity = worker_registry::load(session_id)
-            .ok()
-            .flatten()
-            .filter(|record| record.generation == lease.epoch())
-            .map(|record| RunnerIdentity {
-                pid: record.pid,
-                generation: record.generation,
-            });
-        // One lock: a stop landing after the conversion sees `AlreadyStopping`,
-        // so the pending-stop check must be read in the same critical section.
-        let (stop_pending, converted) = {
-            let mut table = lock_recover(&self.lifecycle);
-            let stop_pending = table.cancel_requested(lease).is_some();
-            let converted = identity.is_some() && table.convert_to_stopping(lease);
-            if converted {
-                table.owe_sweep(lease);
-            }
-            (stop_pending, converted)
+        let identity = lease.spawned_runner().or_else(|| {
+            worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .filter(|record| record.generation == lease.epoch())
+                .map(|record| RunnerIdentity {
+                    pid: record.pid,
+                    generation: record.generation,
+                })
+        });
+        let Some(identity) = identity else {
+            return;
         };
-        if converted {
-            let settlement = tear_down_runner(&*self.process_control, session_id, identity).await;
-            self.settle_sweeping_if_owed(lease, settlement).await;
-        } else if stop_pending {
-            release_scope(&self.process_control, session_id).await;
+        if !lock_recover(&self.lifecycle).convert_to_stopping(lease) {
+            return;
         }
+        let settlement = tear_down_runner(&*self.process_control, session_id, Some(identity)).await;
+        lock_recover(&self.lifecycle).owe_sweep(lease);
+        self.settle_sweeping_if_owed(lease, settlement).await;
     }
 
     /// Tear down a built worker whose install the lifecycle table refused.
@@ -550,6 +566,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             Some(r) if worker_registry::is_record_live(&r) => r,
             _ => return Err(SupervisorError::UnknownSession(session_id)),
         };
+        let admission = capture_durable_launch(
+            record.source_profile.as_deref(),
+            &session_id,
+            reservation.expected_lifecycle_generation,
+        )
+        .await?;
+        admit_durable_launch(admission.as_ref(), &session_id).await?;
         let identity = RunnerIdentity {
             pid: record.pid,
             generation: record.generation,
@@ -650,7 +673,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             None
         };
 
-        let mut client = AcpClient::attach(
+        reservation.lease().record_runner(identity);
+        let client = AcpClient::attach(
             record.socket_path.clone(),
             cwd,
             additional_dirs,
@@ -660,9 +684,28 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_resources,
             agent_key,
             record.source_profile.clone(),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
+            Some(reservation.lease().clone()),
         )
-        .await?;
+        .await;
+        let mut client = match client {
+            Ok(client) => client,
+            Err(error) => {
+                self.reap_failed_launch(reservation.lease()).await;
+                return Err(error.into());
+            }
+        };
 
+        if let Err(refused) = admit_durable_launch(admission.as_ref(), &session_id).await {
+            let lease = reservation.lease().clone();
+            super::teardown::retire_client(&self.lifecycle, &lease, &client, Some(identity)).await;
+            drop(client);
+            lock_recover(&self.lifecycle).convert_to_stopping(&lease);
+            let settlement =
+                tear_down_runner(&*self.process_control, &session_id, Some(identity)).await;
+            self.settle(&lease, settlement);
+            return Err(refused);
+        }
         let inbound = client
             .take_inbound()
             .expect("freshly attached AcpClient always has inbound receiver");
@@ -729,34 +772,103 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
     true
 }
 
-/// Recheck the stored row under its lifecycle lock: the caller's check ran before
-/// `spawn_config` awaited the `before_session` hook. Refuses an archived or trashed row, or one
-/// purged since. A request without a source profile has no stored row to check.
-async fn admit_durable_launch(req: &SpawnRequest) -> Result<(), SupervisorError> {
-    let Some(profile) = req.source_profile.clone() else {
-        return Ok(());
+async fn capture_durable_launch(
+    profile: Option<&str>,
+    session_id: &str,
+    expected: Option<u64>,
+) -> Result<Option<super::LaunchAdmission>, SupervisorError> {
+    let Some(profile) = profile.map(str::to_owned) else {
+        return Ok(None);
     };
-    let session_id = req.session_id.clone();
-    let spawn_error = |e: anyhow::Error| {
-        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {e:#}")))
+    let id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let storage = crate::session::Storage::open_unwatched(&profile)
+            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
+        let _lock = storage
+            .acquire_instance_lifecycle_lock(&id)
+            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
+        let row = storage
+            .load()
+            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or_else(|| SupervisorError::SessionGone(id.clone()))?;
+        Ok(Some(super::LaunchAdmission {
+            store: std::sync::Arc::new(storage),
+            generation: expected.unwrap_or(row.lifecycle_generation),
+            namespace: None,
+        }))
+    })
+    .await
+    .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
+}
+
+fn admission_error(error: anyhow::Error, session_id: &str) -> SupervisorError {
+    if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
+        SupervisorError::Blocked(*blocked)
+    } else if error.is::<crate::session::SessionGone>() {
+        SupervisorError::SessionGone(session_id.to_owned())
+    } else if error.is::<crate::session::LifecycleReservationError>() {
+        SupervisorError::SpawnCancelled(session_id.to_owned())
+    } else if error.is::<crate::session::NativeStoreUnavailable>() {
+        SupervisorError::NativeStoreUnavailable
+    } else {
+        SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {error:#}")))
+    }
+}
+
+/// Check the same authority and generation before hooks, after hooks and after handshake.
+async fn admit_durable_launch(
+    admission: Option<&super::LaunchAdmission>,
+    session_id: &str,
+) -> Result<(), SupervisorError> {
+    with_durable_launch(admission.cloned(), session_id.to_owned(), || Ok(())).await
+}
+
+/// The blocking producer owns the native birth check, child spawn and publication.
+pub(crate) async fn with_durable_launch<T: Send + 'static>(
+    admission: Option<super::LaunchAdmission>,
+    session_id: String,
+    operation: impl FnOnce() -> Result<T, AcpError> + Send + 'static,
+) -> Result<T, SupervisorError> {
+    let Some(mut admission) = admission else {
+        return operation().map_err(SupervisorError::Acp);
+    };
+    let namespace = match admission.namespace.take() {
+        Some(namespace) => Some(namespace.read_owned().await),
+        None => None,
     };
     tokio::task::spawn_blocking(move || {
-        let storage = crate::session::Storage::new_unwatched(&profile).map_err(spawn_error)?;
-        let _lock = storage
+        let _namespace = namespace;
+        let _lock = admission
+            .store
+            .storage()
             .acquire_instance_lifecycle_lock(&session_id)
-            .map_err(spawn_error)?;
-        let stored = storage
+            .map_err(|error| admission_error(error, &session_id))?;
+        let stored = admission
+            .store
             .load()
-            .map_err(spawn_error)?
+            .map_err(|error| admission_error(error, &session_id))?
             .into_iter()
             .find(|row| row.id == session_id);
         match stored {
             None => Err(SupervisorError::SessionGone(session_id)),
-            Some(row) => row.ensure_startable().map_err(SupervisorError::Blocked),
+            Some(row) => {
+                row.ensure_startable().map_err(SupervisorError::Blocked)?;
+                if row.lifecycle_generation != admission.generation {
+                    return Err(SupervisorError::SpawnCancelled(session_id));
+                }
+                if !row.is_structured() || !row.launch_is_finalized() {
+                    return Err(SupervisorError::Acp(AcpError::Spawn(
+                        "structured session launch is not finalized".into(),
+                    )));
+                }
+                operation().map_err(SupervisorError::Acp)
+            }
         }
     })
     .await
-    .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("launch admission task: {e}"))))?
+    .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
 }
 
 /// Unsandboxed host environment as `(base, host)`: trusted global/profile `[environment]` pairs
@@ -1250,6 +1362,7 @@ mod tests {
         );
         let mut inst = crate::session::Instance::new("s-archived", "/tmp");
         inst.id = "s-archived".into();
+        inst.view = crate::session::View::Structured;
         let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
         storage
             .update(|rows, _| {
@@ -1263,7 +1376,9 @@ mod tests {
             let sup = Arc::clone(&sup);
             tokio::spawn(async move { sup.spawn(req).await })
         };
-        gate.entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("structured launcher must reach its handshake");
 
         assert!(
             !storage.instance_lifecycle_lock_is_held_for_test("s-archived"),
@@ -1293,6 +1408,59 @@ mod tests {
             control.signals().iter().any(|(pid, _)| *pid == 4545),
             "the runner launched for the archived row must be torn down"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_terminal_handoff_cannot_forget_a_pending_runner() {
+        use crate::acp::runner_lifecycle::ProcessControl;
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4646);
+        let gate = Gate::default();
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(&gate, 4646)),
+        );
+        let mut row = crate::session::Instance::new("s-terminal-handoff", "/tmp");
+        row.id = "s-terminal-handoff".into();
+        row.view = crate::session::View::Structured;
+        let storage = crate::session::Storage::new_unwatched(&row.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![row.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut request = spawn_request(&row.id);
+        request.source_profile = Some(row.source_profile.clone());
+        let spawner = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.spawn(request).await })
+        };
+        gate.entered.notified().await;
+        storage
+            .update(|rows, _| {
+                rows[0].view = crate::session::View::Terminal;
+                rows[0].lifecycle_generation += 1;
+                Ok(())
+            })
+            .unwrap();
+        sup.shutdown(&row.id).await.unwrap();
+        let _ = sup.forget_session(&row.id);
+        gate.open.notify_one();
+        assert!(matches!(
+            spawner.await.unwrap(),
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+        assert!(
+            control.signals().contains(&(4646, "TERM")),
+            "cancelled handoff must retain the matching teardown lease"
+        );
+        assert!(!control.is_alive(4646));
+        assert!(worker_registry::load(&row.id).unwrap().is_none());
+        assert_eq!(sup.worker_state(&row.id).await, AcpWorkerState::Absent);
     }
 
     #[tokio::test]
@@ -1807,8 +1975,8 @@ mod tests {
             AgentName("claude".into()),
             None,
         );
-        for (_, event) in fixture.store.replay_from(session_id, 0) {
-            state.apply_event(event).unwrap();
+        for (seq, event) in fixture.store.replay_from(session_id, 0) {
+            state.apply_event(seq, event).unwrap();
         }
         state
     }

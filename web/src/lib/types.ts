@@ -4,11 +4,13 @@ import type { AgentLifecycleInfo } from "./agentProfiles";
 
 export interface SessionResponse {
   id: string;
+  idempotency_key?: string | null;
   title: string;
   project_path: string;
   /** Host path of the session's managed artifact directory. */
   artifact_dir: string;
   group_path: string;
+  sort_index?: number | null;
   tool: string;
   status: SessionStatus;
   /** Worker auto-stopped for inactivity (resumable), unlike a deliberate Stop. */
@@ -354,6 +356,13 @@ export interface DockerStatusResponse {
   runtime: string | null;
 }
 
+export interface CreationTrustFingerprint {
+  project_path: string;
+  base_hooks_hash: string;
+  hooks_hash: string | null;
+  mcp_hash: string | null;
+}
+
 export interface CreateSessionRequest {
   title?: string;
   path: string;
@@ -384,6 +393,8 @@ export interface CreateSessionRequest {
   scratch?: boolean;
   /** Approve repo lifecycle hooks, like CLI `--trust-hooks`. */
   trust_hooks?: boolean;
+  /** Fingerprint of the exact hook/MCP configuration reviewed before approval. */
+  trust_review?: CreationTrustFingerprint;
   /** Claude Code session id to import; `path` must be its original cwd. */
   import_acp_session_id?: string;
   /** Agent or ACP session id to fork from. */

@@ -107,6 +107,8 @@ async fn cancel_under_flood() {
         winner: Some(winner_tx),
     });
     let params = ConnectionParams {
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
         event_tx,
         cmd_rx,
         child: None,
@@ -236,6 +238,8 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
     let params = ConnectionParams {
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
         event_tx,
         cmd_rx,
         child: None,

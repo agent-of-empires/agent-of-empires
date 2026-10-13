@@ -1728,10 +1728,7 @@ fn read_document(
     };
     let text = text.trim_start_matches('\u{feff}');
     let parsed = if yaml {
-        let mut options = crate::yaml::options();
-        options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::LastWins;
-        serde_saphyr::from_str_with_options::<serde_json::Value>(text, options)
-            .map_err(anyhow::Error::from)
+        crate::yaml::from_str::<serde_json::Value>(text).map_err(anyhow::Error::from)
     } else {
         serde_json::from_str(text).map_err(anyhow::Error::from)
     };
@@ -1921,6 +1918,33 @@ impl ResourceSeed<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yaml_resource_documents_preserve_scalars_and_skip_undecodable_inputs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        let path = Path::new("config.yaml");
+        let source = "\u{feff}defaults: &defaults {path: './plugin', enabled: true}\ncopy: *defaults\nvalues: [true, false, on, 001, 'true']\n";
+        fs::write(temporary.path().join(path), source).unwrap();
+        let document = read_document(&root, path, true).unwrap().unwrap();
+        assert_eq!(
+            document["copy"],
+            serde_json::json!({"path":"./plugin","enabled":true})
+        );
+        assert_eq!(
+            document["values"],
+            serde_json::json!([true, false, "on", "001", "true"])
+        );
+        assert_eq!(
+            fs::read(temporary.path().join(path)).unwrap(),
+            source.as_bytes()
+        );
+        for invalid in [b"plugins: [".as_slice(), b"\xff", b"? [a, b]\n: value\n"] {
+            fs::write(temporary.path().join(path), invalid).unwrap();
+            assert!(read_document(&root, path, true).unwrap().is_none());
+            assert_eq!(fs::read(temporary.path().join(path)).unwrap(), invalid);
+        }
+    }
 
     #[test]
     fn sqlite_seed_refuses_uncommitted_spilled_pages_and_retries_after_rollback() {

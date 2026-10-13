@@ -37,9 +37,15 @@ pub fn session_artifact_dir(instance_id: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Resolve a URL-supplied relative path against a session's artifact directory, returning the
-/// canonical file path iff it is a regular file that stays inside the artifact root.
-pub fn resolve_artifact_path(instance_id: &str, rel: &str) -> Option<PathBuf> {
+/// Resolve a URL-supplied relative path against a session's artifact directory,
+/// returning `(canonical artifact root, canonical file)` iff the file is a
+/// regular file that stays inside the artifact root.
+///
+/// The root travels with the file so a caller can confine the read to it (see
+/// `server::api::file_provenance::read_confined_bytes`); returning only the
+/// file would force the caller to re-derive the boundary it was checked
+/// against.
+pub fn resolve_artifact_confined(instance_id: &str, rel: &str) -> Option<(PathBuf, PathBuf)> {
     if super::validate_instance_id(instance_id).is_err() {
         return None;
     }
@@ -48,10 +54,16 @@ pub fn resolve_artifact_path(instance_id: &str, rel: &str) -> Option<PathBuf> {
     let candidate = base.join(rel.trim_start_matches('/'));
     let resolved = candidate.canonicalize().ok()?;
     if resolved.starts_with(&root) && is_regular_file(&resolved) {
-        Some(resolved)
+        Some((root, resolved))
     } else {
         None
     }
+}
+
+/// Resolve a URL-supplied relative path against a session's artifact directory, returning the
+/// canonical file path iff it is a regular file that stays inside the artifact root.
+pub fn resolve_artifact_path(instance_id: &str, rel: &str) -> Option<PathBuf> {
+    resolve_artifact_confined(instance_id, rel).map(|(_, file)| file)
 }
 
 /// Path to a session's artifact dir WITHOUT creating it.

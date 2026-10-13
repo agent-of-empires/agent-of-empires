@@ -466,17 +466,17 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
-    let inst = inst.clone();
 
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance archive lock")?;
     if !args.no_kill {
-        if let Err(e) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {}", e);
-        }
-        inst.kill_ancillary_tmux_sessions_locked();
-        inst.release_scope();
+        let inst = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .context("session disappeared before archive")?;
+        inst.kill_all_tmux_sessions_locked()?;
     }
 
     let landed = storage.update(|instances, _groups| {
@@ -503,22 +503,33 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
     let (instances, _groups) = storage.load_with_groups()?;
-    let trashed: Vec<_> = instances
-        .iter()
-        .filter(|i| i.is_trashed())
-        .cloned()
-        .collect();
-    let mut inst = super::resolve_session(&args.identifier, &trashed)
-        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
-        .clone();
+    let trashed: Vec<_> = instances.into_iter().filter(Instance::is_trashed).collect();
+    let inst = super::resolve_session(&args.identifier, &trashed)
+        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
     let restore_id = inst.id.clone();
 
+    let _identity = crate::session::acquire_session_identity_lock()?;
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&restore_id)
         .context("failed to acquire instance restore lock")?;
-    let decision = storage.update(|instances, _groups| {
-        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
-            .map_err(anyhow::Error::new)
+    let (decision, fresh) = storage.update(|instances, _groups| {
+        let decision = crate::session::claim::decide_restore_claim(
+            instances,
+            &restore_id,
+            chrono::Utc::now(),
+        )?;
+        let fresh = if matches!(
+            decision,
+            crate::session::claim::RestoreClaimDecision::Claimed(_)
+        ) {
+            instances
+                .iter()
+                .find(|instance| instance.id == restore_id)
+                .cloned()
+        } else {
+            None
+        };
+        Ok((decision, fresh))
     })?;
     let restore_generation = match decision {
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {
@@ -531,6 +542,8 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         ),
         crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
     };
+    let mut inst = fresh.context("restored session disappeared after claim")?;
+    inst.source_profile = storage.profile().to_owned();
 
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
@@ -641,10 +654,11 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 detach_hooks: false,
                 keep_scratch: false,
             },
+            None,
         )?;
         let transaction = match reservation {
-            crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
-            crate::session::deletion::PurgeReservation::Rejected(result) => {
+            Ok(transaction) => transaction,
+            Err(result) => {
                 match result.disposition {
                     crate::session::deletion::DeletionDisposition::KeptRestored => {
                         being_restored_elsewhere += 1;
@@ -657,7 +671,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 continue;
             }
         };
-        let result = transaction.run_hooks().complete_with(|instance| {
+        let result = transaction.run_hooks()?.complete_with(|instance| {
             super::purge_acp_transcript(instance).map_err(|error| {
                 format!("transcript not purged, keeping session in trash: {error}")
             })
@@ -869,26 +883,29 @@ fn apply_import_mode(
     s: &crate::session::claude_import::ClaudeSessionSummary,
     structured: bool,
 ) {
+    let binding = crate::session::ConversationBinding {
+        session_id: s.session_id.clone(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![s.config_dir.clone()],
+            configuration: Vec::new(),
+            cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
+            filesystem: "host".into(),
+            cwd_filesystem: "host".into(),
+            exported_default_store: Some(true),
+        }),
+        provenance: crate::session::ConversationProvenance::Imported,
+        transcript_path: None,
+    };
     if structured {
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some(s.session_id.clone());
+        inst.agent_session_id = Some(s.session_id.clone());
+        inst.agent_session_binding = Some(binding);
         inst.import_pending = Some(true);
     } else {
         inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
-        inst.resume_binding = Some(crate::session::ConversationBinding {
-            session_id: s.session_id.clone(),
-            execution: Some(crate::session::ExecutionBinding {
-                agent: "claude".into(),
-                stores: vec![s.config_dir.clone()],
-                configuration: Vec::new(),
-                cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
-                filesystem: "host".into(),
-                cwd_filesystem: "host".into(),
-                exported_default_store: None,
-            }),
-            provenance: crate::session::ConversationProvenance::Imported,
-            transcript_path: None,
-        });
+        inst.resume_binding = Some(binding);
     }
 }
 
@@ -1453,7 +1470,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let storage = Storage::open_reference(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let mut inst = if let Some(id) = &args.identifier {
@@ -1701,7 +1718,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_locked(
         &storage,
         &mut inst,
         &mut Default::default(),
@@ -2479,7 +2496,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_locked(
         &storage,
         &mut inst,
         &mut Default::default(),
@@ -2727,7 +2744,13 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         crate::session::attach_project::Quiesced::default()
     };
 
-    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
+    let outcome = match crate::session::attach_project::attach_planned(
+        &storage,
+        &id,
+        inst,
+        plan,
+        quiesced.lifecycle_generation,
+    ) {
         Ok(outcome) => outcome,
         Err(e) => {
             crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);

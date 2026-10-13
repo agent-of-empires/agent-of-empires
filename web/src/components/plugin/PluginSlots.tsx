@@ -26,7 +26,7 @@ export interface ComposerActionSnapshot {
   selectionEnd: number;
 }
 
-const entryKey = (e: PluginUiEntry) => `${e.plugin_id}:${e.id}`;
+const entryKey = (e: PluginUiEntry) => JSON.stringify([e.plugin_id, e.slot, e.id, e.session_id ?? null]);
 
 /** An entry is a single badge or an `items` list; `items: []` clears it. */
 function EntryBadge({ entry }: { entry: PluginUiEntry }) {

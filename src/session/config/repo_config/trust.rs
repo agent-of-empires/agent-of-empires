@@ -154,6 +154,31 @@ impl RepoTrust {
     }
 }
 
+/// Canonical creation-review fingerprint shared by the daemon validator and
+/// clients that can only present a synchronous trust dialog. The daemon
+/// always recomputes it before persisting approval or provisioning.
+pub fn creation_trust_fingerprint(
+    base: &HooksConfig,
+    trust: &RepoTrust,
+) -> crate::daemon::CreationTrustFingerprint {
+    crate::daemon::CreationTrustFingerprint {
+        project_path: trust.project_path.clone(),
+        base_hooks_hash: compute_hooks_hash(base),
+        hooks_hash: match &trust.hooks {
+            TrustSurface::Absent => None,
+            TrustSurface::Trusted(hooks) => Some(compute_hooks_hash(hooks)),
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+        },
+        mcp_hash: match &trust.mcp {
+            TrustSurface::Absent => None,
+            TrustSurface::Trusted(servers) => {
+                Some(crate::session::mcp::project_mcp::fingerprint(servers))
+            }
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+        },
+    }
+}
+
 pub fn check_repo_trust(project_path: &Path) -> Result<RepoTrust> {
     let normalized = normalize_path(&repo_config_source_path(project_path));
     let trusted = load_trusted_repos()?;
@@ -216,6 +241,26 @@ mod tests {
         assert_eq!(
             hashes[1],
             compute_hooks_hash(&hooks(&["npm install"], &[], &[]))
+        );
+    }
+
+    #[test]
+    fn creation_fingerprint_changes_with_reviewed_base_configuration() {
+        let trust = RepoTrust {
+            project_path: "/repo".into(),
+            hooks: TrustSurface::NeedsTrust {
+                config: HooksConfig::default(),
+                hash: "repo-hooks".into(),
+            },
+            mcp: TrustSurface::Absent,
+        };
+        let reviewed = creation_trust_fingerprint(&HooksConfig::default(), &trust);
+        let mut drifted = HooksConfig::default();
+        drifted.on_launch.push("curl untrusted".into());
+        assert_ne!(
+            reviewed,
+            creation_trust_fingerprint(&drifted, &trust),
+            "daemon revalidation must reject a base-hook change after review"
         );
     }
 

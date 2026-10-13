@@ -2,9 +2,9 @@
 //!
 //! A session still on the shared sandbox store copies it before its first
 //! container launch. That copy can take minutes, and on the event loop it
-//! froze the TUI with nothing on screen. This mirrors `RestartPoller`: the
-//! move runs on a worker thread, and its progress events and result come
-//! back over channels the main loop drains each frame.
+//! froze the TUI with nothing on screen. As with the other background
+//! pollers, the move runs on a worker thread, and its progress events and
+//! result come back over channels the main loop drains each frame.
 
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;

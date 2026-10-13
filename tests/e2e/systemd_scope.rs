@@ -15,7 +15,14 @@ use crate::harness::{
 /// Replaces the harness's `[systemd]` section, with a slice no real session
 /// uses: directly under `background.slice`, named after this test run.
 /// Returns the slice the harness profile resolves to.
-fn configure_scopes(h: &TuiTestHarness, enabled: bool) -> String {
+fn configure_scopes(h: &mut TuiTestHarness, enabled: bool) -> String {
+    for name in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        if let Ok(value) = std::env::var(name) {
+            h.set_env(name, &value);
+        } else {
+            h.remove_env(name);
+        }
+    }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -69,25 +76,28 @@ fn units_matching(glob: &str) -> Vec<String> {
 struct ScopeGuard {
     glob: String,
     slice: String,
+    launcher: Option<std::process::Child>,
 }
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
         // Blocking stop: the units are gone before the harness removes its temp home.
         match Command::new("systemctl")
-            .args(["--user", "stop", &self.glob, &self.slice])
+            .args(["--user", "stop", &self.slice])
             .output()
         {
             Ok(out) if !out.status.success() => {
                 eprintln!(
-                    "systemctl stop {} {} failed: {}",
-                    self.glob,
+                    "systemctl stop {} failed: {}",
                     self.slice,
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
             }
-            Err(e) => eprintln!("systemctl stop {} {} failed: {e}", self.glob, self.slice),
+            Err(e) => eprintln!("systemctl stop {} failed: {e}", self.slice),
             _ => {}
+        }
+        if let Some(mut child) = self.launcher.take() {
+            let _ = child.wait();
         }
     }
 }
@@ -111,6 +121,7 @@ fn start_session(h: &TuiTestHarness, command: &str, slice: &str) -> (String, Sco
     let guard = ScopeGuard {
         glob: format!("aoe-session-{id}-*.scope"),
         slice: slice.to_string(),
+        launcher: None,
     };
     h.run_cli_ok(&["session", "start", &id]);
     (id, guard)
@@ -210,12 +221,11 @@ fn tmux_session_runs_in_its_own_scope_until_removed() {
         eprintln!("Skipping test: systemd user manager not reachable");
         return;
     }
-    let h = TuiTestHarness::new("systemd_scope");
-    let slice = configure_scopes(&h, true);
+    let mut h = TuiTestHarness::new("systemd_scope");
+    let slice = configure_scopes(&mut h, true);
     let agent = h.home_path().join("escapee-agent");
     write_executable(&agent, ESCAPEE_AGENT);
-    let (id, guard) = start_session(&h, agent.to_str().unwrap(), &slice);
-    let glob = guard.glob.clone();
+    let (id, mut guard) = start_session(&h, agent.to_str().unwrap(), &slice);
 
     let scope_marker = format!("/background.slice/{slice}/aoe-session-{id}-");
     let (pane, cgroup) = agent_cgroup(&h, &id, |c| c.contains(&scope_marker));
@@ -233,10 +243,91 @@ fn tmux_session_runs_in_its_own_scope_until_removed() {
         env_var(&agent, "INVOCATION_ID"),
         env_var(&pane, "INVOCATION_ID")
     );
-    assert_eq!(systemd_unit_in_list(&h, &id), glob.as_str());
+    let listed = systemd_unit_in_list(&h, &id);
+    let listed = listed
+        .as_str()
+        .expect("a live scoped session exposes its expected namespace pattern");
+    assert!(
+        cgroup.contains(listed.strip_suffix("*.scope").unwrap()),
+        "listed {listed}, actual cgroup {cgroup}"
+    );
+    // A second namespace can use the same SID; the first row never owns its unit.
+    let replacement_unit = format!(
+        "aoe-session-{id}-another-namespace-1-{}.scope",
+        uuid::Uuid::new_v4()
+    );
+    guard.launcher = Some(
+        Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--expand-environment=no",
+                "--unit",
+                &replacement_unit,
+                "--slice",
+                &slice,
+                "/bin/sh",
+                "-c",
+                "exec sleep 602",
+            ])
+            .spawn()
+            .expect("start this test's independent same-SID scope"),
+    );
+    let replacement = guard.launcher.as_mut().unwrap();
+    let replacement_cgroup = wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        if let Some(status) = replacement.try_wait().map_err(|error| error.to_string())? {
+            return Err(format!("independent scope launcher exited: {status}"));
+        }
+        let out = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=ControlGroup",
+                "--value",
+                &replacement_unit,
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        let group = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && !group.is_empty() {
+            Ok(format!("0::{group}"))
+        } else {
+            Err(format!(
+                "independent scope has no cgroup yet: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+    });
+    let replacement_pid = find_in_cgroup(&replacement_cgroup, b"sleep\x00602\x00");
 
     h.run_cli_ok(&["rm", &id, "--force"]);
-    wait_for_release(&glob, escapee);
+    let owned_unit = cgroup.trim().rsplit('/').next().unwrap();
+    wait_for_release(owned_unit, escapee);
+    assert!(
+        pid_alive(replacement_pid),
+        "owned cleanup killed a same-SID unit from a different namespace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("/proc/{replacement_pid}/cgroup"))
+            .unwrap()
+            .trim(),
+        replacement_cgroup
+    );
+    assert!(
+        replacement.try_wait().unwrap().is_none(),
+        "the independent scope must still be running"
+    );
+    let stopped = Command::new("systemctl")
+        .args(["--user", "stop", &replacement_unit])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let _ = replacement.wait().unwrap();
 }
 
 /// The escapee keeps the scope alive unless `aoe rm` released it.
@@ -264,8 +355,8 @@ fn rm_releases_an_existing_scope_after_scopes_are_disabled() {
         eprintln!("Skipping test: systemd user manager not reachable");
         return;
     }
-    let h = TuiTestHarness::new("systemd_scope_disabled_later");
-    let slice = configure_scopes(&h, true);
+    let mut h = TuiTestHarness::new("systemd_scope_disabled_later");
+    let slice = configure_scopes(&mut h, true);
     let agent = h.home_path().join("escapee-agent");
     write_executable(&agent, ESCAPEE_AGENT);
     let (id, guard) = start_session(&h, agent.to_str().unwrap(), &slice);
@@ -296,8 +387,8 @@ fn tmux_session_stays_unscoped_when_disabled() {
         eprintln!("Skipping test: systemd user manager not reachable");
         return;
     }
-    let h = TuiTestHarness::new("systemd_scope_off");
-    let slice = configure_scopes(&h, false);
+    let mut h = TuiTestHarness::new("systemd_scope_off");
+    let slice = configure_scopes(&mut h, false);
     let (id, guard) = start_session(&h, "sleep 600", &slice);
 
     // The agent itself, so the check cannot race a `systemd-run` still starting.

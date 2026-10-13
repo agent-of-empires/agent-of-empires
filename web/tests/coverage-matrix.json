@@ -1046,6 +1046,7 @@
     },
     {
       "id": "wizard.project-sandbox-override",
+      "notes": "Tri-state project container defaults resolve from the acknowledged served or explicitly selected profile; registry retries preserve unknown versus empty, profile switches commit atomically, manual edits and host-only imports outrank late defaults, and saves preserve explicit false while omitting inherited values.",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
@@ -1302,7 +1303,12 @@
       "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/session-wizard/__tests__/ProjectStep.test.tsx"],
+      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, never writes the implicit profile choice into the form, clears worktree/container/branch/attach/scratch/extra-repo state, and ignores late registry and profile defaults.",
+      "specs": [
+        "src/components/session-wizard/__tests__/ProjectStep.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts"
+      ],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
         "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
@@ -1447,9 +1453,21 @@
     {
       "id": "sidebar.session-color",
       "kind": "vitest",
-      "risk": "low",
-      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts",
+        "src/components/__tests__/SessionRowReceipts.test.tsx",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "sidebar.menu-choice-stays-open",
@@ -1477,7 +1495,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-context-menu.spec.ts"],
-      "components": ["web/src/components/ContextMenu.tsx", "web/src/components/sidebar/SidebarGroupHeader.tsx"]
+      "components": ["web/src/components/ContextMenu.tsx"]
     },
     {
       "id": "sidebar.system-health",
@@ -1500,8 +1518,16 @@
       "id": "sidebar.session-color-toggle",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/lib/__tests__/sessionColors.test.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/lib/sessionColors.ts", "web/src/components/WorkspaceSidebar.tsx"]
+      "specs": [
+        "src/lib/__tests__/sessionColors.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts"
+      ],
+      "components": [
+        "web/src/lib/sessionColors.ts",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts"
+      ]
     },
     {
       "id": "sidebar.dormant-dot",
@@ -1825,7 +1851,14 @@
         "web/src/components/plugin/PluginSlots.tsx",
         "web/src/components/plugin/SlotChrome.tsx"
       ],
-      "notes": "Grouped badge items collapse into one chip that cycles on click. The Playwright story clicks it inside the real session-row link, which jsdom cannot cover: the click must cycle without the row selecting or the browser following the row href. Group, wrap-around and clamping logic is in PluginSlots.test.tsx."
+      "notes": "Grouped badge items collapse into one chip that cycles on click. The Playwright story clicks it inside the real session-row link, which jsdom cannot cover: the click must cycle without the row selecting or the browser following the row href. Group, wrap-around and clamping logic is in PluginSlots.test.tsx, which also verifies that changing the addressed session resets a detail badge cycle."
+    },
+    {
+      "id": "sidebar.plugin-row-badge-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/plugin/SlotChrome.tsx"]
     },
     {
       "id": "sidebar.group-axis-pure",
@@ -2675,7 +2708,8 @@
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/hooks/useAcpSession.ts",
         "web/src/lib/acpTypes.ts"
-      ]
+      ],
+      "notes": "Provider requests remain single-flight across keyed session-view remounts and keep controls locked until settlement. Canonical changes observed during a pending request invalidate its late echo, including a return to the previous provider. Open model menus close when turn or provider locks arrive."
     },
     {
       "id": "acp.mode-switch",
@@ -3216,7 +3250,7 @@
     {
       "id": "projects-form-modal",
       "kind": "vitest",
-      "risk": "low",
+      "risk": "medium",
       "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
       "components": ["web/src/components/ProjectFormModal.tsx"]
     },
@@ -3937,9 +3971,14 @@
     {
       "id": "story.wizard-saved-projects",
       "kind": "mocked-playwright",
-      "risk": "low",
+      "risk": "high",
       "specs": ["tests/wizard-project.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
+      "components": [
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "story.wizard-browse-disk",
@@ -4001,7 +4040,9 @@
       "components": [
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/projectPicker.ts",
-        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/lib/api.ts"
       ]
     },
     {
@@ -4060,7 +4101,7 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/sidebar-project-pin.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/lib/api.ts"]
+      "components": ["web/src/App.tsx", "web/src/lib/api.ts", "web/src/hooks/useProjects.ts"]
     },
     {
       "id": "sidebar.active-project-settings",
@@ -4131,7 +4172,7 @@
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
-      "description": "Picker lists saved and recent projects, and a clicked row or typed path posts to attach; attach eligibility and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
+      "description": "Picker lists saved projects from the session profile and recents; failed reads retry without dropping typed paths. A clicked row or typed path posts to attach with canonical ACK consumption; attach eligibility and worker outcomes; native continuation remains best-effort.",
       "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
@@ -4418,6 +4459,135 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ]
+    },
+    {
+      "id": "projects.served-profile-registry.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/__tests__/useProjects.test.tsx"],
+      "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"]
+    },
+    {
+      "id": "projects.served-profile-registry",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/served-profile-browser.spec.ts"],
+      "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"],
+      "notes": "Browser: focus refresh retains the acknowledged registry on failure and closes writes on served-profile change."
+    },
+    {
+      "id": "wizard.served-profile-scope.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/ProjectStep.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.projectWorktreeOverride.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.lastProject.test.tsx",
+        "src/components/session-wizard/__tests__/projectPickerScope.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
+      ]
+    },
+    {
+      "id": "wizard.served-profile-scope",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/served-profile-browser.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
+      ],
+      "notes": "Browser: wizard retries failed about without guessing the machine default or overwriting dirty fields; wizard switching explicit Beta back to unresolved Server default resets Beta defaults after about retry."
+    },
+    {
+      "id": "connectivity.poll-abort-deadline.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/hooks/__tests__/useProjects.test.tsx",
+        "src/components/__tests__/TopBar.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useSessions.ts",
+        "web/src/hooks/useProjects.ts",
+        "web/src/lib/api.ts",
+        "web/src/lib/connectionState.ts",
+        "web/src/components/TopBar.tsx"
+      ]
+    },
+    {
+      "id": "connectivity.poll-abort-deadline",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/hooks/useSessions.ts",
+        "web/src/hooks/useProjects.ts",
+        "web/src/lib/api.ts",
+        "web/src/lib/connectionState.ts",
+        "web/src/components/TopBar.tsx"
+      ],
+      "notes": "Browser: valid stale same epoch polls restore online state without admitting stale rows or settings; valid stale abandoned epoch polls restore online state without admitting stale rows or settings; a hung sessions poll aborts at its deadline and the next canonical poll restores online controls."
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SessionRowReceipts.test.tsx",
+        "src/components/sidebar/usePendingSetting.test.ts",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "Browser: color cancellation installs a held lower receipt after another row ACK and accepts the next canonical writer; notifications cancellation installs a held lower receipt after another row ACK and accepts the next canonical writer. Revisions exceed Number.MAX_SAFE_INTEGER."
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts.live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for color and notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
     }
   ]
 }

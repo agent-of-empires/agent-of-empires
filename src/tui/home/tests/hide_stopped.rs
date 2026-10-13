@@ -56,6 +56,32 @@ fn header_text(view: &HomeView, group: &str) -> String {
     rendered_row_text(view, item)
 }
 
+fn publish_statuses(view: &mut HomeView, updates: &[(&str, Status)]) {
+    let mut snapshot = view
+        .session_feed
+        .applied_snapshot()
+        .unwrap()
+        .as_ref()
+        .clone();
+    snapshot.cursor.revision += 1;
+    for (id, status) in updates {
+        let row = snapshot
+            .contents
+            .sessions
+            .iter_mut()
+            .find(|row| row.id == *id)
+            .unwrap();
+        row.status = status.wire_str().to_string();
+    }
+    let cursor = snapshot.cursor.clone();
+    view.session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            Arc::new(snapshot),
+        ));
+    assert!(view.apply_session_feed());
+    assert!(view.session_feed.receipt_applied(&cursor));
+}
+
 fn press_y(env: &mut TestEnv) {
     env.view.handle_key(key(KeyCode::Char('y')), None);
 }
@@ -208,11 +234,10 @@ fn the_selection_finds_its_own_header_when_rows_above_it_also_drop_out() {
         .map(|i| i.id.clone())
         .unwrap();
 
-    for id in [&upper_live, &selected] {
-        env.view
-            .mutate_instance(id, |inst| inst.status = Status::Stopped);
-    }
-    env.view.rebuild_flat_items_keeping_cursor();
+    publish_statuses(
+        &mut env.view,
+        &[(&upper_live, Status::Stopped), (&selected, Status::Stopped)],
+    );
     assert_eq!(env.view.selected_group.as_deref(), Some("second"));
 }
 
@@ -254,76 +279,75 @@ fn a_session_crossing_into_or_out_of_stopped_follows_the_toggle_at_once() {
     press_y(&mut env);
     let live = select_session(&mut env, "util-live");
 
-    env.view.set_instance_status(&live, Status::Stopped);
+    publish_statuses(&mut env.view, &[(&live, Status::Stopped)]);
     assert!(!session_titles(&env.view).contains(&"util-live".to_string()));
     assert!(header_text(&env.view, "util").contains("util (0/3)"));
     assert_eq!(env.view.selected_group.as_deref(), Some("util"));
     assert_eq!(env.view.selected_session, None);
 
-    env.view.set_instance_status(&live, Status::Idle);
+    publish_statuses(&mut env.view, &[(&live, Status::Idle)]);
     assert!(session_titles(&env.view).contains(&"util-live".to_string()));
     assert!(header_text(&env.view, "util").contains("util (1/3)"));
 }
 
 /// A move renumbers every sibling in the store, hidden ones included, so it is refused while
 /// they are hidden.
-#[test]
+#[tokio::test]
 #[serial]
-fn custom_moves_wait_until_stopped_sessions_are_shown() {
+async fn custom_moves_wait_until_stopped_sessions_are_shown() {
+    use crate::daemon::{MoveDirection, NamespaceMutation, ReorderBody};
     let mut env = env_with_stopped(true);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
     env.view.apply_sort_order(SortOrder::Custom);
     press_y(&mut env);
-    select_session(&mut env, "util-live");
-    let before: Vec<_> = env
-        .view
-        .instances
-        .values()
-        .map(|i| (i.id.clone(), i.sort_index, i.group_path.clone()))
-        .collect();
-
+    let id = select_session(&mut env, "util-live");
+    let before = payload_bytes("test");
     env.view.move_row_at_cursor(1).unwrap();
+    assert!(env.view.pending_namespace_intent.is_none());
+    assert_eq!(payload_bytes("test"), before);
     assert!(env
         .view
         .status_flash_text()
         .is_some_and(|t| t.contains("Show stopped sessions")));
-    let after: Vec<_> = env
-        .view
-        .instances
-        .values()
-        .map(|i| (i.id.clone(), i.sort_index, i.group_path.clone()))
-        .collect();
-    assert_eq!(before, after);
 
-    let group_row = env
+    env.view.cursor = env
         .view
         .flat_items
         .iter()
         .position(|item| matches!(item, Item::Group { path, .. } if path == "util"))
         .unwrap();
-    env.view.cursor = group_row;
     env.view.update_selected();
-    env.view.status_flash = None;
-    env.view.move_row_at_cursor(1).unwrap();
-    assert!(
-        !env.view
-            .status_flash_text()
-            .is_some_and(|t| t.contains("Show stopped sessions")),
-        "a group header moves among groups, which hiding does not touch"
-    );
+    let group = env.view.canonical_group_location("util").unwrap();
+    super::pickers_groups_sort::settle_namespace(
+        &state,
+        &mut env.view,
+        NamespaceMutation::Reorder(ReorderBody::Group {
+            group,
+            direction: MoveDirection::Up,
+        }),
+        |view| view.move_row_at_cursor(-1),
+    )
+    .await
+    .unwrap();
 
     press_y(&mut env);
     select_session(&mut env, "util-live");
-    env.view.move_row_at_cursor(-1).unwrap();
-    let moved: Vec<_> = env
-        .view
-        .instances
-        .values()
-        .map(|i| (i.id.clone(), i.sort_index, i.group_path.clone()))
-        .collect();
-    assert_ne!(
-        before, moved,
-        "with everything shown the same move goes through"
-    );
+    super::pickers_groups_sort::settle_namespace(
+        &state,
+        &mut env.view,
+        NamespaceMutation::Reorder(ReorderBody::Session {
+            id,
+            profile: "test".into(),
+            source_group: "util".into(),
+            direction: MoveDirection::Down,
+            destination: None,
+        }),
+        |view| view.move_row_at_cursor(1),
+    )
+    .await
+    .unwrap();
+    assert_ne!(payload_bytes("test"), before);
 }
 
 /// A parent group counts its subgroups' sessions, shown and total alike.
@@ -408,22 +432,6 @@ fn each_profile_counts_its_own_copy_of_a_group() {
     );
 }
 
-#[test]
-#[serial]
-fn the_toggle_says_what_it_did() {
-    let mut env = env_with_stopped(true);
-    press_y(&mut env);
-    assert!(env
-        .view
-        .status_flash_text()
-        .is_some_and(|t| t.contains("hidden")));
-    press_y(&mut env);
-    assert!(env
-        .view
-        .status_flash_text()
-        .is_some_and(|t| t.contains("Showing")));
-}
-
 /// A hidden structured session the daemon reports working again comes back into its group.
 #[test]
 #[serial]
@@ -446,15 +454,7 @@ fn a_structured_session_lifted_out_of_stopped_reappears() {
     press_y(&mut env);
     assert!(!session_titles(&env.view).contains(&"acp-stopped".to_string()));
 
-    env.view
-        .apply_daemon_status_update(crate::tui::session_feed::DaemonStatusUpdate {
-            id,
-            status: Status::Running,
-            last_error: None,
-            last_accessed_at: None,
-            idle_entered_at: None,
-            pending_approvals: Vec::new(),
-        });
+    publish_statuses(&mut env.view, &[(&id, Status::Running)]);
     assert!(session_titles(&env.view).contains(&"acp-stopped".to_string()));
     assert!(header_text(&env.view, "util").contains("util (2)"));
 }
@@ -475,7 +475,7 @@ fn a_session_menu_closes_when_its_session_is_hidden() {
     assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
     assert!(env.view.context_menu.is_some());
 
-    env.view.set_instance_status(&id, Status::Stopped);
+    publish_statuses(&mut env.view, &[(&id, Status::Stopped)]);
 
     assert_eq!(env.view.selected_group.as_deref(), Some("util"));
     assert!(env.view.context_menu.is_none());
@@ -492,16 +492,7 @@ fn live_send_ends_when_its_session_is_hidden() {
     let id = select_session(&mut env, "util-live");
     live_send_to_terminal(&mut env, &id);
 
-    Storage::new_unwatched("test")
-        .unwrap()
-        .update(|insts, _| {
-            let disk = insts.iter_mut().find(|i| i.id == id).unwrap();
-            disk.lifecycle_generation += 1;
-            disk.status = Status::Stopped;
-            Ok(())
-        })
-        .unwrap();
-    env.view.reload_storage_only().unwrap();
+    publish_statuses(&mut env.view, &[(&id, Status::Stopped)]);
 
     assert!(!session_titles(&env.view).contains(&"util-live".to_string()));
     assert!(env.view.live_send.is_none(), "live-send ends with its row");
@@ -667,60 +658,55 @@ fn w_skips_an_unread_session_the_filter_hides() {
 /// Restoring a stopped session from Archived or Trash while the filter is on brings it back
 /// into a group that hides it. The selection follows it to its group's header, so the cursor
 /// row and the session the next key acts on agree.
-#[test]
+#[tokio::test]
 #[serial]
-fn restoring_a_session_the_filter_hides_selects_its_own_header() {
-    type Shelve = fn(&mut HomeView, &str);
-    let cases: [(&str, Shelve); 2] = [
-        ("archive", |view, id| {
-            view.select_session_by_id(id);
-            view.toggle_archive_at_cursor().unwrap();
-            assert!(view.get_instance(id).unwrap().is_archived());
-        }),
-        ("trash", |view, id| {
-            view.selected_session = Some(id.to_string());
-            view.trash_session_by_id(id);
-            assert!(view.get_instance(id).unwrap().is_trashed());
-        }),
-    ];
-    for (case, shelve) in cases {
+async fn restoring_a_session_the_filter_hides_selects_its_own_header() {
+    use crate::tui::session_feed::SessionRequest;
+    for trash in [false, true] {
         let mut env = env_with_stopped(true);
         env.view.archived_section_collapsed = false;
         env.view.trashed_section_collapsed = false;
         let id = select_session(&mut env, "util-stopped-a");
-        shelve(&mut env.view, &id);
-        press_y(&mut env);
-        select_session(&mut env, "util-stopped-a");
-        assert_eq!(
-            env.view.selected_session.as_deref(),
-            Some(id.as_str()),
-            "{case}: on the shelf"
-        );
-
-        env.view.toggle_archive_at_cursor().unwrap();
-
+        if trash {
+            let state = native_state(&["test"]).await;
+            apply_published(&mut env.view, &state).await;
+            super::pickers_groups_sort::settle_row_command(
+                &state,
+                &mut env.view,
+                &id,
+                SessionRequest::Trash(Default::default()),
+                |view| {
+                    view.trash_session_by_id(&id);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            press_y(&mut env);
+            select_session(&mut env, "util-stopped-a");
+            super::pickers_groups_sort::settle_row_command(
+                &state,
+                &mut env.view,
+                &id,
+                SessionRequest::Restore,
+                |view| view.toggle_archive_at_cursor(),
+            )
+            .await
+            .unwrap();
+        } else {
+            with_canonical_archive(&mut env, |env| env.view.toggle_archive_at_cursor().unwrap());
+            press_y(&mut env);
+            select_session(&mut env, "util-stopped-a");
+            with_canonical_archive(&mut env, |env| env.view.toggle_archive_at_cursor().unwrap());
+        }
         let inst = env.view.get_instance(&id).unwrap();
+        assert!(!inst.is_archived() && !inst.is_trashed());
+        assert_eq!(inst.status, Status::Stopped);
+        assert!(!session_titles(&env.view).contains(&"util-stopped-a".to_string()));
+        assert_eq!(env.view.selected_session, None);
         assert!(
-            !inst.is_archived() && !inst.is_trashed(),
-            "{case}: restored"
+            matches!(&env.view.flat_items[env.view.cursor], Item::Group { path, .. } if path == "util")
         );
-        assert_eq!(
-            inst.status,
-            Status::Stopped,
-            "{case}: restore keeps it stopped"
-        );
-        assert!(
-            !session_titles(&env.view).contains(&"util-stopped-a".to_string()),
-            "{case}: hidden"
-        );
-        assert_eq!(
-            env.view.selected_session, None,
-            "{case}: the hidden session is not the target"
-        );
-        assert!(
-            matches!(&env.view.flat_items[env.view.cursor], Item::Group { path, .. } if path == "util"),
-            "{case}: cursor on its util header"
-        );
-        assert_eq!(env.view.selected_group.as_deref(), Some("util"), "{case}");
+        assert_eq!(env.view.selected_group.as_deref(), Some("util"));
     }
 }

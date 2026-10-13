@@ -1,7 +1,9 @@
 //! `GET /api/projects?profile=` resolves the registry for the requested profile rather than the
 //! served one, so a wizard that switches profile reads that profile's per-project overrides.
 
-use agent_of_empires::server::test_support::{build_router_for_test, build_test_app_state};
+use agent_of_empires::server::test_support::{
+    build_router_for_test, build_test_app_state, refresh_canonical_metadata_for_test,
+};
 use agent_of_empires::session::projects;
 use agent_of_empires::session::{Project, ProjectOverrides, ProjectScope};
 use axum::body::Body;
@@ -34,16 +36,33 @@ async fn list_projects_resolves_overrides_for_the_requested_profile() {
     let repo = home.path().join("demo");
     std::fs::create_dir_all(&repo).unwrap();
 
+    for profile in ["test", "a", "b"] {
+        agent_of_empires::session::create_profile(profile).unwrap();
+    }
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("demo", repo.to_string_lossy(), ProjectScope::Global).with_overrides(
+            ProjectOverrides {
+                sandbox_enabled: Some(true),
+                ..Default::default()
+            },
+        ),
+        false,
+    )
+    .unwrap();
     for (profile, sandbox) in [("a", false), ("b", true)] {
         let project = Project::new("demo", repo.to_string_lossy(), ProjectScope::Profile)
             .with_overrides(ProjectOverrides {
                 sandbox_enabled: Some(sandbox),
                 ..Default::default()
             });
-        projects::add(profile, ProjectScope::Profile, project, false).unwrap();
+        projects::add(profile, ProjectScope::Profile, project, true).unwrap();
     }
 
-    let app = build_router_for_test(build_test_app_state(Vec::new()));
+    let state = build_test_app_state(Vec::new());
+    refresh_canonical_metadata_for_test(&state).await;
+    let app = build_router_for_test(state);
     for (profile, sandbox) in [("a", false), ("b", true)] {
         let (status, body) = get(&app, &format!("/api/projects?profile={profile}")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -56,16 +75,27 @@ async fn list_projects_resolves_overrides_for_the_requested_profile() {
     let (status, body) = get(&app, "/api/projects?profile=../escape").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "bad_profile", "{body}");
+    for uri in [
+        "/api/projects",
+        "/api/projects?scope=global",
+        "/api/projects?scope=profile&profile=b",
+    ] {
+        let (status, body) = get(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body[0]["overrides"]["sandbox_enabled"], true, "{body}");
+    }
 }
 
-/// An unreadable registry must fail the request: a 200 with the broken file skipped would read as
-/// "no overrides" and let the wizard fall back to the profile's sandbox default.
+/// Registry reads remain on the last complete native publication until a disk reload commits.
 #[tokio::test]
 #[serial_test::serial]
-async fn list_projects_fails_when_a_registry_is_unreadable() {
+async fn list_projects_retains_committed_registry_and_distinguishes_unknown_profiles() {
     let home = crate::common::setup_temp_home();
     let repo = home.path().join("demo");
     std::fs::create_dir_all(&repo).unwrap();
+    for profile in ["test", "a", "b", "empty"] {
+        agent_of_empires::session::create_profile(profile).unwrap();
+    }
     let project = Project::new("demo", repo.to_string_lossy(), ProjectScope::Profile)
         .with_overrides(ProjectOverrides {
             sandbox_enabled: Some(true),
@@ -80,20 +110,27 @@ async fn list_projects_fails_when_a_registry_is_unreadable() {
     )
     .unwrap();
 
-    let app = build_router_for_test(build_test_app_state(Vec::new()));
+    let state = build_test_app_state(Vec::new());
+    refresh_canonical_metadata_for_test(&state).await;
+    let app = build_router_for_test(state);
     let (status, body) = get(&app, "/api/projects?profile=a").await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
+    let (status, committed) = get(&app, "/api/projects?profile=b").await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
     let broken = agent_of_empires::session::get_profile_dir_path("b")
         .unwrap()
         .join("projects.json");
     std::fs::write(&broken, "{ not json").unwrap();
     let (status, body) = get(&app, "/api/projects?profile=b").await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert_eq!(body["error"], "load_failed", "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, committed);
+    assert!(projects::load_merged("b").is_err());
 
-    // A profile that has no registry file at all is genuinely empty.
-    let (status, body) = get(&app, "/api/projects?profile=never-registered").await;
+    let (status, body) = get(&app, "/api/projects?profile=empty").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, serde_json::json!([]));
+    let (status, body) = get(&app, "/api/projects?profile=never-registered").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "profile_not_found");
 }

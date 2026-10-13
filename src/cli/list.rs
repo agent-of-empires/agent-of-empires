@@ -57,6 +57,17 @@ pub struct ListArgs {
     state: StateFilter,
 }
 
+/// Simple string tag describing whether a session is live/archived/trashed,
+/// exposed alongside `trashed_at`/`archived_at` in `--json` so a consumer
+/// keying on state does not have to reason about the timestamps itself.
+/// `live` and `trashed` are the [`SessionScope`] filter vocabulary; `archived`
+/// is an output-only third value, since `--state=archived` is not a filter the
+/// API offers either (an archived row is excluded by `live` and by `trashed`,
+/// and only shows under `all`).
+///
+/// Derived from [`Instance::effective_bucket`] so the `Trashed > Archived >
+/// Active` precedence has exactly one definition: an archived row that is then
+/// trashed keeps its `archived_at` but reports `trashed`.
 pub(super) fn state_tag(inst: &Instance) -> &'static str {
     match inst.effective_bucket() {
         SessionBucket::Trashed => "trashed",
@@ -65,6 +76,12 @@ pub(super) fn state_tag(inst: &Instance) -> &'static str {
     }
 }
 
+/// Mirrors the API's snooze surfacing rule (`SessionResponse::from_instance`,
+/// `src/server/api/sessions/model.rs`): expose `snoozed_until` only while
+/// [`Instance::is_snoozed`] holds. An expired deadline stays persisted until
+/// the next mutation rewrites it, so without this gate a woken row would keep
+/// advertising a snooze that already ended. Shared by `session show --json`
+/// so both CLI projections gate identically.
 pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<chrono::Utc>> {
     if inst.is_snoozed() {
         inst.snoozed_until
@@ -83,19 +100,38 @@ struct SessionJson {
     #[serde(skip_serializing_if = "String::is_empty")]
     command: String,
     profile: String,
+    /// One of `live`, `archived`, `trashed`; the natural way to distinguish a
+    /// trashed row from a failed one that #3350 was filed for.
     state: &'static str,
     created_at: chrono::DateTime<chrono::Utc>,
+    /// Set iff the session is currently in the trash. Together with
+    /// `archived_at`, lets a scripted consumer read the state without a
+    /// second `aoe session list-trash` shellout.
     #[serde(skip_serializing_if = "Option::is_none")]
     trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set iff the session is currently archived. Orthogonal to `trashed_at`
+    /// on the store: `trash()` deliberately leaves `archived_at` alone so a
+    /// restore is faithful, so both keys can be present at once and `state`
+    /// reports `trashed` in that case.
     #[serde(skip_serializing_if = "Option::is_none")]
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set while a snooze deadline is in the future, gated on
+    /// [`Instance::is_snoozed`] exactly like the API: an expired deadline
+    /// lingers on disk but the row has woken, so the key disappears instead
+    /// of advertising a stale snooze. Orthogonal to `state`.
     #[serde(skip_serializing_if = "Option::is_none")]
     snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set iff the session is currently pinned for the web sidebar.
+    /// Independent of `state`; the client derives the boolean as
+    /// `pinned_at != null`, matching the API field from #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pinned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Empty for single-repo sessions; populated with one entry per repo
+    /// (including the primary) for sessions created with `--repo`/`--project`.
     workspace_repos: Vec<WorkspaceRepoJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree: Option<WorktreeJson>,
+    /// The session this one was added under with `aoe add -P`.
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
     /// Expected scope unit glob (`aoe-session-<id>-*.scope`) for live sessions with a process; not proof a unit exists.
@@ -134,7 +170,7 @@ fn systemd_scopes_active() -> bool {
     crate::process::systemd::scopes_expected(crate::session::Config::load_or_warn().systemd.enabled)
 }
 
-fn session_json(inst: &Instance, profile: &str, systemd_active: bool) -> SessionJson {
+fn session_json(inst: &Instance, profile: &str, systemd_namespace: Option<&str>) -> SessionJson {
     let live = matches!(inst.effective_bucket(), SessionBucket::Active);
     SessionJson {
         id: inst.id.clone(),
@@ -153,11 +189,14 @@ fn session_json(inst: &Instance, profile: &str, systemd_active: bool) -> Session
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
         parent_session_id: inst.parent_session_id.clone(),
-        systemd_unit: (systemd_active && live && crate::process::systemd::has_process(inst.status))
-            .then(|| crate::process::systemd::unit_glob(&inst.id)),
+        systemd_unit: systemd_namespace
+            .filter(|_| live && crate::process::systemd::has_process(inst.status))
+            .map(|namespace| crate::process::systemd::unit_glob(&inst.id, namespace)),
     }
 }
 
+/// Via `all_repos` so a session converted by `attach_project` (#3103) lists both
+/// repos here, exactly like one created multi-repo.
 fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
     inst.all_repos()
         .iter()
@@ -212,6 +251,9 @@ fn print_table_header(show_state: bool) {
     }
 }
 
+/// `instances` in table order with each row's nesting depth: an `aoe add -P`
+/// child follows its parent. A child whose parent is not listed stays
+/// top-level, and a parent cycle still lists every row once.
 fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
     fn place<'a>(
         inst: &'a Instance,
@@ -244,12 +286,14 @@ fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
             place(inst, 0, instances, &mut placed, &mut ordered);
         }
     }
+    // Rows reachable only through a parent cycle.
     for inst in instances {
         place(inst, 0, instances, &mut placed, &mut ordered);
     }
     ordered
 }
 
+/// A row's title, indented under its parent when nested.
 fn table_title(inst: &Instance, depth: usize) -> String {
     match depth {
         0 => inst.title.clone(),
@@ -289,6 +333,12 @@ fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
     }
 }
 
+/// Whether the human table should render the `STATE` column. Off for
+/// `--state=live` (every row is `live` and the column carries no
+/// information) and off when filtering to only `trashed` (same). Only
+/// meaningful under `all`, where rows are mixed and a scripted consumer
+/// or human reader benefits from distinguishing a live row from a trashed
+/// or archived one.
 fn table_shows_state(scope: SessionScope) -> bool {
     matches!(scope, SessionScope::All)
 }
@@ -300,18 +350,27 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         return run_all_profiles(args.json, scope).await;
     }
 
-    let storage = Storage::open_unwatched(profile)?;
+    let storage = Storage::open_reference(profile)?;
     let (all_instances, _) = storage.load_with_groups()?;
     let instances: Vec<Instance> = all_instances
         .into_iter()
-        .filter(|inst| SessionScope::matches(Some(scope), inst))
+        .filter(|inst| {
+            SessionScope::matches(Some(scope), (inst).is_archived(), (inst).is_trashed())
+        })
         .collect();
 
+    // `--json` is answered before the empty-listing message: an empty result is
+    // `[]`, never human prose on stdout, matching `aoe ps --json` and `aoe group
+    // list --json`. `--state=live` makes this reachable with sessions present
+    // (a profile whose rows are all trashed), which is precisely the scripted
+    // consumer #3350 is about.
     if args.json {
-        let systemd_active = systemd_scopes_active();
+        let systemd_namespace = systemd_scopes_active()
+            .then(|| crate::process::systemd::scope_namespace().ok())
+            .flatten();
         let sessions: Vec<SessionJson> = instances
             .iter()
-            .map(|inst| session_json(inst, storage.profile(), systemd_active))
+            .map(|inst| session_json(inst, storage.profile(), systemd_namespace.as_deref()))
             .collect();
         super::output::print_json(&sessions)?;
         return Ok(());
@@ -336,6 +395,63 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+/// Read one profile's rows, naming the failure instead of dropping the profile.
+fn read_profile(profile_name: &str) -> Result<Vec<Instance>, String> {
+    let storage = Storage::open_unwatched(profile_name).map_err(|error| error.to_string())?;
+    storage
+        .load_with_groups()
+        .map(|(instances, _)| instances)
+        .map_err(|error| error.to_string())
+}
+
+/// The `--json` listing across every profile, plus a per-profile note for each
+/// one that could not be read. An unreadable profile must never be silently
+/// skipped: the caller has no other way to tell a partial list from a complete
+/// one.
+fn collect_profile_sessions(
+    profiles: &[String],
+    scope: SessionScope,
+) -> (Vec<SessionJson>, Vec<String>) {
+    let systemd_namespace = systemd_scopes_active()
+        .then(|| crate::process::systemd::scope_namespace().ok())
+        .flatten();
+    let mut all_sessions: Vec<SessionJson> = Vec::new();
+    let mut failures = Vec::new();
+    for profile_name in profiles {
+        match read_profile(profile_name) {
+            Ok(instances) => {
+                for inst in &instances {
+                    if !SessionScope::matches(Some(scope), inst.is_archived(), inst.is_trashed()) {
+                        continue;
+                    }
+                    all_sessions.push(session_json(
+                        inst,
+                        profile_name,
+                        systemd_namespace.as_deref(),
+                    ));
+                }
+            }
+            Err(error) => failures.push(format!("profile '{profile_name}': {error}")),
+        }
+    }
+    (all_sessions, failures)
+}
+
+/// Report each unreadable profile on stderr and fail the command, leaving
+/// stdout untouched.
+fn report_profile_failures(failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    for failure in &failures {
+        eprintln!("warning: {failure}");
+    }
+    anyhow::bail!(
+        "{} profile(s) could not be read; the listing is incomplete",
+        failures.len()
+    )
+}
+
 async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
     let profiles = crate::session::list_profiles()?;
 
@@ -345,46 +461,41 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
     }
 
     if json {
-        let systemd_active = systemd_scopes_active();
-        let mut all_sessions: Vec<SessionJson> = Vec::new();
-        for profile_name in &profiles {
-            if let Ok(storage) = Storage::open_unwatched(profile_name) {
-                if let Ok((instances, _)) = storage.load_with_groups() {
-                    for inst in &instances {
-                        if !SessionScope::matches(Some(scope), inst) {
-                            continue;
-                        }
-                        all_sessions.push(session_json(inst, profile_name, systemd_active));
-                    }
-                }
-            }
-        }
+        let (all_sessions, failures) = collect_profile_sessions(&profiles, scope);
         super::output::print_json(&all_sessions)?;
-        return Ok(());
+        // stdout stays pure JSON: a profile that could not be read is reported
+        // on stderr and turns the exit code non-zero, so a consumer never
+        // mistakes a partial listing for a complete one.
+        return report_profile_failures(failures);
     }
 
     let show_state = table_shows_state(scope);
     let mut total_sessions = 0;
     for profile_name in &profiles {
-        if let Ok(storage) = Storage::open_unwatched(profile_name) {
-            if let Ok((all_instances, _)) = storage.load_with_groups() {
-                let instances: Vec<&Instance> = all_instances
-                    .iter()
-                    .filter(|inst| SessionScope::matches(Some(scope), inst))
-                    .collect();
-                if instances.is_empty() {
-                    continue;
-                }
-
-                println!("\n═══ Profile: {} ═══\n", profile_name);
-                print_table_header(show_state);
-                for (inst, depth) in nest_children(&instances) {
-                    print_table_row(inst, depth, show_state);
-                }
-                println!("({} sessions)", instances.len());
-                total_sessions += instances.len();
-            }
+        let (all_instances, failure) = match read_profile(profile_name) {
+            Ok(instances) => (instances, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        if let Some(error) = &failure {
+            eprintln!("warning: profile '{profile_name}': {error}");
         }
+        let instances: Vec<&Instance> = all_instances
+            .iter()
+            .filter(|inst| {
+                SessionScope::matches(Some(scope), (inst).is_archived(), (inst).is_trashed())
+            })
+            .collect();
+        if instances.is_empty() {
+            continue;
+        }
+
+        println!("\n═══ Profile: {} ═══\n", profile_name);
+        print_table_header(show_state);
+        for (inst, depth) in nest_children(&instances) {
+            print_table_row(inst, depth, show_state);
+        }
+        println!("({} sessions)", instances.len());
+        total_sessions += instances.len();
     }
 
     println!("\n═══════════════════════════════════════");
@@ -401,6 +512,7 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// #3472: `aoe add -P` children render under their parent in the table.
     #[test]
     fn nest_children_lists_each_child_under_its_listed_parent() {
         let row = |title: &str, parent: Option<&str>| {
@@ -444,9 +556,7 @@ mod tests {
         );
 
         assert_eq!(
-            session_json(&child, "p", false)
-                .parent_session_id
-                .as_deref(),
+            session_json(&child, "p", None).parent_session_id.as_deref(),
             Some(root.id.as_str())
         );
     }
@@ -455,7 +565,7 @@ mod tests {
     fn session_json_reports_state_and_only_the_timestamps_that_apply() {
         let plain = Instance::new("z", "/repo");
         assert_eq!(state_tag(&plain), "live");
-        let json = session_json(&plain, "p", false);
+        let json = session_json(&plain, "p", None);
         assert_eq!(json.state, "live");
         let serialized = serde_json::to_string(&json).unwrap();
         assert!(!serialized.contains("trashed_at"));
@@ -465,7 +575,7 @@ mod tests {
         let mut archived = Instance::new("z", "/repo");
         archived.archive();
         assert_eq!(state_tag(&archived), "archived");
-        let json = session_json(&archived, "p", false);
+        let json = session_json(&archived, "p", None);
         assert_eq!(json.state, "archived");
         assert!(json.archived_at.is_some());
         assert!(json.trashed_at.is_none());
@@ -473,10 +583,39 @@ mod tests {
         let mut trashed = Instance::new("z", "/repo");
         trashed.trash();
         assert_eq!(state_tag(&trashed), "trashed");
-        let json = session_json(&trashed, "p", false);
+        let json = session_json(&trashed, "p", None);
         assert_eq!(json.state, "trashed");
         assert!(json.trashed_at.is_some());
         assert!(json.archived_at.is_none());
+    }
+
+    /// An unreadable profile must surface, not vanish: a silent skip makes a
+    /// partial listing indistinguishable from a complete one.
+    #[test]
+    fn an_unreadable_profile_is_reported_rather_than_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        // A regular file where the profile directory belongs: the name still
+        // exists, so nothing creates it, and opening it fails deterministically.
+        let profiles = temp.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(profiles.join("broken"), b"x").unwrap();
+        let (rows, failures) =
+            collect_profile_sessions(&["broken".to_string()], SessionScope::Live);
+        assert!(rows.is_empty());
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(
+            failures[0].contains("broken"),
+            "the failure must name the profile: {}",
+            failures[0]
+        );
+        assert!(
+            report_profile_failures(failures)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete"),
+            "an incomplete listing must not exit zero"
+        );
     }
 
     #[test]
@@ -490,7 +629,7 @@ mod tests {
             inst
         };
         let check = |label: &str, f: &dyn Fn(&mut Instance), snooze: bool, pin: bool, state| {
-            let value = serde_json::to_value(session_json(&row(f), "p", false)).unwrap();
+            let value = serde_json::to_value(session_json(&row(f), "p", None)).unwrap();
             let seen = (
                 value.get("snoozed_until").is_some(),
                 value.get("pinned_at").is_some(),
@@ -569,7 +708,7 @@ mod tests {
         let active = serde_json::to_value(session_json(
             &row(&|i| i.snoozed_until = Some(future)),
             "p",
-            false,
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -580,7 +719,7 @@ mod tests {
 
     #[test]
     fn systemd_unit_field_serialization() {
-        let mut j = session_json(&Instance::new("example", "/repo"), "p", false);
+        let mut j = session_json(&Instance::new("example", "/repo"), "p", None);
         j.systemd_unit = Some("aoe-session-abc123-*.scope".into());
         let v = serde_json::to_value(&j).unwrap();
         assert_eq!(v["systemd_unit"], "aoe-session-abc123-*.scope");
@@ -600,34 +739,21 @@ mod tests {
         archived.archive();
         let mut stopped = Instance::new("example", "/repo");
         stopped.status = crate::session::Status::Stopped;
-        assert_eq!(session_json(&live, "p", false).systemd_unit, None);
+        assert_eq!(session_json(&live, "p", None).systemd_unit, None);
         assert_eq!(
-            session_json(&live, "p", true).systemd_unit,
-            Some(format!("aoe-session-{}-*.scope", live.id))
+            session_json(&live, "p", Some("namespace")).systemd_unit,
+            Some(format!("aoe-session-{}-namespace-*.scope", live.id))
         );
         for no_scope in [&trashed, &archived, &stopped] {
-            assert_eq!(session_json(no_scope, "p", true).systemd_unit, None);
-        }
-    }
-
-    #[test]
-    fn default_state_is_all_for_backward_compat() {
-        let default: SessionScope = StateFilter::All.into();
-        assert!(matches!(default, SessionScope::All));
-
-        let live_inst = Instance::new("l", "/r");
-        let mut trashed = Instance::new("t", "/r");
-        trashed.trash();
-        let mut archived = Instance::new("a", "/r");
-        archived.archive();
-        for inst in [&live_inst, &trashed, &archived] {
-            assert!(
-                SessionScope::matches(Some(default), inst),
-                "default state=all must list every session"
+            assert_eq!(
+                session_json(no_scope, "p", Some("namespace")).systemd_unit,
+                None
             );
         }
     }
 
+    /// `list --all` never consumes `--profile`; the single-profile form goes
+    /// through `Storage::open_unwatched`, which refuses an unknown name (#148).
     mod profile_guard {
         use crate::cli::{Cli, Commands};
         use clap::Parser;

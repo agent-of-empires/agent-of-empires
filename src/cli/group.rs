@@ -77,7 +77,7 @@ pub async fn run(profile: &str, command: GroupCommands) -> Result<()> {
 }
 
 async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let storage = Storage::open_reference(profile)?;
     let (instances, groups) = storage.load_with_groups()?;
 
     let group_tree = GroupTree::new_with_groups(&instances, &groups);

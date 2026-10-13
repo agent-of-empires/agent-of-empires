@@ -70,6 +70,22 @@ describe("sidebar Edit workdir name", () => {
   });
 });
 
+describe("sidebar workdir receipt warnings", () => {
+  it("applies the canonical row and reports edit warnings without an error", async () => {
+    const warning = "Worktree metadata was saved with a cleanup warning";
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({
+        ...makeSession({ branch: "fresh-name", has_managed_worktree: true }),
+        outcome: { warnings: [warning] },
+      }),
+    );
+    editWorkdir("fresh-name");
+    await vi.waitFor(() => expect(reportInfo).toHaveBeenCalledWith(warning));
+    expect(reportError).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("workdir-modal-error")).toBeNull();
+  });
+});
+
 describe("sidebar inline rename", () => {
   it("PATCHes the title endpoint", async () => {
     rename("new title");
@@ -79,7 +95,9 @@ describe("sidebar inline rename", () => {
 
   it("reports warnings from a successful rename as info, not errors", async () => {
     const warning = "Session was saved, but its live tmux session could not be rekeyed";
-    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "s1", warnings: [warning] }));
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({ ...makeSession({ title: "new title" }), outcome: { warnings: [warning] } }),
+    );
     rename("new title");
     await vi.waitFor(() => expect(reportInfo).toHaveBeenCalledWith(warning));
     expect(reportError).not.toHaveBeenCalled();

@@ -28,9 +28,13 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
 pub(crate) fn resolve_client_ip(
     socket_addr: SocketAddr,
     headers: &axum::http::HeaderMap,
+    behind_ingress: bool,
 ) -> IpAddr {
     let socket_ip = socket_addr.ip();
-    if socket_ip.is_loopback() {
+    // A forwarded header is only as trustworthy as the proxy that sets it, and
+    // a loopback peer is indistinguishable from that proxy: any local process
+    // could otherwise rotate the header and void the per-IP auth rate limiter.
+    if behind_ingress && socket_ip.is_loopback() {
         if let Some(cf_ip) = headers.get("cf-connecting-ip") {
             if let Ok(ip_str) = cf_ip.to_str() {
                 if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
@@ -51,10 +55,21 @@ pub(crate) fn resolve_client_ip(
     socket_ip
 }
 
-/// Whether `client_ip` should be treated as a same-host caller that already passes the
-/// filesystem-permission trust boundary.
-fn is_local_trusted(client_ip: IpAddr) -> bool {
-    client_ip.is_loopback()
+fn is_local_trusted(
+    client_ip: IpAddr,
+    headers: &axum::http::HeaderMap,
+    behind_ingress: bool,
+) -> bool {
+    !behind_ingress
+        && client_ip.is_loopback()
+        && ![
+            "cf-connecting-ip",
+            "x-forwarded-for",
+            "forwarded",
+            "x-real-ip",
+        ]
+        .iter()
+        .any(|header| headers.contains_key(*header))
 }
 
 /// Build a Set-Cookie header value with optional Secure flag for HTTPS tunnels.
@@ -197,12 +212,12 @@ enum PostTokenAuthAction {
 fn post_token_auth_action(
     login_enabled: bool,
     login_exempt: bool,
-    client_ip: IpAddr,
+    loopback_trusted: bool,
 ) -> PostTokenAuthAction {
     if !login_enabled || login_exempt {
         return PostTokenAuthAction::Bypass;
     }
-    if is_local_trusted(client_ip) {
+    if loopback_trusted {
         PostTokenAuthAction::Bypass
     } else {
         PostTokenAuthAction::RequireLogin
@@ -221,15 +236,11 @@ enum PassphraseWallEntryAction {
 }
 
 /// Resolve the entry decision for `run_passphrase_wall`.
-fn passphrase_wall_entry_action(
-    path: &str,
-    client_ip: IpAddr,
-    behind_ingress: bool,
-) -> PassphraseWallEntryAction {
+fn passphrase_wall_entry_action(path: &str, loopback_trusted: bool) -> PassphraseWallEntryAction {
     if is_login_session_exempt(path) {
         return PassphraseWallEntryAction::BypassExempt;
     }
-    if !behind_ingress && is_local_trusted(client_ip) {
+    if loopback_trusted {
         return PassphraseWallEntryAction::BypassLoopback;
     }
     PassphraseWallEntryAction::Continue
@@ -345,6 +356,20 @@ pub struct AuthenticatedSession(pub String);
 #[derive(Clone, Copy, Debug)]
 pub struct LoopbackTrusted;
 
+/// Request extension carrying the authorization grounded in the accepted
+/// connection, independent of browser credentials. `LoopbackTrusted` answers
+/// "is this the same host"; this answers "is this the same *process*", which
+/// is what a Unix-socket peer proves and a loopback TCP bearer client does
+/// not. Handlers that gate a secret-bearing capability read this one.
+#[derive(Clone, Copy, Debug)]
+pub enum LocalAuthorization {
+    /// The peer on the daemon's Unix socket, with its uid from the kernel.
+    UnixOwner(u32),
+    /// Same host, different identity: any process that can open a loopback
+    /// socket, including a browser client holding a bearer token.
+    TcpLoopback,
+}
+
 /// Pure elevation decision, extracted so the matrix is unit-testable without standing up
 /// `AppState`.
 fn elevation_verdict(
@@ -380,12 +405,13 @@ async fn run_passphrase_wall(
     state: &AppState,
     request: Request,
     client_ip: IpAddr,
+    loopback_trusted: bool,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
-    match passphrase_wall_entry_action(&path, client_ip, state.behind_tunnel) {
+    match passphrase_wall_entry_action(&path, loopback_trusted) {
         PassphraseWallEntryAction::BypassExempt => return next.run(request).await,
         PassphraseWallEntryAction::BypassLoopback => {
             log_loopback_bypass_passphrase(client_ip, &path);
@@ -462,20 +488,51 @@ async fn run_passphrase_wall(
 
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let client_ip = resolve_client_ip(addr, request.headers());
+    // The listeners stamp the connection's identity as a `ConnectInfo`: the
+    // Unix one from SO_PEERCRED, the TCP one from the accepted address. It is
+    // read off the request rather than taken as an extractor, because the two
+    // listeners stamp different payloads and a required extractor would fail
+    // on the one that stamps the other.
+    let (peer_uid, addr) = match request
+        .extensions()
+        .get::<ConnectInfo<super::peer::ConnectionPeer>>()
+    {
+        Some(ConnectInfo(super::peer::ConnectionPeer::UnixOwner { uid })) => {
+            (Some(*uid), SocketAddr::from(([0, 0, 0, 0], 0)))
+        }
+        Some(ConnectInfo(super::peer::ConnectionPeer::Tcp(addr))) => (None, *addr),
+        // A request with no stamped identity is a non-local caller, not a
+        // failed request.
+        None => (
+            None,
+            request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| *addr)
+                .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+        ),
+    };
+    let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
 
-    // Mark same-host callers before any auth branch so handler-side elevation gates see the
-    // #1168 carve-out no matter which path (token, session, passphrase wall, loopback
-    // bypass) handled the request.
-    let wall_covers_loopback = state.behind_tunnel
-        && state.token_manager.is_no_auth().await
-        && state.login_manager.is_enabled();
-    if !wall_covers_loopback && is_local_trusted(client_ip) {
+    let loopback_trusted = is_local_trusted(client_ip, request.headers(), state.behind_tunnel);
+    if loopback_trusted {
         request.extensions_mut().insert(LoopbackTrusted);
+    }
+    if let Some(uid) = peer_uid {
+        // The socket's owner is identified by the kernel, not by anything the
+        // caller can present, so it needs none of the credential branches and
+        // never reaches a state that can fail them.
+        request
+            .extensions_mut()
+            .insert(LocalAuthorization::UnixOwner(uid));
+        return next.run(request).await;
+    } else if loopback_trusted {
+        request
+            .extensions_mut()
+            .insert(LocalAuthorization::TcpLoopback);
     }
 
     // Trace structured view ws specifically so we can see whether the browser ever reached
@@ -513,7 +570,7 @@ pub async fn auth_middleware(
             request
                 .extensions_mut()
                 .insert(AuthenticatedTokenHash([0u8; 32]));
-            return run_passphrase_wall(&state, request, client_ip, next).await;
+            return run_passphrase_wall(&state, request, client_ip, loopback_trusted, next).await;
         }
         NO_AUTH_LOGGED.call_once(|| {
             tracing::info!(
@@ -528,7 +585,13 @@ pub async fn auth_middleware(
     }
 
     // Rate limit check BEFORE token validation
-    if let Some(remaining_secs) = state.rate_limiter.check_locked(client_ip).await {
+    if let Some(remaining_secs) = state
+        .rate_limiter
+        // Every budget, not just the token one: a valid bearer must not reset
+        // a passphrase budget that is already counting down.
+        .check_locked_any(client_ip)
+        .await
+    {
         tracing::warn!(
             target: "auth.rate_limit",
             ip = %client_ip,
@@ -611,7 +674,10 @@ pub async fn auth_middleware(
         if !is_api_or_ws {
             return next.run(request).await;
         }
-        let locked = state.rate_limiter.record_failure(client_ip).await;
+        let locked = state
+            .rate_limiter
+            .record_failure(client_ip, super::rate_limit::AuthBudget::Token)
+            .await;
         let reason =
             if extract_tokens(&request).is_empty() && extract_ws_protocols(&request).is_empty() {
                 "missing"
@@ -637,7 +703,10 @@ pub async fn auth_middleware(
     };
 
     // Token valid: record success, stamp owner, record device.
-    state.rate_limiter.record_success(client_ip).await;
+    state
+        .rate_limiter
+        .record_success(client_ip, super::rate_limit::AuthBudget::Token)
+        .await;
     tracing::trace!(
         target: "auth.middleware",
         ip = %client_ip,
@@ -654,11 +723,10 @@ pub async fn auth_middleware(
     let should_attach_token =
         matches!(source, TokenSource::QueryParam | TokenSource::Bearer) || needs_upgrade;
 
-    // When login is enabled, a valid token alone is not enough for non-bootstrap paths.
     let login_exempt = is_login_session_exempt(&path);
-    match post_token_auth_action(login_enabled, login_exempt, client_ip) {
+    match post_token_auth_action(login_enabled, login_exempt, loopback_trusted) {
         PostTokenAuthAction::Bypass => {
-            if login_enabled && !login_exempt && is_local_trusted(client_ip) {
+            if login_enabled && !login_exempt && loopback_trusted {
                 log_loopback_bypass_token(client_ip, &path);
             }
         }
@@ -707,7 +775,10 @@ async fn handle_session_authenticated(
     next: Next,
     session_id: String,
 ) -> Response {
-    state.rate_limiter.record_success(client_ip).await;
+    state
+        .rate_limiter
+        .record_success(client_ip, super::rate_limit::AuthBudget::Token)
+        .await;
     tracing::trace!(
         target: "auth.middleware",
         ip = %client_ip,
@@ -851,7 +922,7 @@ mod tests {
                 let name = axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap();
                 map.insert(name, v.parse().unwrap());
             }
-            resolve_client_ip(socket.parse().unwrap(), &map)
+            resolve_client_ip(socket.parse().unwrap(), &map, true)
         };
         let cf = ("cf-connecting-ip", "203.0.113.50");
         let xff = |v: &'static str| ("x-forwarded-for", v);
@@ -880,10 +951,16 @@ mod tests {
         );
 
         for local in ["127.0.0.1", "::1"] {
-            assert!(is_local_trusted(ip(local)), "{local}");
+            assert!(
+                is_local_trusted(ip(local), &axum::http::HeaderMap::new(), false),
+                "{local}"
+            );
         }
         for remote in ["192.168.1.50", "100.64.0.5", "203.0.113.10"] {
-            assert!(!is_local_trusted(ip(remote)), "{remote}");
+            assert!(
+                !is_local_trusted(ip(remote), &axum::http::HeaderMap::new(), false),
+                "{remote}"
+            );
         }
     }
 
@@ -913,10 +990,6 @@ mod tests {
         }
     }
 
-    /// Per-row coverage of the post-token branch policy from #1168. The remote +
-    /// non-bootstrap row is the threat passphrase auth exists to mitigate (a leaked
-    /// token used from off-box); a real reverse proxy is covered because
-    /// `resolve_client_ip` hands us the forwarded remote IP, not the loopback socket.
     #[test]
     fn post_token_auth_action_matrix() {
         use PostTokenAuthAction::*;
@@ -932,16 +1005,26 @@ mod tests {
         ];
         for (enabled, exempt, client, want) in cases {
             assert_eq!(
-                post_token_auth_action(enabled, exempt, ip(client)),
+                post_token_auth_action(
+                    enabled,
+                    exempt,
+                    is_local_trusted(ip(client), &axum::http::HeaderMap::new(), false)
+                ),
                 want,
                 "enabled={enabled} exempt={exempt} ip={client}"
             );
         }
+        assert_eq!(
+            post_token_auth_action(
+                true,
+                false,
+                is_local_trusted(ip("127.0.0.1"), &axum::http::HeaderMap::new(), true)
+            ),
+            RequireLogin,
+            "loopback behind an ingress must not bypass the login"
+        );
     }
 
-    /// Per-row coverage of the passphrase-wall entry policy added in #1525. The
-    /// login-bootstrap allow-list wins regardless of IP or ingress, otherwise nobody
-    /// could reach the wall to get past it; #3843 is the ingress column.
     #[test]
     fn passphrase_wall_entry_action_matrix() {
         use PassphraseWallEntryAction::*;
@@ -961,10 +1044,46 @@ mod tests {
         ];
         for (path, client, ingress, want) in cases {
             assert_eq!(
-                passphrase_wall_entry_action(path, ip(client), ingress),
+                passphrase_wall_entry_action(
+                    path,
+                    is_local_trusted(ip(client), &axum::http::HeaderMap::new(), ingress)
+                ),
                 want,
                 "path={path} ip={client} ingress={ingress}"
             );
+        }
+    }
+
+    #[test]
+    fn forwarding_metadata_never_grants_direct_loopback_authorization() {
+        for client in ["127.0.0.1", "::1"] {
+            for header in [
+                "cf-connecting-ip",
+                "x-forwarded-for",
+                "forwarded",
+                "x-real-ip",
+            ] {
+                for value in ["", "invalid", "203.0.113.5"] {
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert(
+                        axum::http::HeaderName::from_static(header),
+                        value.parse().unwrap(),
+                    );
+                    for ingress in [false, true] {
+                        let trusted = is_local_trusted(ip(client), &headers, ingress);
+                        assert!(!trusted, "{client} {header}={value:?} ingress={ingress}");
+                        assert_eq!(
+                            passphrase_wall_entry_action("/api/sessions", trusted),
+                            PassphraseWallEntryAction::Continue
+                        );
+                        assert_eq!(
+                            post_token_auth_action(true, false, trusted),
+                            PostTokenAuthAction::RequireLogin
+                        );
+                        assert!(!elevation_verdict(true, trusted, None));
+                    }
+                }
+            }
         }
     }
 

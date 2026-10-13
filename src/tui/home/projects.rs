@@ -88,15 +88,14 @@ impl HomeView {
     /// Resolve the effective `SessionConfig` for an existing session row, honoring
     /// per-profile overrides: it reads the instance's `source_profile`, since the view's
     /// active profile may have moved on, falling back to `config_profile()` when the row
-    /// records none. `None` for structured sessions, whose attach-mode and click-action
-    /// settings all have structured-specific bypass paths upstream, so callers treat it as
-    /// "skip this setting".
+    /// records none. Structured agent panes bypass attach/click settings; their auxiliary
+    /// terminal and tool panes honor the same per-profile settings as terminal agents.
     pub(super) fn resolve_session_config_for(
         &self,
         session_id: &str,
     ) -> Option<crate::session::SessionConfig> {
         let inst = self.get_instance(session_id)?;
-        if inst.is_structured() {
+        if inst.is_structured() && matches!(self.view_mode, ViewMode::Structured) {
             return None;
         }
         let profile = if inst.source_profile.is_empty() {

@@ -65,7 +65,10 @@ async function mockApis(page: Page, sessions: MockSession[], ordering: string[],
   await mockStaticApis(page);
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
-    return r.fulfill({ json: { sessions: sessions.map(sessionResponse), workspace_ordering: ordering } });
+    return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: { sessions: sessions.map(sessionResponse), workspace_ordering: ordering },
+    });
   });
   await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: uiEntries, notifications: [] } }));
 }

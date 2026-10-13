@@ -20,6 +20,9 @@ pub struct ImportableSession {
     /// RFC 3339 last activity, when the source reports one.
     pub updated_at: Option<String>,
     pub cwd_exists: bool,
+    /// Source-qualified identity retained only for canonical create admission.
+    #[serde(skip)]
+    pub conversation_binding: Option<crate::session::ConversationBinding>,
 }
 
 impl ImportableSession {
@@ -36,6 +39,7 @@ impl ImportableSession {
             title,
             updated_at,
             cwd_exists,
+            conversation_binding: None,
         }
     }
 
@@ -228,6 +232,7 @@ mod tests {
             title: None,
             updated_at: updated_at.map(str::to_string),
             cwd_exists: true,
+            conversation_binding: None,
         }
     }
 

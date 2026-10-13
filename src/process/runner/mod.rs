@@ -103,6 +103,9 @@ pub struct AcpRunnerArgs {
     /// the registry record and compared against the restart marker.
     #[arg(long, default_value_t = 0)]
     pub generation: u64,
+    /// Exact transient unit created by this launch, absent for an unscoped runner.
+    #[arg(long)]
+    pub systemd_scope: Option<String>,
     /// Agent program + args after `--`.
     #[arg(last = true, required = true)]
     pub agent_argv: Vec<String>,
@@ -154,7 +157,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     // Save the record before spawning so a save failure has no agent tree to leak.
     let our_pid = std::process::id();
-    let record = WorkerRecord::new(
+    let mut record = WorkerRecord::new(
         args.session_id.clone(),
         our_pid,
         args.socket.clone(),
@@ -172,6 +175,11 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     )
     .with_generation(args.generation);
+    record.scope = args
+        .systemd_scope
+        .as_ref()
+        .map(|unit| worker_registry::ScopeOwnership::Owned { unit: unit.clone() })
+        .unwrap_or(worker_registry::ScopeOwnership::Unscoped);
     if let Err(e) = worker_registry::save(&record).context("writing registry record") {
         let _ = std::fs::remove_file(&control_socket);
         return Err(e);

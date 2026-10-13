@@ -9,7 +9,7 @@ mod requests;
 mod sink;
 mod teardown;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -30,9 +30,10 @@ use super::runner_lifecycle::{
 use super::state::AcpSessionId;
 use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
+pub(crate) use teardown::RetirementTarget;
 
 pub(crate) use agents::apply_agent_command_override;
-pub(crate) use launch::host_spawn_environment;
+pub(crate) use launch::{host_spawn_environment, with_durable_launch};
 pub use sink::{BroadcastSink, ChannelSink};
 
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.
@@ -88,6 +89,8 @@ pub enum SupervisorError {
     Blocked(crate::session::StartBlocked),
     #[error("session {0:?} no longer exists")]
     SessionGone(String),
+    #[error("native session authority unavailable")]
+    NativeStoreUnavailable,
 }
 
 /// What the caller does with prompt text after it was published.
@@ -123,6 +126,7 @@ struct WorkerHandle {
     /// Respawn timestamps inside the restart window; the initial spawn is not counted.
     restart_history: Vec<Instant>,
     kind: WorkerKind,
+    launch_epoch: u64,
     lease: Lease,
     native_session_id: Option<String>,
 }
@@ -180,6 +184,7 @@ pub struct Supervisor<S: BroadcastSink> {
 /// install abandons the epoch so a failed resume cannot pin the session.
 pub(crate) struct ResumeReservation {
     lease: Lease,
+    pub(crate) expected_lifecycle_generation: Option<u64>,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
 }
@@ -192,7 +197,19 @@ impl ResumeReservation {
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
-        if lock_recover(&self.lifecycle).abandon(&self.lease) {
+        let mut lifecycle = lock_recover(&self.lifecycle);
+        if lifecycle.construction_is_pending(&self.lease) {
+            self.lease.cancellation().cancel();
+        }
+        if let Some(identity) = self.lease.spawned_runner() {
+            if lifecycle.convert_to_stopping(&self.lease) {
+                lifecycle.settle(
+                    &self.lease,
+                    super::runner_lifecycle::Settlement::Unproven(Some(identity)),
+                );
+                self.notify.notify_waiters();
+            }
+        } else if lifecycle.abandon(&self.lease) {
             self.notify.notify_waiters();
         }
     }
@@ -216,6 +233,8 @@ pub enum SandboxContinuation {
 
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
+    pub(crate) launch_admission: Option<LaunchAdmission>,
+    pub(crate) expected_lifecycle_generation: u64,
     pub session_id: String,
     /// The ACP backend `pick_agent_for_tool` resolved.
     pub agent: String,
@@ -250,6 +269,21 @@ pub struct SpawnRequest {
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }
 
+#[derive(Clone)]
+pub(crate) struct LaunchAdmission {
+    pub store: Arc<dyn crate::session::SessionStore>,
+    pub generation: u64,
+    pub namespace: Option<Arc<tokio::sync::RwLock<()>>>,
+}
+
+impl std::fmt::Debug for LaunchAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchAdmission")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Constructor with no concurrency cap.
     pub fn new(sink: Arc<S>) -> Self {
@@ -280,6 +314,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             respawned_in_place: Arc::default(),
             max_concurrent_workers,
         }
+    }
+
+    pub(crate) fn max_concurrent_workers(&self) -> u32 {
+        self.max_concurrent_workers
     }
 
     /// Flag a build-stale worker kept alive to finish its turn.
@@ -358,14 +396,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle).phase(session_id).into()
     }
 
-    /// Drop per-session bookkeeping for a deleted session.
-    pub fn forget_session(&self, session_id: &str) {
+    /// Drop bookkeeping only after the matching runner retirement is proven.
+    pub fn forget_session(&self, session_id: &str) -> Result<(), SupervisorError> {
+        if !lock_recover(&self.lifecycle).forget(session_id) {
+            return Err(SupervisorError::TeardownPending(session_id.into()));
+        }
         if let Ok(mut guard) = self.next_seqs.lock() {
             guard.remove(session_id);
         }
-        lock_recover(&self.lifecycle).forget(session_id);
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
+        Ok(())
     }
 
     /// Seed seq counters from the event store's stored maxima.
@@ -391,6 +432,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
             .get(session_id)
             .is_some_and(|worker| worker.lease.epoch() == generation)
+    }
+
+    /// Automatic respawns retain the originating launch; a new launch supersedes it.
+    pub(crate) async fn is_current_launch(&self, session_id: &str, launch_epoch: u64) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|worker| worker.launch_epoch == launch_epoch)
     }
 
     /// Return the native store owned by the current worker only when it still

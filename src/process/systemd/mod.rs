@@ -1,6 +1,8 @@
-//! Per-session transient systemd scopes via `systemd-run --user --scope`. Best
-//! effort: every failure is logged and ignored so a session never depends on
-//! systemd. Compiled on every OS; outside Linux the entry points are inert.
+//! Per-session transient systemd scopes via systemd-run --user --scope. New
+//! scope creation is best effort and falls back to unscoped launch. Retirement
+//! is fallible: only exact captured units with proven empty cgroups authorize
+//! releasing owned resources; unknown ownership or manager errors retain them.
+//! Compiled on every OS, with scope creation supported only on Linux.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,12 +50,30 @@ fn escaped_id(session_id: &str) -> String {
     format!("{UNIT_PREFIX}{}", escape(session_id))
 }
 
-pub(crate) fn unit_name(session_id: &str, start_ms: u64) -> String {
-    format!("{}-{start_ms}.scope", escaped_id(session_id))
+pub(crate) fn unit_name(session_id: &str, start_ms: u64, namespace: &str) -> String {
+    format!(
+        "{}-{namespace}-{start_ms}-{}.scope",
+        escaped_id(session_id),
+        uuid::Uuid::new_v4()
+    )
 }
 
-pub(crate) fn unit_glob(session_id: &str) -> String {
-    format!("{}-*.scope", escaped_id(session_id))
+pub(crate) fn unit_glob(session_id: &str, namespace: &str) -> String {
+    format!("{}-{namespace}-*.scope", escaped_id(session_id))
+}
+
+/// Application-directory consistency, not instance authentication or attestation.
+pub(crate) fn scope_namespace() -> anyhow::Result<String> {
+    use sha2::Digest;
+    let app = crate::session::get_app_dir()?.canonicalize()?;
+    let digest = sha2::Sha256::digest(app.as_os_str().as_encoded_bytes());
+    let mut namespace = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        namespace.push(char::from(HEX[usize::from(byte >> 4)]));
+        namespace.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    Ok(namespace)
 }
 
 fn now_ms() -> u64 {
@@ -443,6 +463,19 @@ pub(crate) struct ScopePrefix {
 }
 
 impl ScopePrefix {
+    /// The only scope this prefix can create; its exact name survives SID reuse.
+    pub(crate) fn ownership(&self) -> crate::process::worker_registry::ScopeOwnership {
+        self.argv
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--unit="))
+            .map(
+                |unit| crate::process::worker_registry::ScopeOwnership::Owned {
+                    unit: unit.to_owned(),
+                },
+            )
+            .unwrap_or(crate::process::worker_registry::ScopeOwnership::Unscoped)
+    }
+
     /// `argv`, then `<env> -u INVOCATION_ID`; callers append their own
     /// restore words and the command.
     pub(crate) fn with_env_restore(&self) -> Vec<String> {
@@ -463,7 +496,8 @@ pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopeP
     } else {
         profile.to_string()
     };
-    let unit = unit_name(session_id, now_ms());
+    let namespace = scope_namespace().ok()?;
+    let unit = unit_name(session_id, now_ms(), &namespace);
     let mut argv = vec![cap.systemd_run.to_string_lossy().into_owned()];
     argv.extend(scope_args(
         &cap.cfg,
@@ -477,44 +511,93 @@ pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopeP
     })
 }
 
-/// Stops the session's scope(s) without waiting. Ignores `enabled`, which
-/// gates only new scopes: ones from before it was turned off still need
-/// stopping. Best effort; inert outside Linux.
-pub(crate) fn release(session_id: &str) {
+/// Retire only frozen owned units, including scopes created before configuration was disabled.
+pub(crate) fn retire_scopes(
+    session_id: &str,
+    scopes: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<()> {
     #[cfg(test)]
     release_probe::observe(session_id);
-    if cfg!(test) || !cfg!(target_os = "linux") {
-        return;
-    }
-    let Ok(systemctl) = which::which("systemctl") else {
-        return;
+    scopes
+        .iter()
+        .try_for_each(|scope| retire_scope(session_id, scope))
+}
+/// Prove a captured scope empty without selecting any replacement by SID.
+pub(crate) fn scope_stopped(
+    session_id: &str,
+    scope: &crate::process::worker_registry::ScopeOwnership,
+) -> anyhow::Result<bool> {
+    use crate::process::worker_registry::ScopeOwnership;
+    let unit = match scope {
+        ScopeOwnership::Unscoped => return Ok(true),
+        ScopeOwnership::Unresolved => anyhow::bail!("runner scope ownership is unresolved"),
+        ScopeOwnership::Owned { unit } => unit,
     };
-    release_with(session_id, &|argv| {
-        let mut cmd = Command::new(&systemctl);
-        cmd.args(&argv[1..]);
-        crate::process::run_with_timeout(&mut cmd, Duration::from_secs(3))
-    });
+    anyhow::ensure!(
+        cfg!(target_os = "linux"),
+        "captured Linux scope cannot be checked on this platform"
+    );
+    anyhow::ensure!(
+        unit.starts_with(&format!("{}-", escaped_id(session_id)))
+            && unit.ends_with(".scope")
+            && unit
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b':')),
+        "invalid captured scope unit"
+    );
+    let mut command = Command::new(which::which("systemctl")?);
+    command.args([
+        "--user",
+        "show",
+        "--property=LoadState",
+        "--property=ActiveState",
+        "--property=ControlGroup",
+        unit,
+    ]);
+    let output = crate::process::run_with_timeout(&mut command, Duration::from_secs(3))?
+        .ok_or_else(|| anyhow::anyhow!("scope status timed out"))?;
+    let text = std::str::from_utf8(&output.stdout)?;
+    let property = |name: &str| text.lines().find_map(|line| line.strip_prefix(name));
+    let load =
+        property("LoadState=").ok_or_else(|| anyhow::anyhow!("scope load state unavailable"))?;
+    let active = property("ActiveState=")
+        .ok_or_else(|| anyhow::anyhow!("scope active state unavailable"))?;
+    let cgroup =
+        property("ControlGroup=").ok_or_else(|| anyhow::anyhow!("scope cgroup unavailable"))?;
+    anyhow::ensure!(
+        output.status.success() || load == "not-found",
+        "scope status rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(matches!(active, "inactive" | "failed") && cgroup.is_empty())
 }
 
-/// Runs `systemctl --user stop --no-block <glob>` through `run` (argv
-/// includes the program), logging any failure at debug.
-fn release_with(
+/// Blocking exact-unit retirement; only completed, empty scope exit is success.
+pub(crate) fn retire_scope(
     session_id: &str,
-    run: &dyn Fn(&[String]) -> std::io::Result<Option<std::process::Output>>,
-) {
-    let glob = unit_glob(session_id);
-    let argv = ["systemctl", "--user", "stop", "--no-block", &glob].map(String::from);
-    match run(&argv) {
-        Ok(Some(o)) if !o.status.success() => tracing::debug!(
-            target: "process.systemd",
-            unit = %glob,
-            "release: {}",
-            String::from_utf8_lossy(&o.stderr)
-        ),
-        Ok(None) => tracing::debug!(target: "process.systemd", unit = %glob, "release timed out"),
-        Err(e) => tracing::debug!(target: "process.systemd", unit = %glob, "release failed: {e}"),
-        _ => {}
+    scope: &crate::process::worker_registry::ScopeOwnership,
+) -> anyhow::Result<()> {
+    if scope_stopped(session_id, scope)? {
+        return Ok(());
     }
+    let crate::process::worker_registry::ScopeOwnership::Owned { unit } = scope else {
+        unreachable!()
+    };
+    let mut command = Command::new(which::which("systemctl")?);
+    command.args(["--user", "stop", unit]);
+    let output = crate::process::run_with_timeout(&mut command, Duration::from_secs(3))?
+        .ok_or_else(|| anyhow::anyhow!("scope stop timed out"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "scope stop rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(
+        scope_stopped(session_id, scope)?,
+        "captured scope is not empty after stop"
+    );
+    Ok(())
 }
 
 /// Observes this thread's `release` calls, so tests can check when one runs.
@@ -617,16 +700,32 @@ mod tests {
 
     #[test]
     fn unit_names_carry_id_and_start_number() {
-        assert_eq!(
-            unit_name("abc123", 1_700_000_000_000),
-            "aoe-session-abc123-1700000000000.scope"
+        let first = unit_name("abc123", 1_700_000_000_000, "namespace");
+        assert!(first.starts_with("aoe-session-abc123-namespace-1700000000000-"));
+        let nonce = first
+            .strip_prefix("aoe-session-abc123-namespace-1700000000000-")
+            .unwrap()
+            .strip_suffix(".scope")
+            .unwrap();
+        uuid::Uuid::parse_str(nonce).unwrap();
+        assert_ne!(
+            first,
+            unit_name("abc123", 1_700_000_000_000, "namespace"),
+            "concurrent same-SID starts cannot share scope authority"
         );
-        assert_eq!(unit_glob("abc123"), "aoe-session-abc123-*.scope");
-        assert_eq!(unit_name("a b", 5), "aoe-session-a_20b-5.scope");
-        assert_eq!(unit_name("a_b/c", 5), "aoe-session-a_5fb_2fc-5.scope");
-        // The glob for `a` must not match the units of `a-b`.
-        assert_eq!(unit_glob("a-b"), "aoe-session-a_2db-*.scope");
-        assert!(!unit_name("a-b", 5).starts_with("aoe-session-a-"));
+        assert_eq!(
+            unit_glob("abc123", "namespace"),
+            "aoe-session-abc123-namespace-*.scope"
+        );
+        assert!(unit_name("a b", 5, "namespace").starts_with("aoe-session-a_20b-namespace-5-"));
+        assert!(
+            unit_name("a_b/c", 5, "namespace").starts_with("aoe-session-a_5fb_2fc-namespace-5-")
+        );
+        assert_eq!(
+            unit_glob("a-b", "namespace"),
+            "aoe-session-a_2db-namespace-*.scope"
+        );
+        assert!(!unit_name("a-b", 5, "namespace").starts_with("aoe-session-a-"));
         assert_eq!(description("abc123def4567890"), "aoe session abc123de");
     }
 
@@ -802,12 +901,6 @@ mod tests {
                 "{limits:?} {failure:?}"
             );
         }
-    }
-
-    #[test]
-    fn capability_and_release_are_inert_under_test() {
-        assert!(scope_prefix_for("abc", "main").is_none());
-        release("abc");
     }
 
     #[test]

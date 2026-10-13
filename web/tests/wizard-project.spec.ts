@@ -170,8 +170,10 @@ test.describe("import session", () => {
   });
 
   test("imports a pi session through the generic tab", async ({ page }) => {
+    const importedProfiles: (string | null)[] = [];
     await page.route("**/api/importable-sessions**", (r) => {
       const agent = new URL(r.request().url()).searchParams.get("agent");
+      importedProfiles.push(new URL(r.request().url()).searchParams.get("profile"));
       const sessions =
         agent === "pi"
           ? [
@@ -188,6 +190,11 @@ test.describe("import session", () => {
     });
     const created = await startWizard(page, {
       project: false,
+      servedProfile: "work",
+      profiles: [
+        { name: "machine", is_default: true },
+        { name: "work", is_default: false },
+      ],
       agents: [builtin("claude", "claude-agent-acp"), builtin("pi", "pi-acp")],
     });
     await openWizard(page);
@@ -201,5 +208,7 @@ test.describe("import session", () => {
     await launch(page);
     await expect.poll(() => created[0]?.import_acp_session_id).toBe("pi-1");
     expect(created[0]).toMatchObject({ tool: "pi", path: "/home/user/pi-project", sandbox: false });
+    expect(importedProfiles).toEqual(["work", "work"]);
+    expect(created[0]?.profile).toBeUndefined();
   });
 });

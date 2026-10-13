@@ -9,7 +9,14 @@ const STATIC_PATHS = ["settings", "themes", "agents", "profiles", "groups", "dev
 export async function mockStaticApis(page: Page, overrides: Record<string, unknown> = {}) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of STATIC_PATHS) {
-    const json = path in overrides ? overrides[path] : path === "docker/status" ? {} : [];
+    const json =
+      path in overrides
+        ? overrides[path]
+        : path === "about"
+          ? { profile: "default" }
+          : path === "docker/status"
+            ? {}
+            : [];
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json }));
   }
 }
@@ -37,7 +44,11 @@ export async function mockSettingsApis(
 ) {
   await page.route(
     (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
+    (r) =>
+      r.fulfill({
+        headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+        json: { sessions: [], workspace_ordering: [] },
+      }),
   );
   await page.route(
     (url) => url.pathname === "/api/about",

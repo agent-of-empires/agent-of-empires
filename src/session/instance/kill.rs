@@ -1,39 +1,26 @@
 //! Tearing a session down.
 
 use super::*;
+pub(crate) struct PiSidecarUpdate {
+    session_id: Option<String>,
+    path: Option<String>,
+}
 
-impl Instance {
-    pub(super) fn flush_published_if_present(&mut self) {
-        if !self.uses_pi_session_sidecar()
-            && !matches!(
-                self.active_execution
-                    .as_ref()
-                    .and_then(|active| active.capture.as_ref()),
-                Some(CaptureContext::Hooks(_))
-            )
-        {
-            return;
+impl PiSidecarUpdate {
+    pub(crate) fn apply(self, instance: &mut Instance) {
+        if let Some(id) = self.session_id {
+            instance.agent_session_id = Some(id);
         }
-        let profile = self.effective_profile();
-        let Ok(storage) =
-            crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-        else {
-            return;
-        };
-        if self.flush_published_conversation(&storage) == Some(SidWrite::Failed) {
-            tracing::warn!(target: "session.store", instance = %self.id, "could not persist final conversation publication");
-            return;
-        }
-        if let Ok(instances) = storage.load() {
-            if let Some(row) = instances.iter().find(|i| i.id == self.id) {
-                self.adopt_conversation_state(row.conversation_state());
-            }
+        if let Some(path) = self.path {
+            instance.pi_session_path = Some(path);
         }
     }
+}
 
+impl Instance {
     pub(crate) fn flush_published_conversation(
         &self,
-        storage: &crate::session::storage::Storage,
+        storage: &dyn crate::session::SessionStore,
     ) -> Option<SidWrite> {
         let observation = self.final_publication_observation()?;
         if self.is_capture_excluded(&observation.sid, observation.source()) {
@@ -103,8 +90,42 @@ impl Instance {
         }
     }
 
-    /// Tear down the current tmux session cleanly so a fresh `start_with_size_opts` can recreate
-    /// it.
+    pub(crate) fn read_pi_sidecar_update(&self) -> Option<PiSidecarUpdate> {
+        if !self.uses_pi_session_sidecar() {
+            return None;
+        }
+        let observation = self.pi_published_conversation(true)?;
+        let published = observation.sid;
+        let path = observation.pi_session_path;
+        if self.agent_session_id.as_deref() == Some(published.as_str()) {
+            if path.is_none() || path == self.pi_session_path {
+                return None;
+            }
+            return Some(PiSidecarUpdate {
+                session_id: None,
+                path,
+            });
+        }
+        Some(PiSidecarUpdate {
+            session_id: Some(published),
+            path,
+        })
+    }
+
+    /// Tear down the current tmux session cleanly so a fresh
+    /// `start_with_size_opts` can recreate it.
+    ///
+    /// `remain-on-exit on` keeps the tmux session alive after the agent
+    /// process exits, leaving a frozen pane. The plain kill-session +
+    /// new-session flow can race against the session cache
+    /// (kill_process_tree on a defunct pid stalls on macOS, and the
+    /// subsequent kill can run while start's exists() check still sees the
+    /// cached entry), leaving the dead pane in place. Respawning the pane
+    /// into a shell first puts it back in a live state so the kill path
+    /// proceeds cleanly. The kill below then sees a live pane and tears it
+    /// down. Caller is responsible for the subsequent
+    /// `start_with_size_opts` to recreate the session with the agent
+    /// command.
     pub(super) fn kill_clean_locked(&self) -> Result<()> {
         let session = self.tmux_session()?;
         // The poller watches this pane, so it goes before the pane does, whether or not the pane
@@ -133,25 +154,30 @@ impl Instance {
         Ok(())
     }
 
-    pub(crate) fn kill_clean(&self) -> Result<()> {
-        let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
+    pub(crate) fn kill_clean_in(&self, storage: &dyn crate::session::SessionStore) -> Result<u64> {
+        storage.check_available()?;
         let _lifecycle_lock = storage
+            .storage()
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
         let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        let generation =
+            lifecycle.acquire_lifecycle_reservation(storage, LifecycleOperation::Stop, None)?;
         match self.kill_clean_locked() {
-            Ok(()) => lifecycle.commit_lifecycle_status(
-                &storage,
-                LifecycleOperation::Stop,
-                Status::Stopped,
-            ),
+            Ok(()) => {
+                lifecycle.commit_lifecycle_status(
+                    storage,
+                    LifecycleOperation::Stop,
+                    generation,
+                    Status::Stopped,
+                )?;
+                Ok(generation)
+            }
             Err(error) => {
                 let _ = lifecycle.commit_lifecycle_status(
-                    &storage,
+                    storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -161,11 +187,7 @@ impl Instance {
 
     pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
-        let session = self.tmux_session()?;
-        if session.exists() {
-            session.kill()?;
-        }
-        Ok(())
+        self.tmux_session()?.kill()
     }
 
     pub fn kill(&self) -> Result<()> {
@@ -175,20 +197,28 @@ impl Instance {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
-        let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
-        let killed = self.kill_locked();
-        self.release_scope();
-        match killed {
+        let mut lifecycle = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == self.id)
+            .context("session disappeared before coordinated kill")?;
+        let generation =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        match lifecycle
+            .kill_locked()
+            .and_then(|()| lifecycle.release_scope())
+        {
             Ok(()) => lifecycle.commit_lifecycle_status(
                 &storage,
                 LifecycleOperation::Stop,
+                generation,
                 Status::Stopped,
             ),
             Err(error) => {
                 let _ = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -196,8 +226,7 @@ impl Instance {
         }
     }
 
-    /// Kill every tmux session owned by this instance (agent, web terminal, container terminal,
-    /// tool sub-sessions).
+    /// Best-effort coordinated stop of the agent and every ancillary tmux session.
     pub fn kill_all_tmux_sessions(&self) {
         let profile = self.effective_profile();
         let storage =
@@ -231,7 +260,17 @@ impl Instance {
     /// [`Self::kill_all_tmux_sessions`] for a caller already holding this instance's lifecycle
     /// lock, so it can commit its next state (an archive) before a peer launch or send gets in.
     pub(crate) fn stop_all_tmux_sessions_locked(&self, storage: &crate::session::storage::Storage) {
-        let mut lifecycle = self.clone();
+        let mut lifecycle = match storage.load().and_then(|rows| {
+            rows.into_iter()
+                .find(|row| row.id == self.id)
+                .context("session disappeared before coordinated stop")
+        }) {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(target: "session.tmux_cleanup", session_id = %self.id, %error, "kill_all_tmux_sessions: current row unavailable");
+                return;
+            }
+        };
         if let Err(error) =
             lifecycle.acquire_lifecycle_reservation(storage, LifecycleOperation::Stop, None)
         {
@@ -243,10 +282,20 @@ impl Instance {
             );
             return;
         }
-        self.kill_all_tmux_sessions_locked();
-        if let Err(error) =
-            lifecycle.commit_lifecycle_status(storage, LifecycleOperation::Stop, Status::Stopped)
-        {
+        let stopped = lifecycle.kill_all_tmux_sessions_locked();
+        if let Err(error) = &stopped {
+            tracing::warn!(target: "session.tmux_cleanup", session_id = %self.id, %error, "tmux teardown failed");
+        }
+        if let Err(error) = lifecycle.commit_lifecycle_status(
+            storage,
+            LifecycleOperation::Stop,
+            lifecycle.lifecycle_generation,
+            if stopped.is_ok() {
+                Status::Stopped
+            } else {
+                Status::Error
+            },
+        ) {
             tracing::warn!(
                 target: "session.tmux_cleanup",
                 session_id = %self.id,
@@ -256,42 +305,42 @@ impl Instance {
         }
     }
 
-    /// Kill every tmux session owned by this instance while the caller holds the selected profile's
-    /// per-instance lifecycle lock.
-    pub(crate) fn kill_all_tmux_sessions_locked(&self) {
-        self.kill_all_tmux_sessions_uncoordinated();
+    /// Caller holds the per-instance lifecycle lock through teardown and commit.
+    pub(crate) fn kill_all_tmux_sessions_locked(&self) -> Result<()> {
+        self.kill_all_tmux_sessions_uncoordinated()
     }
 
-    /// Tear down tmux resources when no durable lifecycle row exists.
-    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) {
-        self.kill_all_tmux_sessions_uncoordinated();
+    /// Caller has excluded launches for an id without a durable lifecycle row.
+    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) -> Result<()> {
+        self.kill_all_tmux_sessions_uncoordinated()
     }
 
-    fn kill_all_tmux_sessions_uncoordinated(&self) {
-        if let Err(e) = self.kill_locked() {
-            tracing::debug!(
-                target: "session.tmux_cleanup",
-                session_id = %self.id,
-                kind = "agent",
-                error = %e,
-                "kill_all_tmux_sessions_uncoordinated: kill failed"
-            );
+    fn kill_all_tmux_sessions_uncoordinated(&self) -> Result<()> {
+        // The ancillary sessions run their own processes, so they are reaped
+        // even when the agent kill fails: short-circuiting leaks a shell per
+        // failed kill. The agent failure is what the caller reports.
+        let agent = self.kill_locked();
+        let ancillary = self.kill_ancillary_tmux_sessions_locked();
+        let scope = self.release_scope();
+        let stopped = match (agent, ancillary) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(ancillary)) => Err(ancillary).context("ancillary tmux teardown failed"),
+            (Err(agent), Ok(())) => Err(agent),
+            (Err(agent), Err(ancillary)) => Err(agent.context(format!(
+                "ancillary tmux teardown also failed: {ancillary:#}"
+            ))),
+        };
+        match (stopped, scope) {
+            (Ok(()), scope) => scope,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(scope)) => {
+                Err(error.context(format!("scope retirement also failed: {scope:#}")))
+            }
         }
-        self.kill_ancillary_tmux_sessions_locked();
-        self.release_scope();
     }
 
-    /// Stops the session's scope, sweeping processes that escaped the pane.
-    /// Structured sessions are released by the ACP teardown.
-    pub(crate) fn release_scope(&self) {
-        if !self.is_structured() {
-            crate::process::systemd::release(&self.id);
-        }
-    }
-
-    pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) {
-        crate::tmux::kill_all_terminals_for_id(&self.id);
-        crate::tmux::kill_all_tool_sessions_for_id(&self.id);
+    pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) -> Result<()> {
+        crate::tmux::utils::kill_ancillary_sessions_for_id(&self.id)
     }
 
     /// Kill every tmux session owned by this instance EXCEPT the agent
@@ -335,7 +384,9 @@ impl Instance {
             );
             return;
         }
-        self.kill_ancillary_tmux_sessions_locked();
+        if let Err(error) = self.kill_ancillary_tmux_sessions_locked() {
+            tracing::warn!(target: "session.tmux_cleanup", session_id = %self.id, %error, "ancillary tmux teardown failed");
+        }
         if let Err(error) =
             lifecycle.release_lifecycle_reservation(&storage, LifecycleOperation::Stop)
         {
@@ -346,6 +397,25 @@ impl Instance {
                 "kill_ancillary_tmux_sessions: lifecycle release failed"
             );
         }
+    }
+
+    pub(crate) fn stop_resources_locked(&self) -> Result<()> {
+        self.kill_locked()?;
+        self.release_scope()?;
+        crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())
+    }
+
+    /// Stops the session's scope, sweeping processes that escaped the pane.
+    /// Structured sessions are released by the ACP teardown.
+    pub(crate) fn release_scope(&self) -> Result<()> {
+        if self.is_structured() {
+            return Ok(());
+        }
+        let scopes = self
+            .terminal_scopes
+            .as_deref()
+            .context("Terminal scope ownership is unresolved; resources retained")?;
+        crate::process::systemd::retire_scopes(&self.id, scopes)
     }
 
     /// Stop the session and its sandbox container under the same lifecycle
@@ -363,14 +433,15 @@ impl Instance {
             .find(|row| row.id == self.id)
             .context("session disappeared before stop")?;
         lifecycle.source_profile = profile.clone();
-        lifecycle.acquire_lifecycle_reservation(
+        let generation = lifecycle.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Stop,
             Some(Status::Stopped),
         )?;
         self.stop_poller();
-        let killed = lifecycle.kill_locked();
-        self.release_scope();
+        let killed = lifecycle
+            .kill_locked()
+            .and_then(|()| lifecycle.release_scope());
         let teardown = killed.and_then(|()| {
             let mut current = storage
                 .load()?
@@ -406,8 +477,10 @@ impl Instance {
                 lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Stopped,
                 )?;
+
                 crate::hooks::cleanup_hook_status_dir(&self.id);
                 Ok(())
             }
@@ -415,6 +488,7 @@ impl Instance {
                 let _ = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -427,6 +501,97 @@ impl Instance {
 mod tests {
 
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn cached_terminal_stop_uses_the_newer_rows_scope_and_refuses_unproven_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let bin = temp.path().join("manager-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let marker = temp.path().join("manager-called");
+        let manager = bin.join("systemctl");
+        std::fs::write(
+            &manager,
+            format!(
+                "#!/bin/sh\nprintf '%s\n' \"$*\" > '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", path.as_str())]);
+        for coordinated_all in [false, true] {
+            let profile = "fresh-terminal-stop";
+            let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+            let mut cached = Instance::new("cached scope", temp.path().to_str().unwrap());
+            cached.source_profile = profile.into();
+            storage
+                .update(|rows, _| {
+                    rows.push(cached.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let unit = format!("aoe-session-{}-newer.scope", cached.id.replace('-', "_2d"));
+            storage
+                .update(|rows, _| {
+                    let current = rows.iter_mut().find(|row| row.id == cached.id).unwrap();
+                    current.terminal_scopes = Some(vec![
+                        crate::process::worker_registry::ScopeOwnership::Owned {
+                            unit: unit.clone(),
+                        },
+                    ]);
+                    current.lifecycle_generation += 1;
+                    Ok(())
+                })
+                .unwrap();
+            let name = crate::tmux::Session::generate_name(&cached.id, &cached.title);
+            let created = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &name, "sleep 60"])
+                .output()
+                .unwrap();
+            assert!(
+                created.status.success(),
+                "{}",
+                String::from_utf8_lossy(&created.stderr)
+            );
+            crate::tmux::refresh_session_cache();
+            if coordinated_all {
+                cached.kill_all_tmux_sessions();
+            } else {
+                cached
+                    .kill()
+                    .expect_err("the current scope lacks empty-cgroup proof");
+            }
+            assert!(
+                !crate::tmux::session_exists(&name),
+                "tmux teardown must really run before the manager refusal"
+            );
+            assert!(
+                std::fs::read_to_string(&marker).unwrap().contains(&unit),
+                "the authoritative newer unit, not the stale empty list, must be queried"
+            );
+            let current = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == cached.id)
+                .unwrap();
+            assert_eq!(current.status, Status::Error);
+            assert!(current.lifecycle_reservation.is_none());
+            assert_eq!(
+                current.terminal_scopes.unwrap(),
+                vec![crate::process::worker_registry::ScopeOwnership::Owned { unit }]
+            );
+            std::fs::remove_file(&marker).unwrap();
+        }
+    }
 
     /// Real-tmux integration for #3157.
     // Serialized for the same reason as its neighbours: it creates and kills a
@@ -691,6 +856,48 @@ mod tests {
         assert_eq!(row.resume_intent, ResumeIntent::Use(pinned.into()));
         assert_eq!(row.status, Status::Stopped);
         assert!(!sidecar.exists());
+    }
+
+    /// The ancillary sessions (web terminal, container terminal, tool
+    /// sub-sessions) hold their own processes, so a failed agent kill must
+    /// still reap them: short-circuiting on that error leaks a shell per
+    /// failed kill. The agent failure is still what the caller is told.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_failed_agent_kill_still_reaps_ancillary_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_read = crate::session::test_support::EnvGuard::read_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let inst = Instance::new("Ancillary teardown", temp.path().to_str().unwrap());
+        let terminal = crate::tmux::TerminalSession::generate_name(&inst.id, "web terminal");
+        let reaped = temp.path().join("ancillary-reaped");
+        let reaped_marker = reaped.display().to_string();
+        // A tmux that reports the web terminal as live, refuses the agent
+        // session with a real (not "absent") failure, and reaps the terminal.
+        let shim = temp.path().join("tmux");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" list-sessions \"*) printf '%s\\n' '{terminal}'; exit 0 ;;\nesac\ncase \" $* \" in\n  *\" kill-session \"*)\n    case \"$*\" in\n      *'={terminal}'*) : > '{reaped_marker}'; exit 0 ;;\n    esac\n    echo 'permission denied' >&2\n    exit 1\n    ;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _guard = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
+
+        inst.kill_all_tmux_sessions_locked()
+            .expect_err("the refused agent kill is reported to the caller");
+        assert!(
+            reaped.exists(),
+            "the ancillary session must be reaped even when the agent kill fails"
+        );
     }
 
     /// A takeover relaunch can replace the row's pane while its old poller keeps the same agent and

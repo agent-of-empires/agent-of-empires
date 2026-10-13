@@ -32,6 +32,7 @@ async function mockApis(
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
       json: {
         sessions: getSessions().map(sessionResponse),
         workspace_ordering: getOrdering(),

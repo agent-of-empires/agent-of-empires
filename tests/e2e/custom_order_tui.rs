@@ -1,10 +1,10 @@
-//! e2e: the Custom sort order and the keys that arrange rows inside it, driven through a
-//! real TUI: the picker's mnemonic applies an order, Ctrl+Down moves a session past its
-//! sibling, and the move survives a restart because it is stored rather than recomputed.
+//! Custom row moves through the TUI survive a restart.
+
+use std::time::Duration;
 
 use serial_test::parallel;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{require_tmux, wait_until, TuiTestHarness};
 
 fn add_session(h: &TuiTestHarness, title: &str) {
     let project = h.project_path();
@@ -25,8 +25,7 @@ fn add_session(h: &TuiTestHarness, title: &str) {
     );
 }
 
-/// Row order the session list shows. Only the list column counts: the preview pane to its
-/// right carries the selected session's title too, and it is drawn above the rows.
+/// Only sidebar titles count; the preview also names the selected session.
 fn order_on_screen(h: &TuiTestHarness) -> Vec<String> {
     const LIST_COLUMNS: usize = 34;
     let screen = h.capture_screen();
@@ -42,6 +41,20 @@ fn order_on_screen(h: &TuiTestHarness) -> Vec<String> {
     seen
 }
 
+fn wait_for_order(h: &TuiTestHarness, expected: &[String]) -> Vec<String> {
+    wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+        let actual = order_on_screen(h);
+        if actual == expected {
+            Ok(actual)
+        } else {
+            Err(format!(
+                "expected rows {expected:?}, got {actual:?}\n{}",
+                h.capture_screen()
+            ))
+        }
+    })
+}
+
 #[test]
 #[parallel]
 fn test_tui_custom_sort_reorders_and_persists() {
@@ -55,41 +68,37 @@ fn test_tui_custom_sort_reorders_and_persists() {
     add_session(&h, "beta-two");
 
     h.spawn_tui();
+    h.wait_for("Runtime ready");
     h.wait_for("alpha-one");
     h.wait_for("beta-two");
-    let before = order_on_screen(&h);
-    assert_eq!(before.len(), 2, "both sessions on screen: {before:?}");
 
-    // Ctrl+O opens the sort picker; `c` is Custom's mnemonic and applies it outright.
+    // The picker's `c` mnemonic applies Custom immediately.
     h.send_keys("C-o");
     h.wait_for(" Sort Order ");
     h.send_keys("c");
     h.wait_for("Custom");
+    h.wait_for_absent(" Sort Order ", Duration::from_secs(10));
+    let before = order_on_screen(&h);
+    assert_eq!(before.len(), 2, "both sessions on screen: {before:?}");
 
-    // Put the cursor on the first of the two and move it past the second.
+    // Home selects the group header; Down selects its first session.
+    h.send_keys("Home");
     h.send_keys("Down");
     h.send_keys("C-Down");
-    h.wait_for(&before[1]);
-    let moved = order_on_screen(&h);
-    assert_eq!(
-        moved,
-        vec![before[1].clone(), before[0].clone()],
-        "the rows swapped"
-    );
+    let expected = vec![before[1].clone(), before[0].clone()];
+    // Input ACK fences submission, not the daemon's committed publication.
+    let moved = wait_for_order(&h, &expected);
+    h.wait_for("Runtime ready");
 
-    // A fresh TUI reads the order back from disk: this is the claim the feature makes, and
-    // asserting only on the stored indices would not test it.
+    // A fresh TUI must display the persisted order.
     h.kill_tui();
     h.spawn_tui();
+    h.wait_for("Runtime ready");
     h.wait_for("alpha-one");
     h.wait_for("beta-two");
-    assert_eq!(
-        order_on_screen(&h),
-        moved,
-        "a restarted TUI shows the moved order"
-    );
+    wait_for_order(&h, &moved);
 
-    // And the indices themselves are what the move assigned.
+    // Both siblings received their new indices.
     let rows: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(h.sessions_path()).expect("read sessions.json"),
     )

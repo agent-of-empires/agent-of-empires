@@ -151,6 +151,16 @@ test.describe("Dockable pane system", () => {
     if (!diff) throw new Error("missing diff tab");
     await dragTab(page, "terminal:0", { x: diff.x + 4, y: diff.y + diff.height / 2 });
     await expect.poll(() => dockTabOrder(page, "right")).toEqual(["terminal:0", "diff"]);
+    await expect
+      .poll(() =>
+        page.evaluate((session) => {
+          const saved = JSON.parse(localStorage.getItem("aoe-pane-layout-v2") ?? "null") as {
+            sessions?: Record<string, { right: { tabs: string[] }[] }>;
+          } | null;
+          return saved?.sessions?.[session]?.right.flatMap((group) => group.tabs);
+        }, SESSION),
+      )
+      .toEqual(["terminal:0", "diff"]);
 
     await page.reload();
     await expect(page.getByTestId("pane-tab-diff")).toBeVisible();

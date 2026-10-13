@@ -377,10 +377,12 @@ impl<S: BroadcastSink> Drain<S> {
         };
         let reservation = ResumeReservation {
             lease: respawn_lease.clone(),
+            expected_lifecycle_generation: None,
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.notify),
         };
         config.generation = respawn_lease.epoch();
+        config.launch_lease = Some(respawn_lease.clone());
 
         tokio::time::sleep(RESPAWN_BACKOFF).await;
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
@@ -440,7 +442,8 @@ impl<S: BroadcastSink> Drain<S> {
         match refused {
             None => {}
             Some(InstallError::Cancelled { reason }) => {
-                let _ = client.shutdown().await;
+                super::teardown::retire_client(&self.lifecycle, &respawn_lease, &client, identity)
+                    .await;
                 self.finish_cancelled(&respawn_lease, previous, reason, identity)
                     .await;
                 return None;
@@ -561,14 +564,16 @@ impl<S: BroadcastSink> Drain<S> {
     ) {
         let session_id = &self.session_id;
         self.workers.lock().await.remove(session_id);
-        let launched = worker_registry::load(session_id)
-            .ok()
-            .flatten()
-            .filter(|r| r.generation == respawn_lease.epoch())
-            .map(|r| RunnerIdentity {
-                pid: r.pid,
-                generation: r.generation,
-            });
+        let launched = respawn_lease.spawned_runner().or_else(|| {
+            worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .filter(|record| record.generation == respawn_lease.epoch())
+                .map(|record| RunnerIdentity {
+                    pid: record.pid,
+                    generation: record.generation,
+                })
+        });
         // One lock, after the await: a stop recorded while this waited for
         // `workers` must not be lost to a conversion that drops it.
         let (cancelled, converted) = {
@@ -907,8 +912,8 @@ mod tests {
             "the dropped worker's sub-agent must be detached in the durable log"
         );
         let mut state = AcpState::new(AcpSessionId(id.into()), AgentName("claude".into()), None);
-        for (_, event) in store.replay_from(id, 0) {
-            state.apply_event(event).unwrap();
+        for (seq, event) in store.replay_from(id, 0) {
+            state.apply_event(seq, event).unwrap();
         }
         assert_eq!(
             state.background_agents[0].status,
@@ -1167,7 +1172,7 @@ mod tests {
         failing.notified().await;
         // What `shutdown` does under the `workers` lock it holds.
         assert!(matches!(
-            lock_recover(&sup.lifecycle).begin_stop("s-respfail", "idle_auto_stop"),
+            lock_recover(&sup.lifecycle).begin_stop("s-respfail", "idle_auto_stop", false),
             StopDecision::CancelRequested
         ));
         drop(workers);

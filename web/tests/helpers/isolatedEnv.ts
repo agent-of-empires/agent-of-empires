@@ -1,6 +1,5 @@
-// The live daemon inherits process.env, so any variable naming config, data, or credentials would point it at
-// real agent state. Path-shaped names are dropped wholesale, a few needed ones are kept, and host state under
-// unsuffixed names is dropped or pinned by name (#3657). isolatedEnv.test.ts enforces the contract against src/.
+// Live daemons must resolve config, data and credentials inside the isolated HOME.
+// System and toolchain paths intentionally remain inherited.
 
 import { join } from "node:path";
 
@@ -35,6 +34,9 @@ export const HOST_STATE_VARS = new Set([
   // Discovery must not prefer a host endpoint over the private daemon.
   "AOE_DAEMON_TOKEN",
   "AOE_DAEMON_URL",
+  // Browser origin used to resolve plugin-relative links. A host value would
+  // point the private daemon's own navigation at a host dashboard.
+  "AOE_DASHBOARD_URL",
   // A host passphrase would let discovery log in against a host daemon's
   // session store instead of the private one the harness spawned.
   "AOE_DAEMON_PASSPHRASE",
@@ -69,10 +71,11 @@ export const HOST_STATE_VARS = new Set([
   "TMUX",
   "TMUX_PANE",
   // Re-pinned to the private socket by spawnAoeServe.
+  "DBUS_SESSION_BUS_ADDRESS",
   "AOE_TMUX_SOCKET",
 ]);
 
-/** Kept path variables: toolchain and system locations. XDG_RUNTIME_DIR names host sockets, not data. */
+/** Kept path variables name toolchain and system locations, never host sockets. */
 export const INHERITED_PATH_VARS = new Set([
   "CARGO_HOME",
   "DYLD_FALLBACK_LIBRARY_PATH",
@@ -80,7 +83,6 @@ export const INHERITED_PATH_VARS = new Set([
   "LD_LIBRARY_PATH",
   "RUSTUP_HOME",
   "SSL_CERT_DIR",
-  "XDG_RUNTIME_DIR",
 ]);
 
 /** Pinned rather than dropped, since git falls back to /etc/gitconfig and $HOME/.gitconfig; keeps daemon writes in the test home. */
@@ -88,6 +90,8 @@ export function pinnedVars(paths: IsolatedPaths): Record<string, string> {
   return {
     GIT_CONFIG_GLOBAL: join(paths.home, ".gitconfig"),
     GIT_CONFIG_SYSTEM: "/dev/null",
+    XDG_RUNTIME_DIR: join(paths.home, "runtime"),
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/dev/null",
   };
 }
 

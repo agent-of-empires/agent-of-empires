@@ -219,6 +219,50 @@ describe("SEED_PROJECT_OVERRIDES", () => {
   });
 });
 
+describe("native import defaults", () => {
+  it.each([true, false])("clears host-incompatible state and ignores late defaults (skipIfDirty %s)", (skipIfDirty) => {
+    const imported = run(
+      makeState({
+        path: "/repo",
+        scratch: true,
+        useWorktree: true,
+        sandboxEnabled: true,
+        attachExisting: true,
+        extraRepoPaths: ["/other"],
+        repoBases: { "/other": "main" },
+        worktreeBranch: "feature",
+        baseBranch: "main",
+        projectWorktreeOverride: true,
+        projectSandboxOverride: true,
+      }),
+      set("importAcpSessionId", "native"),
+    );
+    const late = run(
+      imported,
+      {
+        type: "SEED_PROJECT_OVERRIDES",
+        path: "/repo",
+        overrides: { worktree_enabled: true, sandbox_enabled: true },
+      },
+      defaults({ sandboxEnabled: true, worktreeEnabled: true, skipIfDirty }),
+      set("title", "Imported title"),
+    );
+    expect(late.data).toMatchObject({
+      importAcpSessionId: "native",
+      scratch: false,
+      useWorktree: false,
+      sandboxEnabled: false,
+      attachExisting: false,
+      extraRepoPaths: [],
+      repoBases: {},
+      worktreeBranch: "",
+      baseBranch: "",
+      projectWorktreeOverride: undefined,
+      projectSandboxOverride: undefined,
+    });
+  });
+});
+
 describe("SEED_PROJECT_OVERRIDES sandbox", () => {
   const seed = (sandbox: boolean | undefined): Action => ({
     type: "SEED_PROJECT_OVERRIDES",

@@ -47,19 +47,15 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// rather than carried (and whitespace-flattened) in full every frame.
 const MAX_PROMPT_CHARS: usize = 200;
 
-/// Cached scrape for one pane, keyed by the displayed tmux session name and
-/// stamped with when it was taken, so the caller can throttle refreshes and
-/// invalidate on a pane / view switch or a rename.
+/// Cached scrape keyed by daemon epoch, session lifecycle and displayed pane.
+/// A recycled pane name cannot reuse an older generation's prompt.
 pub(super) struct LastPromptCache {
     pub(super) pane: String,
+    pub(super) session_id: String,
+    pub(super) epoch: String,
+    pub(super) lifecycle_generation: u64,
     pub(super) text: Option<String>,
     pub(super) at: Instant,
-}
-
-impl LastPromptCache {
-    fn is_fresh(&self, pane: &str, now: Instant) -> bool {
-        self.pane == pane && now.duration_since(self.at) < REFRESH_INTERVAL
-    }
 }
 
 /// Capture the pane for `tmux_name` and return its last submitted prompt.
@@ -121,6 +117,30 @@ fn is_horizontal_rule(line: &str) -> bool {
 }
 
 impl super::HomeView {
+    pub(super) fn last_prompt_identity(&self) -> Option<(&str, &str, u64)> {
+        let id = self
+            .live_send
+            .as_ref()
+            .map(|state| state.session_id.as_str())
+            .or(self.selected_session.as_deref())?;
+        let row = self.session_feed.applied_session(id)?;
+        Some((
+            self.session_feed.applied_epoch()?,
+            row.id.as_str(),
+            row.lifecycle_generation,
+        ))
+    }
+
+    fn last_prompt_matches(&self, cache: &LastPromptCache, pane: &str) -> bool {
+        self.last_prompt_identity()
+            .is_some_and(|(epoch, id, generation)| {
+                cache.pane == pane
+                    && cache.epoch == epoch
+                    && cache.session_id == id
+                    && cache.lifecycle_generation == generation
+            })
+    }
+
     /// Keep the last-prompt cache fresh without ever blocking the render/input
     /// thread: adopt any completed background scrape, then, when the cache for the
     /// displayed pane is stale and no capture is running, dispatch one on a short
@@ -150,8 +170,14 @@ impl super::HomeView {
             self.last_prompt_in_flight = false;
             self.last_prompt_cache = Some(done);
         }
-        let fresh = matches!(&self.last_prompt_cache, Some(c) if c.is_fresh(&pane, now));
+        let fresh = matches!(&self.last_prompt_cache, Some(c) if self.last_prompt_matches(c, &pane) && now.duration_since(c.at) < REFRESH_INTERVAL);
         if !fresh && !self.last_prompt_in_flight {
+            let Some((epoch, id, lifecycle_generation)) = self.last_prompt_identity() else {
+                self.last_prompt_cache = None;
+                return;
+            };
+            let epoch = epoch.to_owned();
+            let session_id = id.to_owned();
             self.last_prompt_in_flight = true;
             let slot = self.last_prompt_slot.clone();
             std::thread::spawn(move || {
@@ -159,6 +185,9 @@ impl super::HomeView {
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some(LastPromptCache {
                         pane,
+                        epoch,
+                        session_id,
+                        lifecycle_generation,
                         text,
                         at: Instant::now(),
                     });
@@ -179,7 +208,7 @@ impl super::HomeView {
         let text = self
             .last_prompt_cache
             .as_ref()
-            .filter(|c| c.pane == pane)
+            .filter(|c| self.last_prompt_matches(c, &pane))
             .and_then(|c| c.text.as_deref());
         Some(text.unwrap_or("(no recent prompt found)").to_string())
     }

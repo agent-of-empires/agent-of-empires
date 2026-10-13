@@ -18,15 +18,52 @@ Invariants worth knowing before touching this code:
 - **Self-termination watchdog.** A runner polls its own registry record and exits when abandoned: record gone, superseded, or detached from any daemon past a 48h retention window (reset on reattach). This is the backstop for a daemon that dies without killing its runners.
 - **Detach buffer.** Only agent notifications and `PromptCompleted` survive a detach, in a queue bounded by frame count and encoded bytes that sheds the oldest first. Delivery is best effort, not durable or exactly once. Reverse calls outstanding at detach are cancelled toward the agent and queued replies are dropped; within the admitted native session `terminal/release` is idempotent cleanup, so it needs no tombstone.
 - **Native-session admission.** Only lifecycle results select native identity; notification and callback metadata never do. Unrelated updates are ignored and unrelated session callbacks are rejected before any transcript, permission, filesystem, or terminal effect. While identity is pending, retained notifications are bounded by the runner's detach-queue ceiling, so a reattach admits the whole flushed backlog and an overflow fails the connection rather than publishing a partial replay. Stored history is never rewritten by the guard.
+- **Launch authority.** Preparation pins the native profile, title, lifecycle generation and provider under owned namespace, submission and instance exclusion. Startup is reserved before those preparation guards are released; hooks and readiness never run while holding them. Blocking admission owns its namespace guard through native checkpoints, including caller cancellation.
+- **Producer-owned cancellation.** The admitted lease wakes an outstanding socket connection, initialize, or session establishment. Detached spawn records its exact PID and worker generation before the first post-spawn await. The producer waits for its owned connection task to quiesce and proves that runner retired before settling; dropping a launcher waiter or observing an absent registry is not exit proof.
+- **Exact scope retirement.** Scoped runners persist their exact transient unit alongside PID and generation; unscoped and unresolved ownership are distinct. Explicit stop waits for only the captured unit to stop and become empty before settling. Rejected or timed-out scope retirement keeps its lease and retry debt, even after the leader exits. A SID wildcard never authorizes ACP retirement or recovered purge cleanup.
 - **Callback parity and replay accounting.** Session-scoped filesystem, terminal, and permission callbacks wait for that announcement with either named or positional parameters, while request-scoped elicitation stays independent of session authority. Pending replay charges each original control frame, its four-byte prefix included, against the runner's 4096-frame / 128 MiB budget; typed re-serialization can expand native JSON and is not a substitute.
 - **Mid-turn reattach.** `ResumeSession` adopts the runner's committed session identity and never sends ACP `session/new` or `session/load`. A new local prompt supersedes adoption, and only the matching canonical request id may resolve it; a 30-second resume-idle watchdog is the fallback.
 - **Background sub-agents across a restart.** The async-Task tailer (see [Stuck-turn watchdogs](#stuck-turn-watchdogs)) is per connection, so a `BackgroundAgentLaunched` can be left with no completion when its worker dies. The next owner reconciles that: `attach` re-tails every unresolved launch that still carries a transcript path, since the runner it adopted is provably alive; `spawn`, the drain task's respawn, and every terminal drain arm detach unconditionally. `output_file` is persisted for that resume and stripped from every client-facing frame.
 
+Terminal handoff retains the session transition lock until an in-flight spawn or respawn has settled and its matching runner and registry record have retired. Cancellation alone is not retirement, and active or unproven teardown ownership cannot be forgotten. The terminal view and launch lifecycle commit through the native store; successful enable and disable responses carry the canonical runtime receipt, including idempotent responses. A failed retirement returns an error without discarding its owner, and purge retains its cleanup ownership until the same barrier succeeds. A CLI-resumable handoff keeps the adapter transcript; permanent discard also requests best-effort `session/delete` when a cancelled launch completes its handshake.
+
+The ACP load-session capability belongs to structured runtime state: same-view reloads retain it, while terminal handoff and a later enable clear it rather than resurrecting the previous adapter observation.
+
+The shared start core distinguishes admission from a no-op: native start requires its authoritative row even when a live pane already exists. The default-store entry point retains its preexisting-live-pane `Skipped` contract without requiring a persisted row; any actual launch still rereads and validates its row before reserving a generation.
+
 ## Session deletion
 
-`session/delete` fires only on permanent removal (a purge, or disabling the structured view, which discards the conversation). Reversible teardown (`aoe acp stop`, snooze, archive, trash, idle auto-stop) deliberately does not fire it, so the transcript stays on disk and the next respawn resumes through `session/load`.
+`session/delete` fires only on permanent removal (a purge or a terminal handoff that discards the conversation). Reversible teardown (`aoe acp stop`, snooze, archive, trash, idle auto-stop) and CLI-resumable terminal handoff deliberately do not fire it, so the transcript stays on disk and the next respawn resumes through `session/load`.
 
 Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges have no running worker, so they delete the local transcript only.
+
+Purge captures the selected row's path, branch and runner references before destroy hooks. Before irreversible row removal, it adds fresh row references and persists ownership in `pending-purge-owners.json`. Failed cleanup retains ownership across requests and daemon restart; success releases only its own token. Missing, malformed or unsupported journals refuse cleanup. Both ordinary and irreversible purges require a captured process group to exit before host cleanup, even if its worker record disappeared. Ordinary purge retains the row and releases its reservation when that check fails. Uncaptured evidence is not proof of runtime absence. A refused irreversible commit settles its durable purge reservation before returning when the row remains on disk, so an immediate retry is not blocked b…
+
+After journal ownership and row removal are durable, a committed purge releases identity and instance lifecycle flocks before awaiting its captured lease and runner retirement. The durable journal and frozen retirement target preserve the original cleanup and process authority across that wait. Initial and recovered cleanup reacquire identity then lifecycle exclusion and revalidate store health, row absence, and the exact live journal owner before touching resources. A replacement lease or runner is never adopted as the old purge target; any unproven retirement, reused row, or changed owner keeps the journal and resources.
+
+Recovery freezes that retirement target while its short absent-row and journal-owner preparation exclusions still hold, then releases both before waiting. Native supervisor bookkeeping and event-store projection deletion are cleanup effects too: they run only under the reacquired cleanup fence after process exit, health, live-owner, and row-absence validation, so a reused ID without a replacement worker keeps its transcript and counters.
+
+The schema-45 purge journal retains exact captured scope ownership too, so a
+reaped leader cannot authorize checkout cleanup while its escaped cgroup members
+remain. Legacy unknown scope evidence stays unresolved. Native child birth,
+scope capture and immediate PID/generation recording share the final durable
+launch-admission exclusion; cancellation and the birth publication lock prevent
+a dropped constructor waiter from publishing a child after ownership is released.
+
+Schema 45 also records terminal scope ownership in each instance row before
+physical pane birth, under the existing launch generation and instance lifecycle
+exclusion. A known unscoped start is an empty scope list; missing legacy evidence
+is unresolved, never implicit classic-process proof. Ordinary terminal purge
+freezes that row's exact units and proves their cgroups empty before checkout,
+worktree, sandbox or scratch cleanup. Coordinated stop reloads the authoritative
+row under its lifecycle exclusion so a cached clone cannot omit a newer unit.
+Purge admission returns a stack-owned transaction or a boxed structured lifecycle
+refusal; store and lock failures remain a separate outer error. The admitted path
+does not allocate a wrapper just to balance an enum layout.
+
+Per-ID instance and submission mutex registries follow the same native absence fence. Pruning removes only map-owned entries with no held or queued external references; later lookups retain that single Arc authority through ID reuse. Unused entries deferred by an active holder are reaped on a lookup miss, using the existing strong-reference pruning pattern rather than a second registry protocol.
+
+Live owner references include missing descendants and symlink traversal dependencies. Permission errors, symlink loops and non-directory traversal refuse cleanup instead of being treated as absent owners.
 
 ## Who owns the state
 
@@ -43,6 +80,8 @@ The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::de
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.
 
+Native ACP HTTP history decodes each existing JSON replay page incrementally, with a fixed-size read buffer and no copy of the entire encoded body. Replay pages and individual events or rows may exceed 16 MiB; the generic daemon response decoder remains size-bounded. The native history decoder retains the 15-second body-read deadline, requires a complete valid document through EOF, and cancels a pending body read if its caller is dropped. Count-based paging and raw/rows cursor metadata are unchanged. This does not change the pre-existing WebSocket message limits.
+
 A cold open loads recent-first rather than folding from seq 0 before first paint. `GET /api/sessions/{id}/acp/replay?before=<seq>&limit=N` returns the events closest below `before`, aligned to a user-turn boundary so a page never seams a split turn. The client renders the tail immediately and, on a long session, also pulls a small `since=0` prefix for the pinned handshake snapshot (capabilities, slash palette, agent and model) the composer needs. Scrolling to the top pages older history, prepending with the scroll position frozen; each page is fetched twice, once for frames and once for `view=rows`, and a failure on either leg abandons the page rather than advancing the cursor.
 
 If context restoration fails (the agent's stored session is gone) the view falls back to a fresh session, renders a "Conversation context reset" callout, and offers `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`: a compact markdown recap of the last ~20 turns (capped ~24k chars, bulky tool I/O elided), pre-filled into the composer and never auto-sent.
@@ -56,6 +95,8 @@ Modes come from `NewSessionResponse.modes`, and the picker shows whatever the ad
 Model and reasoning-effort selectors arrive over two wire mechanisms, normalized into one dropdown: `SessionUpdate::ConfigOptionUpdate` (a full snapshot of every selector whenever one changes, so the client replaces its cached list) and the `unstable_session_model` capability (`SessionModelState` on `session/new` and `session/load`, switched with `session/set_model`). With both present, `config_option` wins, since it has a push path; `session/set_model` only acks, so the client synthesizes the confirming update. The UI is pessimistic (the chip keeps the prior value until a confirming update arrives) to avoid snap-back on slow tunnels. The cached list clears on `AgentSwitched` but survives `/clear`, since capabilities are process-scoped.
 
 Session notices (`SessionUpdate::Notice`) are live advisories, not conversation history. The adapter only sends them when the client advertises `clientCapabilities.session.notices`; without that it folds each one into a bold-label agent message indistinguishable from the model's reply, so advertising the capability is what makes them identifiable. They ride on `AcpState` capped and scoped to the current turn, which is what feeds the dismissible strip on both surfaces, and they also land in the transcript as an `advisory` row, which unlike a `notice` row both surfaces render, so the history survives a dismissal. Dismissal is client-local: the folded list is shared, so clearing it server-side would blank every other client.
+
+Notice IDs use the durable event sequence, not the count of retained events, so replay after pruning preserves client-local dismissal.
 
 Approval nonces are server-generated and single-use, and are never revealed to the agent. Resolving an already-resolved approval clears the card quietly.
 
@@ -81,7 +122,9 @@ A worker that exits within ~10s (broken command, missing adapter, failed handsha
 
 ## Agent switching
 
-`POST /api/sessions/{id}/acp/switch-agent` stops the current worker, spawns the target, persists `agent_name`, clears `acp_session_id` (the old id belongs to a different vendor), resolves the model from the request alone so the old backend's pick does not follow the session across vendors (as `Instance::swap_tool` does), and emits `AgentSwitched { from, to, reason }` so reducers drop backend-specific transient state and the transcript shows a divider. The composer is pre-filled with a context-primer recap, never auto-sent. CLI: `aoe acp switch-agent <session> <target> [--model <name>]`. `reason` is `manual` or `rate_limited`.
+`POST /api/sessions/{id}/acp/switch-agent` stops the current worker, spawns the target, persists `agent_name`, clears `acp_session_id` (the old id belongs to a different vendor), resolves the model from the request alone so the old backend's pick does not follow the session across vendors (as `Instance::swap_tool` does), and emits `AgentSwitched { from, to, reason }` so reducers drop backend-specific transient state and the transcript shows a divider. The composer is pre-filled with a context-primer recap, never auto-sent. CLI: `aoe acp switch-agent <session> <target> [--model <name>]`. `reason` is `manual` or `rate_limited`. Completion commits through the scoped native store under canonical exclusion. An automatic respawn retains the originating launch intent; an independent launch supersedes it and refuses the old completion.
+
+Claude-family provider changes restart the worker, preserve conversation and reasoning effort, and reset the model to the target provider default. Active turns and background work refuse the change. The web client keeps one pending request per session across route remounts; an observed canonical provider change invalidates a late response echo, including an away-and-back transition.
 
 ## Agent profiles
 

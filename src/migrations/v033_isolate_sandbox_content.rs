@@ -17,6 +17,37 @@ const RECEIPTS: &str = "sandbox-content-receipts";
 pub(crate) const RECOVERY: &str = ".aoe-sandbox-recovery";
 pub(crate) const CONTENT_POLICY: u8 = 1;
 
+#[cfg(test)]
+pub(super) struct TestReconcileGuard {
+    content: Option<TestReconcileProbes>,
+    layout: Option<layout::TestReconcileProbes>,
+}
+
+#[cfg(test)]
+impl Drop for TestReconcileGuard {
+    fn drop(&mut self) {
+        TEST_RECONCILE_PROBES.set(self.content);
+        layout::TEST_RECONCILE_PROBES.set(self.layout);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_test_reconcile_probes(
+    running: fn(&str) -> Result<bool>,
+    reap: fn(&str) -> Result<bool>,
+    exposure: fn(&str) -> Result<Vec<PathBuf>>,
+) -> TestReconcileGuard {
+    TestReconcileGuard {
+        content: TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
+            running,
+            reap,
+            exposure,
+        })),
+        layout: layout::TEST_RECONCILE_PROBES
+            .replace(Some(layout::TestReconcileProbes { running, reap })),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContentRoot {
     pub(crate) path: PathBuf,
@@ -163,7 +194,13 @@ fn claim_context_reset(
         "starts a fresh"
     };
     let labelled = agent.unwrap_or(instance.tool.as_str());
-    Some((format!("Sandbox native history was isolated; this launch {context} {labelled} conversation. The existing AoE transcript is retained. Complete originals: {}", recovery.into_iter().collect::<Vec<_>>().join(", ")), slots))
+    Some((
+        format!(
+            "Sandbox native history was isolated; this launch {context} {labelled} conversation. The existing AoE transcript is retained. Complete originals: {}",
+            recovery.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+        slots,
+    ))
 }
 
 pub(crate) struct AcpLaunchContext {
@@ -447,7 +484,7 @@ pub(crate) fn canonical_expected_path(path: &Path) -> Result<PathBuf> {
                 existing = existing.parent().context("content path has no parent")?;
             }
             Err(error) => {
-                return Err(error).with_context(|| format!("resolving {}", path.display()))
+                return Err(error).with_context(|| format!("resolving {}", path.display()));
             }
         }
     }
@@ -539,7 +576,10 @@ fn guard_other_transactions(
             .iter()
             .any(|part| roots.iter().any(|root| root.path == part.root.path))
         {
-            bail!("sandbox {instance} has an unfinished {} content transition; restore that tool's original configuration and finish aoe migrate before sharing its roots", receipt.tool);
+            bail!(
+                "sandbox {instance} has an unfinished {} content transition; restore that tool's original configuration and finish aoe migrate before sharing its roots",
+                receipt.tool
+            );
         }
     }
     Ok(())
@@ -1088,7 +1128,9 @@ fn prove_binds<'a>(
 ) -> Result<()> {
     for (source, before) in sources.iter().zip(before) {
         if !bind_identifies_mount(lines.next(), before, source_identity(source)?.as_ref()) {
-            bail!("live sandbox {id} source spelling does not identify its actual mount; defer native content isolation");
+            bail!(
+                "live sandbox {id} source spelling does not identify its actual mount; defer native content isolation"
+            );
         }
     }
     if lines.next().is_some() {
@@ -2064,7 +2106,9 @@ fn checked_receipt(
     if let Some(receipt) = read_receipt(&path)? {
         let matches = receipt_matches(&receipt, id, tool, roots);
         if !matches && receipt.phase != Phase::Committed {
-            bail!("unfinished content transition has a different root or role plan; restore the original configuration and finish aoe migrate; its originals and journal are retained");
+            bail!(
+                "unfinished content transition has a different root or role plan; restore the original configuration and finish aoe migrate; its originals and journal are retained"
+            );
         }
         uuid::Uuid::parse_str(&receipt.transaction)
             .context("invalid content transaction identity")?;
@@ -2310,7 +2354,9 @@ fn reconcile_in(
                     return Err(error);
                 }
                 tracing::warn!(target: "session.profile", %error, %id, %tool, "Native source kept changing during content isolation");
-                progress::notice(format!("sandbox {id}: native configuration kept changing; content isolation remains pending"));
+                progress::notice(format!(
+                    "sandbox {id}: native configuration kept changing; content isolation remains pending"
+                ));
             }
         } else {
             let config = crate::session::config::profile_config::resolve_config(
@@ -2325,7 +2371,9 @@ fn reconcile_in(
                 }
                 let roots = row_roots(&row, &tool, home, &config)?;
                 if !roots_ready(app, &id, &tool, &roots)? {
-                    progress::notice(format!("sandbox {id}: native content isolation pending; originals will be preserved before a fresh native session starts"));
+                    progress::notice(format!(
+                        "sandbox {id}: native content isolation pending; originals will be preserved before a fresh native session starts"
+                    ));
                 }
             }
         }
@@ -2391,13 +2439,16 @@ fn reconcile_pending_with_home(move_stores: bool, home: Option<PathBuf>) -> Resu
             &probes.exposure,
         );
     }
+    let runtime = crate::containers::get_container_runtime();
+    let running = layout::batched_running_probe(&runtime, false);
+    let reap = |id: &str| layout::reap_migrated_container(id, &runtime);
     reconcile_in(
         &app,
         &home,
         None,
         move_stores,
-        &layout::batched_running_probe(false),
-        &layout::reap_migrated_container,
+        &running,
+        &reap,
         &live_bind_sources,
     )
 }
@@ -2405,13 +2456,16 @@ fn reconcile_pending_with_home(move_stores: bool, home: Option<PathBuf>) -> Resu
 pub(crate) fn migrate_instance(id: &str) -> Result<()> {
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
+    let runtime = crate::containers::get_container_runtime();
+    let running = layout::batched_running_probe(&runtime, false);
+    let reap = |id: &str| layout::reap_migrated_container(id, &runtime);
     reconcile_in(
         &app,
         &home,
         Some(id),
         true,
-        &layout::batched_running_probe(false),
-        &layout::reap_migrated_container,
+        &running,
+        &reap,
         &live_bind_sources,
     )
 }
@@ -2465,7 +2519,9 @@ fn ensure_fresh_content_with(
                         && (identity(&root.path)?.is_some()
                             || certificate_path(app, instance, &root.path)?.exists())
                     {
-                        bail!("sandbox {instance} has unproven native content; stop it and run aoe migrate before relaunch");
+                        bail!(
+                            "sandbox {instance} has unproven native content; stop it and run aoe migrate before relaunch"
+                        );
                     }
                 }
             }
@@ -2540,7 +2596,10 @@ pub(crate) fn admit_fresh_instance(
     instance: &crate::session::Instance,
 ) -> Result<crate::session::StorageFlock> {
     if instance.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-        bail!("sandbox {} still uses a legacy shared store; stop the other owners and run aoe migrate", instance.id);
+        bail!(
+            "sandbox {} still uses a legacy shared store; stop the other owners and run aoe migrate",
+            instance.id
+        );
     }
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
@@ -2789,34 +2848,6 @@ mod tests {
         assert_eq!(identity(parent.path()).unwrap(), identity(&nested).unwrap());
         parent.create_child(Path::new("stage/tree/nested")).unwrap();
         assert!(nested.join("stage/tree/nested").is_dir());
-    }
-
-    struct TestReconcileGuard {
-        content: Option<TestReconcileProbes>,
-        layout: Option<layout::TestReconcileProbes>,
-    }
-
-    impl Drop for TestReconcileGuard {
-        fn drop(&mut self) {
-            TEST_RECONCILE_PROBES.set(self.content);
-            layout::TEST_RECONCILE_PROBES.set(self.layout);
-        }
-    }
-
-    fn install_test_reconcile_probes(
-        running: fn(&str) -> Result<bool>,
-        reap: fn(&str) -> Result<bool>,
-        exposure: fn(&str) -> Result<Vec<PathBuf>>,
-    ) -> TestReconcileGuard {
-        TestReconcileGuard {
-            content: TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
-                running,
-                reap,
-                exposure,
-            })),
-            layout: layout::TEST_RECONCILE_PROBES
-                .replace(Some(layout::TestReconcileProbes { running, reap })),
-        }
     }
 
     /// The same-kernel mount proof runs only for a running container on a
