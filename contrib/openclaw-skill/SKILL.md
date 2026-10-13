@@ -45,8 +45,11 @@ aoe add /path/to/repo -t "API work" -g backend -l
 # Add with specific tool
 aoe add . -t "codex session" -c codex
 
-# Add in a git worktree (parallel branch)
-aoe add . -t "fix-123" -w fix/issue-123 -l
+# Add in a git worktree on a new branch, YOLO mode (omit -b to check out an existing branch)
+aoe add . -t "fix-123" -w fix/issue-123 -b -y -l
+
+# Base the new branch on another branch instead of the default
+aoe add . -t "fix-124" -w fix/issue-124 -b --base-branch fix/issue-123 -l
 
 # Add in Docker sandbox
 aoe add . -t "sandboxed" -s -l
@@ -57,6 +60,10 @@ aoe add . -t "sub task" -P <parent-id>
 # Enable YOLO mode (skip permission prompts)
 aoe add . -t "yolo" -y -l
 ```
+
+Without `--base-branch`, `-w <branch> -b` starts the branch from `worktree.default_base_branch` if set, otherwise from the repo's detected default branch (chosen among each remote's `HEAD` target and `main`/`master`), fetched first. It is not the branch checked out where you run `aoe add`, so pass `--base-branch` to build on a feature branch.
+
+A sandboxed session (`-s`) sees only its mounts: the project, its agent store and credentials, `~/.gitconfig`, and configured `extra_volumes`. Work that needs host-only resources (macOS Keychain, launchd, the aoe app directory, other paths outside the project) must run without `-s`. See the [sandbox guide](https://github.com/agent-of-empires/agent-of-empires/blob/main/docs/guides/sandbox.md).
 
 ### Listing sessions
 
@@ -121,6 +128,8 @@ aoe status --json
 aoe status -q   # just the waiting count (for scripting)
 ```
 
+`-n` has no cap, but capture only reaches back as far as tmux scrollback (`history-limit`, 2000 lines by default), and agent TUIs that redraw the screen leave little of a long turn in it. For a long report, ask the agent to write it to a file in its worktree and read that file from the host (`path` in `aoe session show --json`).
+
 **JSON output shape** (`aoe session capture --json`):
 ```json
 {
@@ -174,6 +183,25 @@ aoe session capture       # auto-detects current session
 aoe session current --json
 ```
 
+### Sending messages
+
+```bash
+aoe send <id-or-title> "message"
+aoe send <id-or-title> "message" --no-revive   # fail instead of starting a stopped session
+```
+
+`aoe send` starts a stopped session unless `--no-revive` is given, waits at most 5 seconds for the agent to look ready, then sends anyway. A message that arrives before the agent's prompt is up is lost or left unsubmitted, so after launching, poll for the agent's ready marker instead of sleeping a fixed time. For Claude Code with `-y` that is `bypass permissions` in the footer:
+
+```bash
+for _ in $(seq 60); do
+  aoe session capture "fix-123" -n 40 --strip-ansi | grep -q "bypass permissions" && break
+  sleep 2
+done
+aoe send "fix-123" "Fix issue #123 and open a PR"
+```
+
+After sending, confirm the agent picked it up (status `running`, or the message in the transcript) before assuming delivery. Messages of 16 bytes or more, or with a newline, are pasted (bracketed when the agent enables it) and followed by Enter, and an agent may show them collapsed (Claude Code renders `[Pasted text #1 ...]`). Claude Code's input box can also show a dimmed suggested next prompt that looks like typed text; it was not submitted. Only text in the transcript above the input box has been sent.
+
 ### Renaming and organizing
 
 ```bash
@@ -207,9 +235,12 @@ aoe worktree cleanup -f
 ### Removing sessions
 
 ```bash
-aoe remove <id-or-title>
-aoe remove <id-or-title> --delete-worktree --force
+aoe remove <id-or-title>                    # move to trash (alias: rm)
+aoe session restore <id-or-title>           # bring it back
+aoe remove <id-or-title> --purge --delete-worktree --force   # delete permanently
 ```
+
+With `session.delete_to_trash` on (the default), `aoe remove` stops the agent, keeps the record with `state` `trashed`, and moves an aoe-managed worktree into a `.aoe-trash/<id>` directory beside it. `--delete-worktree`, `--delete-branch`, and `--keep-container` only apply with `--purge`. For sandboxed sessions the move can fail (for example with `Permission denied`); aoe then prints `left worktree in place` and still trashes the session.
 
 ## Workflow patterns
 
@@ -224,9 +255,9 @@ aoe session capture "feature X" --json
 ### Parallel worktree agents
 
 ```bash
-aoe add . -t "issue-100" -w fix/issue-100 -l
-aoe add . -t "issue-101" -w fix/issue-101 -l
-aoe add . -t "issue-102" -w fix/issue-102 -l
+aoe add . -t "issue-100" -w fix/issue-100 -b -l
+aoe add . -t "issue-101" -w fix/issue-101 -b -l
+aoe add . -t "issue-102" -w fix/issue-102 -b -l
 aoe status --json   # check all at once
 ```
 

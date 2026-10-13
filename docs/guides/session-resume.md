@@ -14,11 +14,14 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 | Pi | Yes | Yes | Pane-scoped AoE extension |
 | OMP | Yes | Yes | Pane-scoped routed terminal store |
 | OpenCode | Opt-in | No | AoE-preassigned native id |
-| Gemini CLI, Hermes, Kimi CLI | No | Yes | Isolated managed store |
+| Hermes | Yes | Yes | `pre_llm_call` hook of the CLI or TUI foreground agent (host; subagents and background tasks are never adopted), isolated managed store (sandbox) |
+| Gemini CLI, Kimi CLI | No | Yes | Isolated managed store |
 | Prime Agent | No | Yes | Root-only publication and isolated managed store |
 | Vibe, Droid, Copilot CLI, Settl, Qwen Code, Kiro CLI, Antigravity | No | No | None verified |
 
 `No` means automatic discovery is unsupported there, not that resume is: a user-provided exact id stays authoritative for any agent with a verified resume contract, and agents with no such contract reject automatic resume entirely. OpenCode host capture also needs `session.opencode_preassign_session_id = true`. AoE never scans a shared store or infers an identity from recency. [Importing](#importing-an-existing-conversation) is different: you pick the conversation, and its recency only drives a warning.
+
+Hermes host identity hooks validate the complete JSON payload while retaining only the foreground identity, not the conversation history. Payloads up to 64 MiB are accepted. Larger or malformed payloads do not update the stored identity; the previous identity remains unchanged. This transport limit bounds input processing and temporary token storage, not exact process memory usage.
 
 Sandbox config and conversation stores are staged per AoE instance, including custom `agent_config_dir` roots, and a cross-process lease guards each managed store, so two sessions in the same directory cannot claim each other's conversation.
 

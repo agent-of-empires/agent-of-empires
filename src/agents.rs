@@ -102,14 +102,15 @@ impl SessionCaptureSpec {
     ///
     /// The single decision every sidecar consumer (poller, retroactive capture, reconciliation,
     /// sidecar cleanup, wrapper attribution) goes through, so none of them can disagree about
-    /// where an id comes from. Codex is context-dependent: a host pane publishes from its
-    /// `SessionStart` hook, which Codex fires when the conversation starts at the first turn
-    /// (not at launch), while a sandboxed one keeps the isolated managed-store scan, so it reads
-    /// the sidecar only when `PaneScoped`.
+    /// where an id comes from. Codex and Hermes are context-dependent: a host pane publishes
+    /// from its hooks at the first turn (not at launch), while a sandboxed one keeps the isolated
+    /// managed-store scan, so they read the sidecar only when `PaneScoped`.
     pub(crate) fn reads_hook_sidecar(&self, context: SessionCaptureContext) -> bool {
         match self.backend {
             SessionCaptureBackend::Claude | SessionCaptureBackend::HookSidecar => true,
-            SessionCaptureBackend::Codex => context == SessionCaptureContext::PaneScoped,
+            SessionCaptureBackend::Codex | SessionCaptureBackend::Hermes => {
+                context == SessionCaptureContext::PaneScoped
+            }
             _ => false,
         }
     }
@@ -187,6 +188,10 @@ impl std::fmt::Display for AgentLifecycle {
 pub enum HookIdentityField {
     SessionId,
     ConversationIdOrSessionId,
+    /// Hermes's top-level `session_id`, accepted only from the CLI or TUI foreground agent.
+    /// Delegated subagents (`platform: subagent`) and side tasks (`bg_`, `preview_` ids) fire
+    /// the same hooks from the same process with their own ids.
+    HermesForegroundSessionId,
 }
 
 #[derive(Debug)]
@@ -430,7 +435,12 @@ pub(crate) const SETTL_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
 ];
 
 pub(crate) const HERMES_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    sidecar("pre_llm_call", HookStatus::Running),
+    // Fires every foreground turn, so the id follows `/new`, `/resume` and compression rotation.
+    // Tool events carry no `platform` and cannot tell a subagent apart.
+    SidecarHookEvent {
+        identity_field: Some(HookIdentityField::HermesForegroundSessionId),
+        ..sidecar("pre_llm_call", HookStatus::Running)
+    },
     sidecar("pre_tool_call", HookStatus::Running),
     sidecar("post_llm_call", HookStatus::Idle),
     sidecar("pre_approval_request", HookStatus::Waiting),
@@ -755,7 +765,7 @@ pub const AGENTS: &[AgentDef] = &[
         session_support: session_support(
             ResumeStrategy::Flag("--resume"),
             SessionCaptureBackend::Hermes,
-            SessionCaptureContext::Unsupported,
+            SessionCaptureContext::PaneScoped,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
         ..agent(
@@ -1397,6 +1407,7 @@ mod tests {
             let expected = match agent.name {
                 "claude" | "codex" => Some(HookIdentityField::SessionId),
                 "cursor" => Some(HookIdentityField::ConversationIdOrSessionId),
+                "hermes" => Some(HookIdentityField::HermesForegroundSessionId),
                 _ => None,
             };
             let hook_fields = agent

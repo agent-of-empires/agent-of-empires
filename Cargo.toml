@@ -5,7 +5,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 name = "agent-of-empires"
 version = "1.19.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 authors = ["Agent of Empires Contributors"]
 description = "Terminal session manager for AI coding agents"
 # MIT throughout, except the OSC 8 emission state machine in
