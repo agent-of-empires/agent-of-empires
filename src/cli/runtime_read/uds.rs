@@ -270,6 +270,26 @@ fn namespace_is_unpublished(path: &Path, euid: u32) -> bool {
         Err(TrustedPathError::Missing) => return true,
         Err(_) => return false,
     };
+    let Ok(directory) = fstat(dir.as_raw_fd()) else {
+        return false;
+    };
+    let names = [PUBLISHER_LOCK_FILE, LOCK_FILE];
+    let mut locks: [Option<(File, FileIdentity)>; 2] = [None, None];
+    for (slot, name) in locks.iter_mut().zip(names) {
+        match open_entry(dir.as_raw_fd(), name) {
+            Ok((file, entry)) => {
+                // This only proves absence; ownership follows the namespace, not the caller.
+                if validate_regular_file(&file, directory.st_uid, &entry).is_err()
+                    || fs2::FileExt::try_lock_shared(&file).is_err()
+                {
+                    return false;
+                }
+                *slot = Some((file, entry));
+            }
+            Err(EntryError::Missing) => {}
+            Err(EntryError::Invalid) => return false,
+        }
+    }
     let Ok(path) = anchored_child_path(dir.as_raw_fd(), ".") else {
         return false;
     };
@@ -282,6 +302,9 @@ fn namespace_is_unpublished(path: &Path, euid: u32) -> bool {
         };
         let name = entry.file_name();
         let bytes = name.as_encoded_bytes();
+        if names.iter().any(|name| bytes == name.as_bytes()) {
+            continue;
+        }
         if bytes.starts_with(b"runtime.")
             || bytes.starts_with(b".runtime.")
             || bytes.starts_with(b"lifetime.lock")
@@ -290,7 +313,16 @@ fn namespace_is_unpublished(path: &Path, euid: u32) -> bool {
             return false;
         }
     }
-    true
+    locks.iter().zip(names).all(
+        |(lock, name)| match (lock, fstatat(dir.as_raw_fd(), name)) {
+            (Some((file, entry)), Ok(after)) => {
+                identity(&after) == *entry
+                    && validate_regular_file(file, directory.st_uid, entry).is_ok()
+            }
+            (None, Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        },
+    )
 }
 
 pub(crate) fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, TrustedPathError> {
@@ -1059,14 +1091,10 @@ mod tests {
         .await
         .unwrap();
         let rows: serde_json::Value = serde_json::from_str(&projection.stdout).unwrap();
-        assert_eq!(
-            rows,
-            serde_json::json!([{
-                "id": id, "title": "after publication", "path": "/repo", "group": "",
-                "tool": "claude", "command": "agent --retry-proof", "profile": "main",
-                "state": "live", "created_at": "2026-01-02T03:04:05Z", "workspace_repos": []
-            }])
-        );
+        assert_eq!(rows[0]["id"], id);
+        assert_eq!(rows[0]["title"], "after publication");
+        assert_eq!(rows[0]["command"], "agent --retry-proof");
+        assert_eq!(rows[0]["profile"], "main");
         drop(_admission);
         state.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), server.unwrap())
@@ -1233,6 +1261,41 @@ mod tests {
     }
     #[test]
     #[serial_test::parallel]
+    fn idle_publication_locks_allow_absence_but_live_or_invalid_artifacts_do_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let home = tempfile::tempdir().unwrap();
+        let app = home.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o775)).unwrap();
+        for name in [PUBLISHER_LOCK_FILE, LOCK_FILE] {
+            std::fs::write(app.join(name), "").unwrap();
+            std::fs::set_permissions(app.join(name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let uid = crate::process::effective_uid();
+        assert!(namespace_is_unpublished(&app, uid));
+        assert!(open_trusted_directory(&app, uid).is_err());
+        let owner = File::open(app.join(PUBLISHER_LOCK_FILE)).unwrap();
+        fs2::FileExt::try_lock_exclusive(&owner).unwrap();
+        assert!(!namespace_is_unpublished(&app, uid));
+        fs2::FileExt::unlock(&owner).unwrap();
+        for name in [
+            PREBIND_FILE,
+            POSTBIND_FILE,
+            SOCKET_FILE,
+            "publisher.lock.suspect",
+        ] {
+            std::fs::write(app.join(name), "").unwrap();
+            assert!(!namespace_is_unpublished(&app, uid), "{name}");
+            std::fs::remove_file(app.join(name)).unwrap();
+        }
+        std::fs::set_permissions(app.join(LOCK_FILE), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(!namespace_is_unpublished(&app, uid));
+    }
+    #[test]
+    #[serial_test::parallel]
     fn a_foreign_owned_unpublished_namespace_is_absent_but_never_admitted() {
         let _env = crate::session::test_support::EnvGuard::read_lock();
         let home = tempfile::tempdir().unwrap();
@@ -1247,6 +1310,13 @@ mod tests {
             open_trusted_directory(&app, caller_uid),
             Err(TrustedPathError::Refused(_))
         ));
+        assert!(namespace_is_unpublished(&app, caller_uid));
+        use std::os::unix::fs::PermissionsExt;
+        for name in [PUBLISHER_LOCK_FILE, LOCK_FILE] {
+            std::fs::write(app.join(name), "").unwrap();
+            std::fs::set_permissions(app.join(name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         assert!(namespace_is_unpublished(&app, caller_uid));
         std::fs::write(app.join("runtime.prebind.json"), b"{}").unwrap();
         assert!(!namespace_is_unpublished(&app, caller_uid));

@@ -10,13 +10,17 @@ Protected routes follow the configured authentication mode. Token authentication
 
 The read-only CLI commands use `/api/runtime/ws` when `--daemon-url` or `AOE_DAEMON_URL` names an endpoint. The route uses the same credential policy as the daemon API, including bearer tokens, query tokens and login cookies; an unauthenticated daemon needs no credential. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`, with the existing device-bound session cache for passphrase login. See the [CLI transport options](cli/reference.md#aoe) for endpoint selection and fallback behavior.
 
-When descriptor-based inspection finds no runtime artifacts, local reads remain available even if ownership or permissions prohibit a UDS connection. Observed runtime artifacts still require trusted admission.
+Environment URLs discard query parameters, matching TUI discovery; a query token is not a CLI credential. Explicit CLI endpoints require a base URL without a query. HTTP on a non-loopback host is accepted only without bearer or passphrase credentials; remote authentication requires HTTPS. Localhost login bypasses proxies and pins both IPv4 and IPv6 loopback addresses.
+
+When descriptor-based inspection finds no runtime publication, local reads remain available even if ownership or permissions prohibit a UDS connection. Valid inactive lock files left by shutdown do not constitute a publication: absence probes hold shared locks and recheck their identities. A live publisher, invalid lock or observed runtime artifact still refuses that fallback; this observation never authorizes a UDS connection.
 
 Local publication waits for shared absence probes and readers retaining a prior namespace. An existing publisher's exclusive claim still refuses a second publisher.
 
 The runtime wire protocol is **version 4**. Each exchange sends a `Hello` followed by a `Snapshot`; both frames require each profile's `name`, `listed` boolean and `aliases` array. `name` identifies the representative of a physical directory on the daemon's filesystem. `aliases` contains its other selectable names. Scoped reads and configured defaults retain the requested alias spelling.
 
 Where a wire schema allows `null`, the member must still be present. Omitting a required member is `schema_invalid`. This differs from CLI JSON: `session show --json` omits an unknown `agent_session_id`.
+
+CLI list JSON emits the optional `systemd_unit` glob only for local peers with scopes enabled and an eligible live session. Remote snapshots do not infer a daemon capability from the client's configuration and omit this field. A glob is an expected unit name, not proof the unit exists.
 
 Aliases into a real profile reuse its cached sessions. Alias-only external stores have `listed: false` and are available through scoped runtime reads, but remain outside ordinary REST/web/TUI session lists, `list --all` and the profile picker. Only listed profiles contribute to all-profile totals.
 
@@ -27,6 +31,8 @@ A failed pane probe keeps a newer disk generation's terminal status and idle-ent
 Profile inventory, cached session data, group registries and project registries have independent health. A newly observed physical store is not ready until an accepted daemon reload; accepted empty stores are ready too. A session load failure makes affected session reads exit 1 instead of returning incomplete counts or an empty successful result. Repairing the file does not clear that failure until an accepted reload. Selector conflicts with retained cached ownership refuse session reads while the binding differs. Restoring the accepted binding clears that conflict immediately; using a new binding requires an accepted reload. Other healthy profiles and inventory-only reads remain available.
 
 Project listing does not require session or group data. The `global` and `profile` scopes require their respective project registry; `all` retains entries from readable registries, matching the local merged listing. Missing or blank registry files represent an empty registry. Registries must resolve to regular files; nonregular paths and other read errors mark the registry unreadable rather than returning a successful empty result. Global project registry reads and explicitly named profile project registry reads do not create app/profile directories. Local empty-profile bootstrap behavior is unchanged.
+
+Session, group and project registry reads open nonblockingly, validate the opened descriptor as a regular file, and read that same descriptor. Path replacement cannot redirect an already validated registry read.
 
 Project names, configured agent names and stored Git branch labels are display text. Workspace repository names retain their native basenames. Native paths preserve legal controls but reject NUL; stored project and main-repository spellings, including trailing separators, are never rewritten. A session writer that cannot represent a native path as UTF-8 stores an empty string. Runtime reads preserve that existing representation without rejecting unrelated profiles; they do not recover the original native path. Empty paths cannot identify registered projects.
 

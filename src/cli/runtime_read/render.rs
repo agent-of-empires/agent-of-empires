@@ -39,7 +39,7 @@ pub(crate) fn evaluate(
     local_home: Option<&Path>,
 ) -> Result<Projection, ReadFailure> {
     match command {
-        ScopedCommand::List(args) => render_list(args, snapshot, source),
+        ScopedCommand::List(args) => render_list(args, snapshot, source, local_home.is_some()),
         ScopedCommand::Status(args) => render_status(args, snapshot, source, local_home),
         ScopedCommand::Show(args) => render_show(args, snapshot, source),
         ScopedCommand::ListTrash => render_trash(snapshot, source).map(Projection::text),
@@ -144,6 +144,7 @@ fn render_list(
     args: &ListArgs,
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
+    local_peer: bool,
 ) -> Result<Projection, ReadFailure> {
     let state = args.state;
     if args.all {
@@ -153,12 +154,13 @@ fn render_list(
             return Ok(Projection::text("No profiles found.\n".into()));
         }
         if args.json {
+            let systemd_active = local_peer && list::systemd_scopes_active();
             let mut rows = Vec::new();
             for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
                 for session in sessions_for_profile(snapshot, &profile.name)
                     .filter(|session| matches_state(session.state, state))
                 {
-                    rows.push(session_json(session, &profile.name)?);
+                    rows.push(session_json(session, &profile.name, systemd_active)?);
                 }
             }
             return json_lines(&rows).map(Projection::text);
@@ -203,9 +205,10 @@ fn render_list(
     require_selected_profile_health(snapshot, profile, profile_name)?;
 
     if args.json {
+        let systemd_active = local_peer && list::systemd_scopes_active();
         let rows: Vec<SessionJson> = sessions
             .iter()
-            .map(|session| session_json(session, profile_name))
+            .map(|session| session_json(session, profile_name, systemd_active))
             .collect::<Result<_, _>>()?;
         return json_lines(&rows).map(Projection::text);
     }
@@ -258,7 +261,11 @@ fn tree_order<'a>(sessions: &'a [&'a SessionRead]) -> Vec<(&'a SessionRead, usiz
 /// The local `aoe list --json` row, filled from a snapshot. The timestamps are
 /// parsed back to instants so the serializer spells them the way the local
 /// command's own `DateTime<Utc>` fields do.
-fn session_json(session: &SessionRead, profile: &str) -> Result<SessionJson, ReadFailure> {
+fn session_json(
+    session: &SessionRead,
+    profile: &str,
+    systemd_active: bool,
+) -> Result<SessionJson, ReadFailure> {
     Ok(SessionJson {
         id: session.id.clone(),
         title: session.title.clone(),
@@ -289,7 +296,7 @@ fn session_json(session: &SessionRead, profile: &str) -> Result<SessionJson, Rea
             base_branch: worktree.base_branch.clone(),
         }),
         parent_session_id: session.parent_session_id.clone(),
-        systemd_unit: (list::systemd_scopes_active()
+        systemd_unit: (systemd_active
             && session.state.as_str() == "live"
             && !matches!(
                 session.status.as_str(),
@@ -1015,6 +1022,65 @@ mod tests {
             .to_string()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn list_json_uses_systemd_only_for_local_peers() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let manager = tempfile::tempdir().unwrap();
+        std::fs::create_dir(manager.path().join("systemd")).unwrap();
+        std::fs::write(manager.path().join("systemd/private"), "").unwrap();
+        let _env = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
+            .and_set("XDG_RUNTIME_DIR", manager.path());
+        crate::session::config::update_config(|config| config.systemd.enabled = true).unwrap();
+        let cases = [
+            (WireStatus::Running, WireState::Live, true),
+            (WireStatus::Stopped, WireState::Live, false),
+            (WireStatus::Creating, WireState::Live, false),
+            (WireStatus::Deleting, WireState::Live, false),
+            (WireStatus::Error, WireState::Live, false),
+            (WireStatus::Idle, WireState::Archived, false),
+            (WireStatus::Idle, WireState::Trashed, false),
+        ];
+        let rows = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (status, state, _))| {
+                let mut row = session(&format!("row{index}"), *status);
+                row.state = *state;
+                row
+            })
+            .collect();
+        let value = snapshot(rows);
+        for all in [false, true] {
+            for local in [false, true] {
+                let args = ListArgs {
+                    json: true,
+                    all,
+                    state: StateFilter::All,
+                };
+                let projection = evaluate(
+                    &ScopedCommand::List(&args),
+                    &value,
+                    &source(),
+                    local.then_some(Path::new("/owned-home")),
+                )
+                .unwrap();
+                let rendered: serde_json::Value = serde_json::from_str(&projection.stdout).unwrap();
+                for (index, (_, _, eligible)) in cases.iter().enumerate() {
+                    assert_eq!(
+                        rendered[index]
+                            .get("systemd_unit")
+                            .and_then(serde_json::Value::as_str),
+                        (local && *eligible)
+                            .then(|| format!("aoe-session-row{index}-*.scope"))
+                            .as_deref(),
+                        "all={all}, local={local}, row={index}"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn status_json_is_exact_compact_shape() {
         let value = snapshot(vec![
@@ -1093,7 +1159,7 @@ mod tests {
             all: false,
             state: StateFilter::All,
         };
-        let projection = render_list(&args, &value, &source()).unwrap();
+        let projection = render_list(&args, &value, &source(), false).unwrap();
         assert!(projection.session_table);
         assert!(
             projection.stdout.ends_with("\nTotal: 2 sessions\n"),
@@ -1102,7 +1168,7 @@ mod tests {
         );
 
         let empty = snapshot(vec![]);
-        let empty_projection = render_list(&args, &empty, &source()).unwrap();
+        let empty_projection = render_list(&args, &empty, &source(), false).unwrap();
         assert!(!empty_projection.session_table);
     }
     #[test]
@@ -1160,7 +1226,7 @@ mod tests {
             all: false,
             state: crate::cli::list::StateFilter::All,
         };
-        let failure = render_list(&args, &value, &broken_source)
+        let failure = render_list(&args, &value, &broken_source, false)
             .expect_err("the bad profile reports its own degradation");
         assert_eq!(failure.code(), "health_degraded");
     }
@@ -1182,7 +1248,7 @@ mod tests {
         };
         for all in [true, false] {
             args.all = all;
-            let output = render_list(&args, &value, &source())
+            let output = render_list(&args, &value, &source(), false)
                 .expect("projects do not affect sessions")
                 .stdout;
             let rows: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -1649,7 +1715,7 @@ mod tests {
             selected.env_profile = (mode == 1).then(|| OsString::from("inside"));
             value.default_profile = Some("inside".into());
             value.resolved_default_profile = Some("inside".into());
-            let output = render_list(&args, &value, &selected).unwrap().stdout;
+            let output = render_list(&args, &value, &selected, false).unwrap().stdout;
             let rows: serde_json::Value = serde_json::from_str(&output).unwrap();
             assert_eq!(rows.as_array().unwrap().len(), 1);
             assert_eq!(rows[0]["id"], "canonical");
@@ -1662,6 +1728,7 @@ mod tests {
             },
             &value,
             &selected,
+            false,
         )
         .unwrap()
         .stdout;
@@ -1674,6 +1741,7 @@ mod tests {
             },
             &value,
             &selected,
+            false,
         )
         .unwrap()
         .stdout;
@@ -1701,11 +1769,11 @@ mod tests {
         value.profiles[1].health.profile_data = ComponentHealth::Degraded {
             code: super::super::dto::HealthCode::ProfileEnumeration,
         };
-        let error = render_list(&args, &value, &selected).unwrap_err();
+        let error = render_list(&args, &value, &selected, false).unwrap_err();
         let outcome = crate::cli::runtime_read::ReadOutcome::from(error);
         assert!(outcome.stderr.unwrap().contains("external-other"));
         assert_eq!(
-            render_list(&ListArgs { all: true, ..args }, &value, &selected)
+            render_list(&ListArgs { all: true, ..args }, &value, &selected, false)
                 .unwrap()
                 .stdout,
             all
@@ -1734,7 +1802,7 @@ mod tests {
             value.health.profiles = BTreeMap::from([(name.into(), value.profiles[0].health)]);
             super::super::dto::validate_snapshot(&value).unwrap();
             let refusal = crate::cli::runtime_read::ReadOutcome::from(
-                render_list(&args, &value, &source()).unwrap_err(),
+                render_list(&args, &value, &source(), false).unwrap_err(),
             );
             assert!(refusal.stderr.unwrap().contains(name));
             assert!(render_profiles(&value).unwrap().contains(name));
@@ -1747,7 +1815,8 @@ mod tests {
                 selected.env_profile = None;
                 value.default_profile = default_present.then(|| name.into());
                 let outcome = crate::cli::runtime_read::ReadOutcome::from(
-                    render_list(&ListArgs { all: false, ..args }, &value, &selected).unwrap_err(),
+                    render_list(&ListArgs { all: false, ..args }, &value, &selected, false)
+                        .unwrap_err(),
                 );
                 assert_eq!(outcome.stderr, Some(format!("Error: {expected}\n")));
             }
@@ -1881,7 +1950,7 @@ mod tests {
         .stdout;
         assert!(human.contains("Parent:  hidden-only\n"));
         assert!(!human.contains("outside-hidden-only"));
-        let all = render_list(&ListArgs { all: true, ..args }, &value, &selected)
+        let all = render_list(&ListArgs { all: true, ..args }, &value, &selected, false)
             .unwrap()
             .stdout;
         let all: serde_json::Value = serde_json::from_str(&all).unwrap();

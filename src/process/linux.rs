@@ -560,7 +560,7 @@ pub(crate) mod runtime_io {
             libc::openat(
                 dir,
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         })
         .map(File::from)
@@ -784,10 +784,11 @@ pub(crate) mod runtime_io {
         if u32::from_le_bytes(header.try_into().unwrap()) != ACL_VERSION {
             return Err(AclError::Unverifiable);
         }
-        if value[4..].len() % ACL_ENTRY_LEN != 0 {
+        let (entries, remainder) = value[4..].as_chunks::<ACL_ENTRY_LEN>();
+        if !remainder.is_empty() {
             return Err(AclError::Unverifiable);
         }
-        for entry in value[4..].chunks_exact(ACL_ENTRY_LEN) {
+        for entry in entries {
             let tag = u16::from_le_bytes([entry[0], entry[1]]);
             let permissions = u16::from_le_bytes([entry[2], entry[3]]);
             let Ok(tag) = u8::try_from(tag) else {

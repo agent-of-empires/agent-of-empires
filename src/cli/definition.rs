@@ -73,9 +73,9 @@ pub struct Cli {
     /// Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; an
     /// unauthenticated daemon needs neither. Passphrase sessions are cached
     /// using the same login and device binding as the ACP client. Loopback
-    /// login bypasses environment proxies. Plaintext URLs must name a loopback
-    /// literal or localhost, which is pinned to loopback addresses without DNS.
-    /// Use HTTPS for other hosts.
+    /// login bypasses proxies and pins localhost to IPv4/IPv6 loopback.
+    /// Other plaintext hosts require no credential; use HTTPS for remote auth.
+    /// Environment URLs discard query parameters; they do not supply tokens.
     /// Without an HTTP endpoint, Linux uses an admitted local daemon socket
     /// when published, otherwise the local store. Other platforms use the
     /// local store. A served view can omit an unknown agent_session_id.

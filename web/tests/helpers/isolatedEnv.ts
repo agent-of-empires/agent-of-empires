@@ -70,6 +70,8 @@ export const HOST_STATE_VARS = new Set([
   "AOE_OMP_LAUNCH_ID",
   "TMUX",
   "TMUX_PANE",
+  "DBUS_SESSION_BUS_ADDRESS",
+  "INVOCATION_ID",
   "NOTIFY_SOCKET", // the host service manager's notification endpoint
   // Re-pinned to the private socket by spawnAoeServe.
   "AOE_TMUX_SOCKET",

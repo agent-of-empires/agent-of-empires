@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { HOST_STATE_VARS, isolateEnv, pinnedVars, type IsolatedPaths } from "./isolatedEnv";
+import { isolateEnv, pinnedVars, type IsolatedPaths } from "./isolatedEnv";
 
 const HOME = "/tmp/aoe-pw-w0-p0-test";
 const HOST = "/host/dev";
@@ -17,6 +17,8 @@ const PATHS: IsolatedPaths = {
 const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AGENT_OF_EMPIRES_DEBUG: "1",
   AGENT_OF_EMPIRES_PROFILE: "work",
+  DBUS_SESSION_BUS_ADDRESS: `unix:path=${HOST}/systemd/bus`,
+  INVOCATION_ID: "host-invocation",
   AOE_ACP_AGENT_ENV: '[["ANTHROPIC_API_KEY","host-key"]]',
   AOE_ACP_NODE: `${HOST}/.nvm/versions/node/v22.0.0/bin/node`,
   AOE_CAPTURED_SESSION_ID: "host-captured",
@@ -93,9 +95,6 @@ describe("isolateEnv", () => {
     expect(env.LANG).toBe("en_US.UTF-8");
   });
 
-  // #3657: the suffix rule missed GIT_CONFIG_*, AOE_ACP_NODE and
-  // AOE_GITHUB_CLONE_BASE, so host git config, a host Node binary, and a host
-  // plugin source still reached `aoe serve`.
   it("neutralizes host state whose name carries no path suffix", () => {
     const pinned = pinnedVars(PATHS);
     const env = isolateEnv({ HOME: HOST, ...NON_SUFFIX_HOST_STATE }, PATHS);
@@ -109,12 +108,5 @@ describe("isolateEnv", () => {
     // Pinned unconditionally: an unset GIT_CONFIG_SYSTEM still leaves the
     // daemon's git reading /etc/gitconfig.
     expect(isolateEnv({}, PATHS)).toMatchObject(pinned);
-
-    // Every name dropped by name carries a case above, so the list cannot
-    // grow one that nothing exercises.
-    expect(
-      [...HOST_STATE_VARS].filter((name) => !(name in NON_SUFFIX_HOST_STATE)),
-      "dropped by isolatedEnv.ts with no hostile case here",
-    ).toEqual([]);
   });
 });

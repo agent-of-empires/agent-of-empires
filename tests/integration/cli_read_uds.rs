@@ -125,7 +125,7 @@ async fn every_scoped_command_and_alias_round_trips_over_uds() {
         assert!(outcome.stdout.is_some(), "{argv:?} produced no stdout");
     }
     state.shutdown.cancel();
-    server.join().await;
+    let _fixture = server.join().await;
 }
 
 /// The machine form of `aoe status --json` must not depend on the transport.
@@ -152,7 +152,7 @@ async fn the_daemon_and_local_status_json_agree_on_an_empty_profile() {
         Some("{\"waiting\":0,\"running\":0,\"idle\":0,\"stopped\":0,\"error\":0,\"total\":0}\n")
     );
     state.shutdown.cancel();
-    server.join().await;
+    let _fixture = server.join().await;
 }
 
 /// With no daemon publishing, the local transport reports that the command is
@@ -257,7 +257,7 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
     );
 
     state.shutdown.cancel();
-    server.join().await;
+    let _fixture = server.join().await;
 }
 
 /// Retraction returns discovery to local takeover, never an unserved socket.
@@ -282,7 +282,7 @@ async fn shutdown_retracts_the_socket_and_closes_admission() {
     }
 
     state.shutdown.cancel();
-    server.join().await;
+    let _fixture = server.join().await;
 
     for name in [
         "runtime.sock",
@@ -296,6 +296,18 @@ async fn shutdown_retracts_the_socket_and_closes_admission() {
         matches!(read, ScopedRead::NoLocalPublication(_)),
         "a retracted publication must not serve a read"
     );
+    use std::os::unix::fs::PermissionsExt;
+    for name in ["lifetime.lock", "publisher.lock"] {
+        assert!(app_dir.join(name).exists());
+    }
+    for changed in [app_dir.as_path(), app_dir.parent().unwrap()] {
+        std::fs::set_permissions(changed, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(matches!(
+            attempt_read(ScopedCommand::Profile, &local_source()).await,
+            ScopedRead::NoLocalPublication(None)
+        ));
+        std::fs::set_permissions(changed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }
 
 /// Prefix symlinks are followed and their resolved directories validated.
@@ -339,7 +351,7 @@ async fn a_publication_under_a_symlinked_config_home_is_served() {
         outcome.stderr
     );
     state.shutdown.cancel();
-    server.join().await;
+    let _fixture = server.join().await;
 }
 
 #[tokio::test]
@@ -362,7 +374,7 @@ async fn retained_markers_without_a_live_owner_are_absent() {
         (name, marker)
     });
     state.shutdown.cancel();
-    server.join().await;
+    let _fixture = server.join().await;
     for (name, marker) in markers {
         let path = app.join(name);
         std::fs::write(&path, serde_json::to_vec(&marker).unwrap()).unwrap();

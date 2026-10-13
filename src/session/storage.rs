@@ -322,15 +322,21 @@ where
 
 /// Missing or blank registries are empty; unreadable and nonregular paths are errors.
 fn read_nonempty(path: &Path) -> Result<Option<String>> {
-    let metadata = match fs::metadata(path) {
+    use std::io::Read;
+    let mut file = match crate::process::open_read_nonblocking(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
-        Ok(metadata) => metadata,
+        Ok(file) => file,
     };
-    if !metadata.is_file() {
+    if !file.metadata()?.is_file() {
         anyhow::bail!("{} is not a regular file", path.display());
     }
-    let content = fs::read_to_string(path)?;
+    #[cfg(test)]
+    if let Some(replace) = tests::AFTER_REGISTRY_METADATA.with(|hook| hook.borrow_mut().take()) {
+        replace();
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
     if content.trim().is_empty() {
         return Ok(None);
     }
@@ -2678,6 +2684,43 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    thread_local! {
+        pub(super) static AFTER_REGISTRY_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn registry_read_keeps_validated_file_after_path_replacement() {
+        let root = tempdir().unwrap();
+        for name in ["sessions.json", "groups.json"] {
+            let path = root.path().join(name);
+            fs::write(&path, "original registry").unwrap();
+            let replaced = path.clone();
+            AFTER_REGISTRY_METADATA.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let replacement = replaced.with_extension("replacement");
+                    fs::write(&replacement, "replacement registry").unwrap();
+                    fs::rename(replacement, replaced).unwrap();
+                }));
+            });
+            assert_eq!(
+                read_nonempty(&path).unwrap().as_deref(),
+                Some("original registry")
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "replacement registry");
+            fs::remove_file(&path).unwrap();
+            assert!(read_nonempty(&path).unwrap().is_none());
+            fs::write(
+                &path, " 
+	",
+            )
+            .unwrap();
+            assert!(read_nonempty(&path).unwrap().is_none());
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert!(read_nonempty(&path).is_err());
+        }
+    }
     fn setup_test_home(temp: &std::path::Path) -> AppDirGuard {
         isolate_app_dir_at(temp)
     }

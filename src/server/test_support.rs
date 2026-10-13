@@ -457,10 +457,10 @@ impl RuntimeUdsTestServer {
         self.app_dir.clone()
     }
 
-    /// Join after the daemon's shutdown is cancelled: the accept loop returns
-    /// and its artifacts are retracted before this resolves.
-    pub async fn join(self) {
+    /// Wait for retraction; retain the returned guards for post-shutdown reads.
+    pub async fn join(self) -> (Option<tempfile::TempDir>, RuntimeEnvGuard) {
         let _ = self.listener.await;
+        (self._namespace, self._env)
     }
 }
 

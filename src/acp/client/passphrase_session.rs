@@ -148,15 +148,29 @@ pub(super) async fn elevate(
 /// Login secrets never follow redirects or use a proxy for a loopback destination.
 fn login_client(url: impl reqwest::IntoUrl) -> Result<(reqwest::Client, reqwest::Url), HttpError> {
     let url = url.into_url()?;
+    Ok((login_client_builder(&url).build()?, url))
+}
+
+fn login_client_builder(url: &reqwest::Url) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder()
         .timeout(LOGIN_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none());
-    let builder = if crate::daemon::is_loopback_url(&url) {
+    let builder = if crate::daemon::is_loopback_url(url) {
         builder.no_proxy()
     } else {
         builder
     };
-    Ok((builder.build()?, url))
+    if url.host_str() == Some("localhost") {
+        builder.resolve_to_addrs(
+            "localhost",
+            &[
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+            ],
+        )
+    } else {
+        builder
+    }
 }
 
 fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -273,6 +287,50 @@ mod tests {
             .with_local_passphrase_path(dir.join("serve.passphrase"))
     }
 
+    #[tokio::test]
+    async fn localhost_login_ignores_hostile_dns_for_both_address_families() {
+        struct HostileDns;
+        impl reqwest::dns::Resolve for HostileDns {
+            fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async {
+                    Err(std::io::Error::other("hostile DNS must not handle localhost").into())
+                })
+            }
+        }
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let router = axum::Router::new().route(
+                "/api/login",
+                axum::routing::post(
+                    |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        assert_eq!(body["passphrase"], "owned secret");
+                        axum::http::StatusCode::NO_CONTENT
+                    },
+                ),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let url: reqwest::Url = format!("http://localhost:{port}/api/login")
+                .parse()
+                .unwrap();
+            let client = login_client_builder(&url)
+                .dns_resolver(Arc::new(HostileDns))
+                .build()
+                .unwrap();
+            let response = client
+                .post(url)
+                .json(&serde_json::json!({"passphrase":"owned secret"}))
+                .send()
+                .await;
+            server.abort();
+            let _ = server.await;
+            assert_eq!(
+                response.unwrap().status(),
+                StatusCode::NO_CONTENT,
+                "{address}"
+            );
+        }
+    }
     #[test]
     fn extract_session_cookie_parses_first_attribute_only() {
         let mut headers = HeaderMap::new();

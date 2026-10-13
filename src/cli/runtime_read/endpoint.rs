@@ -85,10 +85,23 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
         (None, None) => return Ok(SelectedEndpoint::Local),
     };
     let raw = selected.ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
+    let raw = if source.explicit_url.is_none() {
+        raw.split_once('?').map(|(base, _)| base).unwrap_or(raw)
+    } else {
+        raw
+    };
     let (request_url, secure) = parse_endpoint(raw)?;
     let mut request = request_url
         .into_client_request()
         .map_err(|_| ReadFailure::pre("invalid_endpoint"))?;
+    let sends_credentials = source.token.is_some()
+        || std::env::var("AOE_DAEMON_PASSPHRASE").is_ok_and(|secret| !secret.trim().is_empty());
+    if !secure
+        && !crate::daemon::is_loopback_host(request.uri().host().unwrap_or(""))
+        && sends_credentials
+    {
+        return Err(ReadFailure::pre("invalid_endpoint"));
+    }
     if let Some(token) = source.token.as_deref() {
         let value = valid_token_bytes(token).ok_or_else(|| ReadFailure::pre("invalid_token"))?;
         let value = std::str::from_utf8(value).expect("validated ASCII");
@@ -173,11 +186,7 @@ fn parse_endpoint(raw: &str) -> Result<(String, bool), ReadFailure> {
         return Err(invalid());
     }
     let (host, port): (&str, Option<u16>) = split_authority(authority).ok_or_else(invalid)?;
-    // The connector pins localhost to loopback IPs before sending plaintext credentials.
-    if !secure && !crate::daemon::is_loopback_host(host) {
-        return Err(invalid());
-    }
-    if secure && !valid_https_host(host) {
+    if !valid_host(host) {
         return Err(invalid());
     }
 
@@ -224,7 +233,7 @@ fn parse_port(raw: &str) -> Option<u16> {
     raw.parse().ok()
 }
 
-fn valid_https_host(host: &str) -> bool {
+fn valid_host(host: &str) -> bool {
     if host.starts_with('[') {
         return unbracketed(host).parse::<std::net::Ipv6Addr>().is_ok();
     }
@@ -301,6 +310,74 @@ mod tests {
     use clap::Parser as _;
 
     #[test]
+    #[serial_test::serial]
+    fn environment_urls_strip_queries_but_never_send_credentials_over_lan_http() {
+        use std::ffi::OsString;
+        let cases = [
+            (
+                "http://192.168.1.50:8080",
+                None,
+                "",
+                false,
+                Some("ws://192.168.1.50:8080/api/runtime/ws"),
+            ),
+            ("http://192.168.1.50:8080", Some("secret"), "", false, None),
+            ("http://192.168.1.50:8080", None, "phrase", false, None),
+            (
+                "https://example.test/base/?token=query-secret",
+                Some("env-secret"),
+                "",
+                false,
+                Some("wss://example.test/base/api/runtime/ws"),
+            ),
+            (
+                "http://localhost:8080/?token=query-secret",
+                None,
+                "",
+                false,
+                Some("ws://localhost:8080/api/runtime/ws"),
+            ),
+            (
+                "http://localhost:8080/?token=query-secret",
+                None,
+                "",
+                true,
+                None,
+            ),
+        ];
+        for (url, token, phrase, explicit, expected) in cases {
+            let _env =
+                crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
+            let source = ReadRequestSource {
+                explicit_url: explicit.then(|| url.into()),
+                env_url: (!explicit).then(|| OsString::from(url)),
+                token: token.map(OsString::from),
+                explicit_profile: None,
+                env_profile: None,
+            };
+            let result = select_endpoint(&source);
+            if let Some(expected) = expected {
+                let SelectedEndpoint::Http { request } = result.unwrap() else {
+                    panic!("HTTP selection required")
+                };
+                assert_eq!(request.uri().to_string(), expected);
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("Authorization")
+                        .map(|value| value.to_str().unwrap()),
+                    token.map(|token| format!("Bearer {token}")).as_deref()
+                );
+                assert!(!request.uri().to_string().contains("query-secret"));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "credentials must not leave over plaintext LAN HTTP or query auth"
+                );
+            }
+        }
+    }
+    #[test]
     fn endpoint_grammar_is_literal_and_bounded() {
         for raw in [
             "http://127.0.0.1:8080",
@@ -313,13 +390,13 @@ mod tests {
             "http://127.0.0.2",
             "http://localhost:8080",
             "http://LocalHost:8080",
+            "http://[::2]",
             "https://example.test/base/",
         ] {
             assert!(parse_endpoint(raw).is_ok(), "{raw}");
         }
         for raw in [
             "",
-            "http://[::2]",
             "https://[fe80::1%25eth0]",
             "https://user@example.test",
             "https://example.test?x=1",

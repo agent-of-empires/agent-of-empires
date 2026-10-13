@@ -820,7 +820,7 @@ async fn compare_transports(
 
         // Retraction makes the next pass use the local store.
         shutdown.cancel();
-        daemon.join().await;
+        let _fixture = daemon.join().await;
     }
 
     for (args, expected) in &served {
