@@ -16,7 +16,7 @@ Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSock
 
 ### TUI keybinds
 
-The view opens with the composer ready. The transcript stays scrollable from the composer, a pending authorization opens a focused approval shelf above it, and the status line keeps the worker state and primary controls visible. The active session's agent, directory, and permission mode sit in a compact card in the upper left; user turns use a `›` gutter and agent replies a `•` gutter, so only modal decisions get a full-width border.
+The view opens with the composer ready. The transcript stays scrollable from the composer, a pending authorization opens a focused approval shelf above it, and the status line keeps the worker state and primary controls visible. When there is room, the active session's agent, directory, and permission mode sit in a compact card in the upper left; short previews omit the card to preserve transcript space. User turns have a bold `You ›` label in the theme's title color, while agent replies use a bold `Agent •` label in the terminal accent. Messages remain unframed; only modal decisions get a full-width border.
 
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |

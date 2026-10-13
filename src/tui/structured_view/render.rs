@@ -668,7 +668,9 @@ fn render_transcript(
         .as_deref()
         .filter(|title| !title.trim().is_empty())
         .unwrap_or(&state.session_id);
-    let body = if active && area.width >= 28 && area.height >= 8 {
+    // Preserve enough transcript rows in a short home preview. The metadata
+    // card otherwise leaves a single content row at height eight.
+    let body = if active && area.width >= 28 && area.height >= 14 {
         let card_width = metadata_card_width(state, friendly_title, area.width);
         let card_area = Rect {
             width: card_width,
@@ -1293,7 +1295,7 @@ fn user_message_lines<'a>(text: &str, theme: &Theme) -> Vec<Line<'a>> {
         .map(|(index, line)| {
             Line::from(vec![
                 Span::styled(
-                    if index == 0 { "› " } else { "  " },
+                    if index == 0 { "You › " } else { "      " },
                     Style::default()
                         .fg(theme.title)
                         .add_modifier(Modifier::BOLD),
@@ -1312,8 +1314,10 @@ fn agent_message_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
             line.spans.insert(
                 0,
                 Span::styled(
-                    if index == 0 { "• " } else { "  " },
-                    Style::default().fg(theme.hint),
+                    if index == 0 { "Agent • " } else { "        " },
+                    Style::default()
+                        .fg(theme.terminal_active)
+                        .add_modifier(Modifier::BOLD),
                 ),
             );
             line
@@ -2652,6 +2656,32 @@ mod tests {
     }
 
     #[test]
+    fn short_active_view_keeps_the_labeled_exchange_visible() {
+        let mut state = test_state();
+        state.transcript.server_rows = server_rows(&[
+            Event::UserPromptSent {
+                prompt_id: None,
+                text: "Hello.".into(),
+                attachments: Vec::new(),
+                synthesized: false,
+            },
+            Event::AgentMessageChunk {
+                text: "Ready to help.".into(),
+            },
+        ]);
+        let rows = render_rows(&state, 60, 10, true);
+        assert!(
+            rows.iter().any(|row| row.contains("You › Hello.")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Agent • Ready to help.")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
     fn full_render_layout() {
         let rows = render_rows(&test_state(), 60, 12, true);
         let prompt = rows
@@ -2697,7 +2727,7 @@ mod tests {
             "virtual-wardrobe",
             "/workspace/virtual-wardrobe",
             "permissions: yolo",
-            "• What should we build?",
+            "Agent • What should we build?",
         ] {
             assert!(
                 rows.iter().any(|row| row.contains(want)),
@@ -2706,7 +2736,7 @@ mod tests {
         }
         let prompt = rows
             .iter()
-            .find(|row| row.contains("› Hello."))
+            .find(|row| row.contains("You › Hello."))
             .expect("user turn");
         assert!(
             !prompt.starts_with('│') && !prompt.ends_with('│'),

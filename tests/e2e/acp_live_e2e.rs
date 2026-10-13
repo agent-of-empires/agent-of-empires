@@ -35,6 +35,31 @@ fn live_session(name: &str, script: &str, prompt: &str) -> (TuiTestHarness, Stri
     (h, session_id)
 }
 
+/// Speaker labels remain visible in the full-screen structured transcript.
+#[test]
+#[parallel]
+fn tui_acp_renders_user_and_agent_speaker_labels() {
+    require_tmux!();
+    require_node!();
+    const MESSAGE_SCRIPT: &str = r#"{
+  "turns": [
+    {
+      "updates": [
+        {
+          "sessionUpdate": "agent_message_chunk",
+          "content": { "type": "text", "text": "hello from the fake agent" }
+        }
+      ],
+      "stopReason": "end_turn"
+    }
+  ]
+}"#;
+    let (mut h, session_id) = live_session("acp_speaker_labels", MESSAGE_SCRIPT, "Say hello");
+    h.spawn(&["acp", "attach", &session_id]);
+
+    h.wait_for("You › Say hello");
+    h.wait_for("Agent • hello from the fake agent");
+}
 #[test]
 #[parallel]
 fn tui_acp_renders_compact_edit_summary_with_live_daemon() {
@@ -688,11 +713,9 @@ fn wizard_created_structured_session_opens_structured_view() {
     h.type_text(project.to_str().unwrap());
     h.send_keys("Tab");
     h.type_text("wizstruct");
-    // The Tool row is focusable only with several tools, shown by `[1/N]`.
+    // Tab past the optional tool selector to the structured-view toggle.
     h.send_keys("Tab");
-    if h.capture_screen().contains("[1/") {
-        h.send_keys("Tab");
-    }
+    h.send_keys("Tab");
     h.send_keys("Space");
     h.assert_screen_contains("[x] Structured view");
     h.send_keys("Enter");
