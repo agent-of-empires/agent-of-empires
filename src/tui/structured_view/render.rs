@@ -2212,10 +2212,10 @@ mod tests {
             assert_eq!(joined(&lines), "…", "input {input:?}");
         }
 
-        // A user message takes one chevron and no background.
+        // A user message has a labeled gutter and no background.
         let theme = crate::tui::styles::load_theme("empire");
         let lines = user_message_lines("first\nsecond", &theme);
-        assert_eq!(joined(&lines), "› first\n  second");
+        assert_eq!(joined(&lines), "You › first\n      second");
         assert!(lines
             .iter()
             .flat_map(|line| &line.spans)
@@ -2664,6 +2664,7 @@ mod tests {
                 text: "Hello.".into(),
                 attachments: Vec::new(),
                 synthesized: false,
+                origin_plugin: None,
             },
             Event::AgentMessageChunk {
                 text: "Ready to help.".into(),
