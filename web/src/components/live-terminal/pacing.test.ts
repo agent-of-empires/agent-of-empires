@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { anchoredScrollTop, scrollAnchor, type RowLayout } from "./pacing";
 
 const LINE_H = 10;
+/** Three rows tall. */
+const VIEW_H = 30;
 
 const LINES = Array.from({ length: 20 }, (_, i) => `line ${i}`);
 
@@ -84,10 +86,28 @@ describe("scroll anchor across a relayout", () => {
       expected: (18 + 0.5) * LINE_H,
     },
     {
-      name: "a spacer row moves with the loaded history when reading switches from the VT grid to tmux",
+      name: "a spacer row moves with the loaded text in view when reading switches from the VT grid to tmux",
+      before: { top: 50, spacer: 6, layout: layout(ones(4), LINES.slice(16, 20), 2) },
+      after: { spacer: 0, layout: layout(ones(20), LINES, 2) },
+      expected: 15 * LINE_H,
+    },
+    {
+      name: "the oldest boundary stays put when reading switches from the VT grid to tmux",
+      before: { top: 0, spacer: 6, layout: layout(ones(4), LINES.slice(16, 20), 2) },
+      after: { spacer: 0, layout: layout(ones(20), LINES, 2) },
+      expected: 0,
+    },
+    {
+      name: "the oldest boundary stays put with loaded text in view when reading switches from the VT grid to tmux",
+      before: { top: 0, spacer: 2, layout: layout(ones(4), LINES.slice(16, 20), 2) },
+      after: { spacer: 0, layout: layout(ones(20), LINES, 2) },
+      expected: 0,
+    },
+    {
+      name: "a view of only spacer keeps its scrollbar position when reading switches from the VT grid to tmux",
       before: { top: 20, spacer: 6, layout: layout(ones(4), LINES.slice(16, 20), 2) },
       after: { spacer: 0, layout: layout(ones(20), LINES, 2) },
-      expected: 12 * LINE_H,
+      expected: 2 * LINE_H,
     },
     {
       name: "a spacer row stays put when output appends and no history is loaded",
@@ -108,13 +128,13 @@ describe("scroll anchor across a relayout", () => {
       expected: 37,
     },
   ])("$name", ({ before, after, expected }) => {
-    const anchor = scrollAnchor(before.top, before.spacer, before.layout, LINE_H);
+    const anchor = scrollAnchor(before.top, VIEW_H, before.spacer, before.layout, LINE_H);
     expect(anchor).not.toBeNull();
     expect(anchoredScrollTop(anchor!, after.spacer, after.layout, LINE_H)).toBeCloseTo(expected);
   });
 
   it("gives up on a position no layout can place", () => {
-    expect(scrollAnchor(100, 2, layout([1, 1]), LINE_H)).toBeNull();
+    expect(scrollAnchor(100, VIEW_H, 2, layout([1, 1]), LINE_H)).toBeNull();
     const pastTheEnd = { line: 9, fromEnd: -5, wrap: 0, fraction: 0, probe: 0, context: [] };
     expect(anchoredScrollTop(pastTheEnd, 2, layout([1, 1]), LINE_H)).toBeNull();
   });

@@ -126,7 +126,9 @@ const ANCHOR_CONTEXT_LINES = 8;
  *  count from the top of the scrollback and the spacer holds one row per line; `fromEnd` counts back from the
  *  end instead, which a trim or a switch between the VT grid and tmux capture leaves unchanged. `context` is the
  *  plain text of history lines starting `probe` lines below the anchor's: its own when it is a loaded history
- *  line, else the nearest loaded ones. History lines, unlike the live screen, are never repainted in place. */
+ *  line, the first loaded ones for a spacer line, or those just above the live screen for a screen line, which
+ *  is repainted in place. The oldest boundary, or a view of nothing but spacer, has no context and keeps its
+ *  scrollbar position: one asks for the oldest line, and in the other nothing was read. */
 export interface ScrollAnchor {
   line: number;
   fromEnd: number;
@@ -136,7 +138,13 @@ export interface ScrollAnchor {
   context: readonly string[];
 }
 
-export function scrollAnchor(top: number, spacerLines: number, layout: RowLayout, lineH: number): ScrollAnchor | null {
+export function scrollAnchor(
+  top: number,
+  viewHeight: number,
+  spacerLines: number,
+  layout: RowLayout,
+  lineH: number,
+): ScrollAnchor | null {
   const abs = Math.floor(top / lineH);
   const fraction = top / lineH - abs;
   const row = abs - spacerLines;
@@ -145,7 +153,10 @@ export function scrollAnchor(top: number, spacerLines: number, layout: RowLayout
   const line = spacerLines + src.line;
   const first =
     src.line < layout.screenStart ? Math.max(0, src.line) : Math.max(0, layout.screenStart - ANCHOR_CONTEXT_LINES);
-  const context = layout.keys.slice(first, Math.min(first + ANCHOR_CONTEXT_LINES, layout.screenStart));
+  const keepPosition = top <= 0 || spacerLines * lineH >= top + viewHeight;
+  const context = keepPosition
+    ? []
+    : layout.keys.slice(first, Math.min(first + ANCHOR_CONTEXT_LINES, layout.screenStart));
   return {
     line,
     fromEnd: spacerLines + layout.keys.length - line,

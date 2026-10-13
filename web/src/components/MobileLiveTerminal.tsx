@@ -633,7 +633,7 @@ export function MobileLiveTerminal({
       // Shrunken content has already clamped scrollTop to the bottom; the last known position predates that.
       const clamped = el.scrollTop >= el.scrollHeight - el.clientHeight - 1;
       const from = clamped ? Math.max(el.scrollTop, prev.top) : el.scrollTop;
-      const anchor = scrollAnchor(from, prev.spacer, prev.layout, lineH);
+      const anchor = scrollAnchor(from, el.clientHeight, prev.spacer, prev.layout, lineH);
       const top = anchor && anchoredScrollTop(anchor, effectiveSpacerLines, visual, lineH);
       if (top != null && Math.abs(top - el.scrollTop) >= 1) el.scrollTop = top;
     }
