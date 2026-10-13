@@ -102,11 +102,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Lib and bins only: dev-dependencies such as `serial_test` may need a
       # newer compiler without affecting anyone building aoe.
-      - name: Check the locked graph on rust-version
+      - name: Check the locked graph on rust-version (core)
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo +"$MSRV" check --locked --workspace
+      - name: Check the locked graph on rust-version (web)
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
         run: |
           mkdir -p target/ci-web-dist
           printf '<!doctype html><title>aoe msrv placeholder</title>\n' > target/ci-web-dist/index.html
-          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo +${{ steps.msrv.outputs.version }} check --locked --workspace --all-features
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo +"$MSRV" check --locked --workspace --features web
 
   web-fmt:
     name: Format (web)
