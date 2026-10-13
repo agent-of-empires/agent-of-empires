@@ -215,10 +215,17 @@ fn audit_token(pid: u32) -> anyhow::Result<Option<AuditToken>> {
     let mut token = AuditToken { values: [0; 8] };
     let mut count = 8;
     let result = unsafe { libc::task_info(port, 15, token.values.as_mut_ptr().cast(), &mut count) };
-    anyhow::ensure!(
-        result == 0 && count == 8 && token.values[5] == pid as u32,
-        "invalid process audit token"
-    );
+    if result != 0 || count != 8 || token.values[5] != pid {
+        if !super::worker::is_pid_alive(pid)
+            || process_membership(pid)?.is_none_or(|info| info.pbi_status == libc::SZOMB)
+        {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "invalid process audit token: Mach error {result}, count {count}, PID {}",
+            token.values[5]
+        );
+    }
     Ok(Some(token))
 }
 
