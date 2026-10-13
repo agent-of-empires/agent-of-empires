@@ -254,7 +254,6 @@
       "risk": "high",
       "specs": [
         "tests/live-terminal-compose.spec.ts",
-        "tests/live/acp-stories/mobile-toolbar-keys.spec.ts",
         "src/components/__tests__/TerminalComposeSheet.test.tsx",
         "src/components/__tests__/LiveTerminalView.compose.test.tsx",
         "src/components/__tests__/MobileTerminalToolbar.test.tsx",
@@ -272,6 +271,18 @@
         "web/src/lib/terminalToolbarKeys.ts",
         "web/src/lib/arrowJoystick.ts"
       ]
+    },
+    {
+      "id": "terminal.mobile-ctrl-consumption",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/mobile-toolbar-keys.spec.ts"],
+      "components": [
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/MobileLiveTerminal.tsx"
+      ],
+      "reason": "Checks received terminal bytes and real input focus after ordinary, interrupt, and held toolbar keys consume Ctrl."
     },
     {
       "id": "terminal.selection-hold",

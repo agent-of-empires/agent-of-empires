@@ -26,6 +26,7 @@ interface Props {
   compact: boolean;
   ctrlActive: boolean;
   onCtrlToggle: () => void;
+  onCtrlClear: () => void;
   /** The live view's hidden input element, which owns keyboard focus. */
   inputElRef: RefObject<HTMLTextAreaElement | null>;
 }
@@ -94,6 +95,7 @@ export function MobileTerminalToolbar({
   compact,
   ctrlActive,
   onCtrlToggle,
+  onCtrlClear,
   inputElRef,
 }: Props) {
   const haptic = useCallback(() => {
@@ -106,16 +108,16 @@ export function MobileTerminalToolbar({
     if (keyboardOpen) inputElRef.current?.focus();
   }, [inputElRef, keyboardOpen]);
 
-  // Every toolbar key reaches the PTY without a `beforeinput` on either hidden input, so the retained IME syllable
-  // stops mirroring the line it shadowed.
+  // Toolbar sends bypass hidden-input edits; invalidate the IME shadow before delivery.
   const send = useCallback(
     (data: string) => {
       haptic();
       invalidateRetainedImeContext(inputElRef.current);
       sendData(data);
+      onCtrlClear();
       refocusTerminal();
     },
-    [sendData, inputElRef, refocusTerminal, haptic],
+    [sendData, inputElRef, onCtrlClear, refocusTerminal, haptic],
   );
 
   const paste = async () => {
@@ -190,10 +192,7 @@ export function MobileTerminalToolbar({
             type="button"
             aria-label={spec.name}
             className={KEY_CLASS}
-            onClick={() => {
-              send(spec.data!);
-              if (ctrlActive) onCtrlToggle();
-            }}
+            onClick={() => send(spec.data!)}
           >
             <KeyFace spec={spec} />
           </button>
