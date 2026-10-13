@@ -187,13 +187,17 @@ aoe send <id-or-title> "message"
 aoe send <id-or-title> "message" --no-revive   # fail instead of starting a stopped session
 ```
 
-`aoe send` starts a stopped session unless `--no-revive` is given, waits at most 5 seconds for the agent to look ready, then sends anyway. A message that arrives before the agent's prompt is up is lost or left unsubmitted, so after launching, poll for the agent's ready marker instead of sleeping a fixed time. For Claude Code with `-y` that is `bypass permissions` in the footer:
+`aoe send` starts a stopped session unless `--no-revive` is given, waits at most 5 seconds for the agent to look ready, then sends anyway. A message that arrives before the agent's prompt is up is lost or left unsubmitted, so after launching, poll capture until the agent is ready instead of sleeping a fixed time. For Claude Code in any permission mode, `status` reads `idle` once its input box is on screen. Send only after that was observed; on a capture error or deadline, stop without sending:
 
 ```bash
+ready=
 for _ in $(seq 60); do
-  aoe session capture "fix-123" -n 40 --strip-ansi | grep -q "bypass permissions" && break
+  out=$(aoe session capture "fix-123" --json) || { echo "capture failed" >&2; exit 1; }
+  status=$(printf '%s\n' "$out" | jq -er .status) || { echo "unreadable capture" >&2; exit 1; }
+  [ "$status" = idle ] && { ready=1; break; }
   sleep 2
 done
+[ -n "$ready" ] || { echo "fix-123 not ready after 120s" >&2; exit 1; }
 aoe send "fix-123" "Fix issue #123 and open a PR"
 ```
 
@@ -292,7 +296,7 @@ done
 2. **Using raw `tmux` to start or stop agents.** That bypasses aoe's tracking; the session's status and metadata go stale. Always use `aoe session start/stop/restart`.
 3. **Forgetting `-l`/`--launch`.** `aoe add` creates a session but does not start it unless you pass `-l`.
 4. **Running across the wrong profile.** Sessions are profile-scoped; use `-p <name>` or set `AGENT_OF_EMPIRES_PROFILE` when scripting, and `aoe list --all` to see everything.
-5. **Sending before the agent is ready.** Poll capture for the ready marker first, and confirm the agent started working afterwards. See [Sending messages](#sending-messages).
+5. **Sending before the agent is ready.** Poll capture until `status` is `idle` and abort on timeout, and confirm the agent started working afterwards. See [Sending messages](#sending-messages).
 
 ## Verification Checklist
 

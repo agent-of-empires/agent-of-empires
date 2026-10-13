@@ -190,13 +190,17 @@ aoe send <id-or-title> "message"
 aoe send <id-or-title> "message" --no-revive   # fail instead of starting a stopped session
 ```
 
-`aoe send` starts a stopped session unless `--no-revive` is given, waits at most 5 seconds for the agent to look ready, then sends anyway. A message that arrives before the agent's prompt is up is lost or left unsubmitted, so after launching, poll for the agent's ready marker instead of sleeping a fixed time. For Claude Code with `-y` that is `bypass permissions` in the footer:
+`aoe send` starts a stopped session unless `--no-revive` is given, waits at most 5 seconds for the agent to look ready, then sends anyway. A message that arrives before the agent's prompt is up is lost or left unsubmitted, so after launching, poll capture until the agent is ready instead of sleeping a fixed time. For Claude Code in any permission mode, `status` reads `idle` once its input box is on screen. Send only after that was observed; on a capture error or deadline, stop without sending:
 
 ```bash
+ready=
 for _ in $(seq 60); do
-  aoe session capture "fix-123" -n 40 --strip-ansi | grep -q "bypass permissions" && break
+  out=$(aoe session capture "fix-123" --json) || { echo "capture failed" >&2; exit 1; }
+  status=$(printf '%s\n' "$out" | jq -er .status) || { echo "unreadable capture" >&2; exit 1; }
+  [ "$status" = idle ] && { ready=1; break; }
   sleep 2
 done
+[ -n "$ready" ] || { echo "fix-123 not ready after 120s" >&2; exit 1; }
 aoe send "fix-123" "Fix issue #123 and open a PR"
 ```
 
