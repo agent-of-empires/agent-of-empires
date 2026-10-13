@@ -1,6 +1,6 @@
 # Installation
 
-**Prerequisites:** [tmux](https://github.com/tmux/tmux/wiki). Docker (or another container runtime) is optional, for [sandboxing](guides/sandbox.md), and [Node.js](https://nodejs.org/) is needed only to build the web dashboard from source. Building also needs a C toolchain for the bundled native dependencies (SQLite, libgit2, OpenSSL, liblzma, AWS-LC); a stock `cc` covers most platforms, and targets without pre-generated AWS-LC bindings also need CMake.
+**Prerequisites:** [tmux](https://github.com/tmux/tmux/wiki). Docker (or another container runtime) is optional, for [sandboxing](guides/sandbox.md), and [Node.js](https://nodejs.org/) is needed only to build the web dashboard from source. Building also needs a C toolchain for native dependencies; a stock `cc` covers most platforms, and targets without pre-generated AWS-LC bindings also need CMake.
 
 ## Install
 
@@ -12,11 +12,24 @@ curl -fsSL \
 
 # Homebrew
 brew install aoe
+```
 
-# From source; add --features web for the dashboard (needs Node and npm)
+## Build from Source
+
+```bash
 git clone https://github.com/agent-of-empires/agent-of-empires
 cd agent-of-empires && cargo build --release
 ```
+
+Add `--features web` for the dashboard, which requires Node and npm. The default-enabled `vendored` feature selects OpenSSL and SQLite vendoring.
+
+For system libraries, install `pkg-config` and compatible libgit2, OpenSSL and SQLite development packages. SQLite must provide JSON functions. Then build with vendoring disabled and system libgit2 required:
+
+```bash
+LIBGIT2_NO_VENDOR=1 cargo build --release --no-default-features --features default-plugins
+```
+
+`--no-default-features` disables all defaults; explicitly selecting `default-plugins` retains that default feature selection independently of `vendored`. Add `web` to the feature list for the dashboard. `LIBGIT2_NO_VENDOR=1` fails the build if compatible system libgit2 is unavailable, instead of falling back to a source build. Other native dependencies are unaffected, and system libgit2 may still link OpenSSL transitively.
 
 A source build leaves the binary at `target/release/aoe`. Verify any install with `aoe --version`.
 
