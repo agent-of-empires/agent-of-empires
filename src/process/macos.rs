@@ -189,13 +189,13 @@ unsafe extern "C" {
 }
 
 fn audit_token(pid: u32) -> anyhow::Result<Option<AuditToken>> {
-    let pid = i32::try_from(pid)?;
-    anyhow::ensure!(pid > 0, "invalid owned process PID");
+    let raw_pid = i32::try_from(pid)?;
+    anyhow::ensure!(raw_pid > 0, "invalid owned process PID");
     let mut port = 0;
     let task = unsafe { mach_task_self_ };
-    let result = unsafe { task_name_for_pid(task, pid, &mut port) };
+    let result = unsafe { task_name_for_pid(task, raw_pid, &mut port) };
     if result != 0 {
-        if !super::worker::is_pid_alive(pid as u32) {
+        if !super::worker::is_pid_alive(pid) {
             return Ok(None);
         }
         if process_membership(pid)?.is_none_or(|info| info.pbi_status == libc::SZOMB) {
