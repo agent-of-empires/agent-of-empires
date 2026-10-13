@@ -176,6 +176,7 @@ struct AuditToken {
 }
 
 unsafe extern "C" {
+    static mach_task_self_: libc::mach_port_t;
     fn task_name_for_pid(
         task: libc::mach_port_t,
         pid: libc::pid_t,
@@ -191,13 +192,13 @@ fn audit_token(pid: u32) -> anyhow::Result<Option<AuditToken>> {
     let pid = i32::try_from(pid)?;
     anyhow::ensure!(pid > 0, "invalid owned process PID");
     let mut port = 0;
-    let task = unsafe { libc::mach_task_self_ };
+    let task = unsafe { mach_task_self_ };
     let result = unsafe { task_name_for_pid(task, pid, &mut port) };
     if result != 0 {
         if !super::worker::is_pid_alive(pid as u32) {
             return Ok(None);
         }
-        if process_membership(pid)?.is_none_or(|info| info.pbi_status == 5) {
+        if process_membership(pid)?.is_none_or(|info| info.pbi_status == libc::SZOMB) {
             return Ok(None);
         }
         anyhow::bail!("process audit token unavailable: Mach error {result}");
