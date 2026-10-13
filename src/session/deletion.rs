@@ -1909,8 +1909,9 @@ fn kept_resources_from_messages(request: &DeletionRequest, messages: &[String]) 
     messages
         .iter()
         .filter(|message| {
-            let lower = message.to_ascii_lowercase();
-            lower.contains(" kept") || lower.starts_with("kept") || lower.contains("preserved")
+            message.starts_with("Workspace directory kept:")
+                || message.starts_with("Scratch directory kept at:")
+                || message.starts_with("Agent store kept (")
         })
         .map(|message| {
             let workspace_path = request

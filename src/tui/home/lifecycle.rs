@@ -107,19 +107,48 @@ impl HomeView {
                 // `retain` can empty this when every lock failed; writing then would
                 // rewrite sessions.json and notify subscribers for no change.
                 if !expired.is_empty() {
+                    let mut cleared_ids = std::collections::HashSet::new();
                     let cleared = storage.update(|disk, _groups| {
                         for id in &expired {
-                            if let Some(stored) =
+                            let Some(stored) =
                                 disk.iter_mut().find(|candidate| &candidate.id == id)
-                            {
-                                stored.clear_expired_lifecycle_reservation(ttl, now);
+                            else {
+                                continue;
+                            };
+                            if stored.status == crate::session::Status::Deleting {
+                                if let Some(reservation) = stored.lifecycle_reservation.as_ref() {
+                                    if reservation.op
+                                        == crate::session::LifecycleOperation::Purge
+                                    {
+                                        match crate::session::lifecycle_journal::deletion_exists(
+                                            storage.sessions_path(),
+                                            &stored.id,
+                                            reservation.generation,
+                                        ) {
+                                            Ok(true) => continue,
+                                            Ok(false) => {}
+                                            Err(error) => {
+                                                tracing::warn!(
+                                                    target: "session.delete_recovery",
+                                                    session = %stored.id,
+                                                    %error,
+                                                    "could not verify purge journal under lifecycle lock; preserving its reservation"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if stored.clear_expired_lifecycle_reservation(ttl, now) {
+                                cleared_ids.insert(id.clone());
                             }
                         }
                         Ok(())
                     });
                     if cleared.is_ok() {
                         for instance in &mut instances {
-                            if expired.contains(&instance.id) {
+                            if cleared_ids.contains(&instance.id) {
                                 instance.clear_expired_lifecycle_reservation(ttl, now);
                             }
                         }

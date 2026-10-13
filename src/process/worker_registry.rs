@@ -154,8 +154,8 @@ pub fn fence_for_purge(
         let fence = PurgeFence {
             source_profile: source_profile.to_string(),
             lifecycle_generation,
-            runner_pid: None,
-            runner_generation: None,
+            runner_pid: current.as_ref().and_then(|fence| fence.runner_pid),
+            runner_generation: current.as_ref().and_then(|fence| fence.runner_generation),
         };
         let bytes = serde_json::to_vec(&fence).context("serializing ACP purge fence")?;
         crate::session::atomic_write_verified(&purge_fence_path(session_id)?, &bytes)
@@ -1108,12 +1108,16 @@ mod tests {
                     ));
                 }
                 if let Some(marker) = std::env::var_os("AOE_TEST_CONTROL_RUNNER_SURVIVING_CHILD") {
-                    let child = std::process::Command::new("sh")
-                        .args(["-c", "trap '' TERM; sleep 30"])
+                    let output = std::process::Command::new("sh")
+                        .args(["-c", "trap '' TERM; sleep 30 >/dev/null 2>&1 & echo $!"])
+                        .stdout(std::process::Stdio::piped())
                         .spawn()
-                        .expect("spawn surviving process-group child");
-                    std::fs::write(marker, child.id().to_string())
-                        .expect("record surviving child PID");
+                        .expect("spawn process-group helper")
+                        .wait_with_output()
+                        .expect("reap process-group helper");
+                    assert!(output.status.success(), "process-group helper failed");
+                    let child_pid = String::from_utf8_lossy(&output.stdout);
+                    std::fs::write(marker, child_pid.trim()).expect("record surviving child PID");
                 }
                 return;
             }
@@ -1665,13 +1669,16 @@ mod tests {
         assert!(is_pid_alive(child_pid));
         assert!(crate::process::worker::is_process_group_alive(pid));
 
-        let second_error = terminate_and_confirm_stopped(session_id, "profile", generation)
+        fence_for_purge(session_id, "profile", generation + 1)
+            .expect("recovery must renew the purge fence");
+        let second_error = terminate_and_confirm_stopped(session_id, "profile", generation + 1)
             .expect_err("a retry must not treat missing artifacts as an exited group");
         assert!(second_error
             .to_string()
             .contains("identity cannot be confirmed"));
         let fence = load_purge_fence_unlocked(session_id).unwrap().unwrap();
         assert_eq!(fence.runner_pid, Some(pid));
+        assert_eq!(fence.lifecycle_generation, generation + 1);
         assert_eq!(fence.runner_generation, Some(generation));
         assert!(is_pid_alive(child_pid));
 
@@ -1683,10 +1690,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(!crate::process::worker::is_process_group_alive(pid));
-        terminate_and_confirm_stopped(session_id, "profile", generation).unwrap();
+        terminate_and_confirm_stopped(session_id, "profile", generation + 1).unwrap();
         assert!(!record_path(session_id).unwrap().exists());
         assert!(!socket_exists(&socket_path_for(session_id).unwrap()));
-        assert!(clear_purge_fence_if_owned(session_id, "profile", generation).unwrap());
+        assert!(clear_purge_fence_if_owned(session_id, "profile", generation + 1).unwrap());
         assert!(child.wait().is_ok());
     }
 

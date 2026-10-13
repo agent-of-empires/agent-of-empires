@@ -48,6 +48,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_TEST_CONTROL_RUNNER_MARKER: `${HOST}/runner-marker`,
   AOE_TEST_CONTROL_RUNNER_SELF_DELETE: "host-session",
   AOE_TEST_CONTROL_RUNNER_SOCKET: `${HOST}/runner-control.sock`,
+  AOE_TEST_CONTROL_RUNNER_SURVIVING_CHILD: `${HOST}/runner-child.pid`,
   AOE_GITHUB_CLONE_BASE: `file://${HOST}/plugins`,
   AOE_AGENT_BIN: "host-session",
   AOE_AGENT_PID: "host-session",
