@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment } from "../lib/ansi";
-import { LineParseCache, textWidth, wrapLine } from "../lib/liveTermLines";
+import { LineParseCache, lineText, textWidth, wrapLine } from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, unwrapPointer } from "../lib/liveMouse";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -190,31 +190,36 @@ export function MobileLiveTerminal({
   }, [reading]);
   // Unchanged lines keep their parse and wrap identity across frames, so memoized rows skip them.
   const [parseCache] = useState(() => new LineParseCache());
-  const rawLines = useMemo(() => (frame ? frameLines(frame) : []), [frame]);
-  const lines = useMemo(() => parseCache.lines(rawLines), [rawLines, parseCache]);
+  const lines = useMemo(() => (frame ? parseCache.lines(frame.lines ?? frame.content) : []), [frame, parseCache]);
   // Columns rendered at; wrapping keeps a frame readable when another client widened the window.
   const [renderCols, setRenderCols] = useState(0);
-  const [wrapCache] = useState(() => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][] }>());
+  const [wrapCache] = useState(
+    () => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][]; key: string }>(),
+  );
   const visual = useMemo(() => {
     const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
     const rows: AnsiSegment[][] = [];
     const lineStartRow: number[] = new Array(lines.length);
+    const keys: string[] = new Array(lines.length);
     const source: Array<{ line: number; wrap: number }> = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
       let wrapped = wrapCache.get(line);
       if (!wrapped || wrapped.cols !== cols) {
-        wrapped = { cols, rows: wrapLine(line, cols) };
+        // Plain text, so the anchor matches a line whichever producer encoded its style.
+        wrapped = { cols, rows: wrapLine(line, cols), key: lineText(line).trimEnd() };
         wrapCache.set(line, wrapped);
       }
       lineStartRow[i] = rows.length;
+      keys[i] = wrapped.key;
       wrapped.rows.forEach((row, wrap) => {
         rows.push(row);
         source.push({ line: i, wrap });
       });
     }
-    return { keys: rawLines, rows, lineStartRow, source };
-  }, [lines, rawLines, renderCols, wrapCache]);
+    const screenStart = Math.max(0, lines.length - (frame?.rows ?? 0));
+    return { keys, rows, lineStartRow, source, screenStart };
+  }, [lines, frame?.rows, renderCols, wrapCache]);
   const screenRows = frame?.rows ?? 0;
   const spacerLines = Math.max(0, (frame?.history ?? 0) - Math.max(0, lines.length - screenRows));
   // A full-screen mouse app's scrollback is not capturable: no spacer, no native scroll, wheels go to the app.

@@ -5,14 +5,23 @@ import { openLiveSession, scroller } from "./helpers/liveTerminal";
 
 // #4204: a reader scrolled into history must keep their line in view while the rows above it change. Reading
 // mode loads the full history into a spacer that reserves one row per pane line, though a line can wrap to
-// several; and once scrollback is full, its oldest lines are trimmed in a chunk.
+// several; once scrollback is full, its oldest lines are trimmed in a chunk; and a reading window deeper than
+// the VT grid's scrollback is served by tmux capture, which numbers lines from an older origin and encodes
+// styles differently.
 const HISTORY = 400;
 const TRIM = 200;
+const TMUX_EXTRA = 600;
+/** The VT grid ends every row with a reset. */
+const vtRow = (line: (i: number) => string) => (i: number) => `${line(i)}\x1b[0m`;
 const lineKinds = [
   { name: "lines that fit the grid", line: (i: number) => `L${String(i).padStart(4, "0")} short` },
   { name: "lines that wrap", line: (i: number) => `L${String(i).padStart(4, "0")} ${"x".repeat(400)}` },
 ];
-const scenarios = ["history loads above the reader", "the oldest scrollback is trimmed"] as const;
+const scenarios = [
+  "history loads above the reader",
+  "the oldest scrollback is trimmed",
+  "reading switches from the VT grid to tmux",
+] as const;
 const cases = scenarios.flatMap((scenario) => lineKinds.map((kind) => ({ scenario, ...kind })));
 
 /** The first history line whose first row is in view: always loaded text, never the spacer above it. */
@@ -48,7 +57,7 @@ test.describe("Live terminal scroll anchor", () => {
     test(`${scenario} without moving the reader's line: ${name}`, async ({ page }) => {
       const handle = await openLiveSession(
         page,
-        await mockTerminalApis(page, { liveHistory: HISTORY, liveHistoryLine: line }),
+        await mockTerminalApis(page, { liveHistory: HISTORY, liveHistoryLine: vtRow(line) }),
       );
       const debug = page.locator("[data-live-debug]");
       const field = async (key: string) =>
@@ -57,7 +66,7 @@ test.describe("Live terminal scroll anchor", () => {
       const lineH = await field("lineH");
 
       // Take over the frames, re-sending the live window unchanged, so the history request below waits for us.
-      await handle.pushLiveFrame(makeLiveFrame({ rows, history: HISTORY, window: rows * 2, line }));
+      await handle.pushLiveFrame(makeLiveFrame({ rows, history: HISTORY, window: rows * 2, line: vtRow(line) }));
 
       const el = scroller(page);
       const startTop = await el.evaluate((n) => n.scrollTop);
@@ -76,7 +85,7 @@ test.describe("Live terminal scroll anchor", () => {
         });
       await expect.poll(requested, { message: "scrolling up must enter reading mode and request history" }).toBe(true);
 
-      const fullFrame = makeLiveFrame({ rows, history: HISTORY, window: fullWindow, line });
+      const fullFrame = makeLiveFrame({ rows, history: HISTORY, window: fullWindow, line: vtRow(line) });
       if (scenario === "the oldest scrollback is trimmed") {
         await handle.pushLiveFrame(fullFrame);
         await expect.poll(() => field("spacer")).toBe(0);
@@ -88,11 +97,18 @@ test.describe("Live terminal scroll anchor", () => {
       if (scenario === "history loads above the reader") {
         await handle.pushLiveFrame(fullFrame);
         await expect.poll(() => field("spacer")).toBe(0);
+      } else if (scenario === "reading switches from the VT grid to tmux") {
+        // tmux holds TMUX_EXTRA older lines, so the same window starts that many lines later in its numbering.
+        const history = HISTORY + TMUX_EXTRA;
+        const tmuxLine = (i: number) =>
+          i > TMUX_EXTRA ? line(i - TMUX_EXTRA) : `O${String(i).padStart(4, "0")} older`;
+        await handle.pushLiveFrame(makeLiveFrame({ rows, history, window: fullWindow, line: tmuxLine }));
+        await expect.poll(() => field("hist")).toBe(history);
       } else {
         // The oldest TRIM lines go and one new line arrives, so every remaining line moves up TRIM places.
         const history = HISTORY - TRIM + 1;
         await handle.pushLiveFrame(
-          makeLiveFrame({ rows, history, window: rows + history, line: (i) => line(i + TRIM) }),
+          makeLiveFrame({ rows, history, window: rows + history, line: (i) => vtRow(line)(i + TRIM) }),
         );
         await expect.poll(() => field("hist")).toBe(history);
       }

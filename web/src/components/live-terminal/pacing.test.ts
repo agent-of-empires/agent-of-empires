@@ -3,18 +3,21 @@ import { anchoredScrollTop, scrollAnchor, type RowLayout } from "./pacing";
 
 const LINE_H = 10;
 
-const LINES = Array.from({ length: 12 }, (_, i) => `line ${i}`);
+const LINES = Array.from({ length: 20 }, (_, i) => `line ${i}`);
 
-/** A layout of the raw rows `keys` whose lines wrap to the given row counts. */
-function layout(rowsPerLine: number[], keys: readonly string[] = LINES.slice(0, rowsPerLine.length)): RowLayout {
+/** A layout of the plain-text lines `keys`, wrapping to the given row counts, whose last `screenRows` lines are
+ *  the live screen. */
+function layout(rowsPerLine: number[], keys: readonly string[] = LINES.slice(0, rowsPerLine.length), screenRows = 0) {
   const lineStartRow: number[] = [];
   const source: RowLayout["source"] = [];
   rowsPerLine.forEach((count, line) => {
     lineStartRow.push(source.length);
     for (let wrap = 0; wrap < count; wrap++) source.push({ line, wrap });
   });
-  return { keys, lineStartRow, source };
+  return { keys, lineStartRow, source, screenStart: keys.length - screenRows };
 }
+
+const ones = (n: number) => Array.from({ length: n }, () => 1);
 
 describe("scroll anchor across a relayout", () => {
   it.each([
@@ -45,18 +48,58 @@ describe("scroll anchor across a relayout", () => {
     {
       name: "a line follows its text when the oldest scrollback is trimmed",
       before: { top: 45, spacer: 0, layout: layout([2, 2, 1, 1, 1, 1]) },
-      after: { spacer: 0, layout: layout([1, 1, 1, 1, 1], LINES.slice(2, 7)) },
+      after: { spacer: 0, layout: layout(ones(5), LINES.slice(2, 7)) },
       expected: 0.5 * LINE_H,
     },
     {
       name: "a trim prefers the line's full context over a repeat of it near the end",
-      before: {
-        top: 40,
-        spacer: 0,
-        layout: layout([1, 1, 1, 1, 1, 1, 1, 1], ["q", "r", "s", "t", "a", "b", "c", "a"]),
-      },
-      after: { spacer: 0, layout: layout([1, 1, 1, 1, 1], ["t", "a", "b", "c", "a"]) },
+      before: { top: 40, spacer: 0, layout: layout(ones(8), ["q", "r", "s", "t", "a", "b", "c", "a"]) },
+      after: { spacer: 0, layout: layout(ones(5), ["t", "a", "b", "c", "a"]) },
       expected: 10,
+    },
+    {
+      name: "a trim with a screen repaint matches on history lines only",
+      before: { top: 20, spacer: 0, layout: layout(ones(6), ["a", "b", "c", "d", "s0", "s1"], 2) },
+      after: { spacer: 0, layout: layout(ones(4), ["c", "d", "x0", "x1"], 2) },
+      expected: 0,
+    },
+    // The VT grid keeps 2000 lines while tmux capture keeps the whole scrollback, so a line's number from the top
+    // differs between them; here the VT grid holds the last 10 of tmux's 20.
+    {
+      name: "a loaded line keeps its place when reading switches from the VT grid to tmux",
+      before: { top: 65, spacer: 6, layout: layout(ones(4), LINES.slice(16, 20), 2) },
+      after: { spacer: 0, layout: layout(ones(20), LINES, 2) },
+      expected: (16 + 0.5) * LINE_H,
+    },
+    {
+      name: "a loaded line keeps its place when reading switches from the VT grid to tmux with wrapped history",
+      before: { top: 65, spacer: 6, layout: layout(ones(4), LINES.slice(16, 20), 2) },
+      after: { spacer: 0, layout: layout([...Array.from({ length: 16 }, () => 2), 1, 1, 1, 1], LINES, 2) },
+      expected: (32 + 0.5) * LINE_H,
+    },
+    {
+      name: "a screen row keeps its place when reading switches from the VT grid to tmux",
+      before: { top: 85, spacer: 6, layout: layout(ones(4), LINES.slice(16, 20), 2) },
+      after: { spacer: 0, layout: layout(ones(20), LINES, 2) },
+      expected: (18 + 0.5) * LINE_H,
+    },
+    {
+      name: "a spacer row moves with the loaded history when reading switches from the VT grid to tmux",
+      before: { top: 20, spacer: 6, layout: layout(ones(4), LINES.slice(16, 20), 2) },
+      after: { spacer: 0, layout: layout(ones(20), LINES, 2) },
+      expected: 12 * LINE_H,
+    },
+    {
+      name: "a spacer row stays put when output appends and no history is loaded",
+      before: { top: 30, spacer: 5, layout: layout(ones(2), ["s0", "s1"], 2) },
+      after: { spacer: 6, layout: layout(ones(2), ["n0", "n1"], 2) },
+      expected: 30,
+    },
+    {
+      name: "a spacer row stays put when output appends past the loaded history",
+      before: { top: 30, spacer: 5, layout: layout(ones(4), ["h5", "h6", "s0", "s1"], 2) },
+      after: { spacer: 6, layout: layout(ones(4), ["h6", "h7", "n0", "n1"], 2) },
+      expected: 30,
     },
     {
       name: "the same layout keeps the same position",
@@ -72,6 +115,7 @@ describe("scroll anchor across a relayout", () => {
 
   it("gives up on a position no layout can place", () => {
     expect(scrollAnchor(100, 2, layout([1, 1]), LINE_H)).toBeNull();
-    expect(anchoredScrollTop({ line: 9, wrap: 0, fraction: 0, context: [] }, 2, layout([1, 1]), LINE_H)).toBeNull();
+    const pastTheEnd = { line: 9, fromEnd: -5, wrap: 0, fraction: 0, probe: 0, context: [] };
+    expect(anchoredScrollTop(pastTheEnd, 2, layout([1, 1]), LINE_H)).toBeNull();
   });
 });

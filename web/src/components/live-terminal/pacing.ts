@@ -110,24 +110,29 @@ export function mountedBlocks(
   return { blocks, bottomPadLines };
 }
 
-/** Rendered rows: each loaded line's raw row, each visual row's source line and wrap offset, and each line's
- *  first row. */
+/** Rendered rows: each loaded line's plain text, each visual row's source line and wrap offset, each line's
+ *  first row, and the index of the first line on the live screen. */
 export interface RowLayout {
   keys: readonly string[];
   lineStartRow: number[];
   source: Array<{ line: number; wrap: number }>;
+  screenStart: number;
 }
 
-/** Lines compared to find the anchor again after the oldest scrollback is trimmed. */
+/** History lines compared to find the anchor again once its line number has changed. */
 const ANCHOR_CONTEXT_LINES = 8;
 
-/** A scroll position as a pane line, its wrap row, and the fraction of a row above the scroller top. Pane
- *  lines count from the top of the scrollback and the spacer holds one row per line. `context` is the raw rows
- *  of the loaded line and those after it. */
+/** A scroll position as a pane line, its wrap row, and the fraction of a row above the scroller top. Pane lines
+ *  count from the top of the scrollback and the spacer holds one row per line; `fromEnd` counts back from the
+ *  end instead, which a trim or a switch between the VT grid and tmux capture leaves unchanged. `context` is the
+ *  plain text of history lines starting `probe` lines below the anchor's: its own when it is a loaded history
+ *  line, else the nearest loaded ones. History lines, unlike the live screen, are never repainted in place. */
 export interface ScrollAnchor {
   line: number;
+  fromEnd: number;
   wrap: number;
   fraction: number;
+  probe: number;
   context: readonly string[];
 }
 
@@ -135,26 +140,42 @@ export function scrollAnchor(top: number, spacerLines: number, layout: RowLayout
   const abs = Math.floor(top / lineH);
   const fraction = top / lineH - abs;
   const row = abs - spacerLines;
-  if (row < 0) return { line: abs, wrap: 0, fraction, context: [] };
-  const src = layout.source[row];
+  const src = row < 0 ? { line: row, wrap: 0 } : layout.source[row];
   if (!src) return null;
-  const context = layout.keys.slice(src.line, src.line + ANCHOR_CONTEXT_LINES);
-  return { line: spacerLines + src.line, wrap: src.wrap, fraction, context };
+  const line = spacerLines + src.line;
+  const first =
+    src.line < layout.screenStart ? Math.max(0, src.line) : Math.max(0, layout.screenStart - ANCHOR_CONTEXT_LINES);
+  const context = layout.keys.slice(first, Math.min(first + ANCHOR_CONTEXT_LINES, layout.screenStart));
+  return {
+    line,
+    fromEnd: spacerLines + layout.keys.length - line,
+    wrap: src.wrap,
+    fraction,
+    probe: first - src.line,
+    context,
+  };
 }
 
-/** Local index of the anchor's line: where its pane line now falls or, when trimming the oldest scrollback has
- *  renumbered every line, the nearest earlier index whose lines match its context. */
+/** Local index of the anchor's line: where its context is found, searching outward from predictions counted from
+ *  either end, else its line number, which holds while output only appends. */
 function anchorLine(anchor: ScrollAnchor, spacerLines: number, keys: readonly string[]): number {
-  const expected = anchor.line - spacerLines;
-  const { context } = anchor;
-  if (context.length === 0) return expected;
+  const fromStart = anchor.line - spacerLines;
+  const { context, probe } = anchor;
+  if (context.length === 0) return fromStart;
   // A context cut off by the end only counts once no full match exists, so a repeat near the end loses.
   const matches = (at: number, cutOff: boolean) =>
-    context.every((key, k) => (at + k < keys.length ? keys[at + k] === key : cutOff));
+    at >= 0 && at < keys.length && context.every((key, k) => (at + k < keys.length ? keys[at + k] === key : cutOff));
+  const predictions = [fromStart + probe, keys.length - anchor.fromEnd + probe];
+  const reach = Math.max(...predictions.map((p) => Math.max(p, keys.length - 1 - p)));
   for (const cutOff of [false, true]) {
-    for (let at = Math.min(expected, keys.length - 1); at >= 0; at--) if (matches(at, cutOff)) return at;
+    for (let d = 0; d <= reach; d++) {
+      for (const p of predictions) {
+        if (matches(p - d, cutOff)) return p - d - probe;
+        if (d > 0 && matches(p + d, cutOff)) return p + d - probe;
+      }
+    }
   }
-  return expected;
+  return fromStart;
 }
 
 /** The scrollTop that puts `anchor` back where it was, or null when its line is not in this layout. */
@@ -165,7 +186,7 @@ export function anchoredScrollTop(
   lineH: number,
 ): number | null {
   const local = anchorLine(anchor, spacerLines, layout.keys);
-  if (local < 0) return (anchor.line + anchor.fraction) * lineH;
+  if (local < 0) return Math.max(0, spacerLines + local + anchor.fraction) * lineH;
   const first = layout.lineStartRow[local];
   if (first == null) return null;
   const rows = (layout.lineStartRow[local + 1] ?? layout.source.length) - first;
