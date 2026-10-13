@@ -153,7 +153,7 @@ _Avoid_: hook (unqualified), git hook
 
 **Structured view**:
 A Session rendered from ACP state: plan, tool-call cards, diffs, approvals. The Agent runs under a Worker instead of a tmux pane.
-_Avoid_: web dashboard (that is a surface), ACP-native, structured session
+_Avoid_: web dashboard (that is a Client), ACP-native, structured session
 
 **Terminal view**:
 A Session rendered as its raw tmux pane.
@@ -197,15 +197,23 @@ Entering a Session's tmux pane from the TUI. Unrelated to attaching a Worktree t
 **Live-send**:
 An attach mode that keeps the TUI on the home view and forwards keystrokes to whichever pane is on screen: agent, Paired terminal or Tool session.
 
-**Surface**:
-Where the user meets AoE: TUI, web dashboard, or CLI.
-_Avoid_: frontend, client
-
 ### Processes
 
 **Daemon**:
-The long-running `aoe serve` process. Hosts the API, the web dashboard, the Supervisor, the Reconciler, Plugin workers and push notifications.
+The always-on `aoe serve` process that owns all Session runtime state and is required to use AoE. Hosts the API, Web serving, the Supervisor, the Reconciler, Plugin workers and push notifications.
 _Avoid_: server, agent daemon
+
+**Client**:
+A program that drives a Daemon through its API: the TUI, the CLI or the Web dashboard. Holds no Session runtime state of its own.
+_Avoid_: surface, frontend
+
+**Remote Daemon**:
+A Daemon on another machine that a Client reaches over the network. Plain Daemon means the one on the user's own machine.
+_Avoid_: remote server, host
+
+**Web serving**:
+The Daemon's toggle for hosting the Web dashboard. Not a separate process.
+_Avoid_: web server
 
 **Supervisor**:
 The part of the Daemon that owns the pool of Workers and tracks each one's phase.
@@ -222,8 +230,8 @@ Stopping a Terminal view Session that has sat Idle past a threshold. Distinct fr
 _Avoid_: dormant
 
 **Web dashboard**:
-The browser UI the Daemon serves, protected by a rotating access token and an optional passphrase.
-_Avoid_: PWA, web UI, structured view (that is a view, not a surface)
+The browser Client the Daemon serves through Web serving, protected by a rotating access token and an optional passphrase.
+_Avoid_: PWA, web UI, structured view (that is a view, not a Client)
 
 **Tunnel**:
 A remote path to the Web dashboard through Cloudflare or Tailscale.
@@ -292,7 +300,7 @@ _Avoid_: event (for this)
 ### Settings
 
 **Setting**:
-A user-facing value declared once, in one place. Every Surface derives its view of it from that declaration.
+A user-facing value declared once, in one place. Every Client derives its view of it from that declaration.
 _Avoid_: config field, option
 
 **Repo config**:
