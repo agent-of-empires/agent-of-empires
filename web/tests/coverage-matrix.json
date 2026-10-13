@@ -2187,6 +2187,14 @@
       ]
     },
     {
+      "id": "terminal.http-send-normalization",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/live-terminal.spec.ts"],
+      "components": ["src/server/api/sessions/send.rs"],
+      "reason": "Captures real HTTP terminal input bytes after suffix normalization, including internal content and empty rejection."
+    },
+    {
       "id": "diff-comments.typed-event",
       "kind": "vitest",
       "risk": "high",

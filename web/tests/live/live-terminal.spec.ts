@@ -1,6 +1,8 @@
 // The live terminal view against a real server and tmux: frame transport, compression, size ownership, scrollback.
 
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { devices, type Page } from "@playwright/test";
 import { test, expect, type ServeHandle, type ServeOptions } from "../helpers/liveTest";
@@ -488,4 +490,88 @@ while true; do sleep 1; done
       await ctxB.close().catch(() => {});
     }
   });
+});
+
+test("HTTP sends normalize trailing breaks after paste delimiters without losing internal content", async ({
+  spawnServe,
+}) => {
+  const serve = await serveAgent(
+    spawnServe,
+    "http-byte-capture",
+    `#!/bin/bash
+set -e
+stty raw -echo
+printf '\\e[?2004l'
+exec python3 -u -c 'import os
+f = open(os.path.join(os.environ["HOME"], "received.bin"), "ab", buffering=0)
+open(os.path.join(os.environ["HOME"], "ready"), "w").close()
+while True:
+ b = os.read(0, 1)
+ if not b: break
+ f.write(b)
+'
+`,
+  );
+  for (const tool of ["tmux", "stty", "python3"]) {
+    const result = spawnSync("bash", ["-c", 'command -v "$1"', "bash", tool], {
+      env: serve.env,
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    expect(result.error, tool).toBeUndefined();
+    expect(result.status, `required terminal capture tool: ${tool}`).toBe(0);
+  }
+  const session = (await waitForSessions(serve.baseUrl)).find((s) => s.title === "http-byte-capture");
+  if (!session) throw new Error("HTTP capture session was not seeded");
+  const ensured = await fetch(`${serve.baseUrl}/api/sessions/${session.id}/ensure`, { method: "POST" });
+  expect(ensured.status).toBe(200);
+  await ensured.body?.cancel();
+  await expect.poll(() => existsSync(join(serve.home, "ready")), { timeout: 15_000 }).toBe(true);
+
+  const tmux = (...args: string[]) => {
+    const result = spawnSync("tmux", ["-S", serve.tmuxSocket, ...args], {
+      env: serve.env,
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout;
+  };
+  const name = `${serve.tmuxPrefix}http-byte-capture_${session.id.slice(0, 8)}`;
+  const panes = tmux("list-panes", "-a", "-F", "#{session_name} #{window_index} #{pane_id}")
+    .trim()
+    .split("\n")
+    .map((line) => line.split(" "))
+    .filter(([sessionName, window]) => sessionName === name && window === "0");
+  expect(panes).toHaveLength(1);
+  const pane = panes[0][2];
+  const P = "0123456789abcdef";
+  const cases = [
+    { label: "control", message: P, bytes: P + "\r", status: 200 },
+    { label: "LF", message: P + "\n", bytes: P + "\r", status: 200 },
+    { label: "CRLF", message: P + "\r\n", bytes: P + "\r", status: 200 },
+    { label: "delimiters", message: "\x1b[200~" + P + "\n\x1b[201~", bytes: P + "\r", status: 200 },
+    { label: "internal breaks", message: P + "\nX\rY\r\n", bytes: P + "\rX\rY\r", status: 200 },
+    { label: "spaces", message: P + " \t\n", bytes: P + " \t\r", status: 200 },
+    { label: "only breaks", message: "\x1b[200~\r\n\n\x1b[201~", bytes: "", status: 400 },
+  ];
+  const file = join(serve.home, "received.bin");
+  let expected = Buffer.alloc(0);
+  for (const [index, { label, message, bytes, status }] of cases.entries()) {
+    const response = await fetch(`${serve.baseUrl}/api/sessions/${session.id}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, revive: false }),
+    });
+    expect(response.status, label).toBe(status);
+    expect(await response.json(), label).toEqual(status === 200 ? { sent: true } : { error: "message_empty" });
+    // The new sentinel is consumed only after all bytes from this response's send.
+    tmux("send-keys", "-t", pane, "-H", "1e");
+    await expect
+      .poll(() => readFileSync(file).filter((byte) => byte === 0x1e).length, { timeout: 10_000, message: label })
+      .toBe(index + 1);
+    expected = Buffer.concat([expected, Buffer.from(bytes), Buffer.from([0x1e])]);
+    expect(readFileSync(file), label).toEqual(expected);
+  }
 });

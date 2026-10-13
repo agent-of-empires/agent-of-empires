@@ -258,6 +258,8 @@ pub async fn send_message(
     };
 
     crate::server::live_ws::strip_paste_escapes(&mut req.message);
+    let len = req.message.trim_end_matches(['\r', '\n']).len();
+    req.message.truncate(len);
     if req.message.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
