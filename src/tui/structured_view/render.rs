@@ -879,7 +879,7 @@ pub(crate) fn wrapped_transcript(
     let lines = transcript_lines(&state.transcript, theme, state.path_roots.as_ref());
     let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     for line in lines {
-        wrap_line_into(own_line(line), width, &mut wrapped);
+        wrap_transcript_line(own_line(line), width, &mut wrapped);
     }
     Text::from(wrapped)
 }
@@ -930,9 +930,31 @@ fn own_line(line: Line<'_>) -> Line<'static> {
     Line::from(spans).style(line.style)
 }
 
-/// Word-wrap a styled line at the last space, hard-breaking long words.
-/// Unlike `markdown::wrap_line_into`, tabs are not expanded.
+fn wrap_transcript_line(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
+    let continuation = line.spans.first().and_then(|span| {
+        let gutter = match span.content.as_ref() {
+            "You › " => "      ",
+            "Agent • " => "        ",
+            "      " => "      ",
+            "        " => "        ",
+            _ => return None,
+        };
+        Some((gutter, span.style))
+    });
+    wrap_line_into_with_indent(line, width, out, continuation);
+}
+
 fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
+    wrap_line_into_with_indent(line, width, out, None);
+}
+
+/// Word-wrap a styled line, starting continued rows with the supplied gutter.
+fn wrap_line_into_with_indent(
+    line: Line<'static>,
+    width: u16,
+    out: &mut Vec<Line<'static>>,
+    continuation: Option<(&str, Style)>,
+) {
     use unicode_width::UnicodeWidthChar;
 
     let width = width.max(1) as usize;
@@ -948,6 +970,11 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
     let mut row: Vec<(char, Style)> = Vec::new();
     let mut row_width = 0usize;
     let mut last_space: Option<usize> = None;
+    let continuation: Vec<(char, Style)> = continuation
+        .into_iter()
+        .flat_map(|(text, style)| text.chars().map(move |c| (c, style)))
+        .take(width.saturating_sub(1))
+        .collect();
     let flush = |row: &mut Vec<(char, Style)>, out: &mut Vec<Line<'static>>| {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (c, style) in row.drain(..) {
@@ -962,15 +989,16 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
         let cw = c.width().unwrap_or(0);
         if row_width + cw > width && !row.is_empty() {
             if let Some(cut) = last_space {
-                // The break space is dropped, like a terminal word wrap.
                 let tail: Vec<(char, Style)> = row.split_off(cut + 1);
                 row.truncate(cut);
                 flush(&mut row, out);
-                row = tail;
+                row = continuation.clone();
+                row.extend(tail);
                 row_width = row.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
             } else {
                 flush(&mut row, out);
-                row_width = 0;
+                row = continuation.clone();
+                row_width = row.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
             }
             last_space = None;
         }
@@ -2138,6 +2166,32 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_speaker_messages_keep_their_gutter() {
+        let theme = crate::tui::styles::load_theme("empire");
+        for (line, gutter) in [
+            (
+                user_message_lines("one two three four five", &theme)[0].clone(),
+                "      ",
+            ),
+            (
+                agent_message_lines("one two three four five", &theme)[0].clone(),
+                "        ",
+            ),
+        ] {
+            let mut wrapped = Vec::new();
+            wrap_transcript_line(line, 12, &mut wrapped);
+            assert!(wrapped.len() > 1, "{wrapped:?}");
+            assert!(
+                wrapped
+                    .iter()
+                    .skip(1)
+                    .all(|line| line_text(line).starts_with(gutter)),
+                "{wrapped:?}"
+            );
+        }
+    }
+
+    #[test]
     fn truncate_chars_is_char_safe() {
         assert_eq!(truncate_chars("hi", 10), None);
         // Byte slicing used to panic on a multi-byte boundary.
@@ -2670,7 +2724,9 @@ mod tests {
                 text: "Ready to help.".into(),
             },
         ]);
-        let rows = render_rows(&state, 60, 10, true);
+        // Eleven rows give the transcript eight rows: the old card threshold
+        // would hide the first turn.
+        let rows = render_rows(&state, 60, 11, true);
         assert!(
             rows.iter().any(|row| row.contains("You › Hello.")),
             "{rows:?}"

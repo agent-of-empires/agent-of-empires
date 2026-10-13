@@ -713,8 +713,10 @@ fn wizard_created_structured_session_opens_structured_view() {
     h.type_text(project.to_str().unwrap());
     h.send_keys("Tab");
     h.type_text("wizstruct");
-    // Tab past the optional tool selector to the structured-view toggle.
-    h.send_keys("Tab");
+    // The selector exists only when multiple tools are available.
+    if h.capture_screen().contains("Tool:") {
+        h.send_keys("Tab");
+    }
     h.send_keys("Tab");
     h.send_keys("Space");
     h.assert_screen_contains("[x] Structured view");
