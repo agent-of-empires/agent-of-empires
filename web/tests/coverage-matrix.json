@@ -2097,7 +2097,8 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/right-panel.spec.ts"],
-      "components": ["web/src/components/diff/FileContextMenu.tsx", "web/src/lib/openInNewTab.ts"]
+      "components": ["web/src/components/diff/FileContextMenu.tsx", "web/src/lib/openInNewTab.ts"],
+      "reason": "Opens worktree text and a decodable PNG with positive intrinsic width; saves active HTML and refuses deleted files."
     },
     {
       "id": "right-panel.diff",
@@ -2148,7 +2149,8 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/right-panel.spec.ts"],
-      "components": ["web/src/components/FilesPane.tsx", "web/src/components/diff/FileContextMenu.tsx"]
+      "components": ["web/src/components/FilesPane.tsx", "web/src/components/diff/FileContextMenu.tsx"],
+      "reason": "Opens unchanged text and a decodable PNG with positive intrinsic width from the Files pane."
     },
     {
       "id": "right-panel.files-pane-live",
