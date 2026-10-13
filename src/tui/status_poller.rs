@@ -108,7 +108,7 @@ pub(super) fn poll_statuses_once(
     // If not, skip the batch subprocess calls entirely.
     let any_pollable = instances.iter().any(|inst| {
         let tier = polling_tier(inst.status);
-        tier != 0 && state.cycle_count % tier == 0
+        tier != 0 && state.cycle_count.is_multiple_of(tier)
     });
 
     let pane_metadata = if any_pollable {
@@ -206,7 +206,7 @@ fn project_status_updates(
         .filter_map(|mut inst| {
             // Adaptive polling: skip instances whose tier interval hasn't elapsed
             let tier = polling_tier(inst.status);
-            if tier == 0 || cycle_count % tier != 0 {
+            if tier == 0 || !cycle_count.is_multiple_of(tier) {
                 return None;
             }
 

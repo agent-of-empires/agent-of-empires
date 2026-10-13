@@ -48,7 +48,7 @@ fn clear_reported_session_creates(reported: u32, outcome: crate::telemetry::Send
         return;
     }
     use std::sync::atomic::Ordering;
-    // `try_update` needs Rust 1.99; this keeps the 1.85 MSRV and the Nix toolchain building.
+    // `try_update` needs Rust 1.99, newer than the MSRV and the Nix toolchain.
     #[allow(deprecated)]
     let _ = TUI_SESSION_CREATES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(reported))

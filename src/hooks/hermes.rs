@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::agents::ResolvedHookEvent;
 
-use super::command::{hook_command, is_aoe_hook_command};
+use super::command::{hook_command, hook_command_session_id, is_aoe_hook_command};
 use super::config_io::{log_installed, log_removed, log_unchanged, with_config_lock, write_file};
 use super::HookInstallTarget;
 
@@ -17,6 +17,17 @@ fn yaml_command_is_aoe(hook: &Value) -> bool {
         .is_some_and(is_aoe_hook_command)
 }
 
+/// Commands for one event: the identity extractor first (it must see stdin first), then the
+/// status writer. `config.yaml` and the allowlist both render from this, so they cannot drift.
+fn event_commands(event: &ResolvedHookEvent, target: HookInstallTarget) -> Vec<String> {
+    let identity = event
+        .identity_field
+        .map(|field| hook_command_session_id(target, field, event.publisher));
+    let status = event
+        .status
+        .map(|status| hook_command(status.as_str(), target));
+    identity.into_iter().chain(status).collect()
+}
 fn parse_config(content: &str, config_path: &Path) -> Result<Value> {
     serde_saphyr::from_str_with_options(content, crate::yaml::options())
         .with_context(|| format!("Failed to parse {}", config_path.display()))
@@ -58,9 +69,10 @@ pub fn install_hermes_hooks_with_events(
         }
         let hooks = hooks.as_object_mut().expect("ensured mapping above");
         for event in events {
-            let Some(status) = event.status else {
+            let commands = event_commands(event, target);
+            if commands.is_empty() {
                 continue;
-            };
+            }
             let entries = hooks
                 .entry(event.name.clone())
                 .or_insert_with(|| Value::Array(Vec::new()));
@@ -69,9 +81,9 @@ pub fn install_hermes_hooks_with_events(
             }
             let entries = entries.as_array_mut().expect("ensured sequence above");
             entries.retain(|hook| !yaml_command_is_aoe(hook));
-            entries.push(serde_json::json!({
-                "command": hook_command(status.as_str(), target),
-            }));
+            for command in commands {
+                entries.push(serde_json::json!({ "command": command }));
+            }
         }
         let yaml_changed = config != yaml_before;
 
@@ -168,26 +180,24 @@ fn render_hermes_allowlist(
         .ok_or_else(|| anyhow::anyhow!("allowlist root is not a JSON object with approvals[]"))?;
 
     for event in events {
-        let Some(status) = event.status else {
-            continue;
-        };
-        let cmd = hook_command(status.as_str(), target);
-        let same = |entry: &Value| {
-            entry.get("event").and_then(Value::as_str) == Some(event.name.as_str())
-                && entry.get("command").and_then(Value::as_str) == Some(&cmd)
-        };
-        let preserved = approvals.iter().find_map(|entry| {
-            same(entry)
-                .then(|| entry.get("approved_at").cloned())
-                .flatten()
-        });
-        approvals.retain(|entry| !same(entry));
-        approvals.push(serde_json::json!({
-            "event": event.name,
-            "command": cmd,
-            "approved_at": preserved.unwrap_or_else(|| Value::String(now.clone())),
-            "script_mtime_at_approval": Value::Null,
-        }));
+        for cmd in event_commands(event, target) {
+            let same = |entry: &Value| {
+                entry.get("event").and_then(Value::as_str) == Some(event.name.as_str())
+                    && entry.get("command").and_then(Value::as_str) == Some(&cmd)
+            };
+            let preserved = approvals.iter().find_map(|entry| {
+                same(entry)
+                    .then(|| entry.get("approved_at").cloned())
+                    .flatten()
+            });
+            approvals.retain(|entry| !same(entry));
+            approvals.push(serde_json::json!({
+                "event": event.name,
+                "command": cmd,
+                "approved_at": preserved.unwrap_or_else(|| Value::String(now.clone())),
+                "script_mtime_at_approval": Value::Null,
+            }));
+        }
     }
 
     Ok((allowlist_path, serde_json::to_string_pretty(&data)?))
@@ -234,22 +244,31 @@ mod tests {
             let entries = config["hooks"][event.name.as_str()].as_array().unwrap();
             assert_eq!(
                 entries.iter().filter(|h| yaml_command_is_aoe(h)).count(),
-                1,
+                1 + usize::from(event.identity_field.is_some()),
                 "{}",
                 event.name
             );
             assert!(yaml_command_is_aoe(entries.last().unwrap()));
         }
+        // The foreground identity publisher runs before the status writer on `pre_llm_call`.
+        let identity = config["hooks"]["pre_llm_call"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            identity.contains(
+                "__extract-session-id --field hermes-foreground-session-id --agent hermes"
+            ),
+            "{identity}"
+        );
         assert_eq!(
             config["hooks"]["pre_tool_call"][0]["command"].as_str(),
             Some("echo user-hook")
         );
         let allowlist = read_json(&allowlist_path);
         assert_eq!(allowlist["version"], 7);
-        assert_eq!(
-            allowlist["approvals"].as_array().unwrap().len(),
-            events.len()
-        );
+        let approvals = allowlist["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), events.len() + 1);
+        assert!(approvals.iter().any(|entry| entry["command"] == identity));
 
         assert!(uninstall_hermes_hooks(&path).unwrap());
         let config = read_yaml(&path);
@@ -343,7 +362,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            events.len()
+            events.len() + 1
         );
 
         uninstall_hermes_hooks(&config_path).unwrap();
