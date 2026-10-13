@@ -3,18 +3,17 @@ import { anchoredScrollTop, scrollAnchor, type RowLayout } from "./pacing";
 
 const LINE_H = 10;
 
-/** Distinct parsed lines, shared between layouts the way the parse cache shares unchanged lines across frames. */
-const LINES = Array.from({ length: 12 }, () => [] as unknown[]);
+const LINES = Array.from({ length: 12 }, (_, i) => `line ${i}`);
 
-/** A layout of `lines` whose lines wrap to the given row counts. */
-function layout(rowsPerLine: number[], lines: readonly unknown[] = LINES.slice(0, rowsPerLine.length)): RowLayout {
+/** A layout of the raw rows `keys` whose lines wrap to the given row counts. */
+function layout(rowsPerLine: number[], keys: readonly string[] = LINES.slice(0, rowsPerLine.length)): RowLayout {
   const lineStartRow: number[] = [];
   const source: RowLayout["source"] = [];
   rowsPerLine.forEach((count, line) => {
     lineStartRow.push(source.length);
     for (let wrap = 0; wrap < count; wrap++) source.push({ line, wrap });
   });
-  return { lines, lineStartRow, source };
+  return { keys, lineStartRow, source };
 }
 
 describe("scroll anchor across a relayout", () => {
@@ -48,6 +47,16 @@ describe("scroll anchor across a relayout", () => {
       before: { top: 45, spacer: 0, layout: layout([2, 2, 1, 1, 1, 1]) },
       after: { spacer: 0, layout: layout([1, 1, 1, 1, 1], LINES.slice(2, 7)) },
       expected: 0.5 * LINE_H,
+    },
+    {
+      name: "a trim prefers the line's full context over a repeat of it near the end",
+      before: {
+        top: 40,
+        spacer: 0,
+        layout: layout([1, 1, 1, 1, 1, 1, 1, 1], ["q", "r", "s", "t", "a", "b", "c", "a"]),
+      },
+      after: { spacer: 0, layout: layout([1, 1, 1, 1, 1], ["t", "a", "b", "c", "a"]) },
+      expected: 10,
     },
     {
       name: "the same layout keeps the same position",

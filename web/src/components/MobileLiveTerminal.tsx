@@ -190,7 +190,8 @@ export function MobileLiveTerminal({
   }, [reading]);
   // Unchanged lines keep their parse and wrap identity across frames, so memoized rows skip them.
   const [parseCache] = useState(() => new LineParseCache());
-  const lines = useMemo(() => (frame ? parseCache.lines(frame.lines ?? frame.content) : []), [frame, parseCache]);
+  const rawLines = useMemo(() => (frame ? frameLines(frame) : []), [frame]);
+  const lines = useMemo(() => parseCache.lines(rawLines), [rawLines, parseCache]);
   // Columns rendered at; wrapping keeps a frame readable when another client widened the window.
   const [renderCols, setRenderCols] = useState(0);
   const [wrapCache] = useState(() => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][] }>());
@@ -212,8 +213,8 @@ export function MobileLiveTerminal({
         source.push({ line: i, wrap });
       });
     }
-    return { lines, rows, lineStartRow, source };
-  }, [lines, renderCols, wrapCache]);
+    return { keys: rawLines, rows, lineStartRow, source };
+  }, [lines, rawLines, renderCols, wrapCache]);
   const screenRows = frame?.rows ?? 0;
   const spacerLines = Math.max(0, (frame?.history ?? 0) - Math.max(0, lines.length - screenRows));
   // A full-screen mouse app's scrollback is not capturable: no spacer, no native scroll, wheels go to the app.

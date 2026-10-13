@@ -110,9 +110,10 @@ export function mountedBlocks(
   return { blocks, bottomPadLines };
 }
 
-/** Rendered rows: the loaded lines, each visual row's source line and wrap offset, and each line's first row. */
+/** Rendered rows: each loaded line's raw row, each visual row's source line and wrap offset, and each line's
+ *  first row. */
 export interface RowLayout {
-  lines: readonly unknown[];
+  keys: readonly string[];
   lineStartRow: number[];
   source: Array<{ line: number; wrap: number }>;
 }
@@ -121,13 +122,13 @@ export interface RowLayout {
 const ANCHOR_CONTEXT_LINES = 8;
 
 /** A scroll position as a pane line, its wrap row, and the fraction of a row above the scroller top. Pane
- *  lines count from the top of the scrollback and the spacer holds one row per line. `context` is the loaded
- *  line and those after it, which keep their parsed identity across frames. */
+ *  lines count from the top of the scrollback and the spacer holds one row per line. `context` is the raw rows
+ *  of the loaded line and those after it. */
 export interface ScrollAnchor {
   line: number;
   wrap: number;
   fraction: number;
-  context: readonly unknown[];
+  context: readonly string[];
 }
 
 export function scrollAnchor(top: number, spacerLines: number, layout: RowLayout, lineH: number): ScrollAnchor | null {
@@ -137,19 +138,22 @@ export function scrollAnchor(top: number, spacerLines: number, layout: RowLayout
   if (row < 0) return { line: abs, wrap: 0, fraction, context: [] };
   const src = layout.source[row];
   if (!src) return null;
-  const context = layout.lines.slice(src.line, src.line + ANCHOR_CONTEXT_LINES);
+  const context = layout.keys.slice(src.line, src.line + ANCHOR_CONTEXT_LINES);
   return { line: spacerLines + src.line, wrap: src.wrap, fraction, context };
 }
 
 /** Local index of the anchor's line: where its pane line now falls or, when trimming the oldest scrollback has
  *  renumbered every line, the nearest earlier index whose lines match its context. */
-function anchorLine(anchor: ScrollAnchor, spacerLines: number, lines: readonly unknown[]): number {
+function anchorLine(anchor: ScrollAnchor, spacerLines: number, keys: readonly string[]): number {
   const expected = anchor.line - spacerLines;
   const { context } = anchor;
   if (context.length === 0) return expected;
-  const matches = (at: number) =>
-    at < lines.length && context.every((line, k) => at + k >= lines.length || lines[at + k] === line);
-  for (let at = Math.min(expected, lines.length - 1); at >= 0; at--) if (matches(at)) return at;
+  // A context cut off by the end only counts once no full match exists, so a repeat near the end loses.
+  const matches = (at: number, cutOff: boolean) =>
+    context.every((key, k) => (at + k < keys.length ? keys[at + k] === key : cutOff));
+  for (const cutOff of [false, true]) {
+    for (let at = Math.min(expected, keys.length - 1); at >= 0; at--) if (matches(at, cutOff)) return at;
+  }
   return expected;
 }
 
@@ -160,7 +164,7 @@ export function anchoredScrollTop(
   layout: RowLayout,
   lineH: number,
 ): number | null {
-  const local = anchorLine(anchor, spacerLines, layout.lines);
+  const local = anchorLine(anchor, spacerLines, layout.keys);
   if (local < 0) return (anchor.line + anchor.fraction) * lineH;
   const first = layout.lineStartRow[local];
   if (first == null) return null;
