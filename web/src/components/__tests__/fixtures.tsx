@@ -4,6 +4,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { vi } from "vitest";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
+import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { SessionColorsContext } from "../../lib/sessionColors";
 import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
@@ -84,6 +85,7 @@ interface RowOptions {
   readOnly?: boolean;
   isActive?: boolean;
   onCreateSession?: (repoPath: string) => void;
+  compact?: boolean;
   rowTagMode?: SessionRowTagMode;
   colorsEnabled?: boolean;
   unread?: boolean;
@@ -114,13 +116,16 @@ function Providers({
   children,
   rowTagMode = "branch",
   colorsEnabled = true,
+  compact = false,
   unread,
 }: RowOptions & { children: ReactNode }) {
   const ref = useRef(0);
   const inner = (
-    <SessionRowTagContext.Provider value={rowTagMode}>
-      <SessionColorsContext.Provider value={colorsEnabled}>{children}</SessionColorsContext.Provider>
-    </SessionRowTagContext.Provider>
+    <SidebarCompactContext.Provider value={compact}>
+      <SessionRowTagContext.Provider value={rowTagMode}>
+        <SessionColorsContext.Provider value={colorsEnabled}>{children}</SessionColorsContext.Provider>
+      </SessionRowTagContext.Provider>
+    </SidebarCompactContext.Provider>
   );
   return (
     <DragSuppressContext.Provider value={ref}>
