@@ -882,13 +882,16 @@
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/lib/api.ts",
         "web/src/components/settings/PluginsSettings.tsx",
         "web/src/components/McpServers.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/LaunchFooter.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/Dashboard.tsx"
-      ]
+      ],
+      "reason": "Curates CityHall settings and wizard; writes 15-minute trash retention through the profile PATCH and retains it after a full reload and profile-qualified settings GET."
     },
     {
       "id": "tips.panel",
