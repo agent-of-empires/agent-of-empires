@@ -121,6 +121,8 @@ export interface RowLayout {
 
 /** History lines compared to find the anchor again once its line number has changed. */
 const ANCHOR_CONTEXT_LINES = 8;
+/** Non-space characters the context must hold before its joined text can identify re-wrapped rows. */
+const MIN_REWRAP_CHARS = 16;
 
 /** A scroll position as a pane line, its wrap row, and the fraction of a row above the scroller top. Pane lines
  *  count from the top of the scrollback and the spacer holds one row per line; `fromEnd` counts back from the
@@ -168,7 +170,8 @@ export function scrollAnchor(
 }
 
 /** Local index of the anchor's line: where its context is found, searching outward from predictions counted from
- *  either end, else its line number, which holds while output only appends. */
+ *  either end, else where its joined text is found after a re-wrap, else its line number, which holds while
+ *  output only appends. */
 function anchorLine(anchor: ScrollAnchor, spacerLines: number, keys: readonly string[]): number {
   const fromStart = anchor.line - spacerLines;
   const { context, probe } = anchor;
@@ -186,7 +189,45 @@ function anchorLine(anchor: ScrollAnchor, spacerLines: number, keys: readonly st
       }
     }
   }
-  return fromStart;
+  const row = rewrappedRow(context, keys, predictions);
+  return row == null ? fromStart : row - probe;
+}
+
+/** The row holding the first character of `context` once a width change has re-wrapped the rows: a re-wrap moves
+ *  soft row breaks but keeps every character, so the joined text without whitespace still matches. Of several
+ *  copies, the one nearest a prediction wins. */
+function rewrappedRow(context: readonly string[], keys: readonly string[], predictions: number[]): number | null {
+  const strip = (key: string) => key.replace(/\s+/g, "");
+  const needle = context.map(strip).join("");
+  if (needle.length < MIN_REWRAP_CHARS) return null;
+  const starts: number[] = [];
+  let text = "";
+  for (const key of keys) {
+    starts.push(text.length);
+    text += strip(key);
+  }
+  // The last row starting at or before `offset` holds that character; empty rows before it share its start.
+  const rowAt = (offset: number) => {
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (starts[mid]! <= offset) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
+  let best: number | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + 1)) {
+    const row = rowAt(at);
+    const distance = Math.min(...predictions.map((p) => Math.abs(p - row)));
+    if (distance < bestDistance) {
+      best = row;
+      bestDistance = distance;
+    }
+  }
+  return best;
 }
 
 /** The scrollTop that puts `anchor` back where it was, or null when its line is not in this layout. */

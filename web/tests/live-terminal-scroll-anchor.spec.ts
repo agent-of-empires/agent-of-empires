@@ -50,41 +50,60 @@ async function lineOffset(page: Page, id: string) {
   }, id);
 }
 
+/** The history line whose text is at the top of the view, counting a wrapped line's later rows as that line. */
+async function topLine(page: Page) {
+  return page.evaluate(() => {
+    const content = document.querySelector("[data-live-content]")!;
+    const top = content.closest("[data-live-terminal] > div")!.getBoundingClientRect().top;
+    let id: string | null = null;
+    for (const row of content.querySelectorAll(":scope > *")) {
+      id = /^L(\d{4}) /.exec(row.textContent ?? "")?.[1] ?? id;
+      if (row.getBoundingClientRect().bottom > top) return id;
+    }
+    return null;
+  });
+}
+
+/** Open a session of HISTORY lines, take over its frames, and scroll up until reading mode requests history. */
+async function scrollIntoHistory(page: Page, line: (i: number) => string) {
+  const handle = await openLiveSession(
+    page,
+    await mockTerminalApis(page, { liveHistory: HISTORY, liveHistoryLine: vtRow(line) }),
+  );
+  const debug = page.locator("[data-live-debug]");
+  const field = async (key: string) =>
+    Number(new RegExp(`${key}=([\\d.]+)`).exec((await debug.textContent()) ?? "")?.[1]);
+  const rows = await field("rows");
+  const lineH = await field("lineH");
+
+  // Take over the frames, re-sending the live window unchanged, so the history request below waits for us.
+  await handle.pushLiveFrame(makeLiveFrame({ rows, history: HISTORY, window: rows * 2, line: vtRow(line) }));
+
+  const el = scroller(page);
+  const startTop = await el.evaluate((n) => n.scrollTop);
+  await el.hover();
+  await page.mouse.wheel(0, -lineH * 8);
+  await expect.poll(() => el.evaluate((n) => n.scrollTop)).toBeLessThan(startTop - lineH * 2);
+  const fullWindow = rows + HISTORY;
+  const requested = () =>
+    handle.liveMessages.some((m) => {
+      try {
+        const msg = JSON.parse(m.toString()) as { type?: string; lines?: number };
+        return msg.type === "window" && msg.lines === fullWindow;
+      } catch {
+        return false;
+      }
+    });
+  await expect.poll(requested, { message: "scrolling up must enter reading mode and request history" }).toBe(true);
+  return { handle, field, rows, lineH, fullWindow };
+}
+
 test.describe("Live terminal scroll anchor", () => {
   test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
 
   for (const { scenario, name, line } of cases) {
     test(`${scenario} without moving the reader's line: ${name}`, async ({ page }) => {
-      const handle = await openLiveSession(
-        page,
-        await mockTerminalApis(page, { liveHistory: HISTORY, liveHistoryLine: vtRow(line) }),
-      );
-      const debug = page.locator("[data-live-debug]");
-      const field = async (key: string) =>
-        Number(new RegExp(`${key}=([\\d.]+)`).exec((await debug.textContent()) ?? "")?.[1]);
-      const rows = await field("rows");
-      const lineH = await field("lineH");
-
-      // Take over the frames, re-sending the live window unchanged, so the history request below waits for us.
-      await handle.pushLiveFrame(makeLiveFrame({ rows, history: HISTORY, window: rows * 2, line: vtRow(line) }));
-
-      const el = scroller(page);
-      const startTop = await el.evaluate((n) => n.scrollTop);
-      await el.hover();
-      await page.mouse.wheel(0, -lineH * 8);
-      await expect.poll(() => el.evaluate((n) => n.scrollTop)).toBeLessThan(startTop - lineH * 2);
-      const fullWindow = rows + HISTORY;
-      const requested = () =>
-        handle.liveMessages.some((m) => {
-          try {
-            const msg = JSON.parse(m.toString()) as { type?: string; lines?: number };
-            return msg.type === "window" && msg.lines === fullWindow;
-          } catch {
-            return false;
-          }
-        });
-      await expect.poll(requested, { message: "scrolling up must enter reading mode and request history" }).toBe(true);
-
+      const { handle, field, rows, lineH, fullWindow } = await scrollIntoHistory(page, line);
       const fullFrame = makeLiveFrame({ rows, history: HISTORY, window: fullWindow, line: vtRow(line) });
       if (scenario === "the oldest scrollback is trimmed") {
         await handle.pushLiveFrame(fullFrame);
@@ -131,4 +150,35 @@ test.describe("Live terminal scroll anchor", () => {
       );
     });
   }
+
+  // #4375: a width change re-wraps tmux's rows, so none match the reader's rows one for one.
+  test("a re-wrap at another width keeps the reader's line at the top of the view", async ({ page }) => {
+    const line = lineKinds[1]!.line;
+    const { handle, field, rows, fullWindow } = await scrollIntoHistory(page, line);
+    await handle.pushLiveFrame(makeLiveFrame({ rows, history: HISTORY, window: fullWindow, line: vtRow(line) }));
+    await expect.poll(() => field("spacer")).toBe(0);
+    const before = await topLine(page);
+    expect(before, "a history line must be at the top of the view").not.toBeNull();
+
+    // The same lines, re-wrapped by tmux at 100 columns after a resize.
+    const history = Array.from({ length: HISTORY }, (_, i) => line(i + 1)).flatMap((l) => l.match(/.{1,100}/g)!);
+    const screen = ["$ ready", ...Array.from({ length: rows - 1 }, () => "")];
+    await handle.pushLiveFrame({
+      content: [...history, ...screen].join("\n") + "\n",
+      rows,
+      history: history.length,
+      cursor: { x: 8, y: 0 },
+    });
+    await expect.poll(() => field("hist")).toBe(history.length);
+
+    let after = await topLine(page);
+    await expect
+      .poll(async () => {
+        const prev = after;
+        after = await topLine(page);
+        return after === prev;
+      })
+      .toBe(true);
+    expect(after, `L${before} was at the top of the view before the re-wrap`).toBe(before);
+  });
 });
