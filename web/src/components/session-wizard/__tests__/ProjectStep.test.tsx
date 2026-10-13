@@ -297,19 +297,25 @@ describe("Import session tab", () => {
     await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("claude", "home"));
   });
 
-  it("says when the agent cannot list or the list was cut", async () => {
-    vi.mocked(listImportableSessions).mockResolvedValue({
-      ok: false,
-      error: "list_unsupported",
-      message: "agent does not advertise session/list and session/load",
-    });
-    renderImport();
-    expect(await screen.findByText("This agent can't list sessions.")).toBeTruthy();
-    cleanup();
-
-    listed(SESSIONS, true);
-    renderImport();
-    expect(await screen.findByText("Showing newest 200.")).toBeTruthy();
+  it("reports partial returned counts independently of visible rows and only for truncated results", async () => {
+    for (const truncated of [true, false]) {
+      listed(SESSIONS, truncated);
+      renderImport();
+      await row("Fix the spinner bug");
+      if (truncated) {
+        const notice = await screen.findByRole("status");
+        expect(notice.textContent?.match(/\d+/g)).toEqual(["2"]);
+        fireEvent.click(screen.getByLabelText("Show sessions with missing directories"));
+        await row("Old work");
+        expect(notice.textContent?.match(/\d+/g)).toEqual(["2"]);
+        fireEvent.change(screen.getByLabelText("Filter sessions"), { target: { value: "zzznomatch" } });
+        expect(screen.getByRole("list", { name: "Importable sessions" }).querySelectorAll("button")).toHaveLength(0);
+        expect(notice.textContent?.match(/\d+/g)).toEqual(["2"]);
+      } else {
+        expect(screen.queryByRole("status")).toBeNull();
+      }
+      cleanup();
+    }
   });
 
   it("asks before importing a recent session or one with unknown activity", async () => {

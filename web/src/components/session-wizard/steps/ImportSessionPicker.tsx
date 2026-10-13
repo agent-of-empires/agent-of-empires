@@ -175,7 +175,11 @@ function SessionList({
           Show sessions whose directory is missing
         </label>
       )}
-      {result.truncated && <p className="text-xs text-content-subtle">Showing newest 200.</p>}
+      {result.truncated && (
+        <p role="status" className="text-xs text-content-subtle">
+          Partial list: {result.sessions.length} loaded. More sessions may exist.
+        </p>
+      )}
       <ul className="flex max-h-80 flex-col gap-1 overflow-y-auto" aria-label="Importable sessions">
         {filtered.map((s) => {
           const selected = s.session_id === selectedSessionId;
