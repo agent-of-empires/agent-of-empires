@@ -49,8 +49,8 @@ aoe add /path/to/repo -t "API work" -g backend -l
 # Add with specific tool
 aoe add . -t "codex session" -c codex
 
-# Add in a git worktree on a new branch (omit -b to check out an existing branch)
-aoe add . -t "fix-123" -w fix/issue-123 -b -l
+# Add in a git worktree on a new branch, YOLO mode (omit -b to check out an existing branch)
+aoe add . -t "fix-123" -w fix/issue-123 -b -y -l
 
 # Base the new branch on another branch instead of the default
 aoe add . -t "fix-124" -w fix/issue-124 -b --base-branch fix/issue-123 -l
@@ -65,9 +65,9 @@ aoe add . -t "sub task" -P <parent-id>
 aoe add . -t "yolo" -y -l
 ```
 
-Without `--base-branch`, `-w <branch> -b` starts the branch from `worktree.default_base_branch` if set, otherwise from the repo's detected default branch (the remote's `HEAD` target, or `main`/`master`), fetched first. It ignores whatever is checked out where you run `aoe add`, so pass `--base-branch` to build on a feature branch.
+Without `--base-branch`, `-w <branch> -b` starts the branch from `worktree.default_base_branch` if set, otherwise from the repo's detected default branch (chosen among each remote's `HEAD` target and `main`/`master`), fetched first. It is not the branch checked out where you run `aoe add`, so pass `--base-branch` to build on a feature branch.
 
-A sandboxed session (`-s`) sees only the project mount, its agent credentials, and configured `extra_volumes`. Work that needs host-only resources (macOS Keychain, launchd, the aoe app directory such as `~/.agent-of-empires`, other paths outside the project) must run without `-s`. See the [sandbox guide](https://github.com/agent-of-empires/agent-of-empires/blob/main/docs/guides/sandbox.md).
+A sandboxed session (`-s`) sees only its mounts: the project, its agent store and credentials, `~/.gitconfig`, and configured `extra_volumes`. Work that needs host-only resources (macOS Keychain, launchd, the aoe app directory, other paths outside the project) must run without `-s`. See the [sandbox guide](https://github.com/agent-of-empires/agent-of-empires/blob/main/docs/guides/sandbox.md).
 
 ## Listing Sessions
 
@@ -197,7 +197,7 @@ done
 aoe send "fix-123" "Fix issue #123 and open a PR"
 ```
 
-After sending, confirm the agent picked it up (status `running`, or the message in the transcript) before assuming delivery. Messages of 16 bytes or more, or with a newline, arrive as a bracketed paste followed by Enter, and an agent may show them collapsed (Claude Code renders `[Pasted text #1 ...]`). Claude Code's input box can also show a dimmed suggested next prompt that looks like typed text; it was not submitted. Only text in the transcript above the input box has been sent.
+After sending, confirm the agent picked it up (status `running`, or the message in the transcript) before assuming delivery. Messages of 16 bytes or more, or with a newline, are pasted (bracketed when the agent enables it) and followed by Enter, and an agent may show them collapsed (Claude Code renders `[Pasted text #1 ...]`). Claude Code's input box can also show a dimmed suggested next prompt that looks like typed text; it was not submitted. Only text in the transcript above the input box has been sent.
 
 ## Renaming and Organizing
 
@@ -237,7 +237,7 @@ aoe session restore <id-or-title>           # bring it back
 aoe remove <id-or-title> --purge --delete-worktree --force   # delete permanently
 ```
 
-With `session.delete_to_trash` on (the default), `aoe remove` stops the agent, keeps the record with `state` `trashed`, and moves an aoe-managed worktree into a `.aoe-trash/<id>` directory beside it. `--delete-worktree`, `--delete-branch`, and `--keep-container` only apply with `--purge`. For sandboxed sessions the move can fail with `Permission denied` because files the container created are root-owned; aoe prints `left worktree in place` and still trashes the session. `--purge --delete-worktree` deletes them through the container unless `--keep-container` is set.
+With `session.delete_to_trash` on (the default), `aoe remove` stops the agent, keeps the record with `state` `trashed`, and moves an aoe-managed worktree into a `.aoe-trash/<id>` directory beside it. `--delete-worktree`, `--delete-branch`, and `--keep-container` only apply with `--purge`. For sandboxed sessions the move can fail (for example with `Permission denied`); aoe then prints `left worktree in place` and still trashes the session.
 
 ## Workflow Patterns
 
