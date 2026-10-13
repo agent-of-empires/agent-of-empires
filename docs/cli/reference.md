@@ -1660,7 +1660,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
 * `stop` — Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
-* `recover` — Retire an untracked Prime record after externally stopping its native processes
+* `recover` — Retire unprovable worker ownership after external shutdown confirmation
 * `kill` — SIGKILL the runner, then settle its native workers
 * `logs` — Tail the runner's log file for an agent session
 * `restart` — Restart a wedged worker after its runner and native workers have stopped
@@ -1723,17 +1723,18 @@ Stop an agent worker and settle its owned native processes. Unlike `aoe serve --
 
 ## `aoe acp recover`
 
-Retire an untracked Prime record after externally stopping its native processes
+Retire unprovable worker ownership after external shutdown confirmation
 
-**Usage:** `aoe acp recover --confirm-prime-stopped <SESSION>`
+**Usage:** `aoe acp recover [OPTIONS] <SESSION>`
 
 ###### **Arguments:**
 
-* `<SESSION>` — Session whose missing-route Prime ownership record to retire
+* `<SESSION>` — Session whose ownership evidence to retire
 
 ###### **Options:**
 
-* `--confirm-prime-stopped` — Confirm every native worker and service in the original host/container scope is stopped. AoE cannot verify this for a record without a native route
+* `--confirm-prime-stopped` — Confirm native processes are stopped for an identifiable missing-route Prime record
+* `--confirm-worker-stopped` — Confirm the original runner and all host/container native processes are stopped. Only malformed or unattested legacy runner records are eligible
 
 
 

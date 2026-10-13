@@ -169,7 +169,11 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
     let state = structured_state(&id, false);
     let reservation = match state
         .acp_supervisor
-        .begin_resume(&id, ResumeKind::Spawn)
+        .begin_resume(
+            &id,
+            ResumeKind::Spawn,
+            crate::process::worker_registry::ResumeAuthority::Automatic,
+        )
         .await
         .expect("begin_resume must not error under capacity")
     {

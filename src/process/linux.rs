@@ -152,20 +152,32 @@ fn process_disappeared(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
+fn foreign_process_permission_error(error: &std::io::Error, owner: Option<u32>, euid: u32) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+        && owner.is_some_and(|uid| uid != euid)
+}
+
 pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
     use std::io::Read as _;
     let mut bytes = [0u8; 1024];
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
             continue;
-        };
+        }
         let size = match fs::File::open(entry.path().join("stat"))
             .and_then(|mut file| file.read(&mut bytes))
         {
             Ok(size) => size,
             Err(error) if process_disappeared(&error) => continue,
-            Err(error) => return Err(error).context("runner group census unavailable"),
+            Err(error) => {
+                use std::os::unix::fs::MetadataExt as _;
+                let owner = entry.metadata().ok().map(|metadata| metadata.uid());
+                if foreign_process_permission_error(&error, owner, unsafe { libc::geteuid() }) {
+                    continue;
+                }
+                return Err(error).context("runner group census unavailable");
+            }
         };
         let offset = bytes[..size]
             .windows(2)
@@ -177,11 +189,190 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
             .nth(1)
             .context("missing process group")?
             .parse::<u32>()?;
-        if (pid == group || process_group == group) && state != "Z" {
+        if process_group == group && state != "Z" {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+pub(super) fn process_start_id(pid: u32) -> anyhow::Result<Option<String>> {
+    let stat = match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if process_disappeared(&error) => return Ok(None),
+        Err(error) => return Err(error).context("reading process birth identity"),
+    };
+    let offset = stat
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .context("invalid process stat")?;
+    let tail = std::str::from_utf8(&stat[offset + 2..])?;
+    let mut fields = tail.split_ascii_whitespace();
+    fields.next().context("missing process state")?;
+    let start = fields.nth(18).context("missing process birth identity")?;
+    Ok(Some(format!("proc:{start}")))
+}
+
+pub(super) struct ProcessHandle(std::os::fd::OwnedFd);
+pub(super) fn process_group_id(pid: u32) -> anyhow::Result<Option<u32>> {
+    let stat = match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if process_disappeared(&error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let offset = stat
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .context("invalid process stat")?;
+    let tail = std::str::from_utf8(&stat[offset + 2..])?;
+    Ok(Some(
+        tail.split_ascii_whitespace()
+            .nth(2)
+            .context("missing process group")?
+            .parse()?,
+    ))
+}
+impl ProcessHandle {
+    pub(super) fn capture(identity: &super::PrimeProcessIdentity) -> anyhow::Result<Option<Self>> {
+        Self::capture_identity(identity, false)
+    }
+
+    pub(super) fn capture_group(
+        identity: &super::PrimeProcessIdentity,
+    ) -> anyhow::Result<Option<Self>> {
+        Self::capture_identity(identity, true)
+    }
+
+    fn capture_identity(
+        identity: &super::PrimeProcessIdentity,
+        allow_exited: bool,
+    ) -> anyhow::Result<Option<Self>> {
+        use std::os::fd::FromRawFd as _;
+        let pid = i32::try_from(identity.pid)?;
+        anyhow::ensure!(pid > 0, "invalid owned process PID");
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            if process_disappeared(&error) {
+                return Ok(None);
+            }
+            return Err(error).context("opening owned process handle");
+        }
+        let handle = Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) });
+        if process_start_id(identity.pid)?.as_deref() != Some(&identity.start_id)
+            || (!allow_exited && handle.exited()?)
+        {
+            return Ok(None);
+        }
+        Ok(Some(handle))
+    }
+    pub(super) fn group_executing(&self) -> anyhow::Result<Option<bool>> {
+        match self.send_group(0) {
+            Ok(()) => Ok(Some(true)),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(Some(false)),
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(super) fn signal_group(&self, signal: i32) -> anyhow::Result<()> {
+        match self.send_group(signal) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn send_group(&self, signal: i32) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        // PIDFD_SIGNAL_PROCESS_GROUP binds the original group, including after leader reap.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                4,
+            )
+        };
+        if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn exited(&self) -> anyhow::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        let mut descriptor = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error()).context("checking owned process exit");
+        }
+        Ok(result > 0)
+    }
+
+    pub(super) fn signal(&self, signal: i32) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if !process_disappeared(&error) {
+                return Err(error).context("signalling owned process handle");
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn runner_group_identities(
+    group: u32,
+) -> anyhow::Result<Vec<super::PrimeProcessIdentity>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut result = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => {
+                let owner = entry.metadata().ok().map(|metadata| metadata.uid());
+                if foreign_process_permission_error(&error, owner, unsafe { libc::geteuid() }) {
+                    continue;
+                }
+                return Err(error).context("inspecting owned runner group");
+            }
+        };
+        let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
+        let mut fields = tail.split_ascii_whitespace();
+        let state = fields.next().context("missing process state")?;
+        let pgrp = fields
+            .nth(1)
+            .context("missing process group")?
+            .parse::<u32>()?;
+        if state != "Z" && pgrp == group {
+            let start = fields.nth(16).context("missing process birth identity")?;
+            result.push(super::PrimeProcessIdentity {
+                pid,
+                start_id: format!("proc:{start}"),
+            });
+        }
+    }
+    Ok(result)
 }
 
 pub(super) fn prime_processes(
@@ -272,7 +463,7 @@ pub(super) fn prime_processes(
             }
         }
     }
-    Ok(super::select_prime_processes(samples, known))
+    super::select_stable_prime_processes(samples, known)
 }
 
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
@@ -602,6 +793,26 @@ mod tests {
     }
 
     #[test]
+    fn group_census_ignores_only_proven_foreign_permission_errors() {
+        for (errno, owner, expected) in [
+            (libc::EACCES, Some(1001), true),
+            (libc::EPERM, Some(1001), true),
+            (libc::EACCES, Some(1000), false),
+            (libc::EPERM, None, false),
+            (libc::EIO, Some(1001), false),
+        ] {
+            assert_eq!(
+                foreign_process_permission_error(
+                    &std::io::Error::from_raw_os_error(errno),
+                    owner,
+                    1000
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn prime_quiescence_never_declares_an_uninspectable_owned_process_absent() {
         use std::io::{BufRead as _, Read as _, Write as _};
@@ -722,11 +933,11 @@ mod tests {
             "unreadable owned environment was treated as absence"
         );
         let fresh: crate::process::prime::PrimeRuntime = serde_json::from_str(&route).unwrap();
-        assert!(fresh.cleanup().is_err());
-        assert!(runtime.0.directory.is_dir());
-        assert!(child.0.try_wait().unwrap().is_none());
-        child.0.stdin.as_mut().unwrap().write_all(&[0]).unwrap();
-        assert!(child.0.wait().unwrap().success());
+        fresh.cleanup().unwrap();
+        assert!(
+            !child.0.wait().unwrap().success(),
+            "the attested process must actually exit, not merely disappear from the census"
+        );
         let fresh: crate::process::prime::PrimeRuntime = serde_json::from_str(&route).unwrap();
         fresh.cleanup().unwrap();
         assert!(!runtime.0.directory.exists());

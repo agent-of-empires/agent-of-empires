@@ -274,6 +274,7 @@ impl PromptTouch {
 /// session id, bundled so the function stays under clippy's argument-count
 /// lint.
 pub(crate) struct SendTurnRequest<'a> {
+    pub resume_authority: crate::process::worker_registry::ResumeAuthority,
     pub text: &'a str,
     pub attachments: &'a [crate::acp::event_store::AttachmentBlob],
     /// Forces the resume trigger even when the worker looks alive, mirroring
@@ -552,6 +553,7 @@ impl SessionService {
         turn: SendTurnRequest<'_>,
     ) -> Result<(), SendTurnError> {
         let SendTurnRequest {
+            resume_authority,
             text,
             attachments,
             woke_idle_dormant,
@@ -574,13 +576,24 @@ impl SessionService {
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode)
         };
+        if resume_authority == crate::process::worker_registry::ResumeAuthority::Automatic
+            && crate::process::worker_registry::stop_requested(id)
+        {
+            return Err(SendTurnError::RevivalRefused);
+        }
         // Resume a worker that is not currently live.
         let needs_resume = woke_idle_dormant || !self.acp_supervisor.is_running(id).await;
         if no_revive && needs_resume {
             return Err(SendTurnError::RevivalRefused);
         }
         if needs_resume {
-            match crate::server::acp_reconciler::trigger_resume_background(self, id).await {
+            match crate::server::acp_reconciler::trigger_resume_background(
+                self,
+                id,
+                resume_authority,
+            )
+            .await
+            {
                 Ok(ResumeTrigger::NotFound) => return Err(SendTurnError::SessionNotFound),
                 Ok(_) => {}
                 Err(e) => return Err(SendTurnError::ResumeFailed(e)),
@@ -606,8 +619,12 @@ impl SessionService {
                 }
             }
         }
-        // Publish the user's prompt into the event stream BEFORE forwarding to the agent so
-        // the replay buffer / on-disk store captures it even if the agent forward fails.
+        if resume_authority == crate::process::worker_registry::ResumeAuthority::Automatic
+            && crate::process::worker_registry::stop_requested(id)
+        {
+            return Err(SendTurnError::RevivalRefused);
+        }
+        // Persist the admitted turn before forwarding it to the agent.
         let disposition = self
             .acp_supervisor
             .publish_user_prompt_with_attachments(
@@ -716,6 +733,7 @@ impl SessionService {
                 &caller,
                 id,
                 SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: &text,
                     attachments: &attachments,
                     woke_idle_dormant: false,
@@ -1227,6 +1245,7 @@ impl SessionService {
                 &caller,
                 id,
                 SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: &combined,
                     attachments: &attachments,
                     woke_idle_dormant: false,
@@ -1855,6 +1874,8 @@ mod tests {
                     &cron,
                     "sess-user",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -1872,6 +1893,8 @@ mod tests {
                     &other,
                     "sess-cron",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -1889,6 +1912,8 @@ mod tests {
                     &cron,
                     "sess-gone",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -1910,6 +1935,8 @@ mod tests {
                     &cron,
                     "sess-cron",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -1927,6 +1954,8 @@ mod tests {
                     &SessionCaller::User,
                     "sess-user",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -1959,7 +1988,58 @@ mod tests {
             "drain must release its claim on the no-op paths"
         );
     }
-
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stopped_running_worker_keeps_queued_prompts_instead_of_delivering_them() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "stopped-queue";
+        let mut row = Instance::new("stopped", "/tmp/aoe-stopped-queue");
+        row.id = id.into();
+        row.view = crate::session::View::Structured;
+        row.status = crate::session::Status::Idle;
+        let service = service_for(vec![row]);
+        let commands = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            id.into(),
+            std::process::id(),
+            crate::process::worker_registry::socket_path_for(id).unwrap(),
+            "agent".into(),
+            "agent".into(),
+            "/tmp".into(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        crate::process::worker_registry::request_stop(&record).unwrap();
+        let queued = service
+            .enqueue_prompt(
+                id,
+                "pending".into(),
+                "keep this turn queued".into(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(service.acp_supervisor.is_running(id).await);
+        service.drain_queued_prompts_once(id).await;
+        let retained = service.queued_prompts_snapshot(id).await;
+        assert_eq!(
+            retained
+                .iter()
+                .map(|row| (&row.id, &row.text))
+                .collect::<Vec<_>>(),
+            vec![(&queued.id, &queued.text)]
+        );
+        assert!(commands.lock().unwrap().is_empty());
+    }
     /// The drain must not deliver into a turn prompt dispatch parked the prompt behind.
     #[tokio::test]
     async fn a_queued_prompt_is_not_drained_into_a_turn_status_has_not_caught_up_with() {
@@ -2066,7 +2146,11 @@ mod tests {
         // Hold the reservation for the whole probe so no worker can land.
         let reservation = match service
             .acp_supervisor
-            .begin_resume("sess-3621", ResumeKind::Spawn)
+            .begin_resume(
+                "sess-3621",
+                ResumeKind::Spawn,
+                crate::process::worker_registry::ResumeAuthority::Automatic,
+            )
             .await
             .expect("begin_resume must not error under capacity")
         {

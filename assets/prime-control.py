@@ -8,35 +8,69 @@ import stat
 import tarfile
 
 
-def fence(pid, expected):
+def capture(pid, expected):
     try:
         fd = os.pidfd_open(pid)
     except ProcessLookupError:
-        return
+        return None
+    accepted = False
     try:
         poll = select.poll()
         poll.register(fd, select.POLLIN)
         if poll.poll(0):
-            return
+            return None
         try:
-            with open(f"/proc/{pid}/stat", "rb") as stat:
-                fields = stat.read().rsplit(b") ", 1)[1].split()
+            with open(f"/proc/{pid}/stat", "rb") as source:
+                fields = source.read().rsplit(b") ", 1)[1].split()
         except FileNotFoundError:
             if poll.poll(0):
-                return
+                return None
             raise
-        if fields[0] == b"Z" or b"proc:" + fields[19] != expected.encode():
-            return
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                signal.pidfd_send_signal(fd, sig)
-            except ProcessLookupError:
-                return
-            if poll.poll(500):
-                return
-        raise RuntimeError("Prime launch termination unproven")
+        if fields[0] == b"Z" or b"proc:" + fields[19] != expected.encode() or poll.poll(0):
+            return None
+        accepted = True
+        return fd
     finally:
-        os.close(fd)
+        if not accepted:
+            os.close(fd)
+
+
+def fence_many(pairs):
+    handles = []
+    try:
+        for pid, expected in pairs:
+            fd = capture(pid, expected)
+            if fd is not None:
+                handles.append(fd)
+        active = set(handles)
+        poll = select.poll()
+        for fd in handles:
+            poll.register(fd, select.POLLIN)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for fd in tuple(active):
+                try:
+                    signal.pidfd_send_signal(fd, sig)
+                except ProcessLookupError:
+                    active.discard(fd)
+            deadline = time.monotonic() + 0.5
+            while active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                for fd, event in poll.poll(max(1, int(remaining * 1000))):
+                    if event & select.POLLIN:
+                        active.discard(fd)
+                        poll.unregister(fd)
+            if not active:
+                return
+        raise RuntimeError("Prime process termination unproven")
+    finally:
+        for fd in handles:
+            os.close(fd)
+
+
+def fence(pid, expected):
+    fence_many([(pid, expected)])
 
 
 def prepare(root, workers, token):
@@ -98,6 +132,18 @@ def descriptor_archive(directory):
 if sys.argv[1] == "fence":
     fence(int(sys.argv[2]), sys.argv[3])
     print("settled", end="", flush=True)
+elif sys.argv[1] == "fence-many":
+    args = sys.argv[2:]
+    if len(args) % 2:
+        raise ValueError("Invalid process identity pairs")
+    fence_many((int(args[index]), args[index + 1]) for index in range(0, len(args), 2))
+    print("settled", end="", flush=True)
+elif sys.argv[1] == "epoch":
+    with open("/proc/sys/kernel/random/boot_id") as source:
+        boot = source.read().strip()
+    with open("/proc/1/stat", "rb") as source:
+        start = source.read().rsplit(b") ", 1)[1].split()[19].decode()
+    print(boot + "|" + os.readlink("/proc/self/ns/pid") + "|" + start, end="", flush=True)
 elif sys.argv[1] == "prepare":
     prepare(*sys.argv[2:])
 elif sys.argv[1] == "rollback":

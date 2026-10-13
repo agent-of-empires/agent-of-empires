@@ -505,7 +505,12 @@ mod tests {
         req.tool = "claude-personal".into();
         req.cwd = tmp.path().join("does-not-exist");
         assert!(
-            sup.spawn(req).await.is_err(),
+            sup.spawn(
+                req,
+                crate::process::worker_registry::ResumeAuthority::Explicit
+            )
+            .await
+            .is_err(),
             "launch into a missing working directory must fail"
         );
         let logs = logs.contents();

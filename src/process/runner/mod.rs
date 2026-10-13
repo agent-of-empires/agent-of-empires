@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -138,20 +137,10 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         "structured view runner starting"
     );
 
-    // Bind before spawning so the daemon's post-spawn connect cannot race the listener.
-    let control_socket = crate::process::worker::control_socket_sibling(&args.socket);
+    // Registry admission fences stop requests before binding or publishing.
     if let Some(parent) = args.socket.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating socket dir {}", parent.display()))?;
-    }
-    if control_socket.exists() {
-        let _ = std::fs::remove_file(&control_socket);
-    }
-    let control_listener = UnixListener::bind(&control_socket)
-        .with_context(|| format!("bind {}", control_socket.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&control_socket, std::fs::Permissions::from_mode(0o600));
     }
 
     // Save the record before spawning so a save failure has no agent tree to leak.
@@ -181,10 +170,8 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         .map(serde_json::from_str)
         .transpose()
         .context("parsing Prime runtime")?;
-    if let Err(e) = worker_registry::save(&record).context("writing registry record") {
-        let _ = std::fs::remove_file(&control_socket);
-        return Err(e);
-    }
+    let control_listener =
+        worker_registry::register_runner(&record).context("registering runner ownership")?;
 
     let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
         Ok(handles) => handles,
@@ -443,10 +430,10 @@ async fn self_terminate_agent_tree(
     let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
 
     let cleanup_record = record.clone();
-    loop {
+    let cleanup_proven = loop {
         let route = cleanup_record.clone();
         match tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&route)).await {
-            Ok(Ok(())) => break,
+            Ok(Ok(())) => break true,
             result => {
                 warn!(target: "acp.runner", ?result, "native cleanup unproven; retaining ownership evidence");
                 if (cleanup_record.agent_key == "prime-agent"
@@ -456,13 +443,21 @@ async fn self_terminate_agent_tree(
                         .as_ref()
                         .is_none_or(|runtime| runtime.proof_path.is_none())
                 {
-                    break;
+                    break false;
                 }
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    if cleanup_proven
+        && !worker_registry::delete_if_owned_by(
+            session_id,
+            crate::acp::runner_lifecycle::RunnerIdentity::from_record(record),
+        )
+    {
+        warn!(target: "acp.runner", session = %session_id, "settled runner record could not be retired");
     }
-    // As group leader this SIGKILLs the whole agent tree and the runner itself.
+    // Kill only the runner's own group after retaining or retiring its evidence.
     if !crate::process::worker::kill_own_process_group_if_leader(own_pid) {
         let _ = agent_child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
@@ -632,6 +627,123 @@ fn open_log_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn detached_expiry_retires_only_settled_records_and_sockets_before_self_exit() {
+        use std::io::Read as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        if let Ok(case) = std::env::var("AOE_RUNNER_EXPIRY_CHILD") {
+            assert!(unsafe { libc::setsid() } >= 0);
+            let id = "expired";
+            let socket = worker_registry::socket_path_for(id).unwrap();
+            let mut record = WorkerRecord::new(
+                id.into(),
+                std::process::id(),
+                socket,
+                "agent".into(),
+                "agent".into(),
+                std::env::temp_dir(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+            .with_generation(1);
+            if case == "untracked-prime" {
+                record.agent_key = "prime-agent".into();
+            }
+            let _listener = worker_registry::register_runner(&record).unwrap();
+            let mut agent = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            agent
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"agent-ready\n")
+                .await
+                .unwrap();
+            let mut ready = String::new();
+            BufReader::new(agent.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .await
+                .unwrap();
+            assert_eq!(ready, "agent-ready\n");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(run_watchdog(
+                worker_registry::record_path(id).unwrap(),
+                worker_registry::restart_marker_path(id).unwrap(),
+                record.pid,
+                record.generation,
+                Arc::new(AtomicU64::new(
+                    now_secs() - DETACHED_RETENTION.as_secs() - 1,
+                )),
+                id.into(),
+                tx,
+            ));
+            let reason = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(reason, WatchdogShutdown::DetachedRetentionExpired));
+            task.await.unwrap();
+            self_terminate_agent_tree(reason, &record, &mut agent).await;
+            panic!("the expired runner must exit its own process group");
+        }
+        for case in ["settled", "untracked-prime"] {
+            let root = tempfile::TempDir::with_prefix_in("aoe-expiry-", "/tmp").unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+            let name = format!(
+                "{}::detached_expiry_retires_only_settled_records_and_sockets_before_self_exit",
+                module_path!().split_once("::").unwrap().1
+            );
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("AOE_RUNNER_EXPIRY_CHILD", case)
+                .env("AOE_ACP_WATCHDOG_POLL_MS", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("expired runner did not exit");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "{stderr}");
+            let record = worker_registry::load("expired").unwrap();
+            let control = crate::process::worker::control_socket_sibling(
+                &worker_registry::socket_path_for("expired").unwrap(),
+            );
+            if case == "settled" {
+                assert!(record.is_none());
+                assert!(!control.exists());
+            } else {
+                assert_eq!(record.unwrap().agent_key, "prime-agent");
+                assert!(control.exists());
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

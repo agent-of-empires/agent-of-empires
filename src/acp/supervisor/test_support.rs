@@ -325,8 +325,9 @@ pub(super) fn worker_record(session_id: &str, pid: u32, socket: PathBuf) -> Work
 
 pub(super) fn save_record(session_id: &str, pid: u32, generation: u64) {
     let socket = worker_registry::socket_path_for(session_id).unwrap();
-    worker_registry::save(&worker_record(session_id, pid, socket).with_generation(generation))
-        .unwrap();
+    let mut record = worker_record(session_id, pid, socket).with_generation(generation);
+    record.runner_identity = None;
+    worker_registry::save(&record).unwrap();
 }
 
 /// Holds a gated launch until the test opens it.

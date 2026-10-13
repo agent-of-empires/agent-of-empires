@@ -65,6 +65,10 @@ struct PrimeCleanupProof {
     route: String,
     processes: Vec<crate::process::PrimeProcessIdentity>,
     settled: bool,
+    #[serde(default)]
+    epoch: Option<String>,
+    #[serde(default)]
+    launch_epoch: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -222,10 +226,13 @@ impl PrimeRuntime {
     pub(crate) fn prepare(&self) -> Result<()> {
         self.validate()?;
         let _lock = self.lock_proof()?;
+        let epoch = self.process_epoch()?;
         let proof = PrimeCleanupProof {
             route: self.proof_route()?,
             processes: Vec::new(),
             settled: false,
+            epoch: Some(epoch.clone()),
+            launch_epoch: Some(epoch),
         };
         if self.container.is_some() {
             return self.prepare_guest(&proof);
@@ -590,6 +597,7 @@ impl PrimeRuntime {
 socket=$2
 known=$3
 seen=$'\n'
+rows=()
 [[ -r /proc/self/stat ]] || exit 1
 for directory in /proc/[0-9]*; do
     pid=${directory#/proc/}
@@ -605,7 +613,8 @@ for directory in /proc/[0-9]*; do
     marked=0
     grep -z -F -x -- "$marker" "$directory/environ" >/dev/null 2>&1 && marked=1
     grep -z -F -x -- "$socket" "$directory/cmdline" >/dev/null 2>&1 && marked=1
-    printf '%s\tproc:%s\t%s\t%s\n' "$pid" "${fields[19]}" "${fields[1]}" "$marked"
+    printf -v row '%s\tproc:%s\t%s\t%s' "$pid" "${fields[19]}" "${fields[1]}" "$marked"
+    rows+=("$row")
     seen+="$pid"$'\t'"proc:${fields[19]}"$'\n'
 done
 while IFS=$'\t' read -r pid start; do
@@ -614,7 +623,18 @@ while IFS=$'\t' read -r pid start; do
     read -r -a fields <<< "${stat##*) }"
     [[ ${fields[0]} == Z || "proc:${fields[19]}" != "$start" ]] && continue
     [[ $seen == *$'\n'"$pid"$'\t'"$start"$'\n'* ]] || exit 1
-done <<< "$known""#;
+done <<< "$known"
+for row in "${rows[@]}"; do
+    IFS=$'\t' read -r pid start parent marked <<< "$row"
+    if ! IFS= read -r stat < "/proc/$pid/stat"; then
+        [[ ! -d /proc/$pid ]] && continue
+        [[ $marked == 0 && $known != *$'\n'"$pid"$'\t'* ]] || exit 1
+        continue
+    fi
+    read -r -a fields <<< "${stat##*) }"
+    [[ ${fields[0]} != Z && "proc:${fields[19]}" == "$start" ]] || continue
+    printf '%s\n' "$row"
+done"#;
             let known_wire = known
                 .iter()
                 .fold(String::from("\n"), |mut value, identity| {
@@ -830,6 +850,44 @@ done <<< "$known""#;
         }
     }
 
+    fn process_epoch(&self) -> Result<String> {
+        if self.container.is_none() {
+            return crate::process::boot_id().context("Prime process epoch unavailable");
+        }
+        let bytes = crate::session::capture::run_with_timeout_limit(
+            self.guest_control("epoch")?,
+            Duration::from_secs(2),
+            "Prime guest process epoch",
+            1024,
+        )?;
+        let value = String::from_utf8(bytes)?;
+        anyhow::ensure!(!value.is_empty(), "Prime guest process epoch is empty");
+        Ok(value)
+    }
+
+    fn fence_owned_processes(
+        &self,
+        identities: &[crate::process::PrimeProcessIdentity],
+    ) -> Result<()> {
+        if self.container.is_none() {
+            return crate::process::fence_processes(identities, Duration::from_millis(500));
+        }
+        let mut command = self.guest_control("fence-many")?;
+        for identity in identities {
+            command
+                .arg(identity.pid.to_string())
+                .arg(&identity.start_id);
+        }
+        let output = crate::session::capture::run_with_timeout_limit(
+            command,
+            Duration::from_secs(5),
+            "Prime owned auxiliary fence",
+            1024,
+        )?;
+        anyhow::ensure!(output == b"settled", "Prime auxiliary termination unproven");
+        Ok(())
+    }
+
     pub fn cleanup(&self) -> Result<()> {
         self.validate()?;
         let mut state = self
@@ -842,36 +900,74 @@ done <<< "$known""#;
         let _lock = self.lock_proof()?;
         let mut proof = self.read_proof()?;
         let exists = self.directory_exists(proof.settled)?;
-        if !proof.settled {
-            anyhow::ensure!(
-                exists,
-                "Prime runtime disappeared without a termination receipt"
-            );
-            proof.processes.extend(self.worker_identities()?);
-            proof.processes.extend(self.launch_identity(true)?);
-            proof.processes.extend(self.launch_identity(false)?);
-            proof.processes = self.process_snapshot(&proof.processes)?;
-            // Native shutdown deletes worker descriptors before every auxiliary process has exited.
+        let epoch = self.process_epoch()?;
+        if proof
+            .epoch
+            .as_ref()
+            .is_some_and(|previous| previous != &epoch)
+        {
+            proof.processes = self.process_snapshot(&[])?;
+            proof.epoch = Some(epoch.clone());
+            proof.settled = false;
             self.write_proof(&proof)?;
-            self.fence_container_processes(false)?;
-            let mut command = self.command(true);
-            command.args(["shutdown", "--force", "--json"]);
-            let bytes = crate::session::capture::run_with_timeout_limit(
-                command,
-                Duration::from_secs(20),
-                "Prime runtime shutdown",
-                256 * 1024,
-            )?;
-            let response: Value = serde_json::from_slice(&bytes)?;
-            anyhow::ensure!(
-                response
-                    .get("failed")
-                    .and_then(Value::as_array)
-                    .is_some_and(Vec::is_empty),
-                "Prime runtime shutdown did not prove termination"
-            );
+        }
+        let launch_attested = proof.launch_epoch.as_ref() == Some(&epoch);
+        if !proof.settled {
+            if proof.epoch.is_none() {
+                let fresh = self.process_snapshot(&[])?;
+                let observed = self.process_snapshot(&proof.processes)?;
+                anyhow::ensure!(observed.iter().all(|identity| fresh.contains(identity)), "legacy Prime ledger cannot attest live process incarnations; retained ownership evidence");
+                proof.processes = fresh;
+            }
+            if launch_attested || proof.launch_epoch.is_none() {
+                let mut sources = self.worker_identities()?;
+                if exists {
+                    sources.extend(self.launch_identity(true)?);
+                    sources.extend(self.launch_identity(false)?);
+                }
+                if !launch_attested {
+                    let fresh = self.process_snapshot(&[])?;
+                    let observed = self.process_snapshot(&sources)?;
+                    anyhow::ensure!(observed.iter().all(|identity| fresh.contains(identity)), "legacy Prime launch evidence cannot attest live process incarnations; retained ownership evidence");
+                    sources = fresh;
+                }
+                proof.processes.extend(sources);
+            }
+            proof.epoch = Some(epoch);
+            proof.processes = self.process_snapshot(&proof.processes)?;
+            self.write_proof(&proof)?;
+            if !exists {
+                anyhow::ensure!(proof.processes.is_empty(), "Prime runtime directory is missing but owned processes remain; retained ownership ledger");
+                proof.settled = true;
+                self.write_proof(&proof)?;
+            }
+        }
+        if !proof.settled {
+            if launch_attested {
+                self.fence_container_processes(false)?;
+            }
+            if launch_attested {
+                let mut command = self.command(true);
+                command.args(["shutdown", "--force", "--json"]);
+                let bytes = crate::session::capture::run_with_timeout_limit(
+                    command,
+                    Duration::from_secs(20),
+                    "Prime runtime shutdown",
+                    256 * 1024,
+                )?;
+                let response: Value = serde_json::from_slice(&bytes)?;
+                anyhow::ensure!(
+                    response
+                        .get("failed")
+                        .and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty),
+                    "Prime runtime shutdown did not prove termination"
+                );
+            }
             state.observation = None;
-            self.stop_owned_daemon()?;
+            if launch_attested {
+                self.stop_owned_daemon()?;
+            }
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let remaining = self.process_snapshot(&proof.processes)?;
@@ -886,7 +982,7 @@ done <<< "$known""#;
                     Instant::now() < deadline,
                     "Prime-owned processes remain after native shutdown; retained identity ledger"
                 );
-                std::thread::sleep(Duration::from_millis(25));
+                self.fence_owned_processes(&proof.processes)?;
             }
             proof.settled = true;
             self.write_proof(&proof)?;
@@ -1142,6 +1238,207 @@ pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    struct CleanupProbe(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for CleanupProbe {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CleanupProbe {
+        fn spawn(directory: &Path, ignore_term: bool) -> Self {
+            use std::io::{BufRead as _, Write as _};
+            use std::os::unix::process::CommandExt as _;
+            let mut command = Command::new("cat");
+            command
+                .env("TMPDIR", directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if ignore_term && libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = Self(command.spawn().unwrap());
+            child
+                .0
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"probe-ready\n")
+                .unwrap();
+            let stdout = child.0.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut ready = String::new();
+                let result = std::io::BufReader::new(stdout)
+                    .read_line(&mut ready)
+                    .map(|_| ready);
+                let _ = tx.send(result);
+            });
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+                "probe-ready\n"
+            );
+            reader.join().unwrap();
+            child
+        }
+
+        fn identity(&self) -> crate::process::PrimeProcessIdentity {
+            crate::process::PrimeProcessIdentity {
+                pid: self.0.id(),
+                start_id: crate::process::process_birth_identity(self.0.id())
+                    .unwrap()
+                    .unwrap()
+                    .start_id,
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn missing_runtime_requires_external_descriptor_settlement_before_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let runtime =
+            PrimeRuntime::new("/bin/false".into(), root.path().join("agent"), None).unwrap();
+        runtime.prepare().unwrap();
+        let mut worker = CleanupProbe::spawn(root.path(), false);
+        let identity = worker.identity();
+        let descriptors = runtime.worker_descriptor_dir();
+        std::fs::create_dir_all(&descriptors).unwrap();
+        std::fs::write(descriptors.join("worker.json"), serde_json::to_vec(&serde_json::json!({"pid":identity.pid, "processStartId":identity.start_id, "supervisorSocketPath":runtime.socket()})).unwrap()).unwrap();
+        let route = serde_json::to_vec(&runtime).unwrap();
+        std::fs::remove_dir_all(&runtime.directory).unwrap();
+        assert!(runtime.cleanup().is_err());
+        assert!(worker.0.try_wait().unwrap().is_none());
+        let proof = runtime.read_proof().unwrap();
+        assert!(!proof.settled);
+        assert!(proof.processes.contains(&identity));
+        drop(worker.0.stdin.take());
+        assert!(worker.0.wait().unwrap().success());
+        let restored: PrimeRuntime = serde_json::from_slice(&route).unwrap();
+        restored.cleanup().unwrap();
+        assert!(restored.read_proof().unwrap().settled);
+        assert!(!restored.directory.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn old_epoch_never_reimports_stale_launch_or_descriptor_pids_on_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let runtime =
+            PrimeRuntime::new("/bin/false".into(), root.path().join("agent"), None).unwrap();
+        runtime.prepare().unwrap();
+        let mut foreign = CleanupProbe::spawn(root.path(), false);
+        let identity = foreign.identity();
+        let mut fresh = CleanupProbe::spawn(&runtime.directory, false);
+        let mut proof = runtime.read_proof().unwrap();
+        proof.epoch = Some("previous-boot".into());
+        proof.launch_epoch = proof.epoch.clone();
+        proof.processes = vec![identity.clone()];
+        runtime.write_proof(&proof).unwrap();
+        std::fs::write(
+            runtime.launch_identity_path(true),
+            format!("{}\t{}\n", identity.pid, identity.start_id),
+        )
+        .unwrap();
+        let descriptors = runtime.worker_descriptor_dir();
+        std::fs::create_dir_all(&descriptors).unwrap();
+        std::fs::write(descriptors.join("worker.json"), serde_json::to_vec(&serde_json::json!({"pid":identity.pid, "processStartId":identity.start_id, "supervisorSocketPath":runtime.socket()})).unwrap()).unwrap();
+        let route = serde_json::to_vec(&runtime).unwrap();
+        runtime.cleanup().unwrap();
+        assert!(!fresh.0.wait().unwrap().success());
+        assert!(foreign.0.try_wait().unwrap().is_none());
+        let restored: PrimeRuntime = serde_json::from_slice(&route).unwrap();
+        restored.cleanup().unwrap();
+        assert!(restored.read_proof().unwrap().settled);
+        assert_eq!(
+            restored.read_proof().unwrap().launch_epoch.as_deref(),
+            Some("previous-boot")
+        );
+        assert!(foreign.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn native_shutdown_fences_scoped_setsid_auxiliaries_and_preserves_foreign_processes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let program = root.path().join("native-shutdown");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+printf '{"failed":[]}\n'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for ignore_term in [false, true] {
+            let runtime =
+                PrimeRuntime::new(program.clone(), root.path().join("agent"), None).unwrap();
+            runtime.prepare().unwrap();
+            let mut auxiliary = CleanupProbe::spawn(&runtime.directory, ignore_term);
+            let mut foreign = CleanupProbe::spawn(root.path(), false);
+            let mut wrong = auxiliary.identity();
+            wrong.start_id = "proc:0".into();
+            crate::process::fence_processes(&[wrong], Duration::ZERO).unwrap();
+            assert!(auxiliary.0.try_wait().unwrap().is_none());
+            let route = serde_json::to_vec(&runtime).unwrap();
+            runtime.cleanup().unwrap();
+            assert!(!auxiliary.0.wait().unwrap().success());
+            assert!(foreign.0.try_wait().unwrap().is_none());
+            assert!(!runtime.directory.exists());
+            let restored: PrimeRuntime = serde_json::from_slice(&route).unwrap();
+            restored.cleanup().unwrap();
+            assert!(restored.read_proof().unwrap().settled);
+            assert!(foreign.0.try_wait().unwrap().is_none());
+        }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn guest_auxiliary_batch_settles_term_resistant_processes_within_the_caller_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let mut processes: Vec<_> = (0..12)
+            .map(|_| CleanupProbe::spawn(root.path(), true))
+            .collect();
+        let mut foreign = CleanupProbe::spawn(root.path(), false);
+        let mut command = Command::new("python3");
+        command.args(["-c", PRIME_GUEST_CONTROL, "fence-many"]);
+        for process in &processes {
+            let identity = process.identity();
+            command.arg(identity.pid.to_string()).arg(identity.start_id);
+        }
+        let output = crate::session::capture::run_with_timeout_limit(
+            command,
+            Duration::from_secs(5),
+            "owned guest auxiliary batch",
+            1024,
+        )
+        .unwrap();
+        assert_eq!(output, b"settled");
+        for process in &mut processes {
+            assert!(!process.0.wait().unwrap().success());
+        }
+        assert!(foreign.0.try_wait().unwrap().is_none());
+    }
     #[test]
     #[serial_test::serial]
     fn apple_descriptor_snapshot_keeps_namespace_and_file_type_guards() {

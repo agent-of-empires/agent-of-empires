@@ -271,7 +271,13 @@ fn spawn_enabled_worker(
                 return;
             }
         };
-        if let Err(e) = supervisor.spawn(request).await {
+        if let Err(e) = supervisor
+            .spawn(
+                request,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+        {
             let message = structured_spawn_error_message(&e, &agent_name);
             tracing::warn!(target: "acp.switch", session = %session_id, "spawn after enable: {message}");
             supervisor.publish_startup_error(&session_id, message);
