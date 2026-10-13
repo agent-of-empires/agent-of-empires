@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ProjectStep } from "../steps/ProjectStep";
 import { initialData, type WizardData } from "../wizardReducer";
@@ -298,23 +298,35 @@ describe("Import session tab", () => {
   });
 
   it("reports partial returned counts independently of visible rows and only for truncated results", async () => {
-    for (const truncated of [true, false]) {
-      listed(SESSIONS, truncated);
-      renderImport();
-      await row("Fix the spinner bug");
-      if (truncated) {
-        const notice = await screen.findByRole("status");
-        expect(notice.textContent?.match(/\d+/g)).toEqual(["2"]);
-        fireEvent.click(screen.getByLabelText("Show sessions with missing directories"));
-        await row("Old work");
-        expect(notice.textContent?.match(/\d+/g)).toEqual(["2"]);
-        fireEvent.change(screen.getByLabelText("Filter sessions"), { target: { value: "zzznomatch" } });
-        expect(screen.getByRole("list", { name: "Importable sessions" }).querySelectorAll("button")).toHaveLength(0);
-        expect(notice.textContent?.match(/\d+/g)).toEqual(["2"]);
-      } else {
-        expect(screen.queryByRole("status")).toBeNull();
+    for (const sessions of [SESSIONS, []]) {
+      for (const truncated of [true, false]) {
+        listed(sessions, truncated);
+        await act(async () => {
+          renderImport();
+        });
+        const notice = screen.queryByRole("status");
+        if (truncated) {
+          expect(notice).not.toBeNull();
+          expect(notice!.textContent).toMatch(/partial/i);
+          expect(notice!.textContent).toMatch(/more sessions/i);
+          expect(notice!.textContent?.match(/\d+/g)).toEqual([String(sessions.length)]);
+          if (sessions.length > 0) {
+            fireEvent.click(screen.getByLabelText("Show sessions with missing directories"));
+            await row("Old work");
+            expect(notice!.textContent?.match(/\d+/g)).toEqual(["2"]);
+            fireEvent.change(screen.getByLabelText("Filter sessions"), { target: { value: "zzznomatch" } });
+            expect(screen.getByRole("list", { name: "Importable sessions" }).querySelectorAll("button")).toHaveLength(
+              0,
+            );
+            expect(notice!.textContent?.match(/\d+/g)).toEqual(["2"]);
+          } else {
+            expect(screen.queryByText(/no existing .+ sessions found/i)).toBeNull();
+          }
+        } else {
+          expect(notice).toBeNull();
+        }
+        cleanup();
       }
-      cleanup();
     }
   });
 

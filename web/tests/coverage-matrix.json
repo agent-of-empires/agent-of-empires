@@ -1321,7 +1321,7 @@
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
         "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ],
-      "reason": "Covers partial-list visibility and returned counts independently of missing-directory and search filters."
+      "reason": "Covers partial-list disclosure for empty and nonempty results, with received counts independent of missing-directory and search filters."
     },
     {
       "id": "wizard.scratch-delete-cleans-tempdir",
