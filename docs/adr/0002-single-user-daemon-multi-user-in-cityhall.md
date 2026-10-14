@@ -11,7 +11,7 @@ The "software development factory" scope (a user base with local, remote and SSO
 - **A typed Principal is the only seam added now.** The "authentication principal" from #2734 section D becomes one type with four variants, and every current auth path maps to one:
   - **Local owner**: a Unix socket peer. Loopback TCP trust (`is_local_trusted` in `src/server/auth.rs`) also maps here, transitionally: it ends on each platform when that platform's Unix socket listener lands (#3897).
   - **Device**: a passphrase login bound to a browser (`src/server/login.rs`).
-  - **Token holder**: a caller presenting the `serve.token` bearer. `--auth none` admits every caller as a Token holder.
+  - **Token holder**: a caller presenting the `serve.token` bearer. `--auth none` skips the token check and admits every caller as a Token holder.
   - **Proxy**: a caller on a configured proxy ingress (#3839), such as CityHall's proxy with its per-workspace bearer. Never the local owner.
 
   Every authorization decision goes through one function of principal and route. The scattered `read_only` checks move behind it as their code is touched, not as a separate project.
