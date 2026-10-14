@@ -764,12 +764,18 @@ fn host_hook_config_path_for_launch(
                 host_environment,
             )));
         }
+        let command_override = if launch.command_override.is_empty() {
+            session_cfg.launch_command_for(tool)
+        } else {
+            launch.command_override.to_owned()
+        };
         let context = super::omp::resolve_host_omp_layout_for_launch(
+            tool,
             host_environment,
             home,
             launch.cwd,
             session_cfg,
-            launch.command_override,
+            &command_override,
             launch.extra_args,
         )?;
         return Ok(Some(crate::hooks::sidecar_host_config_path_in(
@@ -1429,15 +1435,13 @@ mod tests {
         profile_config
             .environment
             .push("PI_CODING_AGENT_DIR=".into());
-        let profile = host_hook_disclosure_for_launch(
-            "omp",
-            agent,
-            &profile_config,
-            &project,
-            "omp --profile work",
-            "",
-        )
-        .unwrap();
+        profile_config
+            .session
+            .agent_command_override
+            .insert("omp".into(), "omp --profile work".into());
+        let profile =
+            host_hook_disclosure_for_launch("omp", agent, &profile_config, &project, "", "")
+                .unwrap();
         assert_eq!(
             profile.settings_paths,
             [home
@@ -1453,6 +1457,26 @@ mod tests {
                 .join(".omp/agent/hooks/pre/aoe-status.ts")
                 .to_string_lossy()
                 .into_owned()]
+        );
+        let wrapper = "omp-wrapper";
+        let wrapper_root = home.join("wrapper-agent");
+        std::fs::create_dir_all(&wrapper_root).unwrap();
+        let mut wrapper_config = config.clone();
+        wrapper_config
+            .session
+            .agent_config_dir
+            .insert(wrapper.into(), wrapper_root.to_str().unwrap().into());
+        let wrapper_launch =
+            host_hook_disclosure_for_launch(wrapper, agent, &wrapper_config, &project, "omp", "")
+                .unwrap();
+        assert_eq!(
+            wrapper_launch.settings_paths,
+            [
+                crate::session::capture::canonicalize_or_raw(wrapper_root.to_str().unwrap())
+                    .join("hooks/pre/aoe-status.ts")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
         );
     }
 

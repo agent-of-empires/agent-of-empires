@@ -43,6 +43,7 @@ pub(super) fn resolve_host_omp_store_layout(
 }
 
 pub(super) fn resolve_host_omp_layout_for_launch(
+    tool: &str,
     host_environment: &[String],
     home: &Path,
     cwd: &Path,
@@ -55,7 +56,7 @@ pub(super) fn resolve_host_omp_layout_for_launch(
     let cwd = crate::session::capture::canonicalize_or_raw(
         cwd.to_str().context("OMP launch cwd is not UTF-8")?,
     );
-    let declared_agent_dir = session_config.agent_config_dir_for("omp", home);
+    let declared_agent_dir = session_config.agent_config_dir_for(tool, home);
     resolve_host_omp_store_layout(environment, &cwd, &options, declared_agent_dir.as_deref())
 }
 /// Build a post-login routing fingerprint check without embedding any routing value in argv.

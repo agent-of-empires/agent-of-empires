@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::agents::ResolvedHookEvent;
 
@@ -53,7 +53,14 @@ pub fn install_omp_hooks_with_events(
         return Ok(());
     }
     with_config_lock(path, "lock", || {
-        let existing = std::fs::read_to_string(path).ok();
+        let existing = match std::fs::read_to_string(path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read OMP hook {}", path.display()));
+            }
+        };
         if existing
             .as_deref()
             .is_some_and(|content| !is_omp_hook(content))
@@ -78,10 +85,12 @@ pub fn install_omp_hooks_with_events(
             let command = serde_json::to_string(&hook_command(status.as_str(), target))?;
             if event.name == "agent_end" {
                 source.push_str(&format!(
-                    "  pi.on({event_name}, (event) => {{ if (!event.willContinue) write({command}); }});\n"
+                    "  pi.on({event_name}, (event, ctx) => {{ if (ctx.agent.kind === \"main\" && !event.willContinue) write({command}); }});\n"
                 ));
             } else {
-                source.push_str(&format!("  pi.on({event_name}, () => write({command}));\n"));
+                source.push_str(&format!(
+                    "  pi.on({event_name}, (_event, ctx) => {{ if (ctx.agent.kind === \"main\") write({command}); }});\n"
+                ));
             }
         }
         if !installed {
@@ -134,19 +143,27 @@ mod tests {
         install_omp_hooks_with_events(&path, HookInstallTarget::Host, &events).unwrap();
         assert!(is_omp_hook(&std::fs::read_to_string(&path).unwrap()));
         let source = std::fs::read_to_string(&path).unwrap();
-        assert!(source.contains("pi.on(\"agent_start\""));
-        assert!(source.contains("pi.on(\"agent_end\""));
-        assert!(source.contains("if (!event.willContinue)"));
+        assert!(source.contains(
+            "pi.on(\"agent_start\", (_event, ctx) => { if (ctx.agent.kind === \"main\")"
+        ));
+        assert!(source.contains(
+            "pi.on(\"agent_end\", (event, ctx) => { if (ctx.agent.kind === \"main\" && !event.willContinue)"
+        ));
         assert!(uninstall_omp_hooks(&path).unwrap());
         assert!(!path.exists());
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "export default function userHook() {}\\n").unwrap();
+        let foreign = b"export default function userHook() {}\n";
+        std::fs::write(&path, foreign).unwrap();
         assert!(install_omp_hooks_with_events(&path, HookInstallTarget::Host, &events).is_err());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "export default function userHook() {}\\n"
-        );
+        assert_eq!(std::fs::read(&path).unwrap(), foreign);
         assert!(!uninstall_omp_hooks(&path).unwrap());
+
+        let invalid_utf8 = b"\xff\xfe";
+        std::fs::write(&path, invalid_utf8).unwrap();
+        let error =
+            install_omp_hooks_with_events(&path, HookInstallTarget::Host, &events).unwrap_err();
+        assert!(error.to_string().contains("failed to read OMP hook"));
+        assert_eq!(std::fs::read(&path).unwrap(), invalid_utf8);
     }
 }
