@@ -2,7 +2,7 @@
 
 Status: proposed. Decides #4400 (part of #2734). Terms follow `CONTEXT.md`: **Daemon** is the `aoe serve` process, a **Client** is the TUI, CLI or Web dashboard that pilots it.
 
-Today almost every mutating CLI command writes `sessions.json`, tmux, worktrees or config files itself, and the running Daemon only learns about it through its `sessions.json` watcher. That out-of-band write is the stale-reload eviction of #4035 and the race class of #2541. #3838 made the Daemon mandatory and auto-started for the TUI; ADR 0003 forbids a disk fallback for mutations and ties removal of the read fallback to CLI auto-start. This ADR sets which CLI commands route through the Daemon and what the CLI does when none runs.
+Today almost every mutating CLI command writes `sessions.json`, tmux, worktrees or config files itself, and the running Daemon only learns about it through its `sessions.json` watcher. That out-of-band write is the stale-reload eviction of #4035 and the race class of #2541. #3838 decided the Daemon is mandatory and auto-started for the TUI; ADR 0003 forbids a disk fallback for mutations and ties removal of the read fallback to CLI auto-start. This ADR sets which CLI commands route through the Daemon and what the CLI does when none runs.
 
 ## Decision
 
