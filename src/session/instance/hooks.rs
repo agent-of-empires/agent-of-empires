@@ -1526,6 +1526,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn omp_profile_cli_disclosure_matches_launch_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let agent = crate::agents::get_agent("omp").unwrap();
+
+        for (omp_profile, pi_profile, launch_command) in [
+            ("work", "legacy", None),
+            ("work", "legacy", Some("omp --profile default")),
+            ("", "work", None),
+        ] {
+            let environment = crate::session::capture::OMP_STORE_ENV_KEYS
+                .iter()
+                .map(|key| match *key {
+                    "HOME" => format!("HOME={}", home.display()),
+                    "OMP_PROFILE" => format!("OMP_PROFILE={omp_profile}"),
+                    "PI_PROFILE" => format!("PI_PROFILE={pi_profile}"),
+                    "PI_CODING_AGENT_DIR" => "PI_CODING_AGENT_DIR=relative-agent".into(),
+                    _ => format!("{key}="),
+                })
+                .collect();
+            let mut config = crate::session::config::Config {
+                environment,
+                ..crate::session::config::Config::default()
+            };
+            if let Some(command) = launch_command {
+                config
+                    .session
+                    .agent_command_override
+                    .insert("omp".into(), command.into());
+            }
+
+            let cli = host_hook_disclosure_for_profile("omp", agent, &config).unwrap();
+            let launched =
+                host_hook_disclosure_for_launch("omp", agent, &config, &project, "", "").unwrap();
+            let launch_cwd =
+                crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                    .to_string_lossy()
+                    .into_owned();
+            let cli_paths: Vec<_> = cli
+                .settings_paths
+                .iter()
+                .map(|path| path.replace("<launch cwd>", &launch_cwd))
+                .collect();
+            assert_eq!(
+                cli_paths, launched.settings_paths,
+                "OMP_PROFILE={omp_profile:?}, PI_PROFILE={pi_profile:?}, command={launch_command:?}"
+            );
+        }
+    }
+
     /// #4159: an event can install both an identity extractor and a status
     /// writer. The disclosure must account for every command the installer
     /// writes, so the counts are compared against the installed file rather
