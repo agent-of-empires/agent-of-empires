@@ -92,6 +92,10 @@ A foreground `aoe serve` reports readiness over `sd_notify` when systemd sets `N
 
 Responses carry `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` (the last keeps tokens out of `Referer`).
 
+### Plugin pages
+
+A plugin page is framed with `sandbox="allow-scripts"` and served under its own policy (see [Pages](../plugin-api.md#pages)), so its script runs in an opaque origin: it cannot read the dashboard's token, binding secret, storage or cookies, call the API, or navigate the dashboard. Because a frame load cannot send the device-binding header, the dashboard first mints a page ticket through a bound request. The ticket rides an `HttpOnly` cookie scoped to that page's URL, lasts 60 seconds, and authenticates only that page for the still-signed-in session that minted it; it never appears in the frame URL or document. That route is the only one framable, and only by the dashboard.
+
 ### DNS rebinding
 
 `aoe serve` validates `Host` and `Origin` before authentication: an unlisted `Host`, or any `Origin` that is sent and not allowlisted (including the opaque `Origin: null`), gets `403`. A request with no `Origin` is exempt from the origin check. The allowlist is derived automatically from `localhost`, `127.0.0.1`, `::1`, a concrete `--host`, any routable IP literal (an IP is dialed directly and cannot be rebound), and `--remote` tunnel hostnames. The unspecified, link-local, and multicast addresses are excluded and cannot be allowlisted at all.
