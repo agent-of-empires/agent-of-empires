@@ -1214,6 +1214,96 @@ id = "voice"
         PluginManifest::hash_bytes(manifest.as_bytes())
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_active_plugins_page_is_delivered_through_the_real_route() {
+        use tower::ServiceExt;
+        let _app_dir = AppDirEnvGuard::new();
+        let mut config = Config::default();
+        // `acme.idle` is installed but never granted, so it is inactive.
+        for (id, granted) in [("acme.board", true), ("acme.idle", false)] {
+            let manifest = format!(
+                "id = \"{id}\"\nname = \"Board\"\nversion = \"1.0.0\"\napi_version = 16\n\n\
+                 [[ui]]\nslot = \"page\"\nid = \"board\"\ntitle = \"Board\"\nentry = \"dist/board.html\"\n"
+            );
+            let dir = crate::plugin::plugins_dir().unwrap().join(id);
+            std::fs::create_dir_all(dir.join("dist")).unwrap();
+            std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+            std::fs::write(dir.join("dist/board.html"), format!("<p>{id}</p>")).unwrap();
+            if granted {
+                config.plugins.insert(
+                    id.to_string(),
+                    PluginConfig {
+                        grant: Some(CapabilityGrant {
+                            manifest_hash: PluginManifest::hash_bytes(manifest.as_bytes()),
+                            capabilities: Vec::new(),
+                            granted_at: chrono::Utc::now(),
+                        }),
+                        ..PluginConfig::default()
+                    },
+                );
+            }
+        }
+        update_config(|c| *c = config).expect("save config");
+        crate::plugin::reload_registry();
+
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some("secret-token".to_string()),
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let get =
+            |path: &str| {
+                let mut req = axum::http::Request::get(path)
+                    .header("host", "127.0.0.1")
+                    .header("cookie", "aoe_token=secret-token")
+                    .header("sec-fetch-dest", "iframe")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([203, 0, 113, 7], 5555)),
+                ));
+                app.clone().oneshot(req)
+            };
+
+        let resp = get("/api/plugins/acme.board/pages/board").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let header = |name| {
+            resp.headers()
+                .get(name)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(header("content-security-policy"), PLUGIN_PAGE_CSP);
+        assert_eq!(header("x-frame-options"), "SAMEORIGIN");
+        assert_eq!(header("content-type"), "text/html; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"<p>acme.board</p>");
+
+        let resp = get("/api/plugins/acme.idle/pages/board").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = get("/api/plugins/ui-state").await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            state["pages"],
+            json!([{
+                "plugin_id": "acme.board",
+                "id": "board",
+                "title": "Board",
+                "icon": null,
+                "url": "/api/plugins/acme.board/pages/board",
+            }])
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn composer_snapshot_forwarding_requires_active_composer_read_capability() {
