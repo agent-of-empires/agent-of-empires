@@ -136,10 +136,12 @@ pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
         .into_response()
 }
 
-/// Plugin HTML is untrusted: opened directly it gets an opaque origin and no
-/// network, scripts or forms. The dashboard renders it in a sandboxed `srcdoc`.
-const PLUGIN_PAGE_CSP: &str = "sandbox; default-src 'none'; base-uri 'none'; \
-    form-action 'none'; frame-ancestors 'none'";
+/// No-egress policy for untrusted plugin HTML (ADR 0005): only its own inline
+/// script and style run. The dashboard frames it with `sandbox="allow-scripts"`;
+/// the `sandbox` directive gives a directly opened page the same opaque origin.
+const PLUGIN_PAGE_CSP: &str = "sandbox allow-scripts; default-src 'none'; \
+    script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; \
+    connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
 
 fn plugin_page_response(bytes: Vec<u8>) -> Response {
     (
@@ -148,6 +150,7 @@ fn plugin_page_response(bytes: Vec<u8>) -> Response {
             (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (axum::http::header::CACHE_CONTROL, "private, no-store"),
             (axum::http::header::CONTENT_SECURITY_POLICY, PLUGIN_PAGE_CSP),
+            (axum::http::header::X_FRAME_OPTIONS, "SAMEORIGIN"),
         ],
         bytes,
     )
@@ -1021,22 +1024,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_page_keeps_its_sandbox_csp_through_the_security_middleware() {
+    async fn only_the_plugin_page_relaxes_the_global_frame_policy() {
         use tower::ServiceExt;
         let app = axum::Router::new()
             .route(
-                "/",
+                "/page",
                 axum::routing::get(|| async { plugin_page_response(b"<p>hi</p>".to_vec()) }),
             )
+            .route("/other", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(
                 crate::server::access::security_headers,
             ));
-        let req = axum::http::Request::get("/")
+        let cases = [
+            ("/page", PLUGIN_PAGE_CSP, "SAMEORIGIN"),
+            ("/other", crate::server::access::CSP, "DENY"),
+        ];
+        for (path, csp, frame_options) in cases {
+            let req = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let header = |name| resp.headers().get(name).unwrap().to_str().unwrap();
+            assert_eq!(header("content-security-policy"), csp, "{path}");
+            assert_eq!(header("x-frame-options"), frame_options, "{path}");
+        }
+        let req = axum::http::Request::get("/page")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let header = |name| resp.headers().get(name).unwrap().to_str().unwrap();
-        assert_eq!(header("content-security-policy"), PLUGIN_PAGE_CSP);
         assert_eq!(header("content-type"), "text/html; charset=utf-8");
         assert_eq!(header("cache-control"), "private, no-store");
     }
