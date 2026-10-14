@@ -136,10 +136,9 @@ pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
         .into_response()
 }
 
-/// No-egress policy for untrusted plugin HTML (ADR 0005): only its own inline
-/// script and style run. The dashboard frames it with `sandbox="allow-scripts"`;
-/// the `sandbox` directive gives a directly opened page the same opaque origin.
-const PLUGIN_PAGE_CSP: &str = "sandbox allow-scripts; default-src 'none'; \
+/// Page policy from ADR 0005: only the bundle's own inline script and style run,
+/// and only the dashboard may frame it (with `sandbox="allow-scripts"`).
+const PLUGIN_PAGE_CSP: &str = "default-src 'none'; \
     script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; \
     connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
 
