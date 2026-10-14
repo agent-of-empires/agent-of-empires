@@ -46,8 +46,8 @@ export function useSessions() {
   }, []);
 
   // Published after the commit so no row sees the new ordinal beside the previous snapshot.
-  // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
   useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
     if (appliedRead) markReadApplied(appliedRead);
   }, [appliedRead]);
 
