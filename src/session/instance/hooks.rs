@@ -128,6 +128,49 @@ pub(crate) fn host_hook_disclosure(
     host_hook_disclosure_for_path(agent, config, path)
 }
 
+/// The CLI has no launch cwd: name profile targets exactly, and leave a
+/// relative OMP directory relative to the future launch rather than HOME.
+pub(crate) fn host_hook_disclosure_for_profile(
+    tool_name: &str,
+    agent: &'static crate::agents::AgentDef,
+    config: &crate::session::config::Config,
+) -> anyhow::Result<HostHookDisclosure> {
+    if agent.name != "omp" {
+        return Ok(host_hook_disclosure(tool_name, agent, config));
+    }
+    let host_env = config.environment.as_slice();
+    let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
+    let sidecar = agent
+        .sidecar_hooks
+        .as_ref()
+        .context("OMP status hooks require sidecar metadata")?;
+    let options = crate::session::capture::OmpCliCaptureOptions::parse_launch(
+        &config.session.launch_command_for(tool_name),
+        "",
+    )?;
+    let configured = config.session.agent_config_dir_for(tool_name, &home);
+    let root = if let Some(root) = configured.as_ref().filter(|root| root.is_absolute()) {
+        root.clone()
+    } else {
+        let environment = crate::session::capture::host_launcher_environment(host_env);
+        let has_profile = options.profile.is_some()
+            || environment
+                .get("PI_PROFILE")
+                .is_some_and(|profile| !profile.is_empty());
+        let relative = (!has_profile)
+            .then(|| environment.get("PI_CODING_AGENT_DIR"))
+            .flatten()
+            .filter(|dir| !dir.is_empty() && !Path::new(dir).is_absolute());
+        match relative {
+            Some(dir) => Path::new("<launch cwd>").join(dir),
+            None => crate::hooks::context_free_agent_dir(&home, host_env, &options)
+                .context("cannot resolve OMP hook target without launch cwd")?,
+        }
+    };
+    let path = crate::hooks::sidecar_host_config_path_in(&home, sidecar, Some(&root), host_env);
+    Ok(host_hook_disclosure_for_path(agent, config, Some(path)))
+}
+
 /// Resolve the disclosure against the cwd and argv this new session will launch.
 pub(crate) fn host_hook_disclosure_for_launch(
     tool_name: &str,
@@ -696,7 +739,11 @@ fn host_hook_config_path(
                     host_environment,
                 ));
             }
-            if let Some(root) = crate::hooks::context_free_agent_dir(home, host_environment) {
+            if let Some(root) = crate::hooks::context_free_agent_dir(
+                home,
+                host_environment,
+                &crate::session::capture::OmpCliCaptureOptions::default(),
+            ) {
                 return Some(crate::hooks::sidecar_host_config_path_in(
                     home,
                     sidecar,

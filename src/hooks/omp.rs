@@ -14,6 +14,7 @@ use super::HookInstallTarget;
 pub(crate) fn context_free_agent_dir(
     home: &Path,
     host_environment: &[String],
+    options: &crate::session::capture::OmpCliCaptureOptions,
 ) -> Option<std::path::PathBuf> {
     let mut environment = crate::session::capture::host_launcher_environment(host_environment);
     let resolved_home = environment
@@ -30,13 +31,9 @@ pub(crate) fn context_free_agent_dir(
         environment.remove("PI_CODING_AGENT_DIR");
     }
     let cwd = resolved_home.to_str()?;
-    crate::session::capture::resolve_omp_store_layout_with_environment(
-        environment,
-        cwd,
-        &crate::session::capture::OmpCliCaptureOptions::default(),
-    )
-    .ok()
-    .map(|context| context.agent_dir)
+    crate::session::capture::resolve_omp_store_layout_with_environment(environment, cwd, options)
+        .ok()
+        .map(|context| context.agent_dir)
 }
 const MARKER: &str = "// aoe-hooks: managed OMP status module\n";
 

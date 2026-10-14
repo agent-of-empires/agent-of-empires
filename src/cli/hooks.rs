@@ -8,7 +8,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::session::{host_hook_agent, host_hook_disclosure, update_app_state, Config};
+use crate::session::{host_hook_agent, host_hook_disclosure_for_profile, update_app_state, Config};
 
 #[derive(Subcommand)]
 pub enum HooksCommands {
@@ -40,14 +40,14 @@ fn print_status(profile: &str) -> Result<()> {
         println!("  Run `aoe hooks approve` to let AoE write them, or accept the");
         println!("  dialog the TUI shows when you create a host session.");
     }
-    print_disclosure(profile);
+    print_disclosure(profile)?;
     Ok(())
 }
 
 fn approve(profile: &str) -> Result<()> {
     // Always disclose, even on a repeat run, so the output can be used to
     // review what the standing approval covers for another profile.
-    print_disclosure(profile);
+    print_disclosure(profile)?;
     if approved()? {
         println!();
         println!("Agent hooks already approved for this installation");
@@ -63,7 +63,7 @@ fn approve(profile: &str) -> Result<()> {
 
 /// Print the files and hook commands this profile resolves, for every tool it
 /// installs hooks for. The printed caveat is the bound on that list.
-fn print_disclosure(profile: &str) {
+fn print_disclosure(profile: &str) -> Result<()> {
     let profile = crate::session::config::effective_profile(profile);
     let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
     let status_hooks = config.session.agent_status_hooks;
@@ -79,7 +79,7 @@ fn print_disclosure(profile: &str) {
     let mut unresolved: Vec<&str> = Vec::new();
     let disclosures: Vec<_> = tool_names
         .into_iter()
-        .filter_map(|tool_name| {
+        .map(|tool_name| {
             let agent = host_hook_agent(
                 tool_name,
                 &config.session.launch_command_for(tool_name),
@@ -87,14 +87,17 @@ fn print_disclosure(profile: &str) {
             );
             let Some(agent) = agent else {
                 unresolved.push(tool_name);
-                return None;
+                return Ok(None);
             };
             if !crate::agents::hook_install_required(agent, status_hooks) {
-                return None;
+                return Ok(None);
             }
-            let disclosure = host_hook_disclosure(tool_name, agent, &config);
-            (!disclosure.settings_paths.is_empty()).then_some((tool_name, disclosure))
+            let disclosure = host_hook_disclosure_for_profile(tool_name, agent, &config)?;
+            Ok((!disclosure.settings_paths.is_empty()).then_some((tool_name, disclosure)))
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect();
 
     let status_hooks_active = disclosures
@@ -129,6 +132,14 @@ fn print_disclosure(profile: &str) {
                 config.display()
             );
         }
+    }
+    if disclosures.iter().any(|(_, disclosure)| {
+        disclosure
+            .settings_paths
+            .iter()
+            .any(|path| path.starts_with("<launch cwd>/"))
+    }) {
+        println!("  <launch cwd> paths are resolved against the launch cwd for each session.");
     }
 
     if !unresolved.is_empty() {
@@ -200,4 +211,5 @@ fn print_disclosure(profile: &str) {
             println!("Until then, AoE falls back to pane-based status detection.");
         }
     }
+    Ok(())
 }
