@@ -203,6 +203,7 @@ Add a new session
 * `-l`, `--launch` — Launch the session immediately after creating
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
 * `-b`, `--new-branch` — Create a new branch (use with --worktree)
+* `--generated-name` — Use a generated civilization name as the session title and as the `{branch}` value of the worktree path template, instead of the branch name (use with --worktree). The git branch stays as given. Attaching to an existing worktree keeps its directory and only generates the title. Cannot be combined with --title, --repo or --project
 * `--base-branch <BASE_BRANCH>` — Branch to base the new worktree branch on (use with --new-branch). Defaults to the repository's default branch. Useful for stacking work on top of an in-flight PR branch, hot-fixing a release branch, or branching off a teammate's branch
 * `--repo-base <REPO_BASES>` — Base branch for one repo of a multi-repo workspace, as `<repo>=<branch>` (repeatable). `<repo>` is the repo's directory name or the path you passed to `--repo`. Outranks `--base-branch`, which stays the base for every repo this does not name. Example: `--base-branch develop --repo-base api=epic/checkout`
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
