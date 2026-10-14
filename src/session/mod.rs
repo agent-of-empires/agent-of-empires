@@ -349,7 +349,7 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
-        resolved = config::resolve_default_profile();
+        resolved = config::default_profile_name();
         resolved.as_str()
     } else {
         profile
@@ -357,7 +357,7 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     Ok(base.join("profiles").join(profile_name))
 }
 
-/// Resolve the effective profile name for a read/reference operation.
+/// Resolve an existing profile, allowing bootstrap only on a genuine empty first run.
 pub fn resolve_existing_profile(profile: &str) -> Result<String> {
     let name = if profile.is_empty() {
         config::resolve_default_profile()
