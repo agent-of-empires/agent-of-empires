@@ -158,7 +158,7 @@ describe("AcpRuntime", () => {
     expect(sendPrompt).toHaveBeenCalledOnce();
     expect(session.releaseSend).not.toBeNull();
     expect(window.localStorage.getItem("acp:draft:sess-onnew")).toBeNull();
-    expect(window.localStorage.getItem("acp:draft-attachments:sess-onnew")).toBeNull();
+    expect(window.localStorage.getItem("acp:draft-attachments-v2:sess-onnew")).not.toMatch(/^S:/);
     expect(sendPrompt.mock.calls[0]?.[1]).toEqual([stored]);
     await vi.waitFor(async () => expect(await getDraftAttachments("sess-onnew")).toEqual([]));
     await act(async () => session.releaseSend?.());
@@ -175,7 +175,7 @@ describe("AcpRuntime", () => {
 
     release();
     await vi.waitFor(() => expect(names(view)).toBe("stored.png"));
-    expect(window.localStorage.getItem("acp:draft-attachments:sess-early")).toBe("1");
+    expect(window.localStorage.getItem("acp:draft-attachments-v2:sess-early")).toMatch(/^S:/);
     expect(await getDraftAttachments("sess-early")).toEqual([stored]);
 
     await click(view, "append");
@@ -211,6 +211,23 @@ describe("AcpRuntime", () => {
     );
     const again = mount("sess-away");
     await vi.waitFor(() => expect(names(again)).toBe("stored.png,staged.png"));
+  });
+
+  it("a replacement mount waits for the first mount's reconciliation, so its next send carries both", async () => {
+    session.activity = [];
+    sendPrompt.mockClear();
+    await setDraftAttachments("sess-remount", [stored]);
+    const release = holdReads();
+    const first = mount("sess-remount");
+    await click(first, "stage");
+    first.unmount();
+    // The replacement mounts while the first read is still pending: its restore must queue behind it.
+    const second = mount("sess-remount");
+    release();
+    await vi.waitFor(() => expect(names(second)).toBe("stored.png,staged.png"));
+    await click(second, "append");
+    expect(sendPrompt.mock.calls[0]?.[1]).toEqual([stored, staged]);
+    await act(async () => session.releaseSend?.());
   });
 
   it("keeps what was just staged when the stored draft is near the cap", async () => {
