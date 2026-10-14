@@ -41,6 +41,7 @@ export function useRepoGroups(
   sortMode: SidebarSortMode = "manual",
   projects: readonly ProjectInfo[] = [],
   pluginSort?: PluginSortContext,
+  pluginAttention?: ReadonlySet<string>,
 ): {
   groups: RepoGroup[];
   savedProjects: RepoGroup[];
@@ -74,7 +75,7 @@ export function useRepoGroups(
         return [...list].sort(pluginCompare);
       }
       if (sortMode === "attention") {
-        return [...list].sort(compareWorkspacesByAttention);
+        return [...list].sort((a, b) => compareWorkspacesByAttention(a, b, pluginAttention));
       }
       if (sortMode === "lastActivity") {
         return [...list].sort(compareWorkspacesByLastActivityDesc);
@@ -148,8 +149,8 @@ export function useRepoGroups(
             const au = repoGroupIsUrgent(a.workspaces);
             const bu = repoGroupIsUrgent(b.workspaces);
             if (au !== bu) return au ? -1 : 1;
-            const ar = repoGroupAttentionRank(a.workspaces);
-            const br = repoGroupAttentionRank(b.workspaces);
+            const ar = repoGroupAttentionRank(a.workspaces, pluginAttention);
+            const br = repoGroupAttentionRank(b.workspaces, pluginAttention);
             if (ar !== br) return ar - br;
             const af = repoGroupIsFavorited(a.workspaces);
             const bf = repoGroupIsFavorited(b.workspaces);
@@ -200,7 +201,17 @@ export function useRepoGroups(
     });
 
     return { groups: merged, savedProjects };
-  }, [workspaces, workspaceOrdering, sortMode, pluginSort, projects, isCollapsed, appearanceMap, groupOrder]);
+  }, [
+    workspaces,
+    workspaceOrdering,
+    sortMode,
+    pluginSort,
+    pluginAttention,
+    projects,
+    isCollapsed,
+    appearanceMap,
+    groupOrder,
+  ]);
 
   const updateRepoAppearance = useCallback((repoId: string, update: RepoAppearanceUpdate) => {
     setAppearanceMap((prev) => {

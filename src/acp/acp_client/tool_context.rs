@@ -1,8 +1,9 @@
 //! The bounded per-tool-call context cache that fills in permission requests
 //! whose raw input arrived empty.
 
+use crate::acp::acp_client::update_events::is_wake_tool_title;
 use crate::acp::state::Event;
-use agent_client_protocol::schema::v1::SessionUpdate;
+use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -14,6 +15,8 @@ pub(super) const TOOL_CONTEXT_CACHE_LIMIT: usize = 256;
 pub(super) struct ToolCallContextCache {
     raw_inputs: HashMap<String, serde_json::Value>,
     insertion_order: VecDeque<String>,
+    /// Wake tools only: their later updates may omit the title.
+    wake_titles: HashMap<String, String>,
 }
 
 impl ToolCallContextCache {
@@ -123,6 +126,41 @@ pub(super) fn update_tool_context_cache(
     }
 }
 
+/// claude-agent-acp can send a `Monitor` call's args in `ToolCallUpdate`s
+/// whose title is unset, so the name the wake-tool synthesis keys on is
+/// remembered from the initial `ToolCall`. Returns it for an untitled update.
+pub(super) fn restore_wake_tool_title(
+    cache: &ToolContextCache,
+    update: &SessionUpdate,
+) -> Option<String> {
+    let mut cache = cache.lock().expect("tool context cache mutex poisoned");
+    match update {
+        SessionUpdate::ToolCall(tc) if is_wake_tool_title(&tc.title) => {
+            cache
+                .wake_titles
+                .insert(tc.tool_call_id.0.to_string(), tc.title.clone());
+            None
+        }
+        SessionUpdate::ToolCallUpdate(u) => {
+            let id = u.tool_call_id.0.to_string();
+            let restored = u
+                .fields
+                .title
+                .is_none()
+                .then(|| cache.wake_titles.get(&id).cloned())
+                .flatten();
+            if matches!(
+                u.fields.status,
+                Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+            ) {
+                cache.wake_titles.remove(&id);
+            }
+            restored
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn raw_input_for_tool_event(
     source_update: &SessionUpdate,
     tool_call_id: &str,
@@ -145,7 +183,33 @@ pub(super) fn raw_input_for_tool_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{ToolCall, ToolCallUpdate, ToolCallUpdateFields};
     use serde_json::json;
+
+    #[test]
+    fn wake_title_restored_on_untitled_updates() {
+        let cache: ToolContextCache = Default::default();
+        let untitled = |status| {
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "tc-1",
+                ToolCallUpdateFields::new().status(status),
+            ))
+        };
+        restore_wake_tool_title(
+            &cache,
+            &SessionUpdate::ToolCall(ToolCall::new("tc-1", "Monitor")),
+        );
+        let restore = |status| restore_wake_tool_title(&cache, &untitled(status));
+        assert_eq!(
+            restore(ToolCallStatus::InProgress).as_deref(),
+            Some("Monitor")
+        );
+        assert_eq!(
+            restore(ToolCallStatus::Completed).as_deref(),
+            Some("Monitor")
+        );
+        assert_eq!(restore(ToolCallStatus::InProgress), None);
+    }
 
     #[test]
     fn tool_context_cases() {

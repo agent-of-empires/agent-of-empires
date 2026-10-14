@@ -373,6 +373,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           compact={!keyboardOpen && !inputFocused}
           ctrlActive={ctrlActive}
           onCtrlToggle={() => setCtrlActive((v) => !v)}
+          onCtrlClear={clearCtrl}
         />
       )}
 

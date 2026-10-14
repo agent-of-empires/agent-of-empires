@@ -16,6 +16,7 @@ import {
 import { isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
+import { usePluginAttention } from "../../lib/pluginUiContext";
 import { sessionRowChromeClass } from "../../lib/sessionRowChrome";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { useSidebarCompact } from "../../lib/sidebarCompact";
@@ -65,9 +66,15 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const { workspace, isActive, isSelected, onActivate, readOnly, indented, bulkApi } = props;
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
+  const pluginAttention = usePluginAttention();
   const sessionColorsEnabled = useSessionColorsEnabled();
   const compact = useSidebarCompact();
-  const derived = deriveRowModel(workspace, props.optimistic, { idleDecayWindowMs, isActive, unreadIndicatorEnabled });
+  const derived = deriveRowModel(workspace, props.optimistic, {
+    idleDecayWindowMs,
+    isActive,
+    unreadIndicatorEnabled,
+    pluginAttention,
+  });
   const { label, sessionId, isDeleting, navigationSession } = derived;
   const [notifyPreset, setNotify] = usePendingSetting(
     derived.notifyPreset,
@@ -233,7 +240,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                   <Pin className="h-3 w-3 -rotate-45" />
                 </span>
               )}
-              {!compact && model.isFavorited && (
+              {model.isFavorited && (
                 <span title="Favorited" aria-label="Favorited" className="shrink-0 text-favorite">
                   ✦
                 </span>

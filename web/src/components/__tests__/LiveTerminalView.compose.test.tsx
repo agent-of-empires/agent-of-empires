@@ -62,11 +62,11 @@ async function openCompose(sessionId: string, delivered: boolean) {
 }
 
 describe("LiveTerminalView compose", () => {
-  it("sends the draft as a submitting paste and returns focus to the terminal input", async () => {
+  it("sends the draft as a submitting paste and leaves the terminal input unfocused", async () => {
     const { error } = await openCompose("compose-ok", true);
     expect(live.sendPaste).toHaveBeenCalledWith("ship it", true);
     expect(screen.queryByRole("dialog", { name: "Compose" })).toBeNull();
-    expect(document.activeElement).toBe(screen.getByLabelText("Live terminal input"));
+    expect(document.activeElement).toBe(document.body);
     expect(error).not.toHaveBeenCalled();
   });
 

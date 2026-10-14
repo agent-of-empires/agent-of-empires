@@ -18,7 +18,8 @@ use super::config_options::map_acp_config_option;
 use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{extract_plan_from_switch_mode, map_plan_status, plan_status_to_str};
 use super::raw_input::{
-    background_agent_launched_from_value, monitor_event_from_raw, wakeup_event_from_raw,
+    background_agent_launched_from_value, background_command_launched_from_value,
+    monitor_event_from_raw, wakeup_event_from_raw,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -255,6 +256,23 @@ pub(super) fn is_heartbeat_tool_call_id(id: &str) -> bool {
         .is_some_and(|(_, suffix)| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
 }
 
+pub(super) fn is_wake_tool_title(title: &str) -> bool {
+    matches!(title, "ScheduleWakeup" | "Monitor")
+}
+
+/// The wake event of an untitled `ToolCallUpdate` whose tool name was
+/// restored from its initial `ToolCall`.
+pub(super) fn restored_wake_tool_event(
+    profile: &'static agent_profiles::AgentProfile,
+    update: &SessionUpdate,
+    title: &str,
+) -> Option<Event> {
+    let SessionUpdate::ToolCallUpdate(u) = update else {
+        return None;
+    };
+    wake_tool_event(profile, Some(title), u.fields.raw_input.as_ref()?)
+}
+
 /// A wake or monitor tool's own event, `None` for any other tool or a profile
 /// that does not synthesize them. Args reach `ToolCall` on some adapters and
 /// only a later `ToolCallUpdate` on others (#1091), so both arms call this.
@@ -458,7 +476,12 @@ pub(super) fn map_update_to_events(
                 let payload = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
                 match background_agent_launched_from_value(&payload) {
                     Some(event) => events.push(event),
-                    None => events.push(Event::RawAgentUpdate { payload }),
+                    None => {
+                        if profile.supports_wakeup_tools {
+                            events.extend(background_command_launched_from_value(&payload));
+                        }
+                        events.push(Event::RawAgentUpdate { payload });
+                    }
                 }
             }
             if let Some(raw) = update.fields.raw_input.as_ref() {
@@ -1472,5 +1495,53 @@ mod tests {
         assert!(!update("Monitor", Some(serde_json::json!({})))
             .iter()
             .any(|e| matches!(e, Event::MonitorArmed { .. })));
+    }
+
+    #[test]
+    fn restored_title_arms_monitor_without_retitling_the_update() {
+        let update = tool_update(
+            "tc-1",
+            ToolCallUpdateFields::new()
+                .raw_input(serde_json::json!({"command": "sleep 9", "description": "wait"})),
+        );
+        assert!(matches!(
+            restored_wake_tool_event(&agent_profiles::CLAUDE, &update, "Monitor"),
+            Some(Event::MonitorArmed { description }) if description.as_deref() == Some("wait")
+        ));
+        assert!(restored_wake_tool_event(&agent_profiles::CODEX, &update, "Monitor").is_none());
+        assert!(claude(update)
+            .iter()
+            .all(|e| matches!(e, Event::ToolCallUpdated { title: None, .. })));
+    }
+
+    #[test]
+    fn background_bash_launch_arms_monitor_badge_for_wake_profiles_only() {
+        let launch = || {
+            let mut update = ToolCallUpdate::new("tc-1", ToolCallUpdateFields::new());
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "claudeCode".to_string(),
+                serde_json::json!({
+                    "toolName": "Bash",
+                    "toolResponse": {"stdout": "", "backgroundTaskId": "byiee4aex"},
+                }),
+            );
+            update.meta = Some(meta);
+            SessionUpdate::ToolCallUpdate(update)
+        };
+        let armed = |events: &[Event]| {
+            events
+                .iter()
+                .any(|e| matches!(e, Event::MonitorArmed { description: None }))
+        };
+        let claude_events = claude(launch());
+        assert!(armed(&claude_events));
+        assert!(matches!(
+            claude_events.last(),
+            Some(Event::RawAgentUpdate { .. })
+        ));
+        let codex = map_update_to_events(launch(), &agent_profiles::CODEX);
+        assert!(!armed(&codex));
+        assert_eq!(kinds(&codex), ["raw_agent_update"]);
     }
 }

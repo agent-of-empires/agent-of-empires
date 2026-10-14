@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     gnupg \
     jq \
+    python3 \
     openssh-client \
     ripgrep \
     fzf \
@@ -82,14 +83,9 @@ RUN npm install -g @qwen-code/qwen-code
 RUN curl -fsSL https://code.kimi.com/kimi-code/install.sh \
     | KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
 
-# Install Prime Agent (PrimeIntellect). The installer is downloaded to a
-# file first so a failed fetch fails the build instead of piping an empty
-# script into sh, and `command -v` fails the build if no binary landed. The
-# installer itself SHA-256-verifies the release tarball it installs. It
-# detects the missing TTY in docker build and proceeds without its
-# interactive confirmations; it needs npm (installed above) and lands the
-# binary in npm's global bin directory, which the /root/.prime/agent config
-# mount below does not shadow.
+# Install native Prime Agent. The installer verifies the release tarball and
+# places its binary in ~/.local/bin, already on PATH above. The configuration
+# mount at /root/.prime/agent does not shadow the installation.
 RUN curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \
         -o /tmp/install-prime-agent.sh \
     && sh /tmp/install-prime-agent.sh \

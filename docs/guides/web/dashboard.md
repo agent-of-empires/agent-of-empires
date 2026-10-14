@@ -46,7 +46,7 @@ The sort picker offers three modes, and drag is available only in the first:
 
 - **Manual** (default).
 - **Recent activity**: by the most recent of `last_accessed_at`, `idle_entered_at`, and `created_at` across the workspace's sessions.
-- **Attention**: sessions needing a human first, mirroring the TUI. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient last), floats sessions the `attention-urgent` hook flagged above non-urgent rows in their tier, favorites first within a rank, then most recent activity.
+- **Attention**: sessions needing a human first, mirroring the TUI. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient last), floats sessions the `attention-urgent` hook flagged above non-urgent rows in their tier, favorites first within a rank, then most recent activity. A session with a plugin `row-column` entry toned `warn` or `danger` ranks at least as high as Error (Waiting stays ahead), and counts toward the attention badges and the jump-to-next shortcut like a Waiting or Error session. Archived, snoozed, and trashed sessions never count.
 
 A grouping toggle next to it cycles **By repo** (default), **By group** (the group set in the TUI rename dialog, with `aoe group move`, or from the row's **Edit group** menu; ungrouped sessions sit in a bucket at the bottom), and **By repo and group** (repo headers with groups nested inside). Group paths use `/` for hierarchy. Collapse state is tracked per axis, and the sort and grouping choices are per-browser. The Multi-repo and Scratch groups default to the bottom.
 
@@ -54,7 +54,7 @@ A grouping toggle next to it cycles **By repo** (default), **By group** (the gro
 
 Right-click (long-press on touch) a session row:
 
-- **Pin** floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark.
+- **Pin** floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark. Favorites keep their `✦` marker in both normal and compact sidebars.
 - **Archive** tears down every tmux session the workspace owns (pass `kill_pane: false` in the API, or `--no-kill` on the CLI, to skip that) and shuts down the structured-view worker, then sinks the row into the collapsible "Snoozed & archived" footer. An archived session never starts or resumes, whether from a message, **Start**, attaching, or a daemon restart; unarchive it first.
 - **Snooze** sinks the row for a chosen duration (1h through 1w); it wakes when the timer expires, or early if you send a message.
 

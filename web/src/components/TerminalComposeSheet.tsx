@@ -6,7 +6,7 @@ const drafts = new Map<string, string>();
 
 interface Props {
   draftKey: string;
-  /** Height the soft keyboard covers, so the sheet sits above it. */
+  /** Soft keyboard height above the home-indicator inset, which the sheet adds since its parent drops it. */
   bottomInset: number;
   /** Whether the pane will receive the text. */
   onSubmit: (text: string, submit: boolean) => boolean;
@@ -19,6 +19,7 @@ interface Props {
  */
 export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose }: Props) {
   const textRef = useRef<HTMLTextAreaElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const [empty, setEmpty] = useState(() => !drafts.get(draftKey)?.trim());
 
   const grow = useCallback(() => {
@@ -37,32 +38,49 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
     ta.setSelectionRange(ta.value.length, ta.value.length);
   }, [grow]);
 
-  const deliver = (submit: boolean) => {
+  const deliver = (submit: boolean, keepTyping = !submit) => {
     const text = textRef.current?.value ?? "";
     if (!text.trim() || !onSubmit(text, submit)) return;
     drafts.delete(draftKey);
-    onClose(true);
+    // A tapped Send drops the keyboard; Insert and the hardware chord keep typing in the terminal.
+    if (!keepTyping) textRef.current?.blur();
+    onClose(keepTyping);
   };
 
-  const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
       e.preventDefault();
       onClose(false);
+    } else if (e.key === "Tab") {
+      // The terminal controls behind the sheet stay mounted, so wrap instead of leaving.
+      const items = dialogRef.current?.querySelectorAll<HTMLElement>("textarea, button:not([disabled])") ?? [];
+      const first = items[0];
+      const last = items[items.length - 1];
+      const wrapTo = e.shiftKey ? document.activeElement === first && last : document.activeElement === last && first;
+      if (wrapTo) {
+        e.preventDefault();
+        wrapTo.focus();
+      }
     } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      deliver(true);
+      deliver(true, true);
     }
   };
 
   const action = "h-10 px-3 rounded-md text-sm transition-colors disabled:opacity-40";
 
   return (
-    <div className="absolute inset-x-0 top-0 z-30 flex flex-col justify-end" style={{ bottom: bottomInset }}>
+    <div
+      className="absolute inset-x-0 top-0 z-30 flex flex-col justify-end"
+      style={{ bottom: `calc(${bottomInset}px + env(safe-area-inset-bottom))` }}
+    >
       <div className="absolute inset-0 bg-black/40" onClick={() => onClose(false)} data-compose-backdrop />
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Compose"
+        onKeyDown={onKeyDown}
         className="relative flex flex-col gap-2 p-2 bg-surface-900 border-t border-surface-700/40 rounded-t-lg"
       >
         <textarea
@@ -77,7 +95,6 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
             setEmpty(!value.trim());
             grow();
           }}
-          onKeyDown={onKeyDown}
           // 16px stops iOS from zooming the page on focus.
           style={{ fontSize: "16px" }}
           className="w-full max-h-[40vh] resize-none overflow-y-auto bg-surface-950 border border-surface-700 rounded-md px-2 py-1.5 text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"

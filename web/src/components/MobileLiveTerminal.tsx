@@ -1,14 +1,20 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment } from "../lib/ansi";
-import { LineParseCache, textWidth, wrapLine } from "../lib/liveTermLines";
+import { LineParseCache, lineText, textWidth, wrapLine } from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, unwrapPointer } from "../lib/liveMouse";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useTerminalGestureBoundary } from "../hooks/useTerminalGestureBoundary";
 import { useSelectionHold } from "../hooks/useSelectionHold";
-import { FrameTimingProbe, mountedBlocks } from "./live-terminal/pacing";
+import {
+  anchoredScrollTop,
+  FrameTimingProbe,
+  mountedBlocks,
+  scrollAnchor,
+  type RowLayout,
+} from "./live-terminal/pacing";
 import { FORWARD_TOUCH_GAIN, useForwardInput } from "./live-terminal/useForwardInput";
 import { Row } from "./live-terminal/TermRow";
 import { LIVE_WINDOW_SCREENS, useLiveEdgeScroll } from "./live-terminal/useLiveEdgeScroll";
@@ -187,27 +193,33 @@ export function MobileLiveTerminal({
   const lines = useMemo(() => (frame ? parseCache.lines(frame.lines ?? frame.content) : []), [frame, parseCache]);
   // Columns rendered at; wrapping keeps a frame readable when another client widened the window.
   const [renderCols, setRenderCols] = useState(0);
-  const [wrapCache] = useState(() => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][] }>());
+  const [wrapCache] = useState(
+    () => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][]; key: string }>(),
+  );
   const visual = useMemo(() => {
     const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
     const rows: AnsiSegment[][] = [];
     const lineStartRow: number[] = new Array(lines.length);
+    const keys: string[] = new Array(lines.length);
     const source: Array<{ line: number; wrap: number }> = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
       let wrapped = wrapCache.get(line);
       if (!wrapped || wrapped.cols !== cols) {
-        wrapped = { cols, rows: wrapLine(line, cols) };
+        // Plain text, so the anchor matches a line whichever producer encoded its style.
+        wrapped = { cols, rows: wrapLine(line, cols), key: lineText(line).trimEnd() };
         wrapCache.set(line, wrapped);
       }
       lineStartRow[i] = rows.length;
+      keys[i] = wrapped.key;
       wrapped.rows.forEach((row, wrap) => {
         rows.push(row);
         source.push({ line: i, wrap });
       });
     }
-    return { rows, lineStartRow, source };
-  }, [lines, renderCols, wrapCache]);
+    const screenStart = Math.max(0, lines.length - (frame?.rows ?? 0));
+    return { keys, rows, lineStartRow, source, screenStart };
+  }, [lines, frame?.rows, renderCols, wrapCache]);
   const screenRows = frame?.rows ?? 0;
   const spacerLines = Math.max(0, (frame?.history ?? 0) - Math.max(0, lines.length - screenRows));
   // A full-screen mouse app's scrollback is not capturable: no spacer, no native scroll, wheels go to the app.
@@ -605,13 +617,42 @@ export function MobileLiveTerminal({
     if (LIVE_DEBUG && streamFrame) frameTiming.record(performance.now(), streamFrame.receivedAt);
   }, [streamFrame, frameTiming]);
 
+  // Loaded lines wrap to more rows than the spacer rows they replace, and trimming the oldest scrollback removes
+  // rows, so either would move a detached reader's text; restore the line they were reading.
+  const anchorLayoutRef = useRef<{ spacer: number; layout: RowLayout; lineH: number; top: number } | null>(null);
+  const onScrollerScroll = useCallback(() => {
+    if (anchorLayoutRef.current && scrollerRef.current) anchorLayoutRef.current.top = scrollerRef.current.scrollTop;
+    onScroll();
+  }, [onScroll]);
   useLayoutEffect(() => {
     if (live.top != null) cursorAnchorRef.current = live.top;
     pinIfWasAtBottom();
+    const el = scrollerRef.current;
+    const prev = anchorLayoutRef.current;
+    if (el && prev && liveDetachedRef.current && !forwardMode && prev.lineH === lineH) {
+      // Shrunken content has already clamped scrollTop to the bottom; the last known position predates that.
+      const clamped = el.scrollTop >= el.scrollHeight - el.clientHeight - 1;
+      const from = clamped ? Math.max(el.scrollTop, prev.top) : el.scrollTop;
+      const anchor = scrollAnchor(from, el.clientHeight, prev.spacer, prev.layout, lineH);
+      const top = anchor && anchoredScrollTop(anchor, effectiveSpacerLines, visual, lineH);
+      if (top != null && Math.abs(top - el.scrollTop) >= 1) el.scrollTop = top;
+    }
+    anchorLayoutRef.current = { spacer: effectiveSpacerLines, layout: visual, lineH, top: el?.scrollTop ?? 0 };
     // Match the virtualization window to the pinned position before paint.
     syncView();
     // `renderRowCount` changes the content height at the live edge, which must re-pin.
-  }, [lines, spacerLines, lineH, live, renderRowCount, cursorAnchorRef, pinIfWasAtBottom, syncView]);
+  }, [
+    visual,
+    effectiveSpacerLines,
+    forwardMode,
+    lineH,
+    live,
+    renderRowCount,
+    cursorAnchorRef,
+    liveDetachedRef,
+    pinIfWasAtBottom,
+    syncView,
+  ]);
 
   const input = useTerminalInput({
     active,
@@ -633,7 +674,7 @@ export function MobileLiveTerminal({
     <div className="absolute inset-0" data-live-terminal>
       <div
         ref={scrollerRef}
-        onScroll={onScroll}
+        onScroll={onScrollerScroll}
         onWheel={forward.onWheel}
         onClick={focusInputOnTap}
         onPointerDown={forward.onPointerDown}
@@ -667,7 +708,7 @@ export function MobileLiveTerminal({
             // Declarative, because React's touch listeners are passive and cannot stop the page pan.
             touchAction: forwardGestures ? "none" : undefined,
             // No -webkit-overflow-scrolling: Safari rasterizes that layer at 1x. Browser scroll anchoring is off
-            // because the spacer model already keeps the reader's place.
+            // because the layout effect re-anchors the reader by pane line.
             overflowAnchor: "none",
           } as CSSProperties
         }

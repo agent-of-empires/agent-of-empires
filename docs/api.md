@@ -63,7 +63,7 @@ Creates a session. Pass `?wait=ready` to block until the new session's status le
 
 ## POST /api/sessions/{id}/send
 
-Types a message into the agent and presses Enter, like the TUI's send dialog and `aoe send`. Honors the per-agent paste-burst delay. `message` is sent literally; newlines become shift-Enter line breaks and a final Enter submits.
+Types a message into the agent and presses Enter, honoring the per-agent paste-burst delay. Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remaining ESC bytes, then removes only trailing CR/LF characters. Internal line breaks, spaces, and tabs are preserved by this normalization. The terminal transport adapts pasted LF to CR and adds a final Enter to submit. An empty or whitespace-only result is rejected before delivery.
 
 ```bash
 curl -sS -X POST -H "Authorization: Bearer $AOE_TOKEN" \
