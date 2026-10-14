@@ -347,6 +347,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
       if (!ok) return;
     }
     setPanel(null);
+    if (profileName) dispatch({ type: "RESET_STRUCTURED_VIEW_DIRTY" });
     // Launch waits for this switch, and a response for a superseded profile is dropped.
     const switchId = ++profileSwitchRef.current;
     const isCurrent = () => profileSwitchRef.current === switchId;
@@ -383,7 +384,6 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
       if (settings) {
         handleApplyProfileDefaults({
           ...profileDefaults(settings, "", latest.tool),
-          resetStructuredViewDirty: true,
           commandMaps: commandMapsFromSettings(settings),
         });
       }

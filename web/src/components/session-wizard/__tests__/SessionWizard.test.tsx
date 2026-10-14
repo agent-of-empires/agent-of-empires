@@ -250,6 +250,49 @@ describe("SessionWizard rows", () => {
       expect(payload()).toMatchObject({ profile: "work" });
     });
 
+    // #4086: a view toggled while the settings response is pending is newer than the response.
+    it("keeps a view toggled while the profile response is pending", async () => {
+      vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
+      const terminal = { acp: { default_new_session_view: "terminal" } } as never;
+      let release!: (v: never) => void;
+      vi.mocked(fetchSettings)
+        .mockResolvedValueOnce(terminal)
+        .mockReturnValueOnce(new Promise((r) => (release = r)));
+      renderWizard();
+      const view = () => screen.getByRole("switch", { name: "Use structured view" });
+      await screen.findByRole("switch", { name: "Use structured view" });
+      await waitFor(() => expect(view().getAttribute("aria-checked")).toBe("false"));
+      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+      await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+      fireEvent.click(view());
+      expect(view().getAttribute("aria-checked")).toBe("true");
+      release(terminal);
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalled());
+      expect(view().getAttribute("aria-checked")).toBe("true");
+      expect(payload()).toMatchObject({ profile: "work", view: "structured" });
+    });
+
+    it("resets a view set before the profile was picked", async () => {
+      vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      try {
+        vi.mocked(fetchSettings)
+          .mockResolvedValueOnce({} as never)
+          .mockResolvedValueOnce({ acp: { default_new_session_view: "terminal" } } as never);
+        renderWizard();
+        fireEvent.click(await screen.findByRole("switch", { name: "Use structured view" }));
+        fireEvent.click(screen.getByText("Profile"));
+        fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+        await launch();
+        await waitFor(() => expect(createSession).toHaveBeenCalled());
+        expect(payload()).toMatchObject({ profile: "work", view: "terminal" });
+      } finally {
+        confirmSpy.mockRestore();
+      }
+    });
+
     it("confirms before a profile overwrites edits", async () => {
       vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
       const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
