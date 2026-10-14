@@ -138,27 +138,17 @@ jobs:
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
           cargo nextest run --no-fail-fast
-      # bare-core: the three no-default-features feature corners. `web` is not
-      # a default feature, so these runs are also the dashboard-off compile
-      # gate that keeps the `cfg(feature = "web")` sites from rotting.
-      #  - lib/bins: with every bundled plugin compiled out, core must still
-      #    build and pass its unit tests.
-      #  - e2e: acceptance criterion 1 of #268 (issue #2097): with all default
-      #    plugins disabled, aoe still creates, attaches to, and destroys a
-      #    tmux + worktree session from CLI and TUI. Filtered to the modules
-      #    that carry that criterion instead of the whole 134-test suite: the
-      #    rest re-asserts behavior the web-e2e leg already covers with plugins
-      #    on, for ~90s of duplicate wall on a concurrency-bound workflow.
-      #  - check --all-targets: default-plugins on, dashboard off compile gate;
-      #    `e2e-tests` keeps the e2e target inside the --all-targets sweep, which
-      #    the gate would otherwise silently drop.
+      # bare-core keeps OpenSSL/SQLite vendoring across flag corners:
+      # default-plugins off for lib/bin and selected lifecycle e2e tests (the
+      # web leg covers the rest), then flag on/web off for all-targets.
+      # e2e-tests includes its target in that compile sweep.
       - name: Cargo test (bare core, no default features)
         if: matrix.leg == 'bare-core'
         run: |
-          cargo nextest run --no-default-features --lib --bins --no-fail-fast
-          cargo test --no-default-features --features e2e-tests --test e2e -- \
+          cargo nextest run --no-default-features --features vendored --lib --bins --no-fail-fast
+          cargo test --no-default-features --features vendored,e2e-tests --test e2e -- \
             --test-threads=3 cli:: new_session::
-          cargo check --no-default-features --features default-plugins,e2e-tests --all-targets
+          cargo check --no-default-features --features vendored,default-plugins,e2e-tests --all-targets
       # A default `cargo build` must ship the daemon without invoking Node
       # (#3619). Shadow node and npm with failing stubs so a `web`-gate
       # regression in build.rs fails here rather than silently reintroducing

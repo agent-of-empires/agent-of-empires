@@ -51,6 +51,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde-saphyr = "1.3"
+granit-parser = { version = "1.3", features = ["std"] }
 toml = "1.1"
 toml_edit = "0.25"
 dotenv-ng-core = "1.0"
@@ -118,7 +119,7 @@ rattles = "0.3"
 regex = "1.10"
 
 # Git operations
-git2 = { version = "0.21", features = ["vendored-openssl"] }
+git2 = "0.21"
 
 # Diff computation
 similar = "3.1"
@@ -139,11 +140,8 @@ tempfile = "3.14"
 # PATH lookup for external viewers (lnav, bat, less) used by `aoe logs`.
 which = "8.0"
 
-# Local SQLite reader for opencode's session store. Bundled to avoid a
-# system libsqlite3 dependency. Used to read session state without spawning
-# `opencode session list`, which leaks a 4.5MB /tmp/.<hash>.so per invocation
-# via opencode's bun:ffi OpenTUI extract path (see anomalyco/opencode#6523).
-rusqlite = { version = "0.40", features = ["bundled"] }
+# SQLite
+rusqlite = "0.40"
 
 # Daemon HTTP/WS server. Core: the daemon is the product, the dashboard is one
 # surface on it (see the `web` feature).
@@ -206,9 +204,10 @@ sd-notify = "0.5"
 # plain `cargo build` ships it and needs no Node. `web` adds the embedded
 # dashboard bundle, which is what invokes npm; released binaries are built
 # `--features web`, so every distributed binary ships the dashboard.
-default = ["default-plugins"]
-# Compile in the bundled first-party plugins. Build the bare core (acceptance
-# criterion 1 of #268) by opting out with `--no-default-features`.
+default = ["default-plugins", "vendored"]
+# OpenSSL and SQLite vendoring for portable builds.
+vendored = ["git2/vendored-openssl", "rusqlite/bundled"]
+# Compatibility flag for default plugin selection.
 default-plugins = []
 # Gates the `e2e` test target (tests/e2e/main.rs). Off by default so CI can run
 # the suite as two parallel shards without enumerating every non-e2e test

@@ -120,6 +120,7 @@ dependencies = [
  "getrandom 0.4.3",
  "git2",
  "glob",
+ "granit-parser",
  "hkdf 0.13.0",
  "indexmap 2.14.2",
  "jsonwebtoken",

@@ -150,6 +150,13 @@ impl Instance {
             return;
         }
 
+        // A peer process is launching this row and has not created its pane yet; the owner's
+        // commit or failure write decides the outcome.
+        if self.has_fresh_launch_reservation(Utc::now()) {
+            self.status = Status::Starting;
+            return;
+        }
+
         if self.status == Status::Error && self.last_error.is_some() {
             if let Some(last_check) = self.last_error_check {
                 if last_check.elapsed().as_secs() < 30 {
@@ -737,6 +744,33 @@ mod tests {
         inst.update_status_with_metadata_inner(None, None);
         assert!(inst.ever_confirmed_present);
         assert_eq!(inst.unknown_since, None);
+    }
+
+    /// A row whose launch is still reserved by another process reads Starting, not a missing pane.
+    #[test]
+    #[serial_test::serial]
+    fn reserved_launch_without_a_pane_reads_starting() {
+        let _cache = force_session_absent();
+        let now = Utc::now();
+        for (op, at, want) in [
+            (LifecycleOperation::Launch, now, Status::Starting),
+            (
+                LifecycleOperation::Launch,
+                now - Instance::LIFECYCLE_RESERVATION_TTL,
+                Status::Error,
+            ),
+            (LifecycleOperation::Stop, now, Status::Error),
+        ] {
+            let mut inst = Instance::new("reserved", "/tmp/reserved");
+            inst.status = Status::Starting;
+            inst.lifecycle_reservation = Some(LifecycleReservation {
+                op,
+                generation: inst.lifecycle_generation,
+                at,
+            });
+            inst.update_status_with_metadata(None, None);
+            assert_eq!(inst.status, want, "{op:?} at {at}");
+        }
     }
 
     /// The poll loops resolve the live tmux name once against the batch snapshot.

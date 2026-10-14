@@ -36,11 +36,23 @@ const SCHEMA = [
 }));
 
 async function installCityHallMocks(page: Page) {
+  let trashRetentionMinutes = 43200;
   await mockSettingsApis(page, {
     about: () => ({ cityhall_mode: true }),
     schema: SCHEMA,
-    settings: () => ({ theme: { name: "dark" }, session: { delete_to_trash: true, trash_retention_minutes: 43200 } }),
+    settings: () => ({
+      theme: { name: "dark" },
+      session: { delete_to_trash: true, trash_retention_minutes: trashRetentionMinutes },
+    }),
   });
+  await page.route(
+    (url) => url.pathname === "/api/profiles/main/settings",
+    async (route) => {
+      if (route.request().method() !== "PATCH") return route.fallback();
+      trashRetentionMinutes = route.request().postDataJSON().session.trash_retention_minutes;
+      await route.fulfill({ json: { session: { trash_retention_minutes: trashRetentionMinutes } } });
+    },
+  );
   await page.route(
     (url) => url.pathname === "/api/projects",
     (r) => r.fulfill({ json: [{ name: "app", path: "/repos/app", scope: "global", pinned: false }] }),
@@ -139,6 +151,29 @@ test("Settings, its tabs, and settings search are curated to the CityHall subset
   await expect(page.getByText("Delete to Trash")).toBeVisible();
   await expect(page.getByText("Confirm Before Delete")).toBeVisible();
   await expect(page.getByText("Trash Retention (minutes)")).toBeVisible();
+  const retention = page.getByRole("spinbutton");
+  await expect(retention).toHaveValue("43200");
+  const save = page.waitForResponse(
+    (response) =>
+      response.request().method() === "PATCH" && new URL(response.url()).pathname === "/api/profiles/main/settings",
+  );
+  await retention.fill("15");
+  await retention.press("Tab");
+  const saved = await save;
+  expect(saved.ok()).toBe(true);
+  expect(saved.request().postDataJSON()).toEqual({ session: { trash_retention_minutes: 15 } });
+  await expect(retention).toHaveValue("15");
+  const readback = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return (
+      response.request().method() === "GET" &&
+      url.pathname === "/api/settings" &&
+      url.searchParams.get("profile") === "main"
+    );
+  });
+  await page.reload();
+  await readback;
+  await expect(retention).toHaveValue("15");
   await expect(page.getByText("Idle auto-stop")).toHaveCount(0);
   await expect(page.getByText("Default profile")).toHaveCount(0);
 
