@@ -21,14 +21,17 @@ export interface MockHandle {
 }
 
 /** `history` numbered scrollback lines, then a `rows`-tall screen with a prompt on its first line. */
-export function makeLiveFrame(opts: { rows?: number; history?: number; window?: number } = {}) {
+export function makeLiveFrame(
+  opts: { rows?: number; history?: number; window?: number; line?: (i: number) => string } = {},
+) {
   const rows = opts.rows ?? 24;
   const history = opts.history ?? 0;
   const window = Math.min(opts.window ?? rows, rows + history);
   const fetchedHistory = Math.max(0, window - rows);
+  const line = opts.line ?? ((i: number) => `history line ${String(i).padStart(3, "0")} lorem ipsum`);
   const lines: string[] = [];
   for (let i = history - fetchedHistory + 1; i <= history; i++) {
-    lines.push(`history line ${String(i).padStart(3, "0")} lorem ipsum`);
+    lines.push(line(i));
   }
   lines.push("$ ready");
   for (let i = 1; i < rows; i++) lines.push("");
@@ -44,6 +47,8 @@ export async function mockTerminalApis(
   page: Page,
   opts: {
     liveHistory?: number;
+    /** History line text by 1-based line number; defaults to a short line that never wraps. */
+    liveHistoryLine?: (i: number) => string;
     delayLiveWindowShrinkMs?: number;
     tool?: string;
     extraSessions?: Array<{ id: string; title: string }>;
@@ -167,7 +172,10 @@ export async function mockTerminalApis(
       if (customFrames) return;
       try {
         ws.send(
-          JSON.stringify({ type: "frame", ...makeLiveFrame({ rows: responseRows, history, window: responseWindow }) }),
+          JSON.stringify({
+            type: "frame",
+            ...makeLiveFrame({ rows: responseRows, history, window: responseWindow, line: opts.liveHistoryLine }),
+          }),
         );
         socket.frames++;
       } catch {

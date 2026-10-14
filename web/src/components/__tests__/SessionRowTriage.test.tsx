@@ -46,14 +46,16 @@ describe("SessionRow chips", () => {
     },
   );
 
-  it("marks a favorite with the theme-colored star, and nothing otherwise", () => {
-    renderRow(ws({ favorited: true }));
-    const star = label("Favorited")!;
-    expect(star.textContent).toBe("✦");
-    expect(star.className).toContain("text-favorite");
-    cleanup();
-    renderRow(ws({ favorited: false }));
-    expect(label("Favorited")).toBeNull();
+  it("keeps favorite identity distinct from pin in normal and compact rows", () => {
+    for (const compact of [false, true]) {
+      const { rerenderRow } = renderRow(ws({ favorited: true, pinned_at: null }), { compact });
+      expect(label("Favorited")?.textContent).toBe("✦");
+      expect(label("Pinned")).toBeNull();
+      rerenderRow(ws({ favorited: false, pinned_at: null }));
+      expect(label("Favorited")).toBeNull();
+      expect(label("Pinned")).toBeNull();
+      cleanup();
+    }
   });
 
   it("shows the snooze remaining time and the payload rate-limit park", () => {

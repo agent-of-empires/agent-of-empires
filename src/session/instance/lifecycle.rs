@@ -104,6 +104,14 @@ impl Instance {
         )
     }
 
+    pub(crate) fn has_fresh_launch_reservation(&self, now: DateTime<Utc>) -> bool {
+        self.has_fresh_lifecycle_reservation(now)
+            && self
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.op == LifecycleOperation::Launch)
+    }
+
     pub fn release_lifecycle_reservation_if_owned(
         &mut self,
         operation: LifecycleOperation,

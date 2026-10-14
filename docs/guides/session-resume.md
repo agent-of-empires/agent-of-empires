@@ -132,11 +132,11 @@ Upgrading the agent binary from inside a session does not replace the process in
 
 ## Importing an existing conversation
 
-Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import session** tab. The tab appears when at least one built-in agent has both its CLI and its ACP adapter installed, since the import resumes through that adapter. Pick the agent, then a conversation: AoE lists it newest first, with its title, working directory, and last activity. It preselects Claude when available and remembers your last pick.
+Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import session** tab. The tab appears when at least one built-in agent has both its CLI and its ACP adapter installed, since the import resumes through that adapter. Pick the agent, then a conversation: AoE sorts the returned conversations by activity, showing their title, working directory, and last activity. It preselects Claude when available and remembers your last pick.
 
 Picking one creates a structured-view session in that conversation's recorded working directory and loads it with ACP `session/load`, so the prior transcript is there and you can keep going. It always uses the recorded directory and never creates a worktree or a sandbox, because the conversation only resolves on the host where it started. The original is read in place, not copied.
 
-The list hides conversations not worth importing: ones AoE already owns, scratch sessions, and anything inside an AoE worktree directory. It shows at most the newest 200 and says when it cut the rest. Sessions whose directory no longer exists are hidden until you tick "show missing directories", and then shown disabled. A conversation active in the last 10 minutes, or with no recorded activity, asks for confirmation first: if it is still open in another terminal, two processes would append to the same transcript.
+The list hides conversations not worth importing: ones AoE already owns, scratch sessions, and anything inside an AoE worktree directory. It returns at most 200 conversations. Resource limits can make the returned list partial even below 200; unread pages may contain newer conversations. An empty partial result does not establish that no importable conversations exist. Sessions whose directory no longer exists are hidden until you tick "show missing directories", and then shown disabled. A conversation active in the last 10 minutes, or with no recorded activity, asks for confirmation first: if it is still open in another terminal, two processes would append to the same transcript.
 
 ### Claude
 

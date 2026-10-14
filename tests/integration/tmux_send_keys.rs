@@ -40,21 +40,24 @@ fn send_keys_keeps_a_trailing_semicolon() {
         socket: &socket,
         name: &name,
     };
-    // App creation pins pane 0 even when the tmux server inherits another base index.
-    Session::from_name(&name)
-        .create(home.path().to_str().unwrap(), Some("cat -v"), "main")
-        .expect("create agent pane");
+    let session = Session::from_name(&name);
+    session
+        .create(
+            home.path().to_str().expect("temporary HOME is UTF-8"),
+            Some("cat -v"),
+            "main",
+        )
+        .expect("create managed cat session");
+    let target = format!("{name}:^.0");
 
-    Session::from_name(&name)
-        .send_keys("ls;")
-        .expect("send_keys");
+    session.send_keys("ls;").expect("send_keys");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let out = Command::new("tmux")
             .arg("-S")
             .arg(&socket)
-            .args(["capture-pane", "-p", "-t", &name])
+            .args(["capture-pane", "-p", "-t", &target])
             .output()
             .expect("tmux capture-pane");
         let pane = String::from_utf8_lossy(&out.stdout);

@@ -90,6 +90,8 @@
      legible. Decorative uses (separator hairlines, etc.) that need
      to read as quieter can drop to surface-700 directly. See #1105. */
   --color-text-dim: #8b8b94;
+  /* text-dim lifted to AA on surface-900 and -850 (see resolved.rs). Zinc default. */
+  --color-text-subtle: #97979f;
   --color-text-bright: #fafafa;
 
   /* Semantic Status */
