@@ -159,7 +159,18 @@ fn plugin_page_response(bytes: Vec<u8>) -> Response {
 
 /// `GET /api/plugins/{id}/pages/{page_id}`: the declared `entry` HTML of an
 /// active plugin's page. Anything undeclared, missing or escaping 404s.
-pub async fn serve_plugin_page(Path((id, page_id)): Path<(String, String)>) -> Response {
+pub async fn serve_plugin_page(
+    Path((id, page_id)): Path<(String, String)>,
+    uri: axum::http::Uri,
+) -> Response {
+    // Page script can read its own URL, so a `?token=` must never reach it.
+    if uri.query().is_some() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "query_not_allowed",
+            "Plugin page URLs take no query string",
+        );
+    }
     let registry = plugin::registry();
     let Some(plugin) = registry.active().find(|p| p.id() == id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1055,6 +1066,41 @@ mod tests {
         let header = |name| resp.headers().get(name).unwrap().to_str().unwrap();
         assert_eq!(header("content-type"), "text/html; charset=utf-8");
         assert_eq!(header("cache-control"), "private, no-store");
+    }
+
+    #[tokio::test]
+    async fn plugin_page_refuses_a_query_so_no_token_reaches_page_script() {
+        use tower::ServiceExt;
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some("secret-token".to_string()),
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let cookie = Some("aoe_token=secret-token");
+        let cases = [
+            ("?token=secret-token", None, StatusCode::BAD_REQUEST),
+            ("?token=secret-token", cookie, StatusCode::BAD_REQUEST),
+            ("", cookie, StatusCode::NOT_FOUND),
+            ("?token=wrong", None, StatusCode::UNAUTHORIZED),
+        ];
+        for (query, cookie, want) in cases {
+            let mut req =
+                axum::http::Request::get(format!("/api/plugins/acme.absent/pages/board{query}"))
+                    .header("host", "127.0.0.1");
+            if let Some(c) = cookie {
+                req = req.header("cookie", c);
+            }
+            let mut req = req.body(axum::body::Body::empty()).unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [203, 0, 113, 7],
+                    5555,
+                ))));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), want, "{query} cookie={cookie:?}");
+        }
     }
 
     #[test]
