@@ -148,6 +148,26 @@ impl Instance {
         }
     }
 
+    /// Publish a retained purge result beyond peers' Deleting observation.
+    pub(crate) fn finish_owned_purge(
+        &mut self,
+        generation: u64,
+        status_before: Status,
+    ) -> Result<bool, LifecycleReservationError> {
+        if !self.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation) {
+            return Ok(false);
+        }
+        let completed = generation
+            .checked_add(1)
+            .ok_or(LifecycleReservationError::GenerationOverflow)?;
+        if self.status == Status::Deleting {
+            self.status = status_before;
+        }
+        self.lifecycle_reservation = None;
+        self.lifecycle_generation = completed;
+        Ok(true)
+    }
+
     /// Clear a crashed owner's expired reservation. The generation is
     /// deliberately retained as the monotonic cache/result revision.
     pub fn clear_expired_lifecycle_reservation(

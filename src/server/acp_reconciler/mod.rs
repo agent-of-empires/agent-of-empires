@@ -454,39 +454,56 @@ async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<S
 
 /// Reaps registry entries whose session no longer exists.
 async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
-    let Ok(records) = crate::process::worker_registry::list() else {
-        return;
+    use crate::process::worker_registry;
+    #[cfg(unix)]
+    let records = worker_registry::list_for_reaping();
+    #[cfg(not(unix))]
+    let records = worker_registry::list();
+    let records = match records {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(target: "acp.supervisor", error = %error, "cannot enumerate orphan workers");
+            return;
+        }
     };
     for record in records {
+        #[cfg(unix)]
+        {
+            let tracked = match worker_registry::cleanup_dead_orphan_tracking(&record) {
+                Ok(worker_registry::OrphanTracking::Reclaimed) => continue,
+                Ok(worker_registry::OrphanTracking::Untracked) => false,
+                Ok(worker_registry::OrphanTracking::Pending) => true,
+                Err(error) => {
+                    tracing::warn!(target: "acp.supervisor", session = %record.session_id, error = %error, "cannot reclaim orphan tracking");
+                    continue;
+                }
+            };
+            if tracked
+                && state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .any(|row| row.id == record.session_id)
+            {
+                continue;
+            }
+        }
         if live.contains(&record.session_id)
             || state.acp_supervisor.is_owned(&record.session_id).await
         {
             continue;
         }
-        tracing::info!(
-            target: "acp.supervisor",
-            session = %record.session_id,
-            pid = record.pid,
-            "sweeping orphan worker (no matching session on disk)"
-        );
-        #[cfg(unix)]
-        let (session_id, pid) = (record.session_id.clone(), record.pid);
+        tracing::info!(target: "acp.supervisor", session = %record.session_id, pid = record.pid, "sweeping orphan worker (no matching session on disk)");
         #[cfg(unix)]
         tokio::spawn(async move {
-            if let Err(error) =
-                crate::process::worker_registry::terminate_orphan_and_confirm_stopped(record).await
+            if let Err(error) = worker_registry::terminate_orphan_and_confirm_stopped(&record).await
             {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %session_id,
-                    pid,
-                    error = %error,
-                    "orphan runner exit could not be confirmed; retaining its registry record"
-                );
+                tracing::warn!(target: "acp.supervisor", session = %record.session_id, pid = record.pid, error = %error, "orphan runner exit could not be confirmed; retaining stop evidence");
             }
         });
         #[cfg(not(unix))]
-        crate::process::worker_registry::delete(&record.session_id).ok();
+        worker_registry::delete(&record.session_id).ok();
     }
 }
 

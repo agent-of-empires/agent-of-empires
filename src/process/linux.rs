@@ -6,6 +6,81 @@ use std::fs;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+pub(super) fn kernel_process_state(pid: u32) -> anyhow::Result<Option<super::KernelProcessState>> {
+    use anyhow::Context as _;
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let (_, tail) = stat
+        .rsplit_once(')')
+        .context("malformed kernel process stat")?;
+    let mut fields = tail.split_whitespace();
+    let state = fields
+        .next()
+        .context("kernel process state absent")?
+        .as_bytes();
+    anyhow::ensure!(
+        state.len() == 1 && state[0].is_ascii_alphabetic(),
+        "invalid kernel process state"
+    );
+    let group = fields
+        .nth(1)
+        .context("kernel process group absent")?
+        .parse()?;
+    let start_id = fields
+        .nth(16)
+        .context("kernel process birth absent")?
+        .parse()?;
+    Ok(Some(super::KernelProcessState {
+        start_id,
+        group,
+        writing: state[0] != b'Z',
+    }))
+}
+
+pub(super) fn group_has_writers(group: u32) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    let mounts = fs::read_to_string("/proc/self/mountinfo")?;
+    let mount = mounts
+        .lines()
+        .find(|line| line.split_whitespace().nth(4) == Some("/proc"))
+        .context("process namespace mount identity unavailable")?;
+    let (vfs, filesystem) = mount.split_once(" - ").context("invalid process mount")?;
+    anyhow::ensure!(
+        filesystem.split_whitespace().next() == Some("proc"),
+        "process mount is not procfs"
+    );
+    for options in [
+        vfs.split_whitespace().nth(5),
+        filesystem.split_whitespace().nth(2),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        anyhow::ensure!(
+            !options
+                .split(',')
+                .any(|option| option.starts_with("hidepid=") && option != "hidepid=0"),
+            "process namespace hides group members"
+        );
+    }
+    for item in fs::read_dir("/proc")? {
+        let item = item?;
+        let name = item.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        if let Some(state) = kernel_process_state(pid)? {
+            if state.group == group && state.writing {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };

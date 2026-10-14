@@ -26,6 +26,7 @@ mod lifecycle_reservation;
 pub mod mcp;
 mod move_journal;
 pub mod poller;
+pub(crate) mod profile_rename;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod restart;
@@ -328,6 +329,11 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     } else {
         profile
     };
+    let _transition = storage::acquire_storage_shared_flock(
+        &base,
+        crate::migrations::v027_isolate_sandbox_stores::LOCK,
+    )?;
+    profile_rename::ensure_profile_available(profile_name)?;
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
         // Only a name about to be created runs the strict grammar; an existing directory still
@@ -597,6 +603,11 @@ pub fn delete_profile(name: &str) -> Result<()> {
 
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
+    let _transition = storage::acquire_storage_shared_flock(
+        &base,
+        crate::migrations::v027_isolate_sandbox_stores::LOCK,
+    )?;
+    profile_rename::ensure_profile_available(name)?;
 
     if !profile_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", name);
@@ -617,28 +628,7 @@ pub fn delete_profile(name: &str) -> Result<()> {
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     validate_profile_name(old_name)?;
     validate_new_profile_name(new_name)?;
-
-    let base = get_app_dir()?;
-    let old_dir = base.join("profiles").join(old_name);
-    let new_dir = base.join("profiles").join(new_name);
-
-    if !old_dir.exists() {
-        anyhow::bail!("Profile '{}' does not exist", old_name);
-    }
-    if new_dir.exists() {
-        anyhow::bail!("Profile '{}' already exists", new_name);
-    }
-
-    fs::rename(&old_dir, &new_dir)?;
-
-    // Update default profile if the renamed profile was the default
-    if let Some(config) = load_config()? {
-        if config.default_profile == old_name {
-            set_default_profile(new_name)?;
-        }
-    }
-
-    Ok(())
+    profile_rename::rename(old_name, new_name)
 }
 
 pub fn set_default_profile(name: &str) -> Result<()> {

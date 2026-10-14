@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -136,23 +135,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         "structured view runner starting"
     );
 
-    // Bind before spawning so the daemon's post-spawn connect cannot race the listener.
-    let control_socket = crate::process::worker::control_socket_sibling(&args.socket);
-    if let Some(parent) = args.socket.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating socket dir {}", parent.display()))?;
-    }
-    if control_socket.exists() {
-        let _ = std::fs::remove_file(&control_socket);
-    }
-    let control_listener = UnixListener::bind(&control_socket)
-        .with_context(|| format!("bind {}", control_socket.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&control_socket, std::fs::Permissions::from_mode(0o600));
-    }
-
-    // Save the record before spawning so a save failure has no agent tree to leak.
+    // Publish before spawning so a failed publication cannot leak an agent tree.
     let our_pid = std::process::id();
     let record = WorkerRecord::new(
         args.session_id.clone(),
@@ -172,10 +155,8 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     )
     .with_generation(args.generation);
-    if let Err(e) = worker_registry::save(&record).context("writing registry record") {
-        let _ = std::fs::remove_file(&control_socket);
-        return Err(e);
-    }
+    let (control_listener, profile_guard) = worker_registry::publish_runner(&record)
+        .context("publishing runner listener and record")?;
 
     let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
         Ok(handles) => handles,
@@ -184,6 +165,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             return Err(e).with_context(|| format!("spawning agent {:?}", args.agent_argv));
         }
     };
+    drop(profile_guard);
     let agent_started_at = std::time::Instant::now();
 
     // Drain stderr so the child cannot block on a full pipe.

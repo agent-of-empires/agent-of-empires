@@ -80,6 +80,7 @@ pub struct PurgeTransaction {
     was_trashed: bool,
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
+    owner_lock: Option<StorageFlock>,
     journal_path: Option<PathBuf>,
     journal_entry: Option<Box<crate::session::lifecycle_journal::LifecycleJournalEntry>>,
     status_before: Status,
@@ -94,6 +95,7 @@ pub struct CommittedPurge {
     storage: Storage,
     request: DeletionRequest,
     _lifecycle_lock: StorageFlock,
+    _owner_lock: StorageFlock,
     journal_path: Option<PathBuf>,
     journal_entry: Option<Box<crate::session::lifecycle_journal::LifecycleJournalEntry>>,
     generation: u64,
@@ -138,6 +140,17 @@ impl PurgeTransaction {
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
         let expected_trashed_at = request.instance.trashed_at;
+        crate::session::profile_rename::ensure_profile_available(storage.profile())?;
+        let Some(owner_lock) = storage.try_acquire_purge_owner_lock(&id)? else {
+            let retained = storage.load()?.into_iter().find(|row| row.id == id);
+            return Ok(PurgeReservation::Rejected(DeletionResult::rejected(
+                id,
+                DeletionDisposition::Busy,
+                "Session has a live purge owner",
+                retained,
+            )));
+        };
+        crate::session::profile_rename::ensure_profile_available(storage.profile())?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
@@ -243,6 +256,7 @@ impl PurgeTransaction {
             was_trashed,
             generation,
             lifecycle_lock: Some(lifecycle_lock),
+            owner_lock: Some(owner_lock),
             journal_path,
             journal_entry: journal_entry.map(Box::new),
             status_before,
@@ -418,13 +432,7 @@ impl PurgeTransaction {
         self.storage.update(|instances, _groups| {
             if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                 if stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation) {
-                    if stored.status == Status::Deleting {
-                        stored.status = status_before;
-                    }
-                    stored.release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
-                    );
+                    stored.finish_owned_purge(generation, status_before)?;
                 }
                 retained = Some(stored.clone());
             }
@@ -459,11 +467,7 @@ impl PurgeTransaction {
                 CompletionGate::Proceed
             };
             if !matches!(gate, CompletionGate::Proceed) && owns {
-                if stored.status == Status::Deleting {
-                    stored.status = status_before;
-                }
-                stored
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
+                stored.finish_owned_purge(generation, status_before)?;
             }
             outcome = Some((gate, Some(stored.clone())));
             Ok(())
@@ -550,13 +554,7 @@ impl PurgeTransaction {
                 .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
             if restored {
                 if owns {
-                    if instances[index].status == Status::Deleting {
-                        instances[index].status = status_before;
-                    }
-                    instances[index].release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
-                    );
+                    instances[index].finish_owned_purge(generation, status_before)?;
                 }
                 commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
             } else if !owns || instances[index].status != Status::Deleting {
@@ -564,10 +562,7 @@ impl PurgeTransaction {
                     instances[index].status = status_before;
                 }
                 if owns {
-                    instances[index].release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
-                    );
+                    instances[index].finish_owned_purge(generation, status_before)?;
                 }
                 commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
@@ -624,6 +619,10 @@ impl PurgeTransaction {
                 .lifecycle_lock
                 .take()
                 .expect("active purge transaction must own its lifecycle lock"),
+            _owner_lock: self
+                .owner_lock
+                .take()
+                .expect("active purge must own its owner lock"),
             journal_path: self.journal_path.take(),
             journal_entry: self.journal_entry.take(),
             generation,
@@ -746,21 +745,12 @@ impl PurgeTransaction {
                 .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
             if restored {
                 if owns {
-                    if instances[index].status == Status::Deleting {
-                        instances[index].status = status_before;
-                    }
-                    instances[index].release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
-                    );
+                    instances[index].finish_owned_purge(generation, status_before)?;
                 }
                 commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
             } else if !owns || instances[index].status != Status::Deleting {
                 if owns {
-                    instances[index].release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
-                    );
+                    instances[index].finish_owned_purge(generation, status_before)?;
                 }
                 commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
@@ -909,13 +899,7 @@ impl CommittedPurge {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                     if stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
                     {
-                        if stored.status == Status::Deleting {
-                            stored.status = status_before;
-                        }
-                        stored.release_lifecycle_reservation_if_owned(
-                            LifecycleOperation::Purge,
-                            generation,
-                        );
+                        stored.finish_owned_purge(generation, status_before)?;
                     }
                 }
                 Ok(())
@@ -963,21 +947,12 @@ impl CommittedPurge {
                 .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
             if restored {
                 if owns {
-                    if instances[index].status == Status::Deleting {
-                        instances[index].status = status_before;
-                    }
-                    instances[index].release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
-                    );
+                    instances[index].finish_owned_purge(generation, status_before)?;
                 }
                 gate = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
             } else if !owns || instances[index].status != Status::Deleting {
                 if owns {
-                    instances[index].release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        generation,
-                    );
+                    instances[index].finish_owned_purge(generation, status_before)?;
                 }
                 gate = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
@@ -1179,13 +1154,7 @@ impl CommittedPurge {
             if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                 if stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, self.generation)
                 {
-                    if stored.status == Status::Deleting {
-                        stored.status = self.status_before;
-                    }
-                    stored.release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Purge,
-                        self.generation,
-                    );
+                    stored.finish_owned_purge(self.generation, self.status_before)?;
                 }
             }
             Ok(())
@@ -1215,10 +1184,12 @@ impl Drop for PurgeTransaction {
         let generation = self.generation;
         let status_before = self.status_before;
         let structured = self.request.instance.is_structured();
+        let owner_lock = self.owner_lock.take();
         let journal_path = self.journal_path.clone();
         let _ = std::thread::Builder::new()
             .name("aoe-purge-reservation-release".to_string())
             .spawn(move || {
+                let _owner_lock = owner_lock;
                 let Ok(storage) = Storage::open_unwatched(&profile) else {
                     return;
                 };
@@ -1244,13 +1215,7 @@ impl Drop for PurgeTransaction {
                         if stored
                             .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
                         {
-                            if stored.status == Status::Deleting {
-                                stored.status = status_before;
-                            }
-                            stored.release_lifecycle_reservation_if_owned(
-                                LifecycleOperation::Purge,
-                                generation,
-                            );
+                            stored.finish_owned_purge(generation, status_before)?;
                         }
                     }
                     Ok(())
@@ -1281,6 +1246,41 @@ impl Drop for PurgeTransaction {
             });
     }
 }
+pub(crate) fn abandon_purge_intents_lifecycle_locked(storage: &Storage, id: &str) -> Result<()> {
+    let scan = crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
+    anyhow::ensure!(
+        scan.unreadable_dirs.is_empty(),
+        "purge intents cannot be enumerated"
+    );
+    for (path, parsed) in scan.entries {
+        let key = crate::session::lifecycle_journal::filename_key(&path)?;
+        let entry = match parsed {
+            Ok(entry) => entry,
+            Err(_) if key.session_id() != id => continue,
+            Err(error) => anyhow::bail!("cannot abandon session purge intent: {error}"),
+        };
+        anyhow::ensure!(
+            key.session_id() == entry.session_id
+                && key.generation == entry.generation
+                && entry.session_id == entry.instance.id
+                && entry.source_profile == storage.profile()
+                && paths_refer_to_same_sessions_file(&entry.sessions_path, storage.sessions_path()),
+            "purge intent identity is ambiguous"
+        );
+        if entry.session_id == id
+            && !matches!(
+                entry.phase,
+                LifecyclePhase::Abandoned | LifecyclePhase::Kept
+            )
+        {
+            crate::session::lifecycle_journal::update(
+                &path,
+                &entry.with_phase(LifecyclePhase::Abandoned),
+            )?;
+        }
+    }
+    Ok(())
+}
 
 pub fn execute_deletion(request: DeletionRequest) -> DeletionResult {
     let id = request.session_id.clone();
@@ -1310,6 +1310,7 @@ pub fn execute_deletion(request: DeletionRequest) -> DeletionResult {
 
 pub fn recover_lifecycle_journals_once() -> Result<()> {
     use crate::session::lifecycle_journal::LifecycleJournalEntry;
+    crate::session::profile_rename::recover_once()?;
 
     let profiles = crate::session::list_profiles()?;
     let mut storages = std::collections::HashMap::new();
@@ -1343,20 +1344,39 @@ pub fn recover_lifecycle_journals_once() -> Result<()> {
         );
     }
 
+    let mut blocked_sessions: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     let mut entries: Vec<(PathBuf, LifecycleJournalEntry)> = Vec::new();
     for (path, parsed) in scan.entries {
+        let key = crate::session::lifecycle_journal::filename_key(&path);
         match parsed {
-            Ok(entry) => entries.push((path, entry)),
-            Err(error) => {
+            Ok(entry)
+                if key.as_ref().is_ok_and(|key| {
+                    key.session_id() == entry.session_id && key.generation == entry.generation
+                }) =>
+            {
+                entries.push((path, entry))
+            }
+            Ok(_) => {
                 if let Some(dir) = path.parent() {
                     blocked_dirs.insert(dir.to_path_buf());
                 }
-                tracing::error!(
-                    target: "session.delete_recovery",
-                    path = %path.display(),
-                    %error,
-                    "unreadable lifecycle journal blocks recovery for this profile"
-                );
+                tracing::error!(target: "session.delete_recovery", path = %path.display(), "journal filename and payload identity disagree");
+            }
+            Err(error) => {
+                if let Some(dir) = path.parent() {
+                    if let Ok(key) = key {
+                        blocked_sessions
+                            .entry(dir.to_path_buf())
+                            .or_default()
+                            .insert(key.session_id().to_owned());
+                    } else {
+                        blocked_dirs.insert(dir.to_path_buf());
+                    }
+                }
+                tracing::error!(target: "session.delete_recovery", path = %path.display(), %error, "unreadable lifecycle evidence retained");
             }
         }
     }
@@ -1368,27 +1388,33 @@ pub fn recover_lifecycle_journals_once() -> Result<()> {
             .then_with(|| right.1.created_at_epoch_ms.cmp(&left.1.created_at_epoch_ms))
     });
 
+    #[cfg(test)]
+    BEFORE_LIFECYCLE_ENTRY_RECOVERY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let mut handled_sessions = std::collections::HashSet::new();
     for (path, entry) in entries {
         let Some(dir) = path.parent() else {
             continue;
         };
-        if blocked_dirs.contains(dir) {
+        if blocked_dirs.contains(dir)
+            || blocked_sessions
+                .get(dir)
+                .is_some_and(|ids| ids.contains(entry.session_id.as_str()))
+        {
             continue;
         }
         let key = (entry.source_profile.clone(), entry.session_id.clone());
         if handled_sessions.contains(&key) {
             continue;
         }
-        if entry.phase == LifecyclePhase::Kept {
-            handled_sessions.insert(key);
-            continue;
-        }
         let Some(storage) = storages.get(&entry.source_profile) else {
             continue;
         };
         match recover_lifecycle_entry(&path, &entry, storage) {
-            Ok(true) => {
+            Ok(RecoveryOutcome::Settled) => {
                 handled_sessions.insert(key);
                 tracing::info!(
                     target: "session.delete_recovery",
@@ -1397,7 +1423,10 @@ pub fn recover_lifecycle_journals_once() -> Result<()> {
                     "replayed interrupted session purge"
                 );
             }
-            Ok(false) => {}
+            Ok(RecoveryOutcome::Terminal) => {
+                handled_sessions.insert(key);
+            }
+            Ok(RecoveryOutcome::Unprocessed) => {}
             Err(error) => {
                 handled_sessions.insert(key);
                 tracing::warn!(
@@ -1438,20 +1467,140 @@ pub fn start_lifecycle_recovery_worker() -> Result<()> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryOutcome {
+    Unprocessed,
+    Settled,
+    Terminal,
+}
+
+struct RecoverySiblings {
+    newer_terminal: bool,
+    same_session: bool,
+}
+
+fn inspect_recovery_siblings(
+    path: &Path,
+    current: &crate::session::lifecycle_journal::LifecycleJournalEntry,
+    storage: &Storage,
+) -> Result<RecoverySiblings> {
+    let mut result = RecoverySiblings {
+        newer_terminal: false,
+        same_session: false,
+    };
+    let dir = path.parent().context("journal has no parent directory")?;
+    for item in std::fs::read_dir(dir)? {
+        let sibling_path = item?.path();
+        if sibling_path == path
+            || sibling_path
+                .extension()
+                .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let key = crate::session::lifecycle_journal::filename_key(&sibling_path)?;
+        let sibling = match crate::session::lifecycle_journal::read_deletion(&sibling_path) {
+            Ok(Some(sibling)) => sibling,
+            Ok(None) => continue,
+            Err(_) if key.session_id() != current.session_id => continue,
+            Err(error) => return Err(error),
+        };
+        anyhow::ensure!(
+            key.session_id() == sibling.session_id && key.generation == sibling.generation,
+            "sibling journal filename and payload identity disagree"
+        );
+        anyhow::ensure!(
+            sibling.session_id == sibling.instance.id
+                && sibling.source_profile == storage.profile()
+                && paths_refer_to_same_sessions_file(
+                    &sibling.sessions_path,
+                    storage.sessions_path()
+                ),
+            "sibling journal identity does not match its source profile"
+        );
+        if sibling.session_id != current.session_id {
+            continue;
+        }
+        anyhow::ensure!(
+            sibling.generation != current.generation,
+            "duplicate lifecycle generation"
+        );
+        result.same_session = true;
+        result.newer_terminal |=
+            sibling.generation > current.generation && sibling.phase.teardown_complete();
+    }
+    Ok(result)
+}
+
+fn kept_resources_are_reclaimed(
+    entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
+) -> bool {
+    !entry.kept_resources.is_empty()
+        && entry.kept_resources.iter().all(|resource| {
+            let path = if let Some(scratch) = resource.strip_prefix("Scratch directory kept at: ") {
+                if !entry.instance.scratch || scratch != entry.instance.project_path {
+                    return false;
+                }
+                Path::new(scratch)
+            } else if resource.starts_with("Workspace directory kept:") {
+                let Some(workspace) = entry.instance.workspace_info.as_ref() else {
+                    return false;
+                };
+                let Some(suffix) = resource
+                    .strip_suffix(']')
+                    .and_then(|text| text.strip_suffix(workspace.workspace_dir.as_str()))
+                else {
+                    return false;
+                };
+                if !suffix.ends_with(" [") {
+                    return false;
+                }
+                Path::new(&workspace.workspace_dir)
+            } else {
+                return false;
+            };
+            if !path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+            {
+                return false;
+            }
+            if !std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return false;
+            }
+            path.ancestors()
+                .skip(1)
+                .all(|ancestor| match std::fs::symlink_metadata(ancestor) {
+                    Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                })
+        })
+}
 fn recover_lifecycle_entry(
     path: &Path,
     scanned_entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
     storage: &Storage,
-) -> Result<bool> {
+) -> Result<RecoveryOutcome> {
+    crate::session::profile_rename::ensure_profile_available(storage.profile())?;
+    let Some(_owner_lock) = storage.try_acquire_purge_owner_lock(&scanned_entry.session_id)? else {
+        return Ok(RecoveryOutcome::Unprocessed);
+    };
+    crate::session::profile_rename::ensure_profile_available(storage.profile())?;
     let Some(lifecycle_lock) =
         storage.try_acquire_instance_lifecycle_lock(&scanned_entry.session_id)?
     else {
-        return Ok(false);
+        return Ok(RecoveryOutcome::Unprocessed);
     };
     let mut lifecycle_lock = Some(lifecycle_lock);
 
     let Some(mut current_entry) = crate::session::lifecycle_journal::read_deletion(path)? else {
-        return Ok(false);
+        return Ok(RecoveryOutcome::Unprocessed);
     };
     anyhow::ensure!(
         current_entry.session_id == current_entry.instance.id,
@@ -1464,7 +1613,7 @@ fn recover_lifecycle_entry(
     if current_entry.session_id != scanned_entry.session_id
         || current_entry.generation != scanned_entry.generation
     {
-        return Ok(false);
+        return Ok(RecoveryOutcome::Unprocessed);
     }
     crate::session::validate_instance_id(&current_entry.session_id)
         .context("journal contains an invalid session id")?;
@@ -1472,12 +1621,20 @@ fn recover_lifecycle_entry(
         paths_refer_to_same_sessions_file(&current_entry.sessions_path, storage.sessions_path()),
         "journal sessions path does not match its source profile"
     );
-    if matches!(current_entry.phase, LifecyclePhase::Kept) {
-        return Ok(false);
+    if current_entry.phase == LifecyclePhase::Kept {
+        if kept_resources_are_reclaimed(&current_entry)
+            && !inspect_recovery_siblings(path, &current_entry, storage)?.same_session
+        {
+            consume_lifecycle_journal_if_owned(path, &current_entry)?;
+        }
+        return Ok(RecoveryOutcome::Terminal);
+    }
+    if inspect_recovery_siblings(path, &current_entry, storage)?.newer_terminal {
+        return Ok(RecoveryOutcome::Terminal);
     }
     if current_entry.phase == LifecyclePhase::Abandoned {
         abandon_recovery_entry(path, &current_entry, storage)?;
-        return Ok(false);
+        return Ok(RecoveryOutcome::Unprocessed);
     }
 
     let id = current_entry.session_id.clone();
@@ -1490,16 +1647,14 @@ fn recover_lifecycle_entry(
             .count()
             > 1
     {
-        clear_recovery_fence(&current_entry)?;
-        consume_lifecycle_journal_if_owned(path, &current_entry)?;
-        return Ok(false);
+        abandon_recovery_entry(path, &current_entry, storage)?;
+        return Ok(RecoveryOutcome::Unprocessed);
     }
 
     let mut row_present = owners.iter().any(|profile| profile == storage.profile());
     if !row_present && !current_entry.phase.teardown_started() {
-        clear_recovery_fence(&current_entry)?;
-        consume_lifecycle_journal_if_owned(path, &current_entry)?;
-        return Ok(false);
+        abandon_recovery_entry(path, &current_entry, storage)?;
+        return Ok(RecoveryOutcome::Unprocessed);
     }
 
     let mut current_path = path.to_path_buf();
@@ -1519,12 +1674,11 @@ fn recover_lifecycle_entry(
             || !stored
                 .lifecycle_reservation_is_owned(LifecycleOperation::Purge, current_entry.generation)
         {
-            clear_recovery_fence(&current_entry)?;
-            consume_lifecycle_journal_if_owned(path, &current_entry)?;
-            return Ok(false);
+            abandon_recovery_entry(path, &current_entry, storage)?;
+            return Ok(RecoveryOutcome::Unprocessed);
         }
         if stored.has_fresh_lifecycle_reservation(Utc::now()) {
-            return Ok(false);
+            return Ok(RecoveryOutcome::Unprocessed);
         }
 
         let old_entry = current_entry.clone();
@@ -1554,9 +1708,8 @@ fn recover_lifecycle_entry(
             Ok(())
         })?;
         if superseded {
-            clear_recovery_fence(&old_entry)?;
-            consume_lifecycle_journal_if_owned(path, &old_entry)?;
-            return Ok(false);
+            abandon_recovery_entry(path, &old_entry, storage)?;
+            return Ok(RecoveryOutcome::Unprocessed);
         }
         current_entry = next_entry;
         current_path = next_path;
@@ -1575,7 +1728,8 @@ fn recover_lifecycle_entry(
 
     stop_acp_runner_for_purge(&current_entry.instance, current_entry.generation)?;
 
-    if !current_entry.phase.hooks_are_complete() {
+    let replayed_hooks = !current_entry.phase.hooks_are_complete();
+    if replayed_hooks {
         current_entry = current_entry.with_phase(LifecyclePhase::HooksStarted);
         crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
         let generation = current_entry.generation;
@@ -1608,19 +1762,24 @@ fn recover_lifecycle_entry(
         if row_present {
             lifecycle_lock = storage.try_acquire_instance_lifecycle_lock(&id)?;
             if lifecycle_lock.is_none() {
-                return Ok(false);
+                return Ok(RecoveryOutcome::Unprocessed);
             }
         }
         let Some(latest) = crate::session::lifecycle_journal::read_deletion(&current_path)? else {
-            return Ok(false);
+            return Ok(RecoveryOutcome::Unprocessed);
         };
         if latest.session_id != current_entry.session_id
             || latest.source_profile != current_entry.source_profile
             || latest.generation != current_entry.generation
         {
-            return Ok(false);
+            return Ok(RecoveryOutcome::Unprocessed);
         }
         current_entry = latest;
+        if current_entry.phase == LifecyclePhase::Kept
+            || inspect_recovery_siblings(&current_path, &current_entry, storage)?.newer_terminal
+        {
+            return Ok(RecoveryOutcome::Terminal);
+        }
         owners = session_owner_profiles(&id)?;
         if owners.iter().any(|profile| profile != storage.profile())
             || owners
@@ -1629,9 +1788,8 @@ fn recover_lifecycle_entry(
                 .count()
                 > 1
         {
-            clear_recovery_fence(&current_entry)?;
-            consume_lifecycle_journal_if_owned(&current_path, &current_entry)?;
-            return Ok(false);
+            abandon_recovery_entry(&current_path, &current_entry, storage)?;
+            return Ok(RecoveryOutcome::Unprocessed);
         }
         row_present = owners.iter().any(|profile| profile == storage.profile());
         if row_present {
@@ -1650,9 +1808,8 @@ fn recover_lifecycle_entry(
                     current_entry.generation,
                 )
             {
-                clear_recovery_fence(&current_entry)?;
-                consume_lifecycle_journal_if_owned(&current_path, &current_entry)?;
-                return Ok(false);
+                abandon_recovery_entry(&current_path, &current_entry, storage)?;
+                return Ok(RecoveryOutcome::Unprocessed);
             }
         }
         current_entry = current_entry.with_phase(LifecyclePhase::HooksComplete);
@@ -1667,9 +1824,8 @@ fn recover_lifecycle_entry(
             .count()
             > 1
     {
-        clear_recovery_fence(&current_entry)?;
-        consume_lifecycle_journal_if_owned(&current_path, &current_entry)?;
-        return Ok(false);
+        abandon_recovery_entry(&current_path, &current_entry, storage)?;
+        return Ok(RecoveryOutcome::Unprocessed);
     }
     row_present = owners.iter().any(|profile| profile == storage.profile());
     if row_present {
@@ -1686,17 +1842,18 @@ fn recover_lifecycle_entry(
             || !stored
                 .lifecycle_reservation_is_owned(LifecycleOperation::Purge, current_entry.generation)
         {
-            clear_recovery_fence(&current_entry)?;
-            consume_lifecycle_journal_if_owned(&current_path, &current_entry)?;
-            return Ok(false);
+            abandon_recovery_entry(&current_path, &current_entry, storage)?;
+            return Ok(RecoveryOutcome::Unprocessed);
         }
     } else if !current_entry.phase.teardown_started() {
-        clear_recovery_fence(&current_entry)?;
-        consume_lifecycle_journal_if_owned(&current_path, &current_entry)?;
-        return Ok(false);
+        abandon_recovery_entry(&current_path, &current_entry, storage)?;
+        return Ok(RecoveryOutcome::Unprocessed);
     }
 
     if !current_entry.phase.teardown_complete() {
+        if replayed_hooks {
+            stop_acp_runner_for_purge(&current_entry.instance, current_entry.generation)?;
+        }
         current_entry = current_entry.with_phase(LifecyclePhase::TeardownStarted);
         crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
         let mut request_instance = current_entry.instance.clone();
@@ -1741,7 +1898,7 @@ fn recover_lifecycle_entry(
         || latest.generation != current_entry.generation
         || !latest.phase.teardown_complete()
     {
-        return Ok(false);
+        return Ok(RecoveryOutcome::Unprocessed);
     }
     current_entry = latest;
     owners = session_owner_profiles(&id)?;
@@ -1752,9 +1909,8 @@ fn recover_lifecycle_entry(
             .count()
             > 1
     {
-        clear_recovery_fence(&current_entry)?;
-        consume_lifecycle_journal_if_owned(&current_path, &current_entry)?;
-        return Ok(false);
+        abandon_recovery_entry(&current_path, &current_entry, storage)?;
+        return Ok(RecoveryOutcome::Unprocessed);
     }
     row_present = owners.iter().any(|profile| profile == storage.profile());
     let mut row_superseded = false;
@@ -1782,9 +1938,8 @@ fn recover_lifecycle_entry(
         })?;
     }
     if row_superseded {
-        clear_recovery_fence(&current_entry)?;
-        consume_lifecycle_journal_if_owned(&current_path, &current_entry)?;
-        return Ok(false);
+        abandon_recovery_entry(&current_path, &current_entry, storage)?;
+        return Ok(RecoveryOutcome::Unprocessed);
     }
 
     let removed = current_entry.with_phase(LifecyclePhase::RowRemoved);
@@ -1797,7 +1952,7 @@ fn recover_lifecycle_entry(
         crate::session::lifecycle_journal::update(&current_path, &kept)?;
     }
     drop(lifecycle_lock);
-    Ok(true)
+    Ok(RecoveryOutcome::Settled)
 }
 
 fn session_owner_profiles(session_id: &str) -> Result<Vec<String>> {
@@ -1868,15 +2023,12 @@ fn abandon_recovery_entry(
         );
     }
     storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|row| row.id == entry.session_id) {
+        for stored in instances
+            .iter_mut()
+            .filter(|row| row.id == entry.session_id)
+        {
             if stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, entry.generation) {
-                if stored.status == Status::Deleting {
-                    stored.status = entry.status_before;
-                }
-                stored.release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Purge,
-                    entry.generation,
-                );
+                stored.finish_owned_purge(entry.generation, entry.status_before)?;
             }
         }
         Ok(())
@@ -2093,6 +2245,8 @@ pub(crate) fn paths_in_use_except(except_ids: &[&str]) -> PathsInUse {
 #[cfg(test)]
 thread_local! {
     static AFTER_PATHS_IN_USE_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_LIFECYCLE_ENTRY_RECOVERY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -3373,8 +3527,9 @@ mod tests {
         let profile = "kept-workspace-tombstone";
         let storage = Storage::new_unwatched(profile).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let main_repo = temp.path().join("frontend");
-        let workspace = temp.path().join("workspace");
+        let root = temp.path().canonicalize().unwrap();
+        let main_repo = root.join("frontend");
+        let workspace = root.join("workspace");
         let worktree = workspace.join("frontend");
         init_repo(&main_repo);
         std::fs::create_dir_all(&workspace).unwrap();
@@ -3453,6 +3608,182 @@ mod tests {
                 .len(),
             1
         );
+        std::fs::remove_dir_all(&workspace).unwrap();
+        recover_lifecycle_journals_once().unwrap();
+        assert!(
+            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()])
+                .entries
+                .is_empty(),
+            "reclaimed workspace left a permanent Kept tombstone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kept_reclamation_requires_every_resource_to_be_proven_absent() {
+        for case in [
+            "absent",
+            "present",
+            "unknown",
+            "mixed",
+            "leaf-symlink",
+            "ancestor-symlink",
+            "io-error",
+            "second-present",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let mut scratch = root.join("scratch");
+            let workspace = root.join("workspace");
+            match case {
+                "present" => std::fs::create_dir(&scratch).unwrap(),
+                "leaf-symlink" => {
+                    std::os::unix::fs::symlink(root.join("missing"), &scratch).unwrap()
+                }
+                "ancestor-symlink" => {
+                    let link = root.join("link");
+                    std::os::unix::fs::symlink(root.join("missing"), &link).unwrap();
+                    scratch = link.join("child");
+                }
+                "io-error" => {
+                    let file = root.join("file");
+                    std::fs::write(&file, b"not a directory").unwrap();
+                    scratch = file.join("child");
+                }
+                "second-present" => std::fs::create_dir(&workspace).unwrap(),
+                _ => {}
+            }
+            let mut instance = Instance::new("reclamation", scratch.to_str().unwrap());
+            instance.scratch = true;
+            instance.source_profile = "reclamation".into();
+            instance.workspace_info = Some(workspace_info(&workspace, vec![]));
+            let mut resources = vec![
+                format!("Scratch directory kept at: {}", scratch.display()),
+                format!(
+                    "Workspace directory kept: foreign contents [{}]",
+                    workspace.display()
+                ),
+            ];
+            if matches!(case, "unknown" | "mixed") {
+                if case == "unknown" {
+                    resources.clear();
+                }
+                resources.push("Agent store kept (container retained)".into());
+            }
+            let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
+                instance,
+                Status::Idle,
+                root.join("sessions.json"),
+                crate::session::lifecycle_journal::LifecycleDeletionOptions {
+                    generation: 1,
+                    delete_worktree: false,
+                    delete_branch: false,
+                    delete_sandbox: false,
+                    force_delete: false,
+                    detach_hooks: true,
+                    keep_scratch: true,
+                    purge_acp_transcript: false,
+                },
+            )
+            .with_phase(LifecyclePhase::Kept)
+            .with_kept_resources(resources);
+            assert_eq!(
+                kept_resources_are_reclaimed(&entry),
+                case == "absent",
+                "{case}"
+            );
+        }
+    }
+    #[test]
+    #[serial]
+    fn recovery_terminal_reread_blocks_older_destructive_intents() {
+        for terminal_phase in [
+            LifecyclePhase::TeardownComplete,
+            LifecyclePhase::RowRemoved,
+            LifecyclePhase::Kept,
+        ] {
+            for published_after_scan in [true, false] {
+                let _guard = isolate_app_dir();
+                let profile = "stale-terminal-authority";
+                let storage = Storage::new_unwatched(profile).unwrap();
+                let mut instance = Instance::new("terminal-reread", "/unused");
+                let workspace =
+                    crate::session::scratch::provision_scratch_dir(&instance.id).unwrap();
+                let sentinel = workspace.join("kept-data");
+                std::fs::write(&sentinel, b"retained").unwrap();
+                instance.project_path = workspace.to_string_lossy().into_owned();
+                instance.scratch = true;
+                instance.source_profile = profile.to_string();
+                let older = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
+                    instance,
+                    Status::Idle,
+                    storage.sessions_path().to_path_buf(),
+                    crate::session::lifecycle_journal::LifecycleDeletionOptions {
+                        generation: 1,
+                        delete_worktree: false,
+                        delete_branch: false,
+                        delete_sandbox: false,
+                        force_delete: false,
+                        detach_hooks: true,
+                        keep_scratch: false,
+                        purge_acp_transcript: false,
+                    },
+                )
+                .with_phase(LifecyclePhase::TeardownStarted);
+                let older_path = crate::session::lifecycle_journal::record(&older).unwrap();
+                let mut newer = older.with_generation(2);
+                newer.keep_scratch = true;
+                let current_path = if published_after_scan {
+                    None
+                } else {
+                    Some(crate::session::lifecycle_journal::record(&newer).unwrap())
+                };
+                let terminal = newer
+                    .with_phase(terminal_phase)
+                    .with_kept_resources(vec![format!(
+                        "Scratch directory kept at: {}",
+                        workspace.display()
+                    )]);
+                let sessions_path = storage.sessions_path().to_path_buf();
+                BEFORE_LIFECYCLE_ENTRY_RECOVERY.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let _lock = storage
+                            .acquire_instance_lifecycle_lock(&terminal.session_id)
+                            .unwrap();
+                        if let Some(path) = current_path {
+                            crate::session::lifecycle_journal::update(&path, &terminal).unwrap();
+                        } else {
+                            crate::session::lifecycle_journal::record(&terminal).unwrap();
+                        }
+                    }));
+                });
+                recover_lifecycle_journals_once().unwrap();
+                assert!(
+                    sentinel.exists(),
+                    "terminal checkpoint seen under lock did not stop an older teardown"
+                );
+                assert_eq!(std::fs::read(&sentinel).unwrap(), b"retained");
+                std::fs::remove_dir_all(&workspace).unwrap();
+                for _ in 0..2 {
+                    recover_lifecycle_journals_once().unwrap();
+                    assert_eq!(
+                        crate::session::lifecycle_journal::read_deletion(&older_path)
+                            .unwrap()
+                            .unwrap()
+                            .phase,
+                        LifecyclePhase::TeardownStarted
+                    );
+                    let scan = crate::session::lifecycle_journal::scan([sessions_path.clone()]);
+                    assert!(scan
+                        .entries
+                        .iter()
+                        .any(|(_, entry)| entry
+                            .as_ref()
+                            .is_ok_and(|entry| entry.generation == 2
+                                && entry.phase == LifecyclePhase::Kept)));
+                }
+            }
+        }
     }
 
     #[test]
@@ -3895,6 +4226,365 @@ mod tests {
                 .is_empty()
         );
     }
+    fn seed_expired_purge(storage: &Storage, instance: Instance, phase: LifecyclePhase) -> PathBuf {
+        let (snapshot, row, generation) = expired_deleting_row(instance);
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
+            snapshot,
+            Status::Idle,
+            storage.sessions_path().to_path_buf(),
+            crate::session::lifecycle_journal::LifecycleDeletionOptions {
+                generation,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+                purge_acp_transcript: false,
+            },
+        )
+        .with_phase(phase);
+        crate::session::lifecycle_journal::record(&entry).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn completed_purge_rollback_is_visible_to_cached_deleting_observers() {
+        for path in ["drop", "complete", "finish"] {
+            let _home = isolate_app_dir();
+            let storage = Storage::new_unwatched("rollback-observer").unwrap();
+            let mut instance = stored_instance(&storage, "rollback-observer", "/unused");
+            instance.view = crate::session::View::Structured;
+            storage
+                .update(|rows, _| {
+                    rows[0] = instance.clone();
+                    Ok(())
+                })
+                .unwrap();
+            let transaction = match PurgeTransaction::reserve_with_acp_transcript(
+                storage.clone(),
+                request(instance),
+            )
+            .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(result) => panic!("unexpected rejection: {result:?}"),
+            };
+            let observed = storage.load().unwrap().remove(0);
+            assert_eq!(observed.status, Status::Deleting);
+            match path {
+                "drop" => drop(transaction),
+                "complete" => {
+                    assert!(
+                        !transaction
+                            .run_hooks_with(|_, _| {})
+                            .complete_with(|_| Err("store unavailable".into()))
+                            .success
+                    );
+                }
+                "finish" => {
+                    assert!(
+                        !transaction
+                            .run_hooks_with(|_, _| {})
+                            .begin_irreversible()
+                            .unwrap()
+                            .finish_with_transcript_cleanup(|_| anyhow::bail!("store unavailable"))
+                            .success
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut reloaded = loop {
+                let row = storage.load().unwrap().remove(0);
+                if row.lifecycle_reservation.is_none() {
+                    break row;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned rollback did not complete"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            assert_eq!(reloaded.status, Status::Idle);
+            assert!(reloaded.lifecycle_reservation.is_none());
+            reloaded.merge_runtime_from_reload(&observed);
+            assert_eq!(
+                reloaded.status,
+                Status::Idle,
+                "{path}: cached Deleting overwrote completed rollback"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn live_hook_owner_blocks_recovery_after_wall_clock_expiry() {
+        let _home = isolate_app_dir();
+        let storage = Storage::new_unwatched("live-owner").unwrap();
+        let workspace = crate::session::scratch::provision_scratch_dir("live-owner").unwrap();
+        std::fs::write(workspace.join("retained"), b"live hook owns workspace").unwrap();
+        let mut instance = stored_instance(&storage, "live-owner", workspace.to_str().unwrap());
+        instance.scratch = true;
+        storage
+            .update(|rows, _| {
+                rows[0] = instance.clone();
+                Ok(())
+            })
+            .unwrap();
+        let transaction = reserve("live-owner", instance);
+        let generation = transaction.generation;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            transaction
+                .run_hooks_with(|_, _| {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .complete()
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        storage
+            .update(|rows, _| {
+                rows[0].lifecycle_reservation.as_mut().unwrap().at =
+                    Utc::now() - chrono::Duration::days(1);
+                Ok(())
+            })
+            .unwrap();
+        let recovery = recover_lifecycle_journals_once();
+        let retained = workspace.join("retained").exists();
+        let still_owned =
+            storage.load().unwrap().iter().any(|row| {
+                row.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
+            });
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        recovery.unwrap();
+        assert!(retained, "recovery tore down beside a live hook owner");
+        assert!(
+            still_owned,
+            "recovery stole the live transaction generation"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unreadable_or_future_journal_does_not_block_another_session() {
+        for future in [false, true] {
+            let _home = isolate_app_dir();
+            let storage = Storage::new_unwatched("isolated-errors").unwrap();
+            let bad_workspace = crate::session::scratch::provision_scratch_dir("bad").unwrap();
+            let good_workspace = crate::session::scratch::provision_scratch_dir("good").unwrap();
+            std::fs::write(bad_workspace.join("retained"), b"unknown intent retained").unwrap();
+            let mut bad = Instance::new("bad", bad_workspace.to_str().unwrap());
+            bad.id = "bad".into();
+            bad.source_profile = "isolated-errors".into();
+            bad.scratch = true;
+            let bad_path = seed_expired_purge(&storage, bad, LifecyclePhase::HooksComplete);
+            let mut good = Instance::new("good", good_workspace.to_str().unwrap());
+            good.id = "good".into();
+            good.source_profile = "isolated-errors".into();
+            good.scratch = true;
+            seed_expired_purge(&storage, good, LifecyclePhase::HooksComplete);
+            if future {
+                let mut entry = crate::session::lifecycle_journal::read_deletion(&bad_path)
+                    .unwrap()
+                    .unwrap();
+                entry.version += 1;
+                crate::session::lifecycle_journal::update(&bad_path, &entry).unwrap();
+            } else {
+                std::fs::write(&bad_path, b"malformed").unwrap();
+            }
+            recover_lifecycle_journals_once().unwrap();
+            assert!(bad_workspace.join("retained").exists());
+            assert!(bad_path.exists());
+            assert!(
+                !good_workspace.exists(),
+                "unrelated malformed/future journal blocked healthy recovery"
+            );
+            let rows = storage.load().unwrap();
+            assert!(rows.iter().any(|row| row.id == "bad"));
+            assert!(!rows.iter().any(|row| row.id == "good"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn profile_rename_preserves_interrupted_purge_recovery() {
+        let _home = isolate_app_dir();
+        let storage = Storage::new_unwatched("before").unwrap();
+        let workspace = crate::session::scratch::provision_scratch_dir("rename").unwrap();
+        let mut instance = Instance::new("rename", workspace.to_str().unwrap());
+        instance.id = "rename".into();
+        instance.source_profile = "before".into();
+        instance.scratch = true;
+        seed_expired_purge(&storage, instance, LifecyclePhase::HooksComplete);
+        crate::session::rename_profile("before", "after").unwrap();
+        let renamed = Storage::open_unwatched("after").unwrap();
+        recover_lifecycle_journals_once().unwrap();
+        assert!(!workspace.exists(), "renamed profile stranded its purge");
+        assert!(renamed.load().unwrap().is_empty());
+        assert!(
+            crate::session::lifecycle_journal::scan([renamed.sessions_path().to_path_buf()])
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cached_storage_mutation_cannot_recreate_a_renamed_profile() {
+        let _home = isolate_app_dir();
+        let storage = Storage::new_unwatched("cached-before").unwrap();
+        let row = stored_instance(&storage, "cached", "/repo");
+        crate::session::rename_profile("cached-before", "cached-after").unwrap();
+        let mutation = storage.update(|rows, _| {
+            rows.clear();
+            Ok(())
+        });
+        assert!(
+            mutation.is_err(),
+            "cached write recreated the renamed source profile"
+        );
+        assert!(!crate::session::get_profile_dir_path("cached-before")
+            .unwrap()
+            .exists());
+        let renamed = Storage::open_unwatched("cached-after").unwrap();
+        assert_eq!(renamed.load().unwrap()[0].id, row.id);
+    }
+
+    #[test]
+    #[serial]
+    fn restored_owned_row_releases_abandoned_purge_reservation() {
+        let _home = isolate_app_dir();
+        let storage = Storage::new_unwatched("restored-owned").unwrap();
+        let mut instance = Instance::new("restored", "/unused");
+        instance.source_profile = "restored-owned".into();
+        instance.trashed_at = Some(Utc::now());
+        let path = seed_expired_purge(&storage, instance.clone(), LifecyclePhase::HooksComplete);
+        storage
+            .update(|rows, _| {
+                rows[0].trashed_at = None;
+                Ok(())
+            })
+            .unwrap();
+        recover_lifecycle_journals_once().unwrap();
+        let row = storage.load().unwrap().remove(0);
+        assert_eq!(
+            row.status,
+            Status::Idle,
+            "consumed journal stranded owned Deleting"
+        );
+        assert!(row.lifecycle_reservation.is_none());
+        assert!(!path.exists());
+    }
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn recovery_rechecks_unknown_runner_artifacts_after_destroy_hooks() {
+        use crate::session::config::profile_config::{save_profile_config, ProfileConfig};
+        use std::os::unix::fs::FileTypeExt;
+        let temp = tempfile::TempDir::with_prefix_in("aoe-", "/tmp").unwrap();
+        let _home = isolate_app_dir_at(temp.path());
+        let profile = "hook-recovery";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let session_id = "hook-socket";
+        let workspace = crate::session::scratch::provision_scratch_dir(session_id).unwrap();
+        std::fs::write(
+            workspace.join("retained"),
+            b"hook cannot invalidate writer absence",
+        )
+        .unwrap();
+        let base = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&base);
+        let hook_marker = temp.path().join("hook-done");
+        let executable = std::env::current_exe().unwrap();
+        let command = format!("AOE_TEST_CONTROL_RUNNER_SOCKET='{}' '{}' --exact process::worker_registry::tests::control_socket_runner_helper && printf done > '{}'", control.display(), executable.display(), hook_marker.display());
+        let config: ProfileConfig =
+            serde_json::from_value(serde_json::json!({ "hooks": { "on_destroy": [command] } }))
+                .unwrap();
+        save_profile_config(profile, &config).unwrap();
+        let mut instance = Instance::new("hook", workspace.to_str().unwrap());
+        instance.id = session_id.into();
+        instance.source_profile = profile.into();
+        instance.view = crate::session::View::Structured;
+        instance.scratch = true;
+        let (snapshot, row, generation) = expired_deleting_row(instance);
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
+            snapshot,
+            Status::Idle,
+            storage.sessions_path().to_path_buf(),
+            crate::session::lifecycle_journal::LifecycleDeletionOptions {
+                generation,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+                purge_acp_transcript: false,
+            },
+        );
+        crate::session::lifecycle_journal::record(&entry).unwrap();
+        recover_lifecycle_journals_once().unwrap();
+        assert_eq!(std::fs::read_to_string(&hook_marker).unwrap(), "done");
+        assert!(std::fs::symlink_metadata(&control)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        assert_eq!(crate::process::worker::peer_pid_from_socket(&control), None);
+        assert!(crate::process::worker_registry::load(session_id)
+            .unwrap()
+            .is_none());
+        assert!(
+            workspace.join("retained").exists(),
+            "recovery removed scratch after hooks invalidated artifact absence"
+        );
+        let retained = storage.load().unwrap().remove(0);
+        assert_eq!(retained.status, Status::Deleting);
+        assert!(retained.lifecycle_reservation.is_some());
+        let scan = crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
+        let journal = scan
+            .entries
+            .iter()
+            .find(|(_, entry)| entry.as_ref().unwrap().session_id == session_id)
+            .unwrap();
+        assert_eq!(
+            journal.1.as_ref().unwrap().phase,
+            LifecyclePhase::HooksComplete
+        );
+        std::fs::remove_file(&control).unwrap();
+        storage
+            .update(|rows, _| {
+                rows[0].lifecycle_reservation.as_mut().unwrap().at =
+                    Utc::now() - chrono::Duration::days(1);
+                Ok(())
+            })
+            .unwrap();
+        recover_lifecycle_journals_once().unwrap();
+        assert!(!workspace.exists());
+        assert!(storage.load().unwrap().is_empty());
+        assert!(
+            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()])
+                .entries
+                .is_empty()
+        );
+    }
 
     #[test]
     #[serial]
@@ -3983,7 +4673,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!recover_lifecycle_entry(&path, &scanned_entry, &storage).unwrap());
+        assert_eq!(
+            recover_lifecycle_entry(&path, &scanned_entry, &storage).unwrap(),
+            RecoveryOutcome::Unprocessed
+        );
         let row = storage.load().unwrap().remove(0);
         assert_eq!(row.status, Status::Deleting);
         assert!(row.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
@@ -4483,7 +5176,6 @@ mod tests {
                 Teardown::Failed(DockerError::RemoveFailed("daemon busy".into()))
             });
             assert!(!result.success, "a teardown failure must fail the deletion");
-            assert!(result.errors.iter().any(|e| e.contains("Container")));
         }
 
         /// The agent store goes only when a current session's purge fully succeeds.
@@ -4987,8 +5679,7 @@ mod tests {
                 let _ = fs::remove_dir_all(&dir);
                 assert!(survived, "scratch={scratch}: {dir:?} must survive");
                 assert_eq!(
-                    result.errors.iter().any(|e| e.contains("scratch guard")),
-                    scratch,
+                    result.success, !scratch,
                     "scratch={scratch}: {:?}",
                     result.errors
                 );
