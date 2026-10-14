@@ -651,9 +651,10 @@ fn force_remove_preserves_scratch_worktree_branch_and_reloaded_successor() {
             assert!(repo
                 .find_branch("kept-branch", git2::BranchType::Local)
                 .is_ok());
+            let worktree = git2::Repository::open(&workspace).unwrap();
             assert_eq!(
-                git2::Repository::open(&workspace).unwrap().workdir(),
-                Some(workspace.as_path())
+                worktree.workdir().unwrap().canonicalize().unwrap(),
+                workspace.canonicalize().unwrap()
             );
         }
     }
