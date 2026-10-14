@@ -257,6 +257,16 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-text-secondary".into(), hex(theme.hint));
     css.insert("--color-text-muted".into(), hex(theme.hint));
     css.insert("--color-text-dim".into(), hex(theme.dimmed));
+    // Dimmed lifted to body-text AA, for small text that cannot use the raw slot.
+    css.insert(
+        "--color-text-subtle".into(),
+        hex(lift_until(
+            theme.dimmed,
+            bg,
+            &[bg, elevated_1],
+            TEXT_CONTRAST_RATIO,
+        )),
+    );
     css.insert("--color-text-bright".into(), hex(theme.title));
 
     // Status colors map directly onto the TUI's semantic fields.
@@ -588,7 +598,11 @@ mod tests {
             );
             // Status error text, and the session notices strip's body text, sit on
             // these solid surfaces.
-            for fg in ["--color-status-error-text", "--color-text-primary"] {
+            for fg in [
+                "--color-status-error-text",
+                "--color-text-primary",
+                "--color-text-subtle",
+            ] {
                 for surface in ["--color-surface-900", "--color-surface-850"] {
                     let ratio = contrast_ratio(var(fg), var(surface));
                     assert!(

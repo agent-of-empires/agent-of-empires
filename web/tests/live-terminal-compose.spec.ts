@@ -18,20 +18,27 @@ const pastes = (handle: MockHandle) =>
 test.describe("Live terminal mobile controls", () => {
   test.use(iPhone13);
 
-  test("typing stays in the sheet, and Send pastes once and hands focus back to the terminal", async ({ page }) => {
+  test("the sheet clears the home indicator, typing stays in it, and Send pastes once and drops focus", async ({
+    page,
+  }) => {
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Emulation.setSafeAreaInsetsOverride" as never, { insets: { bottom: 34 } } as never);
     const handle = await openLiveTerminal(page, { mobile: true });
     const typedBefore = handle.liveInput.length;
 
     await page.getByRole("button", { name: "Compose" }).tap();
     const message = page.getByRole("textbox", { name: "Message" });
     await expect(message).toBeFocused();
+    const sheet = page.getByRole("dialog", { name: "Compose" });
+    expect(await sheet.evaluate((el) => innerHeight - el.getBoundingClientRect().bottom)).toBe(34);
     await page.keyboard.type("first line");
     await page.keyboard.press("Enter");
     await page.keyboard.type("second");
     await page.getByRole("button", { name: "Send" }).tap();
 
-    await expect(page.getByRole("dialog", { name: "Compose" })).toHaveCount(0);
-    await expect(page.getByLabel("Live terminal input")).toBeFocused();
+    await expect(sheet).toHaveCount(0);
+    await expect(page.getByLabel("Live terminal input")).not.toBeFocused();
+    expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
     await expect.poll(() => pastes(handle)).toEqual([{ type: "paste", text: "first line\nsecond", submit: true }]);
     expect(handle.liveInput.length).toBe(typedBefore);
   });

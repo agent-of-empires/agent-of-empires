@@ -101,8 +101,8 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
     [
       "confirmed profile change",
       {},
-      [set("useStructuredView", true)],
-      defaults({ useStructuredView: false, resetStructuredViewDirty: true, skipIfDirty: undefined }),
+      [set("useStructuredView", true), { type: "RESET_STRUCTURED_VIEW_DIRTY" }],
+      defaults({ useStructuredView: false, skipIfDirty: undefined }),
       false,
     ],
     ["import", { importAcpSessionId: "abc" }, [], defaults({ useStructuredView: false }), true],

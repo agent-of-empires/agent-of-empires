@@ -276,10 +276,7 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             show_activity_age: resolved.session.show_activity_age,
-            sidebar_position: user_config
-                .as_ref()
-                .map(|c| c.session.sidebar_position)
-                .unwrap_or_default(),
+            sidebar_position: resolved.session.sidebar_position,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
             hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks::default(),

@@ -86,12 +86,12 @@ export type Action =
       agentModel?: string;
       agentEffort?: string;
       useStructuredView?: boolean;
-      /** Set by the profile picker, whose overwrite the user has confirmed. */
-      resetStructuredViewDirty?: boolean;
       /** Mount-time seeding sets this so a late settings response cannot clobber user edits. */
       skipIfDirty?: boolean;
     }
   /** `path`, when set, drops the seed if the selected path has since changed. */
+  /** A confirmed profile pick drops the hand-set view; edits made afterward still win over its response. */
+  | { type: "RESET_STRUCTURED_VIEW_DIRTY" }
   | { type: "SEED_PROJECT_OVERRIDES"; overrides: ProjectOverrides | undefined; path?: string };
 
 export const initialData: WizardData = {
@@ -172,14 +172,9 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   return next;
 }
 
-/** An import (structured on disk) and a hand-set view outrank the seeded view, except that a
- *  confirmed profile change resets the latter. */
-function seededStructuredView(
-  data: WizardData,
-  action: { useStructuredView?: boolean; resetStructuredViewDirty?: boolean },
-): boolean {
-  if (data.importAcpSessionId) return data.useStructuredView;
-  if (data.structuredViewDirty && !action.resetStructuredViewDirty) return data.useStructuredView;
+/** An import (structured on disk) and a hand-set view outrank the seeded view. */
+function seededStructuredView(data: WizardData, action: { useStructuredView?: boolean }): boolean {
+  if (data.importAcpSessionId || data.structuredViewDirty) return data.useStructuredView;
   return action.useStructuredView ?? data.useStructuredView;
 }
 
@@ -187,6 +182,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
   switch (action.type) {
     case "SET_FIELD":
       return { ...state, data: setField(state.data, action.field, action.value), error: null };
+    case "RESET_STRUCTURED_VIEW_DIRTY":
+      return { ...state, data: { ...state.data, structuredViewDirty: false } };
     case "SEED_PROJECT_OVERRIDES": {
       // A manual toggle wins; still record the override for a later profile reset.
       // Same path identity as the registry lookup: `/repo/` and `/repo` are one project.
@@ -266,7 +263,6 @@ export function reducer(state: WizardState, action: Action): WizardState {
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
           useStructuredView,
-          structuredViewDirty: action.resetStructuredViewDirty ? false : state.data.structuredViewDirty,
           profileDirty: false,
           worktreeDirty: false,
           sandboxDirty: false,

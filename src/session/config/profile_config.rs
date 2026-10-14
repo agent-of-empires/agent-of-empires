@@ -164,8 +164,9 @@ pub fn resolve_config(profile: &str) -> Result<Config> {
     Ok(config)
 }
 
-/// Like [`resolve_config`], but logs a warning on failure and returns defaults
-/// instead of propagating the error.
+/// Like [`resolve_config`], but logs a warning on failure instead of
+/// propagating the error. A broken profile file falls back to the global
+/// config; only a broken global config falls back to defaults.
 pub fn resolve_config_or_warn(profile: &str) -> Config {
     match resolve_config(profile) {
         Ok(config) => config,
@@ -174,7 +175,10 @@ pub fn resolve_config_or_warn(profile: &str) -> Config {
                 "Failed to load config for profile '{}', using defaults: {e}",
                 profile
             );
-            let mut fallback = Config::default();
+            let mut fallback = match Config::load() {
+                Ok(global) => merge_configs(global, &ProfileConfig::default()),
+                Err(_) => Config::default(),
+            };
             apply_cityhall_overrides(&mut fallback);
             // Keep the status-rule registry consistent with the config the
             // caller proceeds with: a failed resolve must not leave this
@@ -750,5 +754,24 @@ mod tests {
         apply_cityhall_overrides(&mut on);
         assert_eq!(on.acp.max_concurrent_workers, 50);
         assert!(on.worktree.enabled);
+    }
+
+    /// A malformed profile file must not discard the valid global config.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_config_or_warn_keeps_global_when_profile_is_malformed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::config::update_config(|c| {
+            c.session.confirm_before_quit = false;
+            c.theme.name = "rose-pine".to_string();
+        })
+        .unwrap();
+        let profile_dir = crate::session::get_profile_dir("broken").unwrap();
+        std::fs::write(profile_dir.join("config.toml"), "[session\n").unwrap();
+
+        let config = resolve_config_or_warn("broken");
+        assert!(!config.session.confirm_before_quit);
+        assert_eq!(config.theme.name, "rose-pine");
     }
 }

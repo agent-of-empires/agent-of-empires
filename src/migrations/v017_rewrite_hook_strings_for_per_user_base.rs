@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::hooks::{
-    has_aoe_marker, install_codex_hooks_with_preserved_state, install_hooks, iter_hook_targets_in,
-    snapshot_codex_hooks_state, HookInstallTarget, HookTarget, HookTargetKind,
+    has_aoe_marker, install_codex_hooks_with_preserved_state, install_codex_json_hooks,
+    install_hooks, iter_hook_targets_in, snapshot_codex_hooks_state, HookInstallTarget, HookTarget,
+    HookTargetKind,
 };
 
 /// Path of the legacy world-known hook directory swept by this migration.
@@ -137,8 +138,12 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
         anyhow::bail!("test-injected rewrite failure for {}", target.agent_name);
     }
     match target.kind {
-        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+        HookTargetKind::JsonSettings => {
             install_hooks(&target.path, &target.events, HookInstallTarget::Host)
+        }
+        HookTargetKind::CodexJson => {
+            install_codex_json_hooks(&target.path, &target.events, HookInstallTarget::Host)
+                .map(drop)
         }
         HookTargetKind::CodexToml => {
             let preserved = snapshot_codex_hooks_state(&target.path)?;
@@ -731,5 +736,33 @@ mod tests {
             sandbox_before, sandbox_after,
             "v017 must not touch settings under .claude/sandbox/ (baked into image)"
         );
+    }
+
+    /// `[features].hooks = false` means the migration strips AoE entries
+    /// instead of rewriting them, and keeps the user's own hooks.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn codex_opt_out_strips_aoe_entries() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(codex.join("config.toml"), "[features]\nhooks = false\n").unwrap();
+        write_json(
+            &codex.join("hooks.json"),
+            &serde_json::json!({"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": PRE_V017_STATUS_CMD}]},
+                {"hooks": [{"type": "command", "command": "echo user-only"}]},
+            ]}}),
+        );
+
+        run_in(&home, &app_dir).unwrap();
+
+        let text = fs::read_to_string(codex.join("hooks.json")).unwrap();
+        assert!(
+            !text.contains("aoe-hooks"),
+            "AoE entries left behind: {text}"
+        );
+        assert!(text.contains("echo user-only"), "user hook lost: {text}");
     }
 }
